@@ -1,0 +1,39 @@
+cognitive-complexity-threshold = 30
+struct-field-name-threshold = 8
+type-complexity-threshold = 250
+too-many-lines-threshold = 150
+too-many-arguments-threshold = 7
+msrv = "1.85.0"
+trivial-copy-size-limit = 32
+stack-size-threshold = 512000
+single-char-binding-names-threshold = 4
+
+disallowed-names = ["foo", "bar", "baz", "quux"]
+
+doc-valid-idents = [
+    "GraphQL", "WebSocket", "REST", "gRPC",
+    "OpenAI", "Anthropic", "HuggingFace",
+    "OAuth", "JWT", "HMAC", "SHA",
+    "Linux", "macOS", "FreeBSD",
+    "AccessKit", "CoreFoundation", "Direct2D",
+    "Direct3D", "DirectWrite", "OpenSSL",
+    "MinGW", "NaN", "NaNs",
+]
+
+avoid-breaking-exported-api = false
+check-private-items = true
+allow-one-hash-in-raw-strings = true
+
+enum-variant-size-threshold = 200
+large-error-threshold = 128
+pass-by-value-size-limit = 256
+vec-box-size-threshold = 128
+unnecessary-box-size = 128
+literal-representation-threshold = 4
+verbose-bit-mask-threshold = 1
+
+max-struct-bools = 3
+max-fn-params-bools = 2
+max-trait-bounds = 4
+
+standard-macro-braces = []

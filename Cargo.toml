@@ -1,0 +1,56 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/dch-labs/dch"
+homepage = "https://github.com/dch-labs/dch"
+readme = "README.md"
+authors = ["dch"]
+
+[workspace.dependencies]
+loopctl = { path = "../loopctl", features = ["openai", "anthropic", "hooks", "testing"] }
+
+tokio       = { version = "1.52.3", features = ["sync", "macros", "time", "rt-multi-thread"] }
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+thiserror   = "2"
+tracing     = "0.1"
+futures     = "0.3"
+uuid        = { version = "1", features = ["v4", "serde"] }
+
+toml        = "0.8"
+syn         = { version = "2", features = ["full", "parsing"] }
+serde_yaml  = "0.9"
+
+ratatui        = "0.29"
+crossterm      = "0.28"
+event-listener = "5"
+chrono         = { version = "0.4", features = ["serde"] }
+
+clap       = { version = "4", features = ["derive"] }
+
+dch        = { path = "crates/dch" }
+dch-loop    = { path = "crates/dch-loop" }
+dch-tools  = { path = "crates/dch-tools" }
+dch-tui    = { path = "crates/dch-tui" }
+dch-config = { path = "crates/dch-config" }
+
+[workspace.lints.clippy]
+pedantic            = { level = "warn", priority = -1 }
+unwrap_used         = "deny"
+expect_used         = "deny"
+panic               = "deny"
+todo                = "deny"
+unimplemented       = "deny"
+unreachable         = "deny"
+arithmetic_side_effects = "deny"
+indexing_slicing   = "deny"
+match_same_arms    = "deny"
+redundant_clone    = "deny"
+clone_on_ref_ptr   = "deny"
+let_underscore_must_use = "deny"

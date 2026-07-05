@@ -1,0 +1,20 @@
+[package]
+name = "dch-loop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Composition layer for dch: loop, provider factory, system prompt, observers"
+
+[dependencies]
+loopctl = { workspace = true }
+dch-tools = { workspace = true }
+dch-config = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

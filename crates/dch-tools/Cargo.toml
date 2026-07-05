@@ -1,0 +1,17 @@
+[package]
+name = "dch-tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Tool implementations for dch (Read, Write, Edit, Bash, Grep, …), wrapping loopctl::tool::Tool"
+
+[dependencies]
+loopctl    = { workspace = true }
+serde_json = { workspace = true }
+syn        = { workspace = true }
+toml       = { workspace = true }
+serde_yaml = { workspace = true }
+
+[lints]
+workspace = true

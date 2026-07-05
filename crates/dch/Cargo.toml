@@ -1,0 +1,25 @@
+[package]
+name = "dch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "A terminal-based agentic coding assistant built on loopctl"
+
+[[bin]]
+name = "dch"
+path = "src/main.rs"
+
+[dependencies]
+dch-loop = { workspace = true }
+dch-tui    = { workspace = true }
+dch-config = { workspace = true }
+loopctl    = { workspace = true }
+clap       = { workspace = true }
+tokio      = { workspace = true }
+serde_json = { workspace = true }
+uuid       = { workspace = true }
+chrono     = { workspace = true }
+
+[lints]
+workspace = true
