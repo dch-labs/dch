@@ -203,6 +203,26 @@ struct MetadataPackage {
 #[derive(Debug, serde::Deserialize)]
 struct MetadataDep {
     name: String,
+    /// `null` for normal deps, `"dev"` for dev-deps, `"build"` for build-deps.
+    #[serde(default)]
+    kind: Option<String>,
+}
+
+/// Converts the parsed `cargo metadata` document into the [`Package`] view the
+/// [`Checker`] consumes, dropping dev- and build-dependencies.
+fn packages_from_metadata(doc: MetadataDoc) -> Vec<Package> {
+    doc.packages
+        .into_iter()
+        .map(|p| Package {
+            name: p.name,
+            deps: p
+                .dependencies
+                .into_iter()
+                .filter(|d| d.kind.is_none())
+                .map(|d| d.name)
+                .collect(),
+        })
+        .collect()
 }
 
 /// Runs `cargo metadata`, parses it, and prints violations. Exit 0 on pass.
@@ -233,16 +253,9 @@ pub fn run_check() -> ExitCode {
         }
     };
 
-    let pkgs: Vec<Package> = doc
-        .packages
-        .into_iter()
-        .map(|p| Package {
-            name: p.name,
-            deps: p.dependencies.into_iter().map(|d| d.name).collect(),
-        })
-        .collect();
-
+    let pkgs = packages_from_metadata(doc);
     let violations = Checker::new(&pkgs).check();
+
     if violations.is_empty() {
         println!("xtask: boundary check passed (4 rules, 0 violations)");
         ExitCode::SUCCESS
@@ -259,7 +272,7 @@ pub fn run_check() -> ExitCode {
 }
 
 #[cfg(test)]
-#[allow(clippy::missing_panics_doc)]
+#[allow(clippy::missing_panics_doc, clippy::missing_errors_doc)]
 mod tests {
     //! Each rule gets a passing case and a violating case, proving the gate
     //! actually bites.
@@ -378,5 +391,37 @@ mod tests {
         let ws = with_pkg(&good_workspace(), "dch", &bad);
         let v = Checker::new(&ws).check();
         assert!(has_violation(&v, "dch", "dch-tools"));
+    }
+
+    // Dev/build deps must not be counted as runtime boundary edges. A dev-dep
+    // on a sibling dch crate is a legitimate test pattern; the checker must
+    // filter it out before evaluating the §9 rules.
+
+    #[test]
+    fn dev_and_build_deps_are_not_runtime_edges() -> Result<(), serde_json::Error> {
+        let json = r#"{
+            "packages": [
+                {
+                    "name": "fake",
+                    "dependencies": [
+                        {"name": "dch-config"},
+                        {"name": "dch-tools", "kind": "dev"},
+                        {"name": "dch-tui",   "kind": "build"}
+                    ]
+                }
+            ]
+        }"#;
+        let doc: MetadataDoc = serde_json::from_str(json)?;
+        let pkgs = packages_from_metadata(doc);
+        // Exactly one package in the fixture; its only normal dep is dch-config.
+        // The dev-dep on dch-tools and the build-dep on dch-tui must be filtered.
+        assert_eq!(
+            pkgs.as_slice(),
+            [Package {
+                name: "fake".to_string(),
+                deps: vec!["dch-config".to_string()],
+            }]
+        );
+        Ok(())
     }
 }
