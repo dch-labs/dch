@@ -192,9 +192,8 @@ mod tests {
     fn debug_elides_question_tx() {
         let rc = sample();
         let rendered = format!("{rc:?}");
-        assert!(rendered.contains("question_tx"));
         // The Sender is not Debug; the rendered summary reports presence as a
         // bool rather than the channel itself.
-        assert!(rendered.contains("false"));
+        assert!(rendered.contains("question_tx: false"));
     }
 }
