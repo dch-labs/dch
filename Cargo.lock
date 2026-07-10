@@ -386,6 +386,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "syn",
+ "tokio",
  "toml",
 ]
 
