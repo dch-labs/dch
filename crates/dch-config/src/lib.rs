@@ -212,8 +212,11 @@ impl DchConfig {
         Self::load_from_dir(&config_dir())
     }
 
-    /// Load from a specific directory. Tries `config.local.toml` first, then
-    /// `config.toml`, then defaults.
+    /// Load from a specific directory.
+    ///
+    /// If `config.local.toml` exists it is loaded as a **complete replacement**
+    /// for `config.toml` (not a field-level merge). If neither file exists,
+    /// returns defaults.
     ///
     /// # Errors
     ///
@@ -375,12 +378,17 @@ json_logs = true
     }
 
     #[test]
-    fn test_local_overrides_main() {
+    fn test_local_replaces_main() {
         let tmp = tempfile::TempDir::new().unwrap();
-        write_config(tmp.path(), "config.toml", "[api]\nmodel = \"A\"\n");
+        write_config(
+            tmp.path(),
+            "config.toml",
+            "[api]\nmodel = \"A\"\n[display]\ntheme = \"dracula\"\n",
+        );
         write_config(tmp.path(), "config.local.toml", "[api]\nmodel = \"B\"\n");
         let c = DchConfig::load_from_dir(tmp.path()).unwrap();
         assert_eq!(c.api.model, "B");
+        assert_eq!(c.display.theme, "default");
     }
 
     #[test]
@@ -408,7 +416,7 @@ json_logs = true
             Some("You are a careful coding assistant.")
         );
         assert_eq!(lc.context_window, 200_000);
-        assert!(lc.session_id != uuid::Uuid::nil());
+        assert_ne!(lc.session_id, uuid::Uuid::nil());
 
         let lc2 = c.to_loop_config();
         assert_ne!(lc.session_id, lc2.session_id);
