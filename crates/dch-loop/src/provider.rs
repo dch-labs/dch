@@ -19,7 +19,7 @@ use crate::error::RunnerError;
 /// loopctl's own Ollama constructor.
 const NO_AUTH_KEY: &str = "ollama";
 
-/// Build a [`loopctl::SharedApiClient`] for the provider named by
+/// Build a [`loopctl::api::SharedApiClient`] for the provider named by
 /// `config.api_type`.
 ///
 /// Variants are mapped by wire-protocol family: OpenAI-compatible providers
