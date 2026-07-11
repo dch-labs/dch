@@ -43,46 +43,38 @@ const NO_AUTH_KEY: &str = "ollama";
 ///   underlying HTTP client cannot be constructed.
 pub fn create_client(config: &ApiConfig) -> Result<SharedApiClient, RunnerError> {
     let base_url = effective_base_url(config);
+    let api_key = resolve_api_key(config)?;
     let timeout = Duration::from_secs(config.request_timeout_secs);
 
     let client: SharedApiClient = match config.api_type {
-        ApiType::OpenAi | ApiType::Ollama | ApiType::DeepSeek | ApiType::Grok => {
-            let api_key = resolve_api_key(config)?;
-            Arc::new(
-                OpenAiClient::builder()
-                    .api_key(api_key)
-                    .base_url(base_url)
-                    .model(config.model.as_str())
-                    .timeout(timeout)
-                    .build()
-                    .map_err(|e| RunnerError::Client(e.to_string()))?,
-            )
-        }
-        ApiType::Anthropic | ApiType::Zai => {
-            let api_key = resolve_api_key(config)?;
-            Arc::new(
-                AnthropicClient::builder()
-                    .api_key(api_key)
-                    .base_url(base_url)
-                    .model(config.model.as_str())
-                    .max_tokens(config.max_tokens)
-                    .timeout(timeout)
-                    .build()
-                    .map_err(|e| RunnerError::Client(e.to_string()))?,
-            )
-        }
-        ApiType::Gemini => {
-            let api_key = resolve_api_key(config)?;
-            Arc::new(
-                GeminiClient::builder()
-                    .api_key(api_key)
-                    .base_url(base_url)
-                    .model(config.model.as_str())
-                    .timeout(timeout)
-                    .build()
-                    .map_err(|e| RunnerError::Client(e.to_string()))?,
-            )
-        }
+        ApiType::OpenAi | ApiType::Ollama | ApiType::DeepSeek | ApiType::Grok => Arc::new(
+            OpenAiClient::builder()
+                .api_key(api_key)
+                .base_url(base_url)
+                .model(config.model.as_str())
+                .timeout(timeout)
+                .build()
+                .map_err(|e| RunnerError::Client(e.to_string()))?,
+        ),
+        ApiType::Anthropic | ApiType::Zai => Arc::new(
+            AnthropicClient::builder()
+                .api_key(api_key)
+                .base_url(base_url)
+                .model(config.model.as_str())
+                .max_tokens(config.max_tokens)
+                .timeout(timeout)
+                .build()
+                .map_err(|e| RunnerError::Client(e.to_string()))?,
+        ),
+        ApiType::Gemini => Arc::new(
+            GeminiClient::builder()
+                .api_key(api_key)
+                .base_url(base_url)
+                .model(config.model.as_str())
+                .timeout(timeout)
+                .build()
+                .map_err(|e| RunnerError::Client(e.to_string()))?,
+        ),
     };
     Ok(client)
 }
@@ -98,43 +90,55 @@ fn effective_base_url(config: &ApiConfig) -> String {
 
 /// Resolve the API key for `config`.
 ///
-/// Returns `config.api_key` when set; for `Ollama`, returns a fixed dummy
-/// (no auth required); otherwise reads the family's conventional environment
-/// variable, mapping a miss to a [`RunnerError::Client`] that names the
-/// expected variable.
+/// Resolution is uniform across providers: `config.api_key` wins; otherwise
+/// each provider's candidate environment variables are tried in order. A miss
+/// yields a [`RunnerError::Client`] naming the variables that were tried.
+///
+/// Ollama is the one exception: a local Ollama server needs no authentication,
+/// so when no key is configured it falls back to a fixed dummy rather than
+/// erroring. A cloud-hosted Ollama with authentication works like any other
+/// provider via `api_key` or `OLLAMA_API_KEY`.
 ///
 /// # Errors
 ///
 /// Returns [`RunnerError::Client`] when the key is neither configured nor
-/// available in the family's environment variable.
+/// available in any of the provider's environment variables (except for
+/// Ollama, which falls back to a dummy).
 fn resolve_api_key(config: &ApiConfig) -> Result<String, RunnerError> {
     if let Some(key) = &config.api_key {
         return Ok(key.clone());
     }
+    let candidates = candidate_env_vars(config.api_type);
+    for var in &candidates {
+        if let Ok(key) = std::env::var(var) {
+            return Ok(key);
+        }
+    }
     if config.api_type == ApiType::Ollama {
         return Ok(NO_AUTH_KEY.to_owned());
     }
-    if let ApiType::Gemini = config.api_type {
-        return std::env::var("GEMINI_API_KEY")
-            .or_else(|_| std::env::var("GOOGLE_API_KEY"))
-            .map_err(|_| {
-                RunnerError::Client(
-                    "no API key: `api_key` not set and neither GEMINI_API_KEY \
-                     nor GOOGLE_API_KEY is set"
-                        .to_string(),
-                )
-            });
+    match candidates.as_slice() {
+        [] => Err(RunnerError::Client(
+            "no API key: `api_key` not set".to_string(),
+        )),
+        [single] => Err(RunnerError::Client(format!(
+            "no API key: `api_key` not set and env var {single} is unset"
+        ))),
+        multiple => Err(RunnerError::Client(format!(
+            "no API key: `api_key` not set and none of {} set",
+            multiple.join(" / ")
+        ))),
     }
-    let var = match config.api_type {
-        ApiType::OpenAi | ApiType::DeepSeek | ApiType::Grok => "OPENAI_API_KEY",
-        ApiType::Anthropic | ApiType::Zai => "ANTHROPIC_API_KEY",
-        ApiType::Ollama | ApiType::Gemini => return Ok(NO_AUTH_KEY.to_owned()),
-    };
-    std::env::var(var).map_err(|_| {
-        RunnerError::Client(format!(
-            "no API key: `api_key` not set and env var {var} is unset"
-        ))
-    })
+}
+
+/// Candidate API-key environment variables for each provider, in fallback order.
+fn candidate_env_vars(api_type: ApiType) -> Vec<&'static str> {
+    match api_type {
+        ApiType::OpenAi | ApiType::DeepSeek | ApiType::Grok => vec!["OPENAI_API_KEY"],
+        ApiType::Anthropic | ApiType::Zai => vec!["ANTHROPIC_API_KEY"],
+        ApiType::Gemini => vec!["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+        ApiType::Ollama => vec!["OLLAMA_API_KEY"],
+    }
 }
 
 #[cfg(test)]
@@ -201,7 +205,7 @@ mod tests {
         let _g = ENV_GUARD
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        remove_env("OPENAI_API_KEY");
+        remove_env("OLLAMA_API_KEY");
         let c = cfg(ApiType::Ollama, "http://localhost:11434/v1", None);
         let client = create_client(&c).expect("ollama builds with no key");
         assert_eq!(client.model(), "test-model");
@@ -212,10 +216,22 @@ mod tests {
         let _g = ENV_GUARD
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        remove_env("OPENAI_API_KEY");
+        remove_env("OLLAMA_API_KEY");
         let c = cfg(ApiType::Ollama, "", None);
         let client = create_client(&c).expect("ollama builds via default base_url");
         assert_eq!(client.model(), "test-model");
+    }
+
+    #[test]
+    fn ollama_cloud_key_from_env() {
+        let _g = ENV_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_env("OLLAMA_API_KEY", "env-key");
+        let c = cfg(ApiType::Ollama, "https://cloud.example.com/v1", None);
+        let client = create_client(&c).expect("cloud ollama builds with OLLAMA_API_KEY");
+        assert_eq!(client.model(), "test-model");
+        remove_env("OLLAMA_API_KEY");
     }
 
     #[test]
@@ -263,6 +279,30 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_key_via_openai_env() {
+        let _g = ENV_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_env("OPENAI_API_KEY", "env-key");
+        let c = cfg(ApiType::DeepSeek, "https://api.deepseek.com", None);
+        let client = create_client(&c).expect("deepseek builds with OPENAI_API_KEY");
+        assert_eq!(client.model(), "test-model");
+        remove_env("OPENAI_API_KEY");
+    }
+
+    #[test]
+    fn grok_key_via_openai_env() {
+        let _g = ENV_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_env("OPENAI_API_KEY", "env-key");
+        let c = cfg(ApiType::Grok, "https://api.x.ai/v1", None);
+        let client = create_client(&c).expect("grok builds with OPENAI_API_KEY");
+        assert_eq!(client.model(), "test-model");
+        remove_env("OPENAI_API_KEY");
+    }
+
+    #[test]
     fn anthropic_key_from_env() {
         let _g = ENV_GUARD
             .lock()
@@ -290,6 +330,76 @@ mod tests {
         assert!(
             msg.contains("OPENAI_API_KEY"),
             "error message should name the env var: {msg}"
+        );
+    }
+
+    #[test]
+    fn zai_key_via_anthropic_env() {
+        let _g = ENV_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_env("ANTHROPIC_API_KEY", "env-key");
+        let c = cfg(ApiType::Zai, "https://api.z.ai/api", None);
+        let client = create_client(&c).expect("zai builds with ANTHROPIC_API_KEY");
+        assert_eq!(client.model(), "test-model");
+        remove_env("ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    fn gemini_key_from_gemini_env() {
+        let _g = ENV_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        remove_env("GOOGLE_API_KEY");
+        set_env("GEMINI_API_KEY", "env-key");
+        let c = cfg(
+            ApiType::Gemini,
+            "https://generativelanguage.googleapis.com/v1beta",
+            None,
+        );
+        let client = create_client(&c).expect("gemini builds with GEMINI_API_KEY");
+        assert_eq!(client.model(), "test-model");
+        remove_env("GEMINI_API_KEY");
+    }
+
+    #[test]
+    fn gemini_key_falls_back_to_google_env() {
+        let _g = ENV_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        remove_env("GEMINI_API_KEY");
+        set_env("GOOGLE_API_KEY", "env-key");
+        let c = cfg(
+            ApiType::Gemini,
+            "https://generativelanguage.googleapis.com/v1beta",
+            None,
+        );
+        let client = create_client(&c).expect("gemini builds with GOOGLE_API_KEY");
+        assert_eq!(client.model(), "test-model");
+        remove_env("GOOGLE_API_KEY");
+    }
+
+    #[test]
+    fn gemini_missing_key_names_both_vars() {
+        let _g = ENV_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        remove_env("GEMINI_API_KEY");
+        remove_env("GOOGLE_API_KEY");
+        let c = cfg(
+            ApiType::Gemini,
+            "https://generativelanguage.googleapis.com/v1beta",
+            None,
+        );
+        let err = create_client(&c)
+            .err()
+            .expect("gemini without key should error");
+        let RunnerError::Client(msg) = &err else {
+            panic!("expected Client error, got {err:?}");
+        };
+        assert!(
+            msg.contains("GEMINI_API_KEY") && msg.contains("GOOGLE_API_KEY"),
+            "error message should name both env vars: {msg}"
         );
     }
 
