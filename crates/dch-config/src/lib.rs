@@ -112,6 +112,8 @@ pub struct ApiConfig {
     pub api_key: Option<String>,
     /// Max response tokens per turn.
     pub max_tokens: u32,
+    /// Context window size of the primary model, in tokens.
+    pub context_window: u64,
     /// Per-request timeout in seconds.
     pub request_timeout_secs: u64,
     /// Secondary model used if the primary errors out.
@@ -164,6 +166,7 @@ impl Default for ApiConfig {
             api_type: ApiType::default(),
             api_key: None,
             max_tokens: 32_000,
+            context_window: 200_000,
             request_timeout_secs: 120,
             fallback_model: None,
         }
@@ -236,6 +239,17 @@ impl DchConfig {
     }
 
     /// Map to a [`loopctl::config::LoopConfig`]. Does not validate.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use dch_config::DchConfig;
+    ///
+    /// let mut c = DchConfig::default();
+    /// c.api.model = "glm-4.7".to_string();
+    /// let lc = c.to_loop_config();
+    /// assert_eq!(lc.model, "glm-4.7");
+    /// ```
     #[must_use]
     pub fn to_loop_config(&self) -> loopctl::config::LoopConfig {
         let defaults = loopctl::config::LoopConfig::default();
@@ -247,7 +261,7 @@ impl DchConfig {
             compact_threshold: self.runner.compact_threshold,
             auto_compact: self.runner.auto_compact,
             session_id: defaults.session_id,
-            context_window: defaults.context_window,
+            context_window: self.api.context_window,
         }
     }
 }
@@ -278,6 +292,7 @@ model = "glm-4.7"
 base_url = "http://localhost:11434/v1"
 api_type = "ollama"
 max_tokens = 8192
+context_window = 128000
 request_timeout_secs = 60
 fallback_model = "glm-4.7-flash"
 
@@ -415,7 +430,7 @@ json_logs = true
             lc.system_prompt.as_deref(),
             Some("You are a careful coding assistant.")
         );
-        assert_eq!(lc.context_window, 200_000);
+        assert_eq!(lc.context_window, 128_000);
         assert_ne!(lc.session_id, uuid::Uuid::nil());
 
         let lc2 = c.to_loop_config();
@@ -457,5 +472,44 @@ json_logs = true
             ApiType::Gemini.default_base_url(),
             "https://generativelanguage.googleapis.com"
         );
+    }
+
+    #[test]
+    fn test_to_loop_config_borrows_not_consumes() {
+        let c = DchConfig::default();
+        let _lc = c.to_loop_config();
+        assert_eq!(c.api.base_url, "");
+        assert_eq!(c.display.theme, "default");
+        assert_eq!(c.runner.permission_mode, PermissionMode::Auto);
+        assert_eq!(c.telemetry.level, "info");
+    }
+
+    #[test]
+    fn test_to_loop_config_max_turns_name_guard() {
+        let mut c = DchConfig::default();
+        c.runner.max_turns = 42;
+        let lc = c.to_loop_config();
+        assert_eq!(lc.max_turns, 42);
+    }
+
+    #[test]
+    fn test_to_loop_config_validate_edge_values() {
+        let mut c = DchConfig::default();
+        c.api.model = "m".to_string();
+        c.runner.compact_threshold = 0.0;
+        assert!(c.to_loop_config().validate().is_ok());
+        c.runner.compact_threshold = 1.0;
+        assert!(c.to_loop_config().validate().is_ok());
+        c.runner.compact_threshold = 1.5;
+        let lc = c.to_loop_config();
+        assert!((lc.compact_threshold - 1.5).abs() < 1e-9);
+        assert!(lc.validate().is_err());
+    }
+
+    #[test]
+    fn test_to_loop_config_system_prompt_none_round_trips() {
+        let c = DchConfig::default();
+        assert!(c.runner.system_prompt.is_none());
+        assert!(c.to_loop_config().system_prompt.is_none());
     }
 }
