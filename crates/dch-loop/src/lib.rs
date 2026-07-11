@@ -2,8 +2,9 @@
 
 #![warn(missing_docs)]
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn dch_loop_compiles() {}
-}
+pub mod error;
+pub mod provider;
+
+pub use dch_config::{ApiConfig, ApiType, DchConfigError};
+pub use error::RunnerError;
+pub use provider::create_client;
