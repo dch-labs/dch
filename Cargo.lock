@@ -382,10 +382,12 @@ dependencies = [
 name = "dch-tools"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "loopctl",
  "serde_json",
  "serde_yaml",
  "syn",
+ "tempfile",
  "tokio",
  "toml",
 ]

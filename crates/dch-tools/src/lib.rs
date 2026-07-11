@@ -8,8 +8,11 @@
 
 pub mod context;
 pub mod question;
+pub mod read;
+pub mod registry;
 pub mod runtime;
 pub mod state;
+pub mod util;
 
 pub use context::RunnerContext;
 pub use context::runner_ctx;
@@ -17,6 +20,8 @@ pub use question::Question;
 pub use question::QuestionOption;
 pub use question::QuestionRequest;
 pub use question::QuestionResponse;
+pub use read::ReadTool;
+pub use registry::builtin_registry;
 pub use runtime::PermissionMode;
 pub use runtime::RuntimeConfig;
 pub use runtime::Verbosity;
