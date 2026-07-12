@@ -155,6 +155,13 @@ impl ReadTool {
             )));
         }
 
+        if !metadata.is_file() {
+            return Ok(ToolOutput::error_text(format!(
+                "{file_path} is a directory, not a file. \
+                 Use Glob or Grep to explore its contents."
+            )));
+        }
+
         // Image branch: return a base64-encoded image block.
         if let Some(mime) = mime_type_from_path(&full_path) {
             let bytes = tokio::fs::read(&full_path).await?;
@@ -285,7 +292,7 @@ fn format_text(content: &str, file_path: &str, offset: usize, limit: usize) -> T
     if shown_content.len() > MAX_FILE_READ_BYTES {
         let original_size = shown_content.len();
         let mut cut = MAX_FILE_READ_BYTES;
-        while !content.is_char_boundary(cut) && cut > 0 {
+        while !shown_content.is_char_boundary(cut) && cut > 0 {
             cut = cut.saturating_sub(1);
         }
         let truncated = shown_content.get(..cut).unwrap_or(&shown_content);
@@ -349,60 +356,89 @@ pub(crate) fn parse_line_range(range: &str) -> Result<(usize, usize), String> {
     if range.is_empty() {
         return Err("line_range cannot be empty".to_string());
     }
-
-    // Dash-separated range: "1-100"
-    if let Some((left, right)) = range.split_once('-') {
-        let start: usize = if left.is_empty() {
-            1
-        } else {
-            left.parse().map_err(|_| {
-                format!("Invalid line_range start: '{left}'. Expected a positive integer.")
-            })?
-        };
-
-        let end: usize = right.parse().map_err(|_| {
-            format!("Invalid line_range end: '{right}'. Expected a positive integer.")
-        })?;
-
-        if start == 0 {
-            return Err("line_range start must be >= 1".to_string());
-        }
-        if end < start {
-            return Err(format!("line_range end ({end}) must be >= start ({start})"));
-        }
-
-        let count = end.saturating_sub(start).saturating_add(1);
-        return Ok((start, count));
+    if let Some(parsed) = range.split_once('-').map(parse_dash_range).transpose()? {
+        return Ok(parsed);
     }
+    if let Some(parsed) = range.split_once(':').map(parse_colon_range).transpose()? {
+        return Ok(parsed);
+    }
+    parse_single_line(range)
+}
 
-    // Colon-separated range: "50:" or ":100"
-    if let Some((left, right)) = range.split_once(':') {
-        if left.is_empty() && right.is_empty() {
-            return Err(
-                "line_range ':' requires at least one side. Use '1:' or ':100'.".to_string(),
-            );
-        }
-
-        if left.is_empty() {
-            let count: usize = right.parse().map_err(|_| {
-                format!("Invalid line_range count: '{right}'. Expected a positive integer.")
-            })?;
-            if count == 0 {
-                return Err("line_range count must be >= 1".to_string());
-            }
-            return Ok((1, count));
-        }
-
-        let start: usize = left.parse().map_err(|_| {
+/// Parse a dash-separated range like `"1-100"` into `(offset, limit)`.
+///
+/// # Errors
+///
+/// Returns a descriptive `String` if either side is unparseable, zero, or
+/// the end precedes the start.
+fn parse_dash_range((left, right): (&str, &str)) -> Result<(usize, usize), String> {
+    let start: usize = if left.is_empty() {
+        1
+    } else {
+        left.parse().map_err(|_| {
             format!("Invalid line_range start: '{left}'. Expected a positive integer.")
+        })?
+    };
+    let end: usize = right
+        .parse()
+        .map_err(|_| format!("Invalid line_range end: '{right}'. Expected a positive integer."))?;
+    if start == 0 {
+        return Err("line_range start must be >= 1".to_string());
+    }
+    if end < start {
+        return Err(format!("line_range end ({end}) must be >= start ({start})"));
+    }
+    let count = end.saturating_sub(start).saturating_add(1);
+    Ok((start, count))
+}
+
+/// Parse a colon-separated range like `"50:"` or `":100"` into `(offset, limit)`.
+///
+/// # Errors
+///
+/// Returns a descriptive `String` if both sides are empty, a side is
+/// unparseable, or a value is zero.
+fn parse_colon_range((left, right): (&str, &str)) -> Result<(usize, usize), String> {
+    if left.is_empty() && right.is_empty() {
+        return Err("line_range ':' requires at least one side. Use '1:' or ':100'.".to_string());
+    }
+    if left.is_empty() {
+        let count: usize = right.parse().map_err(|_| {
+            format!("Invalid line_range count: '{right}'. Expected a positive integer.")
         })?;
-        if start == 0 {
-            return Err("line_range start must be >= 1".to_string());
+        if count == 0 {
+            return Err("line_range count must be >= 1".to_string());
         }
+        return Ok((1, count));
+    }
+    let start: usize = left
+        .parse()
+        .map_err(|_| format!("Invalid line_range start: '{left}'. Expected a positive integer."))?;
+    if start == 0 {
+        return Err("line_range start must be >= 1".to_string());
+    }
+    // Open-ended "50:" → to end; "50:100" → inclusive range.
+    if right.is_empty() {
         return Ok((start, MAX_FILE_READ_LINES));
     }
+    let end: usize = right
+        .parse()
+        .map_err(|_| format!("Invalid line_range end: '{right}'. Expected a positive integer."))?;
+    if end == 0 {
+        return Err("line_range end must be >= 1".to_string());
+    }
+    if end < start {
+        return Err(format!("line_range end ({end}) must be >= start ({start})"));
+    }
+    Ok((start, end.saturating_sub(start).saturating_add(1)))
+}
 
-    // Single number: "100" → read just line 100
+/// Parse a single line number like `"100"` into `(offset, limit)`.
+///
+/// # Errors
+///
+/// Returns a descriptive `String` if the token is unparseable or zero.
+fn parse_single_line(range: &str) -> Result<(usize, usize), String> {
     let line: usize = range.parse().map_err(|_| {
         format!(
             "Invalid line_range: '{range}'. \
@@ -636,6 +672,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_read_directory_returns_error_text() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("subdir");
+        std::fs::create_dir(&dir).unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let out = read(input(dir.to_str().unwrap()), cwd).await.unwrap();
+        assert!(out.is_error);
+        assert!(out.text_content().contains("directory"));
+    }
+
+    #[tokio::test]
+    async fn test_read_multibyte_truncation_with_offset() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("multibyte.txt");
+        // Each line is 3 bytes (€) × 1000 = 3000 bytes per line.
+        // A single line exceeds MAX_FILE_READ_BYTES only at >133 lines, so
+        // build one very long line with multibyte chars and offset past line 1.
+        let euro = "€".repeat(200_000); // 600_000 bytes, one line
+        let content = format!("header\n{euro}\n");
+        std::fs::write(&path, &content).unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let input = json!({ "file_path": path.to_str().unwrap(), "offset": 2 });
+        let out = read(input, cwd).await.unwrap();
+        let text = out.text_content();
+        assert!(text.contains("FILE TRUNCATED"), "should truncate: {text}");
+        // Truncation must land on a char boundary of the shown content, not the
+        // full file — the sliced output must be valid UTF-8 (it already is via
+        // get(..cut), but the char-boundary check must use shown_content).
+        assert!(text.len() < content.len());
+    }
+
+    #[tokio::test]
     async fn test_read_records_file_read_entry() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("tracked.txt");
@@ -707,6 +775,14 @@ mod tests {
     fn test_parse_line_range_colon_open_start() {
         assert_eq!(parse_line_range(":100").unwrap(), (1, 100));
         assert_eq!(parse_line_range(":1").unwrap(), (1, 1));
+    }
+
+    #[test]
+    fn test_parse_line_range_colon_both_sides() {
+        assert_eq!(parse_line_range("50:100").unwrap(), (50, 51));
+        assert_eq!(parse_line_range("1:1").unwrap(), (1, 1));
+        assert!(parse_line_range("10:5").is_err());
+        assert!(parse_line_range("1:0").is_err());
     }
 
     #[test]

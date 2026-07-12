@@ -6,7 +6,7 @@ use crate::read::ReadTool;
 
 /// Build a [`ToolRegistry`] populated with every builtin tool.
 ///
-/// Each concrete tool registers itself here; downstream callers (the runner)
+/// Each builtin tool is registered here. Downstream callers (the runner)
 /// invoke this once at startup. Later tool tasks append their registrations.
 #[must_use]
 pub fn builtin_registry() -> ToolRegistry {
