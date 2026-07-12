@@ -113,7 +113,7 @@ static JOB_TABLE: LazyLock<Mutex<BTreeMap<u64, BackgroundJob>>> =
 static JOB_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Spawn a command as a background job. Returns the job ID.
-fn spawn_background_job(command: &str, cwd: &str) -> u64 {
+fn spawn_background_job(command: &str, cwd: &str, timeout_secs: u64) -> u64 {
     let id = JOB_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
     let started_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -132,14 +132,22 @@ fn spawn_background_job(command: &str, cwd: &str) -> u64 {
 
     let owned_command = command.to_owned();
     let owned_cwd = cwd.to_owned();
+    let timeout = Duration::from_secs(timeout_secs);
 
     tokio::spawn(async move {
-        let (text, is_error) = execute_foreground(&owned_command, &owned_cwd, DEFAULT_TIMEOUT_SECS)
-            .await
-            .map_or_else(
-                |e| (e.to_string(), true),
-                |o| (o.text_content(), o.is_error),
-            );
+        let (text, is_error) =
+            match tokio::time::timeout(timeout, execute_foreground(&owned_command, &owned_cwd))
+                .await
+            {
+                Ok(result) => result.map_or_else(
+                    |e| (e.to_string(), true),
+                    |o| (o.text_content(), o.is_error),
+                ),
+                Err(_) => (
+                    format!("Command timed out after {timeout_secs} seconds"),
+                    true,
+                ),
+            };
         let status = if is_error {
             JobStatus::Failed(text)
         } else {
@@ -323,24 +331,25 @@ impl BashTool {
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidInput("Missing command".to_string()))?;
 
-        if input
-            .get("background")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            let id = spawn_background_job(command, &cwd);
-            return Ok(ToolOutput::text(format!(
-                "Started background job {id}: {command}"
-            )));
-        }
-
         let timeout_secs = input
             .get("timeout")
             .and_then(Value::as_u64)
             .unwrap_or(DEFAULT_TIMEOUT_SECS)
             .min(MAX_TIMEOUT_SECS);
+
+        if input
+            .get("background")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            let id = spawn_background_job(command, &cwd, timeout_secs);
+            return Ok(ToolOutput::text(format!(
+                "Started background job {id}: {command}"
+            )));
+        }
+
         let timeout = Duration::from_secs(timeout_secs);
-        match tokio::time::timeout(timeout, execute_foreground(command, &cwd, timeout_secs)).await {
+        match tokio::time::timeout(timeout, execute_foreground(command, &cwd)).await {
             Ok(result) => result,
             Err(_) => Ok(ToolOutput::error_text(format!(
                 "Command timed out after {timeout_secs} seconds"
@@ -404,11 +413,7 @@ fn dispatch_operation(operation: &str, input: &Value) -> Result<ToolOutput, Tool
 ///
 /// Returns [`ToolError::Execution`] if the process fails to spawn or
 /// `wait_with_output` fails.
-async fn execute_foreground(
-    command: &str,
-    cwd: &str,
-    _timeout_secs: u64,
-) -> Result<ToolOutput, ToolError> {
+async fn execute_foreground(command: &str, cwd: &str) -> Result<ToolOutput, ToolError> {
     let start = Instant::now();
     let mut cmd = Command::new("bash");
     cmd.arg("-c")
@@ -525,8 +530,6 @@ mod tests {
     /// Serializes tests that touch the global job table, preventing cross-test
     /// interference from the shared `JOB_TABLE` / `JOB_ID_COUNTER`.
     static JOB_TEST_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-    // ---- Concurrency check ----
 
     #[test]
     fn concurrency_check_allowlist_hits() {
@@ -667,8 +670,6 @@ mod tests {
         assert!(!is_read_only_command(&json!({ "command": "" })));
     }
 
-    // ---- Schema ----
-
     #[test]
     fn schema_has_v1_properties() {
         let schema = BashTool.schema();
@@ -698,16 +699,12 @@ mod tests {
         assert_eq!(required[0], "command");
     }
 
-    // ---- Constants ----
-
     #[test]
     fn constants_match_spec() {
         assert_eq!(DEFAULT_TIMEOUT_SECS, 120);
         assert_eq!(MAX_TIMEOUT_SECS, 600);
         assert_eq!(MAX_OUTPUT_BYTES, 1_000_000);
     }
-
-    // ---- Truncation ----
 
     #[test]
     fn truncate_string_cuts_at_boundary() {
@@ -725,8 +722,6 @@ mod tests {
         assert!(s.len() <= MAX_OUTPUT_BYTES + 20);
     }
 
-    // ---- Registry registration ----
-
     #[test]
     fn bashtool_registered_in_builtin_registry() {
         let reg = crate::registry::builtin_registry();
@@ -737,16 +732,12 @@ mod tests {
         assert!(!tool.is_safe_for_concurrent_execution(&json!({"command": "rm x"})));
     }
 
-    // ---- System prompt ----
-
     #[test]
     fn system_prompt_present() {
         let prompt = BashTool.system_prompt();
         assert!(prompt.is_some());
         assert!(prompt.unwrap().contains("Bash"));
     }
-
-    // ---- Foreground execution (integration) ----
 
     fn ctx_in(cwd: &str) -> ToolContext {
         let mut ctx = ToolContext::default();
@@ -851,8 +842,6 @@ mod tests {
         );
     }
 
-    // ---- Background jobs ----
-
     #[tokio::test]
     async fn background_returns_job_id() {
         let _guard = JOB_TEST_GUARD.lock().await;
@@ -933,7 +922,70 @@ mod tests {
         assert!(text.contains("Removed"), "cleanup text: {text}");
     }
 
-    // ---- Operation errors ----
+    #[tokio::test]
+    async fn background_job_timeout_marks_failed() {
+        let _guard = JOB_TEST_GUARD.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let tool = BashTool;
+        let ctx = ctx_in(cwd);
+
+        // Spawn a background job that sleeps longer than its timeout.
+        let spawn_input = json!({ "command": "sleep 30", "background": true, "timeout": 1 });
+        let out = tool.call(spawn_input, &ctx).await.unwrap();
+        let text = out.text_content();
+        let id: u64 = text
+            .split("job ")
+            .nth(1)
+            .and_then(|s| s.split(':').next())
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+
+        // Wait long enough for the timeout to fire and update the job table.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let status_input = json!({ "command": "", "operation": "job_status", "job_id": id });
+        let out = tool.call(status_input, &ctx).await.unwrap();
+        let text = out.text_content();
+        assert!(
+            text.contains("Failed"),
+            "timed-out job should be Failed: {text}"
+        );
+        assert!(
+            text.contains("timed out"),
+            "failure message should mention timeout: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_job_custom_timeout_completes() {
+        let _guard = JOB_TEST_GUARD.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let tool = BashTool;
+        let ctx = ctx_in(cwd);
+
+        // A quick command with a short custom timeout should complete fine.
+        let spawn_input = json!({ "command": "echo bgok", "background": true, "timeout": 5 });
+        let out = tool.call(spawn_input, &ctx).await.unwrap();
+        let text = out.text_content();
+        let id: u64 = text
+            .split("job ")
+            .nth(1)
+            .and_then(|s| s.split(':').next())
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let status_input = json!({ "command": "", "operation": "job_status", "job_id": id });
+        let out = tool.call(status_input, &ctx).await.unwrap();
+        let text = out.text_content();
+        assert!(
+            text.contains("bgok") || text.contains("Completed"),
+            "job should complete: {text}"
+        );
+    }
 
     #[tokio::test]
     async fn unknown_operation_errors() {
