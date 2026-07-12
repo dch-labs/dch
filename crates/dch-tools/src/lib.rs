@@ -6,6 +6,7 @@
 
 #![warn(missing_docs)]
 
+pub mod bash;
 pub mod context;
 pub mod question;
 pub mod read;
@@ -14,6 +15,7 @@ pub mod runtime;
 pub mod state;
 pub mod util;
 
+pub use bash::BashTool;
 pub use context::RunnerContext;
 pub use context::runner_ctx;
 pub use question::Question;
