@@ -58,7 +58,24 @@ const READ_ONLY_PREFIXES: &[&str] = &[
 ];
 
 /// Shell operators that indicate a compound command (always unsafe).
-const SHELL_OPERATORS: &[&str] = &["&&", "||", ";", "|", "`", "$("];
+const SHELL_OPERATORS: &[&str] = &["&&", "||", ";", "|", "`", "$(", ">", ">>", "<"];
+
+/// Substrings that make an otherwise-allowlisted command unsafe.
+///
+/// Covers shell redirections, destructive `find` flags, and mutating git
+/// subcommands that a prefix match alone would misclassify.
+const UNSAFE_SUBSTRINGS: &[&str] = &[
+    " -delete",
+    " -exec",
+    "git branch -D",
+    "git branch -d",
+    "git branch --delete",
+    "git remote add",
+    "git remote remove",
+    "git remote rm",
+    "git remote set-url",
+    "git remote rename",
+];
 
 // ---------------------------------------------------------------------------
 // Background job table
@@ -455,9 +472,10 @@ fn truncate_string(s: &mut String, max_bytes: usize) {
 
 /// Check whether a command is read-only (safe to run concurrently).
 ///
-/// Compound commands (containing shell operators) are always unsafe. Otherwise
-/// the command is checked against the read-only prefix allowlist with
-/// boundary-aware matching so `cargo check` matches but `cargo checkout` does not.
+/// Compound commands (containing shell operators), shell redirections, and
+/// destructive subcommands are always unsafe. Otherwise the command is checked
+/// against the read-only prefix allowlist with boundary-aware matching so
+/// `cargo check` matches but `cargo checkout` does not.
 fn is_read_only_command(input: &Value) -> bool {
     let Some(command) = input.get("command").and_then(Value::as_str) else {
         return false;
@@ -466,8 +484,12 @@ fn is_read_only_command(input: &Value) -> bool {
     if normalized.is_empty() {
         return false;
     }
-    // Compound commands can hide a write.
+    // Compound commands and redirections can hide a write.
     if SHELL_OPERATORS.iter().any(|op| normalized.contains(op)) {
+        return false;
+    }
+    // Destructive subcommands that a prefix match alone would miss.
+    if UNSAFE_SUBSTRINGS.iter().any(|sub| normalized.contains(sub)) {
         return false;
     }
     // Boundary-aware prefix match: the command must start with a prefix
@@ -580,6 +602,63 @@ mod tests {
                 "'{cmd}' should NOT be read-only (compound)"
             );
         }
+    }
+
+    #[test]
+    fn concurrency_check_redirections_unsafe() {
+        for cmd in [
+            "echo hi > file",
+            "echo hi >> file",
+            "cat f < input",
+            "git log > out.txt",
+        ] {
+            assert!(
+                !is_read_only_command(&json!({ "command": cmd })),
+                "'{cmd}' should NOT be read-only (redirection)"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrency_check_find_mutating_unsafe() {
+        for cmd in [
+            "find . -delete",
+            "find / -exec rm {} \\;",
+            "find . -name '*.tmp' -delete",
+        ] {
+            assert!(
+                !is_read_only_command(&json!({ "command": cmd })),
+                "'{cmd}' should NOT be read-only (mutating find)"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrency_check_git_mutating_subcommands_unsafe() {
+        for cmd in [
+            "git branch -D feature",
+            "git branch -d old",
+            "git branch --delete stale",
+            "git remote add origin url",
+            "git remote remove upstream",
+            "git remote set-url origin url",
+        ] {
+            assert!(
+                !is_read_only_command(&json!({ "command": cmd })),
+                "'{cmd}' should NOT be read-only (mutating git)"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrency_check_safe_git_still_allowed() {
+        // Read-only git subcommands remain safe after the denylist.
+        assert!(is_read_only_command(&json!({ "command": "git branch" })));
+        assert!(is_read_only_command(
+            &json!({ "command": "git branch --list" })
+        ));
+        assert!(is_read_only_command(&json!({ "command": "git remote" })));
+        assert!(is_read_only_command(&json!({ "command": "git remote -v" })));
     }
 
     #[test]
