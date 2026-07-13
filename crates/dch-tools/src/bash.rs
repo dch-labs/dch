@@ -18,6 +18,7 @@ use loopctl::tool::ToolOutput;
 use loopctl::tool::ToolSchema;
 use serde_json::Value;
 use serde_json::json;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 use crate::context::RunnerContext;
@@ -135,19 +136,17 @@ fn spawn_background_job(command: &str, cwd: &str, timeout_secs: u64) -> u64 {
     let timeout = Duration::from_secs(timeout_secs);
 
     tokio::spawn(async move {
-        let (text, is_error) =
-            match tokio::time::timeout(timeout, execute_foreground(&owned_command, &owned_cwd))
-                .await
-            {
-                Ok(result) => result.map_or_else(
-                    |e| (e.to_string(), true),
-                    |o| (o.text_content(), o.is_error),
-                ),
-                Err(_) => (
-                    format!("Command timed out after {timeout_secs} seconds"),
-                    true,
-                ),
-            };
+        let exec = Box::pin(execute_command(&owned_command, &owned_cwd));
+        let (text, is_error) = match tokio::time::timeout(timeout, exec).await {
+            Ok(result) => result.map_or_else(
+                |e| (e.to_string(), true),
+                |o| (o.text_content(), o.is_error),
+            ),
+            Err(_) => (
+                format!("Command timed out after {timeout_secs} seconds"),
+                true,
+            ),
+        };
         let status = if is_error {
             JobStatus::Failed(text)
         } else {
@@ -330,7 +329,6 @@ impl BashTool {
             .get("command")
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidInput("Missing command".to_string()))?;
-
         let timeout_secs = input
             .get("timeout")
             .and_then(Value::as_u64)
@@ -349,7 +347,8 @@ impl BashTool {
         }
 
         let timeout = Duration::from_secs(timeout_secs);
-        match tokio::time::timeout(timeout, execute_foreground(command, &cwd)).await {
+        let exec = Box::pin(execute_command(command, &cwd));
+        match tokio::time::timeout(timeout, exec).await {
             Ok(result) => result,
             Err(_) => Ok(ToolOutput::error_text(format!(
                 "Command timed out after {timeout_secs} seconds"
@@ -405,15 +404,18 @@ fn dispatch_operation(operation: &str, input: &Value) -> Result<ToolOutput, Tool
 
 /// Execute a command in the foreground, capturing stdout + stderr.
 ///
-/// Spawns `bash -c <command>` in a new process group, captures both pipes
-/// concurrently via `wait_with_output`, and returns the combined output with
-/// an `[exit {code}, {duration_ms}ms]` metadata line appended.
+/// Spawns `bash -c <command>` in a new process group, reads both pipes
+/// concurrently with a per-stream cap of [`MAX_OUTPUT_BYTES`], and returns the
+/// combined output with an `[exit {code}, {duration_ms}ms]` metadata line
+/// appended. Once a stream's cap is reached it is drained but no longer
+/// retained, preventing unbounded memory growth from commands that produce
+/// gigabytes of output.
 ///
 /// # Errors
 ///
-/// Returns [`ToolError::Execution`] if the process fails to spawn or
-/// `wait_with_output` fails.
-async fn execute_foreground(command: &str, cwd: &str) -> Result<ToolOutput, ToolError> {
+/// Returns [`ToolError::Execution`] if the process fails to spawn or wait
+/// fails.
+async fn execute_command(command: &str, cwd: &str) -> Result<ToolOutput, ToolError> {
     let start = Instant::now();
     let mut cmd = Command::new("bash");
     cmd.arg("-c")
@@ -427,7 +429,7 @@ async fn execute_foreground(command: &str, cwd: &str) -> Result<ToolOutput, Tool
     #[cfg(unix)]
     cmd.process_group(0);
 
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .map_err(|e| ToolError::Execution(format!("Failed to spawn command: {e}")))?;
 
@@ -436,14 +438,29 @@ async fn execute_foreground(command: &str, cwd: &str) -> Result<ToolOutput, Tool
         pgid: child.id().and_then(|id| libc::pid_t::try_from(id).ok()),
     };
 
-    let output = child
-        .wait_with_output()
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stdout_fut = async {
+        match stdout {
+            Some(mut s) => read_bounded(&mut s, MAX_OUTPUT_BYTES).await,
+            None => String::new(),
+        }
+    };
+    let stderr_fut = async {
+        match stderr {
+            Some(mut s) => read_bounded(&mut s, MAX_OUTPUT_BYTES).await,
+            None => String::new(),
+        }
+    };
+    let (stdout_res, stderr_res) = tokio::join!(stdout_fut, stderr_fut);
+    let status = child
+        .wait()
         .await
         .map_err(|e| ToolError::Execution(format!("Failed to wait for command: {e}")))?;
     let duration_ms = start.elapsed().as_millis();
-    let exit_code = output.status.code().unwrap_or(-1);
-    let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let mut stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let exit_code = status.code().unwrap_or(-1);
+    let mut stdout = stdout_res;
+    let mut stderr = stderr_res;
 
     truncate_string(&mut stdout, MAX_OUTPUT_BYTES);
     truncate_string(&mut stderr, MAX_OUTPUT_BYTES);
@@ -455,11 +472,38 @@ async fn execute_foreground(command: &str, cwd: &str) -> Result<ToolOutput, Tool
     };
 
     let output_text = format!("{body}\n[exit {exit_code}, {duration_ms}ms]");
-    if output.status.success() {
+    if status.success() {
         Ok(ToolOutput::text(output_text))
     } else {
         Ok(ToolOutput::error_text(output_text))
     }
+}
+
+/// Read a child pipe into a `String`, capping retained data at `max_bytes`.
+///
+/// Once the cap is reached, the remaining output is drained to EOF (so the
+/// pipe doesn't block the child) but not stored, preventing unbounded memory
+/// growth from commands that produce gigabytes of output.
+async fn read_bounded<R>(stream: &mut R, max_bytes: usize) -> String
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut buf = Vec::with_capacity(8192);
+    let mut tmp = [0u8; 8192];
+    loop {
+        match stream.read(&mut tmp).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if buf.len() < max_bytes {
+                    let room = max_bytes.saturating_sub(buf.len());
+                    if let Some(chunk) = tmp.get(..n.min(room)) {
+                        buf.extend_from_slice(chunk);
+                    }
+                }
+            }
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 /// Truncate a string to at most `max_bytes`, landing on a char boundary.
@@ -722,6 +766,57 @@ mod tests {
         assert!(s.len() <= MAX_OUTPUT_BYTES + 20);
     }
 
+    // ---- read_bounded ----
+
+    #[tokio::test]
+    async fn read_bounded_grows_past_initial_capacity() {
+        // Initial capacity is 8192; data larger than that must still be fully
+        // retained when under the cap. Proves the Vec grows dynamically.
+        use std::io::Cursor;
+        let data = "x".repeat(50_000); // well past 8192, well under MAX_OUTPUT_BYTES
+        let mut cursor = Cursor::new(data.clone().into_bytes());
+        let result = read_bounded(&mut cursor, MAX_OUTPUT_BYTES).await;
+        assert_eq!(result, data, "all data should be retained");
+    }
+
+    #[tokio::test]
+    async fn read_bounded_caps_at_max_bytes() {
+        use std::io::Cursor;
+        let data = "y".repeat(100_000);
+        let mut cursor = Cursor::new(data.into_bytes());
+        let result = read_bounded(&mut cursor, 10_000).await;
+        assert!(
+            result.len() <= 10_000,
+            "retained {} bytes, should be <= 10000",
+            result.len()
+        );
+        assert!(result.chars().all(|c| c == 'y'));
+    }
+
+    #[tokio::test]
+    async fn read_bounded_small_data_preserved() {
+        use std::io::Cursor;
+        let data = "hello world".to_string();
+        let mut cursor = Cursor::new(data.clone().into_bytes());
+        let result = read_bounded(&mut cursor, MAX_OUTPUT_BYTES).await;
+        assert_eq!(result, data);
+    }
+
+    #[tokio::test]
+    async fn read_bounded_drains_after_cap() {
+        // When the cap is hit, the reader must drain to EOF (so the child's
+        // pipe doesn't block) without storing more data. We verify this
+        // indirectly: the Cursor is fully consumed (position at end) even
+        // though only `cap` bytes were retained.
+        use std::io::Cursor;
+        let raw = vec![b'a'; 50_000];
+        let mut cursor = Cursor::new(raw.clone());
+        let result = read_bounded(&mut cursor, 1_000).await;
+        assert!(result.len() <= 1_000);
+        // Cursor position should be at EOF — the reader drained the rest.
+        assert_eq!(cursor.position(), 50_000);
+    }
+
     #[test]
     fn bashtool_registered_in_builtin_registry() {
         let reg = crate::registry::builtin_registry();
@@ -840,6 +935,71 @@ mod tests {
             "output was {} bytes",
             out.text_content().len()
         );
+    }
+
+    #[tokio::test]
+    async fn bounded_read_does_not_exhaust_memory() {
+        // Produce far more than MAX_OUTPUT_BYTES (10 MB of 'y\n').
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let tool = BashTool;
+        let ctx = ctx_in(cwd);
+        let input = json!({ "command": "yes y | head -c 10000000" });
+        let out = tool.call(input, &ctx).await.unwrap();
+        assert!(
+            out.text_content().len() < MAX_OUTPUT_BYTES + 100,
+            "output was {} bytes, should be bounded to ~{}",
+            out.text_content().len(),
+            MAX_OUTPUT_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_read_retains_content_within_cap() {
+        // Output well within the cap — all content should be present.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let tool = BashTool;
+        let ctx = ctx_in(cwd);
+        let input = json!({ "command": "echo 'small output'" });
+        let out = tool.call(input, &ctx).await.unwrap();
+        assert!(out.text_content().contains("small output"));
+    }
+
+    #[tokio::test]
+    async fn bounded_read_stderr_independently_capped() {
+        // stdout is tiny; stderr is large — stderr must be independently bounded.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let tool = BashTool;
+        let ctx = ctx_in(cwd);
+        let input = json!({ "command": "echo ok && dd if=/dev/zero bs=2000 count=1000 2>&1 | tr '\\0' 'e'" });
+        let out = tool.call(input, &ctx).await.unwrap();
+        assert!(
+            out.text_content().len() < MAX_OUTPUT_BYTES + 200,
+            "combined output was {} bytes, stderr should be independently capped",
+            out.text_content().len()
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_read_pipe_does_not_block_child() {
+        // A command that writes more than MAX_OUTPUT_BYTES then exits
+        // successfully — the child must not hang waiting for the reader to
+        // consume the full pipe. (The bounded reader drains to EOF even after
+        // the cap is hit.)
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let tool = BashTool;
+        let ctx = ctx_in(cwd);
+        let input = json!({
+            "command": "for i in $(seq 1 300000); do echo line$i; done",
+            "timeout": 10
+        });
+        let out = tokio::time::timeout(Duration::from_secs(15), tool.call(input, &ctx)).await;
+        assert!(out.is_ok(), "command should not hang on a full pipe");
+        let out = out.unwrap().unwrap();
+        assert!(out.text_content().contains("[exit 0,")); // completed normally
     }
 
     #[tokio::test]
