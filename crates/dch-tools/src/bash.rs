@@ -28,7 +28,7 @@ use crate::context::runner_ctx;
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 /// Hard ceiling on a command timeout.
 const MAX_TIMEOUT_SECS: u64 = 600;
-/// Truncate captured stdout + stderr beyond this many bytes.
+/// Per-stream cap on captured stdout or stderr, in bytes.
 const MAX_OUTPUT_BYTES: usize = 1_000_000;
 
 /// Commands that are safe to run concurrently (read-only).
