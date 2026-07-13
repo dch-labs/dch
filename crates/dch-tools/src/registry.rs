@@ -2,6 +2,7 @@
 
 use loopctl::tool::ToolRegistry;
 
+use crate::bash::BashTool;
 use crate::read::ReadTool;
 
 /// Build a [`ToolRegistry`] populated with every builtin tool.
@@ -12,5 +13,6 @@ use crate::read::ReadTool;
 pub fn builtin_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.register(ReadTool);
+    registry.register(BashTool);
     registry
 }
