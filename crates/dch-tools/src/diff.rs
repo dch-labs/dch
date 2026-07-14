@@ -21,7 +21,7 @@ const MAX_LCS_PRODUCT: usize = 1_000_000;
 /// LCS diff is skipped and a truncated before/after preview is produced
 /// instead. This constant bounds how many lines of old content (prefixed
 /// `- `) and new content (prefixed `+ `) appear in that preview. Lines beyond
-/// the limit are summarized as `... +N more lines`.
+/// the limit are summarized as `... N more lines`.
 const LARGE_DIFF_PREVIEW_LINES: usize = 1000;
 
 /// One line in an LCS diff, produced by [`compute_lcs_diff`].
@@ -102,7 +102,7 @@ pub fn format_file_change(file_path: &str, old_content: Option<&str>, new_conten
 ///
 /// Shows a truncated before/after preview instead of computing the full diff:
 /// up to [`LARGE_DIFF_PREVIEW_LINES`] lines of old content (prefixed `- `) and
-/// the same number of new content (prefixed `+ `), with `... +N more lines`
+/// the same number of new content (prefixed `+ `), with `... N more lines`
 /// summaries for each side.
 fn format_large_diff(file_path: &str, old_lines: &[&str], new_lines: &[&str]) -> String {
     let mut result = format!("Changed: {file_path} (modified, large file)\n");
