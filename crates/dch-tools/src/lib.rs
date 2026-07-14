@@ -8,16 +8,22 @@
 
 pub mod bash;
 pub mod context;
+pub mod diff;
+pub mod linter;
 pub mod question;
 pub mod read;
 pub mod registry;
 pub mod runtime;
 pub mod state;
 pub mod util;
+pub mod write;
 
 pub use bash::BashTool;
 pub use context::RunnerContext;
 pub use context::runner_ctx;
+pub use linter::LinterError;
+pub use linter::LinterResult;
+pub use linter::lint_content;
 pub use question::Question;
 pub use question::QuestionOption;
 pub use question::QuestionRequest;
@@ -33,3 +39,4 @@ pub use state::SessionState;
 pub use state::TodoEntry;
 pub use state::TodoStatus;
 pub use state::ToolStats;
+pub use write::WriteTool;
