@@ -260,7 +260,7 @@ fn lint_js(content: &str) -> LinterResult {
             '[' => bracket = bracket.saturating_add(1),
             ']' => {
                 if bracket == 0 {
-                    return LinterResult::fail(LinterError::msg("unmatched closing bracket `]"));
+                    return LinterResult::fail(LinterError::msg("unmatched closing bracket `]`"));
                 }
                 bracket = bracket.saturating_sub(1);
             }

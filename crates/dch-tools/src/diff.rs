@@ -2,6 +2,28 @@
 
 use std::fmt::Write;
 
+/// Maximum product of old × new line counts for the LCS algorithm.
+///
+/// The LCS dynamic-programming table is O(m × n) in both time and memory.
+/// Beyond this threshold, the table becomes too expensive to compute and a
+/// bounded before/after preview is produced instead via
+/// [`format_large_diff`].
+///
+/// At 1,000,000 the DP table is ~8 MB of `usize` cells and completes in
+/// milliseconds. Files up to roughly 1,000 × 1,000 lines receive the full
+/// line-by-line diff; larger files get the truncated preview governed by
+/// [`LARGE_DIFF_PREVIEW_LINES`].
+const MAX_LCS_PRODUCT: usize = 1_000_000;
+
+/// Maximum lines to show per side in the large-file fallback preview.
+///
+/// When the old × new line-count product exceeds [`MAX_LCS_PRODUCT`], the full
+/// LCS diff is skipped and a truncated before/after preview is produced
+/// instead. This constant bounds how many lines of old content (prefixed
+/// `- `) and new content (prefixed `+ `) appear in that preview. Lines beyond
+/// the limit are summarized as `... +N more lines`.
+const LARGE_DIFF_PREVIEW_LINES: usize = 1000;
+
 /// One line in an LCS diff, produced by [`compute_lcs_diff`].
 ///
 /// Each variant carries the line's text content. The diff algorithm walks
@@ -51,6 +73,11 @@ pub fn format_file_change(file_path: &str, old_content: Option<&str>, new_conten
     if let Some(old) = old_content {
         let old_lines: Vec<&str> = old.lines().collect();
         let new_lines: Vec<&str> = new_content.lines().collect();
+
+        if old_lines.len().saturating_mul(new_lines.len()) > MAX_LCS_PRODUCT {
+            return format_large_diff(file_path, &old_lines, &new_lines);
+        }
+
         let diff = compute_lcs_diff(&old_lines, &new_lines);
         let mut result = format!("Changed: {file_path} (modified)\n");
         result.push_str(&format_diff_with_context(&diff, 3));
@@ -68,6 +95,43 @@ pub fn format_file_change(file_path: &str, old_content: Option<&str>, new_conten
         }
         result
     }
+}
+
+/// Format a diff for files too large for the LCS algorithm (product exceeds
+/// [`MAX_LCS_PRODUCT`]).
+///
+/// Shows a truncated before/after preview instead of computing the full diff:
+/// up to [`LARGE_DIFF_PREVIEW_LINES`] lines of old content (prefixed `- `) and
+/// the same number of new content (prefixed `+ `), with `... +N more lines`
+/// summaries for each side.
+fn format_large_diff(file_path: &str, old_lines: &[&str], new_lines: &[&str]) -> String {
+    let mut result = format!("Changed: {file_path} (modified, large file)\n");
+    let old_preview = old_lines.len().min(LARGE_DIFF_PREVIEW_LINES);
+
+    result.push_str("Before:\n");
+
+    for line in old_lines.iter().take(old_preview) {
+        writeln!(result, "- {line}").ok();
+    }
+
+    if old_lines.len() > old_preview {
+        let more = old_lines.len().saturating_sub(old_preview);
+        writeln!(result, "... {more} more lines").ok();
+    }
+
+    let new_preview = new_lines.len().min(LARGE_DIFF_PREVIEW_LINES);
+    result.push_str("After:\n");
+
+    for line in new_lines.iter().take(new_preview) {
+        writeln!(result, "+ {line}").ok();
+    }
+
+    if new_lines.len() > new_preview {
+        let more = new_lines.len().saturating_sub(new_preview);
+        writeln!(result, "... {more} more lines").ok();
+    }
+
+    result
 }
 
 /// Read a cell from the flat DP table at row `i`, column `j`.
@@ -441,5 +505,37 @@ mod tests {
         let diff: Vec<LineDiff> = vec![];
         let result = format_diff_with_context(&diff, 3);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn large_diff_uses_bounded_preview() {
+        // Product = 1500 × 1500 = 2,250,000 > MAX_LCS_PRODUCT (1,000,000).
+        let old: String = (1..=1500).map(|i| format!("old line {i}\n")).collect();
+        let new: String = (1..=1500).map(|i| format!("new line {i}\n")).collect();
+        let result = format_file_change("big.rs", Some(&old), &new);
+
+        assert!(result.contains("large file"), "{}", result);
+        assert!(result.contains("Before:"));
+        assert!(result.contains("After:"));
+        // LARGE_DIFF_PREVIEW_LINES (1000) shown, rest summarized.
+        assert!(result.contains("... 500 more lines"));
+        // Lines beyond the preview are not shown.
+        assert!(!result.contains("- old line 1001"));
+        assert!(!result.contains("+ new line 1001"));
+    }
+
+    #[test]
+    fn small_diff_still_uses_lcs() {
+        // Product = 100 × 100 = 10,000 < MAX_LCS_PRODUCT.
+        let old: String = (1..=100).map(|i| format!("line {i}\n")).collect();
+        let new: String = (1..=99)
+            .map(|i| format!("line {i}\n"))
+            .chain(std::iter::once("CHANGED\n".to_string()))
+            .collect();
+        let result = format_file_change("small.rs", Some(&old), &new);
+        assert!(result.contains("Changed: small.rs (modified)"));
+        assert!(!result.contains("large file"));
+        assert!(result.contains("- line 100"));
+        assert!(result.contains("+ CHANGED"));
     }
 }

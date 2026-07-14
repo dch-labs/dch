@@ -165,6 +165,13 @@ fn atomic_write(target: &Path, content: &str) -> Result<(), ToolError> {
     let mut tmp = tempfile::NamedTempFile::new_in(dir)
         .map_err(|e| ToolError::Execution(format!("Failed to create temp file: {e}")))?;
 
+    if let Ok(meta) = std::fs::metadata(target) {
+        let perms = meta.permissions();
+        tmp.as_file()
+            .set_permissions(perms)
+            .map_err(|e| ToolError::Execution(format!("Failed to set permissions: {e}")))?;
+    }
+
     tmp.write_all(content.as_bytes())
         .map_err(|e| ToolError::Execution(format!("Failed to write temp file: {e}")))?;
     tmp.flush()
@@ -286,6 +293,36 @@ mod tests {
         let written = std::fs::read_to_string(&target).unwrap();
         assert_eq!(written, "fn main() {}\n");
         assert!(out.text_content().contains("Changed: existing.rs"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_preserves_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("script.sh");
+        std::fs::write(&target, "#!/bin/bash\necho old\n").unwrap();
+        // Set executable permissions (0o755).
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let cwd = tmp.path().to_str().unwrap();
+        let tool = WriteTool;
+        let ctx = ctx_in(cwd);
+        let input = json!({
+            "file_path": "script.sh",
+            "content": "#!/bin/bash\necho new\n"
+        });
+        tool.call(input, &ctx).await.unwrap();
+
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+        // Sticky/setuid bits may vary; check the permission octal we set.
+        assert_eq!(
+            mode & 0o777,
+            0o755,
+            "permissions should be preserved as 0o755, got 0o{:o}",
+            mode & 0o777
+        );
     }
 
     #[tokio::test]
