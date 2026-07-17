@@ -80,6 +80,12 @@ pub fn format_file_change(file_path: &str, old_content: Option<&str>, new_conten
 
         let diff = compute_lcs_diff(&old_lines, &new_lines);
         let mut result = format!("Changed: {file_path} (modified)\n");
+        if let Some(summary) = change_summary(&diff) {
+            result.push_str(&summary);
+        }
+        if let Some(note) = eof_change_note(old, new_content) {
+            result.push_str(&note);
+        }
         result.push_str(&format_diff_with_context(&diff, 3));
         result
     } else {
@@ -95,6 +101,61 @@ pub fn format_file_change(file_path: &str, old_content: Option<&str>, new_conten
         }
         result
     }
+}
+
+/// Build a one-line `N lines removed, M added` summary for a line diff.
+///
+/// Returns `None` when the diff has no removed and no inserted lines (a no-op
+/// edit), so an unchanged file renders header-only with no spurious summary.
+/// Counts are pluralized: `1 line` vs `2 lines`.
+fn change_summary(diff: &[LineDiff]) -> Option<String> {
+    let removed = diff
+        .iter()
+        .filter(|d| matches!(d, LineDiff::Deleted(_)))
+        .count();
+    let added = diff
+        .iter()
+        .filter(|d| matches!(d, LineDiff::Inserted(_)))
+        .count();
+    if removed == 0 && added == 0 {
+        return None;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if removed > 0 {
+        parts.push(format!("{removed} line{} removed", plural(removed)));
+    }
+    if added > 0 {
+        parts.push(format!("{added} line{} added", plural(added)));
+    }
+    Some(format!("│ {}\n", parts.join(", ")))
+}
+
+/// Empty string for a count of one, `"s"` otherwise — for pluralization.
+fn plural(count: usize) -> &'static str {
+    if count == 1 { "" } else { "s" }
+}
+
+/// Describe a trailing-newline-at-EOF change, when that is the *only* change.
+///
+/// `str::lines()` drops a file's final `\n`, so two contents that differ only
+/// in their trailing newline (e.g. `"a\n"` → `"a"`) produce identical line
+/// vectors and an empty LCS diff. Without this note such a write would render
+/// as a bare header with no indication anything changed.
+///
+/// Returns `None` when the line content actually differs (the LCS already
+/// covers it) or when the trailing-newline state is unchanged.
+fn eof_change_note(old: &str, new: &str) -> Option<String> {
+    if old.lines().ne(new.lines()) {
+        return None;
+    }
+    let had = old.ends_with('\n');
+    let has = new.ends_with('\n');
+    let note = match (had, has) {
+        (true, false) => "No newline at end of file",
+        (false, true) => "Newline added at end of file",
+        _ => return None,
+    };
+    Some(format!("│ {note}\n"))
 }
 
 /// Format a diff for files too large for the LCS algorithm (product exceeds
@@ -420,8 +481,6 @@ mod tests {
         assert!(result.contains("- OLD"));
     }
 
-    // ---- format_diff_with_context (tested directly) ----
-
     #[test]
     fn context_shows_lines_around_change() {
         let diff = vec![
@@ -537,5 +596,80 @@ mod tests {
         assert!(!result.contains("large file"));
         assert!(result.contains("- line 100"));
         assert!(result.contains("+ CHANGED"));
+    }
+
+    #[test]
+    fn summary_line_present_for_mixed_edit() {
+        let old = "a\nb\nc\n";
+        let new = "a\nX\nY\nc\n";
+        let result = format_file_change("f.rs", Some(old), new);
+        // 1 removed (b), 2 added (X, Y).
+        assert!(result.contains("1 line removed"), "{result}");
+        assert!(result.contains("2 lines added"), "{result}");
+        assert!(result.contains("- b"));
+        assert!(result.contains("+ X"));
+    }
+
+    #[test]
+    fn summary_line_absent_for_noop_edit() {
+        let content = "a\nb\nc\n";
+        let result = format_file_change("f.rs", Some(content), content);
+        // No summary line and no +/- lines for a no-op edit.
+        assert!(result.starts_with("Changed: f.rs (modified)\n"));
+        assert!(!result.contains("line removed"));
+        assert!(!result.contains("line added"));
+        assert!(!result.contains("\n+ "));
+        assert!(!result.contains("\n- "));
+    }
+
+    #[test]
+    fn summary_line_pure_deletion() {
+        let old = "a\nb\nc\n";
+        let new = "a\nc\n";
+        let result = format_file_change("f.rs", Some(old), new);
+        assert!(result.contains("1 line removed"), "{result}");
+        assert!(!result.contains("added"));
+    }
+
+    #[test]
+    fn summary_line_empty_old_content_render_without_panic() {
+        let result = format_file_change("f.rs", Some(""), "x\n");
+        assert!(result.contains("Changed: f.rs (modified)"));
+        assert!(result.contains("1 line added"));
+        assert!(result.contains("+ x"));
+    }
+
+    #[test]
+    fn trailing_newline_removed_is_visible() {
+        // "a\n" -> "a": line vectors are identical, so the LCS shows nothing.
+        // The EOF note must surface the change.
+        let result = format_file_change("f.txt", Some("a\n"), "a");
+        assert!(result.contains("Changed: f.txt (modified)"));
+        assert!(result.contains("No newline at end of file"), "{result}");
+        // No spurious line +/- from the LCS.
+        assert!(!result.contains("\n+ "));
+        assert!(!result.contains("\n- "));
+    }
+
+    #[test]
+    fn trailing_newline_added_is_visible() {
+        let result = format_file_change("f.txt", Some("a"), "a\n");
+        assert!(result.contains("Newline added at end of file"), "{result}");
+    }
+
+    #[test]
+    fn unchanged_trailing_newline_emits_no_eof_note() {
+        // "a\n" -> "a\n": genuinely identical, including the newline.
+        let result = format_file_change("f.txt", Some("a\n"), "a\n");
+        assert!(!result.contains("end of file"), "{result}");
+    }
+
+    #[test]
+    fn real_line_change_does_not_trigger_eof_note() {
+        // When lines actually differ, the LCS covers it; no EOF note.
+        let result = format_file_change("f.txt", Some("a\n"), "b\n");
+        assert!(result.contains("- a"));
+        assert!(result.contains("+ b"));
+        assert!(!result.contains("end of file"), "{result}");
     }
 }

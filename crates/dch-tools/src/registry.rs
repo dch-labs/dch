@@ -3,6 +3,7 @@
 use loopctl::tool::ToolRegistry;
 
 use crate::bash::BashTool;
+use crate::edit::EditTool;
 use crate::read::ReadTool;
 use crate::write::WriteTool;
 
@@ -16,5 +17,6 @@ pub fn builtin_registry() -> ToolRegistry {
     registry.register(ReadTool);
     registry.register(BashTool);
     registry.register(WriteTool);
+    registry.register(EditTool);
     registry
 }
