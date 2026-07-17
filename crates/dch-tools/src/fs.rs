@@ -12,15 +12,26 @@ use loopctl::tool::ToolError;
 /// temp file is co-located with the target so the rename is a single
 /// filesystem operation with no torn-write window.
 ///
+/// A `target` that is itself a symbolic link is rejected: the rename would
+/// replace the link with a regular file, silently severing it. Callers should
+/// resolve the link and pass the real path.
+///
 /// # Errors
 ///
+/// Returns [`ToolError::InvalidInput`] when `target` is a symbolic link.
 /// Returns [`ToolError::Execution`] on any failure creating, writing, or
 /// persisting the temp file.
 pub(crate) fn atomic_write(target: &Path, content: &str) -> Result<(), ToolError> {
+    if std::fs::symlink_metadata(target).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(ToolError::InvalidInput(format!(
+            "Refusing to write: {} is a symbolic link. Resolve it and pass the real path.",
+            target.display()
+        )));
+    }
+
     let dir = target.parent().unwrap_or_else(|| Path::new("."));
     let mut tmp = tempfile::NamedTempFile::new_in(dir)
         .map_err(|e| ToolError::Execution(format!("Failed to create temp file: {e}")))?;
-
     if let Ok(meta) = std::fs::metadata(target) {
         let perms = meta.permissions();
         tmp.as_file()
@@ -86,5 +97,33 @@ mod tests {
             "permissions should be preserved as 0o755, got 0o{:o}",
             mode & 0o777
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_rejects_symlink_target_without_clobbering() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let real = tmp.path().join("real.txt");
+        std::fs::write(&real, "original\n").unwrap();
+        let link = tmp.path().join("link.txt");
+        symlink(&real, &link).unwrap();
+
+        let err = atomic_write(&link, "new content\n").unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidInput(ref s) if s.contains("symbolic link")),
+            "{err:?}"
+        );
+
+        // The symlink must remain a symlink (not replaced by a regular file)
+        // and the linked-to file must be untouched.
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "link should still be a symlink"
+        );
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "original\n");
     }
 }
