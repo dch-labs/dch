@@ -1,7 +1,6 @@
 //! The Write tool — writes content to a file with syntax validation.
 
 use std::future::Future;
-use std::io::Write;
 use std::path::Path;
 use std::pin::Pin;
 
@@ -136,7 +135,7 @@ impl WriteTool {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        atomic_write(&full_path, content)?;
+        crate::fs::atomic_write(&full_path, content)?;
 
         if let Some(rc) = &rc
             && let Ok(mut state) = rc.session_state.lock()
@@ -154,36 +153,8 @@ impl WriteTool {
     }
 }
 
-/// Write `content` to `target` atomically using a temp file in the same
-/// directory, then rename.
-///
-/// # Errors
-///
-/// Returns [`ToolError::Execution`] on any failure.
-fn atomic_write(target: &Path, content: &str) -> Result<(), ToolError> {
-    let dir = target.parent().unwrap_or_else(|| Path::new("."));
-    let mut tmp = tempfile::NamedTempFile::new_in(dir)
-        .map_err(|e| ToolError::Execution(format!("Failed to create temp file: {e}")))?;
-
-    if let Ok(meta) = std::fs::metadata(target) {
-        let perms = meta.permissions();
-        tmp.as_file()
-            .set_permissions(perms)
-            .map_err(|e| ToolError::Execution(format!("Failed to set permissions: {e}")))?;
-    }
-
-    tmp.write_all(content.as_bytes())
-        .map_err(|e| ToolError::Execution(format!("Failed to write temp file: {e}")))?;
-    tmp.flush()
-        .map_err(|e| ToolError::Execution(format!("Failed to flush temp file: {e}")))?;
-    tmp.persist(target)
-        .map_err(|e| ToolError::Execution(format!("Failed to persist file: {e}")))?;
-
-    Ok(())
-}
-
 /// Format a [`LinterResult`] failure as a human-readable message for the tool
-/// output.
+/// output, shared by Write and Edit.
 ///
 /// The message is structured so the model can read the error list and correct
 /// its output:
@@ -191,14 +162,14 @@ fn atomic_write(target: &Path, content: &str) -> Result<(), ToolError> {
 /// ```text
 /// Syntax validation failed for src/main.rs:
 ///   line 12: expected expression, found `;`
-/// Write blocked to prevent file corruption.
+/// Blocked to prevent file corruption.
 /// To bypass this check, use skip_linter: true (not recommended).
 /// ```
 ///
 /// Each error is indented on its own line, prefixed with `line N:` when the
 /// line number is known. The trailing two lines explain why the write did not
 /// happen and how to bypass the check if the user explicitly accepts the risk.
-fn format_lint_failure(path: &Path, result: &LinterResult) -> String {
+pub(crate) fn format_lint_failure(path: &Path, result: &LinterResult) -> String {
     use std::fmt::Write;
     let mut msg = format!("Syntax validation failed for {}:\n", path.display());
     for err in &result.errors {
@@ -207,7 +178,7 @@ fn format_lint_failure(path: &Path, result: &LinterResult) -> String {
             None => writeln!(msg, "  {}", err.message).ok(),
         };
     }
-    msg.push_str("Write blocked to prevent file corruption.\n");
+    msg.push_str("Blocked to prevent file corruption.\n");
     msg.push_str("To bypass this check, use skip_linter: true (not recommended).");
     msg
 }
