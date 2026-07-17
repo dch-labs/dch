@@ -83,6 +83,9 @@ pub fn format_file_change(file_path: &str, old_content: Option<&str>, new_conten
         if let Some(summary) = change_summary(&diff) {
             result.push_str(&summary);
         }
+        if let Some(note) = eof_change_note(old, new_content) {
+            result.push_str(&note);
+        }
         result.push_str(&format_diff_with_context(&diff, 3));
         result
     } else {
@@ -130,6 +133,29 @@ fn change_summary(diff: &[LineDiff]) -> Option<String> {
 /// Empty string for a count of one, `"s"` otherwise — for pluralization.
 fn plural(count: usize) -> &'static str {
     if count == 1 { "" } else { "s" }
+}
+
+/// Describe a trailing-newline-at-EOF change, when that is the *only* change.
+///
+/// `str::lines()` drops a file's final `\n`, so two contents that differ only
+/// in their trailing newline (e.g. `"a\n"` → `"a"`) produce identical line
+/// vectors and an empty LCS diff. Without this note such a write would render
+/// as a bare header with no indication anything changed.
+///
+/// Returns `None` when the line content actually differs (the LCS already
+/// covers it) or when the trailing-newline state is unchanged.
+fn eof_change_note(old: &str, new: &str) -> Option<String> {
+    if old.lines().ne(new.lines()) {
+        return None;
+    }
+    let had = old.ends_with('\n');
+    let has = new.ends_with('\n');
+    let note = match (had, has) {
+        (true, false) => "No newline at end of file",
+        (false, true) => "Newline added at end of file",
+        _ => return None,
+    };
+    Some(format!("│ {note}\n"))
 }
 
 /// Format a diff for files too large for the LCS algorithm (product exceeds
@@ -455,8 +481,6 @@ mod tests {
         assert!(result.contains("- OLD"));
     }
 
-    // ---- format_diff_with_context (tested directly) ----
-
     #[test]
     fn context_shows_lines_around_change() {
         let diff = vec![
@@ -574,8 +598,6 @@ mod tests {
         assert!(result.contains("+ CHANGED"));
     }
 
-    // ---- change_summary (via format_file_change) ----
-
     #[test]
     fn summary_line_present_for_mixed_edit() {
         let old = "a\nb\nc\n";
@@ -615,5 +637,39 @@ mod tests {
         assert!(result.contains("Changed: f.rs (modified)"));
         assert!(result.contains("1 line added"));
         assert!(result.contains("+ x"));
+    }
+
+    #[test]
+    fn trailing_newline_removed_is_visible() {
+        // "a\n" -> "a": line vectors are identical, so the LCS shows nothing.
+        // The EOF note must surface the change.
+        let result = format_file_change("f.txt", Some("a\n"), "a");
+        assert!(result.contains("Changed: f.txt (modified)"));
+        assert!(result.contains("No newline at end of file"), "{result}");
+        // No spurious line +/- from the LCS.
+        assert!(!result.contains("\n+ "));
+        assert!(!result.contains("\n- "));
+    }
+
+    #[test]
+    fn trailing_newline_added_is_visible() {
+        let result = format_file_change("f.txt", Some("a"), "a\n");
+        assert!(result.contains("Newline added at end of file"), "{result}");
+    }
+
+    #[test]
+    fn unchanged_trailing_newline_emits_no_eof_note() {
+        // "a\n" -> "a\n": genuinely identical, including the newline.
+        let result = format_file_change("f.txt", Some("a\n"), "a\n");
+        assert!(!result.contains("end of file"), "{result}");
+    }
+
+    #[test]
+    fn real_line_change_does_not_trigger_eof_note() {
+        // When lines actually differ, the LCS covers it; no EOF note.
+        let result = format_file_change("f.txt", Some("a\n"), "b\n");
+        assert!(result.contains("- a"));
+        assert!(result.contains("+ b"));
+        assert!(!result.contains("end of file"), "{result}");
     }
 }
