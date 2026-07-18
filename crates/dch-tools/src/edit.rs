@@ -152,7 +152,9 @@ impl EditTool {
 /// Parsed and validated Edit input.
 #[derive(Debug)]
 struct EditInput<'a> {
-    /// The file path exactly as supplied by the caller (before cwd resolution).
+    /// The file path exactly as supplied by the caller (before cwd resolution),
+    /// borrowed from the input. Used in messages so the model sees the path it
+    /// named, not the canonicalized form.
     file_path: &'a str,
     /// The text to find in the file.
     old_text: &'a str,
@@ -170,9 +172,11 @@ struct EditInput<'a> {
 /// structured reason is formatted for the loop.
 #[derive(Debug, PartialEq, Eq)]
 enum EditError {
-    /// `old_text` does not appear in the file.
+    /// `old_text` does not appear in the file. Produced by [`apply_edit`] when
+    /// [`locate_unique`] returns [`FindResult::NotFound`].
     NotFound,
-    /// `old_text` appears more than once; it must be unique.
+    /// `old_text` appears more than once; it must be unique. Produced by
+    /// [`apply_edit`] when [`locate_unique`] returns [`FindResult::Ambiguous`].
     Ambiguous {
         /// The non-overlapping occurrence count (always greater than 1).
         count: usize,
@@ -317,7 +321,7 @@ fn check_linter(full_path: &Path, new_content: &str) -> Result<(), LinterResult>
 /// [`FindResult::Unique`] result is spliced and written; the other two become
 /// soft errors returned to the caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum FindResult {
+pub(crate) enum FindResult {
     /// Exactly one non-overlapping occurrence, with its byte range in `content`.
     Unique(Range<usize>),
     /// `old_text` does not appear in `content`.
@@ -334,7 +338,7 @@ enum FindResult {
 /// Uses `str::matches` (non-overlapping count) and `str::find` (first
 /// position). Returns [`FindResult::Unique`] only for exactly one occurrence,
 /// carrying the byte range to splice into.
-fn locate_unique(content: &str, old_text: &str) -> FindResult {
+pub(crate) fn locate_unique(content: &str, old_text: &str) -> FindResult {
     let Some(start) = content.find(old_text) else {
         return FindResult::NotFound;
     };
@@ -356,7 +360,7 @@ fn locate_unique(content: &str, old_text: &str) -> FindResult {
 /// [`locate_unique`]; this holds by construction because `str::find` returns
 /// char-boundary offsets. The result is the prefix before `range.start`, the
 /// `replacement`, then the suffix from `range.end`.
-fn splice(content: &str, range: Range<usize>, replacement: &str) -> String {
+pub(crate) fn splice(content: &str, range: Range<usize>, replacement: &str) -> String {
     let prefix = content.get(..range.start).unwrap_or("");
     let suffix = content.get(range.end..).unwrap_or("");
     let cap = prefix

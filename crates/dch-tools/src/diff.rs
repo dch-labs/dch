@@ -31,11 +31,14 @@ const LARGE_DIFF_PREVIEW_LINES: usize = 1000;
 /// both), deleted (only in old), or inserted (only in new).
 #[derive(Debug)]
 enum LineDiff {
-    /// A line present in both old and new content.
+    /// A line present in both old and new content. The payload is the line's
+    /// text without any `+`/`-` prefix; the prefix is added at render time.
     Unchanged(String),
-    /// A line only in old content — removed by the change.
+    /// A line only in old content — removed by the change. Payload is the raw
+    /// line text; the `- ` prefix is added by [`format_diff_with_context`].
     Deleted(String),
-    /// A line only in new content — added by the change.
+    /// A line only in new content — added by the change. Payload is the raw
+    /// line text; the `+ ` prefix is added by [`format_diff_with_context`].
     Inserted(String),
 }
 
@@ -130,7 +133,10 @@ fn change_summary(diff: &[LineDiff]) -> Option<String> {
     Some(format!("│ {}\n", parts.join(", ")))
 }
 
-/// Empty string for a count of one, `"s"` otherwise — for pluralization.
+/// Pluralization suffix for a count: empty string for one, `"s"` otherwise.
+///
+/// Meant to be concatenated after "line" (e.g. `format!("{n} line{} removed",
+/// plural(n))`) in [`change_summary`].
 fn plural(count: usize) -> &'static str {
     if count == 1 { "" } else { "s" }
 }

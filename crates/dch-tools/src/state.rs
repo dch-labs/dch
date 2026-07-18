@@ -9,32 +9,45 @@ use std::time::SystemTime;
 /// invocation observes and mutates the same state.
 #[derive(Debug, Clone, Default)]
 pub struct SessionState {
-    /// The agent's current todo list.
+    /// The agent's current todo list. Replaced wholesale by the `TodoWrite` tool
+    /// (not appended to); the TUI reads this for display.
     pub todos: Vec<TodoEntry>,
-    /// Record of files the agent has read this session.
+    /// Record of files the agent has read this session. Appended by the Read
+    /// tool on each successful read; used to detect stale re-reads.
     pub file_read_history: Vec<FileReadEntry>,
-    /// Persistent notes the agent has stashed for later reference.
+    /// Persistent notes the agent has stashed for later reference. Appended by
+    /// tools that want to carry context forward across turns.
     pub memory: Vec<MemoryEntry>,
-    /// Aggregate counts of tool invocations.
+    /// Aggregate counts of tool invocations over the session. Incremented per
+    /// dispatch; read for observability and summaries.
     pub tool_stats: ToolStats,
 }
 
 /// One entry in the agent's todo list.
 #[derive(Debug, Clone)]
 pub struct TodoEntry {
-    /// Stable identifier for this entry.
+    /// Stable identifier for this entry. Preserved across `TodoWrite` replacements
+    /// so the agent can track the same item as it moves through statuses.
     pub id: String,
     /// Short summary of the task.
     pub subject: String,
     /// Longer explanation of what the task entails.
     pub description: String,
-    /// Current lifecycle status of the entry.
+    /// Current lifecycle status of the entry. See [`TodoStatus`] for the
+    /// allowed transitions.
     pub status: TodoStatus,
-    /// Optional present-continuous label, e.g. `"Fixing bug"`.
+    /// Optional present-continuous label, e.g. `"Fixing bug"`. Shown by the UI
+    /// while the entry is [`TodoStatus::InProgress`] to describe current work.
     pub active_form: Option<String>,
 }
 
 /// Lifecycle status of a single todo entry.
+///
+/// Valid transitions: `Pending → InProgress`, `InProgress → Completed`, and
+/// backwards (`InProgress → Pending`, `Completed → InProgress`) when the agent
+/// revisits work. `Completed → Pending` is not allowed (restart via
+/// `InProgress`). Enforced at the tool layer, not by the type system, since
+/// the list is replaced wholesale by `TodoWrite`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TodoStatus {
     /// Not yet started.
@@ -48,16 +61,19 @@ pub enum TodoStatus {
 /// Record of a single file the agent has read.
 #[derive(Debug, Clone)]
 pub struct FileReadEntry {
-    /// The path that was read.
+    /// The path that was read, as supplied to the Read tool (pre-resolution).
+    /// Used to match subsequent reads for staleness detection.
     pub path: String,
-    /// When the read happened.
+    /// When the read happened. Compared against file modification times to
+    /// detect whether the cached content is stale.
     pub read_at: SystemTime,
 }
 
 /// A persistent note the agent has stashed for later reference.
 #[derive(Debug, Clone)]
 pub struct MemoryEntry {
-    /// Grouping label for the note.
+    /// Free-form grouping label for the note (e.g. `"decision"`, `"constraint"`),
+    /// letting the agent bucket recalled context.
     pub category: String,
     /// The note content.
     pub content: String,
@@ -66,9 +82,11 @@ pub struct MemoryEntry {
 /// Aggregate counts of tool invocations over a session.
 #[derive(Debug, Clone, Default)]
 pub struct ToolStats {
-    /// Total invocations across all tools.
+    /// Total invocations across all tools this session. The sum of every value
+    /// in [`per_tool`](Self::per_tool).
     pub total_calls: u64,
-    /// Per-tool-name invocation counts.
+    /// Per-tool-name invocation counts, keyed by the tool's registered name
+    /// (e.g. `"Read"`, `"Edit"`). Incremented on each dispatch.
     pub per_tool: HashMap<String, u64>,
 }
 

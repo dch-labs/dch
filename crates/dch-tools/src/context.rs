@@ -23,13 +23,18 @@ use crate::state::SessionState;
 /// and retrieved with [`runner_ctx`].
 #[derive(Clone)]
 pub struct RunnerContext {
-    /// Working directory the dch operates within.
+    /// Working directory the dch operates within. Every tool resolves relative
+    /// paths against this; it is the absolute root for file operations.
     pub cwd: PathBuf,
-    /// Shared, mutable session state (todos, memory, stats, ...).
+    /// Shared, mutable session state (todos, memory, stats, ...). The
+    /// `Arc<Mutex<>>` lets tool calls in one loop run read and mutate it
+    /// concurrently; cloning [`RunnerContext`] shares the same store.
     pub session_state: Arc<Mutex<SessionState>>,
-    /// Optional channel for asking the user interactive questions.
+    /// Optional channel for asking the user interactive questions. `None` in
+    /// headless mode, where prompting is impossible and asking tools error.
     pub question_tx: Option<mpsc::Sender<QuestionRequest>>,
-    /// Runtime-derived display and permission settings.
+    /// Runtime-derived display and permission settings (verbosity, `no_color`,
+    /// permission mode), read by tools that format output or gate writes.
     pub runtime: RuntimeConfig,
 }
 

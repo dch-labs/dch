@@ -78,18 +78,20 @@ const UNSAFE_SUBSTRINGS: &[&str] = &[
     "git remote rename",
 ];
 
-// ---------------------------------------------------------------------------
+// ===========================================================
 // Background job table
-// ---------------------------------------------------------------------------
+// ===========================================================
 
 /// Status of a background job.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobStatus {
-    /// Still running.
+    /// Still running. No payload — output is collected when the job finishes.
     Running,
-    /// Finished successfully; carries combined output.
+    /// Finished successfully. The payload is the combined stdout and stderr
+    /// captured over the job's lifetime.
     Completed(String),
-    /// Failed or timed out; carries output or error text.
+    /// Failed or timed out. The payload is whatever output was captured
+    /// before termination, or an error/timeout message.
     Failed(String),
 }
 
@@ -98,11 +100,13 @@ pub enum JobStatus {
 pub struct BackgroundJob {
     /// Monotonic job identifier.
     pub id: u64,
-    /// The command string.
+    /// The command string, stored verbatim for display in the `jobs` listing.
     pub command: String,
-    /// Current status.
+    /// Current status. Polled by `job_status` and updated when the process
+    /// exits or the timeout fires.
     pub status: JobStatus,
-    /// When the job started (UNIX seconds).
+    /// When the job started, as a UNIX timestamp in seconds. Used to compute
+    /// elapsed time for the `jobs` listing.
     pub started_at: u64,
 }
 
@@ -765,8 +769,6 @@ mod tests {
         // Must land on a char boundary — no panic from String::truncate.
         assert!(s.len() <= MAX_OUTPUT_BYTES + 20);
     }
-
-    // ---- read_bounded ----
 
     #[tokio::test]
     async fn read_bounded_grows_past_initial_capacity() {

@@ -17,9 +17,12 @@ use std::path::Path;
 /// multi-error reporting in future without changing the public type.
 #[derive(Debug, Clone)]
 pub struct LinterResult {
-    /// Whether the content passed all validation checks.
+    /// Whether the content passed all validation checks. When `false`,
+    /// `errors` is guaranteed non-empty.
     pub is_valid: bool,
-    /// Validation errors found, if any. Empty when `is_valid` is `true`.
+    /// Validation errors found. Empty when `is_valid` is `true`; currently
+    /// holds exactly one entry (validators return early), but the `Vec` leaves
+    /// room for multi-error reporting without changing the public type.
     pub errors: Vec<LinterError>,
 }
 
@@ -31,7 +34,9 @@ pub struct LinterResult {
 /// the Rust `syn` validator does not on stable toolchains).
 #[derive(Debug, Clone)]
 pub struct LinterError {
-    /// 1-indexed line number of the error, when known.
+    /// 1-indexed line number of the error, when the validator can determine
+    /// it. `None` for validators without position info (e.g. `syn` on stable
+    /// toolchains); always `Some` for the Python indentation heuristic.
     pub line: Option<usize>,
     /// Human-readable description of the validation error.
     pub message: String,
