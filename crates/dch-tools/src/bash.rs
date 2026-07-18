@@ -83,30 +83,67 @@ const UNSAFE_SUBSTRINGS: &[&str] = &[
 // ===========================================================
 
 /// Status of a background job.
+///
+/// Stored inside [`BackgroundJob`] in the global job table. Transitions are
+/// one-way: a job starts [`Running`](Self::Running), then moves to either
+/// [`Completed`](Self::Completed) or [`Failed`](Self::Failed) when the process
+/// exits or the timeout fires. Once terminal, the status never changes again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobStatus {
-    /// Still running. No payload — output is collected when the job finishes.
+    /// Still running.
+    ///
+    /// No output is available yet — the process has not exited. The payload is
+    /// absent because stdout/stderr are collected only when the job finishes.
+    /// Polled by `job_status` until it transitions to a terminal variant.
     Running,
-    /// Finished successfully. The payload is the combined stdout and stderr
-    /// captured over the job's lifetime.
+
+    /// Finished successfully (exit code zero).
+    ///
+    /// The payload is the combined stdout and stderr captured over the job's
+    /// lifetime, merged in arrival order. Returned to the model as the tool
+    /// output when it polls a completed job.
     Completed(String),
-    /// Failed or timed out. The payload is whatever output was captured
-    /// before termination, or an error/timeout message.
+
+    /// Failed or timed out.
+    ///
+    /// The payload is whatever output was captured before termination — which
+    /// may be partial if the process was killed by the timeout. If no output
+    /// was produced (e.g. killed instantly), the payload is an error or
+    /// timeout message instead.
     Failed(String),
 }
 
 /// One tracked background job.
+///
+/// Stored in the global job table keyed by `id`. Created by
+/// `spawn_background_job` when the Bash tool runs with `background: true`;
+/// updated by the process-wait future when the job exits or times out.
 #[derive(Debug, Clone)]
 pub struct BackgroundJob {
     /// Monotonic job identifier.
+    ///
+    /// Allocated from the global ID counter at spawn time and never reused.
+    /// The model uses this to poll status via `operation: "job_status"`.
     pub id: u64,
-    /// The command string, stored verbatim for display in the `jobs` listing.
+
+    /// The command string.
+    ///
+    /// Stored verbatim (exactly as the model supplied it) for display in the
+    /// `jobs` listing. Not used for execution — that happens at spawn time.
     pub command: String,
-    /// Current status. Polled by `job_status` and updated when the process
-    /// exits or the timeout fires.
+
+    /// Current status of the job.
+    ///
+    /// Polled by `job_status` on each request. Updated in place when the
+    /// process exits (success or failure) or when the timeout fires — the job
+    /// table entry is mutated under the table's mutex.
     pub status: JobStatus,
-    /// When the job started, as a UNIX timestamp in seconds. Used to compute
-    /// elapsed time for the `jobs` listing.
+
+    /// When the job started.
+    ///
+    /// A UNIX timestamp in seconds, captured at spawn time. Used to compute
+    /// elapsed time (`now - started_at`) for the `jobs` listing so the model
+    /// can see how long a background job has been running.
     pub started_at: u64,
 }
 
@@ -167,12 +204,21 @@ fn spawn_background_job(command: &str, cwd: &str, timeout_secs: u64) -> u64 {
     id
 }
 
-/// Retrieve a single job by ID.
+/// Retrieve a single background job by its ID.
+///
+/// Looks up the job in the global table under the table's mutex and returns a
+/// clone of its current state. Returns `None` if the ID doesn't exist (the job
+/// was never spawned, or already cleaned up via [`cleanup_jobs`]).
 fn get_job(id: u64) -> Option<BackgroundJob> {
     JOB_TABLE.lock().ok()?.get(&id).cloned()
 }
 
 /// List all tracked background jobs.
+///
+/// Returns a clone of every entry in the global job table, in `BTreeMap` key
+/// order (ascending job ID). Used by the `operation: "jobs"` path of the Bash
+/// tool to show the model what's running and what has finished. Returns an
+/// empty vec if the table is empty or the lock is poisoned.
 fn list_jobs() -> Vec<BackgroundJob> {
     JOB_TABLE
         .lock()
@@ -180,7 +226,12 @@ fn list_jobs() -> Vec<BackgroundJob> {
         .unwrap_or_default()
 }
 
-/// Remove completed/failed jobs from the table. Returns the number removed.
+/// Remove terminal jobs (completed or failed) from the table.
+///
+/// Retains only [`JobStatus::Running`] entries, evicting everything else.
+/// Returns the number of jobs removed. Used by the `operation: "cleanup_jobs"`
+/// path of the Bash tool so the model can reclaim table space after polling
+/// all results. Returns 0 if the lock is poisoned or no terminal jobs exist.
 fn cleanup_jobs() -> usize {
     let Ok(mut table) = JOB_TABLE.lock() else {
         return 0;

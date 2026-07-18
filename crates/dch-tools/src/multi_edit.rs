@@ -1,11 +1,14 @@
-//! The `MultiEdit` tool — apply a batch of text edits across one or more files
-//! atomically.
+//! The `MultiEdit` tool — apply a batch of text edits across one or more files.
 //!
 //! Every edit in the batch is validated before any file is written. One
 //! invalid edit (missing file, `old_text` not found or not unique, target is a
 //! symlink, linter rejects the merged content, two edits overlap in the same
 //! file) aborts the entire batch — no file is touched. `dry_run: true` previews
 //! diffs without writing.
+//!
+//! The atomicity guarantee covers *validation*: if any edit is invalid, nothing
+//! is written. It does **not** cover crashes mid-write-batch — see the
+//! "Atomicity scope" section on [`MultiEditTool`]'s call docs.
 
 use std::collections::BTreeMap;
 use std::fmt::Write;
@@ -109,6 +112,17 @@ impl MultiEditTool {
     /// surfaced as soft [`ToolOutput`] errors; hard failures (bad args,
     /// missing file, I/O fault) become [`ToolError`].
     ///
+    /// # Atomicity scope
+    ///
+    /// The all-or-nothing guarantee covers *validation*: by the time any write
+    /// happens, every edit has been validated and every file's merged content
+    /// has passed the linter. Writes are individual atomic file replacements
+    /// (temp-then-rename via [`atomic_write`](crate::fs::atomic_write)), but
+    /// the batch of writes is **not** a single filesystem transaction — a
+    /// process crash mid-batch could leave some files written and others not.
+    /// The partial result is at worst *incomplete*, never syntactically
+    /// corrupt, because every file's content already passed the linter.
+    ///
     /// # Errors
     ///
     /// Returns [`ToolError::InvalidInput`] for a missing `edits` array, an
@@ -144,11 +158,10 @@ impl MultiEditTool {
             return Ok(reason.into_output());
         }
 
-        // Phase 1.5: overlap detection (skip when dry_run).
-        if !parsed.dry_run {
-            if let Some(reason) = overlap_check(&operations, &originals) {
-                return Ok(reason.into_output());
-            }
+        // Phase 1.5: overlap detection. Runs in both dry_run and apply modes
+        // so the preview shows exactly what the apply would catch.
+        if let Some(reason) = overlap_check(&operations, &originals) {
+            return Ok(reason.into_output());
         }
 
         // Phase 2: merge each file's edits sequentially (array order, each
@@ -166,7 +179,7 @@ impl MultiEditTool {
         }
 
         // Phase 3: build the preview/diff block (always).
-        let summary = build_preview(&operations, &originals, parsed.dry_run);
+        let summary = build_preview(&operations, &originals, &finals, parsed.dry_run);
         if parsed.dry_run {
             return Ok(ToolOutput::text(summary));
         }
@@ -300,9 +313,9 @@ fn build_operations(edits: &[Value], cwd: &Path) -> Result<Vec<EditOperation>, T
 
         let path = Path::new(file_path);
         let full_path = if path.is_relative() {
-            cwd.join(path)
+            normalize_path(&cwd.join(path))
         } else {
-            path.to_path_buf()
+            normalize_path(path)
         };
         operations.push(EditOperation {
             file_path: file_path.to_string(),
@@ -312,6 +325,27 @@ fn build_operations(edits: &[Value], cwd: &Path) -> Result<Vec<EditOperation>, T
         });
     }
     Ok(operations)
+}
+
+/// Lexically normalize a path: collapse `.` components and resolve `..`
+/// against preceding components, without touching the filesystem.
+///
+/// This makes path aliases like `a.rs` and `./a.rs` (or `src/../src/a.rs`)
+/// compare equal, so [`dup_path_check`] catches them as duplicates. It does
+/// **not** follow symlinks (unlike [`std::fs::canonicalize`]); symlink
+/// detection is [`symlink_check`]'s job.
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// Read each distinct target file once into a map keyed by `file_path`.
@@ -416,22 +450,30 @@ fn dup_path_check(operations: &[EditOperation]) -> Option<AbortReason> {
     None
 }
 
-/// Reject the batch if any distinct target is a symbolic link.
+/// Reject the batch if any distinct target — or any of its ancestor
+/// directories — is a symbolic link.
 ///
-/// `atomic_write`'s own symlink guard fires at write time — too late for the
-/// atomic contract (file #1 could already be written before file #2's symlink
-/// errors). This pre-check fires during the read pass, before any write.
+/// `atomic_write`'s own symlink guard fires at write time and checks only the
+/// final component, too late for the atomic contract (file #1 could already be
+/// written before file #2's symlink errors). This pre-check walks every
+/// ancestor of each target with `symlink_metadata` (no follow) during the read
+/// pass, before any write, so a symlinked parent directory is caught too.
 fn symlink_check(operations: &[EditOperation]) -> Option<AbortReason> {
     let mut seen = std::collections::HashSet::new();
     for op in operations {
-        if !seen.insert(&op.full_path) {
-            continue;
-        }
-        if std::fs::symlink_metadata(&op.full_path).is_ok_and(|m| m.file_type().is_symlink()) {
-            return Some(AbortReason::Symlink(format!(
-                "Refusing to write: {} is a symbolic link. Resolve it and pass the real path.",
-                op.file_path
-            )));
+        // Walk from the target up through each ancestor, without following links.
+        for ancestor in op.full_path.ancestors() {
+            if !seen.insert(ancestor) {
+                continue;
+            }
+            if std::fs::symlink_metadata(ancestor).is_ok_and(|m| m.file_type().is_symlink()) {
+                return Some(AbortReason::Symlink(format!(
+                    "Refusing to write: {} crosses a symbolic link ({}). \
+                     Resolve it and pass the real path.",
+                    op.file_path,
+                    ancestor.display()
+                )));
+            }
         }
     }
     None
@@ -445,18 +487,34 @@ fn symlink_check(operations: &[EditOperation]) -> Option<AbortReason> {
 #[derive(Debug, Clone)]
 struct EditConflict {
     /// The file both edits target.
+    ///
+    /// Stored as the caller-supplied path (pre-resolution), not the normalized
+    /// form, so the abort message addresses the file the way the model named it.
     file_path: String,
-    /// 0-indexed position of the first edit in the batch. The abort message
-    /// displays this 1-indexed for human readability.
+
+    /// 0-indexed position of the first edit in the batch's `edits` array.
+    ///
+    /// The raw value is used for the dedup-by-sorted-pair step in
+    /// [`detect_edit_conflicts`]; the abort message renders it 1-indexed
+    /// (`edit_index_a + 1`) for human readability.
     edit_index_a: usize,
-    /// 0-indexed position of the second edit in the batch. The abort message
-    /// displays this 1-indexed for human readability.
+
+    /// 0-indexed position of the second edit in the batch's `edits` array.
+    ///
+    /// Paired with [`edit_index_a`](Self::edit_index_a) to identify the
+    /// conflicting pair; rendered 1-indexed in the abort message.
     edit_index_b: usize,
-    /// Truncated `old_text` of the first edit (via [`truncate_str`]), for the
-    /// message so a long needle doesn't flood the output.
+
+    /// Truncated `old_text` of the first edit, for the abort message.
+    ///
+    /// Produced by [`truncate_str`] so a long needle doesn't flood the output;
+    /// the caller sees enough to recognize the edit without the full text.
     snippet_a: String,
-    /// Truncated `old_text` of the second edit (via [`truncate_str`]), for the
-    /// message so a long needle doesn't flood the output.
+
+    /// Truncated `old_text` of the second edit, for the abort message.
+    ///
+    /// Produced by [`truncate_str`]; paired with [`snippet_a`](Self::snippet_a)
+    /// so the message shows both halves of the overlapping pair.
     snippet_b: String,
 }
 
@@ -673,15 +731,18 @@ fn lint_all(
     None
 }
 
-/// Build the per-edit diff preview block, with a header chosen by `dry_run`.
+/// Build the per-file diff preview block, with a header chosen by `dry_run`.
 ///
-/// Lists each edit's file, then the indented output of
-/// [`format_file_change`](crate::diff::format_file_change) for that edit's
-/// old/new text. The dry-run path appends a footer telling the caller how to
-/// apply; the apply path reuses this block as the summary header.
+/// Lists each distinct file once (in first-seen order across the batch), then
+/// the indented output of [`format_file_change`](crate::diff::format_file_change)
+/// comparing that file's *original* content against its *fully merged* final
+/// content from `finals` — so multiple edits to one file render cumulatively,
+/// not as isolated fragments. The dry-run path appends a footer telling the
+/// caller how to apply; the apply path reuses this block as the summary header.
 fn build_preview(
     operations: &[EditOperation],
     originals: &BTreeMap<String, String>,
+    finals: &BTreeMap<String, String>,
     dry_run: bool,
 ) -> String {
     let mut lines = Vec::new();
@@ -692,14 +753,22 @@ fn build_preview(
     }
     lines.push(String::new());
 
-    for (i, op) in operations.iter().enumerate() {
-        lines.push(format!("File {}: {}", i.saturating_add(1), op.file_path));
+    // Distinct files in first-seen order, so the preview follows the batch.
+    let mut seen = std::collections::HashSet::new();
+    let mut index = 1usize;
+    for op in operations {
+        if !seen.insert(&op.file_path) {
+            continue;
+        }
+        lines.push(format!("File {index}: {}", op.file_path));
         let original = originals.get(&op.file_path).map_or("", String::as_str);
-        let diff = format_file_change(&op.file_path, Some(original), &op.new_text);
+        let final_content = finals.get(&op.file_path).map_or("", String::as_str);
+        let diff = format_file_change(&op.file_path, Some(original), final_content);
         for line in diff.lines() {
             lines.push(format!("  {line}"));
         }
         lines.push(String::new());
+        index = index.saturating_add(1);
     }
 
     if dry_run {
@@ -1542,7 +1611,9 @@ mod tests {
         let ops = vec![op("a.rs", "fn one() {}", "fn one(x: i32) {}")];
         let mut originals = BTreeMap::new();
         originals.insert("a.rs".to_string(), "fn one() {}\n".to_string());
-        let out = build_preview(&ops, &originals, true);
+        let mut finals = BTreeMap::new();
+        finals.insert("a.rs".to_string(), "fn one(x: i32) {}\n".to_string());
+        let out = build_preview(&ops, &originals, &finals, true);
         assert!(
             out.starts_with("Dry Run Preview — No files will be modified"),
             "{out}"
@@ -1558,7 +1629,9 @@ mod tests {
         let ops = vec![op("a.rs", "x", "y")];
         let mut originals = BTreeMap::new();
         originals.insert("a.rs".to_string(), "x\n".to_string());
-        let out = build_preview(&ops, &originals, false);
+        let mut finals = BTreeMap::new();
+        finals.insert("a.rs".to_string(), "y\n".to_string());
+        let out = build_preview(&ops, &originals, &finals, false);
         assert!(out.starts_with("Multi-File Edit Summary"), "{out}");
         assert!(!out.contains("dry_run=false"));
     }
@@ -1569,10 +1642,13 @@ mod tests {
         let mut originals = BTreeMap::new();
         originals.insert("a.rs".to_string(), "foo\n".to_string());
         originals.insert("b.rs".to_string(), "baz\n".to_string());
-        let out = build_preview(&ops, &originals, false);
+        let mut finals = BTreeMap::new();
+        finals.insert("a.rs".to_string(), "bar\n".to_string());
+        finals.insert("b.rs".to_string(), "qux\n".to_string());
+        let out = build_preview(&ops, &originals, &finals, false);
         assert!(out.contains("File 1: a.rs"), "{out}");
         assert!(out.contains("File 2: b.rs"), "{out}");
-        // Each edit's diff is indented under its header.
+        // Each file's diff is indented under its header.
         assert!(out.contains("  Changed: a.rs"), "{out}");
         assert!(out.contains("  Changed: b.rs"), "{out}");
     }
@@ -1722,5 +1798,115 @@ mod tests {
         assert!(text.contains("Syntax validation failed"), "{text}");
         assert!(text.contains("No files were modified"), "{text}");
         assert_eq!(std::fs::read_to_string(&f1).unwrap(), "fn one() {}\n");
+    }
+
+    #[tokio::test]
+    async fn dry_run_catches_overlap() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let f = tmp.path().join("a.rs");
+        std::fs::write(&f, "fn main() { hello; world; }\n").unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let tool = MultiEditTool;
+        let ctx = ctx_in(cwd);
+        let input = json!({
+            "edits": [
+                edit("a.rs", "hello; world", "hi"),
+                edit("a.rs", "world", "universe"),
+            ],
+            "dry_run": true
+        });
+        let out = tool.call(input, &ctx).await.unwrap();
+        assert!(out.is_error, "{}", out.text_content());
+        assert!(
+            out.text_content().contains("overlap"),
+            "{}",
+            out.text_content()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_parent_directory_rejected() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let realdir = tmp.path().join("realdir");
+        std::fs::create_dir(&realdir).unwrap();
+        let target = realdir.join("a.rs");
+        std::fs::write(&target, "fn one() {}\n").unwrap();
+        let linkdir = tmp.path().join("linkdir");
+        symlink(&realdir, &linkdir).unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let tool = MultiEditTool;
+        let ctx = ctx_in(cwd);
+        let input = json!({
+            "edits": [ edit("linkdir/a.rs", "fn one() {}", "fn one(x: i32) {}") ]
+        });
+        let out = tool.call(input, &ctx).await.unwrap();
+        assert!(out.is_error, "{}", out.text_content());
+        assert!(
+            out.text_content().contains("symbolic link"),
+            "{}",
+            out.text_content()
+        );
+        // Target untouched.
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "fn one() {}\n");
+    }
+
+    #[test]
+    fn build_preview_shows_cumulative_merged_content() {
+        // Two edits to one file — the preview must diff original vs the
+        // fully merged final, not vs each edit's fragment in isolation.
+        let ops = vec![
+            op("a.txt", "alpha", "alpha\ngamma"),
+            op("a.txt", "gamma", "delta"),
+        ];
+        let mut originals = BTreeMap::new();
+        originals.insert("a.txt".to_string(), "alpha\n".to_string());
+        let mut finals = BTreeMap::new();
+        finals.insert("a.txt".to_string(), "alpha\ndelta\n".to_string());
+        let out = build_preview(&ops, &originals, &finals, false);
+        // The file appears once (distinct), and the diff reflects the merged
+        // result containing "delta", not the intermediate "gamma".
+        assert!(out.contains("delta"), "{out}");
+        // Exactly one File header for a.txt (not two).
+        assert_eq!(out.matches("File 1: a.txt").count(), 1, "{out}");
+    }
+
+    #[test]
+    fn normalize_path_collapses_dot_and_dotdot() {
+        assert_eq!(normalize_path(Path::new("./a.rs")), PathBuf::from("a.rs"));
+        assert_eq!(
+            normalize_path(Path::new("src/../a.rs")),
+            PathBuf::from("a.rs")
+        );
+        assert_eq!(
+            normalize_path(Path::new("/work/./b/../a.rs")),
+            PathBuf::from("/work/a.rs")
+        );
+    }
+
+    #[tokio::test]
+    async fn dup_path_check_catches_dot_alias() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let f = tmp.path().join("a.rs");
+        std::fs::write(&f, "content\n").unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let tool = MultiEditTool;
+        let ctx = ctx_in(cwd);
+        let input = json!({
+            "edits": [
+                edit("a.rs", "content", "x"),
+                edit("./a.rs", "content", "y"),
+            ]
+        });
+        let out = tool.call(input, &ctx).await.unwrap();
+        assert!(out.is_error, "{}", out.text_content());
+        assert!(
+            out.text_content().contains("same file"),
+            "{}",
+            out.text_content()
+        );
+        // Nothing written.
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "content\n");
     }
 }

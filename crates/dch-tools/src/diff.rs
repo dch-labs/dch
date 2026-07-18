@@ -26,19 +26,34 @@ const LARGE_DIFF_PREVIEW_LINES: usize = 1000;
 
 /// One line in an LCS diff, produced by [`compute_lcs_diff`].
 ///
-/// Each variant carries the line's text content. The diff algorithm walks
-/// old and new line lists and classifies each line as unchanged (present in
-/// both), deleted (only in old), or inserted (only in new).
+/// Each variant carries the line's raw text content (no prefix). The diff
+/// algorithm walks the old and new line lists and classifies each line:
+/// present in both → [`Unchanged`](Self::Unchanged), only in old →
+/// [`Deleted`](Self::Deleted), only in new → [`Inserted`](Self::Inserted).
+/// The rendered `+`/`-` prefixes are added later by
+/// [`format_diff_with_context`], not stored here.
 #[derive(Debug)]
 enum LineDiff {
-    /// A line present in both old and new content. The payload is the line's
-    /// text without any `+`/`-` prefix; the prefix is added at render time.
+    /// A line present in both old and new content.
+    ///
+    /// The payload is the line's text without any prefix character. At render
+    /// time, [`format_diff_with_context`] emits it with a leading
+    /// two-space indent (`  `) to mark it as unchanged context surrounding a
+    /// change region.
     Unchanged(String),
-    /// A line only in old content — removed by the change. Payload is the raw
-    /// line text; the `- ` prefix is added by [`format_diff_with_context`].
+
+    /// A line only in old content — removed by the change.
+    ///
+    /// The payload is the raw line text without prefix. At render time,
+    /// [`format_diff_with_context`] emits it with a `- ` prefix so the reader
+    /// can see what was taken away.
     Deleted(String),
-    /// A line only in new content — added by the change. Payload is the raw
-    /// line text; the `+ ` prefix is added by [`format_diff_with_context`].
+
+    /// A line only in new content — added by the change.
+    ///
+    /// The payload is the raw line text without prefix. At render time,
+    /// [`format_diff_with_context`] emits it with a `+ ` prefix so the reader
+    /// can see what was introduced.
     Inserted(String),
 }
 
