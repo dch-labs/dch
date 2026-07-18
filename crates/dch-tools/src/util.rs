@@ -62,6 +62,21 @@ pub fn is_url(path: &str) -> bool {
     path.starts_with("http://") || path.starts_with("https://")
 }
 
+/// Resolve a possibly-relative `file_path` against `cwd`.
+///
+/// Absolute paths are used as-is; relative paths are joined to `cwd`. This
+/// is the shared path-resolution primitive used by every file-touching tool
+/// (`Read`, `Write`, `Edit`, `MultiEdit`, `FileViewer`) so they can't drift apart.
+#[must_use]
+pub fn resolve_path(file_path: &str, cwd: &std::path::Path) -> std::path::PathBuf {
+    let path = std::path::Path::new(file_path);
+    if path.is_relative() {
+        cwd.join(path)
+    } else {
+        path.to_path_buf()
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::missing_panics_doc, clippy::missing_errors_doc)]
 mod tests {

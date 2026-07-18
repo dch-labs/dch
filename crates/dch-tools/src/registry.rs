@@ -4,6 +4,7 @@ use loopctl::tool::ToolRegistry;
 
 use crate::bash::BashTool;
 use crate::edit::EditTool;
+use crate::file_viewer::FileViewerTool;
 use crate::multi_edit::MultiEditTool;
 use crate::read::ReadTool;
 use crate::write::WriteTool;
@@ -20,5 +21,6 @@ pub fn builtin_registry() -> ToolRegistry {
     registry.register(WriteTool);
     registry.register(EditTool);
     registry.register(MultiEditTool);
+    registry.register(FileViewerTool);
     registry
 }

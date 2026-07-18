@@ -17,6 +17,7 @@ use crate::context::runner_ctx;
 use crate::diff::format_file_change;
 use crate::linter::LinterResult;
 use crate::linter::lint_content;
+use crate::util::resolve_path;
 
 /// Write content to a file. Syntax validation is automatically performed for
 /// supported file types (.rs, .json, .py, .js, .ts, etc.).
@@ -114,12 +115,7 @@ impl WriteTool {
             .get("skip_linter")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let path = Path::new(file_path);
-        let full_path = if path.is_relative() {
-            cwd.join(path)
-        } else {
-            path.to_path_buf()
-        };
+        let full_path = resolve_path(file_path, &cwd);
 
         if !skip_linter {
             let result = lint_content(&full_path, content);

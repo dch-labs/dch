@@ -2,7 +2,6 @@
 
 use std::fmt::Write;
 use std::future::Future;
-use std::path::Path;
 use std::pin::Pin;
 use std::time::SystemTime;
 
@@ -22,6 +21,7 @@ use crate::context::runner_ctx;
 use crate::state::FileReadEntry;
 use crate::util::is_url;
 use crate::util::mime_type_from_path;
+use crate::util::resolve_path;
 
 /// Maximum number of lines returned by the Read tool.
 pub const MAX_FILE_READ_LINES: usize = 200;
@@ -131,15 +131,13 @@ impl ReadTool {
                 )
             })?
             .cwd;
-        let path = Path::new(file_path);
-        let full_path = if path.is_relative() {
-            cwd.join(path)
-        } else {
-            path.to_path_buf()
-        };
+        let full_path = resolve_path(file_path, &cwd);
 
         let metadata = tokio::fs::metadata(&full_path).await.map_err(|_| {
-            let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("*");
+            let filename = full_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("*");
             ToolError::FileNotFound(format!(
                 "{file_path}\n\nSuggestions:\n\
                  - Use Glob with pattern '**/*{filename}*' to search for similar files\n\

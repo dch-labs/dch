@@ -7,7 +7,6 @@
 use std::future::Future;
 use std::ops::Range;
 use std::path::Path;
-use std::path::PathBuf;
 use std::pin::Pin;
 
 use loopctl::tool::Tool;
@@ -24,6 +23,7 @@ use crate::diff::format_file_change;
 use crate::linter::LinterResult;
 use crate::linter::lint_content;
 use crate::util::is_url;
+use crate::util::resolve_path;
 use crate::write::format_lint_failure;
 
 /// Edit a file by replacing a **unique** occurrence of text. Runs the linter
@@ -293,18 +293,6 @@ fn parse_input(input: &Value) -> Result<EditInput<'_>, ToolError> {
         new_text,
         skip_linter,
     })
-}
-
-/// Resolve a possibly-relative `file_path` against `cwd`.
-///
-/// Absolute paths are used as-is; relative paths are joined to `cwd`.
-fn resolve_path(file_path: &str, cwd: &Path) -> PathBuf {
-    let path = Path::new(file_path);
-    if path.is_relative() {
-        cwd.join(path)
-    } else {
-        path.to_path_buf()
-    }
 }
 
 /// Read an existing file's full contents as UTF-8.
