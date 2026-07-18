@@ -16,20 +16,49 @@ use crate::state::SessionState;
 /// Per loop instance context attached to every `ToolContext`.
 ///
 /// Carries everything a tool invocation needs that is specific to this loop
-/// instance run: the working directory, shared mutable session state, the optional
-/// channel for asking the user questions, and runtime display/permission
-/// settings. Stored as a typed extension via
+/// instance run: the working directory, shared mutable session state, the
+/// optional channel for asking the user questions, and runtime display /
+/// permission settings. Stored as a typed extension via
 /// [`ToolContext::set_extension`](loopctl::tool::ToolContext::set_extension)
 /// and retrieved with [`runner_ctx`].
+///
+/// Cloning this struct is cheap — [`session_state`](Self::session_state) is
+/// behind an `Arc`, so clones share the same mutable store rather than copying
+/// it. This is how multiple tool invocations within one agent run observe each
+/// other's state mutations.
 #[derive(Clone)]
 pub struct RunnerContext {
-    /// Working directory the dch operates within.
+    /// The working directory the agent operates within.
+    ///
+    /// Every tool that touches the filesystem resolves relative paths against
+    /// this directory. It is the absolute root for file operations (`Read`,
+    /// `Write`, `Edit`, `MultiEdit`, `Glob`, `Grep`, etc.). Set once at runner
+    /// construction from the configured or CLI-supplied working directory.
     pub cwd: PathBuf,
-    /// Shared, mutable session state (todos, memory, stats, ...).
+
+    /// Shared, mutable session state for the current agent run.
+    ///
+    /// Carries the todo list, file-read history, memory entries, and tool
+    /// invocation stats. The `Arc<Mutex<>>` wrapper lets concurrent tool calls
+    /// read and mutate it safely; cloning [`RunnerContext`] shares the same
+    /// store (no copy). Tools acquire the lock briefly to append or replace
+    /// their portion.
     pub session_state: Arc<Mutex<SessionState>>,
+
     /// Optional channel for asking the user interactive questions.
+    ///
+    /// Used by the `AskUserQuestion` tool to send a [`QuestionRequest`] to the
+    /// UI (TUI overlay or headless reader). `None` in headless mode, where
+    /// prompting is impossible — the asking tool returns an error instead of
+    /// blocking. Set at runner construction; presence depends on the run mode.
     pub question_tx: Option<mpsc::Sender<QuestionRequest>>,
+
     /// Runtime-derived display and permission settings.
+    ///
+    /// Bundles verbosity level, color-output toggle (`no_color`), and the
+    /// active permission mode (`Auto` / `Plan` / `AcceptEdits` / `Interactive`). Read
+    /// by tools that format output (to respect verbosity and color settings)
+    /// and by the permission hook (to gate side-effecting tools per the mode).
     pub runtime: RuntimeConfig,
 }
 

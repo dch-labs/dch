@@ -150,37 +150,88 @@ impl EditTool {
 }
 
 /// Parsed and validated Edit input.
+///
+/// Produced by [`parse_input`] from the raw JSON the model sends. All string
+/// fields are borrowed from the input (`'a`) — no cloning until the async
+/// body needs owned copies for file I/O. Validated up front: `old_text` must
+/// be non-empty and `file_path` must not be a URL, both checked before this
+/// struct is constructed.
 #[derive(Debug)]
 struct EditInput<'a> {
-    /// The file path exactly as supplied by the caller (before cwd resolution).
+    /// The file path exactly as supplied by the caller, before cwd resolution.
+    ///
+    /// Borrowed from the input JSON. Kept in its raw (pre-resolution) form so
+    /// error messages and the diff preview show the path the model named, not
+    /// the canonicalized absolute path. Resolution against `cwd` happens later
+    /// in [`edit_inner`](EditTool::edit_inner).
     file_path: &'a str,
+
     /// The text to find in the file.
+    ///
+    /// Must be non-empty (rejected by [`parse_input`] before this struct is
+    /// built) and must appear exactly once in the target file (enforced later
+    /// by [`locate_unique`]). Borrowed from the input — no allocation.
     old_text: &'a str,
+
     /// The text to replace `old_text` with.
+    ///
+    /// May be empty (a pure deletion) or longer than `old_text` (an insertion).
+    /// Borrowed from the input; spliced into the file content by [`splice`]
+    /// after the unique match is located.
     new_text: &'a str,
-    /// Whether to skip the linter gate on the result.
+
+    /// Whether to skip the linter gate on the edited result.
+    ///
+    /// When `true`, the linter is bypassed entirely — the file is written even
+    /// if the resulting content has syntax errors. Defaults to `false` (extracted
+    /// via `unwrap_or(false)` in [`parse_input`]). Not recommended for normal
+    /// use; the linter prevents file corruption from malformed edits.
     skip_linter: bool,
 }
 
 /// A recoverable reason an edit was not applied.
 ///
-/// These are *soft* failures modes: the caller surfaces them to the loop as a
-/// `ToolOutput::error_text` so the model can correct and retry, rather than as
-/// a hard [`ToolError`]. [`EditError::into_output`] is the single place the
-/// structured reason is formatted for the loop.
+/// These are *soft* failure modes: the caller surfaces them to the loop as a
+/// [`ToolOutput::error_text`] so the model can correct its arguments and
+/// retry, rather than as a hard [`ToolError`] (which signals an unrecoverable
+/// fault like a missing file or an I/O error). [`EditError::into_output`] is
+/// the single place the structured reason is formatted into a human-readable
+/// message for the loop.
 #[derive(Debug, PartialEq, Eq)]
 enum EditError {
-    /// `old_text` does not appear in the file.
+    /// `old_text` does not appear anywhere in the file.
+    ///
+    /// Produced by [`apply_edit`] when [`locate_unique`] returns
+    /// [`FindResult::NotFound`]. The formatted message includes hints
+    /// (re-read the file, check for whitespace/Unicode differences, use
+    /// `Grep` to locate the text) so the model has a clear recovery path.
     NotFound,
-    /// `old_text` appears more than once; it must be unique.
+
+    /// `old_text` appears more than once in the file.
+    ///
+    /// Edit requires `old_text` to be unique so it can splice without
+    /// ambiguity. Produced by [`apply_edit`] when [`locate_unique`] returns
+    /// [`FindResult::Ambiguous`]. The formatted message names the count and
+    /// suggests adding surrounding context or using `MultiEdit` (which also
+    /// enforces uniqueness per edit but lets the model batch disambiguated
+    /// edits).
     Ambiguous {
-        /// The non-overlapping occurrence count (always greater than 1).
+        /// The non-overlapping occurrence count.
+        ///
+        /// Always greater than 1 (zero occurrences would be
+        /// [`NotFound`](Self::NotFound) instead). Computed by
+        /// [`locate_unique`] via `str::matches(...).count()`.
         count: usize,
     },
 }
 
 impl EditError {
     /// Format this reason as the soft [`ToolOutput`] returned to the loop.
+    ///
+    /// Each variant produces a human-readable error message with actionable
+    /// hints so the model can correct its input and retry. This is the
+    /// single formatting site — the structured enum is carried through the
+    /// pipeline and only stringified here, at the boundary.
     fn into_output(self) -> ToolOutput {
         match self {
             EditError::NotFound => ToolOutput::error_text(
@@ -313,18 +364,45 @@ fn check_linter(full_path: &Path, new_content: &str) -> Result<(), LinterResult>
 
 /// Outcome of locating `old_text` within the file content.
 ///
-/// Produced by [`locate_unique`]. Edit treats each variant differently: a
-/// [`FindResult::Unique`] result is spliced and written; the other two become
-/// soft errors returned to the caller.
+/// Produced by [`locate_unique`]. The three variants classify the search result
+/// into the cases the `Edit` and `MultiEdit` pipelines need to distinguish:
+/// exactly one match (safe to splice), zero matches (recoverable: the model
+/// should re-read), or more than one (recoverable: the model should add
+/// disambiguating context).
+///
+/// Edit treats [`Unique`](Self::Unique) as a green light — the byte range is
+/// spliced with the replacement text. The other two variants become soft
+/// [`EditError`]s via [`apply_edit`], surfaced to the model as retryable
+/// errors. `MultiEdit` uses the same logic per edit inside [`merge_per_file`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum FindResult {
-    /// Exactly one non-overlapping occurrence, with its byte range in `content`.
+pub(crate) enum FindResult {
+    /// Exactly one non-overlapping occurrence of `old_text` in `content`.
+    ///
+    /// The payload is the byte range (`start..end`) of that single match,
+    /// suitable for passing directly to [`splice`]. The range is guaranteed to
+    /// fall on valid UTF-8 boundaries because it was derived from
+    /// [`str::find`].
     Unique(Range<usize>),
-    /// `old_text` does not appear in `content`.
+
+    /// `old_text` does not appear anywhere in `content`.
+    ///
+    /// The model likely has stale knowledge of the file (it changed since the
+    /// last `Read`) or supplied the wrong text. The recovery path is to
+    /// re-read the file and retry. Maps to [`EditError::NotFound`].
     NotFound,
-    /// `old_text` appears more than once.
+
+    /// `old_text` appears more than once in `content`.
+    ///
+    /// The model needs to supply a longer, more specific `old_text` that
+    /// matches only the intended site, or use `MultiEdit` if it genuinely wants
+    /// all occurrences changed. Maps to [`EditError::Ambiguous`].
     Ambiguous {
-        /// The non-overlapping occurrence count (always greater than 1).
+        /// The non-overlapping occurrence count.
+        ///
+        /// Always greater than 1 (zero occurrences yields
+        /// [`NotFound`](Self::NotFound) instead). Computed by
+        /// [`locate_unique`] via `str::matches(...).count()`. Included in the
+        /// error message so the model knows how many sites it's dealing with.
         count: usize,
     },
 }
@@ -334,7 +412,7 @@ enum FindResult {
 /// Uses `str::matches` (non-overlapping count) and `str::find` (first
 /// position). Returns [`FindResult::Unique`] only for exactly one occurrence,
 /// carrying the byte range to splice into.
-fn locate_unique(content: &str, old_text: &str) -> FindResult {
+pub(crate) fn locate_unique(content: &str, old_text: &str) -> FindResult {
     let Some(start) = content.find(old_text) else {
         return FindResult::NotFound;
     };
@@ -356,7 +434,7 @@ fn locate_unique(content: &str, old_text: &str) -> FindResult {
 /// [`locate_unique`]; this holds by construction because `str::find` returns
 /// char-boundary offsets. The result is the prefix before `range.start`, the
 /// `replacement`, then the suffix from `range.end`.
-fn splice(content: &str, range: Range<usize>, replacement: &str) -> String {
+pub(crate) fn splice(content: &str, range: Range<usize>, replacement: &str) -> String {
     let prefix = content.get(..range.start).unwrap_or("");
     let suffix = content.get(range.end..).unwrap_or("");
     let cap = prefix
