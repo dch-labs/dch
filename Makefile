@@ -39,7 +39,7 @@ docs:
 examples:
 	$(CARGO) build --examples $(ALL_FEATURES)
 
-## boundary: Enforce the ARCHITECTURE.md §9 crate-boundary rules
+## boundary: Enforce the crate-boundary rules
 boundary:
 	$(CARGO) run -p xtask -- check-boundary
 

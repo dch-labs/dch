@@ -36,6 +36,7 @@ clap       = { version = "4", features = ["derive"] }
 dirs       = "6"
 tempfile   = "3"
 base64     = "0.22"
+ignore     = "0.4"
 
 dch        = { path = "crates/dch" }
 dch-loop    = { path = "crates/dch-loop" }
