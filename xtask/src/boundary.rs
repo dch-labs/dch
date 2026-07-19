@@ -274,9 +274,6 @@ pub fn run_check() -> ExitCode {
 #[cfg(test)]
 #[allow(clippy::missing_panics_doc, clippy::missing_errors_doc)]
 mod tests {
-    //! Each rule gets a passing case and a violating case, proving the gate
-    //! actually bites.
-
     use super::*;
 
     fn pkg(name: &str, deps: &[&str]) -> Package {
@@ -335,8 +332,6 @@ mod tests {
         assert!(has_violation(&v, "dch-tools", "dch-config"));
     }
 
-    // Rule 2: dch-tui's dch-* deps must be exactly {dch-config}.
-
     #[test]
     fn rule2_catches_dch_tui_gaining_dch_tools() {
         let bad = pkg(
@@ -392,10 +387,6 @@ mod tests {
         let v = Checker::new(&ws).check();
         assert!(has_violation(&v, "dch", "dch-tools"));
     }
-
-    // Dev/build deps must not be counted as runtime boundary edges. A dev-dep
-    // on a sibling dch crate is a legitimate test pattern; the checker must
-    // filter it out before evaluating the §9 rules.
 
     #[test]
     fn dev_and_build_deps_are_not_runtime_edges() -> Result<(), serde_json::Error> {

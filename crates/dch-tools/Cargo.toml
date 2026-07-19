@@ -16,6 +16,7 @@ tokio      = { workspace = true, features = ["process"] }
 base64     = { workspace = true }
 libc       = "0.2"
 tempfile   = { workspace = true }
+ignore     = { workspace = true }
 
 [dev-dependencies]
 
