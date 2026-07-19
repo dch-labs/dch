@@ -143,7 +143,7 @@ impl Tool for FileViewerTool {
                     "output_format": {
                         "type": "string",
                         "description": "Output format: 'plain' (default), 'colored', or 'markdown'",
-                        "enum": ["plain", "colored", "markdown"]
+                        "enum": ["plain", "colored", "color", "ansi", "markdown", "md"]
                     }
                 },
                 "required": ["file_path"]
@@ -220,9 +220,8 @@ impl FileViewerTool {
             )));
         }
 
-        let end = bounds.end.min(total_lines);
         let view_lines = lines
-            .get(bounds.start.saturating_sub(1)..end)
+            .get(bounds.start.saturating_sub(1)..bounds.end)
             .unwrap_or(&[]);
 
         let output = render_output(parsed.file_path, &bounds, view_lines, parsed.output_format);
@@ -474,9 +473,10 @@ impl ViewBounds {
 ///
 /// # Errors
 ///
-/// Returns [`ToolError::InvalidInput`] when `page == 0` or `offset == 0`.
+/// Returns [`ToolError::InvalidInput`] when `page == 0`, `offset == 0`, or any
+/// explicitly supplied numeric field is non-integer, negative, or out of range.
 fn calculate_bounds(input: &Value, total_lines: usize) -> Result<ViewBounds, ToolError> {
-    let page_size = json_usize(input, "page_size")
+    let page_size = json_usize_strict(input, "page_size")?
         .unwrap_or(DEFAULT_PAGE_SIZE)
         .min(MAX_PAGE_SIZE);
 
@@ -487,47 +487,63 @@ fn calculate_bounds(input: &Value, total_lines: usize) -> Result<ViewBounds, Too
     }
 }
 
-/// Extract a `usize` integer field from the JSON input.
+/// Extract an optional `usize` integer field from JSON, rejecting malformed values.
 ///
-/// Reads `input[key]` as a `u64` then safely converts to `usize` via
-/// [`usize::try_from`], so there is no truncation risk on 32-bit targets.
-/// Returns `None` when the key is absent, the value is not an integer, or the
-/// value exceeds the platform's `usize` range. Callers supply a fallback via
-/// [`unwrap_or`] or [`ok_or_else`] depending on whether the field is optional
-/// (like `page_size`) or required (like `offset`).
-fn json_usize(input: &Value, key: &str) -> Option<usize> {
-    input
-        .get(key)
-        .and_then(Value::as_u64)
-        .and_then(|n| usize::try_from(n).ok())
+/// Returns `Ok(None)` when the key is absent (caller applies a default).
+/// Returns `Ok(Some(n))` when the key is present and is a valid non-negative
+/// integer that fits in `usize`. Returns `Err(InvalidInput)` when the key is
+/// present but is not an integer, is negative, or exceeds the platform's
+/// `usize` range — so malformed input is caught rather than silently defaulted.
+///
+/// # Errors
+///
+/// Returns [`ToolError::InvalidInput`] when the key is present but the value
+/// is not a valid non-negative integer.
+fn json_usize_strict(input: &Value, key: &str) -> Result<Option<usize>, ToolError> {
+    match input.get(key) {
+        None => Ok(None),
+        Some(Value::Number(n)) => n
+            .as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .map(Some)
+            .ok_or_else(|| {
+                ToolError::InvalidInput(format!("'{key}' must be a non-negative integer"))
+            }),
+        Some(_) => Err(ToolError::InvalidInput(format!(
+            "'{key}' must be a non-negative integer"
+        ))),
+    }
 }
 
 /// Compute bounds in offset-based mode (`offset`+`limit`).
 ///
 /// # Errors
 ///
-/// Returns [`ToolError::InvalidInput`] when `offset == 0`.
+/// Returns [`ToolError::InvalidInput`] when `offset == 0` or any supplied
+/// field is malformed.
 fn bounds_from_offset(
     input: &Value,
     total_lines: usize,
     page_size: usize,
 ) -> Result<ViewBounds, ToolError> {
-    let offset = json_usize(input, "offset")
-        .ok_or_else(|| ToolError::InvalidInput("Missing or invalid offset value".to_string()))?;
-
+    let offset = json_usize_strict(input, "offset")?
+        .ok_or_else(|| ToolError::InvalidInput("Missing offset value".to_string()))?;
     if offset == 0 {
         return Err(ToolError::InvalidInput(
             "Offset must be at least 1".to_string(),
         ));
     }
 
-    let limit = json_usize(input, "limit")
+    let limit = json_usize_strict(input, "limit")?
         .unwrap_or(page_size)
         .min(MAX_PAGE_SIZE);
 
     Ok(ViewBounds {
         start: offset,
-        end: offset.saturating_add(limit).saturating_sub(1),
+        end: offset
+            .saturating_add(limit)
+            .saturating_sub(1)
+            .min(total_lines.max(1)),
         total: total_lines,
         page: None,
         total_pages: None,
@@ -538,13 +554,14 @@ fn bounds_from_offset(
 ///
 /// # Errors
 ///
-/// Returns [`ToolError::InvalidInput`] when `page == 0`.
+/// Returns [`ToolError::InvalidInput`] when `page == 0` or any supplied field
+/// is malformed.
 fn bounds_from_page(
     input: &Value,
     total_lines: usize,
     page_size: usize,
 ) -> Result<ViewBounds, ToolError> {
-    let page = json_usize(input, "page").unwrap_or(1);
+    let page = json_usize_strict(input, "page")?.unwrap_or(1);
 
     if page == 0 {
         return Err(ToolError::InvalidInput(
@@ -556,8 +573,15 @@ fn bounds_from_page(
         .saturating_sub(1)
         .saturating_mul(page_size)
         .saturating_add(1);
-    let end = start.saturating_add(page_size).saturating_sub(1);
-    let total_pages = total_lines.div_ceil(page_size.max(1));
+    let end = start
+        .saturating_add(page_size)
+        .saturating_sub(1)
+        .min(total_lines.max(1));
+    let total_pages = if total_lines == 0 {
+        1
+    } else {
+        total_lines.div_ceil(page_size.max(1))
+    };
 
     Ok(ViewBounds {
         start,
@@ -693,6 +717,42 @@ mod tests {
         let input = json!({"page": 1, "page_size": 1000});
         let b = calculate_bounds(&input, 10000).unwrap();
         assert_eq!(b.end - b.start + 1, MAX_PAGE_SIZE);
+    }
+
+    #[test]
+    fn bounds_end_clamped_to_total_in_page_mode() {
+        // 5-line file, page_size 100 → end should clamp to 5, not 100.
+        let input = json!({"page": 1, "page_size": 100});
+        let b = calculate_bounds(&input, 5).unwrap();
+        assert_eq!(b.start, 1);
+        assert_eq!(b.end, 5, "end must clamp to total_lines");
+    }
+
+    #[test]
+    fn bounds_end_clamped_to_total_in_offset_mode() {
+        // 10-line file, offset 8, limit 100 → end should clamp to 10, not 107.
+        let input = json!({"offset": 8, "limit": 100});
+        let b = calculate_bounds(&input, 10).unwrap();
+        assert_eq!(b.start, 8);
+        assert_eq!(b.end, 10, "end must clamp to total_lines");
+    }
+
+    #[test]
+    fn bounds_end_clamped_on_partial_final_page() {
+        // 150-line file, page 2 of 100 → lines 101-150, not 101-200.
+        let input = json!({"page": 2, "page_size": 100});
+        let b = calculate_bounds(&input, 150).unwrap();
+        assert_eq!(b.start, 101);
+        assert_eq!(b.end, 150, "partial final page must clamp to total");
+    }
+
+    #[test]
+    fn bounds_end_clamped_on_empty_file() {
+        // 0-line file → end should be 1 (max(1)), not 100.
+        let input = json!({});
+        let b = calculate_bounds(&input, 0).unwrap();
+        assert_eq!(b.end, 1, "empty file end must be 1 (max(1))");
+        assert_eq!(b.total_pages, Some(1), "empty file must show 1 page");
     }
 
     #[test]
@@ -967,5 +1027,80 @@ mod tests {
     fn detect_language_unknown_returns_empty() {
         assert_eq!(detect_language("a.unknownext"), "");
         assert_eq!(detect_language("Makefile"), "");
+    }
+
+    // ---- regression: malformed values rejected (not silently defaulted) ----
+
+    #[test]
+    fn bounds_reject_negative_page_size() {
+        let input = json!({"page_size": -5});
+        assert!(calculate_bounds(&input, 1000).is_err());
+    }
+
+    #[test]
+    fn bounds_reject_non_integer_page() {
+        let input = json!({"page": "abc"});
+        assert!(calculate_bounds(&input, 1000).is_err());
+    }
+
+    #[test]
+    fn bounds_reject_non_integer_offset() {
+        let input = json!({"offset": true});
+        assert!(calculate_bounds(&input, 1000).is_err());
+    }
+
+    #[test]
+    fn bounds_reject_negative_limit() {
+        let input = json!({"offset": 10, "limit": -1});
+        assert!(calculate_bounds(&input, 1000).is_err());
+    }
+
+    // ---- regression: header reports clamped range + empty-file Page 1/1 ----
+
+    #[tokio::test]
+    async fn short_file_header_shows_clamped_end() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let f = tmp.path().join("short.txt");
+        std::fs::write(&f, "a\nb\nc\n").unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let tool = FileViewerTool;
+        let ctx = ctx_in(cwd);
+        let input = json!({"file_path": "short.txt"});
+        let out = tool.call(input, &ctx).await.unwrap();
+        let text = out.text_content();
+        assert!(text.contains("Lines 1-3 of 3"), "{text}");
+        assert!(!text.contains("Lines 1-100"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn empty_file_header_shows_page_one_of_one() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let f = tmp.path().join("empty.txt");
+        std::fs::write(&f, "").unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let tool = FileViewerTool;
+        let ctx = ctx_in(cwd);
+        let input = json!({"file_path": "empty.txt"});
+        let out = tool.call(input, &ctx).await.unwrap();
+        let text = out.text_content();
+        assert!(text.contains("Page 1/1"), "{text}");
+        assert!(!text.contains("Page 1/0"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn partial_final_page_header_correct() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let f = tmp.path().join("f.txt");
+        // 150 lines → 2 pages of 100: page 2 shows lines 101-150, not 101-200.
+        let content: String = (1..=150).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(&f, &content).unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let tool = FileViewerTool;
+        let ctx = ctx_in(cwd);
+        let input = json!({"file_path": "f.txt", "page": 2});
+        let out = tool.call(input, &ctx).await.unwrap();
+        let text = out.text_content();
+        assert!(text.contains("Lines 101-150 of 150"), "{text}");
+        assert!(!text.contains("101-200"), "{text}");
     }
 }
