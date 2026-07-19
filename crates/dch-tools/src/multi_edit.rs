@@ -33,6 +33,7 @@ use crate::edit::locate_unique;
 use crate::edit::splice;
 use crate::linter::lint_content;
 use crate::util::is_url;
+use crate::util::resolve_path;
 use crate::write::format_lint_failure;
 
 /// Maximum number of edits permitted in a single call.
@@ -311,12 +312,7 @@ fn build_operations(edits: &[Value], cwd: &Path) -> Result<Vec<EditOperation>, T
             ));
         }
 
-        let path = Path::new(file_path);
-        let full_path = if path.is_relative() {
-            normalize_path(&cwd.join(path))
-        } else {
-            normalize_path(path)
-        };
+        let full_path = normalize_path(&resolve_path(file_path, cwd));
         operations.push(EditOperation {
             file_path: file_path.to_string(),
             full_path,
