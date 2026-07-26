@@ -6,6 +6,7 @@ use crate::bash::BashTool;
 use crate::edit::EditTool;
 use crate::file_viewer::FileViewerTool;
 use crate::glob::GlobTool;
+use crate::grep::GrepTool;
 use crate::multi_edit::MultiEditTool;
 use crate::read::ReadTool;
 use crate::write::WriteTool;
@@ -24,5 +25,6 @@ pub fn builtin_registry() -> ToolRegistry {
     registry.register(MultiEditTool);
     registry.register(FileViewerTool);
     registry.register(GlobTool);
+    registry.register(GrepTool);
     registry
 }
