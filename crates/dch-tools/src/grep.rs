@@ -28,8 +28,9 @@ use crate::regex_cache::get_or_compile_case_insensitive;
 use crate::util::is_url;
 use crate::util::resolve_path;
 
-/// Default per-file match cap when the caller does not supply `max_matches`.
 const DEFAULT_MAX_MATCHES: usize = 100;
+const DEFAULT_MAX_RESULTS: usize = 1000;
+const MAX_FILE_BYTES: u64 = 1024 * 1024;
 
 /// Regex content-search tool.
 ///
@@ -81,6 +82,10 @@ impl Tool for GrepTool {
                     "max_matches": {
                         "type": "integer",
                         "description": "Maximum number of matches per file (default: 100)"
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum total matches across all files (default: 1000)"
                     }
                 },
                 "required": ["pattern"]
@@ -153,6 +158,7 @@ impl GrepTool {
             include: parsed.include_patterns,
             exclude: parsed.exclude_patterns,
             max_matches: parsed.max_matches,
+            max_results: parsed.max_results,
             base,
             pattern: parsed.pattern,
             temp_dir,
@@ -195,9 +201,15 @@ struct SearchJob {
     ///
     /// Defaults to [`DEFAULT_MAX_MATCHES`] when the caller omits the field.
     /// Enforced inside [`search_file`]: once this many matches are collected
-    /// from one file, scanning that file stops. The total across files is
-    /// unbounded.
+    /// from one file, scanning that file stops.
     max_matches: usize,
+
+    /// Total match cap across all files.
+    ///
+    /// Defaults to [`DEFAULT_MAX_RESULTS`] when the caller omits the field.
+    /// Enforced in `job::run`: once this many matches are collected overall,
+    /// the walk stops. Composes with [`max_matches`](Self::max_matches).
+    max_results: usize,
 
     /// The directory to search, resolved against the runner cwd.
     ///
@@ -238,14 +250,22 @@ mod job {
     pub(super) fn run(job: &SearchJob) -> ToolOutput {
         let mut matches = Vec::new();
         for entry in walk::walk_files(&job.base, &job.include, &job.exclude) {
+            if matches.len() >= job.max_results {
+                break;
+            }
             let path = entry.path();
             if walk::likely_binary(path) {
+                continue;
+            }
+            if file_too_large(path) {
                 continue;
             }
             let Ok(content) = std::fs::read_to_string(path) else {
                 continue;
             };
-            let file_matches = search_file(&job.regex, &content, path, &job.base, job.max_matches);
+            let remaining = job.max_results.saturating_sub(matches.len());
+            let per_file = job.max_matches.min(remaining);
+            let file_matches = search_file(&job.regex, &content, path, &job.base, per_file);
             matches.extend(file_matches);
         }
 
@@ -261,6 +281,15 @@ mod job {
             }
         };
         truncate_or_write_to_temp(json, "grep", &job.temp_dir, MAX_INLINE_OUTPUT_BYTES)
+    }
+
+    /// True when `path`'s metadata size exceeds `MAX_FILE_BYTES`.
+    ///
+    /// Guards `read_to_string` against a path-matched file large enough to
+    /// OOM the tool. Metadata failures read as "not too large" so the caller
+    /// still attempts the read and surfaces the real I/O error.
+    fn file_too_large(path: &std::path::Path) -> bool {
+        std::fs::metadata(path).is_ok_and(|m| m.len() > super::MAX_FILE_BYTES)
     }
 }
 
@@ -299,9 +328,16 @@ struct ParsedInput {
     ///
     /// Defaults to [`DEFAULT_MAX_MATCHES`] when the caller omits the field or
     /// when it is absent. Enforced inside [`search_file`]: once this many
-    /// matches are collected from one file, scanning that file stops. The
-    /// total across files is unbounded.
+    /// matches are collected from one file, scanning that file stops.
     max_matches: usize,
+
+    /// Total match cap across all files.
+    ///
+    /// Defaults to [`DEFAULT_MAX_RESULTS`] when the caller omits the field.
+    /// Enforced in `job::run`: once this many matches are collected overall,
+    /// the walk stops. Composes with [`max_matches`](Self::max_matches) — a
+    /// single file is capped first, then the running total.
+    max_results: usize,
 
     /// Filename-level glob filters forwarded to the walker.
     ///
@@ -322,14 +358,15 @@ struct ParsedInput {
 ///
 /// `path` defaults to `"."`; the caller resolves it against the runner cwd.
 /// `case_insensitive` defaults to `false`; `max_matches` defaults to
-/// `DEFAULT_MAX_MATCHES`. Non-integer or negative `max_matches` values are
-/// rejected rather than silently coerced.
+/// `DEFAULT_MAX_MATCHES`; `max_results` defaults to `DEFAULT_MAX_RESULTS`.
+/// Non-integer or negative `max_matches`/`max_results` values are rejected
+/// rather than silently coerced.
 ///
 /// # Errors
 ///
 /// Returns [`ToolError::InvalidInput`] when `pattern` is missing, when
-/// `max_matches` is present but not a non-negative integer, or when an array
-/// field contains non-string elements.
+/// `max_matches` or `max_results` is present but not a non-negative integer,
+/// or when an array field contains non-string elements.
 fn parse_input(input: &Value) -> Result<ParsedInput, ToolError> {
     let pattern = input
         .get("pattern")
@@ -345,6 +382,7 @@ fn parse_input(input: &Value) -> Result<ParsedInput, ToolError> {
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let max_matches = json_usize_strict(input, "max_matches")?.unwrap_or(DEFAULT_MAX_MATCHES);
+    let max_results = json_usize_strict(input, "max_results")?.unwrap_or(DEFAULT_MAX_RESULTS);
     let include_patterns = parse_string_array(input, "include_patterns")?;
     let exclude_patterns = parse_string_array(input, "exclude_patterns")?;
     Ok(ParsedInput {
@@ -352,6 +390,7 @@ fn parse_input(input: &Value) -> Result<ParsedInput, ToolError> {
         base_path,
         case_insensitive,
         max_matches,
+        max_results,
         include_patterns,
         exclude_patterns,
     })
@@ -443,15 +482,15 @@ fn search_file(
         .unwrap_or_else(|| file_path.to_str().unwrap_or("unknown"));
     let mut results = Vec::new();
     for (line_num, line) in content.lines().enumerate() {
+        if results.len() >= max_matches {
+            break;
+        }
         if regex.is_match(line) {
             results.push(json!({
                 "file": rel_path,
                 "line": line_num.saturating_add(1),
                 "content": line
             }));
-            if results.len() >= max_matches {
-                break;
-            }
         }
     }
     results
@@ -589,6 +628,16 @@ mod tests {
         let file = Path::new("/repo/a.rs");
         let results = search_file(&regex, content, file, base, 2);
         assert_eq!(results.len(), 2, "per-file cap enforced");
+    }
+
+    #[test]
+    fn search_file_zero_max_matches_returns_empty() {
+        let regex = regex::Regex::new("x").unwrap();
+        let content = "x\nx\nx";
+        let base = Path::new("/repo");
+        let file = Path::new("/repo/a.rs");
+        let results = search_file(&regex, content, file, base, 0);
+        assert!(results.is_empty(), "max_matches=0 must yield no results");
     }
 
     #[tokio::test]
@@ -800,5 +849,57 @@ mod tests {
         assert_eq!(tool.name(), "Grep");
         let reg = crate::registry::builtin_registry();
         assert!(reg.get("Grep").is_some(), "Grep registered");
+    }
+
+    #[tokio::test]
+    async fn max_results_caps_total_across_files() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_file(tmp.path(), "a.rs", "x\nx\nx\n");
+        write_file(tmp.path(), "b.rs", "x\nx\nx\n");
+        write_file(tmp.path(), "c.rs", "x\nx\nx\n");
+        let tool = GrepTool;
+        let ctx = ctx_in(tmp.path());
+        let input = json!({"pattern": "x", "max_matches": 100, "max_results": 4});
+        let out = tool.call(input, &ctx).await.unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&out.text_content()).unwrap();
+        assert_eq!(parsed.len(), 4, "total cap stops the walk at 4");
+    }
+
+    #[tokio::test]
+    async fn max_results_composes_with_per_file_cap() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_file(tmp.path(), "a.rs", "x\nx\nx\n");
+        write_file(tmp.path(), "b.rs", "x\nx\nx\n");
+        let tool = GrepTool;
+        let ctx = ctx_in(tmp.path());
+        let input = json!({"pattern": "x", "max_matches": 2, "max_results": 3});
+        let out = tool.call(input, &ctx).await.unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&out.text_content()).unwrap();
+        assert_eq!(parsed.len(), 3, "total cap stops at 3");
+        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for v in &parsed {
+            let file = v["file"].as_str().unwrap_or("").to_string();
+            *counts.entry(file).or_insert(0) += 1;
+        }
+        let per_file_max = counts.values().copied().max().unwrap_or(0);
+        assert!(
+            per_file_max <= 2,
+            "no file exceeded the per-file cap: max was {per_file_max}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_file_is_skipped() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let big: String = "x".repeat(usize::try_from(MAX_FILE_BYTES + 1).unwrap());
+        std::fs::write(tmp.path().join("big.txt"), &big).unwrap();
+        write_file(tmp.path(), "small.txt", "x\n");
+        let tool = GrepTool;
+        let ctx = ctx_in(tmp.path());
+        let input = json!({"pattern": "x"});
+        let out = tool.call(input, &ctx).await.unwrap();
+        let text = out.text_content();
+        assert!(!text.contains("big.txt"), "oversized file skipped: {text}");
+        assert!(text.contains("small.txt"), "{text}");
     }
 }

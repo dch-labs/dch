@@ -203,16 +203,10 @@ mod tests {
     fn preview_slice_respects_char_boundary() {
         let s = "abcdefghij";
         assert_eq!(preview_slice(s), "abcdefghij");
-
-        // Multi-byte content: cutoff lands inside a 2-byte char; the slice
-        // must back up to the previous char boundary, not split the char.
-        // "é" is 2 bytes in UTF-8 (0xC3 0xA9); 5 such chars = 10 bytes.
-        let multi = "ééééé";
-        assert_eq!(multi.len(), 10);
-        // Force PREVIEW_BYTES lower via a direct call shape: preview_slice
-        // uses the const, so this asserts the function is boundary-safe at
-        // the const limit. For a sub-const slice, floor_char_boundary on a
-        // cutoff inside the multi-byte content still returns a char boundary.
-        let _ = preview_slice(multi);
+        let ascii_prefix = "a".repeat(PREVIEW_BYTES - 1);
+        let content = format!("{ascii_prefix}ééé");
+        assert!(content.len() > PREVIEW_BYTES);
+        let preview = preview_slice(&content);
+        assert_eq!(preview, ascii_prefix);
     }
 }

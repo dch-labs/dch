@@ -116,8 +116,11 @@ fn insert_cached(pattern: String, regex: Regex) {
 )]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use std::sync::atomic::AtomicU64;
     use std::sync::atomic::Ordering;
+
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     pub fn cache_size() -> usize {
         REGEX_CACHE.lock().map_or(0, |c| c.len())
@@ -139,6 +142,7 @@ mod tests {
 
     #[test]
     fn cache_hit_returns_matching_regex() {
+        let _guard = TEST_LOCK.lock().unwrap();
         clear_cache();
         let m = marker("hit");
         let re1 = get_or_compile(&m).unwrap();
@@ -149,6 +153,7 @@ mod tests {
 
     #[test]
     fn cache_miss_compiles_distinct_patterns() {
+        let _guard = TEST_LOCK.lock().unwrap();
         let m1 = marker("miss_a");
         let m2 = marker("miss_b");
         let re1 = get_or_compile(&m1).unwrap();
@@ -160,6 +165,7 @@ mod tests {
 
     #[test]
     fn cache_evicts_at_capacity() {
+        let _guard = TEST_LOCK.lock().unwrap();
         for i in 0..(MAX_CACHE_SIZE + 50) {
             let p = format!("eviction_{}_{}", std::process::id(), i);
             let _ = get_or_compile(&p).unwrap();
@@ -171,6 +177,7 @@ mod tests {
 
     #[test]
     fn cache_lru_reorders_on_access() {
+        let _guard = TEST_LOCK.lock().unwrap();
         clear_cache();
         let first = marker("lru_first");
         let _second = marker("lru_second");
@@ -182,6 +189,7 @@ mod tests {
 
     #[test]
     fn case_insensitive_matches_uppercase() {
+        let _guard = TEST_LOCK.lock().unwrap();
         let m = marker("ci");
         let re = get_or_compile_case_insensitive(&m).unwrap();
         assert!(re.is_match(&m.to_uppercase()));
@@ -190,6 +198,7 @@ mod tests {
 
     #[test]
     fn case_insensitive_is_idempotent() {
+        let _guard = TEST_LOCK.lock().unwrap();
         let m = marker("ci_idem");
         let wrapped = format!("(?i){m}");
         // Both forms should compile and match case-insensitively.
@@ -201,12 +210,14 @@ mod tests {
 
     #[test]
     fn invalid_regex_errors() {
+        let _guard = TEST_LOCK.lock().unwrap();
         let result = get_or_compile("(unclosed");
         assert!(result.is_err());
     }
 
     #[test]
     fn clear_cache_empties_state() {
+        let _guard = TEST_LOCK.lock().unwrap();
         let m = marker("clear");
         let _ = get_or_compile(&m).unwrap();
         assert!(cache_size() > 0);
