@@ -17,6 +17,8 @@ base64     = { workspace = true }
 libc       = "0.2"
 tempfile   = { workspace = true }
 ignore     = { workspace = true }
+regex      = { workspace = true }
+tracing    = { workspace = true }
 
 [dev-dependencies]
 
