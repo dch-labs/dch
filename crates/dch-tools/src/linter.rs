@@ -179,8 +179,12 @@ fn lint_yaml(content: &str) -> LinterResult {
 /// that Python would reject) are acceptable; false positives (failing valid
 /// content) are not.
 ///
-/// This replaces the salvage's `python3 -m py_compile` subprocess call, which
-/// required a Python interpreter at runtime and broke the synchronous contract.
+/// Validate Python source via a fast in-process structural check.
+///
+/// Runs without spawning a Python interpreter (which would require one at
+/// runtime and break the synchronous contract). The check catches the common
+/// structural errors the model makes (unbalanced delimiters, broken
+/// indentation) without attempting full syntax validation.
 fn lint_python(content: &str) -> LinterResult {
     for (i, line) in content.lines().enumerate() {
         let leading = line
@@ -206,10 +210,8 @@ fn lint_python(content: &str) -> LinterResult {
 ///
 /// If any counter goes negative (an unmatched closer) or any counter is
 /// nonzero at EOF (an unmatched opener), the content is rejected. This
-/// catches the most common structural errors without a full parser.
-///
-/// This replaces the salvage's `node --check` subprocess call, which required
-/// Node.js at runtime and broke the synchronous contract.
+/// catches the most common structural errors without a full parser, and
+/// runs in-process with no external runtime dependency.
 fn lint_js(content: &str) -> LinterResult {
     let mut paren = 0u32;
     let mut bracket = 0u32;

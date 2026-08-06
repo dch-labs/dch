@@ -61,8 +61,8 @@ enum OutputFormat {
     /// Wraps the *entire* view window in a single fenced code block with a
     /// language tag from [`detect_language`] (e.g. ` ```rust\n…\n``` `). This
     /// is cheap (no parser dependency), useful for non-terminal consumers, and
-    /// corrects the salvage's per-line fencing bug. Selected by `"markdown"`
-    /// or `"md"`.
+    /// emits a single fence pair around the whole window rather than per-line
+    /// fences. Selected by `"markdown"` or `"md"`.
     Markdown,
 }
 
@@ -407,9 +407,10 @@ impl ViewBounds {
     /// In page-based mode: `File: <path> (Page n/N)\nLines a-b of T`.
     /// In offset-based mode: `File: <path>\nLines a-b of T` (no page info).
     ///
-    /// The exact strings are ported verbatim from the salvage source — the
-    /// model has learned to read this format, and T-SP/T-28 may parse it.
-    /// Do not change the wording without a coordinated task.
+    /// The exact header wording is a stable contract: the model has learned
+    /// to read this format, and downstream consumers (the TUI's tool-call
+    /// display) may parse it. Do not change the wording without coordinating
+    /// across all readers.
     fn format_header(&self, file_path: &str) -> String {
         let page_info = if let (Some(page), Some(total_pages)) = (self.page, self.total_pages) {
             format!(" (Page {page}/{total_pages})")
@@ -433,8 +434,9 @@ impl ViewBounds {
     ///
     /// Returns an empty string when the window spans the entire file (no
     /// navigation possible), so the caller can omit the hint entirely. The
-    /// hint string format (`[Navigate: k=v | k=v]`) is ported verbatim from
-    /// the salvage source.
+    /// hint string format (`[Navigate: k=v | k=v]`) is a stable contract —
+    /// the model has learned to act on it, so do not reword without
+    /// coordinating across all readers.
     fn format_hint(&self) -> String {
         let mut hints = Vec::new();
 
@@ -1029,8 +1031,6 @@ mod tests {
         assert_eq!(detect_language("Makefile"), "");
     }
 
-    // ---- regression: malformed values rejected (not silently defaulted) ----
-
     #[test]
     fn bounds_reject_negative_page_size() {
         let input = json!({"page_size": -5});
@@ -1054,8 +1054,6 @@ mod tests {
         let input = json!({"offset": 10, "limit": -1});
         assert!(calculate_bounds(&input, 1000).is_err());
     }
-
-    // ---- regression: header reports clamped range + empty-file Page 1/1 ----
 
     #[tokio::test]
     async fn short_file_header_shows_clamped_end() {

@@ -1,6 +1,6 @@
 //! The `Glob` tool — gitignore-aware file globbing.
 //!
-//! Walks a directory with the shared [`walk_files`](crate::walk_files) walker
+//! Walks a directory with the shared [`walk_files`](crate::walk::walk_files) walker
 //! and returns the relative paths of files matching a glob pattern. Pattern
 //! matching uses ripgrep's glob engine (`ignore::overrides::Override`), which
 //! supports `*`, `?`, `**`, character classes `[abc]`, and brace expansion
@@ -28,7 +28,7 @@ use crate::walk;
 /// Gitignore-aware file globbing tool.
 ///
 /// `Glob` resolves its `path` against the runner's cwd (or walks `.` when no
-/// path is given), filters the file tree with [`walk_files`](crate::walk_files)
+/// path is given), filters the file tree with [`walk_files`](crate::walk::walk_files)
 /// (which honors `.gitignore`, `.git/info/exclude`, global gitignore,
 /// `.dchignore`, and an always-exclude list), and returns the relative paths
 /// of files matching the user's `pattern`. Pattern matching uses ripgrep's

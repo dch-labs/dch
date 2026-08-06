@@ -78,10 +78,6 @@ const UNSAFE_SUBSTRINGS: &[&str] = &[
     "git remote rename",
 ];
 
-// ===========================================================
-// Background job table
-// ===========================================================
-
 /// Status of a background job.
 ///
 /// Stored inside [`BackgroundJob`] in the global job table. Transitions are
@@ -241,10 +237,6 @@ fn cleanup_jobs() -> usize {
     before.saturating_sub(table.len())
 }
 
-// ===========================================================================
-// Process-group guard
-// ===========================================================================
-
 /// RAII guard that kills a child's process group on drop.
 ///
 /// On timeout cancellation, `tokio::time::timeout` drops the future, dropping
@@ -269,10 +261,6 @@ impl Drop for ChildGuard {
         }
     }
 }
-
-// ===========================================================================
-// Tool
-// ===========================================================================
 
 /// Execute a bash command. Supports background jobs, timeout enforcement, and
 /// a dynamic concurrency check (read-only commands are safe to run concurrently).

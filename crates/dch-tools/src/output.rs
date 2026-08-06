@@ -35,7 +35,10 @@ const PREVIEW_BYTES: usize = 10 * 1024;
 /// If `content.len()` is at or under `threshold`, it is returned inline. If it
 /// exceeds `threshold`, it is written to a fresh file under `temp_dir` and the
 /// returned text names the path, carries a `preview` of the first ~10 `KiB`,
-/// and points the caller at the file-viewer tool for the full content.
+/// and points the caller at the file-viewer tool for the full content. The
+/// spilled file is persisted via `NamedTempFile::keep`, which releases the
+/// open handle and marks the file non-deletable on drop, so the caller can
+/// read the path later.
 ///
 /// `threshold` is a parameter (not a const read inside) so tests can drive the
 /// spill path with a tiny fixture instead of generating 50 `KiB` of content.
@@ -72,8 +75,6 @@ pub fn truncate_or_write_to_temp(
         return ToolOutput::text(truncate_inline(&content));
     }
 
-    // `.keep()` releases the open handle and marks the file persistent: its
-    // Drop will not delete it, so the caller can read the path later.
     let path = match named.keep() {
         Ok((_file, path)) => path,
         Err(e) => {

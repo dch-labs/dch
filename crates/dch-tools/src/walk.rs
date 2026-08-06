@@ -202,6 +202,22 @@ pub fn likely_binary(path: &Path) -> bool {
     text_bytes < threshold
 }
 
+/// Upper bound on a file's byte size before a search tool reads it whole.
+///
+/// Guards the whole-file `read_to_string` path in `Grep` and `CodeSearch`
+/// against a path-matched file large enough to OOM the tool. Text files over
+/// a megabyte are almost never productive search targets.
+pub const MAX_FILE_BYTES: u64 = 1024 * 1024;
+
+/// Whether `path`'s metadata size exceeds [`MAX_FILE_BYTES`].
+///
+/// Metadata failures read as "not too large" so the caller still attempts the
+/// read and surfaces the real I/O error rather than silently skipping.
+#[must_use]
+pub fn file_too_large(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| m.len() > MAX_FILE_BYTES)
+}
+
 #[cfg(test)]
 #[allow(
     clippy::expect_used,

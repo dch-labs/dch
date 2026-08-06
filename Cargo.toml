@@ -38,6 +38,7 @@ tempfile   = "3"
 base64     = "0.22"
 ignore     = "0.4"
 regex      = "1"
+lru        = "0.18.2"
 
 dch        = { path = "crates/dch" }
 dch-loop    = { path = "crates/dch-loop" }

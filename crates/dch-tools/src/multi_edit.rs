@@ -519,7 +519,7 @@ struct EditConflict {
 /// Two edits to one file conflict when one's matched byte-range intersects the
 /// other's (one contains the other, or they share text). Applying either first
 /// would invalidate the other's match. Different files never conflict, even
-/// with identical `old_text`. Ported from the salvage source.
+/// with identical `old_text`.
 fn detect_edit_conflicts(
     operations: &[EditOperation],
     file_contents: &BTreeMap<String, String>,
@@ -1600,8 +1600,6 @@ mod tests {
         assert!(reg.get("MultiEdit").is_some(), "MultiEdit registered");
     }
 
-    // ---- build_preview (pure) ----
-
     #[test]
     fn build_preview_dry_run_header_and_footer() {
         let ops = vec![op("a.rs", "fn one() {}", "fn one(x: i32) {}")];
@@ -1649,8 +1647,6 @@ mod tests {
         assert!(out.contains("  Changed: b.rs"), "{out}");
     }
 
-    // ---- apply_summary (pure) ----
-
     #[test]
     fn apply_summary_counts_applied_files() {
         let preview = "Multi-File Edit Summary\n";
@@ -1684,8 +1680,6 @@ mod tests {
         assert!(out.starts_with("header line\nbody\n"), "{out}");
         assert!(out.contains("━━━"), "{out}");
     }
-
-    // ---- multi_edit_inner (async, output-shape assertions) ----
 
     #[tokio::test]
     async fn multi_edit_inner_dry_run_returns_preview_not_summary() {
