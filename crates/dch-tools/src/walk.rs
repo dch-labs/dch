@@ -69,6 +69,102 @@ pub fn walk_files(
     )
 }
 
+/// One entry (file or directory) yielded by [`walk_entries`].
+///
+/// Wraps the path and whether it's a directory so the Tree tool can render
+/// both nodes without a second metadata lookup.
+#[derive(Debug, Clone)]
+pub struct WalkEntry {
+    /// The entry's path relative to the filesystem root (absolute or as-is).
+    ///
+    /// The path the walker produces — same as `ignore::DirEntry::path()`.
+    pub path: std::path::PathBuf,
+
+    /// Whether this entry is a directory rather than a regular file.
+    ///
+    /// Drives the trailing-slash rendering in the Tree tool and the
+    /// dirs-before-files sort order. Set by [`walk_entries`] from the
+    /// walker's `file_type()`; never derived elsewhere.
+    pub is_dir: bool,
+}
+
+/// Directories the walker always prunes, even without `.gitignore`.
+///
+/// These mirror [`build_default_overrides`] but are checked at the directory
+/// level — the `ignore` crate's override patterns filter files, not directory
+/// descent, so a directory like `target/` would still be yielded as a node
+/// even though its children are excluded. This list prevents the directory
+/// itself from appearing in tree output.
+const ALWAYS_PRUNE_DIRS: &[&str] = &[
+    "target",
+    "node_modules",
+    ".git",
+    "__pycache__",
+    ".next",
+    ".venv",
+    "venv",
+    "dist",
+    "build",
+    ".cache",
+];
+
+/// Walk `base` yielding both files and directories, gitignore-aware.
+///
+/// Shares the same `WalkBuilder` config as [`walk_files`] (hidden entries
+/// skipped, `.gitignore`/`.git/info/exclude`/global gitignore/`.dchignore`
+/// honored, always-exclude overrides applied) but does **not** filter to
+/// files only. The optional `max_depth` caps the traversal depth (number of
+/// path components below `base`; `None` = unlimited). Used by the Tree tool,
+/// which needs directory nodes as well as files.
+///
+/// Directories matching the always-prune list (`target`, `node_modules`, etc.)
+/// are excluded entirely (node and children), because the `ignore` crate's
+/// override patterns filter files only, not directory descent.
+#[must_use]
+pub fn walk_entries(base: &Path, max_depth: Option<usize>) -> Vec<WalkEntry> {
+    let mut builder = ignore::WalkBuilder::new(base);
+    builder
+        .hidden(true)
+        .git_ignore(true)
+        .git_exclude(true)
+        .git_global(true)
+        .add_custom_ignore_filename(".dchignore");
+    builder.max_depth(max_depth);
+
+    let overrides = build_default_overrides(base);
+    builder.overrides(overrides);
+
+    builder
+        .build()
+        .filter_map(std::result::Result::ok)
+        .skip(1)
+        .filter(|e| {
+            if e.file_type().is_some_and(|ft| ft.is_dir()) {
+                let name = e.path().file_name().and_then(|n| n.to_str()).unwrap_or("");
+                !ALWAYS_PRUNE_DIRS.contains(&name)
+            } else {
+                true
+            }
+        })
+        .filter_map(|e| {
+            let ft = e.file_type()?;
+            if ft.is_dir() {
+                Some(WalkEntry {
+                    path: e.path().to_path_buf(),
+                    is_dir: true,
+                })
+            } else if ft.is_file() {
+                Some(WalkEntry {
+                    path: e.path().to_path_buf(),
+                    is_dir: false,
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 /// Build the always-exclude override set for a search root.
 ///
 /// These directories are removed from results regardless of `.gitignore`,
@@ -492,5 +588,168 @@ mod tests {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let got = walked(tmp.path(), &[], &[]);
         assert!(got.is_empty(), "{got:?}");
+    }
+
+    /// Walk `base` and return `(relative_path, is_dir)` for each entry, sorted.
+    ///
+    /// Sorting makes the assertion order-independent: `ignore`'s traversal
+    /// order is not lexical, and `walk_entries` does not sort its output.
+    fn walked_entries(base: &Path, max_depth: Option<usize>) -> Vec<(String, bool)> {
+        let mut out: Vec<(String, bool)> = walk_entries(base, max_depth)
+            .iter()
+            .map(|e| {
+                let rel = e
+                    .path
+                    .strip_prefix(base)
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                (rel, e.is_dir)
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn walk_entries_yields_dirs_and_files() {
+        // Unlike walk_files, directories must appear as entries alongside
+        // files — this is the whole reason walk_entries exists.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("src")).expect("mkdir");
+        std::fs::write(tmp.path().join("a.rs"), "").expect("write");
+        std::fs::write(tmp.path().join("src/b.rs"), "").expect("write");
+        let got = walked_entries(tmp.path(), None);
+        assert!(
+            got.contains(&("a.rs".to_string(), false)),
+            "file present: {got:?}"
+        );
+        assert!(
+            got.contains(&("src/b.rs".to_string(), false)),
+            "nested file present: {got:?}"
+        );
+        assert!(
+            got.contains(&("src".to_string(), true)),
+            "directory present with is_dir=true: {got:?}"
+        );
+    }
+
+    #[test]
+    fn walk_entries_skips_root_itself() {
+        // The walker yields the root first; walk_entries drops it so the
+        // caller never sees the base path in its own output.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(tmp.path().join("a.rs"), "").expect("write");
+        let got = walked_entries(tmp.path(), None);
+        let root_name = tmp
+            .path()
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        assert!(
+            !got.iter().any(|(p, _)| p == root_name || p.is_empty()),
+            "root must not appear in output: {got:?}"
+        );
+    }
+
+    #[test]
+    fn walk_entries_prunes_always_exclude_dirs_without_git() {
+        // The core subtlety: ignore's override patterns filter FILES, not
+        // directory descent — so a `target/` dir would still be yielded as a
+        // node even though its files are excluded. ALWAYS_PRUNE_DIRS removes
+        // the directory node itself. Prove it without .git/.gitignore so the
+        // blocklist is the only thing doing the pruning.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("target/debug")).expect("mkdir");
+        std::fs::write(tmp.path().join("target/debug/foo"), "").expect("write");
+        std::fs::create_dir_all(tmp.path().join("node_modules/pkg")).expect("mkdir");
+        std::fs::write(tmp.path().join("node_modules/pkg/index.js"), "").expect("write");
+        std::fs::write(tmp.path().join("main.rs"), "").expect("write");
+        let got = walked_entries(tmp.path(), None);
+        assert!(
+            !got.iter()
+                .any(|(p, _)| p == "target" || p.starts_with("target/")),
+            "target/ dir node and children must be pruned: {got:?}"
+        );
+        assert!(
+            !got.iter()
+                .any(|(p, _)| p == "node_modules" || p.starts_with("node_modules/")),
+            "node_modules/ dir node and children must be pruned: {got:?}"
+        );
+        assert!(
+            got.contains(&("main.rs".to_string(), false)),
+            "main.rs kept: {got:?}"
+        );
+    }
+
+    #[test]
+    fn walk_entries_depth_none_is_unlimited() {
+        // max_depth = None must reach arbitrarily deep nesting.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("a/b/c/d/e")).expect("mkdir");
+        std::fs::write(tmp.path().join("a/b/c/d/e/deep.rs"), "").expect("write");
+        let got = walked_entries(tmp.path(), None);
+        assert!(
+            got.contains(&("a/b/c/d/e/deep.rs".to_string(), false)),
+            "unlimited depth reaches the leaf: {got:?}"
+        );
+    }
+
+    #[test]
+    fn walk_entries_depth_caps_components_below_root() {
+        // `ignore`'s max_depth counts path components below the root:
+        // `a` = depth 1, `a/b` = depth 2, `a/b/l2.rs` = depth 3. So
+        // max_depth=2 yields the `a/b` dir node and the `a/l1.rs` file but
+        // cuts off everything at depth 3. Pin this boundary so a future
+        // change to the cap semantics is caught.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("a/b/c")).expect("mkdir");
+        std::fs::write(tmp.path().join("a/l1.rs"), "").expect("write");
+        std::fs::write(tmp.path().join("a/b/l2.rs"), "").expect("write");
+        std::fs::write(tmp.path().join("a/b/c/l3.rs"), "").expect("write");
+        let got = walked_entries(tmp.path(), Some(2));
+        assert!(
+            got.contains(&("a".to_string(), true)),
+            "depth-1 dir node in range: {got:?}"
+        );
+        assert!(
+            got.contains(&("a/b".to_string(), true)),
+            "depth-2 dir node in range: {got:?}"
+        );
+        assert!(
+            got.contains(&("a/l1.rs".to_string(), false)),
+            "depth-2 file in range: {got:?}"
+        );
+        assert!(
+            !got.contains(&("a/b/l2.rs".to_string(), false)),
+            "depth-3 file out of range: {got:?}"
+        );
+        assert!(
+            !got.contains(&("a/b/c".to_string(), true)),
+            "depth-3 dir node out of range: {got:?}"
+        );
+        assert!(
+            !got.contains(&("a/b/c/l3.rs".to_string(), false)),
+            "depth-4 file out of range: {got:?}"
+        );
+    }
+
+    #[test]
+    fn walk_entries_respects_gitignore_in_git_repo() {
+        // walk_entries shares the gitignore config with walk_files; confirm a
+        // gitignored file is absent from entry output too.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        make_git_repo(tmp.path());
+        std::fs::write(tmp.path().join(".gitignore"), "ignored.rs\n").expect("write gitignore");
+        std::fs::write(tmp.path().join("ignored.rs"), "").expect("write");
+        std::fs::write(tmp.path().join("kept.rs"), "").expect("write");
+        let got = walked_entries(tmp.path(), None);
+        assert!(
+            got.contains(&("kept.rs".to_string(), false)),
+            "kept file present: {got:?}"
+        );
+        assert!(
+            !got.contains(&("ignored.rs".to_string(), false)),
+            "gitignored file absent: {got:?}"
+        );
     }
 }
