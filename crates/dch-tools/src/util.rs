@@ -31,6 +31,11 @@ pub fn mime_type_from_extension(ext: &str) -> Option<&'static str> {
 }
 
 /// MIME type for a file path, based on its extension.
+///
+/// Thin wrapper over [`mime_type_from_extension`] that extracts the extension
+/// first. Returns `None` for paths without a recognized image extension, so
+/// callers can branch on "is this an image?" without re-implementing the
+/// extension lookup. Case-insensitive (`.JPG` matches).
 #[must_use]
 pub fn mime_type_from_path(path: &Path) -> Option<&'static str> {
     path.extension()
@@ -57,6 +62,11 @@ pub fn is_image_file(path: &str) -> bool {
 }
 
 /// Whether a string looks like an HTTP(S) URL.
+///
+/// Used by every file-touching tool to reject URLs early with a consistent
+/// "use `WebFetch`" message, so a model that sends `Read` against `https://…`
+/// gets a clear redirect instead of a confusing filesystem error. Returns
+/// `false` for `file://`, `ftp://`, bare paths, and empty strings.
 #[must_use]
 pub fn is_url(path: &str) -> bool {
     path.starts_with("http://") || path.starts_with("https://")

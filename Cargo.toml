@@ -5,7 +5,7 @@ members = ["crates/*", "xtask"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.94"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/dch-labs/dch"
 homepage = "https://github.com/dch-labs/dch"
@@ -13,7 +13,7 @@ readme = "README.md"
 authors = ["dch"]
 
 [workspace.dependencies]
-loopctl = { version = "0.1", features = ["openai", "anthropic", "hooks", "testing"] }
+loopctl = { version = "0.2.1", features = ["openai", "anthropic", "hooks", "testing"] }
 
 tokio       = { version = "1.52.3", features = ["sync", "macros", "time", "rt-multi-thread"] }
 serde       = { version = "1", features = ["derive"] }

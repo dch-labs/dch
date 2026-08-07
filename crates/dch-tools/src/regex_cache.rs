@@ -18,18 +18,10 @@ use std::sync::OnceLock;
 use lru::LruCache;
 use regex::Regex;
 
-/// Maximum number of compiled regexes kept in the cache.
-///
-/// Each compiled regex uses roughly 1–10 `KiB`, so 256 entries caps the cache
-/// at ~256 `KiB`–2.5 `MiB` — ample for the small set of patterns a single
-/// agent run tends to repeat, small enough to be forgettable.
+/// Maximum number of compiled regexes kept in the cache (256 ≈ a few `MiB`).
 const CACHE_CAPACITY: usize = 256;
 
-/// The process-global cache.
-///
-/// `OnceLock` because [`LruCache::new`] is not `const` (it allocates the
-/// internal sharded storage), so the cache cannot live in a bare `static`.
-/// Initialized on first use; every access goes through [`cache`].
+/// The process-global regex cache; `OnceLock` because `LruCache::new` is not `const`.
 static REGEX_CACHE: OnceLock<Mutex<LruCache<String, Regex>>> = OnceLock::new();
 
 /// Return the process-global regex cache, initializing it on first access.

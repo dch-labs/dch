@@ -25,6 +25,7 @@ use crate::context::RunnerContext;
 use crate::context::runner_ctx;
 use crate::input::get_usize;
 use crate::output::MAX_INLINE_OUTPUT_BYTES;
+use crate::output::session_temp_dir;
 use crate::output::truncate_or_write_to_temp;
 use crate::search::Match;
 use crate::search::SearchJob;
@@ -33,8 +34,11 @@ use crate::search::no_matches_message;
 use crate::util::is_url;
 use crate::util::resolve_path;
 
+/// Default total match cap across all files when the caller omits `max_results`.
 const DEFAULT_MAX_RESULTS: usize = 50;
+/// Hard ceiling `max_results` is clamped to, regardless of what the caller asks.
 const RESULTS_CAP: usize = 200;
+/// Hard ceiling `context_lines` is clamped to, regardless of what the caller asks.
 const MAX_CONTEXT_LINES: usize = 5;
 
 /// Token-efficient regex code search — the "show me where matches are" search.
@@ -119,7 +123,7 @@ impl Tool for CodeSearchTool {
         ctx: &ToolContext,
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
         let rc = runner_ctx(ctx).cloned();
-        let temp_dir = PathBuf::from(ctx.temp_dir.clone());
+        let temp_dir = session_temp_dir(Path::new(&ctx.temp_dir), ctx.session_id);
         Box::pin(self.code_search_inner(input, rc, temp_dir))
     }
 
@@ -390,8 +394,6 @@ fn push_range(out: &mut Vec<LineRange>, start: usize, end: usize) {
 mod tests {
     use super::*;
     use crate::context::RunnerContext;
-    use crate::runtime::RuntimeConfig;
-    use crate::state::SessionState;
     use loopctl::tool::ToolContext;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -402,9 +404,8 @@ mod tests {
         ctx.cwd = dir.to_string_lossy().into_owned();
         let rc = RunnerContext {
             cwd: PathBuf::from(dir),
-            session_state: Arc::new(Mutex::new(SessionState::default())),
+            todos: Arc::new(Mutex::new(Vec::new())),
             question_tx: None,
-            runtime: RuntimeConfig::default(),
         };
         ctx.set_extension(rc);
         ctx

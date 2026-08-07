@@ -20,6 +20,7 @@ pub struct LinterResult {
     /// Whether the content passed all validation checks. When `false`,
     /// `errors` is guaranteed non-empty.
     pub is_valid: bool,
+
     /// Validation errors found. Empty when `is_valid` is `true`; currently
     /// holds exactly one entry (validators return early), but the `Vec` leaves
     /// room for multi-error reporting without changing the public type.
@@ -38,12 +39,22 @@ pub struct LinterError {
     /// it. `None` for validators without position info (e.g. `syn` on stable
     /// toolchains); always `Some` for the Python indentation heuristic.
     pub line: Option<usize>,
+
     /// Human-readable description of the validation error.
+    ///
+    /// Produced by the validator that found the problem (e.g. `syn`'s error
+    /// string for Rust, the JS delimiter-counter's "unmatched closing brace"
+    /// for JS/TS). Surfaced verbatim to the model in the lint-failure message
+    /// so it can correct the input and retry.
     pub message: String,
 }
 
 impl LinterResult {
     /// Construct a passing result with no errors.
+    ///
+    /// Returns a [`LinterResult`] with `is_valid == true` and an empty error
+    /// list. Used by every validator's success path — the content passed all
+    /// checks, so there is nothing to report.
     fn pass() -> Self {
         Self {
             is_valid: true,
@@ -52,6 +63,11 @@ impl LinterResult {
     }
 
     /// Construct a failing result carrying a single error.
+    ///
+    /// Returns a [`LinterResult`] with `is_valid == false` and the given
+    /// [`LinterError`] as the sole entry. Validators return early on the first
+    /// error, so the list holds exactly one entry today; the `Vec` leaves room
+    /// for multi-error reporting without changing the public type.
     fn fail(error: LinterError) -> Self {
         Self {
             is_valid: false,
@@ -65,6 +81,7 @@ impl LinterError {
     ///
     /// Used by validators that cannot determine the line (e.g. `syn` on stable
     /// toolchains, or parsers that report a structural error without a span).
+    /// The model still gets the message — it just can't jump to the position.
     fn msg(message: impl Into<String>) -> Self {
         Self {
             line: None,
@@ -75,7 +92,8 @@ impl LinterError {
     /// Construct an error at a specific 1-indexed line.
     ///
     /// Used by validators that track position as they scan (e.g. the Python
-    /// indentation heuristic).
+    /// indentation heuristic). The line number lets the lint-failure message
+    /// direct the model to the exact spot to fix.
     fn at(line: usize, message: impl Into<String>) -> Self {
         Self {
             line: Some(line),
@@ -169,36 +187,256 @@ fn lint_yaml(content: &str) -> LinterResult {
     }
 }
 
-/// Heuristic indentation check for Python source.
-///
-/// Flags lines whose leading whitespace mixes tabs and spaces — a common
-/// `IndentationError` cause that the Python interpreter rejects at runtime.
-/// The check is intentionally conservative: it does not verify consistent
-/// indentation depth across blocks, validate syntax, or detect mixed
-/// indentation on non-leading whitespace. False negatives (passing content
-/// that Python would reject) are acceptable; false positives (failing valid
-/// content) are not.
-///
 /// Validate Python source via a fast in-process structural check.
 ///
 /// Runs without spawning a Python interpreter (which would require one at
-/// runtime and break the synchronous contract). The check catches the common
-/// structural errors the model makes (unbalanced delimiters, broken
-/// indentation) without attempting full syntax validation.
+/// runtime and break the synchronous contract). Two structural error families
+/// the model commonly makes are caught without attempting full syntax
+/// validation:
+///
+/// - **Indentation** — lines that mix tabs and spaces in leading whitespace,
+///   or whose dedent returns to an indentation level that was never
+///   established by an outer block (`unindent does not match any outer
+///   indentation level`). Consistent-but-unconventional depths (hanging
+///   indents, aligned continuation lines) are not penalized.
+/// - **Delimiters** — unmatched `()`, `[]`, or `{}`, scanning past `#` line
+///   comments and single-quoted, double-quoted, and triple-quoted strings.
+///
+/// False negatives (passing content Python would reject) are acceptable;
+/// false positives (failing valid content) are not.
 fn lint_python(content: &str) -> LinterResult {
-    for (i, line) in content.lines().enumerate() {
-        let leading = line
-            .chars()
-            .take_while(|c| *c == ' ' || *c == '\t')
-            .collect::<String>();
-        if leading.contains('\t') && leading.contains(' ') {
-            return LinterResult::fail(LinterError::at(
-                i.saturating_add(1),
-                "inconsistent indentation: mixes tabs and spaces",
-            ));
-        }
+    if let Some(err) = python_indent_check(content) {
+        return LinterResult::fail(err);
+    }
+    if let Some(err) = python_delimiter_check(content) {
+        return LinterResult::fail(err);
     }
     LinterResult::pass()
+}
+
+/// One stage of [`lint_python`]: indentation consistency.
+///
+/// Flags two cases: leading whitespace that mixes tabs and spaces on the same
+/// line, and a dedent that lands on a width no outer block established. Blank
+/// lines and lines whose first non-whitespace character is `#` are skipped so
+/// they don't perturb the indent stack. Continuation lines inside open `()`,
+/// `[]`, or `{}` groups are also skipped (Python ignores their indentation),
+/// tracked via a running delimiter depth.
+fn python_indent_check(content: &str) -> Option<LinterError> {
+    let mut indent_stack: Vec<usize> = vec![0];
+    let mut delim_depth = 0i32;
+    for (i, raw) in content.lines().enumerate() {
+        let line_no = i.saturating_add(1);
+        let trimmed = raw.trim_start();
+        if delim_depth > 0 || trimmed.is_empty() || trimmed.starts_with('#') {
+            delim_depth = delim_depth.saturating_add(python_net_delimiters(trimmed));
+            continue;
+        }
+        let leading = raw.len().saturating_sub(trimmed.len());
+        if leading > 0 {
+            let prefix = &raw[..leading];
+            if prefix.contains('\t') && prefix.contains(' ') {
+                return Some(LinterError::at(
+                    line_no,
+                    "inconsistent indentation: mixes tabs and spaces",
+                ));
+            }
+        }
+        match indent_stack.last() {
+            Some(&top) if leading == top => {}
+            Some(&top) if leading > top => {
+                indent_stack.push(leading);
+            }
+            _ => {
+                while indent_stack.last().is_some_and(|&w| w > leading) {
+                    indent_stack.pop();
+                }
+                if indent_stack.last().is_none_or(|&w| w != leading) {
+                    return Some(LinterError::at(
+                        line_no,
+                        "inconsistent indentation: dedent does not match any outer level",
+                    ));
+                }
+            }
+        }
+        delim_depth = delim_depth.saturating_add(python_net_delimiters(trimmed));
+    }
+    None
+}
+
+/// Net delimiter balance of a single Python line, for continuation detection.
+///
+/// Drives a [`PythonScanner`] over the line, summing `+1` per opener and `-1`
+/// per closer, so the string/comment-skipping logic is shared with
+/// [`python_delimiter_check`]. Returns 0 for a line that is entirely inside a
+/// string or comment. A limitation: a triple-quoted string opened on a prior
+/// line makes this line's content "inside a string," which a per-line scanner
+/// cannot detect — such a line is scanned as if top-level. This rarely matters
+/// (continuation lines inside triple strings are unusual) and was already the
+/// behavior of the per-line heuristic this replaces.
+fn python_net_delimiters(line: &str) -> i32 {
+    let mut depth = 0i32;
+    let mut scanner = PythonScanner::new(line);
+    while let Some(ch) = scanner.next_structural() {
+        match ch {
+            '(' | '[' | '{' => depth = depth.saturating_add(1),
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    depth
+}
+
+/// A character-stream scanner that skips Python string literals and comments.
+///
+/// Wraps a `Peekable<Chars>` and yields only the *structural* characters the
+/// Python checks care about: the delimiters `()[]{}` and `\n` (as a line
+/// boundary for the per-line continuation check). String bodies —
+/// single-quoted, double-quoted (with `\` escapes), and triple-quoted (which
+/// may span lines) — and `#` comment bodies are consumed silently and never
+/// yield a character of their own. Both [`python_delimiter_check`]
+/// (whole-content balancing) and the per-line continuation depth used by
+/// [`python_indent_check`] drive this scanner so the string/comment-skipping
+/// logic lives in exactly one place.
+struct PythonScanner<'a> {
+    chars: std::iter::Peekable<std::str::Chars<'a>>,
+}
+
+impl<'a> PythonScanner<'a> {
+    /// Build a scanner over `source`.
+    fn new(source: &'a str) -> Self {
+        Self {
+            chars: source.chars().peekable(),
+        }
+    }
+
+    /// Advance to and return the next structural character.
+    ///
+    /// Returns the next `(`, `)`, `[`, `]`, `{`, `}`, or `\n`, skipping any
+    /// string literal or `#` comment body encountered along the way. `None` at
+    /// EOF. Comments are consumed up to (but not including) the next `\n`, so a
+    /// comment never yields a structural character of its own.
+    fn next_structural(&mut self) -> Option<char> {
+        while let Some(ch) = self.chars.next() {
+            match ch {
+                '#' => self.skip_comment(),
+                '(' | ')' | '[' | ']' | '{' | '}' | '\n' => return Some(ch),
+                quote @ ('\'' | '"') => {
+                    let triple = self.chars.peek().is_some_and(|&c| c == quote)
+                        && self.chars.clone().nth(1).is_some_and(|c| c == quote);
+                    if triple {
+                        self.chars.next();
+                        self.chars.next();
+                        self.skip_triple_string(quote);
+                    } else {
+                        self.skip_single_line_string(quote);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Consume a `#` comment body (the `#` already consumed).
+    ///
+    /// Reads until the next `\n` (left unconsumed so it is yielded separately
+    /// as a line boundary) or EOF.
+    fn skip_comment(&mut self) {
+        while self.chars.peek().is_some_and(|&c| c != '\n') {
+            self.chars.next();
+        }
+    }
+
+    /// Consume a single-line string body (the opener already consumed).
+    ///
+    /// Reads until the matching `quote`, honoring `\` escapes, or until `\n`
+    /// (an unterminated single-line string ends at the newline, matching
+    /// Python's own behavior).
+    fn skip_single_line_string(&mut self, quote: char) {
+        let mut escaped = false;
+        for c in self.chars.by_ref() {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == quote || c == '\n' {
+                break;
+            }
+        }
+    }
+
+    /// Consume a triple-quoted string body (the opening `qqq` already consumed).
+    ///
+    /// Reads until the closing `qqq`, which may be many lines away. An
+    /// unterminated triple string runs to EOF.
+    fn skip_triple_string(&mut self, quote: char) {
+        while let Some(c) = self.chars.next() {
+            if c == quote
+                && self.chars.peek().is_some_and(|&n| n == quote)
+                && self.chars.clone().nth(1).is_some_and(|n| n == quote)
+            {
+                self.chars.next();
+                self.chars.next();
+                return;
+            }
+        }
+    }
+}
+
+/// One stage of [`lint_python`]: delimiter balancing.
+///
+/// Drives a [`PythonScanner`] over the whole content, counting `()[]{}`. Any
+/// counter going negative (an unmatched closer) or nonzero at EOF (an unmatched
+/// opener) is rejected. String and comment bodies are skipped by the scanner so
+/// delimiters inside them don't affect the count.
+fn python_delimiter_check(content: &str) -> Option<LinterError> {
+    let mut paren = 0u32;
+    let mut bracket = 0u32;
+    let mut brace = 0u32;
+    let mut scanner = PythonScanner::new(content);
+    while let Some(ch) = scanner.next_structural() {
+        match ch {
+            '(' => paren = paren.saturating_add(1),
+            ')' => {
+                if paren == 0 {
+                    return Some(LinterError::msg("unmatched closing parenthesis `)`"));
+                }
+                paren = paren.saturating_sub(1);
+            }
+            '[' => bracket = bracket.saturating_add(1),
+            ']' => {
+                if bracket == 0 {
+                    return Some(LinterError::msg("unmatched closing bracket `]`"));
+                }
+                bracket = bracket.saturating_sub(1);
+            }
+            '{' => brace = brace.saturating_add(1),
+            '}' => {
+                if brace == 0 {
+                    return Some(LinterError::msg("unmatched closing brace `}`"));
+                }
+                brace = brace.saturating_sub(1);
+            }
+            _ => {}
+        }
+    }
+    if paren != 0 {
+        return Some(LinterError::msg(format!(
+            "unbalanced parentheses: depth {paren} at end of file"
+        )));
+    }
+    if bracket != 0 {
+        return Some(LinterError::msg(format!(
+            "unbalanced brackets: depth {bracket} at end of file"
+        )));
+    }
+    if brace != 0 {
+        return Some(LinterError::msg(format!(
+            "unbalanced braces: depth {brace} at end of file"
+        )));
+    }
+    None
 }
 
 /// Heuristic brace/bracket matching for JS and TS source.
@@ -379,6 +617,50 @@ mod tests {
         let result = lint_content(Path::new("a.py"), "def foo():\n\t return 42\n");
         assert!(!result.is_valid);
         assert_eq!(result.errors[0].line, Some(2));
+    }
+
+    #[test]
+    fn python_unbalanced_paren_fails() {
+        let result = lint_content(Path::new("a.py"), "def foo(:\n    pass\n");
+        assert!(!result.is_valid, "{:?}", result.errors);
+    }
+
+    #[test]
+    fn python_balanced_ignores_braces_in_string_and_comment() {
+        let src = "x = \"{not a brace}\"\n# this (has [delimiters]\ny = [1, 2, 3]\n";
+        let result = lint_content(Path::new("a.py"), src);
+        assert!(result.is_valid, "{:?}", result.errors);
+    }
+
+    #[test]
+    fn python_triple_quoted_string_braces_ignored() {
+        let src = "x = \"\"\"\nthis has { and [ and ( inside\n\"\"\"\ny = 1\n";
+        let result = lint_content(Path::new("a.py"), src);
+        assert!(result.is_valid, "{:?}", result.errors);
+    }
+
+    #[test]
+    fn python_bad_dedent_fails() {
+        // Dedent to column 3, which no outer block established (cols 0 and 4
+        // were the seen levels).
+        let src = "def f():\n    x = 1\n   y = 2\n";
+        let result = lint_content(Path::new("a.py"), src);
+        assert!(!result.is_valid, "{:?}", result.errors);
+    }
+
+    #[test]
+    fn python_valid_nested_blocks_pass() {
+        let src = "def f():\n    if True:\n        return 1\n    return 2\n";
+        let result = lint_content(Path::new("a.py"), src);
+        assert!(result.is_valid, "{:?}", result.errors);
+    }
+
+    #[test]
+    fn python_hanging_indent_in_parens_passes() {
+        // Continuation lines inside open parens may be indented arbitrarily.
+        let src = "x = (\n    1,\n      2,\n)\n";
+        let result = lint_content(Path::new("a.py"), src);
+        assert!(result.is_valid, "{:?}", result.errors);
     }
 
     #[test]

@@ -23,11 +23,14 @@ use tokio::process::Command;
 
 use crate::context::RunnerContext;
 use crate::context::runner_ctx;
+use crate::input::get_u64;
 
 /// Default command timeout in seconds.
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
+
 /// Hard ceiling on a command timeout.
 const MAX_TIMEOUT_SECS: u64 = 600;
+
 /// Per-stream cap on captured stdout or stderr, in bytes.
 const MAX_OUTPUT_BYTES: usize = 1_000_000;
 
@@ -62,9 +65,6 @@ const READ_ONLY_PREFIXES: &[&str] = &[
 const SHELL_OPERATORS: &[&str] = &["&&", "||", ";", "|", "`", "$(", ">", ">>", "<"];
 
 /// Substrings that make an otherwise-allowlisted command unsafe.
-///
-/// Covers shell redirections, destructive `find` flags, and mutating git
-/// subcommands that a prefix match alone would misclassify.
 const UNSAFE_SUBSTRINGS: &[&str] = &[
     " -delete",
     " -exec",
@@ -109,6 +109,20 @@ pub enum JobStatus {
     Failed(String),
 }
 
+impl std::fmt::Display for JobStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Running => f.write_str("Running"),
+            Self::Completed(payload) => {
+                write!(f, "Completed: {payload}")
+            }
+            Self::Failed(payload) => {
+                write!(f, "Failed: {payload}")
+            }
+        }
+    }
+}
+
 /// One tracked background job.
 ///
 /// Stored in the global job table keyed by `id`. Created by
@@ -150,7 +164,17 @@ static JOB_TABLE: LazyLock<Mutex<BTreeMap<u64, BackgroundJob>>> =
 /// Monotonic counter for job IDs.
 static JOB_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
-/// Spawn a command as a background job. Returns the job ID.
+/// Spawn `command` as a background job and return its ID immediately.
+///
+/// Allocates a fresh monotonic ID, inserts a [`BackgroundJob`] in the
+/// [`Running`](JobStatus::Running) state into [`JOB_TABLE`], and `tokio::spawn`s
+/// a detached task that runs the command under [`execute_command`] capped at
+/// `timeout_secs`. When the task finishes (success, failure, or timeout) it
+/// updates the table entry in place to [`Completed`](JobStatus::Completed) or
+/// [`Failed`](JobStatus::Failed); the caller never blocks on that transition —
+/// it polls later via the `job_status` operation. A poisoned job-table lock is
+/// tolerated: the spawn still returns the ID even if the entry could not be
+/// recorded, matching the rest of the job-table accessors' handling.
 fn spawn_background_job(command: &str, cwd: &str, timeout_secs: u64) -> u64 {
     let id = JOB_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
     let started_at = std::time::SystemTime::now()
@@ -190,10 +214,10 @@ fn spawn_background_job(command: &str, cwd: &str, timeout_secs: u64) -> u64 {
             JobStatus::Completed(text)
         };
 
-        if let Ok(mut table) = JOB_TABLE.lock() {
-            if let Some(job) = table.get_mut(&id) {
-                job.status = status;
-            }
+        if let Ok(mut table) = JOB_TABLE.lock()
+            && let Some(job) = table.get_mut(&id)
+        {
+            job.status = status;
         }
     });
 
@@ -310,7 +334,7 @@ impl Tool for BashTool {
                         "maximum": 600
                     }
                 },
-                "required": ["command"]
+                "required": []
             }),
         }
     }
@@ -372,9 +396,7 @@ impl BashTool {
             .get("command")
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidInput("Missing command".to_string()))?;
-        let timeout_secs = input
-            .get("timeout")
-            .and_then(Value::as_u64)
+        let timeout_secs = get_u64(&input, "timeout")?
             .unwrap_or(DEFAULT_TIMEOUT_SECS)
             .min(MAX_TIMEOUT_SECS);
 
@@ -391,6 +413,7 @@ impl BashTool {
 
         let timeout = Duration::from_secs(timeout_secs);
         let exec = Box::pin(execute_command(command, &cwd));
+
         match tokio::time::timeout(timeout, exec).await {
             Ok(result) => result,
             Err(_) => Ok(ToolOutput::error_text(format!(
@@ -414,7 +437,7 @@ fn dispatch_operation(operation: &str, input: &Value) -> Result<ToolOutput, Tool
                 "No background jobs.".to_string()
             } else {
                 jobs.iter()
-                    .map(|j| format!("  [{}] {} — {:?}", j.id, j.command, j.status))
+                    .map(|j| format!("  [{}] {} — {}", j.id, j.command, j.status))
                     .collect::<Vec<_>>()
                     .join("\n")
             };
@@ -427,7 +450,7 @@ fn dispatch_operation(operation: &str, input: &Value) -> Result<ToolOutput, Tool
                 .ok_or_else(|| ToolError::InvalidInput("job_status requires job_id".to_string()))?;
             match get_job(id) {
                 Some(job) => {
-                    let text = format!("[{}] {}: {:?}", job.id, job.command, job.status);
+                    let text = format!("[{}] {}: {}", job.id, job.command, job.status);
                     Ok(ToolOutput::text(text))
                 }
                 None => Ok(ToolOutput::error_text(format!("Job {id} not found"))),
@@ -549,7 +572,16 @@ where
     String::from_utf8_lossy(&buf).into_owned()
 }
 
-/// Truncate a string to at most `max_bytes`, landing on a char boundary.
+/// Truncate `s` in place to at most `max_bytes`, landing on a UTF-8 char
+/// boundary.
+///
+/// If `s` already fits, it is left untouched. Otherwise the cut point walks
+/// back from `max_bytes` to the preceding char boundary so the result stays
+/// valid UTF-8, the tail is dropped, and a `...[truncated]` marker is appended
+/// so the model can see the output was capped. Used to keep captured
+/// command output under [`MAX_OUTPUT_BYTES`] after [`read_bounded`] has
+/// already sized the buffer — see the [`read_bounded`] docs for why both
+/// exist.
 fn truncate_string(s: &mut String, max_bytes: usize) {
     if s.len() <= max_bytes {
         return;
@@ -782,8 +814,13 @@ mod tests {
             .unwrap()
             .as_array()
             .unwrap();
-        assert_eq!(required.len(), 1);
-        assert_eq!(required[0], "command");
+        // No field is universally required: `command` runs a command, while
+        // `operation` manages background jobs and short-circuits before
+        // `command` is read. The two are alternatives, not a required pair.
+        assert!(
+            required.is_empty(),
+            "required should be empty: {required:?}"
+        );
     }
 
     #[test]
@@ -880,11 +917,8 @@ mod tests {
         ctx.cwd = cwd.to_string();
         let rc = RunnerContext {
             cwd: std::path::PathBuf::from(cwd),
-            session_state: std::sync::Arc::new(std::sync::Mutex::new(
-                crate::state::SessionState::default(),
-            )),
+            todos: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             question_tx: None,
-            runtime: crate::runtime::RuntimeConfig::default(),
         };
         ctx.set_extension(rc);
         ctx
@@ -1219,5 +1253,21 @@ mod tests {
         let input = json!({});
         let err = tool.call(input, &ctx).await.unwrap_err();
         assert!(matches!(err, ToolError::InvalidInput(_)));
+    }
+
+    #[tokio::test]
+    async fn negative_timeout_rejected_not_silently_defaulted() {
+        // Regression: a negative timeout must error loudly, not silently
+        // become the 120 s default (the model's explicit intent erased).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let tool = BashTool;
+        let ctx = ctx_in(cwd);
+        let input = json!({ "command": "true", "timeout": -1 });
+        let err = tool.call(input, &ctx).await.unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidInput(ref s) if s.contains("'timeout'")),
+            "negative timeout should name the field: {err:?}"
+        );
     }
 }

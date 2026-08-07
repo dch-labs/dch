@@ -17,6 +17,7 @@ use crate::context::runner_ctx;
 use crate::diff::format_file_change;
 use crate::linter::LinterResult;
 use crate::linter::lint_content;
+use crate::util::is_url;
 use crate::util::resolve_path;
 
 /// Write content to a file. Syntax validation is automatically performed for
@@ -107,6 +108,11 @@ impl WriteTool {
             .get("file_path")
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidInput("Missing file_path".to_string()))?;
+        if is_url(file_path) {
+            return Err(ToolError::InvalidInput(
+                "URLs are not supported by the Write tool. Use WebFetch for URLs.".to_string(),
+            ));
+        }
         let content = input
             .get("content")
             .and_then(Value::as_str)
@@ -132,15 +138,6 @@ impl WriteTool {
         }
 
         crate::fs::atomic_write(&full_path, content)?;
-
-        if let Some(rc) = &rc
-            && let Ok(mut state) = rc.session_state.lock()
-        {
-            state.file_read_history.push(crate::state::FileReadEntry {
-                path: file_path.to_string(),
-                read_at: std::time::SystemTime::now(),
-            });
-        }
 
         let display_path = file_path;
         let message = format_file_change(display_path, old_content.as_deref(), content);
@@ -191,8 +188,6 @@ pub(crate) fn format_lint_failure(path: &Path, result: &LinterResult) -> String 
 mod tests {
     use super::*;
     use crate::context::RunnerContext;
-    use crate::runtime::RuntimeConfig;
-    use crate::state::SessionState;
     use loopctl::tool::ToolContext;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -203,9 +198,8 @@ mod tests {
         ctx.cwd = cwd.to_string();
         let rc = RunnerContext {
             cwd: PathBuf::from(cwd),
-            session_state: Arc::new(Mutex::new(SessionState::default())),
+            todos: Arc::new(Mutex::new(Vec::new())),
             question_tx: None,
-            runtime: RuntimeConfig::default(),
         };
         ctx.set_extension(rc);
         ctx
@@ -382,6 +376,25 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidInput(_)));
+    }
+
+    #[tokio::test]
+    async fn url_file_path_rejected() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let tool = WriteTool;
+        let ctx = ctx_in(cwd);
+        let err = tool
+            .call(
+                json!({ "file_path": "https://example.com/page", "content": "x" }),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidInput(ref s) if s.contains("WebFetch")),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]

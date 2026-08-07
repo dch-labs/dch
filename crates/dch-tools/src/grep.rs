@@ -25,6 +25,7 @@ use crate::context::RunnerContext;
 use crate::context::runner_ctx;
 use crate::input::get_usize;
 use crate::output::MAX_INLINE_OUTPUT_BYTES;
+use crate::output::session_temp_dir;
 use crate::output::truncate_or_write_to_temp;
 use crate::search::Match;
 use crate::search::SearchJob;
@@ -33,7 +34,9 @@ use crate::search::no_matches_message;
 use crate::util::is_url;
 use crate::util::resolve_path;
 
+/// Default per-file match cap when the caller omits `max_matches`.
 const DEFAULT_MAX_MATCHES: usize = 100;
+/// Default total match cap across all files when the caller omits `max_results`.
 const DEFAULT_MAX_RESULTS: usize = 1000;
 
 /// Regex content-search tool — the "show me every matching line" search.
@@ -118,7 +121,7 @@ impl Tool for GrepTool {
         ctx: &ToolContext,
     ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
         let rc = runner_ctx(ctx).cloned();
-        let temp_dir = PathBuf::from(ctx.temp_dir.clone());
+        let temp_dir = session_temp_dir(Path::new(&ctx.temp_dir), ctx.session_id);
         Box::pin(self.grep_inner(input, rc, temp_dir))
     }
 
@@ -271,8 +274,6 @@ fn render(matches: &[Match], temp_dir: &Path) -> ToolOutput {
 mod tests {
     use super::*;
     use crate::context::RunnerContext;
-    use crate::runtime::RuntimeConfig;
-    use crate::state::SessionState;
     use loopctl::tool::ToolContext;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -283,9 +284,8 @@ mod tests {
         ctx.cwd = dir.to_string_lossy().into_owned();
         let rc = RunnerContext {
             cwd: PathBuf::from(dir),
-            session_state: Arc::new(Mutex::new(SessionState::default())),
+            todos: Arc::new(Mutex::new(Vec::new())),
             question_tx: None,
-            runtime: RuntimeConfig::default(),
         };
         ctx.set_extension(rc);
         ctx

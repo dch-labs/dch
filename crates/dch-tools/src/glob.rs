@@ -450,8 +450,6 @@ mod tests {
 mod integration_tests {
     use super::*;
     use crate::context::RunnerContext;
-    use crate::runtime::RuntimeConfig;
-    use crate::state::SessionState;
     use loopctl::tool::ToolContext;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -466,9 +464,8 @@ mod integration_tests {
         ctx.cwd = dir.to_string_lossy().into_owned();
         let rc = RunnerContext {
             cwd: PathBuf::from(dir),
-            session_state: Arc::new(Mutex::new(SessionState::default())),
+            todos: Arc::new(Mutex::new(Vec::new())),
             question_tx: None,
-            runtime: RuntimeConfig::default(),
         };
         ctx.set_extension(rc);
         ctx

@@ -1,8 +1,9 @@
 //! Coding-assistant tool implementations for `dch`, built on `loopctl::tool`.
 //!
 //! The runner context ([`RunnerContext`]) is installed as a typed extension on
-//! each `ToolContext`; tools retrieve it with [`runner_ctx`] to reach shared
-//! session state, runtime settings, and the interactive question channel.
+//! each `ToolContext`; tools retrieve it with [`runner_ctx`] to reach the
+//! working directory, the per-run todo list, and the interactive question
+//! channel.
 
 #![warn(missing_docs)]
 
@@ -23,9 +24,8 @@ pub mod question;
 pub mod read;
 pub mod regex_cache;
 pub mod registry;
-pub mod runtime;
 pub mod search;
-pub mod state;
+pub mod todo;
 pub mod util;
 pub mod walk;
 pub mod write;
@@ -47,13 +47,6 @@ pub use question::QuestionRequest;
 pub use question::QuestionResponse;
 pub use read::ReadTool;
 pub use registry::builtin_registry;
-pub use runtime::PermissionMode;
-pub use runtime::RuntimeConfig;
-pub use runtime::Verbosity;
-pub use state::FileReadEntry;
-pub use state::MemoryEntry;
-pub use state::SessionState;
-pub use state::TodoEntry;
-pub use state::TodoStatus;
-pub use state::ToolStats;
+pub use todo::TodoEntry;
+pub use todo::TodoStatus;
 pub use write::WriteTool;

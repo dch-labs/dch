@@ -118,15 +118,12 @@ impl EditTool {
         input: Value,
         rc: Option<RunnerContext>,
     ) -> Result<ToolOutput, ToolError> {
-        let cwd = rc
-            .as_ref()
-            .ok_or_else(|| {
-                ToolError::Execution(
-                    "RunnerContext extension is not installed on the ToolContext".to_string(),
-                )
-            })?
-            .cwd
-            .clone();
+        let rc = rc.ok_or_else(|| {
+            ToolError::Execution(
+                "RunnerContext extension is not installed on the ToolContext".to_string(),
+            )
+        })?;
+        let cwd = rc.cwd.clone();
         let parsed = parse_input(&input)?;
         let full_path = resolve_path(parsed.file_path, &cwd);
         let old_content = read_existing(&full_path, parsed.file_path).await?;
@@ -135,12 +132,12 @@ impl EditTool {
             Err(reason) => return Ok(reason.into_output()),
         };
 
-        if !parsed.skip_linter {
-            if let Err(result) = check_linter(&full_path, &new_content) {
-                return Ok(ToolOutput::error_text(format_lint_failure(
-                    &full_path, &result,
-                )));
-            }
+        if !parsed.skip_linter
+            && let Err(result) = check_linter(&full_path, &new_content)
+        {
+            return Ok(ToolOutput::error_text(format_lint_failure(
+                &full_path, &result,
+            )));
         }
 
         crate::fs::atomic_write(&full_path, &new_content)?;
@@ -448,8 +445,6 @@ pub(crate) fn splice(content: &str, range: Range<usize>, replacement: &str) -> S
 mod tests {
     use super::*;
     use crate::context::RunnerContext;
-    use crate::runtime::RuntimeConfig;
-    use crate::state::SessionState;
     use loopctl::tool::ToolContext;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -461,9 +456,8 @@ mod tests {
         ctx.cwd = cwd.to_string();
         let rc = RunnerContext {
             cwd: PathBuf::from(cwd),
-            session_state: Arc::new(Mutex::new(SessionState::default())),
+            todos: Arc::new(Mutex::new(Vec::new())),
             question_tx: None,
-            runtime: RuntimeConfig::default(),
         };
         ctx.set_extension(rc);
         ctx

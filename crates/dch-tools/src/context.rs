@@ -1,7 +1,11 @@
 //! The runner context extension stored on each `loopctl::tool::ToolContext`.
 //!
-//! Tools retrieve it with [`runner_ctx`] to reach shared session state, runtime
-//! settings, and the interactive question channel.
+//! Tools retrieve it with [`runner_ctx`] to reach per-call, tool-facing state:
+//! the working directory, the agent's per-run todo list, and the optional
+//! channel for asking the user interactive questions. Session-lifetime records
+//! (file-touch history for staleness detection, etc.) are owned by the outer
+//! runner layer and recorded via an observer on tool dispatch — not by the
+//! tools and not via this context.
 
 use std::fmt;
 use std::path::PathBuf;
@@ -10,22 +14,21 @@ use std::sync::Mutex;
 use std::sync::mpsc;
 
 use crate::question::QuestionRequest;
-use crate::runtime::RuntimeConfig;
-use crate::state::SessionState;
+use crate::todo::TodoEntry;
 
-/// Per loop instance context attached to every `ToolContext`.
+/// Per-call, tool-facing context attached to every `ToolContext`.
 ///
-/// Carries everything a tool invocation needs that is specific to this loop
-/// instance run: the working directory, shared mutable session state, the
-/// optional channel for asking the user questions, and runtime display /
-/// permission settings. Stored as a typed extension via
+/// Carries what a tool invocation needs that is specific to this run and isn't
+/// already on loopctl's `ToolContext`: the working directory (as a `PathBuf`,
+/// the form the file tools prefer), the agent's per-run todo list, and the
+/// optional channel a tool uses during its call to ask the user a question.
+/// Stored as a typed extension via
 /// [`ToolContext::set_extension`](loopctl::tool::ToolContext::set_extension)
 /// and retrieved with [`runner_ctx`].
 ///
-/// Cloning this struct is cheap — [`session_state`](Self::session_state) is
-/// behind an `Arc`, so clones share the same mutable store rather than copying
-/// it. This is how multiple tool invocations within one agent run observe each
-/// other's state mutations.
+/// Cloning is cheap — `todos` is behind an `Arc`, so clones share the same
+/// mutable list rather than copying it. This is how multiple tool invocations
+/// within one run observe each other's todo-list mutations.
 #[derive(Clone)]
 pub struct RunnerContext {
     /// The working directory the agent operates within.
@@ -36,14 +39,14 @@ pub struct RunnerContext {
     /// construction from the configured or CLI-supplied working directory.
     pub cwd: PathBuf,
 
-    /// Shared, mutable session state for the current agent run.
+    /// The agent's current todo list.
     ///
-    /// Carries the todo list, file-read history, memory entries, and tool
-    /// invocation stats. The `Arc<Mutex<>>` wrapper lets concurrent tool calls
-    /// read and mutate it safely; cloning [`RunnerContext`] shares the same
-    /// store (no copy). Tools acquire the lock briefly to append or replace
-    /// their portion.
-    pub session_state: Arc<Mutex<SessionState>>,
+    /// Replaced wholesale by the `TodoWrite` tool on each call — the model
+    /// sends the complete desired list, not a delta. The `Arc<Mutex<>>`
+    /// wrapper lets concurrent tool calls read and mutate it safely; cloning
+    /// [`RunnerContext`] shares the same list (no copy). Per-run: the runner
+    /// clears it at the top of each `run()` so a new prompt starts fresh.
+    pub todos: Arc<Mutex<Vec<TodoEntry>>>,
 
     /// Optional channel for asking the user interactive questions.
     ///
@@ -52,23 +55,14 @@ pub struct RunnerContext {
     /// prompting is impossible — the asking tool returns an error instead of
     /// blocking. Set at runner construction; presence depends on the run mode.
     pub question_tx: Option<mpsc::Sender<QuestionRequest>>,
-
-    /// Runtime-derived display and permission settings.
-    ///
-    /// Bundles verbosity level, color-output toggle (`no_color`), and the
-    /// active permission mode (`Auto` / `Plan` / `AcceptEdits` / `Interactive`). Read
-    /// by tools that format output (to respect verbosity and color settings)
-    /// and by the permission hook (to gate side-effecting tools per the mode).
-    pub runtime: RuntimeConfig,
 }
 
 impl fmt::Debug for RunnerContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RunnerContext")
             .field("cwd", &self.cwd)
-            .field("session_state", &self.session_state)
+            .field("todos", &self.todos)
             .field("question_tx", &self.question_tx.is_some())
-            .field("runtime", &self.runtime)
             .finish()
     }
 }
@@ -89,9 +83,8 @@ impl fmt::Debug for RunnerContext {
 ///
 /// let rc = RunnerContext {
 ///     cwd: ".".into(),
-///     session_state: Default::default(),
+///     todos: Default::default(),
 ///     question_tx: None,
-///     runtime: Default::default(),
 /// };
 /// ctx.set_extension(rc);
 /// assert!(runner_ctx(&ctx).is_some());
@@ -102,8 +95,8 @@ pub fn runner_ctx(ctx: &loopctl::tool::ToolContext) -> Option<&RunnerContext> {
 }
 
 // Statically asserts `RunnerContext: Send + Sync`, the bound required to store
-// it as a `ToolContext` extension. `Arc<Mutex<SessionState>>` is `Send + Sync`,
-// `Option<mpsc::Sender<_>>` is `Send + Sync`, and the remaining fields are
+// it as a `ToolContext` extension. `Arc<Mutex<Vec<TodoEntry>>>` is
+// `Send + Sync`, `Option<mpsc::Sender<_>>` is `Send + Sync`, and `PathBuf` is
 // trivially so.
 const _: fn() = || {
     fn assert_bounds<T: Send + Sync>() {}
@@ -119,16 +112,18 @@ const _: fn() = || {
 )]
 mod tests {
     use super::*;
-    use crate::state::TodoEntry;
-    use crate::state::TodoStatus;
+    use crate::question::Question;
+    use crate::question::QuestionOption;
+    use crate::question::QuestionRequest;
+    use crate::todo::TodoEntry;
+    use crate::todo::TodoStatus;
     use loopctl::tool::ToolContext;
 
     fn sample() -> RunnerContext {
         RunnerContext {
             cwd: PathBuf::from("/tmp/workspace"),
-            session_state: Arc::new(Mutex::new(SessionState::default())),
+            todos: Arc::new(Mutex::new(Vec::new())),
             question_tx: None,
-            runtime: RuntimeConfig::default(),
         }
     }
 
@@ -159,70 +154,108 @@ mod tests {
     }
 
     #[test]
-    fn shared_mutation_visible_across_clones() {
+    fn shared_todos_visible_across_clones() {
         let rc = sample();
         let twin = rc.clone();
-
-        {
-            let mut state = rc
-                .session_state
-                .lock()
-                .expect("session state lock not poisoned");
-            state.todos.push(TodoEntry {
+        rc.todos
+            .lock()
+            .expect("todos lock not poisoned")
+            .push(TodoEntry {
                 id: "1".to_string(),
                 subject: "Ship it".to_string(),
                 description: String::new(),
                 status: TodoStatus::Pending,
                 active_form: None,
             });
-        }
-
-        let observed = twin
-            .session_state
-            .lock()
-            .expect("session state lock not poisoned")
-            .todos
-            .len();
+        let observed = twin.todos.lock().expect("todos lock not poisoned").len();
         assert_eq!(observed, 1);
     }
 
     #[test]
-    fn question_tx_survives_clone() {
+    fn todos_default_empty_and_can_be_cleared_to_reset_run() {
+        // The per-run reset is a clear of the vec. Verify the default is empty
+        // and that clearing works (the runner does this at the top of each run).
+        let rc = sample();
+        assert!(rc.todos.lock().expect("todos lock not poisoned").is_empty());
+        rc.todos
+            .lock()
+            .expect("todos lock not poisoned")
+            .push(TodoEntry {
+                id: "x".to_string(),
+                subject: "task".to_string(),
+                description: String::new(),
+                status: TodoStatus::Pending,
+                active_form: None,
+            });
+        rc.todos.lock().expect("todos lock not poisoned").clear();
+        assert!(rc.todos.lock().expect("todos lock not poisoned").is_empty());
+    }
+
+    #[test]
+    fn question_tx_round_trips_a_request_and_none_is_default() {
+        // Default is None (headless); when Some, a sent QuestionRequest reaches
+        // the receiver. This is the plumbing AskUserQuestion (T-38) will use.
+        assert!(sample().question_tx.is_none());
+
         let (tx, rx) = mpsc::channel::<QuestionRequest>();
         let rc = RunnerContext {
             question_tx: Some(tx),
             ..sample()
         };
         let twin = rc.clone();
-
-        // Build the only QuestionRequest we can without driving a UI: the
-        // response channel is created and immediately dropped, and the
-        // request is sent on the question channel.
-        let (resp_tx, _) = tokio::sync::oneshot::channel();
-        let req = QuestionRequest {
-            questions: vec![crate::question::Question {
-                question: "ok?".to_string(),
-                header: None,
-                options: vec![],
-                multi_select: false,
-                response_tx: resp_tx,
-            }],
-        };
+        // The cloned context shares the sender (mpsc::Sender is Clone) — both
+        // can send, both reach the same receiver.
+        let (resp_tx, _resp_rx) = tokio::sync::oneshot::channel();
         rc.question_tx
             .as_ref()
-            .expect("question_tx set on rc")
-            .send(req)
+            .expect("tx set")
+            .send(QuestionRequest {
+                questions: vec![Question {
+                    question: "ok?".to_string(),
+                    header: None,
+                    options: vec![QuestionOption {
+                        label: "Yes".to_string(),
+                        description: None,
+                    }],
+                    multi_select: false,
+                    response_tx: resp_tx,
+                }],
+            })
             .expect("receiver alive");
-        drop(twin);
-        assert!(rx.recv().is_ok());
+        twin.question_tx
+            .as_ref()
+            .expect("tx set on clone")
+            .send(QuestionRequest {
+                questions: Vec::new(),
+            })
+            .expect("receiver still alive");
+        // try_recv (non-blocking) twice: confirms both sends arrived without
+        // hanging on iter(), which would block forever waiting for senders to
+        // drop.
+        assert!(rx.try_recv().is_ok(), "first send missing");
+        assert!(rx.try_recv().is_ok(), "second send missing");
+        assert!(rx.try_recv().is_err(), "more than two sends arrived");
     }
 
     #[test]
-    fn debug_elides_question_tx() {
-        let rc = sample();
-        let rendered = format!("{rc:?}");
-        // The Sender is not Debug; the rendered summary reports presence as a
+    fn debug_reports_question_tx_presence_not_the_channel() {
+        // mpsc::Sender is not Debug; the Debug impl must report presence as a
         // bool rather than the channel itself.
-        assert!(rendered.contains("question_tx: false"));
+        let with_tx = {
+            let (tx, _rx) = mpsc::channel::<QuestionRequest>();
+            RunnerContext {
+                question_tx: Some(tx),
+                ..sample()
+            }
+        };
+        let without_tx = sample();
+        assert!(
+            format!("{with_tx:?}").contains("question_tx: true"),
+            "Debug should report question_tx present"
+        );
+        assert!(
+            format!("{without_tx:?}").contains("question_tx: false"),
+            "Debug should report question_tx absent"
+        );
     }
 }

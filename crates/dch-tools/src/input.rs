@@ -17,6 +17,10 @@ use serde_json::Value;
 /// non-negative integer — so `{"max_matches": -5}` or
 /// `{"max_matches": "abc"}` fail loudly rather than silently defaulting.
 ///
+/// Prefer [`get_u64`] when the field is naturally a `u64` (durations, sizes
+/// destined for `Duration::from_secs` or similar) — it avoids the
+/// `usize`-width dance on 32-bit targets.
+///
 /// # Errors
 ///
 /// Returns [`ToolError::InvalidInput`] when the key is present but the value
@@ -44,6 +48,40 @@ fn usize_field_error(key: &str) -> ToolError {
     ToolError::InvalidInput(format!(
         "'{key}' must be a non-negative integer (0 to {max})",
         max = usize::MAX
+    ))
+}
+
+/// Extract an optional `u64` field, rejecting malformed values loudly.
+///
+/// Counterpart to [`get_usize`] for fields whose natural type is `u64` rather
+/// than `usize` — e.g. durations feeding `Duration::from_secs`. Returns
+/// `Ok(None)` when the key is absent (caller applies a default), `Ok(Some(n))`
+/// for a valid non-negative integer, and `Err(InvalidInput)` when the key is
+/// present but is not a non-negative integer — so `{"timeout": -5}` or
+/// `{"timeout": "abc"}` fail loudly rather than silently defaulting.
+///
+/// # Errors
+///
+/// Returns [`ToolError::InvalidInput`] when the key is present but the value
+/// is not a non-negative integer that fits in a `u64`.
+pub fn get_u64(input: &Value, key: &str) -> Result<Option<u64>, ToolError> {
+    match input.get(key) {
+        None => Ok(None),
+        Some(Value::Number(n)) => n.as_u64().map(Some).ok_or_else(|| u64_field_error(key)),
+        Some(_) => Err(u64_field_error(key)),
+    }
+}
+
+/// Build the shared "not a valid u64" error for [`get_u64`].
+///
+/// Mirrors [`usize_field_error`], naming the `u64` range. JSON numbers that
+/// fail `as_u64` are negative, fractional, non-numeric, or larger than
+/// `u64::MAX` — all map to the one message since the caller's intent is the
+/// same.
+fn u64_field_error(key: &str) -> ToolError {
+    ToolError::InvalidInput(format!(
+        "'{key}' must be a non-negative integer (0 to {max})",
+        max = u64::MAX
     ))
 }
 
@@ -140,6 +178,46 @@ mod tests {
         assert!(
             msg.contains(&usize::MAX.to_string()),
             "message should include usize::MAX for this platform: {msg}"
+        );
+        assert!(msg.contains("'n'"), "message should name the key: {msg}");
+    }
+
+    #[test]
+    fn get_u64_absent_returns_none() {
+        assert_eq!(get_u64(&json!({}), "n").unwrap(), None);
+    }
+
+    #[test]
+    fn get_u64_valid_integer() {
+        assert_eq!(get_u64(&json!({"n": 42}), "n").unwrap(), Some(42));
+    }
+
+    #[test]
+    fn get_u64_rejects_negative() {
+        // A negative JSON number is not a u64; it must error, not default.
+        assert!(get_u64(&json!({"n": -1}), "n").is_err());
+    }
+
+    #[test]
+    fn get_u64_rejects_float_and_non_number() {
+        assert!(get_u64(&json!({"n": 1.5}), "n").is_err());
+        assert!(get_u64(&json!({"n": "abc"}), "n").is_err());
+        assert!(get_u64(&json!({"n": true}), "n").is_err());
+    }
+
+    #[test]
+    fn get_u64_error_names_the_range() {
+        // Mirrors get_usize_error_names_the_range: the message states the u64
+        // range so an out-of-range value is actionable, not confusing.
+        let err = get_u64(&json!({"n": "not a number"}), "n").unwrap_err();
+        let msg = match err {
+            ToolError::InvalidInput(s) => s,
+            other => panic!("expected InvalidInput, got {other:?}"),
+        };
+        assert!(msg.contains("0 to"), "message should name the range: {msg}");
+        assert!(
+            msg.contains(&u64::MAX.to_string()),
+            "message should include u64::MAX: {msg}"
         );
         assert!(msg.contains("'n'"), "message should name the key: {msg}");
     }

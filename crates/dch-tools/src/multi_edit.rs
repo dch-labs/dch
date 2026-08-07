@@ -173,10 +173,10 @@ impl MultiEditTool {
             Ok(f) => f,
             Err(reason) => return Ok(reason.into_output()),
         };
-        if !parsed.skip_linter {
-            if let Some(reason) = lint_all(&operations, &finals) {
-                return Ok(reason.into_output());
-            }
+        if !parsed.skip_linter
+            && let Some(reason) = lint_all(&operations, &finals)
+        {
+            return Ok(reason.into_output());
         }
 
         // Phase 3: build the preview/diff block (always).
@@ -808,8 +808,6 @@ fn apply_summary(preview: &str, applied: &[&str], operations: &[EditOperation]) 
 mod tests {
     use super::*;
     use crate::context::RunnerContext;
-    use crate::runtime::RuntimeConfig;
-    use crate::state::SessionState;
     use loopctl::tool::ToolContext;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -821,9 +819,8 @@ mod tests {
         ctx.cwd = cwd.to_string();
         let rc = RunnerContext {
             cwd: PathBuf::from(cwd),
-            session_state: Arc::new(Mutex::new(SessionState::default())),
+            todos: Arc::new(Mutex::new(Vec::new())),
             question_tx: None,
-            runtime: RuntimeConfig::default(),
         };
         ctx.set_extension(rc);
         ctx

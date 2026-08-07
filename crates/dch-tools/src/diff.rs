@@ -2,26 +2,10 @@
 
 use std::fmt::Write;
 
-/// Maximum product of old × new line counts for the LCS algorithm.
-///
-/// The LCS dynamic-programming table is O(m × n) in both time and memory.
-/// Beyond this threshold, the table becomes too expensive to compute and a
-/// bounded before/after preview is produced instead via
-/// [`format_large_diff`].
-///
-/// At 1,000,000 the DP table is ~8 MB of `usize` cells and completes in
-/// milliseconds. Files up to roughly 1,000 × 1,000 lines receive the full
-/// line-by-line diff; larger files get the truncated preview governed by
-/// [`LARGE_DIFF_PREVIEW_LINES`].
+/// Max old×new line-count product before the LCS diff falls back to a preview.
 const MAX_LCS_PRODUCT: usize = 1_000_000;
 
-/// Maximum lines to show per side in the large-file fallback preview.
-///
-/// When the old × new line-count product exceeds [`MAX_LCS_PRODUCT`], the full
-/// LCS diff is skipped and a truncated before/after preview is produced
-/// instead. This constant bounds how many lines of old content (prefixed
-/// `- `) and new content (prefixed `+ `) appear in that preview. Lines beyond
-/// the limit are summarized as `... N more lines`.
+/// Lines shown per side in the large-file fallback preview (past `MAX_LCS_PRODUCT`).
 const LARGE_DIFF_PREVIEW_LINES: usize = 1000;
 
 /// One line in an LCS diff, produced by [`compute_lcs_diff`].
