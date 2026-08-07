@@ -36,8 +36,10 @@ use crate::util::resolve_path;
 
 /// Default per-file match cap when the caller omits `max_matches`.
 const DEFAULT_MAX_MATCHES: usize = 100;
+
 /// Default total match cap across all files when the caller omits `max_results`.
 const DEFAULT_MAX_RESULTS: usize = 1000;
+
 /// Hard ceiling `max_results` is clamped to, regardless of what the caller asks.
 const MAX_RESULTS_CAP: usize = 1000;
 
@@ -178,7 +180,7 @@ impl GrepTool {
         }
 
         let regex = compile_pattern(&parsed_input.pattern, parsed_input.case_insensitive)?;
-        let base = resolve_path(&parsed_input.base_path, &cwd);
+        let base = resolve_path(&parsed_input.base_path, &cwd)?;
         let job = SearchJob {
             regex,
             include: parsed_input.include_patterns,

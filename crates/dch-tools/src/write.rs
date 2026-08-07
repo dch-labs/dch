@@ -121,7 +121,7 @@ impl WriteTool {
             .get("skip_linter")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let full_path = resolve_path(file_path, &cwd);
+        let full_path = resolve_path(file_path, &cwd)?;
 
         if !skip_linter {
             let result = lint_content(&full_path, content);
@@ -440,5 +440,38 @@ mod tests {
             .as_array()
             .unwrap();
         assert_eq!(required.len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_through_in_workspace_symlink_to_outside_is_rejected() {
+        // Writing through an in-workspace symlink that targets a file outside
+        // cwd must be rejected by resolve_path before any write happens. The
+        // external target must remain untouched.
+        use std::os::unix::fs::symlink;
+        let work = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let real = outside.path().join("real.txt");
+        std::fs::write(&real, "original").unwrap();
+        let link = work.path().join("link.rs");
+        symlink(&real, &link).unwrap();
+
+        let cwd = work.path().to_str().unwrap();
+        let tool = WriteTool;
+        let ctx = ctx_in(cwd);
+        let input = json!({
+            "file_path": "link.rs",
+            "content": "fn main() {}\n"
+        });
+        let err = tool.call(input, &ctx).await.unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidInput(ref s) if s.contains("symlink")),
+            "expected symlink-escape rejection, got {err:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&real).unwrap(),
+            "original",
+            "external target must be untouched"
+        );
     }
 }

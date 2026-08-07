@@ -27,10 +27,13 @@ use crate::walk;
 
 /// Maximum number of lines returned by the Read tool.
 pub const MAX_FILE_READ_LINES: usize = 200;
+
 /// Maximum file size before we refuse to read entirely.
 pub const MAX_FILE_SIZE_BYTES: usize = 10 * 1024 * 1024;
+
 /// Maximum bytes of content returned (~100K tokens); guards long-line files.
 const MAX_FILE_READ_BYTES: usize = 400_000;
+
 /// Default limit when `offset` is provided but `limit` is not.
 const DEFAULT_OFFSET_LIMIT: usize = 200;
 
@@ -131,7 +134,7 @@ impl ReadTool {
                 )
             })?
             .cwd;
-        let full_path = resolve_path(file_path, &cwd);
+        let full_path = resolve_path(file_path, &cwd)?;
 
         let metadata = tokio::fs::metadata(&full_path).await.map_err(|_| {
             let filename = full_path
@@ -902,5 +905,29 @@ mod tests {
         let path = tmp.path().join("nope.txt");
         let err = read_capped(&path).await.unwrap_err();
         assert!(matches!(err, ToolError::Execution(_)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_through_in_workspace_symlink_to_outside_is_rejected() {
+        // An in-workspace symlink whose target is outside cwd must be caught
+        // by resolve_path's filesystem check, even though the link's own path
+        // is lexically inside the workspace. Reading the link would otherwise
+        // reach the external file.
+        use std::os::unix::fs::symlink;
+        let work = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, "SHOULD NOT BE READ").unwrap();
+        let link = work.path().join("link.txt");
+        symlink(&secret, &link).unwrap();
+
+        let cwd = work.path().to_str().unwrap();
+        let input = json!({ "file_path": "link.txt" });
+        let err = read(input, cwd).await.unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidInput(ref s) if s.contains("symlink")),
+            "expected symlink-escape rejection, got {err:?}"
+        );
     }
 }

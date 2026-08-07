@@ -10,6 +10,7 @@ use crate::glob::GlobTool;
 use crate::grep::GrepTool;
 use crate::multi_edit::MultiEditTool;
 use crate::read::ReadTool;
+use crate::tree::TreeTool;
 use crate::write::WriteTool;
 
 /// Build a [`ToolRegistry`] populated with every builtin tool.
@@ -28,5 +29,6 @@ pub fn builtin_registry() -> ToolRegistry {
     registry.register(GlobTool);
     registry.register(GrepTool);
     registry.register(CodeSearchTool);
+    registry.register(TreeTool);
     registry
 }
