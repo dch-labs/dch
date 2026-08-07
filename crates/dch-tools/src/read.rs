@@ -27,10 +27,13 @@ use crate::walk;
 
 /// Maximum number of lines returned by the Read tool.
 pub const MAX_FILE_READ_LINES: usize = 200;
+
 /// Maximum file size before we refuse to read entirely.
 pub const MAX_FILE_SIZE_BYTES: usize = 10 * 1024 * 1024;
+
 /// Maximum bytes of content returned (~100K tokens); guards long-line files.
 const MAX_FILE_READ_BYTES: usize = 400_000;
+
 /// Default limit when `offset` is provided but `limit` is not.
 const DEFAULT_OFFSET_LIMIT: usize = 200;
 
@@ -131,7 +134,7 @@ impl ReadTool {
                 )
             })?
             .cwd;
-        let full_path = resolve_path(file_path, &cwd);
+        let full_path = resolve_path(file_path, &cwd)?;
 
         let metadata = tokio::fs::metadata(&full_path).await.map_err(|_| {
             let filename = full_path

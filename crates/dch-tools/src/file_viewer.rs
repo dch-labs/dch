@@ -197,7 +197,7 @@ impl FileViewerTool {
             .clone();
 
         let parsed = parse_input(&input)?;
-        let full_path = resolve_path(parsed.file_path, &cwd);
+        let full_path = resolve_path(parsed.file_path, &cwd)?;
 
         let Some(content) = read_content(&full_path).await? else {
             return Ok(ToolOutput::error_text(format!(

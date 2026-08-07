@@ -121,7 +121,7 @@ impl WriteTool {
             .get("skip_linter")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let full_path = resolve_path(file_path, &cwd);
+        let full_path = resolve_path(file_path, &cwd)?;
 
         if !skip_linter {
             let result = lint_content(&full_path, content);

@@ -36,8 +36,10 @@ use crate::util::resolve_path;
 
 /// Default total match cap across all files when the caller omits `max_results`.
 const DEFAULT_MAX_RESULTS: usize = 50;
+
 /// Hard ceiling `max_results` is clamped to, regardless of what the caller asks.
 const RESULTS_CAP: usize = 200;
+
 /// Hard ceiling `context_lines` is clamped to, regardless of what the caller asks.
 const MAX_CONTEXT_LINES: usize = 5;
 
@@ -177,7 +179,7 @@ impl CodeSearchTool {
         }
 
         let regex = compile_pattern(&parsed_input.pattern, parsed_input.case_insensitive)?;
-        let base = resolve_path(&parsed_input.base_path, &cwd);
+        let base = resolve_path(&parsed_input.base_path, &cwd)?;
         let job = SearchJob {
             regex,
             include: parsed_input.include_patterns,

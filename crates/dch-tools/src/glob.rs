@@ -128,7 +128,7 @@ impl GlobTool {
             ));
         }
 
-        let base = resolve_path(&parsed.base_path, &cwd);
+        let base = resolve_path(&parsed.base_path, &cwd)?;
         let glob_override = build_glob_override(&base, &parsed.pattern)?;
         let pattern = parsed.pattern.clone();
         let matches = tokio::task::spawn_blocking(move || collect_matches(&base, &glob_override))

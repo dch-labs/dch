@@ -30,6 +30,12 @@ use crate::walk::walk_entries;
 /// Default maximum depth when the caller omits `max_depth`.
 const DEFAULT_MAX_DEPTH: usize = 3;
 
+/// Floor for a caller-supplied `max_depth`; values below this are raised.
+const MIN_MAX_DEPTH: usize = 1;
+
+/// Ceiling for a caller-supplied `max_depth`; values above this are lowered.
+const MAX_MAX_DEPTH: usize = 50;
+
 /// Display directory tree structure with depth limits and filtering.
 ///
 /// Respects `.gitignore`. Read-only and concurrency-safe — Tree only reads
@@ -60,7 +66,9 @@ impl Tool for TreeTool {
                     },
                     "max_depth": {
                         "type": "integer",
-                        "description": "Maximum depth to display",
+                        "description": "Maximum depth to display (clamped to 1-50)",
+                        "minimum": 1,
+                        "maximum": 50,
                         "default": 3
                     },
                     "include_files": {
@@ -100,9 +108,10 @@ impl TreeTool {
     ///
     /// # Errors
     ///
-    /// Returns [`ToolError::InvalidInput`] for a missing [`RunnerContext`], a
-    /// URL `path`, or a non-directory `path`. Returns [`ToolError::Execution`]
-    /// on a filesystem I/O error during metadata checks.
+    /// Returns [`ToolError::Execution`] when no [`RunnerContext`] is installed
+    /// on the [`ToolContext`] or on a filesystem I/O error during metadata
+    /// checks. Returns [`ToolError::InvalidInput`] for a URL `path` or a
+    /// non-directory `path`.
     async fn tree_inner(
         &self,
         input: Value,
@@ -129,13 +138,14 @@ impl TreeTool {
             .get("max_depth")
             .and_then(Value::as_u64)
             .and_then(|d| usize::try_from(d).ok())
-            .unwrap_or(DEFAULT_MAX_DEPTH);
+            .unwrap_or(DEFAULT_MAX_DEPTH)
+            .clamp(MIN_MAX_DEPTH, MAX_MAX_DEPTH);
         let include_files = input
             .get("include_files")
             .and_then(Value::as_bool)
             .unwrap_or(true);
         let pattern = input.get("pattern").and_then(Value::as_str);
-        let full_path = resolve_path(base_path, &cwd);
+        let full_path = resolve_path(base_path, &cwd)?;
 
         if !tokio::fs::try_exists(&full_path)
             .await
@@ -156,12 +166,16 @@ impl TreeTool {
         }
 
         let entries = walk_entries(&full_path, Some(max_depth));
+        let entries_were_empty = entries.is_empty();
         let filtered = filter_entries(entries, &full_path, include_files, pattern);
 
         if filtered.is_empty() {
-            return Ok(ToolOutput::error_text(format!(
-                "Empty directory: {base_path}"
-            )));
+            let message = if entries_were_empty {
+                format!("Empty directory: {base_path}")
+            } else {
+                format!("No matching entries in: {base_path}")
+            };
+            return Ok(ToolOutput::error_text(message));
         }
 
         let tree = format_tree(&full_path, base_path, &filtered);
@@ -470,6 +484,7 @@ mod tests {
         assert!(text.contains("a/"));
         assert!(text.contains("file.txt"));
         assert!(!text.contains("c/d"));
+        assert!(!text.contains("d/"), "depth-4 dir must be absent: {text}");
     }
 
     #[tokio::test]
@@ -521,6 +536,106 @@ mod tests {
         let text = out.text_content();
         assert!(text.contains("a.rs"), "{text}");
         assert!(!text.contains("b.md"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn files_only_dir_with_include_files_false_is_filtered_empty() {
+        // A non-empty directory whose entries are all removed by filtering
+        // must report "No matching entries", not the misleading "Empty
+        // directory". Here the dir holds only files and include_files=false
+        // strips them all while the walk genuinely found entries.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("a.rs"), "x").unwrap();
+        std::fs::write(root.join("b.md"), "x").unwrap();
+
+        let cwd = root.to_str().unwrap();
+        let tool = TreeTool;
+        let ctx = ctx_in(cwd);
+        let input = json!({"path": ".", "include_files": false});
+        let out = tool.call(input, &ctx).await.unwrap();
+        assert!(out.is_error, "{}", out.text_content());
+        let text = out.text_content();
+        assert!(
+            text.contains("No matching entries"),
+            "filtered-empty must be truthful: {text}"
+        );
+        assert!(
+            !text.contains("Empty directory"),
+            "must not mislabel a populated dir as empty: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pattern_matching_nothing_is_filtered_empty() {
+        // Same truthfulness check via the pattern filter: a populated dir
+        // whose files all fail the glob must report "No matching entries".
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("a.rs"), "x").unwrap();
+        std::fs::write(root.join("b.md"), "x").unwrap();
+
+        let cwd = root.to_str().unwrap();
+        let tool = TreeTool;
+        let ctx = ctx_in(cwd);
+        let input = json!({"path": ".", "pattern": "*.nomatch"});
+        let out = tool.call(input, &ctx).await.unwrap();
+        assert!(out.is_error, "{}", out.text_content());
+        let text = out.text_content();
+        assert!(
+            text.contains("No matching entries"),
+            "filtered-empty must be truthful: {text}"
+        );
+        assert!(
+            !text.contains("Empty directory"),
+            "must not mislabel a populated dir as empty: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn max_depth_zero_clamped_to_one() {
+        // max_depth=0 is below the floor (MIN_MAX_DEPTH=1); it must clamp to
+        // 1, yielding direct children of root rather than an empty "0 dirs,
+        // 0 files" result.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        std::fs::write(root.join("a/b/deep.rs"), "x").unwrap();
+
+        let cwd = root.to_str().unwrap();
+        let tool = TreeTool;
+        let ctx = ctx_in(cwd);
+        let input = json!({"path": ".", "max_depth": 0});
+        let out = tool.call(input, &ctx).await.unwrap();
+        assert!(!out.is_error, "{}", out.text_content());
+        let text = out.text_content();
+        assert!(
+            text.contains("a/"),
+            "depth-1 child visible after clamp: {text}"
+        );
+        assert!(
+            !text.contains("b/"),
+            "depth-2 child still hidden after clamp to 1: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn max_depth_above_ceiling_clamps_without_panic() {
+        // max_depth far above the ceiling (MAX_MAX_DEPTH=50) must not panic
+        // and must behave as a deep traversal over a shallow tree.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        std::fs::write(root.join("a/b/deep.rs"), "x").unwrap();
+
+        let cwd = root.to_str().unwrap();
+        let tool = TreeTool;
+        let ctx = ctx_in(cwd);
+        let input = json!({"path": ".", "max_depth": 9999});
+        let out = tool.call(input, &ctx).await.unwrap();
+        assert!(!out.is_error, "{}", out.text_content());
+        let text = out.text_content();
+        assert!(text.contains("deep.rs"), "deep file visible: {text}");
     }
 
     #[tokio::test]

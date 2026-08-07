@@ -1,6 +1,10 @@
 //! Small helpers shared across tools.
 
+use std::path::Component;
 use std::path::Path;
+use std::path::PathBuf;
+
+use loopctl::tool::ToolError;
 
 /// Recognized image extensions and their MIME types.
 const IMAGE_EXTENSIONS: &[(&str, &str)] = &[
@@ -77,23 +81,90 @@ pub fn is_url(path: &str) -> bool {
             .is_some_and(|p| p.eq_ignore_ascii_case("https://"))
 }
 
-/// Resolve a possibly-relative `file_path` against `cwd`.
+/// Resolve a possibly-relative `file_path` against `cwd`, enforcing that the
+/// result stays inside the `cwd` workspace.
 ///
-/// Absolute paths are used as-is; relative paths are joined to `cwd`. This
-/// is the shared path-resolution primitive used by every file-touching tool
-/// (`Read`, `Write`, `Edit`, `MultiEdit`, `FileViewer`) so they can't drift apart.
-#[must_use]
-pub fn resolve_path(file_path: &str, cwd: &std::path::Path) -> std::path::PathBuf {
-    let path = std::path::Path::new(file_path);
-    if path.is_relative() {
+/// Relative paths are joined to `cwd`; absolute paths are taken as-is. After
+/// resolution, both the result and `cwd` are normalized lexically (`.` and
+/// `..` collapsed without touching the filesystem, so not-yet-existing write
+/// targets work) and the result must start with `cwd`'s components. A path
+/// that escapes via `..` traversal, or an absolute path unrelated to `cwd`,
+/// is rejected.
+///
+/// This is the shared path-resolution primitive used by every file-touching
+/// tool (`Read`, `Write`, `Edit`, `MultiEdit`, `FileViewer`, and the
+/// navigation tools `Glob`, `Grep`, `CodeSearch`, `Tree`) so they can't drift
+/// apart. Containment is lexical only — a symlink inside the workspace that
+/// points outside is not detected; that is a separate, narrower threat.
+///
+/// # Errors
+///
+/// Returns [`ToolError::InvalidInput`] when the resolved path does not stay
+/// within `cwd`.
+pub fn resolve_path(file_path: &str, cwd: &Path) -> Result<PathBuf, ToolError> {
+    let path = Path::new(file_path);
+    let joined = if path.is_relative() {
         cwd.join(path)
     } else {
         path.to_path_buf()
+    };
+    let normalized = normalize_lexical(&joined);
+    let base = normalize_lexical(cwd);
+    if !lexically_inside(&normalized, &base) {
+        return Err(ToolError::InvalidInput(format!(
+            "Path escapes the working directory: {file_path}"
+        )));
     }
+    Ok(normalized)
+}
+
+/// Lexically normalize `path`, collapsing `.` and `..` without touching the
+/// filesystem.
+///
+/// A leading `..` that would escape above the root is dropped, matching the
+/// behavior of the shared `normalize_path` helper.
+fn normalize_lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// True when `path` starts with all of `base`'s components.
+///
+/// Both arguments are assumed already normalized (see [`normalize_lexical`]).
+/// The root base (`/`) contains everything; an empty `base` contains only
+/// itself.
+fn lexically_inside(path: &Path, base: &Path) -> bool {
+    if base.as_os_str().is_empty() {
+        return path.as_os_str().is_empty();
+    }
+    let mut path_iter = path.components();
+    for base_comp in base.components() {
+        match path_iter.next() {
+            Some(path_comp) if path_comp == base_comp => {}
+            _ => return false,
+        }
+    }
+    true
 }
 
 #[cfg(test)]
-#[allow(clippy::missing_panics_doc, clippy::missing_errors_doc)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
 
@@ -192,5 +263,135 @@ mod tests {
         // must not panic on get(..7)/get(..8).
         assert!(!is_url("éttp://"));
         assert!(!is_url("éxample"));
+    }
+
+    #[test]
+    fn resolve_path_relative_joins_cwd_and_normalizes() {
+        let cwd = Path::new("/work");
+        assert_eq!(
+            resolve_path("sub/a.rs", cwd).unwrap(),
+            PathBuf::from("/work/sub/a.rs")
+        );
+    }
+
+    #[test]
+    fn resolve_path_rejects_unrelated_absolute() {
+        let cwd = Path::new("/work");
+        let err = resolve_path("/abs/a.rs", cwd).unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidInput(ref msg) if msg.contains("escapes")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_path_rejects_traversal_escape() {
+        let cwd = Path::new("/work");
+        assert!(resolve_path("../escape/a.rs", cwd).is_err());
+        assert!(resolve_path("sub/../../escape/a.rs", cwd).is_err());
+        assert!(resolve_path("../../..", cwd).is_err());
+    }
+
+    #[test]
+    fn resolve_path_allows_in_workspace_dots() {
+        let cwd = Path::new("/work");
+        // `..` that stays inside resolves and normalizes.
+        assert_eq!(
+            resolve_path("sub/../a.rs", cwd).unwrap(),
+            PathBuf::from("/work/a.rs")
+        );
+        assert_eq!(
+            resolve_path("a/./b/../c.rs", cwd).unwrap(),
+            PathBuf::from("/work/a/c.rs")
+        );
+        // `..` back to the workspace root itself is still inside.
+        assert_eq!(resolve_path("sub/..", cwd).unwrap(), PathBuf::from("/work"));
+    }
+
+    #[test]
+    fn resolve_path_accepts_absolute_inside_workspace() {
+        let cwd = Path::new("/work");
+        assert_eq!(
+            resolve_path("/work/src/a.rs", cwd).unwrap(),
+            PathBuf::from("/work/src/a.rs")
+        );
+    }
+
+    #[test]
+    fn resolve_path_rejects_prefix_collision_directory() {
+        // `/workspace` shares the prefix string `/work` but is a sibling, not
+        // a child — must be rejected. The check is component-wise, so a naive
+        // starts-with-string test would wrongly accept this.
+        let cwd = Path::new("/work");
+        assert!(resolve_path("/workspace/a.rs", cwd).is_err());
+    }
+
+    #[test]
+    fn normalize_lexical_collapses_dot_and_dotdot() {
+        assert_eq!(
+            normalize_lexical(Path::new("./a.rs")),
+            PathBuf::from("a.rs")
+        );
+        assert_eq!(
+            normalize_lexical(Path::new("src/../a.rs")),
+            PathBuf::from("a.rs")
+        );
+        assert_eq!(
+            normalize_lexical(Path::new("/work/./b/../a.rs")),
+            PathBuf::from("/work/a.rs")
+        );
+    }
+
+    #[test]
+    fn normalize_lexical_consecutive_dotdot_pop_each() {
+        // Two `..` must pop two components, not collapse into one.
+        assert_eq!(
+            normalize_lexical(Path::new("/work/a/b/../../c.rs")),
+            PathBuf::from("/work/c.rs")
+        );
+    }
+
+    #[test]
+    fn normalize_lexical_drops_leading_dotdot_at_root() {
+        // `..` with nothing left to pop is dropped rather than producing
+        // `/..` — the contract resolve_path relies on so a traversal that
+        // would escape above `/` does not synthesize a phantom parent.
+        assert_eq!(normalize_lexical(Path::new("/..")), PathBuf::from("/"));
+        assert_eq!(normalize_lexical(Path::new("/a/../..")), PathBuf::from("/"));
+    }
+
+    #[test]
+    fn lexically_inside_accepts_self_and_descendant() {
+        assert!(lexically_inside(Path::new("/work"), Path::new("/work")));
+        assert!(lexically_inside(
+            Path::new("/work/src/a.rs"),
+            Path::new("/work")
+        ));
+        assert!(lexically_inside(Path::new("/work/a"), Path::new("/work/a")));
+    }
+
+    #[test]
+    fn lexically_inside_rejects_sibling_and_unrelated() {
+        assert!(!lexically_inside(Path::new("/wor"), Path::new("/work")));
+        assert!(!lexically_inside(
+            Path::new("/workspace/a.rs"),
+            Path::new("/work")
+        ));
+        assert!(!lexically_inside(
+            Path::new("/other/a.rs"),
+            Path::new("/work")
+        ));
+    }
+
+    #[test]
+    fn lexically_inside_root_base_contains_everything() {
+        assert!(lexically_inside(Path::new("/anything"), Path::new("/")));
+        assert!(lexically_inside(Path::new("/"), Path::new("/")));
+    }
+
+    #[test]
+    fn lexically_inside_empty_base_only_contains_empty() {
+        assert!(lexically_inside(Path::new(""), Path::new("")));
+        assert!(!lexically_inside(Path::new("a"), Path::new("")));
     }
 }

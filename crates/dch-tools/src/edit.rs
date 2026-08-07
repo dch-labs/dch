@@ -125,7 +125,7 @@ impl EditTool {
         })?;
         let cwd = rc.cwd.clone();
         let parsed = parse_input(&input)?;
-        let full_path = resolve_path(parsed.file_path, &cwd);
+        let full_path = resolve_path(parsed.file_path, &cwd)?;
         let old_content = read_existing(&full_path, parsed.file_path).await?;
         let new_content = match apply_edit(&old_content, parsed.old_text, parsed.new_text) {
             Ok(c) => c,
@@ -811,21 +811,6 @@ mod tests {
             parse_input(&input).unwrap_err(),
             ToolError::InvalidInput(ref s) if s.contains("WebFetch")
         ));
-    }
-
-    #[test]
-    fn resolve_path_relative_joins_cwd() {
-        let cwd = Path::new("/work");
-        assert_eq!(
-            resolve_path("sub/a.rs", cwd),
-            PathBuf::from("/work/sub/a.rs")
-        );
-    }
-
-    #[test]
-    fn resolve_path_absolute_used_as_is() {
-        let cwd = Path::new("/work");
-        assert_eq!(resolve_path("/abs/a.rs", cwd), PathBuf::from("/abs/a.rs"));
     }
 
     #[tokio::test]

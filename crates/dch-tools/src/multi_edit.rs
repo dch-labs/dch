@@ -312,7 +312,7 @@ fn build_operations(edits: &[Value], cwd: &Path) -> Result<Vec<EditOperation>, T
             ));
         }
 
-        let full_path = normalize_path(&resolve_path(file_path, cwd));
+        let full_path = resolve_path(file_path, cwd)?;
         operations.push(EditOperation {
             file_path: file_path.to_string(),
             full_path,
@@ -321,27 +321,6 @@ fn build_operations(edits: &[Value], cwd: &Path) -> Result<Vec<EditOperation>, T
         });
     }
     Ok(operations)
-}
-
-/// Lexically normalize a path: collapse `.` components and resolve `..`
-/// against preceding components, without touching the filesystem.
-///
-/// This makes path aliases like `a.rs` and `./a.rs` (or `src/../src/a.rs`)
-/// compare equal, so [`dup_path_check`] catches them as duplicates. It does
-/// **not** follow symlinks (unlike [`std::fs::canonicalize`]); symlink
-/// detection is [`symlink_check`]'s job.
-fn normalize_path(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for comp in path.components() {
-        match comp {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                out.pop();
-            }
-            other => out.push(other.as_os_str()),
-        }
-    }
-    out
 }
 
 /// Read each distinct target file once into a map keyed by `file_path`.
@@ -984,10 +963,9 @@ mod tests {
     }
 
     #[test]
-    fn build_operations_keeps_absolute_path() {
+    fn build_operations_rejects_unrelated_absolute_path() {
         let edits = vec![edit("/abs/a.rs", "x", "y")];
-        let ops = build_operations(&edits, Path::new("/work")).unwrap();
-        assert_eq!(ops[0].full_path, PathBuf::from("/abs/a.rs"));
+        assert!(build_operations(&edits, Path::new("/work")).is_err());
     }
 
     #[test]
@@ -1857,19 +1835,6 @@ mod tests {
         assert!(out.contains("delta"), "{out}");
         // Exactly one File header for a.txt (not two).
         assert_eq!(out.matches("File 1: a.txt").count(), 1, "{out}");
-    }
-
-    #[test]
-    fn normalize_path_collapses_dot_and_dotdot() {
-        assert_eq!(normalize_path(Path::new("./a.rs")), PathBuf::from("a.rs"));
-        assert_eq!(
-            normalize_path(Path::new("src/../a.rs")),
-            PathBuf::from("a.rs")
-        );
-        assert_eq!(
-            normalize_path(Path::new("/work/./b/../a.rs")),
-            PathBuf::from("/work/a.rs")
-        );
     }
 
     #[tokio::test]

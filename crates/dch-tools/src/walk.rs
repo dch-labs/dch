@@ -117,9 +117,12 @@ const ALWAYS_PRUNE_DIRS: &[&str] = &[
 /// path components below `base`; `None` = unlimited). Used by the Tree tool,
 /// which needs directory nodes as well as files.
 ///
-/// Directories matching the always-prune list (`target`, `node_modules`, etc.)
-/// are excluded entirely (node and children), because the `ignore` crate's
-/// override patterns filter files only, not directory descent.
+/// The `base` path itself is dropped from the output (the caller knows its
+/// root), and directories on the always-prune list (`target`, `node_modules`,
+/// etc.) are pruned during descent via the `ignore` crate's `filter_entry`
+/// hook so neither the node nor its children are visited — the override
+/// patterns filter files only, not directory descent, so the predicate fills
+/// that gap.
 #[must_use]
 pub fn walk_entries(base: &Path, max_depth: Option<usize>) -> Vec<WalkEntry> {
     let mut builder = ignore::WalkBuilder::new(base);
@@ -134,18 +137,22 @@ pub fn walk_entries(base: &Path, max_depth: Option<usize>) -> Vec<WalkEntry> {
     let overrides = build_default_overrides(base);
     builder.overrides(overrides);
 
+    let base_owned = base.to_path_buf();
+    builder.filter_entry(move |e| {
+        if e.path() == base_owned {
+            return true;
+        }
+        if e.file_type().is_some_and(|ft| ft.is_dir()) {
+            let name = e.path().file_name().and_then(|n| n.to_str()).unwrap_or("");
+            return !ALWAYS_PRUNE_DIRS.contains(&name);
+        }
+        true
+    });
+
     builder
         .build()
         .filter_map(std::result::Result::ok)
-        .skip(1)
-        .filter(|e| {
-            if e.file_type().is_some_and(|ft| ft.is_dir()) {
-                let name = e.path().file_name().and_then(|n| n.to_str()).unwrap_or("");
-                !ALWAYS_PRUNE_DIRS.contains(&name)
-            } else {
-                true
-            }
-        })
+        .filter(|e| e.path() != base)
         .filter_map(|e| {
             let ft = e.file_type()?;
             if ft.is_dir() {
@@ -169,27 +176,18 @@ pub fn walk_entries(base: &Path, max_depth: Option<usize>) -> Vec<WalkEntry> {
 ///
 /// These directories are removed from results regardless of `.gitignore`,
 /// because they are almost never useful to search (`target/`, `node_modules/`,
-/// `.git/`, `__pycache__/`, virtualenvs, build output). The `!`-prefix is
-/// gitignore "negate-to-exclude" syntax as interpreted by
-/// `ignore::overrides::Override`. On a build error the matcher falls back to
-/// an empty `Override` (no exclusions) rather than panicking.
+/// `.git/`, `__pycache__/`, virtualenvs, build output). The patterns are
+/// derived from the same always-prune list used by `walk_entries`, so the
+/// file-level overrides and the directory-descent pruning stay in sync. The
+/// `!`-prefix is gitignore "negate-to-exclude" syntax as interpreted by
+/// `ignore::overrides::Override`.
+/// On a build error the matcher falls back to an empty `Override` (no
+/// exclusions) rather than panicking.
 #[must_use]
 pub fn build_default_overrides(base: &Path) -> ignore::overrides::Override {
     let mut builder = ignore::overrides::OverrideBuilder::new(base);
-    let always_exclude = [
-        "!target/**",
-        "!node_modules/**",
-        "!.git/**",
-        "!__pycache__/**",
-        "!.next/**",
-        "!.venv/**",
-        "!venv/**",
-        "!dist/**",
-        "!build/**",
-        "!.cache/**",
-    ];
-    for pat in always_exclude {
-        builder.add(pat).ok();
+    for dir in ALWAYS_PRUNE_DIRS {
+        builder.add(&format!("!{dir}/**")).ok();
     }
     builder
         .build()
@@ -750,6 +748,45 @@ mod tests {
         assert!(
             !got.contains(&("ignored.rs".to_string(), false)),
             "gitignored file absent: {got:?}"
+        );
+    }
+
+    #[test]
+    fn walk_entries_keeps_children_when_root_name_matches_prune_list() {
+        // The root dir is fed to filter_entry before its children. The root
+        // must never be pruned even when its own file name is on the prune
+        // list (e.g. walking a project that itself lives under a `target/`
+        // parent). A positional or naive name-match skip would drop the whole
+        // tree; the identity check in filter_entry lets the root through.
+        let outer = tempfile::TempDir::new().expect("tempdir");
+        let root = outer.path().join("target");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        std::fs::write(root.join("a.rs"), "").expect("write");
+        let got = walked_entries(&root, None);
+        assert!(
+            got.contains(&("a.rs".to_string(), false)),
+            "child under a root named `target` must survive: {got:?}"
+        );
+    }
+
+    #[test]
+    fn walk_entries_prunes_descendants_of_pruned_dir() {
+        // filter_entry prunes during descent: a child whose name matches the
+        // prune list is rejected along with its whole subtree, not yielded and
+        // then filtered after the fact. Pin that a file nested inside a pruned
+        // dir never appears even when it would match an include pattern.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("node_modules/pkg/deep")).expect("mkdir");
+        std::fs::write(tmp.path().join("node_modules/pkg/deep/a.rs"), "").expect("write");
+        std::fs::write(tmp.path().join("kept.rs"), "").expect("write");
+        let got = walked_entries(tmp.path(), None);
+        assert!(
+            !got.iter().any(|(p, _)| p.starts_with("node_modules/")),
+            "nothing under node_modules/ should remain: {got:?}"
+        );
+        assert!(
+            got.contains(&("kept.rs".to_string(), false)),
+            "sibling outside the pruned dir is kept: {got:?}"
         );
     }
 }
