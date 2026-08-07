@@ -173,10 +173,10 @@ impl MultiEditTool {
             Ok(f) => f,
             Err(reason) => return Ok(reason.into_output()),
         };
-        if !parsed.skip_linter {
-            if let Some(reason) = lint_all(&operations, &finals) {
-                return Ok(reason.into_output());
-            }
+        if !parsed.skip_linter
+            && let Some(reason) = lint_all(&operations, &finals)
+        {
+            return Ok(reason.into_output());
         }
 
         // Phase 3: build the preview/diff block (always).
@@ -519,7 +519,7 @@ struct EditConflict {
 /// Two edits to one file conflict when one's matched byte-range intersects the
 /// other's (one contains the other, or they share text). Applying either first
 /// would invalidate the other's match. Different files never conflict, even
-/// with identical `old_text`. Ported from the salvage source.
+/// with identical `old_text`.
 fn detect_edit_conflicts(
     operations: &[EditOperation],
     file_contents: &BTreeMap<String, String>,
@@ -808,8 +808,6 @@ fn apply_summary(preview: &str, applied: &[&str], operations: &[EditOperation]) 
 mod tests {
     use super::*;
     use crate::context::RunnerContext;
-    use crate::runtime::RuntimeConfig;
-    use crate::state::SessionState;
     use loopctl::tool::ToolContext;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -821,9 +819,8 @@ mod tests {
         ctx.cwd = cwd.to_string();
         let rc = RunnerContext {
             cwd: PathBuf::from(cwd),
-            session_state: Arc::new(Mutex::new(SessionState::default())),
+            todos: Arc::new(Mutex::new(Vec::new())),
             question_tx: None,
-            runtime: RuntimeConfig::default(),
         };
         ctx.set_extension(rc);
         ctx
@@ -1600,8 +1597,6 @@ mod tests {
         assert!(reg.get("MultiEdit").is_some(), "MultiEdit registered");
     }
 
-    // ---- build_preview (pure) ----
-
     #[test]
     fn build_preview_dry_run_header_and_footer() {
         let ops = vec![op("a.rs", "fn one() {}", "fn one(x: i32) {}")];
@@ -1649,8 +1644,6 @@ mod tests {
         assert!(out.contains("  Changed: b.rs"), "{out}");
     }
 
-    // ---- apply_summary (pure) ----
-
     #[test]
     fn apply_summary_counts_applied_files() {
         let preview = "Multi-File Edit Summary\n";
@@ -1684,8 +1677,6 @@ mod tests {
         assert!(out.starts_with("header line\nbody\n"), "{out}");
         assert!(out.contains("━━━"), "{out}");
     }
-
-    // ---- multi_edit_inner (async, output-shape assertions) ----
 
     #[tokio::test]
     async fn multi_edit_inner_dry_run_returns_preview_not_summary() {

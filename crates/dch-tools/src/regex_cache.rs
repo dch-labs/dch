@@ -3,7 +3,7 @@
 //! Tools that accept user-supplied regex patterns (`Grep`, `CodeSearch`)
 //! would otherwise recompile the same pattern on every call. This module
 //! caches up to 256 compiled regexes process-globally, with
-//! least-recently-used eviction.
+//! least-recently-used eviction provided by the `lru` crate.
 //!
 //! `regex::Regex` is `Send + Sync` and clones cheaply (it is `Arc`-backed
 //! internally), so the cache hands out clones and never holds its lock across
@@ -11,62 +11,74 @@
 //! concurrency-safe despite sharing global state: the shared state is a
 //! lock-protected lookup table, not mutable file or session state.
 
+use std::num::NonZeroUsize;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 
+use lru::LruCache;
 use regex::Regex;
 
-/// Maximum number of compiled regexes kept in the cache.
-///
-/// Each compiled regex uses roughly 1–10 `KiB`, so 256 entries caps the cache
-/// at ~256 `KiB`–2.5 `MiB` — ample for the small set of patterns a single
-/// agent run tends to repeat, small enough to be forgettable.
-const MAX_CACHE_SIZE: usize = 256;
+/// Maximum number of compiled regexes kept in the cache (256 ≈ a few `MiB`).
+const CACHE_CAPACITY: usize = 256;
 
-/// The process-global cache.
+/// The process-global regex cache; `OnceLock` because `LruCache::new` is not `const`.
+static REGEX_CACHE: OnceLock<Mutex<LruCache<String, Regex>>> = OnceLock::new();
+
+/// Return the process-global regex cache, initializing it on first access.
 ///
-/// Newest entries live at the back; eviction removes the front. `Mutex::new`
-/// is `const` since Rust 1.63, so no lazy initialization is needed.
-static REGEX_CACHE: Mutex<Vec<(String, Regex)>> = Mutex::new(Vec::new());
+/// `OnceLock::get_or_init` constructs the `Mutex<LruCache>` lazily because
+/// [`LruCache::new`] is not `const fn` — it allocates internal storage. The
+/// returned reference is `&'static` (the `OnceLock` lives for the process
+/// lifetime), so callers never need to store or clone it.
+fn cache() -> &'static Mutex<LruCache<String, Regex>> {
+    let cap = NonZeroUsize::new(CACHE_CAPACITY).unwrap_or(NonZeroUsize::MIN);
+    REGEX_CACHE.get_or_init(|| Mutex::new(LruCache::new(cap)))
+}
 
 /// Return a compiled regex for `pattern`, fetching from the cache when able.
 ///
-/// On a cache hit the entry is moved to the back (most-recently-used). On a
-/// miss the regex is compiled, stored at the back (evicting the front if the
-/// cache is full), and returned. A poisoned lock falls back to compiling
-/// without caching — callers still get a working regex.
+/// On a cache hit the entry is moved to most-recently-used (the `lru` crate
+/// does this in O(1) as part of `get`) and a cheap clone is returned — the
+/// lock is held only for the lookup, never across the caller's use. On a miss
+/// the regex is compiled **outside** the lock (compilation can be slow), then
+/// inserted (evicting the least-recently-used if the cache is full, in O(1)).
+/// A concurrent caller may insert the same key between the lookup and the
+/// insert; that is harmless — `put` replaces the prior entry with an
+/// equivalent regex.
+///
+/// A poisoned lock falls back to compiling without caching — callers still
+/// get a working regex rather than a poison error propagating up.
+///
+/// When `case_insensitive` is `true`, the pattern is wrapped with the `(?i)`
+/// flag (idempotently — a pattern already beginning with `(?i)` is not
+/// double-wrapped) before lookup/compile. The wrapped form is the cache key,
+/// so a subsequent case-sensitive call with the same body does not collide
+/// with this entry, and a repeated case-insensitive call is a hit.
 ///
 /// # Errors
 ///
 /// Returns the underlying [`regex::Error`] unchanged if `pattern` fails to
 /// compile. Invalid patterns are never stored in the cache.
-pub fn get_or_compile(pattern: &str) -> Result<Regex, regex::Error> {
-    if let Some(hit) = lookup_cached(pattern) {
-        return Ok(hit);
-    }
-
-    let regex = Regex::new(pattern)?;
-    insert_cached(pattern.to_string(), regex.clone());
-    Ok(regex)
-}
-
-/// Return a case-insensitive compiled regex for `pattern`.
-///
-/// Wraps `pattern` with the `(?i)` flag (idempotent — if the pattern already
-/// begins with `(?i)`, no second prefix is added) and then delegates to
-/// [`get_or_compile`]. The wrapped form is what gets cached, so a subsequent
-/// case-sensitive call with the same body does not collide with this entry.
-///
-/// # Errors
-///
-/// Returns the underlying [`regex::Error`] if `pattern` fails to compile.
-pub fn get_or_compile_case_insensitive(pattern: &str) -> Result<Regex, regex::Error> {
-    let cached_pattern = if pattern.starts_with("(?i)") {
-        pattern.to_string()
-    } else {
+pub fn get_or_compile(pattern: &str, case_insensitive: bool) -> Result<Regex, regex::Error> {
+    let cache_key = if case_insensitive && !pattern.starts_with("(?i)") {
         format!("(?i){pattern}")
+    } else {
+        pattern.to_string()
     };
 
-    get_or_compile(&cached_pattern)
+    if let Ok(mut guard) = cache().lock() {
+        if let Some(regex) = guard.get(&cache_key) {
+            return Ok(regex.clone());
+        }
+    } else {
+        return Regex::new(&cache_key);
+    }
+
+    let regex = Regex::new(&cache_key)?;
+    if let Ok(mut guard) = cache().lock() {
+        guard.put(cache_key, regex.clone());
+    }
+    Ok(regex)
 }
 
 /// Drop every cached entry.
@@ -75,35 +87,9 @@ pub fn get_or_compile_case_insensitive(pattern: &str) -> Result<Regex, regex::Er
 /// pressure (the cache is bounded, so calling this is rarely necessary in
 /// production).
 pub fn clear_cache() {
-    if let Ok(mut cache) = REGEX_CACHE.lock() {
-        cache.clear();
+    if let Ok(mut guard) = cache().lock() {
+        guard.clear();
     }
-}
-
-/// Cache-hit path: find `pattern`, move it to the back, return a clone.
-///
-/// Returns `None` on a miss, a poisoned lock, or an empty cache. Holding the
-/// regex across the lock release is safe because the clone is Arc-backed.
-fn lookup_cached(pattern: &str) -> Option<Regex> {
-    let mut cache = REGEX_CACHE.lock().ok()?;
-    let idx = cache.iter().rposition(|(p, _)| p == pattern)?;
-    let (_, regex) = cache.remove(idx);
-    let cloned = regex.clone();
-    cache.push((pattern.to_string(), regex));
-    Some(cloned)
-}
-
-/// Cache-miss path: store `regex` under `pattern`, evicting the front entry
-/// if the cache is at capacity.
-fn insert_cached(pattern: String, regex: Regex) {
-    let Ok(mut cache) = REGEX_CACHE.lock() else {
-        return;
-    };
-    if cache.len() >= MAX_CACHE_SIZE {
-        // Vec::remove(0) is O(n); fine at n=256, and only on the miss path.
-        cache.remove(0);
-    }
-    cache.push((pattern, regex));
 }
 
 #[cfg(test)]
@@ -112,7 +98,8 @@ fn insert_cached(pattern: String, regex: Regex) {
     clippy::unwrap_used,
     clippy::panic,
     clippy::missing_panics_doc,
-    clippy::missing_errors_doc
+    clippy::missing_errors_doc,
+    clippy::must_use_candidate
 )]
 mod tests {
     use super::*;
@@ -122,14 +109,6 @@ mod tests {
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
-    pub fn cache_size() -> usize {
-        REGEX_CACHE.lock().map_or(0, |c| c.len())
-    }
-
-    /// Build a marker string unique across parallel test threads.
-    ///
-    /// `std::process::id()` is constant across threads in one process; the
-    /// counter makes each call distinct even when tests run in parallel.
     fn marker(label: &str) -> String {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         format!(
@@ -140,13 +119,18 @@ mod tests {
         )
     }
 
+    #[must_use]
+    fn cache_size() -> usize {
+        cache().lock().map_or(0, |c| c.len())
+    }
+
     #[test]
     fn cache_hit_returns_matching_regex() {
         let _guard = TEST_LOCK.lock().unwrap();
         clear_cache();
         let m = marker("hit");
-        let re1 = get_or_compile(&m).unwrap();
-        let re2 = get_or_compile(&m).unwrap();
+        let re1 = get_or_compile(&m, false).unwrap();
+        let re2 = get_or_compile(&m, false).unwrap();
         assert!(re1.is_match(&m));
         assert!(re2.is_match(&m));
     }
@@ -156,8 +140,8 @@ mod tests {
         let _guard = TEST_LOCK.lock().unwrap();
         let m1 = marker("miss_a");
         let m2 = marker("miss_b");
-        let re1 = get_or_compile(&m1).unwrap();
-        let re2 = get_or_compile(&m2).unwrap();
+        let re1 = get_or_compile(&m1, false).unwrap();
+        let re2 = get_or_compile(&m2, false).unwrap();
         assert!(re1.is_match(&m1));
         assert!(re2.is_match(&m2));
         assert!(!re1.is_match(&m2));
@@ -166,12 +150,14 @@ mod tests {
     #[test]
     fn cache_evicts_at_capacity() {
         let _guard = TEST_LOCK.lock().unwrap();
-        for i in 0..(MAX_CACHE_SIZE + 50) {
+        let cap = CACHE_CAPACITY;
+        // Fill well past capacity; the newest entry must still resolve.
+        for i in 0..cap.saturating_add(50) {
             let p = format!("eviction_{}_{}", std::process::id(), i);
-            let _ = get_or_compile(&p).unwrap();
+            let _ = get_or_compile(&p, false).unwrap();
         }
-        let newest = format!("eviction_{}_{}", std::process::id(), MAX_CACHE_SIZE + 49);
-        let re = get_or_compile(&newest).unwrap();
+        let newest = format!("eviction_{}_{}", std::process::id(), cap.saturating_add(49));
+        let re = get_or_compile(&newest, false).unwrap();
         assert!(re.is_match(&newest));
     }
 
@@ -183,7 +169,7 @@ mod tests {
         let _second = marker("lru_second");
         let _third = marker("lru_third");
         // Re-access "first" — it should still resolve (LRU kept it).
-        let re = get_or_compile(&first).unwrap();
+        let re = get_or_compile(&first, false).unwrap();
         assert!(re.is_match(&first));
     }
 
@@ -191,7 +177,7 @@ mod tests {
     fn case_insensitive_matches_uppercase() {
         let _guard = TEST_LOCK.lock().unwrap();
         let m = marker("ci");
-        let re = get_or_compile_case_insensitive(&m).unwrap();
+        let re = get_or_compile(&m, true).unwrap();
         assert!(re.is_match(&m.to_uppercase()));
         assert!(!re.is_match("no_match_xyz"));
     }
@@ -202,8 +188,8 @@ mod tests {
         let m = marker("ci_idem");
         let wrapped = format!("(?i){m}");
         // Both forms should compile and match case-insensitively.
-        let re_plain = get_or_compile_case_insensitive(&m).unwrap();
-        let re_prefixed = get_or_compile_case_insensitive(&wrapped).unwrap();
+        let re_plain = get_or_compile(&m, true).unwrap();
+        let re_prefixed = get_or_compile(&wrapped, true).unwrap();
         assert!(re_plain.is_match(&m.to_uppercase()));
         assert!(re_prefixed.is_match(&m.to_uppercase()));
     }
@@ -211,7 +197,7 @@ mod tests {
     #[test]
     fn invalid_regex_errors() {
         let _guard = TEST_LOCK.lock().unwrap();
-        let result = get_or_compile("(unclosed");
+        let result = get_or_compile("(unclosed", false);
         assert!(result.is_err());
     }
 
@@ -219,7 +205,7 @@ mod tests {
     fn clear_cache_empties_state() {
         let _guard = TEST_LOCK.lock().unwrap();
         let m = marker("clear");
-        let _ = get_or_compile(&m).unwrap();
+        let _ = get_or_compile(&m, false).unwrap();
         assert!(cache_size() > 0);
         clear_cache();
         assert_eq!(cache_size(), 0);

@@ -3,6 +3,7 @@
 use loopctl::tool::ToolRegistry;
 
 use crate::bash::BashTool;
+use crate::code_search::CodeSearchTool;
 use crate::edit::EditTool;
 use crate::file_viewer::FileViewerTool;
 use crate::glob::GlobTool;
@@ -26,5 +27,6 @@ pub fn builtin_registry() -> ToolRegistry {
     registry.register(FileViewerTool);
     registry.register(GlobTool);
     registry.register(GrepTool);
+    registry.register(CodeSearchTool);
     registry
 }

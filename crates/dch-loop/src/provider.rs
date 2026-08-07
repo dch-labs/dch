@@ -13,10 +13,6 @@ use loopctl::provider::OpenAiClient;
 use crate::error::RunnerError;
 
 /// Sentinel API key used for providers that require no authentication.
-///
-/// `loopctl`'s OpenAI-compatible client builder rejects an empty key, so the
-/// local Ollama provider (no auth) is given this fixed value, matching
-/// loopctl's own Ollama constructor.
 const NO_AUTH_KEY: &str = "ollama";
 
 /// Build a [`loopctl::api::SharedApiClient`] for the provider named by
@@ -49,29 +45,29 @@ pub fn create_client(config: &ApiConfig) -> Result<SharedApiClient, RunnerError>
     let client: SharedApiClient = match config.api_type {
         ApiType::OpenAi | ApiType::Ollama | ApiType::DeepSeek | ApiType::Grok => Arc::new(
             OpenAiClient::builder()
-                .api_key(api_key)
-                .base_url(base_url)
-                .model(config.model.as_str())
-                .timeout(timeout)
+                .with_api_key(api_key)
+                .with_base_url(base_url)
+                .with_model(config.model.as_str())
+                .with_timeout(timeout)
                 .build()
                 .map_err(|e| RunnerError::Client(e.to_string()))?,
         ),
         ApiType::Anthropic | ApiType::Zai => Arc::new(
             AnthropicClient::builder()
-                .api_key(api_key)
-                .base_url(base_url)
-                .model(config.model.as_str())
-                .max_tokens(config.max_tokens)
-                .timeout(timeout)
+                .with_api_key(api_key)
+                .with_base_url(base_url)
+                .with_model(config.model.as_str())
+                .with_max_tokens(config.max_tokens)
+                .with_timeout(timeout)
                 .build()
                 .map_err(|e| RunnerError::Client(e.to_string()))?,
         ),
         ApiType::Gemini => Arc::new(
             GeminiClient::builder()
-                .api_key(api_key)
-                .base_url(base_url)
-                .model(config.model.as_str())
-                .timeout(timeout)
+                .with_api_key(api_key)
+                .with_base_url(base_url)
+                .with_model(config.model.as_str())
+                .with_timeout(timeout)
                 .build()
                 .map_err(|e| RunnerError::Client(e.to_string()))?,
         ),
@@ -79,7 +75,13 @@ pub fn create_client(config: &ApiConfig) -> Result<SharedApiClient, RunnerError>
     Ok(client)
 }
 
-/// Resolve the base URL, falling back to the provider default when empty.
+/// Resolve the effective API base URL for `config`.
+///
+/// Returns the configured [`ApiConfig::base_url`] verbatim when the user set
+/// one; otherwise falls back to [`ApiType::default_base_url`] for the
+/// configured provider. This is what lets a config omit `base_url` entirely
+/// (the common case for stock OpenAI/Anthropic/Gemini) while still allowing an
+/// override for self-hosted or proxy deployments.
 fn effective_base_url(config: &ApiConfig) -> String {
     if config.base_url.is_empty() {
         config.api_type.default_base_url().to_owned()
@@ -131,7 +133,15 @@ fn resolve_api_key(config: &ApiConfig) -> Result<String, RunnerError> {
     }
 }
 
-/// Candidate API-key environment variables for each provider, in fallback order.
+/// Candidate API-key environment variables for `api_type`, in fallback order.
+///
+/// Consulted by [`resolve_api_key`] when [`ApiConfig::api_key`] is unset, so a
+/// user can avoid putting the key in the config file by exporting it. Each
+/// provider maps to the env var its official client reads; `OpenAI`-compatible
+/// providers (`DeepSeek`, `Grok`) share `OPENAI_API_KEY` since they speak the
+/// same protocol, and `Gemini` tries both `GEMINI_API_KEY` and the older
+/// `GOOGLE_API_KEY`. [`ApiType::Ollama`] is included for uniformity even though
+/// a local Ollama needs no key.
 fn candidate_env_vars(api_type: ApiType) -> Vec<&'static str> {
     match api_type {
         ApiType::OpenAi | ApiType::DeepSeek | ApiType::Grok => vec!["OPENAI_API_KEY"],

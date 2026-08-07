@@ -166,10 +166,10 @@ const SNIFF_BYTES: usize = 8192;
 /// True if `path` is likely a binary file, by extension or content sniff.
 ///
 /// The check has two stages: first, a known-binary extension (`png`, `pdf`,
-/// `so`, …); if that is inconclusive, the first 8 KB are read and scanned for
-/// NUL bytes or a low ratio of printable/whitespace bytes. Either signal
-/// marks the file binary. Read faults are treated as "not binary" so the
-/// caller can surface the real error itself.
+/// `so`, …); if that is inconclusive, the first `SNIFF_BYTES` are read and
+/// passed to [`bytes_look_binary`]. Either signal marks the file binary.
+/// Read faults are treated as "not binary" so the caller can surface the real
+/// error itself.
 #[must_use]
 pub fn likely_binary(path: &Path) -> bool {
     if let Some(ext) = path.extension() {
@@ -185,21 +185,53 @@ pub fn likely_binary(path: &Path) -> bool {
     let Ok(n) = std::io::Read::read(&mut file, &mut buffer) else {
         return false;
     };
-    if n == 0 {
-        return false;
-    }
     let Some(window) = buffer.get(..n) else {
         return false;
     };
+    bytes_look_binary(window)
+}
+
+/// True if a byte buffer looks like binary content.
+///
+/// Considers only the first `SNIFF_BYTES` of `bytes`. A NUL byte anywhere in
+/// the window, or a ratio of text-like bytes below 75%, marks the content
+/// binary. A byte is text-like when it is ASCII printable/whitespace or part
+/// of a UTF-8 multibyte sequence (any byte >= `0x80`); the bytes that drag
+/// the ratio down are therefore non-whitespace C0 control bytes — the actual
+/// signature of binary payloads. This keeps UTF-8 text (CJK, emoji) readable
+/// while still catching executables, images, and other non-text data. This is
+/// the byte-level core shared by [`likely_binary`] (which opens the file) and
+/// any caller that already holds the bytes — so the detection rule stays in
+/// one place even when the IO path differs.
+#[must_use]
+pub fn bytes_look_binary(bytes: &[u8]) -> bool {
+    let window = bytes.get(..SNIFF_BYTES).unwrap_or(bytes);
+    if window.is_empty() {
+        return false;
+    }
     if window.contains(&0) {
         return true;
     }
-    let threshold = n.saturating_mul(3).saturating_div(4);
+    let threshold = window.len().saturating_mul(3).saturating_div(4);
     let text_bytes = window
         .iter()
-        .filter(|&&b| b == b'\t' || b == b'\n' || b == b'\r' || (32..=126).contains(&b))
+        .filter(|&&b| {
+            b == b'\t' || b == b'\n' || b == b'\r' || (32..=126).contains(&b) || b >= 0x80
+        })
         .count();
     text_bytes < threshold
+}
+
+/// Upper bound (1 `MiB`) on a file's byte size before a search tool reads it whole.
+pub const MAX_FILE_BYTES: u64 = 1024 * 1024;
+
+/// Whether `path`'s metadata size exceeds [`MAX_FILE_BYTES`].
+///
+/// Metadata failures read as "not too large" so the caller still attempts the
+/// read and surfaces the real I/O error rather than silently skipping.
+#[must_use]
+pub fn file_too_large(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| m.len() > MAX_FILE_BYTES)
 }
 
 #[cfg(test)]
@@ -256,6 +288,33 @@ mod tests {
         assert!(likely_binary(&PathBuf::from("code.pyc")));
         assert!(!likely_binary(&PathBuf::from("main.rs")));
         assert!(!likely_binary(&PathBuf::from("config.toml")));
+    }
+
+    #[test]
+    fn bytes_look_binary_detects_nul() {
+        assert!(bytes_look_binary(b"\x00\x01\x02"));
+    }
+
+    #[test]
+    fn bytes_look_binary_detects_control_byte_ratio() {
+        // Many non-NUL control bytes (0x01) and few printable bytes → binary.
+        let mut bytes = vec![0x01u8; 1000];
+        bytes.extend_from_slice(b"hello");
+        assert!(bytes_look_binary(&bytes));
+    }
+
+    #[test]
+    fn bytes_look_binary_accepts_high_multibyte_utf8() {
+        // A buffer of all-`€` (0xE2 0x82 0xAC) is valid UTF-8 with no NUL and
+        // no control bytes — must read as text even though none of its bytes
+        // are ASCII-printable. Guards against CJK/emoji false-positives.
+        let euro = "€".repeat(1000);
+        assert!(!bytes_look_binary(euro.as_bytes()));
+    }
+
+    #[test]
+    fn bytes_look_binary_accepts_plain_text() {
+        assert!(!bytes_look_binary(b"hello world\nthis is text\r\n"));
     }
 
     #[test]

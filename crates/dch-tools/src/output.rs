@@ -7,35 +7,53 @@
 //! full content. This keeps a single oversized search from blowing out a
 //! model's context window.
 //!
+//! Spilled files land in a per-session subdir (see [`session_temp_dir`]) so one
+//! session's results don't intermingle with another's. The subdir is created on
+//! first spill; cleanup on session shutdown is the runner's responsibility (the
+//! `Loop` trait has no shutdown hook today — see the dch `SESSION-MODEL-AUDIT`
+//! and loopctl Change 13).
+//!
 //! Any failure along the spill path (the temp dir cannot be created, the file
 //! cannot be written) degrades gracefully to inline truncation: the caller
 //! always gets a usable result, never an error from this module.
 
 use std::io::Write;
 use std::path::Path;
+use std::path::PathBuf;
 
 use loopctl::tool::ToolOutput;
 
-/// Default inline-output limit: 50 `KiB`.
-///
-/// Results at or below this byte length are returned as text. Larger results
-/// spill to a temp file under the caller-supplied temp dir. Exposed so the
-/// production call site can pass it as the threshold without re-stating the
-/// value.
+/// Default inline-output limit (50 `KiB`); results over this spill to a temp file.
 pub const MAX_INLINE_OUTPUT_BYTES: usize = 50 * 1024;
 
-/// Preview size emitted when output spills or is truncated inline: ~10 `KiB`.
-///
-/// Drawn from the start of the result, sliced on a character boundary so the
-/// preview never ends mid-code-point.
+/// Preview size when output spills/truncates (~10 `KiB`), sliced on a char boundary.
 const PREVIEW_BYTES: usize = 10 * 1024;
+
+/// Resolve a per-session temp directory under `base_temp_dir`.
+///
+/// Returns `{base_temp_dir}/dch-spill-{session_id}`. Each agent session gets
+/// its own subdir so spilled search results stay isolated from other sessions
+/// — giving a future runner-shutdown cleanup (or a manual `rm -rf`) one clear
+/// target per session instead of a flat pile of files in the OS temp dir.
+/// `truncate_or_write_to_temp` creates the subdir on first spill via
+/// `create_dir_all`; this function only computes the path.
+///
+/// `session_id` is generic over [`Display`](std::fmt::Display) so the helper
+/// does not depend on a specific id type (loopctl's `Uuid` formats straight in).
+#[must_use]
+pub fn session_temp_dir(base_temp_dir: &Path, session_id: impl std::fmt::Display) -> PathBuf {
+    base_temp_dir.join(format!("dch-spill-{session_id}"))
+}
 
 /// Return `content` as a tool result, spilling to a temp file when oversized.
 ///
 /// If `content.len()` is at or under `threshold`, it is returned inline. If it
 /// exceeds `threshold`, it is written to a fresh file under `temp_dir` and the
 /// returned text names the path, carries a `preview` of the first ~10 `KiB`,
-/// and points the caller at the file-viewer tool for the full content.
+/// and points the caller at the file-viewer tool for the full content. The
+/// spilled file is persisted via `NamedTempFile::keep`, which releases the
+/// open handle and marks the file non-deletable on drop, so the caller can
+/// read the path later.
 ///
 /// `threshold` is a parameter (not a const read inside) so tests can drive the
 /// spill path with a tiny fixture instead of generating 50 `KiB` of content.
@@ -72,8 +90,6 @@ pub fn truncate_or_write_to_temp(
         return ToolOutput::text(truncate_inline(&content));
     }
 
-    // `.keep()` releases the open handle and marks the file persistent: its
-    // Drop will not delete it, so the caller can read the path later.
     let path = match named.keep() {
         Ok((_file, path)) => path,
         Err(e) => {
@@ -150,6 +166,19 @@ fn floor_char_boundary(s: &str, target: usize) -> usize {
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_temp_dir_joins_session_id() {
+        let dir = session_temp_dir(Path::new("/tmp"), "abc-123");
+        assert_eq!(dir, PathBuf::from("/tmp/dch-spill-abc-123"));
+    }
+
+    #[test]
+    fn session_temp_dir_distinct_per_session() {
+        let a = session_temp_dir(Path::new("/tmp"), "session-a");
+        let b = session_temp_dir(Path::new("/tmp"), "session-b");
+        assert_ne!(a, b);
+    }
 
     #[test]
     fn inline_when_under_threshold() {

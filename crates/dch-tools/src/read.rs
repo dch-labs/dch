@@ -3,7 +3,8 @@
 use std::fmt::Write;
 use std::future::Future;
 use std::pin::Pin;
-use std::time::SystemTime;
+
+use tokio::io::AsyncReadExt;
 
 use loopctl::message::ImageSource;
 use loopctl::message::ToolContent;
@@ -18,10 +19,11 @@ use serde_json::json;
 
 use crate::context::RunnerContext;
 use crate::context::runner_ctx;
-use crate::state::FileReadEntry;
+use crate::input::get_usize;
 use crate::util::is_url;
 use crate::util::mime_type_from_path;
 use crate::util::resolve_path;
+use crate::walk;
 
 /// Maximum number of lines returned by the Read tool.
 pub const MAX_FILE_READ_LINES: usize = 200;
@@ -31,8 +33,6 @@ pub const MAX_FILE_SIZE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_FILE_READ_BYTES: usize = 400_000;
 /// Default limit when `offset` is provided but `limit` is not.
 const DEFAULT_OFFSET_LIMIT: usize = 200;
-/// Number of leading bytes to scan for NUL when detecting binary files.
-const BINARY_SNIFF_BYTES: usize = 8192;
 
 /// Read the contents of a file (up to 200 lines).
 ///
@@ -145,12 +145,8 @@ impl ReadTool {
             ))
         })?;
 
-        if metadata.len() > MAX_FILE_SIZE_BYTES as u64 {
-            return Ok(ToolOutput::error_text(format!(
-                "File is too large to read ({} bytes). Use FileViewer for paginated reading, \
-                 or Grep/CodeSearch to find specific content.",
-                metadata.len()
-            )));
+        if let Some(too_large) = too_large_if_over(metadata.len()) {
+            return Ok(too_large);
         }
 
         if !metadata.is_file() {
@@ -162,7 +158,10 @@ impl ReadTool {
 
         // Image branch: return a base64-encoded image block.
         if let Some(mime) = mime_type_from_path(&full_path) {
-            let bytes = tokio::fs::read(&full_path).await?;
+            let bytes = read_capped(&full_path).await?;
+            if let Some(too_large) = too_large_if_over(bytes.len() as u64) {
+                return Ok(too_large);
+            }
             let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
             let source = ImageSource::new_base64(mime, b64);
             return Ok(ToolOutput::success(ToolContent::from_multipart(vec![
@@ -171,12 +170,11 @@ impl ReadTool {
         }
 
         // Binary sniff: read bytes, check for NUL in the leading region.
-        let bytes = tokio::fs::read(&full_path).await?;
-        let sniff_end = bytes.len().min(BINARY_SNIFF_BYTES);
-        if bytes
-            .get(..sniff_end)
-            .is_some_and(|head| head.contains(&0u8))
-        {
+        let bytes = read_capped(&full_path).await?;
+        if let Some(too_large) = too_large_if_over(bytes.len() as u64) {
+            return Ok(too_large);
+        }
+        if walk::bytes_look_binary(&bytes) {
             return Ok(ToolOutput::error_text(format!(
                 "File {file_path} appears to be binary. \
                  Use Grep or FileViewer to inspect specific content."
@@ -186,15 +184,6 @@ impl ReadTool {
         // The file is text; convert bytes to string.
         let content = String::from_utf8(bytes)
             .map_err(|e| ToolError::Execution(format!("Failed to decode file as UTF-8: {e}")))?;
-        if let Some(rc) = &runner_context {
-            // Record the read in session history.
-            if let Ok(mut state) = rc.session_state.lock() {
-                state.file_read_history.push(FileReadEntry {
-                    path: file_path.to_string(),
-                    read_at: SystemTime::now(),
-                });
-            }
-        }
 
         // Resolve offset/limit/line_range precedence.
         let (offset, limit) = resolve_range(&input)?;
@@ -202,37 +191,79 @@ impl ReadTool {
     }
 }
 
+/// Build the "file too large" rejection when `byte_count` exceeds the cap.
+///
+/// Returns `Some(ToolOutput)` (a soft error pointing the model at `FileViewer`
+/// or the search tools) when `byte_count > MAX_FILE_SIZE_BYTES`, else `None`.
+/// The single source of the rejection message — used by the metadata-size
+/// check and by the post-read check after [`read_capped`] (a file can grow
+/// between the metadata check and the bounded read).
+fn too_large_if_over(byte_count: u64) -> Option<ToolOutput> {
+    if byte_count > MAX_FILE_SIZE_BYTES as u64 {
+        Some(ToolOutput::error_text(format!(
+            "File is too large to read ({byte_count} bytes). Use FileViewer for paginated reading, \
+             or Grep/CodeSearch to find specific content."
+        )))
+    } else {
+        None
+    }
+}
+
+/// Read at most `MAX_FILE_SIZE_BYTES + 1` bytes from `path`.
+///
+/// Bounds the memory allocation so a file that grows past the cap between the
+/// metadata check and the read cannot OOM. If the returned buffer has more than
+/// `MAX_FILE_SIZE_BYTES` bytes, the caller rejects it via [`too_large_if_over`].
+///
+/// # Errors
+///
+/// Returns [`ToolError::Execution`] if the file cannot be opened or read.
+async fn read_capped(path: &std::path::Path) -> Result<Vec<u8>, ToolError> {
+    let file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| ToolError::Execution(format!("Failed to open file: {e}")))?;
+    let cap = MAX_FILE_SIZE_BYTES.saturating_add(1);
+    let mut buf = Vec::with_capacity(cap.min(8192));
+    file.take(cap as u64)
+        .read_to_end(&mut buf)
+        .await
+        .map_err(|e| ToolError::Execution(format!("Failed to read file: {e}")))?;
+    Ok(buf)
+}
+
 /// Resolve `(offset, limit)` from the input, honoring the documented precedence:
 /// explicit `offset`/`limit` win; otherwise `line_range`; otherwise full file.
+///
+/// Integer parsing goes through [`get_usize`], so a negative or non-integer
+/// `offset`/`limit` is rejected loudly with the field named rather than
+/// silently coerced to a default.
 ///
 /// # Errors
 ///
 /// Returns [`ToolError::InvalidInput`] when `offset` or `limit` is zero, when
-/// either exceeds `usize` on the target platform, or when `line_range` fails to
-/// parse.
+/// either is not a valid non-negative integer (per [`get_usize`]), or when
+/// `line_range` fails to parse.
 fn resolve_range(input: &Value) -> Result<(usize, usize), ToolError> {
-    let offset = input.get("offset").and_then(Value::as_u64);
-    let limit = input.get("limit").and_then(Value::as_u64);
+    let offset = get_usize(input, "offset")?;
+    let limit = get_usize(input, "limit")?;
 
     if offset.is_some() || limit.is_some() {
         let offset = match offset {
             Some(0) => {
                 return Err(ToolError::InvalidInput(
-                    "offset must be at least 1".to_string(),
+                    "offset must be at least 1, got 0".to_string(),
                 ));
             }
-            Some(n) => usize::try_from(n)
-                .map_err(|_| ToolError::InvalidInput("offset too large".to_string()))?,
+            Some(n) => n,
             None => 1,
         };
         let limit = match limit {
             Some(0) => {
                 return Err(ToolError::InvalidInput(
-                    "limit must be at least 1".to_string(),
+                    "limit must be at least 1, got 0".to_string(),
                 ));
             }
-            Some(n) => usize::try_from(n)
-                .map_err(|_| ToolError::InvalidInput("limit too large".to_string()))?,
+            Some(n) => n,
             None => DEFAULT_OFFSET_LIMIT,
         };
         let limit = limit.min(MAX_FILE_READ_LINES);
@@ -277,7 +308,6 @@ fn format_text(content: &str, file_path: &str, offset: usize, limit: usize) -> T
         ));
     }
 
-    // offset >= 1 is guaranteed by resolve_range; saturating ops keep clippy happy.
     let start_idx = offset.saturating_sub(1);
     let effective_end = offset
         .saturating_add(limit)
@@ -286,7 +316,6 @@ fn format_text(content: &str, file_path: &str, offset: usize, limit: usize) -> T
     let view_lines = all_lines.get(start_idx..effective_end).unwrap_or_default();
     let shown_content = view_lines.join("\n");
 
-    // Byte cap on the shown view (guards very long single lines).
     if shown_content.len() > MAX_FILE_READ_BYTES {
         let original_size = shown_content.len();
         let mut cut = MAX_FILE_READ_BYTES;
@@ -303,12 +332,10 @@ fn format_text(content: &str, file_path: &str, offset: usize, limit: usize) -> T
         ));
     }
 
-    // Whole-file fast path.
-    if offset == 1 && effective_end >= total_lines {
+    if offset == 1 && effective_end >= total_lines && content.len() <= MAX_FILE_READ_BYTES {
         return ToolOutput::text(content.to_string());
     }
 
-    // Partial view with before/after markers.
     let mut output = String::new();
     if offset > 1 {
         write!(
@@ -317,6 +344,7 @@ fn format_text(content: &str, file_path: &str, offset: usize, limit: usize) -> T
         )
         .ok();
     }
+
     output.push_str(&shown_content);
     if effective_end < total_lines {
         let remaining = total_lines.saturating_sub(effective_end);
@@ -466,8 +494,6 @@ fn parse_single_line(range: &str) -> Result<(usize, usize), String> {
 mod tests {
     use super::*;
     use crate::context::RunnerContext;
-    use crate::runtime::RuntimeConfig;
-    use crate::state::SessionState;
     use loopctl::tool::ToolContext;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -479,9 +505,8 @@ mod tests {
         ctx.cwd = cwd.to_string();
         let rc = RunnerContext {
             cwd: PathBuf::from(cwd),
-            session_state: Arc::new(Mutex::new(SessionState::default())),
+            todos: Arc::new(Mutex::new(Vec::new())),
             question_tx: None,
-            runtime: RuntimeConfig::default(),
         };
         ctx.set_extension(rc);
         ctx
@@ -614,6 +639,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_read_negative_offset_rejected_not_silently_defaulted() {
+        // Regression: a negative offset must error loudly, not silently become 1.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("two.txt");
+        std::fs::write(&path, "a\nb\n").unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let input = json!({ "file_path": path.to_str().unwrap(), "offset": -5 });
+        let err = read(input, cwd).await.unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidInput(ref s) if s.contains("'offset'")),
+            "negative offset should name the field: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_negative_limit_rejected_not_silently_defaulted() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("two.txt");
+        std::fs::write(&path, "a\nb\n").unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let input = json!({ "file_path": path.to_str().unwrap(), "limit": -1 });
+        let err = read(input, cwd).await.unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidInput(ref s) if s.contains("'limit'")),
+            "negative limit should name the field: {err:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_read_limit_only_from_start() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("ten.txt");
@@ -702,22 +756,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_records_file_read_entry() {
+    async fn test_read_whole_file_fast_path_respects_byte_cap() {
+        // A single-line file over MAX_FILE_READ_BYTES, read with no offset/limit,
+        // takes the whole-file fast path. It must still hit the byte cap and
+        // emit a truncation marker rather than returning the full wall of text.
         let tmp = tempfile::TempDir::new().unwrap();
-        let path = tmp.path().join("tracked.txt");
-        std::fs::write(&path, "content\n").unwrap();
+        let path = tmp.path().join("oneline.txt");
+        let over_cap = "x".repeat(MAX_FILE_READ_BYTES + 1000);
+        std::fs::write(&path, &over_cap).unwrap();
         let cwd = tmp.path().to_str().unwrap();
-
-        let tool = ReadTool;
-        let ctx = ctx_in(cwd);
-        tool.call(input(path.to_str().unwrap()), &ctx)
-            .await
-            .unwrap();
-
-        let rc = runner_ctx(&ctx).unwrap();
-        let state = rc.session_state.lock().unwrap();
-        assert_eq!(state.file_read_history.len(), 1);
-        assert_eq!(state.file_read_history[0].path, path.to_str().unwrap());
+        let out = read(input(path.to_str().unwrap()), cwd).await.unwrap();
+        let text = out.text_content();
+        assert!(text.contains("FILE TRUNCATED"), "should truncate: {text}");
+        assert!(text.len() < over_cap.len());
     }
 
     #[tokio::test]
@@ -807,5 +858,49 @@ mod tests {
         assert!(parse_line_range("abc").is_err());
         assert!(parse_line_range(":").is_err());
         assert!(parse_line_range(":0").is_err());
+    }
+
+    #[tokio::test]
+    async fn read_capped_small_file_returns_all_bytes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("small.txt");
+        std::fs::write(&path, b"hello world").unwrap();
+        let bytes = read_capped(&path).await.unwrap();
+        assert_eq!(bytes, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn read_capped_exactly_at_cap_returns_all() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("exact.bin");
+        std::fs::write(&path, vec![b'x'; MAX_FILE_SIZE_BYTES]).unwrap();
+        let bytes = read_capped(&path).await.unwrap();
+        assert_eq!(bytes.len(), MAX_FILE_SIZE_BYTES);
+    }
+
+    #[tokio::test]
+    async fn read_capped_over_cap_returns_cap_plus_one() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("over.bin");
+        std::fs::write(&path, vec![b'x'; MAX_FILE_SIZE_BYTES + 100]).unwrap();
+        let bytes = read_capped(&path).await.unwrap();
+        assert_eq!(bytes.len(), MAX_FILE_SIZE_BYTES + 1);
+    }
+
+    #[tokio::test]
+    async fn read_capped_empty_file_returns_empty() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("empty.txt");
+        std::fs::write(&path, b"").unwrap();
+        let bytes = read_capped(&path).await.unwrap();
+        assert!(bytes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_capped_missing_file_is_execution_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("nope.txt");
+        let err = read_capped(&path).await.unwrap_err();
+        assert!(matches!(err, ToolError::Execution(_)));
     }
 }

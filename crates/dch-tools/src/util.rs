@@ -31,6 +31,11 @@ pub fn mime_type_from_extension(ext: &str) -> Option<&'static str> {
 }
 
 /// MIME type for a file path, based on its extension.
+///
+/// Thin wrapper over [`mime_type_from_extension`] that extracts the extension
+/// first. Returns `None` for paths without a recognized image extension, so
+/// callers can branch on "is this an image?" without re-implementing the
+/// extension lookup. Case-insensitive (`.JPG` matches).
 #[must_use]
 pub fn mime_type_from_path(path: &Path) -> Option<&'static str> {
     path.extension()
@@ -57,9 +62,19 @@ pub fn is_image_file(path: &str) -> bool {
 }
 
 /// Whether a string looks like an HTTP(S) URL.
+///
+/// Used by every file-touching tool to reject URLs early with a consistent
+/// "use `WebFetch`" message, so a model that sends `Read` against `https://…`
+/// gets a clear redirect instead of a confusing filesystem error.
+/// Case-insensitive (`HTTP://`, `Https://` also match). Returns `false` for
+/// `file://`, `ftp://`, bare paths, and empty strings.
 #[must_use]
 pub fn is_url(path: &str) -> bool {
-    path.starts_with("http://") || path.starts_with("https://")
+    path.get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case("http://"))
+        || path
+            .get(..8)
+            .is_some_and(|p| p.eq_ignore_ascii_case("https://"))
 }
 
 /// Resolve a possibly-relative `file_path` against `cwd`.
@@ -149,5 +164,33 @@ mod tests {
         assert!(!is_url("src/main.rs"));
         assert!(!is_url("ftp://example.com"));
         assert!(!is_url(""));
+    }
+
+    #[test]
+    fn is_url_case_insensitive() {
+        assert!(is_url("HTTP://example.com"));
+        assert!(is_url("Https://example.com/x"));
+        assert!(is_url("HtTp://localhost"));
+        assert!(!is_url("FILE://x"));
+    }
+
+    #[test]
+    fn is_url_boundary_lengths() {
+        // Exactly the scheme prefix with nothing after.
+        assert!(is_url("http://"));
+        assert!(is_url("https://"));
+        // Shorter than the prefix — must not panic on the slice.
+        assert!(!is_url("htt"));
+        assert!(!is_url("h"));
+        // Just short of a match.
+        assert!(!is_url("http:/"));
+    }
+
+    #[test]
+    fn is_url_non_ascii_does_not_panic() {
+        // Multi-byte chars whose byte length crosses the 7/8 prefix boundary
+        // must not panic on get(..7)/get(..8).
+        assert!(!is_url("éttp://"));
+        assert!(!is_url("éxample"));
     }
 }
