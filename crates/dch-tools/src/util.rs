@@ -82,25 +82,35 @@ pub fn is_url(path: &str) -> bool {
 }
 
 /// Resolve a possibly-relative `file_path` against `cwd`, enforcing that the
-/// result stays inside the `cwd` workspace.
+/// result stays inside the `cwd` workspace both lexically and on the
+/// filesystem.
 ///
-/// Relative paths are joined to `cwd`; absolute paths are taken as-is. After
-/// resolution, both the result and `cwd` are normalized lexically (`.` and
-/// `..` collapsed without touching the filesystem, so not-yet-existing write
-/// targets work) and the result must start with `cwd`'s components. A path
-/// that escapes via `..` traversal, or an absolute path unrelated to `cwd`,
-/// is rejected.
+/// Relative paths are joined to `cwd`; absolute paths are taken as-is. Two
+/// checks then run, in order:
+///
+/// 1. **Lexical containment** — both the result and `cwd` are normalized (`.`/
+///    `..` collapsed without touching the filesystem, so not-yet-existing
+///    write targets work) and the result must start with `cwd`'s components.
+///    Rejects `..` traversal and unrelated absolute paths.
+/// 2. **Symlink containment** — each *existing* component of the resolved
+///    path is probed with `symlink_metadata`. A symlink's target is resolved
+///    (absolute, or relative to the link's directory) and recursively checked
+///    against the same workspace boundary. A symlink whose chain leaves `cwd`
+///    is rejected. Non-existent components stop the walk, so writing a new
+///    file still works — only the existing prefix is verified.
 ///
 /// This is the shared path-resolution primitive used by every file-touching
 /// tool (`Read`, `Write`, `Edit`, `MultiEdit`, `FileViewer`, and the
 /// navigation tools `Glob`, `Grep`, `CodeSearch`, `Tree`) so they can't drift
-/// apart. Containment is lexical only — a symlink inside the workspace that
-/// points outside is not detected; that is a separate, narrower threat.
+/// apart. The symlink check closes the traversal vector where an in-workspace
+/// link points outside it, but it leaves a TOCTOU window open: a link could
+/// be swapped between the check and the caller's `open`. Closing that race
+/// requires descriptor-relative, `O_NOFOLLOW` opens and is deferred.
 ///
 /// # Errors
 ///
 /// Returns [`ToolError::InvalidInput`] when the resolved path does not stay
-/// within `cwd`.
+/// within `cwd`, either lexically or via a symlink.
 pub fn resolve_path(file_path: &str, cwd: &Path) -> Result<PathBuf, ToolError> {
     let path = Path::new(file_path);
     let joined = if path.is_relative() {
@@ -115,6 +125,7 @@ pub fn resolve_path(file_path: &str, cwd: &Path) -> Result<PathBuf, ToolError> {
             "Path escapes the working directory: {file_path}"
         )));
     }
+    verify_symlinks_inside(&normalized, &base)?;
     Ok(normalized)
 }
 
@@ -154,6 +165,80 @@ fn lexically_inside(path: &Path, base: &Path) -> bool {
         }
     }
     true
+}
+
+/// Walk the *existing* prefix of `resolved` and reject any symlink whose
+/// target chain leaves `base`.
+///
+/// `resolved` is assumed already lexically contained in `base` (the caller's
+/// responsibility). This function adds the filesystem check: each ancestor of
+/// `resolved` is probed; a symlink is followed to its target, which is itself
+/// verified (recursively, for chains). The walk stops at the first
+/// non-existent component, so a not-yet-existing write leaf is never rejected
+/// — only the existing directory prefix is checked. Symlink loops are bounded
+/// by a visited-set of canonicalized paths so a cycle (A → B → A) terminates
+/// rather than recurses forever.
+///
+/// # Errors
+///
+/// Returns [`ToolError::InvalidInput`] when an existing symlink component
+/// resolves (directly or via a chain) to a path outside `base`. Returns
+/// [`ToolError::Execution`] when a symlink cannot be read.
+fn verify_symlinks_inside(resolved: &Path, base: &Path) -> Result<(), ToolError> {
+    let mut visited: Vec<PathBuf> = Vec::new();
+    let mut acc = PathBuf::new();
+    for comp in resolved.components() {
+        acc.push(comp.as_os_str());
+        let Some(meta) = std::fs::symlink_metadata(&acc).ok() else {
+            return Ok(());
+        };
+        if meta.file_type().is_symlink() {
+            let target = std::fs::read_link(&acc).map_err(|e| {
+                ToolError::Execution(format!("Failed to read symlink {}: {e}", acc.display()))
+            })?;
+            let resolved_target = if target.is_absolute() {
+                target
+            } else {
+                acc.parent().unwrap_or_else(|| Path::new(".")).join(target)
+            };
+            let normalized_target = normalize_lexical(&resolved_target);
+            if !symlink_target_inside(&normalized_target, base, &mut visited)? {
+                return Err(ToolError::InvalidInput(format!(
+                    "Path escapes the working directory via symlink: {}",
+                    acc.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Recursively verify that `target` (a resolved symlink target) stays within
+/// `base`, following further symlinks in its existing prefix.
+///
+/// `visited` accumulates canonicalized paths already examined, bounding
+/// symlink cycles. A target that itself contains symlinks is walked the same
+/// way [`verify_symlinks_inside`] walks the original path. Returns `true`
+/// when `target` (and every symlink in its existing prefix) stays inside
+/// `base`.
+///
+/// # Errors
+///
+/// Propagates the same [`ToolError`] variants as [`verify_symlinks_inside`].
+fn symlink_target_inside(
+    target: &Path,
+    base: &Path,
+    visited: &mut Vec<PathBuf>,
+) -> Result<bool, ToolError> {
+    if !lexically_inside(target, base) {
+        return Ok(false);
+    }
+    let canonical = normalize_lexical(target);
+    if visited.iter().any(|v| v == &canonical) {
+        return Ok(true);
+    }
+    visited.push(canonical);
+    verify_symlinks_inside(target, base).map(|()| true)
 }
 
 #[cfg(test)]
@@ -393,5 +478,80 @@ mod tests {
     fn lexically_inside_empty_base_only_contains_empty() {
         assert!(lexically_inside(Path::new(""), Path::new("")));
         assert!(!lexically_inside(Path::new("a"), Path::new("")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_path_accepts_symlink_pointing_inside_workspace() {
+        // A symlink whose target is itself inside cwd is legitimate and must
+        // pass — the filesystem check rejects only escapes, not all links.
+        use std::os::unix::fs::symlink;
+        let work = tempfile::TempDir::new().unwrap();
+        let real = work.path().join("real.txt");
+        std::fs::write(&real, "x").unwrap();
+        let link = work.path().join("link.txt");
+        symlink(&real, &link).unwrap();
+        // Resolving the link (both exist, both inside) must succeed.
+        assert_eq!(
+            resolve_path("link.txt", work.path()).unwrap(),
+            work.path().join("link.txt")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_path_rejects_symlink_pointing_outside_workspace() {
+        use std::os::unix::fs::symlink;
+        let work = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let secret = outside.path().join("secret");
+        std::fs::write(&secret, "x").unwrap();
+        let link = work.path().join("link.txt");
+        symlink(&secret, &link).unwrap();
+        let err = resolve_path("link.txt", work.path()).unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidInput(ref s) if s.contains("symlink")),
+            "{err:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_path_rejects_symlink_chain_escaping_workspace() {
+        // A → B → outside: the chain must be followed far enough to detect
+        // the escape, not just the first hop. Pins the recursion depth.
+        use std::os::unix::fs::symlink;
+        let work = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let secret = outside.path().join("secret");
+        std::fs::write(&secret, "x").unwrap();
+        let first = work.path().join("first");
+        std::fs::create_dir_all(&first).unwrap();
+        let hop = first.join("hop");
+        symlink(&secret, &hop).unwrap();
+        let link = work.path().join("link.txt");
+        symlink(&hop, &link).unwrap();
+        let err = resolve_path("link.txt", work.path()).unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidInput(ref s) if s.contains("symlink")),
+            "{err:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_path_allows_write_to_new_file_under_existing_dir() {
+        // The filesystem check must stop at the first non-existent component,
+        // so writing a brand-new file inside an existing workspace dir still
+        // works. A regression here would break every Write/Edit of a new file.
+        let work = tempfile::TempDir::new().unwrap();
+        let nested = work.path().join("src");
+        std::fs::create_dir_all(&nested).unwrap();
+        // `src/new.rs` does not exist; resolving it must succeed because its
+        // existing prefix (`work/src`) is inside cwd.
+        assert_eq!(
+            resolve_path("src/new.rs", work.path()).unwrap(),
+            work.path().join("src/new.rs")
+        );
     }
 }
