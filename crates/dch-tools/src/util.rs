@@ -65,11 +65,13 @@ pub fn is_image_file(path: &str) -> bool {
 ///
 /// Used by every file-touching tool to reject URLs early with a consistent
 /// "use `WebFetch`" message, so a model that sends `Read` against `https://…`
-/// gets a clear redirect instead of a confusing filesystem error. Returns
-/// `false` for `file://`, `ftp://`, bare paths, and empty strings.
+/// gets a clear redirect instead of a confusing filesystem error.
+/// Case-insensitive (`HTTP://`, `Https://` also match). Returns `false` for
+/// `file://`, `ftp://`, bare paths, and empty strings.
 #[must_use]
 pub fn is_url(path: &str) -> bool {
-    path.starts_with("http://") || path.starts_with("https://")
+    path.len() >= 7 && path[..7].eq_ignore_ascii_case("http://")
+        || path.len() >= 8 && path[..8].eq_ignore_ascii_case("https://")
 }
 
 /// Resolve a possibly-relative `file_path` against `cwd`.
@@ -159,5 +161,25 @@ mod tests {
         assert!(!is_url("src/main.rs"));
         assert!(!is_url("ftp://example.com"));
         assert!(!is_url(""));
+    }
+
+    #[test]
+    fn is_url_case_insensitive() {
+        assert!(is_url("HTTP://example.com"));
+        assert!(is_url("Https://example.com/x"));
+        assert!(is_url("HtTp://localhost"));
+        assert!(!is_url("FILE://x"));
+    }
+
+    #[test]
+    fn is_url_boundary_lengths() {
+        // Exactly the scheme prefix with nothing after.
+        assert!(is_url("http://"));
+        assert!(is_url("https://"));
+        // Shorter than the prefix — must not panic on the slice.
+        assert!(!is_url("htt"));
+        assert!(!is_url("h"));
+        // Just short of a match.
+        assert!(!is_url("http:/"));
     }
 }

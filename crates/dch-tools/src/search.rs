@@ -201,6 +201,8 @@ pub struct CommonInput {
 /// Each tool calls this with its own default for `max_results`, then parses
 /// its own additional fields and assembles its tool-specific struct. The
 /// caller may further clamp `max_results` after this call (e.g. `.min(cap)`).
+/// An explicit zero is clamped to `1` so the caller always gets at least one
+/// result.
 ///
 /// # Errors
 ///
@@ -224,7 +226,9 @@ pub fn parse_input(
         .get("case_insensitive")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    let max_results = get_usize(input, "max_results")?.unwrap_or(default_max_results);
+    let max_results = get_usize(input, "max_results")?
+        .unwrap_or(default_max_results)
+        .max(1);
     let include_patterns = get_string_list(input, "include_patterns")?;
     let exclude_patterns = get_string_list(input, "exclude_patterns")?;
     Ok(CommonInput {
@@ -235,6 +239,22 @@ pub fn parse_input(
         include_patterns,
         exclude_patterns,
     })
+}
+
+/// Compute the display path of `file_path` relative to `base_path`.
+///
+/// Returns the stripped relative path when possible, the full path string when
+/// `file_path` is not under `base_path`, or `"unknown"` when the path cannot be
+/// rendered as UTF-8. Shared by Grep and `CodeSearch` so the relative-path
+/// computation is identical across both tools.
+#[must_use]
+pub fn relative_file(file_path: &Path, base_path: &Path) -> String {
+    file_path
+        .strip_prefix(base_path)
+        .ok()
+        .and_then(|p| p.to_str())
+        .unwrap_or_else(|| file_path.to_str().unwrap_or("unknown"))
+        .to_string()
 }
 
 /// Compile `pattern` through the shared regex cache, case-sensitive or not.
@@ -287,7 +307,7 @@ where
             break;
         }
         let path = entry.path();
-        if walk::likely_binary(path) || walk::file_too_large(path) {
+        if walk::file_too_large(path) || walk::likely_binary(path) {
             continue;
         }
         let Ok(content) = std::fs::read_to_string(path) else {
@@ -563,5 +583,34 @@ mod tests {
         assert_eq!(matches[0].file, "a.txt", "relative to base");
         assert_eq!(matches[0].line, 2, "1-indexed line number");
         assert_eq!(matches[0].content, "BRAVO");
+    }
+
+    #[test]
+    fn relative_file_strips_base_prefix() {
+        assert_eq!(
+            relative_file(Path::new("/repo/src/main.rs"), Path::new("/repo")),
+            "src/main.rs"
+        );
+    }
+
+    #[test]
+    fn relative_file_nested_subdir() {
+        assert_eq!(
+            relative_file(Path::new("/repo/a/b/c.rs"), Path::new("/repo")),
+            "a/b/c.rs"
+        );
+    }
+
+    #[test]
+    fn relative_file_base_equals_file() {
+        assert_eq!(relative_file(Path::new("/repo"), Path::new("/repo")), "");
+    }
+
+    #[test]
+    fn relative_file_not_under_base_falls_back_to_full() {
+        assert_eq!(
+            relative_file(Path::new("/other/x.rs"), Path::new("/repo")),
+            "/other/x.rs"
+        );
     }
 }

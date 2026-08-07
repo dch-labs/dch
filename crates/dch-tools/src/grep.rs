@@ -164,7 +164,9 @@ impl GrepTool {
             .clone();
 
         let common = crate::search::parse_input(&input, DEFAULT_MAX_RESULTS)?;
-        let max_matches = get_usize(&input, "max_matches")?.unwrap_or(DEFAULT_MAX_MATCHES);
+        let max_matches = get_usize(&input, "max_matches")?
+            .unwrap_or(DEFAULT_MAX_MATCHES)
+            .max(1);
 
         if is_url(&common.base_path) {
             return Err(ToolError::InvalidInput(
@@ -211,11 +213,7 @@ fn scan_file(
     base_path: &Path,
     limit: usize,
 ) -> Vec<Match> {
-    let rel_path = file_path
-        .strip_prefix(base_path)
-        .ok()
-        .and_then(|p| p.to_str())
-        .unwrap_or_else(|| file_path.to_str().unwrap_or("unknown"));
+    let rel_path = crate::search::relative_file(file_path, base_path);
     let mut results = Vec::new();
     for (line_num, line) in content.lines().enumerate() {
         if results.len() >= limit {
@@ -223,7 +221,7 @@ fn scan_file(
         }
         if regex.is_match(line) {
             results.push(Match {
-                file: rel_path.to_string(),
+                file: rel_path.clone(),
                 line: line_num.saturating_add(1),
                 content: line.to_string(),
             });
@@ -599,6 +597,42 @@ mod tests {
         assert!(
             out.text_content()
                 .contains("No matches found for pattern: zzz_nomatch")
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_max_matches_clamped_to_one() {
+        // Explicit zero should not zero-out all results; clamp to 1.
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_file(tmp.path(), "a.rs", "x\nx\nx\n");
+        let tool = GrepTool;
+        let ctx = ctx_in(tmp.path());
+        let input = json!({"pattern": "x", "max_matches": 0});
+        let out = tool.call(input, &ctx).await.unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&out.text_content()).unwrap();
+        assert_eq!(
+            parsed.len(),
+            1,
+            "zero max_matches should clamp to 1, got {}",
+            parsed.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_max_results_clamped_to_one() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_file(tmp.path(), "a.rs", "x\n");
+        write_file(tmp.path(), "b.rs", "x\n");
+        let tool = GrepTool;
+        let ctx = ctx_in(tmp.path());
+        let input = json!({"pattern": "x", "max_results": 0});
+        let out = tool.call(input, &ctx).await.unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&out.text_content()).unwrap();
+        assert_eq!(
+            parsed.len(),
+            1,
+            "zero max_results should clamp to 1, got {}",
+            parsed.len()
         );
     }
 

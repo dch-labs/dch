@@ -4,6 +4,8 @@ use std::fmt::Write;
 use std::future::Future;
 use std::pin::Pin;
 
+use tokio::io::AsyncReadExt;
+
 use loopctl::message::ImageSource;
 use loopctl::message::ToolContent;
 use loopctl::message::ToolContentPart;
@@ -156,7 +158,7 @@ impl ReadTool {
 
         // Image branch: return a base64-encoded image block.
         if let Some(mime) = mime_type_from_path(&full_path) {
-            let bytes = tokio::fs::read(&full_path).await?;
+            let bytes = read_capped(&full_path).await?;
             if let Some(too_large) = too_large_if_over(bytes.len() as u64) {
                 return Ok(too_large);
             }
@@ -168,7 +170,7 @@ impl ReadTool {
         }
 
         // Binary sniff: read bytes, check for NUL in the leading region.
-        let bytes = tokio::fs::read(&full_path).await?;
+        let bytes = read_capped(&full_path).await?;
         if let Some(too_large) = too_large_if_over(bytes.len() as u64) {
             return Ok(too_large);
         }
@@ -194,7 +196,8 @@ impl ReadTool {
 /// Returns `Some(ToolOutput)` (a soft error pointing the model at `FileViewer`
 /// or the search tools) when `byte_count > MAX_FILE_SIZE_BYTES`, else `None`.
 /// The single source of the rejection message — used by the metadata-size
-/// check and by the post-read re-checks (a file can grow between them).
+/// check and by the post-read check after [`read_capped`] (a file can grow
+/// between the metadata check and the bounded read).
 fn too_large_if_over(byte_count: u64) -> Option<ToolOutput> {
     if byte_count > MAX_FILE_SIZE_BYTES as u64 {
         Some(ToolOutput::error_text(format!(
@@ -204,6 +207,28 @@ fn too_large_if_over(byte_count: u64) -> Option<ToolOutput> {
     } else {
         None
     }
+}
+
+/// Read at most `MAX_FILE_SIZE_BYTES + 1` bytes from `path`.
+///
+/// Bounds the memory allocation so a file that grows past the cap between the
+/// metadata check and the read cannot OOM. If the returned buffer has more than
+/// `MAX_FILE_SIZE_BYTES` bytes, the caller rejects it via [`too_large_if_over`].
+///
+/// # Errors
+///
+/// Returns [`ToolError::Execution`] if the file cannot be opened or read.
+async fn read_capped(path: &std::path::Path) -> Result<Vec<u8>, ToolError> {
+    let file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| ToolError::Execution(format!("Failed to open file: {e}")))?;
+    let cap = MAX_FILE_SIZE_BYTES.saturating_add(1);
+    let mut buf = Vec::with_capacity(cap.min(8192));
+    file.take(cap as u64)
+        .read_to_end(&mut buf)
+        .await
+        .map_err(|e| ToolError::Execution(format!("Failed to read file: {e}")))?;
+    Ok(buf)
 }
 
 /// Resolve `(offset, limit)` from the input, honoring the documented precedence:
@@ -833,5 +858,49 @@ mod tests {
         assert!(parse_line_range("abc").is_err());
         assert!(parse_line_range(":").is_err());
         assert!(parse_line_range(":0").is_err());
+    }
+
+    #[tokio::test]
+    async fn read_capped_small_file_returns_all_bytes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("small.txt");
+        std::fs::write(&path, b"hello world").unwrap();
+        let bytes = read_capped(&path).await.unwrap();
+        assert_eq!(bytes, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn read_capped_exactly_at_cap_returns_all() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("exact.bin");
+        std::fs::write(&path, vec![b'x'; MAX_FILE_SIZE_BYTES]).unwrap();
+        let bytes = read_capped(&path).await.unwrap();
+        assert_eq!(bytes.len(), MAX_FILE_SIZE_BYTES);
+    }
+
+    #[tokio::test]
+    async fn read_capped_over_cap_returns_cap_plus_one() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("over.bin");
+        std::fs::write(&path, vec![b'x'; MAX_FILE_SIZE_BYTES + 100]).unwrap();
+        let bytes = read_capped(&path).await.unwrap();
+        assert_eq!(bytes.len(), MAX_FILE_SIZE_BYTES + 1);
+    }
+
+    #[tokio::test]
+    async fn read_capped_empty_file_returns_empty() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("empty.txt");
+        std::fs::write(&path, b"").unwrap();
+        let bytes = read_capped(&path).await.unwrap();
+        assert!(bytes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_capped_missing_file_is_execution_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("nope.txt");
+        let err = read_capped(&path).await.unwrap_err();
+        assert!(matches!(err, ToolError::Execution(_)));
     }
 }

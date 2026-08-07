@@ -334,7 +334,11 @@ impl Tool for BashTool {
                         "maximum": 600
                     }
                 },
-                "required": []
+                "required": [],
+                "anyOf": [
+                    {"required": ["command"]},
+                    {"required": ["operation"]}
+                ]
             }),
         }
     }
@@ -372,7 +376,8 @@ impl BashTool {
     /// # Errors
     ///
     /// Returns [`ToolError`] for a missing `RunnerContext`, a missing
-    /// `command`, an unknown `operation`, or a failure to spawn the subprocess.
+    /// `command`, an unknown `operation`, a negative or zero `timeout`, or a
+    /// failure to spawn the subprocess.
     async fn call_inner(
         &self,
         input: Value,
@@ -399,6 +404,11 @@ impl BashTool {
         let timeout_secs = get_u64(&input, "timeout")?
             .unwrap_or(DEFAULT_TIMEOUT_SECS)
             .min(MAX_TIMEOUT_SECS);
+        if timeout_secs == 0 {
+            return Err(ToolError::InvalidInput(
+                "'timeout' must be at least 1, got 0".to_string(),
+            ));
+        }
 
         if input
             .get("background")
@@ -816,11 +826,18 @@ mod tests {
             .unwrap();
         // No field is universally required: `command` runs a command, while
         // `operation` manages background jobs and short-circuits before
-        // `command` is read. The two are alternatives, not a required pair.
+        // `command` is read. The two are alternatives, enforced by anyOf.
         assert!(
             required.is_empty(),
             "required should be empty: {required:?}"
         );
+        let any_of = schema
+            .input_schema
+            .get("anyOf")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(any_of.len(), 2, "anyOf should require command or operation");
     }
 
     #[test]
@@ -1253,6 +1270,20 @@ mod tests {
         let input = json!({});
         let err = tool.call(input, &ctx).await.unwrap_err();
         assert!(matches!(err, ToolError::InvalidInput(_)));
+    }
+
+    #[tokio::test]
+    async fn zero_timeout_rejected() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let tool = BashTool;
+        let ctx = ctx_in(cwd);
+        let input = json!({ "command": "true", "timeout": 0 });
+        let err = tool.call(input, &ctx).await.unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidInput(ref s) if s.contains("'timeout'")),
+            "zero timeout should error: {err:?}"
+        );
     }
 
     #[tokio::test]

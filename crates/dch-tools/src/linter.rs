@@ -225,13 +225,27 @@ fn lint_python(content: &str) -> LinterResult {
 fn python_indent_check(content: &str) -> Option<LinterError> {
     let mut indent_stack: Vec<usize> = vec![0];
     let mut delim_depth = 0i32;
+    let mut in_triple = None::<char>;
     for (i, raw) in content.lines().enumerate() {
         let line_no = i.saturating_add(1);
+
+        if in_triple.is_some() {
+            update_triple_state(raw, &mut in_triple);
+            continue;
+        }
+
         let trimmed = raw.trim_start();
+
+        update_triple_from_line(trimmed, &mut in_triple);
+        if in_triple.is_some() {
+            continue;
+        }
+
         if delim_depth > 0 || trimmed.is_empty() || trimmed.starts_with('#') {
             delim_depth = delim_depth.saturating_add(python_net_delimiters(trimmed));
             continue;
         }
+
         let leading = raw.len().saturating_sub(trimmed.len());
         if leading > 0 {
             let prefix = &raw[..leading];
@@ -264,7 +278,59 @@ fn python_indent_check(content: &str) -> Option<LinterError> {
     None
 }
 
-/// Net delimiter balance of a single Python line, for continuation detection.
+/// Check whether `line` opens a triple-quoted string that spans beyond it.
+///
+/// Scans the line for a `"""` or `'''` opener that is not closed on the same
+/// line (accounting for single-line strings and `#` comments that may precede
+/// it). If found, sets `state` to the quote character.
+fn update_triple_from_line(line: &str, state: &mut Option<char>) {
+    if state.is_some() {
+        return;
+    }
+    let bytes = line.as_bytes();
+    let mut in_str: Option<u8> = None;
+    let mut i = 0;
+    while let Some(&b) = bytes.get(i) {
+        match in_str {
+            Some(q) => {
+                if b == b'\\' {
+                    i = i.saturating_add(2);
+                    continue;
+                }
+                if b == q {
+                    in_str = None;
+                }
+            }
+            None => match b {
+                b'#' => break,
+                b'"' | b'\'' => {
+                    if bytes.get(i.saturating_add(1)) == Some(&b)
+                        && bytes.get(i.saturating_add(2)) == Some(&b)
+                    {
+                        let rest = &line[i.saturating_add(3)..];
+                        let close: String = [b as char, b as char, b as char].iter().collect();
+                        if !rest.contains(&close) {
+                            *state = Some(b as char);
+                        }
+                        return;
+                    }
+                    in_str = Some(b);
+                }
+                _ => {}
+            },
+        }
+        i = i.saturating_add(1);
+    }
+}
+
+/// If inside a triple string, check whether `line` closes it.
+fn update_triple_state(line: &str, state: &mut Option<char>) {
+    let Some(q) = *state else { return };
+    let close: String = [q, q, q].iter().collect();
+    if line.contains(&close) {
+        *state = None;
+    }
+}
 ///
 /// Drives a [`PythonScanner`] over the line, summing `+1` per opener and `-1`
 /// per closer, so the string/comment-skipping logic is shared with
@@ -637,6 +703,20 @@ mod tests {
         let src = "x = \"\"\"\nthis has { and [ and ( inside\n\"\"\"\ny = 1\n";
         let result = lint_content(Path::new("a.py"), src);
         assert!(result.is_valid, "{:?}", result.errors);
+    }
+
+    #[test]
+    fn python_multiline_triple_string_indent_not_checked() {
+        // Lines inside an open triple-quoted string should not be checked for
+        // indentation — the scanner must preserve triple-string state across
+        // line boundaries. Without the fix, line 2's 2-space indent would be
+        // flagged as a bad dedent.
+        let src = "x = \"\"\"\n  arbitrary indent inside\n    more indent\n\"\"\"\ny = 1\n";
+        let result = lint_content(Path::new("a.py"), src);
+        assert!(
+            result.is_valid,
+            "indent inside triple string should not be checked: {result:?}"
+        );
     }
 
     #[test]

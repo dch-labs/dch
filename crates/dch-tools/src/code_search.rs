@@ -220,11 +220,7 @@ fn scan_file(
     limit: usize,
 ) -> Vec<Match> {
     let lines: Vec<&str> = content.lines().collect();
-    let rel_path = file_path
-        .strip_prefix(base_path)
-        .ok()
-        .and_then(|p| p.to_str())
-        .unwrap_or_else(|| file_path.to_str().unwrap_or("unknown"));
+    let rel_path = crate::search::relative_file(file_path, base_path);
     let mut results = Vec::new();
     for (line_num, line) in lines.iter().enumerate() {
         if results.len() >= limit {
@@ -239,7 +235,7 @@ fn scan_file(
             line.to_string()
         };
         results.push(Match {
-            file: rel_path.to_string(),
+            file: rel_path.clone(),
             line: line_num.saturating_add(1),
             content,
         });
@@ -270,15 +266,20 @@ fn render_snippet(lines: &[&str], line_num: usize, context_lines: usize) -> Stri
 
 /// Render the collected matches in one of two modes keyed on `context_lines`.
 ///
-/// `context_lines == 0` → grouped: `Found N matches for "{pattern}":` header,
+/// `context_lines == 0` → grouped: `Found N match(es) for "{pattern}":` header,
 /// a blank line, then per file the path and collapsed line ranges
 /// (`  {N}` or `  {A}-{B}`). `context_lines > 0` → the same header followed by
 /// `file:line` per match and its indented snippet. Output spills to a temp
 /// file via the shared helper if it exceeds the inline limit.
 fn render(matches: &[Match], pattern: &str, context_lines: usize, temp_dir: &Path) -> ToolOutput {
     let mut out = Vec::with_capacity(matches.len().saturating_add(2));
+    let match_word = if matches.len() == 1 {
+        "match"
+    } else {
+        "matches"
+    };
     out.push(format!(
-        "Found {} matches for \"{pattern}\":",
+        "Found {} {match_word} for \"{pattern}\":",
         matches.len()
     ));
     out.push(String::new());
@@ -301,7 +302,9 @@ fn render(matches: &[Match], pattern: &str, context_lines: usize, temp_dir: &Pat
             }
         }
     } else {
-        for m in matches {
+        let mut sorted: Vec<&Match> = matches.iter().collect();
+        sorted.sort_by(|a, b| a.file.cmp(&b.file).then_with(|| a.line.cmp(&b.line)));
+        for m in sorted {
             out.push(format!("{}:{}", m.file, m.line));
             if !m.content.is_empty() {
                 out.push(format!("  {}", m.content));
@@ -691,6 +694,54 @@ mod tests {
     }
 
     #[test]
+    fn render_context_mode_sorted_by_file_then_line() {
+        // Matches in non-sorted order; context mode must sort by file then line.
+        let matches = vec![
+            Match {
+                file: "b.rs".into(),
+                line: 10,
+                content: "x".into(),
+            },
+            Match {
+                file: "a.rs".into(),
+                line: 5,
+                content: "x".into(),
+            },
+            Match {
+                file: "a.rs".into(),
+                line: 3,
+                content: "x".into(),
+            },
+            Match {
+                file: "b.rs".into(),
+                line: 2,
+                content: "x".into(),
+            },
+        ];
+        let tmp = tempfile::TempDir::new().unwrap();
+        let out = render(&matches, "x", 1, tmp.path());
+        let text = out.text_content();
+        let file_lines: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains(':') && !l.starts_with("Found") && !l.starts_with("  "))
+            .collect();
+        // a.rs:3 should come before a.rs:5, which comes before b.rs:2, then b.rs:10
+        let joined = file_lines.join("\n");
+        assert!(
+            joined.find("a.rs:3").unwrap() < joined.find("a.rs:5").unwrap(),
+            "same file sorted by line: {joined}"
+        );
+        assert!(
+            joined.find("a.rs:5").unwrap() < joined.find("b.rs:2").unwrap(),
+            "files sorted alphabetically: {joined}"
+        );
+        assert!(
+            joined.find("b.rs:2").unwrap() < joined.find("b.rs:10").unwrap(),
+            "same file sorted by line: {joined}"
+        );
+    }
+
+    #[test]
     fn render_large_output_spills_to_temp() {
         let padding = "x".repeat(400);
         let matches: Vec<Match> = (0..300)
@@ -793,7 +844,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            out.text_content().contains("Found 1 matches"),
+            out.text_content().contains("Found 1 match"),
             "{}",
             out.text_content()
         );

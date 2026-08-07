@@ -432,6 +432,10 @@ impl DchConfig {
     /// [`ApiConfig`] directly. The session id is minted at runtime by loopctl,
     /// not carried in config.
     ///
+    /// `compact_threshold` is clamped to `100` here (the struct-literal
+    /// bypasses `SessionConfig`'s own construction clamp), so an out-of-range
+    /// config value cannot overflow the `u8` domain.
+    ///
     /// # Examples
     ///
     /// ```
@@ -447,7 +451,7 @@ impl DchConfig {
         loopctl::config::SessionConfig {
             system_prompt: self.runner.system_prompt.clone(),
             context_window: self.api.context_window,
-            compact_threshold: self.runner.compact_threshold,
+            compact_threshold: self.runner.compact_threshold.min(100),
             auto_compact: self.runner.auto_compact,
         }
     }
@@ -710,10 +714,8 @@ json_logs = true
 
     #[test]
     fn test_to_session_config_passes_compact_threshold_through() {
-        // compact_threshold is u8 on both RunnerConfig and SessionConfig, so
-        // to_session_config assigns it directly with no conversion. Out-of-range
-        // clamping (e.g. >100) is SessionConfig's responsibility via its own
-        // Default/with_compact_threshold/deserialize clamp, not this mapping.
+        // compact_threshold is u8 on both RunnerConfig and SessionConfig. The
+        // struct-literal bypasses SessionConfig's own clamp, so we clamp here.
         let mut c = DchConfig::default();
         c.runner.compact_threshold = 0;
         assert_eq!(c.to_session_config().compact_threshold, 0);
@@ -721,6 +723,11 @@ json_logs = true
         assert_eq!(c.to_session_config().compact_threshold, 100);
         c.runner.compact_threshold = 50;
         assert_eq!(c.to_session_config().compact_threshold, 50);
+        // Out-of-range values are clamped to 100.
+        c.runner.compact_threshold = 101;
+        assert_eq!(c.to_session_config().compact_threshold, 100);
+        c.runner.compact_threshold = 255;
+        assert_eq!(c.to_session_config().compact_threshold, 100);
     }
 
     #[test]
