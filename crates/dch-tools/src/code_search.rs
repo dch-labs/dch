@@ -165,27 +165,27 @@ impl CodeSearchTool {
             .cwd
             .clone();
 
-        let common = crate::search::parse_input(&input, DEFAULT_MAX_RESULTS)?;
+        let parsed_input = crate::search::parse_input(&input, DEFAULT_MAX_RESULTS)?;
         let context_lines = get_usize(&input, "context_lines")?
             .unwrap_or(0)
             .min(MAX_CONTEXT_LINES);
 
-        if is_url(&common.base_path) {
+        if is_url(&parsed_input.base_path) {
             return Err(ToolError::InvalidInput(
                 "URLs are not supported by the CodeSearch tool. Use WebFetch for URLs.".to_string(),
             ));
         }
 
-        let regex = compile_pattern(&common.pattern, common.case_insensitive)?;
-        let base = resolve_path(&common.base_path, &cwd);
+        let regex = compile_pattern(&parsed_input.pattern, parsed_input.case_insensitive)?;
+        let base = resolve_path(&parsed_input.base_path, &cwd);
         let job = SearchJob {
             regex,
-            include: common.include_patterns,
-            exclude: common.exclude_patterns,
-            max_results: common.max_results.min(RESULTS_CAP),
+            include: parsed_input.include_patterns,
+            exclude: parsed_input.exclude_patterns,
+            max_results: parsed_input.max_results.min(RESULTS_CAP),
             per_file_cap: None,
             base,
-            pattern: common.pattern.clone(),
+            pattern: parsed_input.pattern.clone(),
         };
         let matches = tokio::task::spawn_blocking(move || {
             crate::search::run(&job, |regex, content, file_path, base, limit| {
@@ -196,10 +196,15 @@ impl CodeSearchTool {
         .map_err(|e| ToolError::Execution(format!("CodeSearch walk task failed: {e}")))?;
 
         if matches.is_empty() {
-            return Ok(no_matches_message(&common.pattern));
+            return Ok(no_matches_message(&parsed_input.pattern));
         }
 
-        Ok(render(&matches, &common.pattern, context_lines, &temp_dir))
+        Ok(render(
+            &matches,
+            &parsed_input.pattern,
+            context_lines,
+            &temp_dir,
+        ))
     }
 }
 

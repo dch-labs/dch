@@ -38,6 +38,8 @@ use crate::util::resolve_path;
 const DEFAULT_MAX_MATCHES: usize = 100;
 /// Default total match cap across all files when the caller omits `max_results`.
 const DEFAULT_MAX_RESULTS: usize = 1000;
+/// Hard ceiling `max_results` is clamped to, regardless of what the caller asks.
+const MAX_RESULTS_CAP: usize = 1000;
 
 /// Regex content-search tool — the "show me every matching line" search.
 ///
@@ -163,27 +165,28 @@ impl GrepTool {
             .cwd
             .clone();
 
-        let common = crate::search::parse_input(&input, DEFAULT_MAX_RESULTS)?;
+        let parsed_input = crate::search::parse_input(&input, DEFAULT_MAX_RESULTS)?;
+        let max_results = parsed_input.max_results.min(MAX_RESULTS_CAP);
         let max_matches = get_usize(&input, "max_matches")?
             .unwrap_or(DEFAULT_MAX_MATCHES)
             .max(1);
 
-        if is_url(&common.base_path) {
+        if is_url(&parsed_input.base_path) {
             return Err(ToolError::InvalidInput(
                 "URLs are not supported by the Grep tool. Use WebFetch for URLs.".to_string(),
             ));
         }
 
-        let regex = compile_pattern(&common.pattern, common.case_insensitive)?;
-        let base = resolve_path(&common.base_path, &cwd);
+        let regex = compile_pattern(&parsed_input.pattern, parsed_input.case_insensitive)?;
+        let base = resolve_path(&parsed_input.base_path, &cwd);
         let job = SearchJob {
             regex,
-            include: common.include_patterns,
-            exclude: common.exclude_patterns,
-            max_results: common.max_results,
+            include: parsed_input.include_patterns,
+            exclude: parsed_input.exclude_patterns,
+            max_results,
             per_file_cap: Some(max_matches),
             base,
-            pattern: common.pattern.clone(),
+            pattern: parsed_input.pattern.clone(),
         };
         let matches = tokio::task::spawn_blocking(move || {
             crate::search::run(&job, |regex, content, file_path, base, limit| {
@@ -194,7 +197,7 @@ impl GrepTool {
         .map_err(|e| ToolError::Execution(format!("Grep walk task failed: {e}")))?;
 
         if matches.is_empty() {
-            return Ok(no_matches_message(&common.pattern));
+            return Ok(no_matches_message(&parsed_input.pattern));
         }
 
         Ok(render(&matches, &temp_dir))

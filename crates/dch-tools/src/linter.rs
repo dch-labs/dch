@@ -324,11 +324,29 @@ fn update_triple_from_line(line: &str, state: &mut Option<char>) {
 }
 
 /// If inside a triple string, check whether `line` closes it.
+///
+/// Scans for an unescaped triple-quote delimiter — `\"""` inside a string does
+/// not close it, only a bare `"""` or `'''` does.
 fn update_triple_state(line: &str, state: &mut Option<char>) {
     let Some(q) = *state else { return };
-    let close: String = [q, q, q].iter().collect();
-    if line.contains(&close) {
-        *state = None;
+    let bytes = line.as_bytes();
+    let qb = q as u8;
+    let mut i: usize = 0;
+    let mut escaped = false;
+    while i.saturating_add(2) <= bytes.len() {
+        let Some(&b) = bytes.get(i) else { break };
+        if escaped {
+            escaped = false;
+        } else if b == b'\\' {
+            escaped = true;
+        } else if b == qb
+            && bytes.get(i.saturating_add(1)) == Some(&qb)
+            && bytes.get(i.saturating_add(2)) == Some(&qb)
+        {
+            *state = None;
+            return;
+        }
+        i = i.saturating_add(1);
     }
 }
 ///
@@ -716,6 +734,19 @@ mod tests {
         assert!(
             result.is_valid,
             "indent inside triple string should not be checked: {result:?}"
+        );
+    }
+
+    #[test]
+    fn python_escaped_triple_quote_does_not_close_string() {
+        // An escaped triple quote (\""") inside a triple-quoted string must NOT
+        // close it — the scanner should keep tracking the open string across
+        // the following lines with arbitrary indentation.
+        let src = "x = \"\"\"\n  \\\"\"\" more text\n  still inside\n\"\"\"\ny = 1\n";
+        let result = lint_content(Path::new("a.py"), src);
+        assert!(
+            result.is_valid,
+            "escaped triple quote should not close the string: {result:?}"
         );
     }
 

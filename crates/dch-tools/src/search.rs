@@ -9,6 +9,7 @@
 //! per-file and global caps, the binary/size guards, the regex cache lookup,
 //! and the no-match success message.
 
+use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -218,14 +219,24 @@ pub fn parse_input(
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| ToolError::InvalidInput("Missing 'pattern' field".to_string()))?
         .to_string();
-    let base_path = input
-        .get("path")
-        .and_then(serde_json::Value::as_str)
-        .map_or_else(|| ".".to_string(), str::to_string);
-    let case_insensitive = input
-        .get("case_insensitive")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
+    let base_path = match input.get("path") {
+        None => ".".to_string(),
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(_) => {
+            return Err(ToolError::InvalidInput(
+                "'path' must be a string".to_string(),
+            ));
+        }
+    };
+    let case_insensitive = match input.get("case_insensitive") {
+        None => false,
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(_) => {
+            return Err(ToolError::InvalidInput(
+                "'case_insensitive' must be a boolean".to_string(),
+            ));
+        }
+    };
     let max_results = get_usize(input, "max_results")?
         .unwrap_or(default_max_results)
         .max(1);
@@ -310,7 +321,18 @@ where
         if walk::file_too_large(path) || walk::likely_binary(path) {
             continue;
         }
-        let Ok(content) = std::fs::read_to_string(path) else {
+        let Ok(file) = std::fs::File::open(path) else {
+            continue;
+        };
+        let cap = usize::try_from(walk::MAX_FILE_BYTES.saturating_add(1)).unwrap_or(usize::MAX);
+        let mut buf = Vec::with_capacity(cap.min(8192));
+        if file.take(cap as u64).read_to_end(&mut buf).is_err() {
+            continue;
+        }
+        if buf.len() > usize::try_from(walk::MAX_FILE_BYTES).unwrap_or(usize::MAX) {
+            continue;
+        }
+        let Ok(content) = String::from_utf8(buf) else {
             continue;
         };
         let remaining = job.max_results.saturating_sub(matches.len());

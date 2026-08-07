@@ -70,8 +70,11 @@ pub fn is_image_file(path: &str) -> bool {
 /// `file://`, `ftp://`, bare paths, and empty strings.
 #[must_use]
 pub fn is_url(path: &str) -> bool {
-    path.len() >= 7 && path[..7].eq_ignore_ascii_case("http://")
-        || path.len() >= 8 && path[..8].eq_ignore_ascii_case("https://")
+    path.get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case("http://"))
+        || path
+            .get(..8)
+            .is_some_and(|p| p.eq_ignore_ascii_case("https://"))
 }
 
 /// Resolve a possibly-relative `file_path` against `cwd`.
@@ -181,5 +184,13 @@ mod tests {
         assert!(!is_url("h"));
         // Just short of a match.
         assert!(!is_url("http:/"));
+    }
+
+    #[test]
+    fn is_url_non_ascii_does_not_panic() {
+        // Multi-byte chars whose byte length crosses the 7/8 prefix boundary
+        // must not panic on get(..7)/get(..8).
+        assert!(!is_url("éttp://"));
+        assert!(!is_url("éxample"));
     }
 }
