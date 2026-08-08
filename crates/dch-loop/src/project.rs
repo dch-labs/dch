@@ -9,7 +9,7 @@ use std::path::Path;
 
 use dch_config::ProjectConfig;
 use dch_config::Role;
-use dch_config::Tech;
+use dch_config::TechProfile;
 use loopctl::api::ApiClient;
 use loopctl::message::Message;
 use loopctl::structured::StructuredError;
@@ -17,67 +17,6 @@ use loopctl::structured::StructuredOutput;
 use loopctl::structured::request_structured;
 use serde::Deserialize;
 use serde::Serialize;
-
-/// A detected (or configured) description of one language in the project.
-///
-/// Built by [`detect_tech_stack`] from a marker file, then refined by
-/// [`merge_by_language`] with the matching [`Tech`] from `[project].techs`.
-/// A polyglot repo has several of these; the runner renders them all.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct TechProfile {
-    /// The language this entry describes.
-    ///
-    /// Lowercased marker-derived name, e.g. `"rust"`, `"typescript"`,
-    /// `"make"`. Used as the merge key against configured [`Tech`] entries and
-    /// rendered as the section header. Never empty for a detected profile.
-    pub language: String,
-
-    /// Command that builds this language's code.
-    ///
-    /// Marker-derived, e.g. `"cargo build"`. Empty when the marker implies no
-    /// build step or the user left the override unset.
-    pub build: String,
-
-    /// Command that runs this language's tests.
-    ///
-    /// Marker-derived, e.g. `"cargo test"`. Empty when the marker implies no
-    /// test step or the user left the override unset.
-    pub test: String,
-
-    /// Command that lints this language's code.
-    ///
-    /// Marker-derived, e.g. `"cargo clippy"`. Empty when the marker implies no
-    /// lint step or the user left the override unset.
-    pub lint: String,
-
-    /// Free-form conventions prose for this language.
-    ///
-    /// Carried from a configured [`Tech`] override's `conventions` field;
-    /// detection never sets it. Empty when the user supplied none.
-    pub conventions: String,
-}
-
-impl TechProfile {
-    /// Apply the set fields of a [`Tech`] override onto this profile.
-    ///
-    /// Fields the user left `None` keep the detected value, so a `[project]`
-    /// entry acts as a partial override. `language` is never overridden here —
-    /// matching is by language, so the identity stays the detected one.
-    pub fn apply_override(&mut self, tech: &Tech) {
-        if let Some(build) = &tech.build {
-            self.build.clone_from(build);
-        }
-        if let Some(test) = &tech.test {
-            self.test.clone_from(test);
-        }
-        if let Some(lint) = &tech.lint {
-            self.lint.clone_from(lint);
-        }
-        if let Some(conv) = &tech.conventions {
-            self.conventions.clone_from(conv);
-        }
-    }
-}
 
 /// One marker file and the profile it implies.
 ///
@@ -195,7 +134,7 @@ const MARKERS: &[Marker] = &[
         lint: "make lint",
     },
     Marker {
-        file: "Mix.exs",
+        file: "mix.exs",
         language: "elixir",
         build: "mix compile",
         test: "mix test",
@@ -236,14 +175,29 @@ pub fn detect_tech_stack(root: &Path) -> Vec<TechProfile> {
         } else {
             root.join(marker.file).exists()
         };
-        if matched
-            && !profiles.iter().any(|p| p.language == marker.language)
-            && let Some(profile) = language_profile(marker.language)
-        {
-            profiles.push(profile);
+        if matched && !profiles.iter().any(|p| p.language == marker.language) {
+            profiles.push(marker_profile(marker));
         }
     }
     profiles
+}
+
+/// Resolve a matched [`Marker`] to its [`TechProfile`].
+///
+/// Companion to [`language_profile`]: both return a [`TechProfile`], but from
+/// different sources — this one from a detected marker (so every command is
+/// known and set to `Some(...)`), [`language_profile`] from a language name
+/// (e.g. an inferred name from [`analyze_message`]). Conventions are `None`
+/// here; detection never infers them, only a `[project]` override does via
+/// [`merge_by_language`].
+fn marker_profile(m: &Marker) -> TechProfile {
+    TechProfile {
+        language: m.language.to_string(),
+        build: Some(m.build.to_string()),
+        test: Some(m.test.to_string()),
+        lint: Some(m.lint.to_string()),
+        conventions: None,
+    }
 }
 
 /// Look up the default [`TechProfile`] for a language name.
@@ -255,16 +209,11 @@ pub fn detect_tech_stack(root: &Path) -> Vec<TechProfile> {
 /// Returns `None` for an unknown language (e.g. an inferred name with no
 /// marker row); the caller skips it.
 fn language_profile(language: &str) -> Option<TechProfile> {
+    let lang = language.to_lowercase();
     MARKERS
         .iter()
-        .find(|m| m.language == language)
-        .map(|m| TechProfile {
-            language: m.language.to_string(),
-            build: m.build.to_string(),
-            test: m.test.to_string(),
-            lint: m.lint.to_string(),
-            conventions: String::new(),
-        })
+        .find(|m| m.language == lang)
+        .map(marker_profile)
 }
 
 /// The model's analysis of a first user message: its intent and its stack.
@@ -298,15 +247,18 @@ impl StructuredOutput for MessageAnalysis {
     }
 
     fn schema() -> serde_json::Value {
+        let role_names: Vec<serde_json::Value> = Role::ALL
+            .iter()
+            .map(|r| serde_json::to_value(r).unwrap_or_default())
+            .collect();
+        let mut role_enum = role_names;
+        role_enum.push(serde_json::Value::Null);
         serde_json::json!({
             "type": "object",
             "properties": {
                 "suggested_role": {
                     "type": ["string", "null"],
-                    "enum": [
-                        "general", "coding", "refactor", "debug",
-                        "review", "docs", "tests", null
-                    ],
+                    "enum": role_enum,
                     "description": "The role that best fits what the user wants to do. null if unclear."
                 },
                 "languages": {
@@ -366,6 +318,11 @@ pub async fn analyze_message(
 
 /// True if any direct child of `root` matches the single-segment `glob`
 /// (e.g. `"*.csproj"`).
+///
+/// Used by [`detect_tech_stack`] for glob-based markers (those whose `file`
+/// contains `*`). Reads only the immediate children of `root` — does not
+/// descend into subdirectories, since markers are root-level files. A
+/// nonexistent or unreadable `root` returns `false` rather than panicking.
 fn has_glob_match(root: &Path, glob: &str) -> bool {
     let Ok(entries) = std::fs::read_dir(root) else {
         return false;
@@ -382,7 +339,7 @@ fn has_glob_match(root: &Path, glob: &str) -> bool {
 
 /// Merge detected profiles with the user's `[project]` overrides by language.
 ///
-/// For each detected profile whose language matches a configured [`Tech`],
+/// For each detected profile whose language matches a configured [`TechProfile`],
 /// that tech's set fields override the detected ones. Configured techs whose
 /// language was not detected are appended (the user adds a language detection
 /// missed). Detected techs the config doesn't mention are kept as-is. Order is
@@ -393,27 +350,27 @@ pub fn merge_by_language(
     config: &ProjectConfig,
 ) -> Vec<TechProfile> {
     for tech in &config.techs {
-        if let Some(profile) = detected.iter_mut().find(|p| p.language == tech.language) {
-            profile.apply_override(tech);
+        if let Some(profile) = detected
+            .iter_mut()
+            .find(|p| p.language.eq_ignore_ascii_case(&tech.language))
+        {
+            if tech.build.is_some() {
+                profile.build.clone_from(&tech.build);
+            }
+            if tech.test.is_some() {
+                profile.test.clone_from(&tech.test);
+            }
+            if tech.lint.is_some() {
+                profile.lint.clone_from(&tech.lint);
+            }
+            if tech.conventions.is_some() {
+                profile.conventions.clone_from(&tech.conventions);
+            }
         } else {
-            detected.push(TechProfile::from_tech(tech));
+            detected.push(tech.clone());
         }
     }
     detected
-}
-
-impl TechProfile {
-    /// Build a profile from a configured [`Tech`] (for languages detection
-    /// missed entirely).
-    fn from_tech(tech: &Tech) -> TechProfile {
-        TechProfile {
-            language: tech.language.clone(),
-            build: tech.build.clone().unwrap_or_default(),
-            test: tech.test.clone().unwrap_or_default(),
-            lint: tech.lint.clone().unwrap_or_default(),
-            conventions: tech.conventions.clone().unwrap_or_default(),
-        }
-    }
 }
 
 /// Render a polyglot tech list plus project-wide conventions as the prose
@@ -435,21 +392,21 @@ pub fn render_techs(techs: &[TechProfile], project_conventions: Option<&str>) ->
         }
         out.push_str("\n\n- Language: ");
         out.push_str(&tech.language);
-        if !tech.build.is_empty() {
+        if let Some(v) = tech.build.as_deref().filter(|v| !v.is_empty()) {
             out.push_str("\n  Build: ");
-            out.push_str(&tech.build);
+            out.push_str(v);
         }
-        if !tech.test.is_empty() {
+        if let Some(v) = tech.test.as_deref().filter(|v| !v.is_empty()) {
             out.push_str("\n  Test: ");
-            out.push_str(&tech.test);
+            out.push_str(v);
         }
-        if !tech.lint.is_empty() {
+        if let Some(v) = tech.lint.as_deref().filter(|v| !v.is_empty()) {
             out.push_str("\n  Lint: ");
-            out.push_str(&tech.lint);
+            out.push_str(v);
         }
-        if !tech.conventions.is_empty() {
+        if let Some(v) = tech.conventions.as_deref().filter(|v| !v.is_empty()) {
             out.push_str("\n  Conventions: ");
-            out.push_str(&tech.conventions);
+            out.push_str(v);
         }
     }
     if let Some(conv) = project_conventions
@@ -461,7 +418,7 @@ pub fn render_techs(techs: &[TechProfile], project_conventions: Option<&str>) ->
     out
 }
 
-/// True when every field of `tech` other than `language` is empty.
+/// True when every field of `tech` other than `language` is unset or empty.
 ///
 /// A profile that is bare (only `language` set, no commands or conventions)
 /// contributes nothing actionable to the prompt, so [`render_techs`] skips it.
@@ -470,10 +427,10 @@ pub fn render_techs(techs: &[TechProfile], project_conventions: Option<&str>) ->
 /// rendered PROJECT section on its own; pair it with at least one command or
 /// convention to make it render.
 fn all_fields_empty(tech: &TechProfile) -> bool {
-    tech.build.is_empty()
-        && tech.test.is_empty()
-        && tech.lint.is_empty()
-        && tech.conventions.is_empty()
+    tech.build.as_deref().is_none_or(str::is_empty)
+        && tech.test.as_deref().is_none_or(str::is_empty)
+        && tech.lint.as_deref().is_none_or(str::is_empty)
+        && tech.conventions.as_deref().is_none_or(str::is_empty)
 }
 
 #[cfg(test)]
@@ -488,7 +445,7 @@ fn all_fields_empty(tech: &TechProfile) -> bool {
 mod tests {
     use super::*;
     use dch_config::ProjectConfig;
-    use dch_config::Tech;
+    use dch_config::TechProfile;
 
     #[test]
     fn empty_root_yields_no_profiles() {
@@ -505,9 +462,9 @@ mod tests {
         assert_eq!(profiles.len(), 1);
         let p = &profiles[0];
         assert_eq!(p.language, "rust");
-        assert_eq!(p.build, "cargo build");
-        assert_eq!(p.test, "cargo test");
-        assert_eq!(p.lint, "cargo clippy");
+        assert_eq!(p.build.as_deref(), Some("cargo build"));
+        assert_eq!(p.test.as_deref(), Some("cargo test"));
+        assert_eq!(p.lint.as_deref(), Some("cargo clippy"));
     }
 
     #[test]
@@ -582,27 +539,59 @@ mod tests {
     }
 
     #[test]
+    fn mix_exs_lowercase_detects_elixir() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("mix.exs"), "").unwrap();
+        let profiles = detect_tech_stack(tmp.path());
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].language, "elixir");
+    }
+
+    #[test]
+    fn build_gradle_detects_java_with_gradle_build() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("build.gradle"), "").unwrap();
+        let profiles = detect_tech_stack(tmp.path());
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].language, "java");
+        assert_eq!(profiles[0].build.as_deref(), Some("gradle build"));
+    }
+
+    #[test]
+    fn case_insensitive_language_matching_in_tech_profiles() {
+        // Model may return "Rust" (capitalized) — must resolve to the lowercase
+        // profile, not be silently dropped.
+        let analysis = MessageAnalysis {
+            suggested_role: Some(Role::Coding),
+            languages: vec!["Rust".to_string()],
+        };
+        let profiles = analysis.tech_profiles();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].language, "rust");
+    }
+
+    #[test]
     fn merge_overrides_matching_language_and_appends_new() {
         let detected = vec![
             TechProfile {
                 language: "rust".to_string(),
-                build: "cargo build".to_string(),
-                test: "cargo test".to_string(),
-                lint: "cargo clippy".to_string(),
-                conventions: String::new(),
+                build: Some("cargo build".to_string()),
+                test: Some("cargo test".to_string()),
+                lint: Some("cargo clippy".to_string()),
+                conventions: None,
             },
             TechProfile {
                 language: "typescript".to_string(),
-                build: "npm run build".to_string(),
-                test: "npm test".to_string(),
-                lint: String::new(),
-                conventions: String::new(),
+                build: Some("npm run build".to_string()),
+                test: Some("npm test".to_string()),
+                lint: None,
+                conventions: None,
             },
         ];
         let config = ProjectConfig {
             techs: vec![
                 // Override rust's build only; keep detected test/lint.
-                Tech {
+                TechProfile {
                     language: "rust".to_string(),
                     build: Some("cargo build --release".to_string()),
                     test: None,
@@ -610,7 +599,7 @@ mod tests {
                     conventions: Some("no unwrap".to_string()),
                 },
                 // Add a language detection missed.
-                Tech {
+                TechProfile {
                     language: "bash".to_string(),
                     build: None,
                     test: Some("bats".to_string()),
@@ -622,13 +611,29 @@ mod tests {
         };
         let merged = merge_by_language(detected, &config);
         let rust = merged.iter().find(|p| p.language == "rust").unwrap();
-        assert_eq!(rust.build, "cargo build --release", "override applied");
-        assert_eq!(rust.test, "cargo test", "unset field kept detected");
-        assert_eq!(rust.lint, "cargo clippy", "unset field kept detected");
-        assert_eq!(rust.conventions, "no unwrap");
+        assert_eq!(
+            rust.build.as_deref(),
+            Some("cargo build --release"),
+            "override applied"
+        );
+        assert_eq!(
+            rust.test.as_deref(),
+            Some("cargo test"),
+            "unset field kept detected"
+        );
+        assert_eq!(
+            rust.lint.as_deref(),
+            Some("cargo clippy"),
+            "unset field kept detected"
+        );
+        assert_eq!(rust.conventions.as_deref(), Some("no unwrap"));
         let bash = merged.iter().find(|p| p.language == "bash").unwrap();
-        assert_eq!(bash.test, "bats", "appended config-only tech");
-        assert_eq!(bash.lint, "shellcheck");
+        assert_eq!(
+            bash.test.as_deref(),
+            Some("bats"),
+            "appended config-only tech"
+        );
+        assert_eq!(bash.lint.as_deref(), Some("shellcheck"));
         assert_eq!(merged.len(), 3, "rust + typescript + bash");
     }
 
@@ -637,17 +642,17 @@ mod tests {
         let techs = vec![
             TechProfile {
                 language: "rust".to_string(),
-                build: "cargo build".to_string(),
-                test: "cargo test".to_string(),
-                lint: "cargo clippy".to_string(),
-                conventions: String::new(),
+                build: Some("cargo build".to_string()),
+                test: Some("cargo test".to_string()),
+                lint: Some("cargo clippy".to_string()),
+                conventions: None,
             },
             TechProfile {
                 language: "bash".to_string(),
-                build: String::new(),
-                test: "bats".to_string(),
-                lint: String::new(),
-                conventions: String::new(),
+                build: None,
+                test: Some("bats".to_string()),
+                lint: None,
+                conventions: None,
             },
         ];
         let rendered = render_techs(&techs, Some("conventional commits"));
@@ -686,9 +691,9 @@ mod tests {
         let profiles = analysis.tech_profiles();
         assert_eq!(profiles.len(), 1);
         assert_eq!(profiles[0].language, "rust");
-        assert_eq!(profiles[0].build, "cargo build");
-        assert_eq!(profiles[0].test, "cargo test");
-        assert_eq!(profiles[0].lint, "cargo clippy");
+        assert_eq!(profiles[0].build.as_deref(), Some("cargo build"));
+        assert_eq!(profiles[0].test.as_deref(), Some("cargo test"));
+        assert_eq!(profiles[0].lint.as_deref(), Some("cargo clippy"));
     }
 
     #[test]

@@ -151,7 +151,9 @@ pub enum PermissionMode {
 /// works on — detected from the repo, overridable in `[project]`). Enforcement
 /// is handled by the permission layer at runtime regardless of which role is
 /// selected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Deserialize, serde::Serialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
     /// General assistance — PC help, sysadmin, app configuration (the default).
@@ -239,7 +241,7 @@ YOUR ROLE: IMPLEMENT FEATURES AND FIXES
 - Keep edits targeted. A single Edit should carry one intent; split work that
   does several things into several edits.
 - For unfamiliar or complex operations, look up the established pattern in the
-  repo (or via WebFetch) before inventing a new one.";
+  repo before inventing a new one.";
 
 /// Role body for [`Role::Refactor`]: restructure without behavior change.
 pub(crate) const REFACTOR_ROLE: &str = "\
@@ -329,6 +331,22 @@ impl Role {
             Role::Tests => TESTS_ROLE,
         }
     }
+
+    /// All variants, in declaration order.
+    ///
+    /// Single source of truth for consumers that need to enumerate roles
+    /// (e.g. the message-analysis schema's `enum` constraint, a `--help`
+    /// listing). Adding a variant to `Role` and forgetting to add it here is
+    /// caught by the `all_roles_covered` test.
+    pub const ALL: [Role; 7] = [
+        Role::General,
+        Role::Coding,
+        Role::Refactor,
+        Role::Debug,
+        Role::Review,
+        Role::Docs,
+        Role::Tests,
+    ];
 }
 
 /// Errors arising while loading configuration.
@@ -552,8 +570,13 @@ pub struct RoleOverride {
     /// whose role matches the selection takes effect.
     pub role: Role,
 
-    /// The replacement prose. Used verbatim in place of
-    /// [`Role::system_prompt`] for this role.
+    /// The replacement prose.
+    ///
+    /// Used verbatim in place of [`Role::system_prompt`] for this role. The
+    /// shared agent discipline, detected tech profile, and per-tool fragments
+    /// still append — only the role-specific body is replaced. There is no
+    /// length limit; the caller composes the full prompt from this string plus
+    /// the other parts.
     pub prompt: String,
 }
 
@@ -562,7 +585,8 @@ impl RunnerConfig {
     ///
     /// Returns the override's prompt when an entry for `role` exists in
     /// [`Self::role_overrides`], otherwise `None` (meaning: use the role's
-    /// built-in [`Role::system_prompt`]).
+    /// built-in [`Role::system_prompt`]). When multiple entries share the
+    /// same role, the first declaration wins.
     #[must_use]
     pub fn role_override(&self, role: Role) -> Option<&str> {
         self.role_overrides
@@ -577,12 +601,12 @@ impl RunnerConfig {
 /// Most real projects are polyglot — a Rust core, a `TypeScript` frontend, a
 /// Python tooling script — and each language has its own build/test/lint
 /// commands and its own conventions. This struct captures one such language;
-/// [`ProjectConfig`] holds a `Vec<Tech>` for all of them.
+/// [`ProjectConfig`] holds a `Vec<TechProfile>` for all of them.
 ///
 /// Every field except `language` is optional: set only what detection got
 /// wrong or can't infer. Loaded from the `[[project.techs]]` array-of-tables.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub struct Tech {
+pub struct TechProfile {
     /// The language this entry describes, e.g. `"rust"` or `"cpp"`.
     ///
     /// Matches against the detected language so the runner can merge detected
@@ -633,7 +657,7 @@ pub struct ProjectConfig {
     /// One `[[project.techs]]` table per language the user wants to declare or
     /// override. The runner merges each with its detected counterpart by
     /// language; entries for languages detection missed are appended.
-    pub techs: Vec<Tech>,
+    pub techs: Vec<TechProfile>,
 
     /// Free-form project-wide conventions that apply across all languages.
     ///
@@ -749,8 +773,12 @@ impl DchConfig {
 
     /// Map the session-scoped fields to a [`loopctl::config::SessionConfig`].
     ///
-    /// Carries the system prompt, context window, compaction threshold, and
-    /// auto-compact flag — the settings that are stable across `run()` calls
+    /// Carries the context window, compaction threshold, and auto-compact
+    /// flag — the settings that are stable across `run()` calls. The
+    /// `system_prompt` is **not** carried here (it is set to `None`); the
+    /// runner composes it from the selected role, detected tech stack, and
+    /// per-tool fragments via the prompt builder and installs it on
+    /// the session after construction.
     /// on the same agent. Provider-specific fields (`model`, `max_tokens`) are
     /// not session-config concerns; they are consumed by the API client via
     /// [`ApiConfig`] directly. The session id is minted at runtime by loopctl,
@@ -1070,6 +1098,19 @@ json_logs = true
     #[test]
     fn role_default_is_general() {
         assert_eq!(Role::default(), Role::General);
+    }
+
+    #[test]
+    fn role_all_covers_every_variant() {
+        let mut seen = std::collections::HashSet::new();
+        for role in Role::ALL {
+            assert!(seen.insert(role), "duplicate variant in ALL: {role:?}");
+        }
+        assert_eq!(
+            seen.len(),
+            7,
+            "ALL must contain all 7 variants — add new ones here"
+        );
     }
 
     #[test]

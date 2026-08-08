@@ -7,10 +7,9 @@ pub mod project;
 pub mod prompt;
 pub mod provider;
 
-pub use dch_config::{ApiConfig, ApiType, DchConfigError};
+pub use dch_config::{ApiConfig, ApiType, DchConfigError, TechProfile};
 pub use error::RunnerError;
 pub use project::MessageAnalysis;
-pub use project::TechProfile;
 pub use project::analyze_message;
 pub use project::detect_tech_stack;
 pub use project::merge_by_language;

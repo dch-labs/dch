@@ -13,9 +13,9 @@
 //! the same string. Working and temporary directory context is appended by
 //! the caller at runner construction, not here.
 
-use crate::project::TechProfile;
 use crate::project::render_techs;
 use dch_config::Role;
+use dch_config::TechProfile;
 use loopctl::tool::ToolRegistry;
 
 /// Agent discipline shared by every role.
@@ -50,7 +50,7 @@ IMAGES
 FILE PATHS
 - Write within the working directory unless the user names a specific location.
   Do not write to system directories. Use the temp directory for scratch and
-  intermediate output (the caller appends both paths to the prompt).";
+  intermediate output.";
 
 /// Assemble the system prompt from the default role, no tech profiles, and
 /// each registered tool's [`loopctl::tool::Tool::system_prompt`] fragment.
@@ -125,6 +125,11 @@ pub fn with_context(
 
 /// Append one `## <Name>` section per tool that has a `system_prompt`
 /// fragment, in alphabetical order by tool name.
+///
+/// Tools whose [`Tool::system_prompt`] returns `None` are skipped — they
+/// contribute nothing to the prompt. The local re-sort (after `tool_names()`
+/// already sorts) keeps the ordering contract owned by this module, so a
+/// future loopctl change to `tool_names()` cannot silently reorder fragments.
 fn append_fragments(out: &mut String, tools: &ToolRegistry) {
     let mut fragments: Vec<(String, String)> = tools
         .tool_names()
@@ -156,7 +161,7 @@ fn append_fragments(out: &mut String, tools: &ToolRegistry) {
 )]
 mod tests {
     use super::*;
-    use crate::project::TechProfile;
+    use dch_config::TechProfile;
     use loopctl::tool::Tool;
     use loopctl::tool::ToolContext;
     use loopctl::tool::ToolError;
@@ -305,17 +310,17 @@ mod tests {
         let techs = vec![
             TechProfile {
                 language: "rust".to_string(),
-                build: "cargo build".to_string(),
-                test: "cargo test".to_string(),
-                lint: "cargo clippy".to_string(),
-                conventions: String::new(),
+                build: Some("cargo build".to_string()),
+                test: Some("cargo test".to_string()),
+                lint: Some("cargo clippy".to_string()),
+                conventions: None,
             },
             TechProfile {
                 language: "bash".to_string(),
-                build: String::new(),
-                test: "bats".to_string(),
-                lint: String::new(),
-                conventions: String::new(),
+                build: None,
+                test: Some("bats".to_string()),
+                lint: None,
+                conventions: None,
             },
         ];
         let prompt = with_context(
@@ -331,6 +336,30 @@ mod tests {
         assert!(
             prompt.contains("Project conventions: conventional commits"),
             "{prompt}"
+        );
+    }
+
+    #[test]
+    fn with_context_sections_in_documented_order() {
+        let r = reg(vec![FragTool {
+            name: "Zeta",
+            frag: Some("z"),
+        }]);
+        let techs = vec![TechProfile {
+            language: "rust".to_string(),
+            build: Some("cargo build".to_string()),
+            test: None,
+            lint: None,
+            conventions: None,
+        }];
+        let prompt = with_context(Role::Coding, &techs, Some("fmt"), None, &r);
+        let discipline = prompt.find("CORE CONDUCT").unwrap();
+        let role_body = prompt.find("IMPLEMENT FEATURES").unwrap();
+        let project = prompt.find("PROJECT").unwrap();
+        let fragment = prompt.find("## Zeta").unwrap();
+        assert!(
+            discipline < role_body && role_body < project && project < fragment,
+            "sections out of order: discipline={discipline}, role={role_body}, project={project}, fragment={fragment}\n{prompt}"
         );
     }
 
@@ -426,10 +455,10 @@ mod tests {
         }]);
         let techs = vec![TechProfile {
             language: "rust".to_string(),
-            build: "cargo build".to_string(),
-            test: String::new(),
-            lint: String::new(),
-            conventions: String::new(),
+            build: Some("cargo build".to_string()),
+            test: None,
+            lint: None,
+            conventions: None,
         }];
         let prompt = with_context(Role::Coding, &techs, None, Some("OVERRIDE BODY"), &r);
         assert!(prompt.contains("OVERRIDE BODY"), "override: {prompt}");
