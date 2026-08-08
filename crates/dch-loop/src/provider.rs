@@ -1,28 +1,151 @@
 //! Construction of the loopctl API client from dch configuration.
 
-use std::sync::Arc;
+use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 
 use dch_config::ApiConfig;
 use dch_config::ApiType;
-use loopctl::api::SharedApiClient;
+use futures::Stream;
+use loopctl::api::ApiClient;
+use loopctl::api::NonStreamingResponse;
+use loopctl::api::StreamRequest;
+use loopctl::api::error::ApiError;
+use loopctl::message::Message;
 use loopctl::provider::AnthropicClient;
 use loopctl::provider::GeminiClient;
 use loopctl::provider::OpenAiClient;
+use loopctl::stream::StreamEvent;
 
 use crate::error::RunnerError;
 
 /// Sentinel API key used for providers that require no authentication.
 const NO_AUTH_KEY: &str = "ollama";
 
-/// Build a [`loopctl::api::SharedApiClient`] for the provider named by
-/// `config.api_type`.
+/// The concrete provider client dch monomorphizes the agent loop over.
+///
+/// A runtime-selected enum over loopctl's three provider client families, so
+/// the agent loop's per-turn LLM call is statically dispatched rather than
+/// going through `dyn ApiClient`. [`create_client`] picks the variant from
+/// [`ApiConfig::api_type`] (by wire-protocol family: OpenAI-compatible
+/// providers map to [`OpenAi`], Anthropic-compatible to [`Anthropic`], Gemini
+/// to [`Gemini`]); every other method on `DchClient` forwards to the inner
+/// client unchanged.
+///
+/// [`OpenAi`]: Self::OpenAi
+/// [`Anthropic`]: Self::Anthropic
+/// [`Gemini`]: Self::Gemini
+pub enum DchClient {
+    /// An OpenAI-protocol provider client.
+    ///
+    /// Selected for the OpenAI wire-protocol family: `OpenAi`, `Ollama`,
+    /// `DeepSeek`, and `Grok` all speak the OpenAI chat-completions API (the
+    /// latter three via a custom `base_url`). Wraps loopctl's `OpenAiClient`,
+    /// which the other `ApiClient` methods forward to.
+    OpenAi(OpenAiClient),
+
+    /// An Anthropic-protocol provider client.
+    ///
+    /// Selected for the Anthropic wire-protocol family: `Anthropic` and `Zai`
+    /// (the latter via a custom `base_url`). Wraps loopctl's `AnthropicClient`,
+    /// which the other `ApiClient` methods forward to.
+    Anthropic(AnthropicClient),
+
+    /// A Google Gemini provider client.
+    ///
+    /// Selected for `Gemini`, which uses its own wire protocol distinct from
+    /// the OpenAI and Anthropic families. Wraps loopctl's `GeminiClient`, which
+    /// the other `ApiClient` methods forward to.
+    Gemini(GeminiClient),
+}
+
+impl ApiClient for DchClient {
+    fn model(&self) -> String {
+        match self {
+            Self::OpenAi(c) => c.model(),
+            Self::Anthropic(c) => c.model(),
+            Self::Gemini(c) => c.model(),
+        }
+    }
+
+    fn set_model(&self, model: &str) -> bool {
+        match self {
+            Self::OpenAi(c) => c.set_model(model),
+            Self::Anthropic(c) => c.set_model(model),
+            Self::Gemini(c) => c.set_model(model),
+        }
+    }
+
+    fn base_url(&self) -> String {
+        match self {
+            Self::OpenAi(c) => c.base_url(),
+            Self::Anthropic(c) => c.base_url(),
+            Self::Gemini(c) => c.base_url(),
+        }
+    }
+
+    fn stream_messages(
+        &self,
+        request: &StreamRequest,
+    ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
+        match self {
+            Self::OpenAi(c) => c.stream_messages(request),
+            Self::Anthropic(c) => c.stream_messages(request),
+            Self::Gemini(c) => c.stream_messages(request),
+        }
+    }
+
+    fn create_message(
+        &self,
+        request: &StreamRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<NonStreamingResponse, ApiError>> + Send + '_>> {
+        match self {
+            Self::OpenAi(c) => c.create_message(request),
+            Self::Anthropic(c) => c.create_message(request),
+            Self::Gemini(c) => c.create_message(request),
+        }
+    }
+
+    fn stream_messages_with_options(
+        &self,
+        request: &StreamRequest,
+        options: loopctl::structured::RequestOptions,
+    ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ApiError>> + Send + 'static>> {
+        match self {
+            Self::OpenAi(c) => c.stream_messages_with_options(request, options),
+            Self::Anthropic(c) => c.stream_messages_with_options(request, options),
+            Self::Gemini(c) => c.stream_messages_with_options(request, options),
+        }
+    }
+
+    fn create_message_with_options(
+        &self,
+        request: &StreamRequest,
+        options: loopctl::structured::RequestOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<NonStreamingResponse, ApiError>> + Send + '_>> {
+        match self {
+            Self::OpenAi(c) => c.create_message_with_options(request, options),
+            Self::Anthropic(c) => c.create_message_with_options(request, options),
+            Self::Gemini(c) => c.create_message_with_options(request, options),
+        }
+    }
+
+    fn extract_structured(&self, message: &Message) -> serde_json::Value {
+        match self {
+            Self::OpenAi(c) => c.extract_structured(message),
+            Self::Anthropic(c) => c.extract_structured(message),
+            Self::Gemini(c) => c.extract_structured(message),
+        }
+    }
+}
+
+/// Build a [`DchClient`] for the provider named by `config.api_type`.
 ///
 /// Variants are mapped by wire-protocol family: OpenAI-compatible providers
-/// (`OpenAi`, `Ollama`, `DeepSeek`, `Grok`) use an [`OpenAiClient`];
-/// Anthropic-compatible providers (`Anthropic`, `Zai`) use an
-/// [`AnthropicClient`]; `Gemini` uses a [`GeminiClient`]. An empty `base_url`
-/// falls back to [`ApiType::default_base_url`](dch_config::ApiType::default_base_url).
+/// (`OpenAi`, `Ollama`, `DeepSeek`, `Grok`) wrap an [`OpenAiClient`];
+/// Anthropic-compatible providers (`Anthropic`, `Zai`) wrap an
+/// [`AnthropicClient`]; `Gemini` wraps a [`GeminiClient`]. An empty `base_url`
+/// falls back to [`ApiType::default_base_url`].
 ///
 /// # API-key resolution
 ///
@@ -37,13 +160,13 @@ const NO_AUTH_KEY: &str = "ollama";
 ///
 /// - [`RunnerError::Client`] if a required API key is missing or if the
 ///   underlying HTTP client cannot be constructed.
-pub fn create_client(config: &ApiConfig) -> Result<SharedApiClient, RunnerError> {
+pub fn create_client(config: &ApiConfig) -> Result<DchClient, RunnerError> {
     let base_url = effective_base_url(config);
     let api_key = resolve_api_key(config)?;
     let timeout = Duration::from_secs(config.request_timeout_secs);
 
-    let client: SharedApiClient = match config.api_type {
-        ApiType::OpenAi | ApiType::Ollama | ApiType::DeepSeek | ApiType::Grok => Arc::new(
+    let client = match config.api_type {
+        ApiType::OpenAi | ApiType::Ollama | ApiType::DeepSeek | ApiType::Grok => DchClient::OpenAi(
             OpenAiClient::builder()
                 .with_api_key(api_key)
                 .with_base_url(base_url)
@@ -52,7 +175,7 @@ pub fn create_client(config: &ApiConfig) -> Result<SharedApiClient, RunnerError>
                 .build()
                 .map_err(|e| RunnerError::Client(e.to_string()))?,
         ),
-        ApiType::Anthropic | ApiType::Zai => Arc::new(
+        ApiType::Anthropic | ApiType::Zai => DchClient::Anthropic(
             AnthropicClient::builder()
                 .with_api_key(api_key)
                 .with_base_url(base_url)
@@ -62,7 +185,7 @@ pub fn create_client(config: &ApiConfig) -> Result<SharedApiClient, RunnerError>
                 .build()
                 .map_err(|e| RunnerError::Client(e.to_string()))?,
         ),
-        ApiType::Gemini => Arc::new(
+        ApiType::Gemini => DchClient::Gemini(
             GeminiClient::builder()
                 .with_api_key(api_key)
                 .with_base_url(base_url)
@@ -420,5 +543,71 @@ mod tests {
         c.model = "default-model".to_string();
         let client = create_client(&c).expect("default ApiConfig should build");
         assert_eq!(client.model(), "default-model");
+    }
+
+    #[test]
+    fn dchclient_variant_matches_api_type_family() {
+        // OpenAI-protocol family → DchClient::OpenAi.
+        for api_type in [
+            ApiType::OpenAi,
+            ApiType::Ollama,
+            ApiType::DeepSeek,
+            ApiType::Grok,
+        ] {
+            let c = cfg(api_type, "https://example.invalid", Some("k"));
+            let DchClient::OpenAi(_) = create_client(&c).expect("builds") else {
+                panic!("{api_type:?} should map to DchClient::OpenAi");
+            };
+        }
+        // Anthropic-protocol family → DchClient::Anthropic.
+        for api_type in [ApiType::Anthropic, ApiType::Zai] {
+            let c = cfg(api_type, "https://example.invalid", Some("k"));
+            let DchClient::Anthropic(_) = create_client(&c).expect("builds") else {
+                panic!("{api_type:?} should map to DchClient::Anthropic");
+            };
+        }
+        // Gemini → DchClient::Gemini.
+        let c = cfg(ApiType::Gemini, "https://example.invalid", Some("k"));
+        let DchClient::Gemini(_) = create_client(&c).expect("builds") else {
+            panic!("Gemini should map to DchClient::Gemini");
+        };
+    }
+
+    #[test]
+    fn dchclient_forwards_model_and_set_model_to_the_inner_provider() {
+        let c = cfg(ApiType::OpenAi, "https://api.openai.com/v1", Some("k"));
+        let client = create_client(&c).expect("openai builds");
+        assert_eq!(client.model(), "test-model");
+        assert!(
+            client.set_model("other-model"),
+            "OpenAiClient supports runtime model swap"
+        );
+        assert_eq!(client.model(), "other-model");
+    }
+
+    #[test]
+    fn dchclient_forwards_base_url_to_the_inner_provider() {
+        let c = cfg(
+            ApiType::Anthropic,
+            "https://api.anthropic.example",
+            Some("k"),
+        );
+        let client = create_client(&c).expect("anthropic builds");
+        assert_eq!(client.base_url(), "https://api.anthropic.example");
+    }
+
+    #[test]
+    fn dchclient_forwards_extract_structured_to_the_inner_provider() {
+        // extract_structured is synchronous (no network), so it can be exercised
+        // offline. A dropped forward would panic on the match (unreachable) or
+        // fail to compile; reaching the inner client's impl proves the arm
+        // delegates. The exact Value depends on the inner impl; we only assert
+        // the call returns without panicking across every variant.
+        let message = loopctl::message::Message::user("hello");
+        for api_type in [ApiType::OpenAi, ApiType::Anthropic, ApiType::Gemini] {
+            let c = cfg(api_type, "https://example.invalid", Some("k"));
+            let client = create_client(&c).expect("builds");
+            let _value: serde_json::Value = client.extract_structured(&message);
+        }
     }
 }

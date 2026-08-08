@@ -10,6 +10,7 @@ description = "Composition layer for dch: loop, provider factory, system prompt,
 loopctl = { workspace = true, features = ["ollama", "openai", "anthropic", "gemini"] }
 dch-tools = { workspace = true }
 dch-config = { workspace = true }
+futures = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

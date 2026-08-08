@@ -6,6 +6,7 @@ pub mod error;
 pub mod project;
 pub mod prompt;
 pub mod provider;
+pub mod runner;
 
 pub use dch_config::{ApiConfig, ApiType, DchConfigError, TechProfile};
 pub use error::RunnerError;
@@ -17,4 +18,6 @@ pub use project::render_techs;
 pub use prompt::build_system_prompt;
 pub use prompt::with_context;
 pub use prompt::with_role;
+pub use provider::DchClient;
 pub use provider::create_client;
+pub use runner::Runner;

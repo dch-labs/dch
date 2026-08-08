@@ -461,6 +461,7 @@ version = "0.1.0"
 dependencies = [
  "dch-config",
  "dch-tools",
+ "futures",
  "loopctl",
  "serde",
  "serde_json",

@@ -51,9 +51,11 @@ pub struct RunnerContext {
     /// Optional channel for asking the user interactive questions.
     ///
     /// Used by the `AskUserQuestion` tool to send a [`QuestionRequest`] to the
-    /// UI (TUI overlay or headless reader). `None` in headless mode, where
-    /// prompting is impossible — the asking tool returns an error instead of
-    /// blocking. Set at runner construction; presence depends on the run mode.
+    /// UI (TUI overlay or headless reader). `None` when prompting is impossible
+    /// or unimplemented — the headless runner constructs `RunnerContext` with
+    /// `None` here, and an interactive entrypoint (TUI) replaces it before the
+    /// first run; the asking tool returns an error instead of blocking when the
+    /// channel is absent.
     pub question_tx: Option<mpsc::Sender<QuestionRequest>>,
 }
 
