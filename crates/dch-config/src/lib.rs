@@ -136,6 +136,219 @@ pub enum PermissionMode {
     Interactive,
 }
 
+/// Which role the agent takes on — *who* it acts as for this session.
+///
+/// Each variant selects a distinct body of guidance that shapes how the agent
+/// approaches the work — what it optimizes for, what it may edit, and how it
+/// sequences exploration and action. It is consumed from
+/// [`RunnerConfig::role`] and (de)serialized as its `snake_case` name,
+/// matching [`PermissionMode`]'s convention.
+///
+/// The role is the *instruction* axis (what the agent is told to do and how to
+/// think about the task); it is orthogonal to [`PermissionMode`], which is the
+/// *enforcement* axis (whether a side effect is allowed to run), and to the
+/// project/tech context, which is the *subject* axis (what stack the agent
+/// works on — detected from the repo, overridable in `[project]`). Enforcement
+/// is handled by the permission layer at runtime regardless of which role is
+/// selected.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Deserialize, serde::Serialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum Role {
+    /// General assistance — PC help, sysadmin, app configuration (the default).
+    ///
+    /// Directs the agent to diagnose and act on the user's machine: read
+    /// logs (`journalctl`, `dmesg`), configure applications, inspect services
+    /// and processes, run shell commands, and edit config files. Not
+    /// repo-centric; the explore-the-codebase framing of the coding roles
+    /// does not apply. dch's primary mode for non-programming work.
+    #[default]
+    General,
+
+    /// Implement features and fixes end-to-end.
+    ///
+    /// Directs the agent to read enough of the surrounding code to make a
+    /// correct, idiomatic change, apply it, and verify it with the build or
+    /// tests. Exploration and reads proceed freely; sizable writes are
+    /// surfaced as a plan before being applied.
+    Coding,
+
+    /// Improve structure without changing behavior.
+    ///
+    /// Directs the agent to restructure code while preserving observable
+    /// behavior, re-running the tests to prove nothing regressed. A behavior
+    /// change forced by the refactor is called out explicitly rather than
+    /// folded in silently.
+    Refactor,
+
+    /// Reproduce, isolate, then fix.
+    ///
+    /// Directs the agent to reproduce the failure first, form a hypothesis,
+    /// probe to narrow the cause, and only then apply the smallest correct
+    /// fix — distinguishing root cause from symptom. Verification confirms the
+    /// fix and checks for regressions.
+    Debug,
+
+    /// Read-only critical pass over a diff or area.
+    ///
+    /// Directs the agent to inspect and report findings — bugs, smells, risks
+    /// — without editing source. Suggested fixes are offered as proposals,
+    /// never applied. No side effects on the codebase.
+    Review,
+
+    /// Author or revise documentation.
+    ///
+    /// Directs the agent to match existing voice and structure, write
+    /// substantive content rather than filler, and keep code examples
+    /// runnable. May edit documentation and doc-comments, not source logic.
+    Docs,
+
+    /// Write and improve tests.
+    ///
+    /// Directs the agent to cover behavior rather than implementation, prefer
+    /// meaningful cases over rote enumeration, and run the suite to confirm
+    /// green. May edit test files; treats the code under test as read-only
+    /// context.
+    Tests,
+}
+
+/// Role body for [`Role::General`]: general assistance and sysadmin work.
+pub(crate) const GENERAL_ROLE: &str = "\
+YOUR ROLE: GENERAL ASSISTANCE
+- Help with the user's machine: diagnose issues, configure applications, inspect
+  services and processes, read logs and status, run shell commands.
+- Read the evidence before theorizing: check logs (`journalctl`, `dmesg`,
+  app logs), service status, and config files. Form a hypothesis from what you
+  observe, then act.
+- Prefer the least-invasive change that resolves the issue. Editing a config
+  line or restarting a service beats reinstalling a package.
+- Confirm before destructive or system-wide actions (package removals, force
+  reloads, edits under `/etc`). State what you intend and why, then act.
+- For commands you are unsure of, check `--help` or the man page before
+  running; a wrong flag on a system tool can be costly.";
+
+/// Role body for [`Role::Coding`]: implement features end-to-end.
+pub(crate) const CODING_ROLE: &str = "\
+YOUR ROLE: IMPLEMENT FEATURES AND FIXES
+- Read enough of the surrounding code to make a correct, idiomatic change.
+- Make the change with Edit or MultiEdit so the diff is visible and reviewable;
+  never mutate files with shell scripting (sed, awk, inline python) — those
+  edits are invisible in review.
+- Verify the change: run the build and the relevant tests (the detected
+  commands, if any, are listed in the prompt). Treat a green check as the
+  signal the task is done, not the edit itself.
+- Keep edits targeted. A single Edit should carry one intent; split work that
+  does several things into several edits.
+- For unfamiliar or complex operations, look up the established pattern in the
+  repo before inventing a new one.";
+
+/// Role body for [`Role::Refactor`]: restructure without behavior change.
+pub(crate) const REFACTOR_ROLE: &str = "\
+YOUR ROLE: IMPROVE STRUCTURE WITHOUT CHANGING BEHAVIOR
+- First characterize the behavior you must preserve: read the code and its
+  tests. The tests are the contract — a successful refactor leaves them green.
+- Restructure in reviewable steps. After each step, run the tests; if any
+  regress, you have changed behavior, not just structure.
+- If a behavior change is forced by the refactor, stop and call it out
+  explicitly rather than folding it in silently. Refactors and behavior changes
+  do not mix in one change.
+- Prefer the smallest mechanical move that clarifies the code. Rename, extract,
+  inline — one kind of step at a time is easier to review than a mixed rewrite.";
+
+/// Role body for [`Role::Debug`]: reproduce, isolate, then fix.
+pub(crate) const DEBUG_ROLE: &str = "\
+YOUR ROLE: REPRODUCE, ISOLATE, AND FIX
+- Reproduce the failure first. A reproducible failure is fixable; an
+  un-reproduced one is a guess. Capture the exact command, input, and observed
+  output before theorizing.
+- Form one hypothesis and probe it with Read, Grep, and Bash (logs, verbose
+  flags, a minimal repro script). Narrow the cause before touching a fix.
+- Fix the root cause, not the symptom. The smallest change that removes the
+  failure mode at its source is usually right; papering over a symptom moves
+  the bug elsewhere.
+- After fixing, confirm the repro now passes and run the surrounding tests to
+  catch regressions. Distinguish clearly between what you observed, what you
+  inferred, and what you changed.";
+
+/// Role body for [`Role::Review`]: read-only critical pass.
+pub(crate) const REVIEW_ROLE: &str = "\
+YOUR ROLE: REVIEW AND REPORT — DO NOT EDIT SOURCE
+- Treat this as a read-only pass. Inspect the diff or area with Read, Grep, and
+  Bash (git, tests) and report findings; do not apply changes to source.
+- Organize findings by severity: correctness bugs first, then risks and design
+  smells, then style. For each, name the file and line and explain the concern
+  concretely.
+- Offer suggested fixes as proposals (\"consider extracting X\", \"this could
+  overflow if N < 0\"), not as applied edits. Let the user decide what to act
+  on.
+- Call out anything you could not verify. A reviewer's value is honesty about
+  what was checked and what wasn't.";
+
+/// Role body for [`Role::Docs`]: author or revise documentation.
+pub(crate) const DOCS_ROLE: &str = "\
+YOUR ROLE: WRITE OR REVISE DOCUMENTATION
+- Match the existing voice, structure, and formatting of the docs around you.
+  Consistency with neighbors reads as one coherent document; a clashing style
+  reads as noise.
+- Write substantive content. Document the why and the how-to, with runnable
+  examples; avoid filler lines that exist only to pad length.
+- Keep code examples accurate and runnable. If you cannot verify a command or
+  snippet, say so rather than presenting it as tested.
+- You may edit documentation files and doc-comments. Do not change source
+  logic under the documentation — if the docs and the code disagree, flag the
+  discrepancy rather than silently \"fixing\" one to match the other.";
+
+/// Role body for [`Role::Tests`]: write and improve tests.
+pub(crate) const TESTS_ROLE: &str = "\
+YOUR ROLE: WRITE AND IMPROVE TESTS
+- Cover behavior, not implementation. A test that pins a public outcome
+  survives refactors; one that asserts private call shape breaks under
+  harmless restructuring.
+- Prefer a few meaningful cases (including the edge: empty, off-by-one, the
+  bug being fixed) over rote enumeration of identical inputs. Each test should
+  fail for one identifiable reason if it fails.
+- Run the suite to confirm green after writing. A test that does not yet pass
+  is a finding, not a deliverable — report it and its cause.
+- You may edit test files. Treat the code under test as read-only context; if
+  the code itself is wrong, say so rather than weakening a test to match it.";
+
+impl Role {
+    /// The role's system-prompt prose body.
+    ///
+    /// Each variant returns its own [`Role`]-specific guidance. The runner
+    /// prepends the shared agent discipline, the detected tech profile, and
+    /// the per-tool fragments; this is only the role-specific portion.
+    #[must_use]
+    pub const fn system_prompt(self) -> &'static str {
+        match self {
+            Role::General => GENERAL_ROLE,
+            Role::Coding => CODING_ROLE,
+            Role::Refactor => REFACTOR_ROLE,
+            Role::Debug => DEBUG_ROLE,
+            Role::Review => REVIEW_ROLE,
+            Role::Docs => DOCS_ROLE,
+            Role::Tests => TESTS_ROLE,
+        }
+    }
+
+    /// All variants, in declaration order.
+    ///
+    /// Single source of truth for consumers that need to enumerate roles
+    /// (e.g. the message-analysis schema's `enum` constraint, a `--help`
+    /// listing). Adding a variant to `Role` and forgetting to add it here is
+    /// caught by the `all_roles_covered` test.
+    pub const ALL: [Role; 7] = [
+        Role::General,
+        Role::Coding,
+        Role::Refactor,
+        Role::Debug,
+        Role::Review,
+        Role::Docs,
+        Role::Tests,
+    ];
+}
+
 /// Errors arising while loading configuration.
 ///
 /// Returned by [`DchConfig::load`] and [`DchConfig::load_from_dir`]. A missing
@@ -185,6 +398,14 @@ pub struct DchConfig {
     /// [`RunnerConfig`].
     #[serde(default)]
     pub runner: RunnerConfig,
+
+    /// Project / tech-stack context.
+    ///
+    /// Optional overrides for the auto-detected tech profile (language, build
+    /// and test commands, conventions). When a field is `None`, the runner
+    /// uses the value it detected from the repo. See [`ProjectConfig`].
+    #[serde(default)]
+    pub project: ProjectConfig,
 
     /// Telemetry / logging settings.
     ///
@@ -311,12 +532,138 @@ pub struct RunnerConfig {
     /// [`PermissionMode::Auto`]. See [`PermissionMode`].
     pub permission_mode: PermissionMode,
 
-    /// Optional override for the generated system prompt.
+    /// Which role the agent takes on for this session.
     ///
-    /// When set, replaces the built-in system prompt entirely. Defaults to
-    /// `None`, meaning the default prompt is generated. Carried into
-    /// [`DchConfig::to_session_config`].
-    pub system_prompt: Option<String>,
+    /// Selects the guidance the agent receives about how to approach the work.
+    /// Defaults to [`Role::General`]. See [`Role`]. Consumed by the runner
+    /// (which composes the full prompt from the role's prose, the detected
+    /// tech stack, and the per-tool fragments); it is **not** carried by
+    /// [`DchConfig::to_session_config`], because composing the prompt needs
+    /// the tool registry and the repo root, which the config layer does not
+    /// own.
+    #[serde(default)]
+    pub role: Role,
+
+    /// Per-role prose overrides.
+    ///
+    /// Each entry replaces the built-in prose of one [`Role`] (the shared
+    /// discipline, detected tech stack, and per-tool fragments still append).
+    /// A role with no entry uses its built-in [`Role::system_prompt`]. This is
+    /// the escape hatch for users who want to customize how a specific role
+    /// instructs the agent without editing the binary. Loaded from
+    /// `[[runner.role_overrides]]`.
+    #[serde(default)]
+    pub role_overrides: Vec<RoleOverride>,
+}
+
+/// A user-supplied replacement for one [`Role`]'s built-in prose.
+///
+/// The runner looks up the selected [`Role`] in [`RunnerConfig::role_overrides`]
+/// and, if present, uses `prompt` in place of [`Role::system_prompt`]. The
+/// shared discipline, tech profile, and per-tool fragments still append — only
+/// the role-specific body is replaced.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct RoleOverride {
+    /// The role whose built-in prose this entry replaces.
+    ///
+    /// Matched against the selected [`RunnerConfig::role`]; only an entry
+    /// whose role matches the selection takes effect.
+    pub role: Role,
+
+    /// The replacement prose.
+    ///
+    /// Used verbatim in place of [`Role::system_prompt`] for this role. The
+    /// shared agent discipline, detected tech profile, and per-tool fragments
+    /// still append — only the role-specific body is replaced. There is no
+    /// length limit; the caller composes the full prompt from this string plus
+    /// the other parts.
+    pub prompt: String,
+}
+
+impl RunnerConfig {
+    /// Look up a user override for `role`, if any.
+    ///
+    /// Returns the override's prompt when an entry for `role` exists in
+    /// [`Self::role_overrides`], otherwise `None` (meaning: use the role's
+    /// built-in [`Role::system_prompt`]). When multiple entries share the
+    /// same role, the first declaration wins.
+    #[must_use]
+    pub fn role_override(&self, role: Role) -> Option<&str> {
+        self.role_overrides
+            .iter()
+            .find(|o| o.role == role)
+            .map(|o| o.prompt.as_str())
+    }
+}
+
+/// One technology in a project, with its toolchain and conventions.
+///
+/// Most real projects are polyglot — a Rust core, a `TypeScript` frontend, a
+/// Python tooling script — and each language has its own build/test/lint
+/// commands and its own conventions. This struct captures one such language;
+/// [`ProjectConfig`] holds a `Vec<TechProfile>` for all of them.
+///
+/// Every field except `language` is optional: set only what detection got
+/// wrong or can't infer. Loaded from the `[[project.techs]]` array-of-tables.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct TechProfile {
+    /// The language this entry describes, e.g. `"rust"` or `"cpp"`.
+    ///
+    /// Matches against the detected language so the runner can merge detected
+    /// and configured entries by language. Required — an entry with no
+    /// language names nothing.
+    pub language: String,
+
+    /// Command that builds this language's code.
+    ///
+    /// Overrides the detected build command for this language, e.g.
+    /// `"cargo build"`. `None` keeps the detected value (or leaves it empty
+    /// when detection found none).
+    pub build: Option<String>,
+
+    /// Command that runs this language's tests.
+    ///
+    /// Overrides the detected test command, e.g. `"cargo test"`. `None`
+    /// keeps the detected value.
+    pub test: Option<String>,
+
+    /// Command that lints this language's code.
+    ///
+    /// Overrides the detected lint command, e.g. `"cargo clippy"`. `None`
+    /// keeps the detected value.
+    pub lint: Option<String>,
+
+    /// Free-form conventions for this language: style rules, module layout,
+    /// anything detection can't capture. Appended to the prompt verbatim under
+    /// this language's section.
+    pub conventions: Option<String>,
+}
+
+/// Project / tech-stack overrides for the auto-detected profile.
+///
+/// Polyglot projects set `[[project.techs]]` once per language; the runner
+/// merges each with its detected counterpart by language (set fields override,
+/// configured languages detection missed are appended, detected languages the
+/// config doesn't mention are kept). `conventions` holds project-wide
+/// conventions that span all languages (commit format, branch policy).
+///
+/// Loaded from the `[project]` table. Absent entirely when the user relies on
+/// auto-detection.
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct ProjectConfig {
+    /// Per-language tech entries.
+    ///
+    /// One `[[project.techs]]` table per language the user wants to declare or
+    /// override. The runner merges each with its detected counterpart by
+    /// language; entries for languages detection missed are appended.
+    pub techs: Vec<TechProfile>,
+
+    /// Free-form project-wide conventions that apply across all languages.
+    ///
+    /// Prose for anything detection can't capture: commit-message format,
+    /// branch policy, where new modules go. Appended to the prompt verbatim.
+    pub conventions: Option<String>,
 }
 
 /// Telemetry / logging settings.
@@ -370,7 +717,8 @@ impl Default for RunnerConfig {
             auto_compact: true,
             compact_threshold: 80,
             permission_mode: PermissionMode::default(),
-            system_prompt: None,
+            role: Role::default(),
+            role_overrides: Vec::new(),
         }
     }
 }
@@ -425,8 +773,12 @@ impl DchConfig {
 
     /// Map the session-scoped fields to a [`loopctl::config::SessionConfig`].
     ///
-    /// Carries the system prompt, context window, compaction threshold, and
-    /// auto-compact flag — the settings that are stable across `run()` calls
+    /// Carries the context window, compaction threshold, and auto-compact
+    /// flag — the settings that are stable across `run()` calls. The
+    /// `system_prompt` is **not** carried here (it is set to `None`); the
+    /// runner composes it from the selected role, detected tech stack, and
+    /// per-tool fragments via the prompt builder and installs it on
+    /// the session after construction.
     /// on the same agent. Provider-specific fields (`model`, `max_tokens`) are
     /// not session-config concerns; they are consumed by the API client via
     /// [`ApiConfig`] directly. The session id is minted at runtime by loopctl,
@@ -449,7 +801,7 @@ impl DchConfig {
     #[must_use]
     pub fn to_session_config(&self) -> loopctl::config::SessionConfig {
         loopctl::config::SessionConfig {
-            system_prompt: self.runner.system_prompt.clone(),
+            system_prompt: None,
             context_window: self.api.context_window,
             compact_threshold: self.runner.compact_threshold.min(100),
             auto_compact: self.runner.auto_compact,
@@ -524,7 +876,11 @@ max_turns = 100
 auto_compact = false
 compact_threshold = 75
 permission_mode = "accept_edits"
-system_prompt = "You are a careful coding assistant."
+role = "coding"
+
+[[runner.role_overrides]]
+role = "coding"
+prompt = "You are a careful coding assistant."
 
 [telemetry]
 level = "debug"
@@ -573,8 +929,9 @@ json_logs = true
         assert!(!c.runner.auto_compact);
         assert_eq!(c.runner.compact_threshold, 75);
         assert_eq!(c.runner.permission_mode, PermissionMode::AcceptEdits);
+        assert_eq!(c.runner.role, Role::Coding);
         assert_eq!(
-            c.runner.system_prompt.as_deref(),
+            c.runner.role_override(Role::Coding),
             Some("You are a careful coding assistant.")
         );
 
@@ -641,10 +998,7 @@ json_logs = true
 
         assert!(!sc.auto_compact);
         assert_eq!(sc.compact_threshold, 75);
-        assert_eq!(
-            sc.system_prompt.as_deref(),
-            Some("You are a careful coding assistant.")
-        );
+        assert!(sc.system_prompt.is_none());
         assert_eq!(sc.context_window, 128_000);
     }
 
@@ -731,9 +1085,54 @@ json_logs = true
     }
 
     #[test]
-    fn test_to_session_config_system_prompt_none_round_trips() {
+    fn default_has_no_role_overrides_and_session_prompt_is_none() {
         let c = DchConfig::default();
-        assert!(c.runner.system_prompt.is_none());
+        assert!(
+            c.runner.role_overrides.is_empty(),
+            "no overrides by default"
+        );
+        assert!(c.runner.role_override(Role::Coding).is_none());
         assert!(c.to_session_config().system_prompt.is_none());
+    }
+
+    #[test]
+    fn role_default_is_general() {
+        assert_eq!(Role::default(), Role::General);
+    }
+
+    #[test]
+    fn role_all_covers_every_variant() {
+        let mut seen = std::collections::HashSet::new();
+        for role in Role::ALL {
+            assert!(seen.insert(role), "duplicate variant in ALL: {role:?}");
+        }
+        assert_eq!(
+            seen.len(),
+            7,
+            "ALL must contain all 7 variants — add new ones here"
+        );
+    }
+
+    #[test]
+    fn runner_config_default_carries_general_role() {
+        assert_eq!(RunnerConfig::default().role, Role::General);
+    }
+
+    #[test]
+    fn role_round_trips_through_toml_as_snake_case() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_config(tmp.path(), "config.toml", "[runner]\nrole = \"debug\"\n");
+        let c = DchConfig::load_from_dir(tmp.path()).unwrap();
+        assert_eq!(c.runner.role, Role::Debug);
+
+        let serialized = toml::to_string(&RunnerConfig {
+            role: Role::Refactor,
+            ..RunnerConfig::default()
+        })
+        .unwrap();
+        assert!(
+            serialized.contains("role = \"refactor\""),
+            "snake_case serialization: {serialized}"
+        );
     }
 }
