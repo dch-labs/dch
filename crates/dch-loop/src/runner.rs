@@ -262,19 +262,52 @@ impl<T: Tool> Contextual<T> {
     }
 }
 
+/// [`Tool`] implementation for [`Contextual`]: a transparent decorator that
+/// preserves the inner tool's identity while injecting the shared
+/// [`RunnerContext`] extension into the per-dispatch [`ToolContext`].
+///
+/// Every method except [`Tool::call`] is a plain delegation, so the model, the
+/// parallel dispatcher, and the system-prompt composer all observe the wrapper
+/// as indistinguishable from the original tool. Only `call` mutates the
+/// incoming context — it clones the dispatcher-built `ToolContext`, installs
+/// the extension, and forwards to the inner tool.
 impl<T: Tool> Tool for Contextual<T> {
+    /// Forward the inner tool's stable identifier.
+    ///
+    /// The model addresses tools by this name, so it must — and does — match
+    /// the unwrapped builtin exactly.
     fn name(&self) -> &str {
         self.inner.name()
     }
 
+    /// Forward the inner tool's human-readable description unchanged.
+    ///
+    /// This prose is embedded in the tool schema shown to the model, so any
+    /// alteration here would change what the model believes the tool does.
     fn description(&self) -> &str {
         self.inner.description()
     }
 
+    /// Forward the inner tool's JSON schema (argument shape + identity).
+    ///
+    /// The returned [`ToolSchema`] is what the provider receives, so forwarding
+    /// verbatim keeps argument validation identical to the bare tool.
     fn schema(&self) -> ToolSchema {
         self.inner.schema()
     }
 
+    /// Dispatch the tool with the shared [`RunnerContext`] injected.
+    ///
+    /// This is the one non-delegating method. The dispatcher hands us a
+    /// [`ToolContext`] that carries no host extension; we clone it, install our
+    /// cached `RunnerContext` as the extension, and forward the call to the
+    /// inner tool. The clone is cheap (extensions are `Arc`-backed) and keeps
+    /// the borrow lifetime tied to this dispatch only.
+    ///
+    /// # Errors
+    ///
+    /// Propagates whatever [`ToolError`] the inner tool yields — the wrapper
+    /// adds no failure mode of its own.
     fn call<'a>(
         &'a self,
         input: Value,
@@ -285,22 +318,47 @@ impl<T: Tool> Tool for Contextual<T> {
         Box::pin(async move { self.inner.call(input, &owned).await })
     }
 
+    /// Forward the inner tool's static concurrency declaration.
+    ///
+    /// The parallel planner reads this to decide whether two instances of the
+    /// tool may co-dispatch; a dropped forward would silently serialize
+    /// read-only tools.
     fn is_concurrency_safe(&self) -> bool {
         self.inner.is_concurrency_safe()
     }
 
+    /// Forward the inner tool's per-call concurrency check.
+    ///
+    /// Some tools are conditionally parallelizable (e.g. read paths yes, write
+    /// paths no); this forwards the inner verdict for the given `input` so the
+    /// planner's per-dispatch gating is preserved.
     fn is_safe_for_concurrent_execution(&self, input: &Value) -> bool {
         self.inner.is_safe_for_concurrent_execution(input)
     }
 
+    /// Forward the inner tool's resource key, if any.
+    ///
+    /// The dispatcher uses this to serialize writes that touch the same
+    /// resource (e.g. the same file path). Forwarding is mandatory: a `None`
+    /// here would let two conflicting writes race silently.
     fn resource_key(&self, input: &Value) -> Option<String> {
         self.inner.resource_key(input)
     }
 
+    /// Forward the inner tool's read-only flag.
+    ///
+    /// Read-only tools may be dispatched speculatively and in parallel; this
+    /// forwards the inner classification so the wrapper does not accidentally
+    /// demote a safe tool into the serialized queue.
     fn is_read_only(&self) -> bool {
         self.inner.is_read_only()
     }
 
+    /// Forward the inner tool's system-prompt fragment, if any.
+    ///
+    /// Tools contribute per-tool prose (usage hints, examples) to the composed
+    /// system prompt; forwarding keeps that composition identical to the bare
+    /// registry.
     fn system_prompt(&self) -> Option<String> {
         self.inner.system_prompt()
     }
@@ -410,6 +468,11 @@ mod tests {
         )
     }
 
+    /// Build a throwaway [`RunnerContext`] pointing at `cwd` for tests.
+    ///
+    /// The todo list starts empty and no question channel is wired, matching
+    /// the shape `Runner::new` would install except without a real working
+    /// directory. Used by the `Contextual` and registry tests above.
     fn sample_context(cwd: &str) -> Arc<RunnerContext> {
         Arc::new(RunnerContext {
             cwd: PathBuf::from(cwd),
