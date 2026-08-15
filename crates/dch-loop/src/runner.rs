@@ -52,20 +52,46 @@ use crate::detect_tech_stack;
 use crate::merge_by_language;
 use crate::with_context;
 
-/// The top-level agent. Owns a configured [`BareLoop`] plus shared context.
+/// The top-level agent: the single type the rest of the application holds.
 ///
-/// Construct with [`Runner::new`], then drive it with [`Runner::run`]. Each
-/// `run` call is one prompt → loop → final answer against the configured
-/// provider; cancellation is cooperative via [`Runner::cancel`].
+/// `Runner` is pure composition glue — it owns no agent-loop logic of its own.
+/// [`Runner::new`] assembles the loopctl ingredients (a concrete provider
+/// client, a tool registry whose every dispatch sees the shared
+/// [`RunnerContext`], a session config carrying the composed system prompt,
+/// and the observer-bearing managers bundle) into one [`BareLoop`], and every
+/// public method after that is a one-line delegation to it.
+///
+/// Construct once per agent identity with [`Runner::new`], then drive it with
+/// [`Runner::run`]: each call is one prompt → loop → final answer against the
+/// configured provider, sharing one conversation across calls. Cancellation is
+/// cooperative via [`Runner::cancel`] or [`Runner::cancel_signal`].
 pub struct Runner {
     /// The agent loop, monomorphized over the concrete [`DchClient`].
+    ///
+    /// Constructed once in [`Runner::new`] via `new_with_managers` with the
+    /// wrapped tool registry, the composed session config, and the
+    /// observer-carrying managers. Every public method delegates to it; the
+    /// concrete (non-`dyn`) client keeps the per-turn LLM call statically
+    /// dispatched.
     inner: BareLoop<DchClient>,
 
-    /// Shared per-runner context, cloned into every tool dispatch by the
-    /// private context-injecting tool wrappers installed in `inner`'s registry.
+    /// The shared per-runner context, cloned into every tool dispatch.
+    ///
+    /// Built from `workdir` in [`Runner::new`] and carried by the private
+    /// context-injecting tool wrappers installed in `inner`'s registry, so
+    /// every builtin tool reaches `cwd`, the todo list, and the question
+    /// channel through the `ToolContext` extension. Exposed read-only-ish via
+    /// [`Runner::context`] for host wiring.
     context: Arc<RunnerContext>,
 
-    /// Cached per-run budget (max turns, etc.). Passed to each `run` call.
+    /// The session-default run policy (turn budget, dispatch policy).
+    ///
+    /// Mapped once from `DchConfig` in [`Runner::new`] and used by every
+    /// [`Runner::run`] call — the underlying `Loop::run` contract takes the
+    /// run config per call, so this field supplies dch's default. A caller
+    /// that needs a different budget for one run passes an override to
+    /// [`Runner::run_with`] rather than rebuilding the `Runner` (rebuilding
+    /// creates a fresh `BareLoop` and discards the conversation).
     run_config: RunConfig,
 }
 
@@ -123,12 +149,14 @@ impl Runner {
         })
     }
 
-    /// Run one prompt → loop → final answer.
+    /// Run one prompt → loop → final answer, with the session-default policy.
     ///
-    /// Returns when the model signals end-of-turn, the per-run turn budget is
-    /// exhausted, the loop detector aborts, or [`Runner::cancel`] is called.
-    /// Delegates entirely to the inner [`BareLoop`], threading the cached
-    /// [`RunConfig`].
+    /// Uses the run policy mapped from `DchConfig` at construction (turn
+    /// budget, dispatch policy). Returns when the model signals end-of-turn,
+    /// the budget is exhausted, the loop detector aborts, or [`Runner::cancel`]
+    /// is called. Equivalent to [`Runner::run_with`] with the default config;
+    /// the conversation is shared across `run`/`run_with` calls on the same
+    /// `Runner`.
     ///
     /// # Errors
     ///
@@ -141,6 +169,31 @@ impl Runner {
         self.inner.run(input, &self.run_config).await
     }
 
+    /// Run one prompt → loop → final answer, with an explicit run policy.
+    ///
+    /// The variation point for per-run budgets: `run_with` overrides the
+    /// session default for this one call without rebuilding the `Runner` (a
+    /// rebuild constructs a fresh `BareLoop` and discards the conversation).
+    /// The returned [`Run`] records `run_config` as its own snapshot, so
+    /// per-call overrides are visible in the run's accounting. This mirrors
+    /// loopctl's own default/override pairing (`stream_messages` vs
+    /// `stream_messages_with_options`).
+    ///
+    /// # Errors
+    ///
+    /// - [`LoopError::MaxTurnsExceeded`] when `run_config.max_turns` is hit.
+    /// - [`LoopError::Cancelled`] when [`Runner::cancel`] fires mid-run.
+    /// - [`LoopError::Api`] / [`LoopError::StreamError`] on provider failures.
+    /// - Other [`LoopError`] variants as surfaced by the loop (compaction,
+    ///   detection, reflection, tool recovery).
+    pub async fn run_with(
+        &mut self,
+        input: &str,
+        run_config: &RunConfig,
+    ) -> Result<Run, LoopError> {
+        self.inner.run(input, run_config).await
+    }
+
     /// Signal the in-flight run, if any, to cancel.
     ///
     /// Cooperative — the loop checks the shared [`CancelSignal`] at the top of
@@ -151,8 +204,13 @@ impl Runner {
         self.inner.cancel();
     }
 
-    /// The shared cancel signal, for external callers that need to select on
-    /// it (e.g. a Ctrl-C handler in a separate task).
+    /// The shared cancel signal, cloned from the inner loop.
+    ///
+    /// For external callers that need to select on cancellation from a
+    /// separate task (e.g. a Ctrl-C handler in the binary wiring, which
+    /// cannot borrow the `Runner` itself). Tripping the returned signal is
+    /// equivalent to calling [`Runner::cancel`]; every clone observes the
+    /// same trip.
     #[must_use]
     pub fn cancel_signal(&self) -> Arc<loopctl::cancel::CancelSignal> {
         self.inner.cancel_signal()
@@ -371,7 +429,10 @@ impl<T: Tool> Tool for Contextual<T> {
     clippy::panic,
     clippy::missing_panics_doc,
     clippy::missing_errors_doc,
-    clippy::field_reassign_with_default
+    clippy::field_reassign_with_default,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::let_underscore_must_use
 )]
 mod tests {
     use super::*;
@@ -459,8 +520,6 @@ mod tests {
         }
     }
 
-    /// Mirror of `dch_tools::runner_ctx` restricted to the cwd, so this test
-    /// module need not depend on the extension's exact type beyond `RunnerContext`.
     fn runner_ctx_cwd(ctx: &ToolContext) -> String {
         ctx.get_extension::<RunnerContext>().map_or_else(
             || "absent".to_string(),
@@ -468,11 +527,6 @@ mod tests {
         )
     }
 
-    /// Build a throwaway [`RunnerContext`] pointing at `cwd` for tests.
-    ///
-    /// The todo list starts empty and no question channel is wired, matching
-    /// the shape `Runner::new` would install except without a real working
-    /// directory. Used by the `Contextual` and registry tests above.
     fn sample_context(cwd: &str) -> Arc<RunnerContext> {
         Arc::new(RunnerContext {
             cwd: PathBuf::from(cwd),
@@ -648,9 +702,6 @@ mod tests {
         );
     }
 
-    /// A minimal `DchConfig` that constructs a provider client without touching
-    /// the network: the OpenAI builder only builds a `reqwest::Client`, it does
-    /// not connect. Used for offline Runner-construction tests.
     fn offline_config() -> DchConfig {
         use dch_config::ApiConfig;
         use dch_config::ApiType;
@@ -687,8 +738,415 @@ mod tests {
         );
     }
 
-    /// Extract the text payload from a tool output for assertion.
     fn out_text(out: &ToolOutput) -> String {
         out.text_content()
+    }
+
+    fn sse_text_turn(text: &str) -> String {
+        [
+            serde_json::json!({
+                "id": "c1", "model": "test-model",
+                "choices": [{"delta": {"content": text}, "finish_reason": null}]
+            }),
+            serde_json::json!({
+                "id": "c1", "model": "test-model",
+                "choices": [{"delta": null, "finish_reason": "stop"}]
+            }),
+        ]
+        .iter()
+        .map(|chunk| format!("data: {chunk}\n\n"))
+        .chain(std::iter::once("data: [DONE]\n\n".to_string()))
+        .collect()
+    }
+
+    fn sse_read_tool_call_turn() -> String {
+        let args = serde_json::json!({"file_path": "note.txt"}).to_string();
+        [
+            serde_json::json!({
+                "id": "c1", "model": "test-model",
+                "choices": [{"delta": {"tool_calls": [{
+                    "index": 0, "id": "call_1",
+                    "function": {"name": "Read", "arguments": ""}
+                }]}, "finish_reason": null}]
+            }),
+            serde_json::json!({
+                "id": "c1", "model": "test-model",
+                "choices": [{"delta": {"tool_calls": [{
+                    "index": 0,
+                    "function": {"arguments": args}
+                }]}, "finish_reason": null}]
+            }),
+            serde_json::json!({
+                "id": "c1", "model": "test-model",
+                "choices": [{"delta": null, "finish_reason": "tool_calls"}]
+            }),
+        ]
+        .iter()
+        .map(|chunk| format!("data: {chunk}\n\n"))
+        .chain(std::iter::once("data: [DONE]\n\n".to_string()))
+        .collect()
+    }
+
+    /// A canned-SSE provider endpoint on an ephemeral local port.
+    ///
+    /// Serves one response body per accepted connection (in order), records
+    /// each request body, and optionally delays before answering so a run can
+    /// be cancelled while in flight.
+    struct SseServer {
+        port: u16,
+        requests: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl SseServer {
+        async fn start(responses: Vec<String>) -> Self {
+            Self::start_with_delay(responses, std::time::Duration::ZERO).await
+        }
+
+        async fn start_with_delay(responses: Vec<String>, delay: std::time::Duration) -> Self {
+            // Bind here (not inside the task) so the port is known before the
+            // first request is sent; the listener moves into the accept loop.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("ephemeral bind");
+            let port = listener
+                .local_addr()
+                .expect("bound socket has an address")
+                .port();
+            let requests: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            let task_requests = Arc::clone(&requests);
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt as _;
+                let mut queue: std::collections::VecDeque<String> = responses.into();
+                loop {
+                    let Ok((mut sock, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let body = queue.pop_front();
+                    if let (Some(req), Ok(mut recorded)) =
+                        (read_http_request(&mut sock).await, task_requests.lock())
+                    {
+                        recorded.push(req);
+                    }
+                    if delay > std::time::Duration::ZERO {
+                        tokio::time::sleep(delay).await;
+                    }
+                    let bytes = body.map_or_else(
+                        || {
+                            "HTTP/1.1 500 No canned response\r\nContent-Length: 0\r\n\
+                             Connection: close\r\n\r\n"
+                                .to_string()
+                        },
+                        |b| {
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                                 Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                b.len(),
+                                b
+                            )
+                        },
+                    );
+                    let _ = sock.write_all(bytes.as_bytes()).await;
+                }
+            });
+            Self { port, requests }
+        }
+    }
+
+    async fn read_http_request(sock: &mut tokio::net::TcpStream) -> Option<String> {
+        use tokio::io::AsyncReadExt as _;
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let header_end = loop {
+            let n = sock.read(&mut chunk).await.ok()?;
+            if n == 0 {
+                return None;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(pos) = find_header_end(&buf) {
+                break pos;
+            }
+        };
+        let headers = String::from_utf8_lossy(&buf[..header_end]).to_string();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())?
+            })
+            .unwrap_or(0);
+        let total = header_end + 4 + content_length;
+        while buf.len() < total {
+            let n = sock.read(&mut chunk).await.ok()?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        Some(String::from_utf8_lossy(&buf).into_owned())
+    }
+
+    fn find_header_end(buf: &[u8]) -> Option<usize> {
+        buf.windows(4).position(|w| w == b"\r\n\r\n")
+    }
+
+    /// An observer that records the lifecycle events it receives, in order.
+    struct RecordingObserver {
+        events: Mutex<Vec<&'static str>>,
+    }
+
+    impl RecordingObserver {
+        fn new() -> Self {
+            Self {
+                events: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn record(&self, event: &'static str) {
+            if let Ok(mut events) = self.events.lock() {
+                events.push(event);
+            }
+        }
+
+        fn snapshot(&self) -> Vec<&'static str> {
+            self.events
+                .lock()
+                .map(|events| events.clone())
+                .unwrap_or_default()
+        }
+    }
+
+    impl loopctl::observer::LoopObserver for RecordingObserver {
+        fn name(&self) -> &'static str {
+            "recording"
+        }
+        fn on_run_start(&self, _: &loopctl::observer::RunStartContext) {
+            self.record("run_start");
+        }
+        fn on_turn_start(&self, _: &loopctl::observer::TurnStartContext) {
+            self.record("turn_start");
+        }
+        fn on_response(&self, _: &loopctl::observer::ResponseContext) {
+            self.record("response");
+        }
+        fn on_turn_end(&self, _: &loopctl::observer::TurnEndContext) {
+            self.record("turn_end");
+        }
+        fn on_run_end(&self, _: &loopctl::observer::RunEndContext) {
+            self.record("run_end");
+        }
+    }
+
+    fn wire_config(port: u16, max_turns: usize) -> DchConfig {
+        use dch_config::ApiConfig;
+        use dch_config::ApiType;
+        let mut config = DchConfig::default();
+        config.api = ApiConfig {
+            api_type: ApiType::OpenAi,
+            base_url: format!("http://127.0.0.1:{port}"),
+            api_key: Some("dummy".to_string()),
+            model: "test-model".to_string(),
+            request_timeout_secs: 10,
+            ..ApiConfig::default()
+        };
+        config.runner.max_turns = max_turns;
+        config
+    }
+
+    fn recorded_requests(server: &SseServer) -> Vec<String> {
+        server
+            .requests
+            .lock()
+            .map(|reqs| reqs.clone())
+            .unwrap_or_default()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_completes_with_the_session_default_policy() {
+        let server = SseServer::start(vec![sse_text_turn("probe says hello")]).await;
+        let dir = TempDir::new().expect("tempdir");
+        let mut runner =
+            Runner::new(&wire_config(server.port, 7), Vec::new(), dir.path()).expect("constructs");
+        let run = tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("hi"))
+            .await
+            .expect("run completes within timeout")
+            .expect("run succeeds against the canned server");
+        assert_eq!(run.output.as_deref(), Some("probe says hello"));
+        assert_eq!(run.turn_count(), 1);
+        assert!(run.stop_reason.is_none(), "clean stop, no error reason");
+        assert_eq!(run.config.max_turns, 7, "session default policy is used");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_with_applies_the_override_for_that_call_only() {
+        let server = SseServer::start(vec![sse_text_turn("first"), sse_text_turn("second")]).await;
+        let dir = TempDir::new().expect("tempdir");
+        let mut runner =
+            Runner::new(&wire_config(server.port, 7), Vec::new(), dir.path()).expect("constructs");
+        let override_config = loopctl::engine::RunConfig::default().with_max_turns(3);
+        let first = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            runner.run_with("hi", &override_config),
+        )
+        .await
+        .expect("first run completes")
+        .expect("first run succeeds");
+        assert_eq!(
+            first.config.max_turns, 3,
+            "run_with must run with the explicit policy"
+        );
+        let second = tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("again"))
+            .await
+            .expect("second run completes")
+            .expect("second run succeeds");
+        assert_eq!(
+            second.config.max_turns, 7,
+            "plain run afterwards must be back on the session default"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn observers_fire_in_lifecycle_order_for_one_run() {
+        let server = SseServer::start(vec![sse_text_turn("hello")]).await;
+        let dir = TempDir::new().expect("tempdir");
+        let observer = Arc::new(RecordingObserver::new());
+        let mut runner = Runner::new(
+            &wire_config(server.port, 7),
+            vec![Arc::clone(&observer) as Arc<dyn LoopObserver>],
+            dir.path(),
+        )
+        .expect("constructs");
+        tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("hi"))
+            .await
+            .expect("run completes")
+            .expect("run succeeds");
+        assert_eq!(
+            observer.snapshot(),
+            vec!["run_start", "turn_start", "response", "turn_end", "run_end"],
+            "each lifecycle event fires exactly once, in order"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn composed_system_prompt_and_tool_schemas_reach_the_provider() {
+        let server = SseServer::start(vec![sse_text_turn("hello")]).await;
+        let dir = TempDir::new().expect("tempdir");
+        let mut runner =
+            Runner::new(&wire_config(server.port, 7), Vec::new(), dir.path()).expect("constructs");
+        tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("hi"))
+            .await
+            .expect("run completes")
+            .expect("run succeeds");
+        let requests = recorded_requests(&server);
+        assert_eq!(requests.len(), 1, "one LLM request for one turn");
+        let body = &requests[0];
+        assert!(
+            body.contains("YOUR ROLE: GENERAL ASSISTANCE"),
+            "composed system prompt must reach the wire: {body}"
+        );
+        assert!(
+            body.contains("\"Read\""),
+            "the registry's tool schemas must be advertised: {body}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn builtin_tool_dispatch_sees_the_runner_context_end_to_end() {
+        // Turn 1 asks the real ReadTool for note.txt; turn 2 finishes. ReadTool
+        // errors when the RunnerContext extension is absent, so a successful
+        // run proves Contextual injects through the actual BareLoop dispatch.
+        let server = SseServer::start(vec![sse_read_tool_call_turn(), sse_text_turn("done")]).await;
+        let dir = TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join("note.txt"), "probe payload\n").expect("write fixture");
+        let mut runner =
+            Runner::new(&wire_config(server.port, 7), Vec::new(), dir.path()).expect("constructs");
+        let run = tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("read it"))
+            .await
+            .expect("run completes")
+            .expect("run succeeds");
+        assert_eq!(run.tool_call_count(), 1, "the Read tool was dispatched");
+        assert_eq!(run.turn_count(), 2, "tool turn plus final text turn");
+        let requests = recorded_requests(&server);
+        assert!(
+            requests.len() >= 2 && requests[1].contains("probe payload"),
+            "the tool result must flow into the follow-up request: {requests:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn conversation_persists_across_runs() {
+        let server = SseServer::start(vec![
+            sse_text_turn("first answer"),
+            sse_text_turn("second answer"),
+        ])
+        .await;
+        let dir = TempDir::new().expect("tempdir");
+        let mut runner =
+            Runner::new(&wire_config(server.port, 7), Vec::new(), dir.path()).expect("constructs");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            runner.run("first question"),
+        )
+        .await
+        .expect("first run completes")
+        .expect("first run succeeds");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            runner.run("second question"),
+        )
+        .await
+        .expect("second run completes")
+        .expect("second run succeeds");
+        let requests = recorded_requests(&server);
+        assert!(
+            requests.len() >= 2
+                && requests[1].contains("first answer")
+                && requests[1].contains("second question"),
+            "the second run's request must carry the prior exchange: {requests:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_the_signal_mid_run_returns_cancelled() {
+        let server = SseServer::start_with_delay(
+            vec![sse_text_turn("too late")],
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        let dir = TempDir::new().expect("tempdir");
+        let mut runner =
+            Runner::new(&wire_config(server.port, 7), Vec::new(), dir.path()).expect("constructs");
+        let signal = runner.cancel_signal();
+        let task = tokio::spawn(async move { runner.run("slow").await });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        signal.cancel();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), task)
+            .await
+            .expect("cancelled run returns promptly")
+            .expect("task joins");
+        assert!(
+            matches!(result, Err(loopctl::error::LoopError::Cancelled)),
+            "expected Cancelled, got {result:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_against_a_dead_endpoint_returns_an_error() {
+        // Bind a listener, note its port, drop it: connections are refused
+        // deterministically, so run() must surface an error, not hang.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        let dir = TempDir::new().expect("tempdir");
+        let mut runner =
+            Runner::new(&wire_config(port, 7), Vec::new(), dir.path()).expect("constructs");
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("hi")).await;
+        assert!(
+            matches!(result, Ok(Err(_))),
+            "expected an Err from run against a refused endpoint, got {result:?}"
+        );
     }
 }

@@ -20,6 +20,11 @@ use loopctl::stream::StreamEvent;
 use crate::error::RunnerError;
 
 /// Sentinel API key used for providers that require no authentication.
+///
+/// A local Ollama server accepts any credential, so when no key is configured
+/// this dummy is sent rather than erroring — the request succeeds and the
+/// user is not forced to invent a placeholder key. Cloud-hosted deployments
+/// with real authentication override it via `api_key` or `OLLAMA_API_KEY`.
 const NO_AUTH_KEY: &str = "ollama";
 
 /// The concrete provider client dch monomorphizes the agent loop over.
