@@ -602,6 +602,32 @@ mod tests {
     }
 
     #[test]
+    fn dchclient_forwards_set_model_and_base_url_on_every_variant() {
+        for (api_type, base_url) in [
+            (ApiType::OpenAi, "https://openai.example/v1"),
+            (ApiType::Anthropic, "https://anthropic.example"),
+            (ApiType::Gemini, "https://gemini.example/v1beta"),
+        ] {
+            let c = cfg(api_type, base_url, Some("k"));
+            let client = create_client(&c).expect("builds");
+            assert_eq!(
+                client.base_url(),
+                base_url,
+                "{api_type:?} must forward base_url"
+            );
+            assert!(
+                client.set_model("renamed-model"),
+                "{api_type:?} must forward set_model"
+            );
+            assert_eq!(
+                client.model(),
+                "renamed-model",
+                "{api_type:?} must forward model"
+            );
+        }
+    }
+
+    #[test]
     fn dchclient_forwards_extract_structured_to_the_inner_provider() {
         // extract_structured is synchronous (no network), so it can be exercised
         // offline. A dropped forward would panic on the match (unreachable) or

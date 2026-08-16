@@ -9,42 +9,32 @@
 //! delegations.
 //!
 //! Tools reach per-call state (the working directory, the todo list, the
-//! optional question channel) through a [`RunnerContext`] extension. Because
-//! [`BareLoop`] builds the per-dispatch [`ToolContext`] internally and never
-//! injects host extensions, the runner wraps every builtin tool in a private
-//! adapter that clones the incoming context, installs the extension, and
-//! delegates to the inner tool.
+//! optional question channel) through a [`RunnerContext`] extension. The
+//! engine builds the per-dispatch
+//! [`ToolContext`](loopctl::tool::ToolContext) without host state, but its
+//! dispatch pipeline hands middlewares the context before the tool runs — so
+//! the runner installs a private context-injector middleware that populates
+//! the extension (and the native `cwd` / `is_non_interactive` fields) on
+//! every dispatch.
 
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use dch_tools::BashTool;
-use dch_tools::CodeSearchTool;
-use dch_tools::EditTool;
-use dch_tools::FileViewerTool;
-use dch_tools::GlobTool;
-use dch_tools::GrepTool;
-use dch_tools::MultiEditTool;
-use dch_tools::ReadTool;
 use dch_tools::RunnerContext;
-use dch_tools::TreeTool;
-use dch_tools::WriteTool;
+use dch_tools::builtin_registry;
 use loopctl::engine::BareLoop;
 use loopctl::engine::Loop;
 use loopctl::engine::Run;
 use loopctl::engine::RunConfig;
 use loopctl::error::LoopError;
 use loopctl::managers::LoopManagers;
+use loopctl::middleware::ToolDispatchContext;
+use loopctl::middleware::ToolMiddleware;
+use loopctl::middleware::ToolPipeline;
 use loopctl::observer::LoopObserver;
-use loopctl::tool::Tool;
-use loopctl::tool::ToolContext;
-use loopctl::tool::ToolError;
-use loopctl::tool::ToolOutput;
 use loopctl::tool::ToolRegistry;
-use loopctl::tool::ToolSchema;
-use serde_json::Value;
 
 use crate::DchClient;
 use crate::RunnerError;
@@ -58,19 +48,22 @@ use crate::with_context;
 /// [`Runner::new`] assembles the loopctl ingredients (a concrete provider
 /// client, a tool registry whose every dispatch sees the shared
 /// [`RunnerContext`], a session config carrying the composed system prompt,
-/// and the observer-bearing managers bundle) into one [`BareLoop`], and every
-/// public method after that is a one-line delegation to it.
+/// and the observer-bearing managers bundle) into one [`BareLoop`], and the
+/// public surface stays thin: runs reset the per-run todo list and delegate
+/// to the loop, the rest are accessors.
 ///
 /// Construct once per agent identity with [`Runner::new`], then drive it with
 /// [`Runner::run`]: each call is one prompt → loop → final answer against the
-/// configured provider, sharing one conversation across calls. Cancellation is
-/// cooperative via [`Runner::cancel`] or [`Runner::cancel_signal`].
+/// configured provider, sharing one conversation across calls. Each run starts
+/// by resetting the per-run todo list (a new prompt plans fresh). Cancellation
+/// is cooperative via [`Runner::cancel`] or [`Runner::cancel_signal`].
 pub struct Runner {
     /// The agent loop, monomorphized over the concrete [`DchClient`].
     ///
     /// Constructed once in [`Runner::new`] via `new_with_managers` with the
-    /// wrapped tool registry, the composed session config, and the
-    /// observer-carrying managers. Every public method delegates to it; the
+    /// builtin tool registry, the composed session config, and the
+    /// observer-carrying managers (which carry the dispatch pipeline with the
+    /// context injector installed). Every public method delegates to it; the
     /// concrete (non-`dyn`) client keeps the per-turn LLM call statically
     /// dispatched.
     inner: BareLoop<DchClient>,
@@ -78,10 +71,11 @@ pub struct Runner {
     /// The shared per-runner context, cloned into every tool dispatch.
     ///
     /// Built from `workdir` in [`Runner::new`] and carried by the private
-    /// context-injecting tool wrappers installed in `inner`'s registry, so
-    /// every builtin tool reaches `cwd`, the todo list, and the question
-    /// channel through the `ToolContext` extension. Exposed read-only-ish via
-    /// [`Runner::context`] for host wiring.
+    /// context-injector middleware in the dispatch pipeline, so every
+    /// builtin tool reaches `cwd`, the todo list, and the question channel
+    /// slot through the `ToolContext` extension. Exposed via
+    /// [`Runner::context`] for host wiring, and mutated by
+    /// [`Runner::set_question_tx`].
     context: Arc<RunnerContext>,
 
     /// The session-default run policy (turn budget, dispatch policy).
@@ -121,10 +115,10 @@ impl Runner {
         let context = Arc::new(RunnerContext {
             cwd: workdir.to_path_buf(),
             todos: Arc::new(std::sync::Mutex::new(Vec::new())),
-            question_tx: None,
+            question_tx: Arc::new(std::sync::Mutex::new(None)),
         });
 
-        let registry = build_wrapped_registry(&context);
+        let registry = builtin_registry();
 
         let session_config = build_session(config, &registry, workdir);
         let run_config = config.to_run_config();
@@ -134,6 +128,7 @@ impl Runner {
         for observer in observers {
             managers.register_observer(observer);
         }
+        managers.set_pipeline(build_pipeline(&context)?);
 
         let inner = BareLoop::<DchClient>::new_with_managers(
             Arc::new(client),
@@ -152,11 +147,12 @@ impl Runner {
     /// Run one prompt → loop → final answer, with the session-default policy.
     ///
     /// Uses the run policy mapped from `DchConfig` at construction (turn
-    /// budget, dispatch policy). Returns when the model signals end-of-turn,
-    /// the budget is exhausted, the loop detector aborts, or [`Runner::cancel`]
-    /// is called. Equivalent to [`Runner::run_with`] with the default config;
-    /// the conversation is shared across `run`/`run_with` calls on the same
-    /// `Runner`.
+    /// budget, dispatch policy). The per-run todo list is reset at the start
+    /// of the run — a new prompt plans fresh. Returns when the model signals
+    /// end-of-turn, the budget is exhausted, the loop detector aborts, or
+    /// [`Runner::cancel`] is called. Equivalent to [`Runner::run_with`] with
+    /// the default config; the conversation is shared across `run`/`run_with`
+    /// calls on the same `Runner`.
     ///
     /// # Errors
     ///
@@ -166,7 +162,8 @@ impl Runner {
     /// - Other [`LoopError`] variants as surfaced by the loop (compaction,
     ///   detection, reflection, tool recovery).
     pub async fn run(&mut self, input: &str) -> Result<Run, LoopError> {
-        self.inner.run(input, &self.run_config).await
+        let run_config = self.run_config.clone();
+        self.run_with(input, &run_config).await
     }
 
     /// Run one prompt → loop → final answer, with an explicit run policy.
@@ -174,9 +171,10 @@ impl Runner {
     /// The variation point for per-run budgets: `run_with` overrides the
     /// session default for this one call without rebuilding the `Runner` (a
     /// rebuild constructs a fresh `BareLoop` and discards the conversation).
-    /// The returned [`Run`] records `run_config` as its own snapshot, so
-    /// per-call overrides are visible in the run's accounting. This mirrors
-    /// loopctl's own default/override pairing (`stream_messages` vs
+    /// The per-run todo list is reset at the start of the run. The returned
+    /// [`Run`] records `run_config` as its own snapshot, so per-call overrides
+    /// are visible in the run's accounting. This mirrors loopctl's own
+    /// default/override pairing (`stream_messages` vs
     /// `stream_messages_with_options`).
     ///
     /// # Errors
@@ -191,6 +189,11 @@ impl Runner {
         input: &str,
         run_config: &RunConfig,
     ) -> Result<Run, LoopError> {
+        self.context
+            .todos
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         self.inner.run(input, run_config).await
     }
 
@@ -219,13 +222,29 @@ impl Runner {
     /// A reference to the shared runner context.
     ///
     /// The returned `RunnerContext` exposes the shared todo list (behind an
-    /// `Arc<Mutex<…>>`, so callers can mutate it) and the optional question
-    /// channel. Intended for host wiring — e.g. a TUI installing its question
-    /// sender before the first run, or an observer reading the todo list — not
-    /// for general inspection.
+    /// `Arc<Mutex<…>>`, so callers can mutate it) and the question channel
+    /// slot. Intended for host wiring and inspection — install the question
+    /// channel with [`Runner::set_question_tx`] rather than through this
+    /// accessor.
     #[must_use]
     pub fn context(&self) -> &RunnerContext {
         &self.context
+    }
+
+    /// Install the channel tools use to ask the user questions.
+    ///
+    /// Intended for interactive hosts (a TUI) to plug in their question
+    /// receiver; a headless runner leaves the slot empty and the asking tool
+    /// errors rather than blocking. Every tool dispatch reads the slot live,
+    /// so the channel may also be installed or replaced between runs — a
+    /// later installation flips subsequent dispatches to interactive
+    /// immediately.
+    pub fn set_question_tx(&self, tx: std::sync::mpsc::Sender<dch_tools::QuestionRequest>) {
+        *self
+            .context
+            .question_tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tx);
     }
 }
 
@@ -260,165 +279,83 @@ fn build_session(
     session_config
 }
 
-/// Build the tool registry with every builtin wrapped so its dispatches see
-/// `context` as the [`RunnerContext`] extension.
+/// Build the dispatch pipeline with the [`ContextInjector`] installed.
 ///
-/// The builtin tools require the extension (e.g. [`ReadTool`] errors when it is
-/// absent), and [`BareLoop`] builds the per-dispatch [`ToolContext`] internally
-/// without injecting host extensions. Wrapping each concrete tool at registry
-/// build time — clone the incoming context, install the extension, delegate —
-/// makes the extension reachable with no loopctl change. Tool identity (name,
-/// schema, prompt, dispatch metadata) is preserved exactly, so the model and
-/// the dispatcher see the wrapped tools as indistinguishable from the originals.
+/// The engine routes every tool call through this pipeline (when one is set on
+/// the managers) instead of calling tools directly, and hands each middleware
+/// the per-dispatch [`ToolDispatchContext`] — whose `tool_context` field is
+/// documented for exactly this augmentation. Putting the injector first
+/// (outermost) means any later middleware also sees the enriched context.
 ///
-/// The tool list mirrors [`dch_tools::builtin_registry`]; each concrete tool is
-/// constructed, wrapped in a private `Contextual` adapter, and registered.
-fn build_wrapped_registry(context: &Arc<RunnerContext>) -> ToolRegistry {
-    let mut registry = ToolRegistry::new();
-    registry.register(Contextual::new(ReadTool, Arc::clone(context)));
-    registry.register(Contextual::new(BashTool, Arc::clone(context)));
-    registry.register(Contextual::new(WriteTool, Arc::clone(context)));
-    registry.register(Contextual::new(EditTool, Arc::clone(context)));
-    registry.register(Contextual::new(MultiEditTool, Arc::clone(context)));
-    registry.register(Contextual::new(FileViewerTool, Arc::clone(context)));
-    registry.register(Contextual::new(GlobTool, Arc::clone(context)));
-    registry.register(Contextual::new(GrepTool, Arc::clone(context)));
-    registry.register(Contextual::new(CodeSearchTool, Arc::clone(context)));
-    registry.register(Contextual::new(TreeTool, Arc::clone(context)));
-    registry
+/// The pipeline's core holds its own registry instance for execution while the
+/// [`BareLoop`] holds the one it advertises to the model; the registry stores
+/// boxed tools that cannot be shared, so the engine's by-value registry and
+/// the pipeline's core registry cannot be one instance. Both come from
+/// [`dch_tools::builtin_registry`], whose construction is deterministic —
+/// pinned by a dch-tools test asserting two constructions register the
+/// identical tool set and schemas.
+///
+/// # Errors
+///
+/// - [`RunnerError::Config`] if the builder rejects the composition — cannot
+///   happen with this fixed stack (the core is always set), but mapped to a
+///   typed error rather than panicked on.
+fn build_pipeline(context: &Arc<RunnerContext>) -> Result<ToolPipeline, RunnerError> {
+    ToolPipeline::builder()
+        .with_middleware(ContextInjector {
+            context: Arc::clone(context),
+        })
+        .with_core(Arc::new(builtin_registry()))
+        .build()
+        .map_err(|e| RunnerError::Config(format!("dispatch pipeline: {e}")))
 }
 
-/// A [`Tool`] that injects a [`RunnerContext`] extension into the per-dispatch
-/// [`ToolContext`] before delegating to `inner`.
+/// A dispatch middleware that populates the per-call tool context with the
+/// shared [`RunnerContext`] before the tool runs.
 ///
-/// See [`build_wrapped_registry`]. Every [`Tool`] method forwards to `inner`
-/// unchanged; only [`call`](Tool::call) is non-trivial.
-struct Contextual<T: Tool> {
-    /// The real tool whose dispatches the wrapper injects the extension into.
-    ///
-    /// Every `Tool` method other than `call` delegates to this field verbatim,
-    /// so the wrapped tool is indistinguishable from the original to the model
-    /// and to the dispatcher.
-    inner: T,
+/// The engine builds each dispatch's [`ToolContext`](loopctl::tool::ToolContext)
+/// with only the session id — no working directory, no interactivity flag, no
+/// host extensions — but its pipeline contract hands middlewares the context to
+/// augment first. This injector installs the runner context as the typed
+/// extension (what `dch_tools::runner_ctx` reads) and sets the native `cwd` /
+/// `is_non_interactive` fields, then delegates down the chain unchanged.
+struct ContextInjector {
     /// The shared runner context, cloned into each dispatch's extension slot.
     ///
-    /// Cloned (cheaply — `RunnerContext` is `Clone` with an `Arc`-shared todo
-    /// list) on every `call` so each dispatch sees the current runner state.
+    /// Cloned on every dispatch (cheaply — `RunnerContext` is `Clone` with an
+    /// `Arc`-shared todo list and question channel slot) so tools always see
+    /// the current runner state.
     context: Arc<RunnerContext>,
 }
 
-impl<T: Tool> Contextual<T> {
-    /// Wrap `tool` so every dispatch sees `context` as the extension.
+impl ToolMiddleware for ContextInjector {
+    /// A stable middleware name for pipeline diagnostics and logging.
     ///
-    /// The wrapper is constructed once per builtin at registry-build time (see
-    /// [`build_wrapped_registry`]) and registered in place of the bare tool.
-    fn new(tool: T, context: Arc<RunnerContext>) -> Self {
-        Self {
-            inner: tool,
-            context,
-        }
-    }
-}
-
-/// [`Tool`] implementation for [`Contextual`]: a transparent decorator that
-/// preserves the inner tool's identity while injecting the shared
-/// [`RunnerContext`] extension into the per-dispatch [`ToolContext`].
-///
-/// Every method except [`Tool::call`] is a plain delegation, so the model, the
-/// parallel dispatcher, and the system-prompt composer all observe the wrapper
-/// as indistinguishable from the original tool. Only `call` mutates the
-/// incoming context — it clones the dispatcher-built `ToolContext`, installs
-/// the extension, and forwards to the inner tool.
-impl<T: Tool> Tool for Contextual<T> {
-    /// Forward the inner tool's stable identifier.
-    ///
-    /// The model addresses tools by this name, so it must — and does — match
-    /// the unwrapped builtin exactly.
-    fn name(&self) -> &str {
-        self.inner.name()
+    /// Appears in `middleware_names()` traces; keep it stable and distinctive.
+    fn name(&self) -> &'static str {
+        "dch-context"
     }
 
-    /// Forward the inner tool's human-readable description unchanged.
+    /// Augment the dispatch context, then continue down the pipeline.
     ///
-    /// This prose is embedded in the tool schema shown to the model, so any
-    /// alteration here would change what the model believes the tool does.
-    fn description(&self) -> &str {
-        self.inner.description()
-    }
-
-    /// Forward the inner tool's JSON schema (argument shape + identity).
-    ///
-    /// The returned [`ToolSchema`] is what the provider receives, so forwarding
-    /// verbatim keeps argument validation identical to the bare tool.
-    fn schema(&self) -> ToolSchema {
-        self.inner.schema()
-    }
-
-    /// Dispatch the tool with the shared [`RunnerContext`] injected.
-    ///
-    /// This is the one non-delegating method. The dispatcher hands us a
-    /// [`ToolContext`] that carries no host extension; we clone it, install our
-    /// cached `RunnerContext` as the extension, and forward the call to the
-    /// inner tool. The clone is cheap (extensions are `Arc`-backed) and keeps
-    /// the borrow lifetime tied to this dispatch only.
-    ///
-    /// # Errors
-    ///
-    /// Propagates whatever [`ToolError`] the inner tool yields — the wrapper
-    /// adds no failure mode of its own.
-    fn call<'a>(
+    /// Installs the [`RunnerContext`] extension and the native `cwd` /
+    /// `is_non_interactive` fields (interactivity read live from the question
+    /// channel slot), then delegates via `next` — the injector adds no control
+    /// flow of its own and never short-circuits.
+    fn dispatch<'a>(
         &'a self,
-        input: Value,
-        ctx: &ToolContext,
-    ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + 'a>> {
-        let mut owned = ctx.clone();
-        owned.set_extension((*self.context).clone());
-        Box::pin(async move { self.inner.call(input, &owned).await })
-    }
-
-    /// Forward the inner tool's static concurrency declaration.
-    ///
-    /// The parallel planner reads this to decide whether two instances of the
-    /// tool may co-dispatch; a dropped forward would silently serialize
-    /// read-only tools.
-    fn is_concurrency_safe(&self) -> bool {
-        self.inner.is_concurrency_safe()
-    }
-
-    /// Forward the inner tool's per-call concurrency check.
-    ///
-    /// Some tools are conditionally parallelizable (e.g. read paths yes, write
-    /// paths no); this forwards the inner verdict for the given `input` so the
-    /// planner's per-dispatch gating is preserved.
-    fn is_safe_for_concurrent_execution(&self, input: &Value) -> bool {
-        self.inner.is_safe_for_concurrent_execution(input)
-    }
-
-    /// Forward the inner tool's resource key, if any.
-    ///
-    /// The dispatcher uses this to serialize writes that touch the same
-    /// resource (e.g. the same file path). Forwarding is mandatory: a `None`
-    /// here would let two conflicting writes race silently.
-    fn resource_key(&self, input: &Value) -> Option<String> {
-        self.inner.resource_key(input)
-    }
-
-    /// Forward the inner tool's read-only flag.
-    ///
-    /// Read-only tools may be dispatched speculatively and in parallel; this
-    /// forwards the inner classification so the wrapper does not accidentally
-    /// demote a safe tool into the serialized queue.
-    fn is_read_only(&self) -> bool {
-        self.inner.is_read_only()
-    }
-
-    /// Forward the inner tool's system-prompt fragment, if any.
-    ///
-    /// Tools contribute per-tool prose (usage hints, examples) to the composed
-    /// system prompt; forwarding keeps that composition identical to the bare
-    /// registry.
-    fn system_prompt(&self) -> Option<String> {
-        self.inner.system_prompt()
+        ctx: &'a mut ToolDispatchContext,
+        next: &'a ToolPipeline,
+    ) -> Pin<Box<dyn Future<Output = loopctl::middleware::ToolDispatchResult> + Send + 'a>> {
+        let has_channel = self
+            .context
+            .question_tx
+            .lock()
+            .is_ok_and(|slot| slot.is_some());
+        ctx.tool_context.cwd = self.context.cwd.to_string_lossy().into_owned();
+        ctx.tool_context.is_non_interactive = !has_channel;
+        ctx.tool_context.set_extension((*self.context).clone());
+        Box::pin(async move { next.dispatch(ctx).await })
     }
 }
 
@@ -437,14 +374,20 @@ impl<T: Tool> Tool for Contextual<T> {
 mod tests {
     use super::*;
     use dch_config::DchConfig;
+    use loopctl::tool::Tool;
     use loopctl::tool::ToolContext;
+    use loopctl::tool::ToolError;
+    use loopctl::tool::ToolOutput;
+    use loopctl::tool::ToolSchema;
+    use serde_json::Value;
     use std::path::PathBuf;
     use std::sync::Mutex;
     use tempfile::TempDir;
 
-    /// A tool that reports the `cwd` it sees via the `RunnerContext` extension,
-    /// or the sentinel `"absent"` when no extension is installed. Used to prove
-    /// `Contextual` actually injects the extension.
+    /// A tool that reports the `cwd` it sees via the `RunnerContext` extension
+    /// (sentinel `"absent"` when no extension is installed) plus the native
+    /// `is_non_interactive` flag. Used to prove the `ContextInjector`
+    /// middleware actually enriches the dispatch context.
     struct ExtensionProbe;
 
     impl Tool for ExtensionProbe {
@@ -466,57 +409,18 @@ mod tests {
             _input: Value,
             ctx: &ToolContext,
         ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + 'a>> {
-            let cwd = runner_ctx_cwd(ctx);
-            Box::pin(async move { Ok(ToolOutput::text(cwd)) })
+            let report = format!(
+                "{},non_interactive={}",
+                runner_ctx_cwd(ctx),
+                ctx.is_non_interactive
+            );
+            Box::pin(async move { Ok(ToolOutput::text(report)) })
         }
         fn is_read_only(&self) -> bool {
             true
         }
         fn system_prompt(&self) -> Option<String> {
             Some("probe".to_string())
-        }
-    }
-
-    /// A tool that overrides the dispatch-metadata methods the parallel planner
-    /// queries (`is_concurrency_safe`, `is_safe_for_concurrent_execution`,
-    /// `resource_key`), so the `Contextual` wrapper's forwarding of each can be
-    /// asserted independently. The values are deliberately non-default so a
-    /// dropped forward is detectable.
-    struct MetadataProbe;
-
-    impl Tool for MetadataProbe {
-        fn name(&self) -> &'static str {
-            "MetadataProbe"
-        }
-        fn description(&self) -> &'static str {
-            "overrides dispatch metadata for forwarding tests"
-        }
-        fn schema(&self) -> ToolSchema {
-            ToolSchema {
-                tool: "MetadataProbe".to_string(),
-                description: "overrides dispatch metadata".to_string(),
-                input_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": {"path": {"type": "string"}}
-                }),
-            }
-        }
-        fn call<'a>(
-            &'a self,
-            _input: Value,
-            _ctx: &ToolContext,
-        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + 'a>> {
-            Box::pin(async { Ok(ToolOutput::text("ok")) })
-        }
-        fn is_concurrency_safe(&self) -> bool {
-            true
-        }
-        fn is_safe_for_concurrent_execution(&self, input: &Value) -> bool {
-            // Safe only when the input carries `"safe": true`.
-            input.get("safe").and_then(Value::as_bool).unwrap_or(false)
-        }
-        fn resource_key(&self, input: &Value) -> Option<String> {
-            input.get("path").and_then(Value::as_str).map(String::from)
         }
     }
 
@@ -531,103 +435,174 @@ mod tests {
         Arc::new(RunnerContext {
             cwd: PathBuf::from(cwd),
             todos: Arc::new(Mutex::new(Vec::new())),
-            question_tx: None,
+            question_tx: Arc::new(Mutex::new(None)),
         })
     }
 
+    fn probe_dispatch_context() -> loopctl::middleware::ToolDispatchContext {
+        loopctl::middleware::ToolDispatchContext {
+            tool_name: "Probe".to_string(),
+            input: Value::Null,
+            call_id: "call_probe".to_string(),
+            turn_number: 0,
+            cancel: Arc::new(loopctl::cancel::CancelSignal::new()),
+            permission: loopctl::tool::PermissionCheck::Allow,
+            tool_context: loopctl::tool::ToolContext::default(),
+        }
+    }
+
+    fn probe_pipeline(with_injector: bool) -> ToolPipeline {
+        if with_injector {
+            probe_pipeline_with(&sample_context("/tmp/probe-cwd"))
+        } else {
+            let mut registry = ToolRegistry::new();
+            registry.register(ExtensionProbe);
+            ToolPipeline::builder()
+                .with_core(Arc::new(registry))
+                .build()
+                .expect("static composition builds")
+        }
+    }
+
+    fn probe_pipeline_with(context: &Arc<RunnerContext>) -> ToolPipeline {
+        let mut registry = ToolRegistry::new();
+        registry.register(ExtensionProbe);
+        ToolPipeline::builder()
+            .with_core(Arc::new(registry))
+            .with_middleware(ContextInjector {
+                context: Arc::clone(context),
+            })
+            .build()
+            .expect("static composition builds")
+    }
+
     #[tokio::test]
-    async fn contextual_injects_the_extension_into_the_dispatch_context() {
+    async fn pipeline_injects_the_extension_into_the_dispatch_context() {
+        let pipeline = probe_pipeline(true);
+        let mut ctx = probe_dispatch_context();
+        let result = pipeline.dispatch(&mut ctx).await;
+        assert!(
+            !result.is_error,
+            "probe dispatch through the injector must succeed"
+        );
+        assert!(
+            result.output.to_string().contains("/tmp/probe-cwd"),
+            "the probe must see the injected cwd: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_without_injector_leaves_the_extension_absent() {
+        let pipeline = probe_pipeline(false);
+        let mut ctx = probe_dispatch_context();
+        let result = pipeline.dispatch(&mut ctx).await;
+        assert!(!result.is_error, "probe dispatch must succeed");
+        assert!(
+            result.output.to_string().contains("absent"),
+            "without the injector the probe must report the extension absent: {result:?}"
+        );
+    }
+
+    #[test]
+    fn build_pipeline_places_the_injector_outermost_over_the_core() {
+        let pipeline =
+            build_pipeline(&sample_context("/tmp/probe-cwd")).expect("static composition builds");
+        assert_eq!(
+            pipeline.middleware_names(),
+            vec!["dch-context", "tool_call"],
+            "the injector must be the outermost layer over the tool-call core"
+        );
+    }
+
+    #[tokio::test]
+    async fn injector_also_populates_the_native_context_fields() {
+        let pipeline = probe_pipeline(true);
+        let mut ctx = probe_dispatch_context();
+        let _ = pipeline.dispatch(&mut ctx).await;
+        assert_eq!(ctx.tool_context.cwd, "/tmp/probe-cwd");
+        assert!(
+            ctx.tool_context.is_non_interactive,
+            "no question channel means non-interactive"
+        );
+    }
+
+    #[tokio::test]
+    async fn installing_a_channel_flips_subsequent_dispatches_to_interactive() {
+        // The injector reads the question slot live per dispatch: an empty
+        // slot dispatches non-interactive, installing a sender afterwards
+        // flips the next dispatch — no rebuild needed.
         let context = sample_context("/tmp/probe-cwd");
-        let wrapped = Contextual::new(ExtensionProbe, context);
-        let ctx = ToolContext::default();
-        let out = wrapped.call(Value::Null, &ctx).await.expect("probe runs");
-        assert_eq!(out_text(&out), "/tmp/probe-cwd");
-    }
-
-    #[tokio::test]
-    async fn without_contextual_the_extension_is_absent() {
-        let out = ExtensionProbe
-            .call(Value::Null, &ToolContext::default())
-            .await
-            .expect("probe runs");
-        assert_eq!(out_text(&out), "absent");
-    }
-
-    #[test]
-    fn contextual_preserves_tool_identity() {
-        let context = sample_context("/tmp");
-        let wrapped = Contextual::new(ExtensionProbe, context);
-        assert_eq!(wrapped.name(), "Probe");
-        assert_eq!(wrapped.description(), "reports the RunnerContext cwd");
-        assert_eq!(wrapped.schema().tool, "Probe");
-        assert_eq!(wrapped.system_prompt().as_deref(), Some("probe"));
-        assert!(wrapped.is_read_only());
-    }
-
-    #[test]
-    fn contextual_forwards_concurrency_metadata_to_the_inner_tool() {
-        // The parallel planner queries these on the wrapped tool; a dropped
-        // forward would silently serialize all parallel dispatch.
-        let context = sample_context("/tmp");
-        let wrapped = Contextual::new(MetadataProbe, context);
+        let pipeline = probe_pipeline_with(&context);
+        let mut first = probe_dispatch_context();
+        let _ = pipeline.dispatch(&mut first).await;
         assert!(
-            wrapped.is_concurrency_safe(),
-            "is_concurrency_safe must forward"
+            first.tool_context.is_non_interactive,
+            "empty slot must dispatch non-interactive"
         );
-        let safe = serde_json::json!({"safe": true});
-        let unsafe_ = serde_json::json!({"safe": false});
+        let (tx, _rx) = std::sync::mpsc::channel();
+        *context.question_tx.lock().expect("slot lock") = Some(tx);
+        let mut second = probe_dispatch_context();
+        let _ = pipeline.dispatch(&mut second).await;
+        assert_eq!(second.tool_context.cwd, "/tmp/probe-cwd");
         assert!(
-            wrapped.is_safe_for_concurrent_execution(&safe),
-            "is_safe_for_concurrent_execution must forward the true case"
-        );
-        assert!(
-            !wrapped.is_safe_for_concurrent_execution(&unsafe_),
-            "is_safe_for_concurrent_execution must forward the false case"
+            !second.tool_context.is_non_interactive,
+            "installed channel must dispatch interactive"
         );
     }
 
     #[test]
-    fn contextual_forwards_resource_key_to_the_inner_tool() {
-        // resource_key drives same-resource serialization for parallel writes;
-        // a dropped forward would co-dispatch conflicting writes silently.
-        let context = sample_context("/tmp");
-        let wrapped = Contextual::new(MetadataProbe, context);
-        let with_path = serde_json::json!({"path": "/tmp/a.txt"});
-        assert_eq!(
-            wrapped.resource_key(&with_path).as_deref(),
-            Some("/tmp/a.txt"),
-            "resource_key must forward"
-        );
-        let without_path = serde_json::json!({});
+    fn set_question_tx_installs_the_channel_into_the_shared_context() {
+        let dir = TempDir::new().expect("tempdir");
+        let runner =
+            Runner::new(&offline_config(), Vec::new(), dir.path()).expect("Runner::new constructs");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        runner.set_question_tx(tx);
         assert!(
-            wrapped.resource_key(&without_path).is_none(),
-            "resource_key None case must forward"
+            runner
+                .context()
+                .question_tx
+                .lock()
+                .expect("slot lock")
+                .is_some(),
+            "the sender must land in the shared slot tools read"
         );
     }
 
     #[test]
-    fn build_wrapped_registry_wraps_every_builtin() {
-        // Guard against drift: build_wrapped_registry must register exactly the
-        // set builtin_registry does, no more, no less. Comparing against the
-        // single source of truth catches a future task (e.g. TodoTool) adding a
-        // tool to builtin_registry but not to the wrapper.
-        let context = sample_context("/tmp");
-        let wrapped = build_wrapped_registry(&context);
-        let mut expected = dch_tools::builtin_registry().tool_names();
-        let mut actual = wrapped.tool_names();
-        expected.sort();
-        actual.sort();
-        assert_eq!(
-            actual, expected,
-            "wrapped registry drifted from builtin_registry"
+    fn set_question_tx_replaces_an_existing_channel() {
+        let dir = TempDir::new().expect("tempdir");
+        let runner =
+            Runner::new(&offline_config(), Vec::new(), dir.path()).expect("Runner::new constructs");
+        let (first_tx, first_rx) = std::sync::mpsc::channel();
+        runner.set_question_tx(first_tx);
+        let (second_tx, second_rx) = std::sync::mpsc::channel();
+        runner.set_question_tx(second_tx);
+        let sender = runner
+            .context()
+            .question_tx
+            .lock()
+            .expect("slot lock")
+            .clone()
+            .expect("sender set");
+        sender
+            .send(dch_tools::QuestionRequest {
+                questions: Vec::new(),
+            })
+            .expect("receiver alive");
+        assert!(
+            second_rx.try_recv().is_ok(),
+            "the replacement channel must receive"
+        );
+        assert!(
+            first_rx.try_recv().is_err(),
+            "the replaced channel must no longer receive"
         );
     }
 
     #[test]
     fn build_session_composes_the_system_prompt_for_general_role() {
         let config = DchConfig::default();
-        let context = sample_context("/tmp");
-        let registry = build_wrapped_registry(&context);
+        let registry = dch_tools::builtin_registry();
         let session = build_session(&config, &registry, Path::new("/tmp"));
         let prompt = session
             .system_prompt
@@ -651,13 +626,16 @@ mod tests {
             role: Role::Coding,
             prompt: "OVERRIDE MARKER: do the thing.".to_string(),
         }];
-        let context = sample_context("/tmp");
-        let registry = build_wrapped_registry(&context);
+        let registry = dch_tools::builtin_registry();
         let session = build_session(&config, &registry, Path::new("/tmp"));
         let prompt = session.system_prompt.expect("composed");
         assert!(
             prompt.contains("OVERRIDE MARKER"),
             "override prose missing: {prompt}"
+        );
+        assert!(
+            !prompt.contains("YOUR ROLE: IMPLEMENT FEATURES AND FIXES"),
+            "an override must replace the built-in role body, not append to it: {prompt}"
         );
     }
 
@@ -673,8 +651,7 @@ mod tests {
         )
         .expect("write marker");
         let config = DchConfig::default();
-        let context = sample_context("/tmp");
-        let registry = build_wrapped_registry(&context);
+        let registry = dch_tools::builtin_registry();
         let session = build_session(&config, &registry, dir.path());
         let prompt = session.system_prompt.expect("composed");
         assert!(
@@ -692,8 +669,7 @@ mod tests {
         // An empty tempdir yields no detected techs, so no PROJECT section.
         let dir = TempDir::new().expect("tempdir");
         let config = DchConfig::default();
-        let context = sample_context("/tmp");
-        let registry = build_wrapped_registry(&context);
+        let registry = dch_tools::builtin_registry();
         let session = build_session(&config, &registry, dir.path());
         let prompt = session.system_prompt.expect("composed");
         assert!(
@@ -738,10 +714,6 @@ mod tests {
         );
     }
 
-    fn out_text(out: &ToolOutput) -> String {
-        out.text_content()
-    }
-
     fn sse_text_turn(text: &str) -> String {
         [
             serde_json::json!({
@@ -760,13 +732,17 @@ mod tests {
     }
 
     fn sse_read_tool_call_turn() -> String {
-        let args = serde_json::json!({"file_path": "note.txt"}).to_string();
+        sse_tool_call_turn("Read", &serde_json::json!({"file_path": "note.txt"}))
+    }
+
+    fn sse_tool_call_turn(tool: &str, args: &serde_json::Value) -> String {
+        let args = args.to_string();
         [
             serde_json::json!({
                 "id": "c1", "model": "test-model",
                 "choices": [{"delta": {"tool_calls": [{
                     "index": 0, "id": "call_1",
-                    "function": {"name": "Read", "arguments": ""}
+                    "function": {"name": tool, "arguments": ""}
                 }]}, "finish_reason": null}]
             }),
             serde_json::json!({
@@ -1054,7 +1030,7 @@ mod tests {
     async fn builtin_tool_dispatch_sees_the_runner_context_end_to_end() {
         // Turn 1 asks the real ReadTool for note.txt; turn 2 finishes. ReadTool
         // errors when the RunnerContext extension is absent, so a successful
-        // run proves Contextual injects through the actual BareLoop dispatch.
+        // run proves the injector middleware enriches the real dispatch path.
         let server = SseServer::start(vec![sse_read_tool_call_turn(), sse_text_turn("done")]).await;
         let dir = TempDir::new().expect("tempdir");
         std::fs::write(dir.path().join("note.txt"), "probe payload\n").expect("write fixture");
@@ -1070,6 +1046,62 @@ mod tests {
         assert!(
             requests.len() >= 2 && requests[1].contains("probe payload"),
             "the tool result must flow into the follow-up request: {requests:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn interactivity_flag_flows_through_full_engine_runs() {
+        // Drive the real engine (not just the pipeline in isolation) with the
+        // probe tool: run 1 with an empty channel slot dispatches
+        // non-interactive; installing a channel into the shared slot flips
+        // run 2 to interactive — the injector reads the slot live on every
+        // real dispatch.
+        let server = SseServer::start(vec![
+            sse_tool_call_turn("Probe", &serde_json::json!({})),
+            sse_text_turn("done"),
+            sse_tool_call_turn("Probe", &serde_json::json!({})),
+            sse_text_turn("done"),
+        ])
+        .await;
+        let dir = TempDir::new().expect("tempdir");
+        let cwd = dir.path().to_string_lossy().into_owned();
+        let context = sample_context(&cwd);
+        let mut managers = LoopManagers::new();
+        // The engine executes through the pipeline's core registry while its
+        // own registry only advertises schemas, so the probe must sit in both.
+        managers.set_pipeline(probe_pipeline_with(&context));
+        let mut registry = ToolRegistry::new();
+        registry.register(ExtensionProbe);
+        let config = wire_config(server.port, 7);
+        let client = crate::create_client(&config.api).expect("client builds");
+        let mut engine = BareLoop::<DchClient>::new_with_managers(
+            Arc::new(client),
+            registry,
+            loopctl::config::SessionConfig::default(),
+            managers,
+        );
+        let policy = RunConfig::default();
+        let first = engine
+            .run("probe", &policy)
+            .await
+            .expect("first run succeeds");
+        assert_eq!(first.tool_call_count(), 1);
+        let requests = recorded_requests(&server);
+        assert!(
+            requests[1].contains(&cwd) && requests[1].contains("non_interactive=true"),
+            "run 1 must see the extension and an empty (non-interactive) slot: {requests:?}"
+        );
+        let (tx, _rx) = std::sync::mpsc::channel();
+        *context.question_tx.lock().expect("slot lock") = Some(tx);
+        let second = engine
+            .run("again", &policy)
+            .await
+            .expect("second run succeeds");
+        assert_eq!(second.tool_call_count(), 1);
+        let requests = recorded_requests(&server);
+        assert!(
+            requests[3].contains("non_interactive=false"),
+            "run 2 (channel installed) must dispatch interactive: {requests:?}"
         );
     }
 
@@ -1147,6 +1179,65 @@ mod tests {
         assert!(
             matches!(result, Ok(Err(_))),
             "expected an Err from run against a refused endpoint, got {result:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_clears_the_todo_list_at_the_start_of_each_run() {
+        // A dead endpoint makes the run fail, but the reset happens before the
+        // request — proving the clear is tied to run start, not to success.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        let dir = TempDir::new().expect("tempdir");
+        let mut runner =
+            Runner::new(&wire_config(port, 7), Vec::new(), dir.path()).expect("constructs");
+        runner
+            .context()
+            .todos
+            .lock()
+            .expect("todos lock")
+            .push(dch_tools::TodoEntry {
+                id: "1".to_string(),
+                subject: "stale plan".to_string(),
+                description: String::new(),
+                status: dch_tools::TodoStatus::Pending,
+                active_form: None,
+            });
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("hi")).await;
+        assert!(
+            runner
+                .context()
+                .todos
+                .lock()
+                .expect("todos lock")
+                .is_empty(),
+            "each run must start with a fresh todo list"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_returns_max_turns_exceeded_when_the_budget_is_hit() {
+        // Two tool-call turns against a two-turn budget: the model never
+        // produces a final answer, so the loop must abort with the budget
+        // error rather than request a third turn.
+        let server =
+            SseServer::start(vec![sse_read_tool_call_turn(), sse_read_tool_call_turn()]).await;
+        let dir = TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join("note.txt"), "probe payload\n").expect("write fixture");
+        let mut runner =
+            Runner::new(&wire_config(server.port, 2), Vec::new(), dir.path()).expect("constructs");
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("loop"))
+            .await
+            .expect("run terminates at the budget");
+        assert!(
+            matches!(
+                result,
+                Err(loopctl::error::LoopError::MaxTurnsExceeded { .. })
+            ),
+            "expected MaxTurnsExceeded, got {result:?}"
         );
     }
 }

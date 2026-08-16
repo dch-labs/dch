@@ -415,7 +415,7 @@ mod tests {
         let rc = RunnerContext {
             cwd: PathBuf::from(dir),
             todos: Arc::new(Mutex::new(Vec::new())),
-            question_tx: None,
+            question_tx: Arc::new(Mutex::new(None)),
         };
         ctx.set_extension(rc);
         ctx

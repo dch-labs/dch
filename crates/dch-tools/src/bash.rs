@@ -935,7 +935,7 @@ mod tests {
         let rc = RunnerContext {
             cwd: std::path::PathBuf::from(cwd),
             todos: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            question_tx: None,
+            question_tx: std::sync::Arc::new(std::sync::Mutex::new(None)),
         };
         ctx.set_extension(rc);
         ctx
