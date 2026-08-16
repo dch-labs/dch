@@ -63,7 +63,11 @@ pub struct RunnerContext {
 
 impl fmt::Debug for RunnerContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let has_channel = self.question_tx.lock().is_ok_and(|slot| slot.is_some());
+        let has_channel = self
+            .question_tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some();
         f.debug_struct("RunnerContext")
             .field("cwd", &self.cwd)
             .field("todos", &self.todos)

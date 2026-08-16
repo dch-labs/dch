@@ -351,7 +351,8 @@ impl ToolMiddleware for ContextInjector {
             .context
             .question_tx
             .lock()
-            .is_ok_and(|slot| slot.is_some());
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some();
         ctx.tool_context.cwd = self.context.cwd.to_string_lossy().into_owned();
         ctx.tool_context.is_non_interactive = !has_channel;
         ctx.tool_context.set_extension((*self.context).clone());
