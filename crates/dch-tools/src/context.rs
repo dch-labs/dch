@@ -1,8 +1,8 @@
 //! The runner context extension stored on each `loopctl::tool::ToolContext`.
 //!
 //! Tools retrieve it with [`runner_ctx`] to reach per-call, tool-facing state:
-//! the working directory, the agent's per-run todo list, and the optional
-//! channel for asking the user interactive questions. Session-lifetime records
+//! the working directory, the agent's per-run todo list, and the channel slot
+//! for asking the user interactive questions. Session-lifetime records
 //! (file-touch history for staleness detection, etc.) are owned by the outer
 //! runner layer and recorded via an observer on tool dispatch — not by the
 //! tools and not via this context.
@@ -26,9 +26,10 @@ use crate::todo::TodoEntry;
 /// [`ToolContext::set_extension`](loopctl::tool::ToolContext::set_extension)
 /// and retrieved with [`runner_ctx`].
 ///
-/// Cloning is cheap — `todos` is behind an `Arc`, so clones share the same
-/// mutable list rather than copying it. This is how multiple tool invocations
-/// within one run observe each other's todo-list mutations.
+/// Cloning is cheap — `todos` and `question_tx` are behind `Arc`s, so clones
+/// share the same mutable list and the same channel slot rather than copying
+/// them. This is how multiple tool invocations within one run observe each
+/// other's todo-list mutations.
 #[derive(Clone)]
 pub struct RunnerContext {
     /// The working directory the agent operates within.
@@ -48,21 +49,29 @@ pub struct RunnerContext {
     /// clears it at the top of each `run()` so a new prompt starts fresh.
     pub todos: Arc<Mutex<Vec<TodoEntry>>>,
 
-    /// Optional channel for asking the user interactive questions.
+    /// Channel for asking the user interactive questions, behind a shared slot.
     ///
-    /// Used by the `AskUserQuestion` tool to send a [`QuestionRequest`] to the
-    /// UI (TUI overlay or headless reader). `None` in headless mode, where
-    /// prompting is impossible — the asking tool returns an error instead of
-    /// blocking. Set at runner construction; presence depends on the run mode.
-    pub question_tx: Option<mpsc::Sender<QuestionRequest>>,
+    /// Used by the asking tool to send a [`QuestionRequest`] to the UI (a TUI
+    /// overlay or a headless reader). The slot starts empty; the asking tool
+    /// returns an error instead of blocking when no channel is installed. A
+    /// host that can prompt installs its sender before the first run (or
+    /// between runs) — every tool dispatch reads the slot live, so a later
+    /// installation affects subsequent dispatches immediately. Cloning
+    /// [`RunnerContext`] shares the same slot.
+    pub question_tx: Arc<Mutex<Option<mpsc::Sender<QuestionRequest>>>>,
 }
 
 impl fmt::Debug for RunnerContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let has_channel = self
+            .question_tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some();
         f.debug_struct("RunnerContext")
             .field("cwd", &self.cwd)
             .field("todos", &self.todos)
-            .field("question_tx", &self.question_tx.is_some())
+            .field("question_tx", &has_channel)
             .finish()
     }
 }
@@ -84,7 +93,7 @@ impl fmt::Debug for RunnerContext {
 /// let rc = RunnerContext {
 ///     cwd: ".".into(),
 ///     todos: Default::default(),
-///     question_tx: None,
+///     question_tx: Default::default(),
 /// };
 /// ctx.set_extension(rc);
 /// assert!(runner_ctx(&ctx).is_some());
@@ -96,8 +105,8 @@ pub fn runner_ctx(ctx: &loopctl::tool::ToolContext) -> Option<&RunnerContext> {
 
 // Statically asserts `RunnerContext: Send + Sync`, the bound required to store
 // it as a `ToolContext` extension. `Arc<Mutex<Vec<TodoEntry>>>` is
-// `Send + Sync`, `Option<mpsc::Sender<_>>` is `Send + Sync`, and `PathBuf` is
-// trivially so.
+// `Send + Sync`, `Arc<Mutex<Option<mpsc::Sender<_>>>>` is `Send + Sync`, and
+// `PathBuf` is trivially so.
 const _: fn() = || {
     fn assert_bounds<T: Send + Sync>() {}
     assert_bounds::<RunnerContext>();
@@ -123,7 +132,7 @@ mod tests {
         RunnerContext {
             cwd: PathBuf::from("/tmp/workspace"),
             todos: Arc::new(Mutex::new(Vec::new())),
-            question_tx: None,
+            question_tx: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -192,23 +201,28 @@ mod tests {
     }
 
     #[test]
-    fn question_tx_round_trips_a_request_and_none_is_default() {
-        // Default is None (headless); when Some, a sent QuestionRequest reaches
-        // the receiver. This is the plumbing AskUserQuestion (T-38) will use.
-        assert!(sample().question_tx.is_none());
+    fn question_tx_round_trips_a_request_and_empty_is_default() {
+        // Default is an empty slot (headless); once a sender is installed, a
+        // sent QuestionRequest reaches the receiver. This is the plumbing the
+        // asking tool uses.
+        assert!(sample().question_tx.lock().expect("slot").is_none());
 
         let (tx, rx) = mpsc::channel::<QuestionRequest>();
         let rc = RunnerContext {
-            question_tx: Some(tx),
+            question_tx: Arc::new(Mutex::new(Some(tx))),
             ..sample()
         };
         let twin = rc.clone();
-        // The cloned context shares the sender (mpsc::Sender is Clone) — both
-        // can send, both reach the same receiver.
+        // The cloned context shares the slot — senders cloned from it reach
+        // the same receiver.
         let (resp_tx, _resp_rx) = tokio::sync::oneshot::channel();
-        rc.question_tx
-            .as_ref()
-            .expect("tx set")
+        let first = rc
+            .question_tx
+            .lock()
+            .expect("slot")
+            .clone()
+            .expect("sender set");
+        first
             .send(QuestionRequest {
                 questions: vec![Question {
                     question: "ok?".to_string(),
@@ -222,9 +236,13 @@ mod tests {
                 }],
             })
             .expect("receiver alive");
-        twin.question_tx
-            .as_ref()
-            .expect("tx set on clone")
+        let second = twin
+            .question_tx
+            .lock()
+            .expect("slot on clone")
+            .clone()
+            .expect("sender set on clone");
+        second
             .send(QuestionRequest {
                 questions: Vec::new(),
             })
@@ -238,13 +256,13 @@ mod tests {
     }
 
     #[test]
-    fn debug_reports_question_tx_presence_not_the_channel() {
-        // mpsc::Sender is not Debug; the Debug impl must report presence as a
-        // bool rather than the channel itself.
+    fn debug_reports_channel_presence_not_the_channel() {
+        // The slot holds an mpsc::Sender, which is not Debug; the Debug impl
+        // must report presence as a bool rather than the channel itself.
         let with_tx = {
             let (tx, _rx) = mpsc::channel::<QuestionRequest>();
             RunnerContext {
-                question_tx: Some(tx),
+                question_tx: Arc::new(Mutex::new(Some(tx))),
                 ..sample()
             }
         };
