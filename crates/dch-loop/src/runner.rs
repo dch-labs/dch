@@ -354,14 +354,14 @@ impl RunnerBuilder<'_> {
             question_tx: Arc::new(std::sync::Mutex::new(None)),
         });
 
-        let mut providers = connect_mcp_servers(self.config).await?;
+        let client = crate::create_client(&self.config.api)?;
+        let mut providers = connect_mcp_servers(self.config, &self.workdir).await?;
         providers.extend(self.mcp_providers);
         let registry = compose_registry(&providers);
         let core_registry = compose_registry(&providers);
 
         let session_config = build_session(self.config, &registry, &self.workdir);
         let run_config = self.config.to_run_config();
-        let client = crate::create_client(&self.config.api)?;
 
         let mut managers = LoopManagers::new();
         for observer in self.observers {
@@ -398,7 +398,8 @@ impl RunnerBuilder<'_> {
 /// Each `[[mcp.servers]]` entry is launched over the stdio transport and its
 /// tools discovered under the server's name prefix. A server that fails to
 /// spawn or complete the MCP handshake fails construction naming the server —
-/// a silently missing tool set is worse than a clear startup error.
+/// a silently missing tool set is worse than a clear startup error. The child
+/// runs in `workdir`, the same directory builtin tools resolve paths against.
 ///
 /// # Errors
 ///
@@ -406,6 +407,7 @@ impl RunnerBuilder<'_> {
 /// or handshake failure.
 async fn connect_mcp_servers(
     config: &dch_config::DchConfig,
+    workdir: &Path,
 ) -> Result<Vec<McpToolProvider>, RunnerError> {
     let mut providers = Vec::new();
     for server in &config.mcp.servers {
@@ -417,7 +419,7 @@ async fn connect_mcp_servers(
                 .iter()
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect(),
-            cwd: None,
+            cwd: Some(workdir.to_string_lossy().into_owned()),
         };
         let client = McpClient::stdio(command)
             .await

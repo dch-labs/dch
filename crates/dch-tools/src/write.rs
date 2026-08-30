@@ -198,6 +198,7 @@ mod tests {
         let written = std::fs::read_to_string(tmp.path().join("new.rs")).unwrap();
         assert!(written.contains("hello"));
         assert!(out.text_content().contains("Created: new.rs"));
+        assert_eq!(out.display_hint, Some(DisplayHint::Diff));
     }
 
     #[tokio::test]

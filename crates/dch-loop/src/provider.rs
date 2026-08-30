@@ -169,19 +169,20 @@ impl ApiClient for DchClient {
 /// Build a [`DchClient`] for the provider named by `config.api_type`.
 ///
 /// Variants are mapped by wire-protocol family: OpenAI-compatible providers
-/// (`OpenAi`, `Ollama`, `DeepSeek`, `Grok`) wrap an [`OpenAiClient`];
-/// Anthropic-compatible providers (`Anthropic`, `Zai`) wrap an
-/// [`AnthropicClient`]; `Gemini` wraps a [`GeminiClient`]. An empty `base_url`
-/// falls back to [`ApiType::default_base_url`].
+/// (`OpenAi`, `Ollama`, `DeepSeek`, `Grok`, `Azure`, `Moonshot`) wrap an
+/// [`OpenAiClient`]; Anthropic-compatible providers (`Anthropic`, `Zai`) wrap
+/// an [`AnthropicClient`]; `Gemini` wraps a [`GeminiClient`]. An empty
+/// `base_url` falls back to [`ApiType::default_base_url`].
 ///
 /// # API-key resolution
 ///
 /// `config.api_key` wins. When `None`, the factory falls back to the family's
 /// conventional environment variable (`OPENAI_API_KEY` for the OpenAI family,
 /// `ANTHROPIC_API_KEY` for the Anthropic family, `GEMINI_API_KEY` or
-/// `GOOGLE_API_KEY` for Gemini). `Ollama` needs no key and is given a dummy.
-/// If a required key is missing, returns [`RunnerError::Client`] naming the
-/// expected environment variable.
+/// `GOOGLE_API_KEY` for Gemini, `AZURE_OPENAI_API_KEY` for Azure, and
+/// `MOONSHOT_API_KEY` for Moonshot). `Ollama` needs no key and is given a
+/// dummy. If a required key is missing, returns [`RunnerError::Client`]
+/// naming the expected environment variable.
 ///
 /// # Errors
 ///
@@ -240,61 +241,130 @@ pub fn create_client(config: &ApiConfig) -> Result<DchClient, RunnerError> {
 
 /// Build the Azure OpenAI client for `config`.
 ///
-/// The resource name comes from [`ApiConfig::azure_resource`] or the
-/// `AZURE_OPENAI_RESOURCE` environment variable; the credential and deployment
-/// model follow the provider profile (`AZURE_OPENAI_API_KEY` and
-/// `AZURE_OPENAI_MODEL`, both required by the endpoint style). A non-empty
-/// [`ApiConfig::model`] overrides the deployment model from configuration.
+/// The resource name comes from [`ApiConfig::azure_resource`] or, when that
+/// is unset or empty, the `AZURE_OPENAI_RESOURCE` environment variable; the
+/// endpoint is the resource's deployment-style URL. Credential and model
+/// resolve like every other provider: [`ApiConfig::api_key`] wins, otherwise
+/// `AZURE_OPENAI_API_KEY`; [`ApiConfig::model`] wins, otherwise the
+/// `AZURE_OPENAI_MODEL` environment variable. `request_timeout_secs` bounds
+/// each request's read gap.
 ///
 /// # Errors
 ///
-/// Returns [`RunnerError::Client`] when the resource name is unresolvable or
-/// the provider profile rejects its environment.
+/// Returns [`RunnerError::Client`] when the resource name is unset or
+/// malformed, the model is unresolvable, the API key is missing, or the HTTP
+/// client cannot be constructed.
 fn build_azure(config: &ApiConfig) -> Result<OpenAiClient, RunnerError> {
-    let resource = config.azure_resource.clone().or_else(|| {
-        std::env::var("AZURE_OPENAI_RESOURCE")
-            .ok()
-            .filter(|v| !v.is_empty())
-    });
+    let resource = config
+        .azure_resource
+        .clone()
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            std::env::var("AZURE_OPENAI_RESOURCE")
+                .ok()
+                .filter(|value| !value.is_empty())
+        });
     let resource = resource.ok_or_else(|| {
         RunnerError::Client(
             "azure: no resource name: set api.azure_resource or AZURE_OPENAI_RESOURCE".to_string(),
         )
     })?;
-    let client =
-        loopctl::provider::azure(&resource).map_err(|e| RunnerError::Client(e.to_string()))?;
-    if !config.model.is_empty() && client.model() != config.model {
-        client.set_model(&config.model);
-    }
-    Ok(client)
+    validate_azure_resource(&resource)?;
+    let model = model_or_env(config, "azure", "AZURE_OPENAI_MODEL")?;
+    let base_url = format!("https://{resource}.openai.azure.com/openai/v1");
+    profile_openai_client(config, base_url, model)
 }
 
 /// Build the Moonshot client for `config`.
 ///
-/// Uses the provider profile (`MOONSHOT_API_KEY`, optional `MOONSHOT_MODEL`)
-/// unless [`ApiConfig::base_url`] is set, in which case an OpenAI-protocol
-/// client is built against that URL with the usual key resolution. A non-empty
-/// [`ApiConfig::model`] overrides the profile's model.
+/// An OpenAI-protocol client pointed at [`ApiConfig::base_url`] when set, or
+/// Moonshot's default endpoint otherwise. Credential and model resolve like
+/// every other provider: [`ApiConfig::api_key`] wins, otherwise
+/// `MOONSHOT_API_KEY`; [`ApiConfig::model`] wins, otherwise the
+/// `MOONSHOT_MODEL` environment variable. `request_timeout_secs` bounds each
+/// request's read gap.
 ///
 /// # Errors
 ///
-/// Returns [`RunnerError::Client`] when the profile rejects its environment or
-/// the HTTP client cannot be constructed.
+/// Returns [`RunnerError::Client`] when the model or API key is unresolvable
+/// or the HTTP client cannot be constructed.
 fn build_moonshot(config: &ApiConfig) -> Result<OpenAiClient, RunnerError> {
-    if !config.base_url.is_empty() {
-        return OpenAiClient::builder()
-            .with_api_key(resolve_api_key(config)?)
-            .with_base_url(config.base_url.clone())
-            .with_model(config.model.as_str())
-            .with_timeout(Duration::from_secs(config.request_timeout_secs))
-            .build()
-            .map_err(|e| RunnerError::Client(e.to_string()));
+    let model = model_or_env(config, "moonshot", "MOONSHOT_MODEL")?;
+    profile_openai_client(config, effective_base_url(config), model)
+}
+
+/// Construct the OpenAI-protocol client shared by the profile providers.
+///
+/// Applies the uniform resolution order — [`resolve_api_key`] for the
+/// credential, the provider's `request_timeout_secs` for the read gap — on
+/// top of the caller's resolved `base_url` and `model`.
+///
+/// # Errors
+///
+/// Returns [`RunnerError::Client`] when the API key is missing or the HTTP
+/// client cannot be constructed.
+fn profile_openai_client(
+    config: &ApiConfig,
+    base_url: String,
+    model: String,
+) -> Result<OpenAiClient, RunnerError> {
+    OpenAiClient::builder()
+        .with_api_key(resolve_api_key(config)?)
+        .with_base_url(base_url)
+        .with_model(model)
+        .with_timeout(Duration::from_secs(config.request_timeout_secs))
+        .build()
+        .map_err(|e| RunnerError::Client(e.to_string()))
+}
+
+/// Resolve the deployment model for a profile provider.
+///
+/// [`ApiConfig::model`] wins when non-empty; otherwise the provider profile's
+/// environment variable supplies the model.
+///
+/// # Errors
+///
+/// Returns [`RunnerError::Client`] naming both sources when neither is set.
+fn model_or_env(config: &ApiConfig, provider: &str, env_var: &str) -> Result<String, RunnerError> {
+    if !config.model.is_empty() {
+        return Ok(config.model.clone());
     }
-    let client = loopctl::provider::moonshot().map_err(|e| RunnerError::Client(e.to_string()))?;
-    if !config.model.is_empty() && client.model() != config.model {
-        client.set_model(&config.model);
+    std::env::var(env_var)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            RunnerError::Client(format!("{provider}: no model: set api.model or {env_var}"))
+        })
+}
+
+/// Reject a resource name that cannot form a valid deployment endpoint.
+///
+/// Azure resource names are 2–64 characters of alphanumerics and hyphens,
+/// starting and ending with an alphanumeric; anything else would fail later
+/// with a confusing request error instead of a clear configuration one.
+///
+/// # Errors
+///
+/// Returns [`RunnerError::Client`] naming the malformed resource.
+fn validate_azure_resource(resource: &str) -> Result<(), RunnerError> {
+    let chars_ok = resource
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-');
+    let edges_ok = resource
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric())
+        && resource
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_alphanumeric());
+    if (2..=64).contains(&resource.chars().count()) && chars_ok && edges_ok {
+        return Ok(());
     }
-    Ok(client)
+    Err(RunnerError::Client(format!(
+        "azure: resource name {resource:?} must be 2-64 characters of alphanumerics \
+         and hyphens, starting and ending with an alphanumeric"
+    )))
 }
 
 /// Build the Bedrock client for `config`.
@@ -792,6 +862,113 @@ mod tests {
         );
         let client = create_client(&c).expect("moonshot with base_url builds directly");
         assert_eq!(client.model(), "test-model");
+    }
+
+    #[test]
+    fn azure_config_api_key_builds_without_env_key() {
+        let env = loopctl::testing::EnvGuard::acquire(&[
+            "AZURE_OPENAI_RESOURCE",
+            "AZURE_OPENAI_API_KEY",
+            "AZURE_OPENAI_MODEL",
+        ]);
+        env.set("AZURE_OPENAI_RESOURCE", "my-resource");
+        env.remove("AZURE_OPENAI_API_KEY");
+        env.set("AZURE_OPENAI_MODEL", "deployment-a");
+        let mut c = cfg(ApiType::Azure, "", Some("cfg-key"));
+        c.azure_resource = None;
+        let client = create_client(&c).expect("azure builds with the configured key");
+        assert_eq!(client.model(), "test-model", "the configured model wins");
+    }
+
+    #[test]
+    fn azure_empty_configured_resource_falls_back_to_env() {
+        let env = loopctl::testing::EnvGuard::acquire(&[
+            "AZURE_OPENAI_RESOURCE",
+            "AZURE_OPENAI_API_KEY",
+            "AZURE_OPENAI_MODEL",
+        ]);
+        env.set("AZURE_OPENAI_RESOURCE", "env-resource");
+        env.set("AZURE_OPENAI_API_KEY", "env-key");
+        env.set("AZURE_OPENAI_MODEL", "deployment-a");
+        let mut c = cfg(ApiType::Azure, "", Some("k"));
+        c.azure_resource = Some(String::new());
+        let client = create_client(&c).expect("empty configured resource defers to the env");
+        assert!(
+            client
+                .base_url()
+                .starts_with("https://env-resource.openai.azure.com"),
+            "the env resource must form the endpoint: {}",
+            client.base_url()
+        );
+    }
+
+    #[test]
+    fn azure_model_from_config_needs_no_env_model() {
+        let env = loopctl::testing::EnvGuard::acquire(&[
+            "AZURE_OPENAI_RESOURCE",
+            "AZURE_OPENAI_API_KEY",
+            "AZURE_OPENAI_MODEL",
+        ]);
+        env.set("AZURE_OPENAI_RESOURCE", "my-resource");
+        env.set("AZURE_OPENAI_API_KEY", "env-key");
+        env.remove("AZURE_OPENAI_MODEL");
+        let c = cfg(ApiType::Azure, "", Some("k"));
+        let client = create_client(&c).expect("the configured model must satisfy azure");
+        assert_eq!(client.model(), "test-model");
+    }
+
+    #[test]
+    fn azure_rejects_malformed_resource_name() {
+        let env = loopctl::testing::EnvGuard::acquire(&[
+            "AZURE_OPENAI_RESOURCE",
+            "AZURE_OPENAI_API_KEY",
+            "AZURE_OPENAI_MODEL",
+        ]);
+        env.remove("AZURE_OPENAI_RESOURCE");
+        env.remove("AZURE_OPENAI_MODEL");
+        let mut c = cfg(ApiType::Azure, "", Some("k"));
+        c.azure_resource = Some("bad resource!".to_string());
+        let err = create_client(&c)
+            .err()
+            .expect("a malformed resource name must be rejected");
+        let RunnerError::Client(msg) = &err else {
+            panic!("expected Client error, got {err:?}");
+        };
+        assert!(
+            msg.contains("resource name"),
+            "error must name the malformed resource: {msg}"
+        );
+    }
+
+    #[test]
+    fn moonshot_config_api_key_builds_without_env_key() {
+        let env = loopctl::testing::EnvGuard::acquire(&["MOONSHOT_API_KEY", "MOONSHOT_MODEL"]);
+        env.remove("MOONSHOT_API_KEY");
+        env.remove("MOONSHOT_MODEL");
+        let c = cfg(ApiType::Moonshot, "", Some("cfg-key"));
+        let client = create_client(&c).expect("moonshot builds with the configured key");
+        let DchClient::OpenAi(_) = client else {
+            panic!("moonshot rides the OpenAI-protocol variant");
+        };
+    }
+
+    #[test]
+    fn moonshot_missing_model_and_env_names_both_sources() {
+        let env = loopctl::testing::EnvGuard::acquire(&["MOONSHOT_API_KEY", "MOONSHOT_MODEL"]);
+        env.set("MOONSHOT_API_KEY", "env-key");
+        env.remove("MOONSHOT_MODEL");
+        let mut c = cfg(ApiType::Moonshot, "", None);
+        c.model = String::new();
+        let err = create_client(&c)
+            .err()
+            .expect("no model anywhere must error");
+        let RunnerError::Client(msg) = &err else {
+            panic!("expected Client error, got {err:?}");
+        };
+        assert!(
+            msg.contains("api.model") && msg.contains("MOONSHOT_MODEL"),
+            "error must name both model sources: {msg}"
+        );
     }
 
     #[test]

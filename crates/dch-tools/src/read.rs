@@ -248,15 +248,15 @@ async fn read_capped(path: &std::path::Path) -> Result<Vec<u8>, ToolError> {
 /// precedence.
 ///
 /// Explicit `offset`/`limit` win; otherwise `line_range`; otherwise the full
-/// file. Integer parsing goes through [`get_usize`], so a negative or
-/// non-integer `offset`/`limit` is rejected loudly with the field named rather
-/// than silently coerced to a default.
+/// file. The input arrives as [`ReadInput`], whose serde deserialization has
+/// already rejected negative or non-integer values as invalid input, so a
+/// missing field here means the caller omitted it — never that it was
+/// malformed.
 ///
 /// # Errors
 ///
-/// Returns [`ToolError::InvalidInput`] when `offset` or `limit` is zero, when
-/// either is not a valid non-negative integer (per [`get_usize`]), or when
-/// `line_range` fails to parse.
+/// Returns [`ToolError::InvalidInput`] when `offset` or `limit` is zero or
+/// when `line_range` fails to parse.
 fn resolve_range(input: &Value) -> Result<(usize, usize), ToolError> {
     let offset = get_usize(input, "offset")?;
     let limit = get_usize(input, "limit")?;
@@ -551,6 +551,7 @@ mod tests {
         let out = read(input(path.to_str().unwrap()), cwd).await.unwrap();
         assert!(!out.is_error);
         assert_eq!(out.text_content(), "hello world\n");
+        assert_eq!(out.display_hint, Some(DisplayHint::Suppress));
     }
 
     #[tokio::test]

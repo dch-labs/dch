@@ -756,6 +756,7 @@ mod tests {
             !text.contains("fn foo()"),
             "no content in succinct mode: {text}"
         );
+        assert_eq!(out.display_hint, Some(DisplayHint::Json));
     }
 
     #[tokio::test]

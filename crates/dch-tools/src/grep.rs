@@ -464,6 +464,7 @@ mod tests {
         let files: Vec<&str> = parsed.iter().map(|v| v["file"].as_str().unwrap()).collect();
         assert!(files.contains(&"a.rs"));
         assert!(files.contains(&"b.txt"));
+        assert_eq!(out.display_hint, Some(DisplayHint::Json));
     }
 
     #[tokio::test]

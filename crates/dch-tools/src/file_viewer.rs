@@ -806,13 +806,13 @@ mod tests {
     #[tokio::test]
     async fn happy_path_page_mode() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let f = tmp.path().join("f.txt");
+        let f = tmp.path().join("f.rs");
         let content: String = (1..=250).map(|i| format!("line {i}\n")).collect();
         std::fs::write(&f, &content).unwrap();
         let cwd = tmp.path().to_str().unwrap();
         let tool = FileViewerInput::default();
         let ctx = ctx_in(cwd);
-        let input = json!({"file_path": "f.txt"});
+        let input = json!({"file_path": "f.rs"});
         let out = tool.call(input, &ctx).await.unwrap();
         assert!(!out.is_error, "{}", out.text_content());
         let text = out.text_content();
@@ -821,6 +821,12 @@ mod tests {
         assert!(text.contains("line 1"), "{text}");
         assert!(text.contains("line 100"), "{text}");
         assert!(!text.contains("line 101"), "{text}");
+        assert_eq!(
+            out.display_hint,
+            Some(DisplayHint::Code {
+                language: "rust".to_string()
+            })
+        );
     }
 
     #[tokio::test]

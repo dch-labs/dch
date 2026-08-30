@@ -1465,6 +1465,7 @@ mod tests {
         let written = std::fs::read_to_string(&f).unwrap();
         assert!(written.contains("delta"), "{written}");
         assert!(written.contains("alpha"), "{written}");
+        assert_eq!(out.display_hint, Some(DisplayHint::Diff));
     }
 
     #[tokio::test]
@@ -1493,6 +1494,7 @@ mod tests {
             "{}",
             out.text_content()
         );
+        assert_eq!(out.display_hint, Some(DisplayHint::Diff));
         // Nothing written.
         assert_eq!(std::fs::read_to_string(&f1).unwrap(), orig1);
         assert_eq!(std::fs::read_to_string(&f2).unwrap(), orig2);

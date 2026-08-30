@@ -217,11 +217,11 @@ fn verify_symlinks_inside(resolved: &Path, base: &Path) -> Result<(), ToolError>
 
 /// Recursively verify that `target` (a resolved symlink target) stays within `base`.
 ///
-/// Follows further symlinks in its existing prefix. `visited` accumulates canonicalized paths already examined, bounding
-/// symlink cycles. A target that itself contains symlinks is walked the same
-/// way [`verify_symlinks_inside`] walks the original path. Returns `true`
-/// when `target` (and every symlink in its existing prefix) stays inside
-/// `base`.
+/// Follows further symlinks in its existing prefix. `visited` accumulates the
+/// lexically normalized paths already examined, bounding symlink cycles. A
+/// target that itself contains symlinks is walked the same way
+/// [`verify_symlinks_inside`] walks the original path. Returns `true` when
+/// `target` (and every symlink in its existing prefix) stays inside `base`.
 ///
 /// # Errors
 ///

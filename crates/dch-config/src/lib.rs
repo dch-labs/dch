@@ -406,6 +406,7 @@ pub struct McpConfig {
     /// Servers to connect at startup, in configuration order.
     ///
     /// Defaults to empty — no external tools.
+    #[serde(default)]
     pub servers: Vec<McpServerConfig>,
 }
 
@@ -1126,6 +1127,12 @@ redact_secrets = false
         write_config(tmp.path(), "config.toml", "[api model = \"x\"\n");
         let err = DchConfig::load_from_dir(tmp.path()).unwrap_err();
         assert!(matches!(err, DchConfigError::Parse(_)));
+    }
+
+    #[test]
+    fn present_but_empty_mcp_section_parses_as_no_servers() {
+        let c: DchConfig = toml::from_str("[mcp]\n").unwrap();
+        assert!(c.mcp.servers.is_empty());
     }
 
     #[test]

@@ -460,6 +460,7 @@ mod tests {
         assert!(!written.contains("hi"));
         assert!(out.text_content().contains("Changed: src.rs"));
         assert!(out.text_content().contains("+ "));
+        assert_eq!(out.display_hint, Some(DisplayHint::Diff));
     }
 
     #[tokio::test]
