@@ -207,9 +207,9 @@ pub struct CommonInput {
 ///
 /// # Errors
 ///
-/// Returns [`ToolError::InvalidInput`] when `pattern` is missing, when
-/// `max_results` is present but not a non-negative integer, or when an
-/// array field is present but not a JSON array.
+/// Returns [`ToolError::InvalidInput`] when `pattern` is missing, when a
+/// numeric field is present but not a non-negative integer, or when an array
+/// field is present but not a JSON array.
 pub fn parse_input(
     input: &serde_json::Value,
     default_max_results: usize,
@@ -285,14 +285,15 @@ pub fn compile_pattern(pattern: &str, case_insensitive: bool) -> Result<Regex, T
         .map_err(|e| ToolError::InvalidInput(format!("Invalid regex pattern: {e}")))
 }
 
-/// Walk `job.base`, scan each non-binary file via `scan_file`, collect up to
-/// `job.max_results` [`Match`]es total.
+/// Walk `job.base` and collect up to `job.max_results` [`Match`]es total.
 ///
-/// This is the shared heart of both content-search tools. It owns:
+/// Each non-binary file is scanned via `scan_file`. This is the shared heart
+/// of both content-search tools. It owns:
 /// - the gitignore-aware directory walk (via [`walk::walk_files`]),
 /// - the binary-file skip (via [`walk::likely_binary`]),
 /// - the file-size guard against OOM on huge files (via [`walk::file_too_large`]),
-/// - the whole-file read (`std::fs::read_to_string`),
+/// - a size-capped read followed by UTF-8 validation (files that fail
+///   either are silently skipped),
 /// - and **both caps** — the global `max_results` ceiling (the walk stops once
 ///   it's reached) and the per-file `per_file_cap` (each file's scan is
 ///   limited to `min(per_file_cap, remaining_under_max_results)` when set).

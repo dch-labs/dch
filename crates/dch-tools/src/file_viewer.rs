@@ -31,16 +31,15 @@ const MAX_PAGE_SIZE: usize = 500;
 /// Which rendering mode the caller asked for.
 ///
 /// Selected by the `output_format` parameter in the tool's input schema. The
-/// enum is the seam that future syntax-highlighting work (post-v1, in the TUI
-/// layer) would plug into — for v1, `Plain` and `Markdown` are fully wired and
-/// `Colored` degrades to plain.
+/// `Plain` and `Markdown` are fully wired; `Colored` degrades to plain (ANSI
+/// escapes are never emitted in tool text output).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum OutputFormat {
     /// Plain text with line numbers.
     ///
     /// The default when `output_format` is omitted or set to `"plain"`. Each
-    /// line is rendered as `{line_num:>6} │ {content}` with no decoration,
-    /// decoration, or ANSI escapes. This is what the headless runner and the
+    /// line is rendered as `{line_num:>6} │ {content}` with no decoration
+    /// or ANSI escapes. This is what the headless runner and the
     /// model itself consume; it must be solid and token-efficient.
     #[default]
     Plain,
@@ -48,12 +47,10 @@ enum OutputFormat {
     /// ANSI-colored output.
     ///
     /// Accepted when the caller passes `"colored"`, `"color"`, or `"ansi"`,
-    /// but for v1 **degrades to plain** — no ANSI escape bytes are emitted.
-    /// Real syntax highlighting lives in the TUI layer (via the theme system
-    /// and tree-sitter captures), not in tool text output, where ANSI escapes
-    /// waste model tokens. This variant exists so prompts that request it
-    /// don't break; it will be wired post-v1 if a headless `--color` mode is
-    /// wanted.
+    /// but **degrades to plain** — no ANSI escape bytes are emitted, since
+    /// escapes waste model tokens. Syntax highlighting belongs to the TUI's
+    /// theme system, not to tool text output. The variant exists so callers
+    /// requesting it get a usable answer rather than an error.
     Colored,
 
     /// Markdown-fenced output.
@@ -102,28 +99,56 @@ impl OutputFormat {
          line access."
 )]
 pub struct FileViewerInput {
-    /// The path to the file to view
+    /// The path to the file to view.
+    ///
+    /// May be relative, in which case it is resolved against the runner's cwd,
+    /// not the process's. URLs are rejected; a missing file is a soft error,
+    /// not an invalid-input error.
     file_path: String,
-    /// Page number (1-indexed)
+
+    /// Page number to view, 1-indexed (default: 1).
+    ///
+    /// Sequential navigation mode together with `page_size`: page `n` shows
+    /// lines `(n - 1) * page_size + 1` through `n * page_size`. Ignored when
+    /// `offset` is supplied; zero is rejected as invalid input.
     #[serde(skip_serializing_if = "Option::is_none")]
     page: Option<usize>,
-    /// Number of lines per page
+
+    /// Number of lines per page (default: 100, clamped to 500).
+    ///
+    /// Also serves as the default window size in offset mode when `limit` is
+    /// omitted. Large requests are lowered to the cap to bound token usage.
     #[serde(skip_serializing_if = "Option::is_none")]
     page_size: Option<usize>,
-    /// Starting line number (1-indexed, alternative to page)
+
+    /// Starting line of the window, 1-indexed — alternative to `page`.
+    ///
+    /// Direct-seek navigation mode: when present it takes precedence over
+    /// `page`/`page_size`, and the window size comes from `limit`. Zero is
+    /// rejected as invalid input; a start beyond the file's last line is a
+    /// soft over-seek error.
     #[serde(skip_serializing_if = "Option::is_none")]
     offset: Option<usize>,
-    /// Maximum number of lines to return (alternative to page_size)
+
+    /// Maximum number of lines to return — alternative to `page_size`.
+    ///
+    /// Applies only in offset mode; clamped to 500 together with `page_size`.
+    /// When omitted, the offset-mode window uses `page_size`.
     #[allow(clippy::doc_markdown)]
     #[serde(skip_serializing_if = "Option::is_none")]
     limit: Option<usize>,
-    /// Output format: 'plain' (default), 'colored', or 'markdown'
+
+    /// Output format: 'plain' (default), 'colored', or 'markdown'.
+    ///
+    /// Matching is case-insensitive and accepts aliases ('md' for markdown,
+    /// 'color'/'ansi' for colored). 'colored' degrades to plain output; any
+    /// unrecognized value falls back to plain.
     #[serde(skip_serializing_if = "Option::is_none")]
     output_format: Option<String>,
 }
 
 impl FileViewerInput {
-    /// Deserializes the typed input and delegates to `view_inner`.
+    /// Serializes the typed input and delegates to `view_inner`.
     ///
     /// # Errors
     ///
@@ -200,7 +225,7 @@ struct ParsedInput<'a> {
     /// The file path exactly as supplied by the caller, before cwd resolution.
     ///
     /// Borrowed from the input JSON (`'a`) — no allocation. Kept in its raw
-    /// form so headers, error messages, and diff output show the path the
+    /// form so headers and error messages show the path the
     /// model named, not the resolved absolute path.
     file_path: &'a str,
 
@@ -212,8 +237,10 @@ struct ParsedInput<'a> {
     output_format: OutputFormat,
 }
 
-/// Extract the file path and output format from the input, validating the
-/// path is present and not a URL.
+/// Extract the file path and output format from the input.
+///
+/// The path must be present and not a URL; the format is optional and
+/// defaults to plain.
 ///
 /// # Errors
 ///
@@ -260,8 +287,7 @@ async fn read_content(full_path: &Path) -> Result<Option<String>, ToolError> {
     Ok(Some(content))
 }
 
-/// Render the header + numbered body lines + navigation hint into a single
-/// output string.
+/// Render the header, numbered body lines, and navigation hint as one string.
 ///
 /// Builds the full tool output in three parts: the [`ViewBounds::format_header`]
 /// two-line header, the numbered body lines (`{:>6} │ {content}`), and the
@@ -331,7 +357,8 @@ struct ViewBounds {
     /// Last line number in the window (1-indexed, inclusive).
     ///
     /// Computed as `start + window_size - 1`. The actual rendered end may be
-    /// clamped to `total` if the window extends past the file's last line.
+    /// clamped to the file's line count (minimum 1) if the window extends
+    /// past the file's last line.
     end: usize,
 
     /// Total number of lines in the file.
@@ -379,9 +406,10 @@ impl ViewBounds {
         )
     }
 
-    /// Format the trailing `[Navigate: …]` hint telling the model which
-    /// parameter values retrieve the next or previous window.
+    /// Format the trailing `[Navigate: …]` hint for the model.
     ///
+    /// The hint tells the model which parameter values retrieve the next or
+    /// previous window.
     /// In page-based mode, the hint offers `page=N+1` (if not the last page)
     /// and `page=N-1` (if not the first). In both modes, `offset=1` is
     /// offered when the window doesn't start at line 1, and `offset=end+1`

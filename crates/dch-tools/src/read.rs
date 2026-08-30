@@ -51,21 +51,42 @@ const DEFAULT_OFFSET_LIMIT: usize = 200;
          continue reading past truncation, use FileViewer with offset/limit parameters."
 )]
 pub struct ReadInput {
-    /// The path to the file to read
+    /// The path to the file to read.
+    ///
+    /// May be absolute or relative; relative paths are resolved against the
+    /// runner's working directory. The path must name a regular file — a
+    /// directory yields a soft error pointing at `Glob`/`Grep` — and URLs are
+    /// rejected.
     file_path: String,
-    /// Starting line number (1-indexed). Lines before this offset are skipped.
+
+    /// Starting line number (1-indexed).
+    ///
+    /// Lines before this offset are skipped, and the output is prefixed with a
+    /// marker telling the model earlier lines were omitted. Defaults to 1
+    /// (read from the start); must be at least 1.
     #[serde(skip_serializing_if = "Option::is_none")]
     offset: Option<usize>,
+
     /// Maximum number of lines to return (default 200).
+    ///
+    /// Counted from the offset; when the view extends past the end of the
+    /// file, the output ends with a truncation marker naming the next offset
+    /// to use. Values above the 200-line ceiling are clamped to it; like
+    /// `offset`, zero is rejected as invalid input.
     #[serde(skip_serializing_if = "Option::is_none")]
     limit: Option<usize>,
-    /// Line range to read (alternative to offset/limit). Examples: '1-100', '50:', ':100'. Ignored if offset or limit are also specified.
+
+    /// Line range to read, as an alternative to `offset`/`limit`.
+    ///
+    /// Supported formats: `'1-100'` (lines 1 to 100), `'50:'` (line 50 to the
+    /// end), `':100'` (first 100 lines), or a single line number. Ignored when
+    /// `offset` or `limit` is also specified — the explicit fields win.
     #[serde(skip_serializing_if = "Option::is_none")]
     line_range: Option<String>,
 }
 
 impl ReadInput {
-    /// Deserializes the typed input and delegates to `read_inner`.
+    /// Serializes the typed input and delegates to `read_inner`.
     ///
     /// # Errors
     ///
@@ -223,12 +244,13 @@ async fn read_capped(path: &std::path::Path) -> Result<Vec<u8>, ToolError> {
     Ok(buf)
 }
 
-/// Resolve `(offset, limit)` from the input, honoring the documented precedence:
-/// explicit `offset`/`limit` win; otherwise `line_range`; otherwise full file.
+/// Resolve `(offset, limit)` from the input, honoring the documented
+/// precedence.
 ///
-/// Integer parsing goes through [`get_usize`], so a negative or non-integer
-/// `offset`/`limit` is rejected loudly with the field named rather than
-/// silently coerced to a default.
+/// Explicit `offset`/`limit` win; otherwise `line_range`; otherwise the full
+/// file. Integer parsing goes through [`get_usize`], so a negative or
+/// non-integer `offset`/`limit` is rejected loudly with the field named rather
+/// than silently coerced to a default.
 ///
 /// # Errors
 ///
@@ -286,8 +308,9 @@ fn resolve_range(input: &Value) -> Result<(usize, usize), ToolError> {
 /// Three fast paths bypass the marker logic:
 ///
 /// - `offset` beyond the file length → a one-line "beyond file length" message.
-/// - The whole file fits (`offset == 1` and the view reaches the last line) →
-///   the raw content is returned with no markers.
+/// - The whole file fits (`offset == 1`, the view reaches the last line, and
+///   the joined view is under the byte cap) → the raw content is returned
+///   with no markers.
 /// - A partial view that starts past line 1 → a `[Lines before offset N
 ///   omitted]` header precedes the content.
 fn format_text(content: &str, file_path: &str, offset: usize, limit: usize) -> ToolOutput {

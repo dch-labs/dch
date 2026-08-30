@@ -1,8 +1,13 @@
 //! Errors raised while constructing or running a runner.
-
-/// Each variant carries a string rather than the upstream error type, because
-/// `dch_config::DchConfigError` wraps non-`Clone` errors while this enum must
-/// remain `Clone`.
+//!
+//! Each variant carries a string rather than the upstream error type, because
+//! `dch_config::DchConfigError` wraps non-`Clone` errors while this enum must
+//! remain `Clone`.
+/// Error type for runner construction and execution failures.
+///
+/// Every variant carries its detail as a [`String`] so the enum stays
+/// [`Clone`], which the observer plumbing requires; the upstream error types
+/// are rendered to text at the conversion site.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum RunnerError {
     /// Failed to construct the API client.

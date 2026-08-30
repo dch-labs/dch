@@ -16,7 +16,8 @@ use crate::write::WriteInput;
 /// Build a [`ToolRegistry`] populated with every builtin tool.
 ///
 /// Each builtin tool is registered here. Downstream callers (the runner)
-/// invoke this once at startup. Later tool tasks append their registrations.
+/// invoke this once for the engine registry and again for the dispatch
+/// pipeline's core, so the two positions agree by construction.
 #[must_use]
 pub fn builtin_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::new();

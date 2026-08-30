@@ -34,17 +34,32 @@ use crate::util::resolve_path;
          for supported file types (.rs, .json, .py, .js, .ts, etc.)"
 )]
 pub struct WriteInput {
-    /// The path to the file to write
+    /// The path to the file to write.
+    ///
+    /// May be absolute or relative; relative paths are resolved against the
+    /// runner's working directory. Parent directories are created as needed,
+    /// and an existing file is overwritten in full — prefer Edit for targeted
+    /// changes to an existing file. URLs are rejected.
     file_path: String,
-    /// The content to write
+
+    /// The content to write.
+    ///
+    /// The complete new contents of the file, not a patch or fragment. The
+    /// linter gate validates it for supported file types before the write
+    /// happens, so malformed syntax is blocked rather than written to disk.
     content: String,
-    /// Skip syntax validation (not recommended)
+
+    /// Skip syntax validation (not recommended).
+    ///
+    /// When `true`, the linter gate is bypassed and the file is written even
+    /// if the content has syntax errors. Defaults to `false`; the gate exists
+    /// to prevent file corruption from malformed output.
     #[serde(skip_serializing_if = "Option::is_none")]
     skip_linter: Option<bool>,
 }
 
 impl WriteInput {
-    /// Deserializes the typed input and delegates to `write_inner`.
+    /// Serializes the typed input and delegates to `write_inner`.
     ///
     /// # Errors
     ///
@@ -62,8 +77,8 @@ impl WriteInput {
     /// # Errors
     ///
     /// Returns [`ToolError`] for a missing `RunnerContext`, a missing
-    /// `file_path`, a missing `content`, or a file-system error during the
-    /// atomic write.
+    /// `file_path`, a missing `content`, a URL `file_path` or a path escaping
+    /// the working directory, or a file-system error during the atomic write.
     async fn write_inner(
         &self,
         input: Value,
@@ -109,10 +124,10 @@ impl WriteInput {
 }
 
 /// Format a [`LinterResult`] failure as a human-readable message for the tool
-/// output, shared by Write and Edit.
+/// output.
 ///
-/// The message is structured so the model can read the error list and correct
-/// its output:
+/// Shared by Write and Edit. The message is structured so the model can read
+/// the error list and correct its output:
 ///
 /// ```text
 /// Syntax validation failed for src/main.rs:

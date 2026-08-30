@@ -94,11 +94,11 @@ enum JobStatus {
     /// Polled by `job_status` until it transitions to a terminal variant.
     Running,
 
-    /// Finished successfully (exit code zero).
+    /// Finished successfully.
     ///
-    /// The payload is the combined stdout and stderr captured over the job's
-    /// lifetime, merged in arrival order. Returned to the model as the tool
-    /// output when it polls a completed job.
+    /// The payload is the job's final tool output: stdout followed by stderr,
+    /// plus the `[exit …, …ms]` metadata line. Returned to the model when it
+    /// polls a completed job.
     Completed(String),
 
     /// Failed or timed out.
@@ -258,8 +258,7 @@ fn cleanup_jobs() -> usize {
 /// grandchildren die too — not just the `bash` child.
 #[cfg(unix)]
 struct ChildGuard {
-    /// Process-group ID of the child, when it was successfully spawned into
-    /// its own group.
+    /// Process-group ID of the child, when it was successfully spawned into its own group.
     ///
     /// `None` when no live group exists to signal — the guard then has
     /// nothing to do on drop. The guard stores the PGID rather than the PID
@@ -283,8 +282,12 @@ impl Drop for ChildGuard {
     }
 }
 
-/// Execute a bash command. Supports background jobs, timeout enforcement, and
-/// a dynamic concurrency check (read-only commands are safe to run concurrently).
+/// Execute a bash command.
+///
+/// Supports background jobs, timeout enforcement, and a dynamic concurrency
+/// check (read-only commands are safe to run concurrently). Not read-only
+/// overall: any command that fails the concurrency check runs serialized
+/// against other writes.
 pub struct BashTool;
 
 impl Tool for BashTool {
@@ -571,8 +574,7 @@ where
     String::from_utf8_lossy(&buf).into_owned()
 }
 
-/// Truncate `s` in place to at most `max_bytes`, landing on a UTF-8 char
-/// boundary.
+/// Truncate `s` in place to at most `max_bytes`, landing on a UTF-8 char boundary.
 ///
 /// If `s` already fits, it is left untouched. Otherwise the cut point walks
 /// back from `max_bytes` to the preceding char boundary so the result stays

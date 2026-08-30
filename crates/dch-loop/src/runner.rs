@@ -242,7 +242,7 @@ impl Runner {
 ///
 /// - Observers receive read-only lifecycle events and never affect
 ///   execution — displays, loggers, and metrics recorders coexist freely.
-/// - Middleware intercept every tool dispatch in registration order and may
+/// - Middleware intercepts every tool dispatch in registration order and may
 ///   rewrite the dispatch context, the tool output, or the control flow.
 ///
 /// # Examples
@@ -260,20 +260,37 @@ impl Runner {
 /// ```
 pub struct RunnerBuilder<'a> {
     /// The application configuration the runner is built from.
+    ///
+    /// Read during [`build`](Self::build) to construct the provider client,
+    /// connect any `[[mcp.servers]]` stdio servers, compose the session
+    /// config, and arm the model fallback breaker when one is configured.
     config: &'a dch_config::DchConfig,
 
     /// The directory the agent operates within.
+    ///
+    /// Used as the working directory tools see in the dispatch context and as
+    /// the root for tech-stack detection when composing the system prompt.
     workdir: PathBuf,
 
     /// Lifecycle observers, registered with the loop in the order added.
+    ///
+    /// Each observer receives every read-only lifecycle event; registration
+    /// order determines only the notification order among them and never
+    /// affects execution.
     observers: Vec<Arc<dyn LoopObserver>>,
 
-    /// Host dispatch middleware, installed under the runner's context
-    /// injector in the order added.
+    /// Host dispatch middleware installed by the host application.
+    ///
+    /// Installed under the runner's context injector and above the
+    /// secrets-redaction pass, in the order added, so they see the enriched
+    /// context and scrubbed output.
     middleware: Vec<Arc<dyn ToolMiddleware>>,
 
-    /// Pre-connected MCP tool providers, registered alongside any
-    /// config-declared stdio servers.
+    /// Pre-connected MCP tool providers supplied by the host.
+    ///
+    /// Registered alongside any config-declared stdio servers — their tools
+    /// join the registry beside the builtin tools in the order added. Use
+    /// these for transports the config cannot express.
     mcp_providers: Vec<McpToolProvider>,
 }
 
@@ -290,9 +307,10 @@ impl RunnerBuilder<'_> {
 
     /// Register a dispatch middleware.
     ///
-    /// Middleware run in registration order, inside the runner's context
-    /// injector (so they see the enriched [`ToolContext`](loopctl::tool::ToolContext)) and outside the
-    /// secrets-redaction pass (so they observe scrubbed output). The same
+    /// Middleware runs in registration order, inside the runner's context
+    /// injector (so it sees the enriched
+    /// [`ToolContext`](loopctl::tool::ToolContext)) and outside the
+    /// secrets-redaction pass (so it observes scrubbed output). The same
     /// instance may be shared across runners.
     #[must_use]
     pub fn with_middleware(mut self, middleware: Arc<dyn ToolMiddleware>) -> Self {
@@ -326,7 +344,9 @@ impl RunnerBuilder<'_> {
     ///
     /// - [`RunnerError::Client`] if the provider client cannot be constructed
     ///   (missing API key, HTTP client failure).
-    /// - [`RunnerError::Config`] if the fallback breaker cannot be armed.
+    /// - [`RunnerError::Config`] if the fallback breaker cannot be armed, an
+    ///   `[[mcp.servers]]` entry fails to spawn or handshake, or the dispatch
+    ///   pipeline cannot be built.
     pub async fn build(self) -> Result<Runner, RunnerError> {
         let context = Arc::new(RunnerContext {
             cwd: self.workdir.clone(),
@@ -453,7 +473,8 @@ fn arm_fallback(primary: &str, fallback: &str) -> Result<FallbackManager, Runner
 /// override when one is configured. The prompt is written into
 /// `session_config.system_prompt` before the [`BareLoop`] reads it.
 ///
-/// Extracted as a free function (rather than inlined in [`Runner::new`]) so the
+/// Extracted as a free function (rather than inlined in
+/// [`RunnerBuilder::build`]) so the
 /// composition can be unit-tested without constructing a provider client.
 fn build_session(
     config: &dch_config::DchConfig,

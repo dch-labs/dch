@@ -38,15 +38,23 @@ use crate::walk;
          Supports *, **, ? patterns. Returns matching file paths."
 )]
 pub struct GlobInput {
-    /// Glob pattern to match files (e.g., '**/*.rs', 'src/**/*.json')
+    /// The glob pattern selecting which files to return (e.g., '**/*.rs').
+    ///
+    /// Interpreted with gitignore-flavored semantics by the `ignore` crate:
+    /// `*`, `?`, `**`, character classes, and brace expansion are supported. A
+    /// pattern with no `/` matches the basename at any depth.
     pattern: String,
-    /// Directory to search in (defaults to current working directory)
+
+    /// The directory to search in, defaulting to the current working directory.
+    ///
+    /// May be relative, in which case it is resolved against the runner's cwd,
+    /// not the process's. URLs are rejected; the walk honors `.gitignore`.
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<String>,
 }
 
 impl GlobInput {
-    /// Deserializes the typed input and delegates to `glob_inner`.
+    /// Serializes the typed input and delegates to `glob_inner`.
     ///
     /// # Errors
     ///
@@ -127,8 +135,7 @@ fn collect_matches(base: &Path, glob_override: &ignore::overrides::Override) -> 
 /// either as supplied or defaulted to `"."` (the search root, resolved against
 /// the runner cwd by the caller). It may be relative.
 struct ParsedInput {
-    /// The glob pattern supplied by the caller, copied verbatim from the input
-    /// JSON.
+    /// The glob pattern supplied by the caller, copied verbatim.
     ///
     /// No normalization happens here — backslashes, brace expansion, character
     /// classes all pass through unchanged. The pattern is fed directly to the

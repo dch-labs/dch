@@ -17,6 +17,8 @@ const IMAGE_EXTENSIONS: &[(&str, &str)] = &[
 
 /// MIME type for an image extension, if recognized.
 ///
+/// Lookup is case-insensitive; unrecognized extensions return `None`.
+///
 /// # Examples
 ///
 /// ```
@@ -83,12 +85,11 @@ pub fn reject_url(tool: &str, path: &str) -> Result<(), ToolError> {
     Ok(())
 }
 
-/// Resolve a possibly-relative `file_path` against `cwd`, enforcing that the
-/// result stays inside the `cwd` workspace both lexically and on the
-/// filesystem.
+/// Resolve a possibly-relative `file_path` against `cwd`, keeping the result inside the workspace.
 ///
-/// Relative paths are joined to `cwd`; absolute paths are taken as-is. Two
-/// checks then run, in order:
+/// The result must stay inside the `cwd` workspace both lexically and on the
+/// filesystem. Relative paths are joined to `cwd`; absolute paths are
+/// accepted only when they stay inside `cwd`. Both then pass two checks:
 ///
 /// 1. **Lexical containment** — both the result and `cwd` are normalized (`.`/
 ///    `..` collapsed without touching the filesystem, so not-yet-existing
@@ -131,8 +132,7 @@ pub fn resolve_path(file_path: &str, cwd: &Path) -> Result<PathBuf, ToolError> {
     Ok(normalized)
 }
 
-/// Lexically normalize `path`, collapsing `.` and `..` without touching the
-/// filesystem.
+/// Lexically normalize `path`, collapsing `.` and `..` without touching the filesystem.
 ///
 /// A leading `..` that would escape above the root is dropped, matching the
 /// behavior of the shared `normalize_path` helper.
@@ -169,8 +169,7 @@ fn lexically_inside(path: &Path, base: &Path) -> bool {
     true
 }
 
-/// Walk the *existing* prefix of `resolved` and reject any symlink whose
-/// target chain leaves `base`.
+/// Walk the *existing* prefix of `resolved` and reject any symlink whose target chain leaves `base`.
 ///
 /// `resolved` is assumed already lexically contained in `base` (the caller's
 /// responsibility). This function adds the filesystem check: each ancestor of
@@ -178,7 +177,8 @@ fn lexically_inside(path: &Path, base: &Path) -> bool {
 /// verified (recursively, for chains). The walk stops at the first
 /// non-existent component, so a not-yet-existing write leaf is never rejected
 /// — only the existing directory prefix is checked. Symlink loops are bounded
-/// by a visited-set of canonicalized paths so a cycle (A → B → A) terminates
+/// by a visited-set of lexically normalized paths so a cycle (A → B → A)
+/// terminates
 /// rather than recurses forever.
 ///
 /// # Errors
@@ -215,10 +215,9 @@ fn verify_symlinks_inside(resolved: &Path, base: &Path) -> Result<(), ToolError>
     Ok(())
 }
 
-/// Recursively verify that `target` (a resolved symlink target) stays within
-/// `base`, following further symlinks in its existing prefix.
+/// Recursively verify that `target` (a resolved symlink target) stays within `base`.
 ///
-/// `visited` accumulates canonicalized paths already examined, bounding
+/// Follows further symlinks in its existing prefix. `visited` accumulates canonicalized paths already examined, bounding
 /// symlink cycles. A target that itself contains symlinks is walked the same
 /// way [`verify_symlinks_inside`] walks the original path. Returns `true`
 /// when `target` (and every symlink in its existing prefix) stays inside

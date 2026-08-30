@@ -57,32 +57,63 @@ const MAX_RESULTS_CAP: usize = 1000;
          Returns matching lines with file paths and line numbers."
 )]
 pub struct GrepInput {
-    /// Regular expression pattern to search for
+    /// The regular expression to search file contents for.
+    ///
+    /// Compiled with the shared [`compile_pattern`] helper, so an unparseable
+    /// pattern is rejected as invalid input before any walking starts. Matched
+    /// against whole lines; a line appears in the output at most once.
     pattern: String,
-    /// Directory to search in (defaults to current working directory)
+
+    /// The directory to search in, defaulting to the current working directory.
+    ///
+    /// May be relative, in which case it is resolved against the runner's cwd,
+    /// not the process's. URLs are rejected; the walk honors `.gitignore`.
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<String>,
-    /// File patterns to include (e.g., ['*.rs', '*.json'])
+
+    /// File patterns restricting the search to matching files (e.g., ['*.rs']).
+    ///
+    /// Applied in addition to the walker's `.gitignore` handling. Files that
+    /// match no pattern are skipped entirely; binary files are always skipped.
     #[allow(clippy::doc_link_with_quotes)]
     #[serde(skip_serializing_if = "Option::is_none")]
     include_patterns: Option<Vec<String>>,
-    /// File patterns to exclude (e.g., ['*.lock', 'target/*'])
+
+    /// File patterns removing files from the search (e.g., ['*.lock']).
+    ///
+    /// Takes precedence over `include_patterns`: a file matching both is
+    /// excluded. Useful for pruning large generated directories such as
+    /// `target/*`.
     #[allow(clippy::doc_link_with_quotes)]
     #[serde(skip_serializing_if = "Option::is_none")]
     exclude_patterns: Option<Vec<String>>,
-    /// Enable case-insensitive matching
+
+    /// Whether to match the pattern case-insensitively.
+    ///
+    /// Defaults to `false` (case-sensitive). When `true`, the compiled regex
+    /// has the case-insensitive flag set, affecting both the pattern itself and
+    /// the text it is matched against.
     #[serde(skip_serializing_if = "Option::is_none")]
     case_insensitive: Option<bool>,
-    /// Maximum number of matches per file (default: 100)
+
+    /// Maximum number of matches reported per file (default: 100).
+    ///
+    /// Guards against one pathological file flooding the result set. Values
+    /// below 1 are clamped up to 1 so an explicit zero still returns the first
+    /// match.
     #[serde(skip_serializing_if = "Option::is_none")]
     max_matches: Option<usize>,
-    /// Maximum total matches across all files (default: 1000)
+
+    /// Maximum total matches across all files (default: 1000, cap: 1000).
+    ///
+    /// Once the cap is reached the walk stops early. Values below 1 are
+    /// clamped up to 1, and requests above the hard cap are lowered to it.
     #[serde(skip_serializing_if = "Option::is_none")]
     max_results: Option<usize>,
 }
 
 impl GrepInput {
-    /// Deserializes the typed input and delegates to `grep_inner`.
+    /// Serializes the typed input and delegates to `grep_inner`.
     ///
     /// # Errors
     ///
@@ -104,10 +135,11 @@ impl GrepInput {
     /// # Errors
     ///
     /// Returns [`ToolError::InvalidInput`] for a missing `pattern`, a URL
-    /// `path`, or a pattern the regex engine cannot parse. Returns
-    /// [`ToolError::Execution`] when the [`RunnerContext`] extension is
-    /// absent, the blocking task joins unsuccessfully, or `serde_json` cannot
-    /// encode the result.
+    /// `path`, a pattern the regex engine cannot parse, or a malformed
+    /// numeric or array field. Returns [`ToolError::Execution`] when the
+    /// [`RunnerContext`] extension is absent or the blocking task joins
+    /// unsuccessfully. Result rendering never fails — a serialization fault
+    /// degrades to a text message.
     async fn grep_inner(
         &self,
         input: Value,

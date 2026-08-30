@@ -14,10 +14,12 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ApiType {
-    /// `OpenAI`-compatible API (also used by `DeepSeek`, `Grok`, `vLLM`).
+    /// `OpenAI`-compatible API.
     ///
-    /// The Chat Completions schema that several other providers mirror, so they
-    /// reuse this variant rather than getting one of their own.
+    /// The Chat Completions schema that several other providers (including
+    /// vLLM servers) speak, so they map to this variant's client family;
+    /// `DeepSeek` and `Grok` carry their own variants for host-specific
+    /// defaults while reusing the same wire protocol.
     OpenAi,
 
     /// `Anthropic` Messages API (also used by Z.AI).
@@ -68,7 +70,8 @@ pub enum ApiType {
     /// Moonshot AI.
     ///
     /// An OpenAI-compatible API served by Moonshot; the default base URL and
-    /// model come from the provider profile (`MOONSHOT_API_KEY`).
+    /// model resolve to Moonshot's host, with the key taken from the
+    /// `MOONSHOT_API_KEY` provider profile.
     Moonshot,
 
     /// AWS Bedrock.
@@ -81,8 +84,9 @@ pub enum ApiType {
 impl ApiType {
     /// The default `base_url` for this provider.
     ///
-    /// Returns a sensible public or local endpoint for each variant, used to
-    /// populate [`ApiConfig::base_url`] when the user has not set one. These are
+    /// Returns a sensible public or local endpoint for each variant,
+    /// consulted as the effective endpoint when [`ApiConfig::base_url`] is
+    /// unset. These are
     /// the canonical host roots; provider clients may append their own path
     /// suffixes on top.
     #[must_use]
@@ -544,8 +548,9 @@ pub struct ApiConfig {
 
     /// Secondary model used if the primary errors out.
     ///
-    /// Falls back to this model identifier when a primary request fails.
-    /// Defaults to `None`, meaning no fallback is configured.
+    /// Routes to this model once the primary has failed often enough to trip
+    /// the fallback breaker — not on the first failure. Defaults to `None`,
+    /// meaning no fallback is configured.
     pub fallback_model: Option<String>,
 
     /// Azure OpenAI resource name.
@@ -604,10 +609,10 @@ pub struct RunnerConfig {
 
     /// Compaction threshold as a percentage (0–100) of the context window.
     ///
-    /// Matches the `u8` percentage loopctl's `SessionConfig` expects, so the
-    /// value passes through `to_session_config` with no conversion. Values
-    /// above 100 are clamped to 100 by `SessionConfig`'s construction clamp;
-    /// the meaningful range is `0..=100`.
+    /// Defaults to `80`. Matches the `u8` percentage loopctl's
+    /// `SessionConfig` expects, so the value passes through
+    /// `to_session_config` with no conversion; that conversion clamps values
+    /// above 100 to 100. The meaningful range is `0..=100`.
     pub compact_threshold: u8,
 
     /// When to prompt the user before side-effecting actions.
@@ -717,9 +722,11 @@ pub struct TechProfile {
     /// keeps the detected value.
     pub lint: Option<String>,
 
-    /// Free-form conventions for this language: style rules, module layout,
-    /// anything detection can't capture. Appended to the prompt verbatim under
-    /// this language's section.
+    /// Free-form conventions for this language.
+    ///
+    /// Style rules, module layout, anything detection can't capture. Appended
+    /// to the prompt verbatim under this language's section. `None` keeps the
+    /// detected value.
     pub conventions: Option<String>,
 }
 
@@ -889,7 +896,7 @@ impl DchConfig {
     /// agent. The `system_prompt` is **not** carried here (it is set to
     /// `None`); the runner composes it from the selected role, detected tech
     /// stack, and per-tool fragments via the prompt builder and installs it
-    /// on the session after construction. Provider-specific fields (`model`,
+    /// before the loop reads it. Provider-specific fields (`model`,
     /// `max_tokens`) are not session-config concerns; they are consumed by
     /// the API client via [`ApiConfig`] directly. The session id is minted
     /// at runtime by loopctl, not carried in config.

@@ -57,32 +57,63 @@ const MAX_CONTEXT_LINES: usize = 5;
          format by default. Use context_lines > 0 to include matched content."
 )]
 pub struct CodeSearchInput {
-    /// Regular expression pattern to search for
+    /// The regular expression to search file contents for.
+    ///
+    /// Compiled with the shared [`compile_pattern`] helper, so an unparseable
+    /// pattern is rejected as invalid input before any walking starts. Matched
+    /// against whole lines.
     pattern: String,
-    /// Directory to search in (defaults to current working directory)
+
+    /// The directory to search in, defaulting to the current working directory.
+    ///
+    /// May be relative, in which case it is resolved against the runner's cwd,
+    /// not the process's. URLs are rejected; the walk honors `.gitignore`.
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<String>,
-    /// File patterns to include (e.g., ['*.rs', '*.json'])
+
+    /// File patterns restricting the search to matching files (e.g., ['*.rs']).
+    ///
+    /// Applied in addition to the walker's `.gitignore` handling. Files that
+    /// match no pattern are skipped entirely; binary files are always skipped.
     #[allow(clippy::doc_link_with_quotes)]
     #[serde(skip_serializing_if = "Option::is_none")]
     include_patterns: Option<Vec<String>>,
-    /// File patterns to exclude (e.g., ['*.lock', 'target/*'])
+
+    /// File patterns removing files from the search (e.g., ['*.lock']).
+    ///
+    /// Takes precedence over `include_patterns`: a file matching both is
+    /// excluded. Useful for pruning large generated directories such as
+    /// `target/*`.
     #[allow(clippy::doc_link_with_quotes)]
     #[serde(skip_serializing_if = "Option::is_none")]
     exclude_patterns: Option<Vec<String>>,
-    /// Enable case-insensitive matching
+
+    /// Whether to match the pattern case-insensitively.
+    ///
+    /// Defaults to `false` (case-sensitive). When `true`, the compiled regex
+    /// has the case-insensitive flag set.
     #[serde(skip_serializing_if = "Option::is_none")]
     case_insensitive: Option<bool>,
-    /// Context lines around matches (default: 0)
+
+    /// Lines of context shown around each match (default: 0, cap: 5).
+    ///
+    /// At 0 the output is the succinct form: file headers with collapsed line
+    /// ranges and no content. Above 0, each match also renders a
+    /// `±context_lines` snippet with `>` marking the matched line.
     #[serde(skip_serializing_if = "Option::is_none")]
     context_lines: Option<usize>,
-    /// Maximum results (default: 50)
+
+    /// Maximum total matches across all files (default: 50, cap: 200).
+    ///
+    /// Bounds the output regardless of how many matches a single file
+    /// contains; the walk stops once the cap is reached. Requests above the
+    /// hard cap are lowered to it.
     #[serde(skip_serializing_if = "Option::is_none")]
     max_results: Option<usize>,
 }
 
 impl CodeSearchInput {
-    /// Deserializes the typed input and delegates to `code_search_inner`.
+    /// Serializes the typed input and delegates to `code_search_inner`.
     ///
     /// # Errors
     ///
@@ -219,7 +250,8 @@ fn render_snippet(lines: &[&str], line_num: usize, context_lines: usize) -> Stri
 /// `context_lines == 0` → grouped: `Found N match(es) for "{pattern}":` header,
 /// a blank line, then per file the path and collapsed line ranges
 /// (`  {N}` or `  {A}-{B}`). `context_lines > 0` → the same header followed by
-/// `file:line` per match and its indented snippet. Output spills to a temp
+/// `file:line` per match and its snippet (the first snippet line indented).
+/// Output spills to a temp
 /// file via the shared helper if it exceeds the inline limit.
 fn render(matches: &[Match], pattern: &str, context_lines: usize, temp_dir: &Path) -> ToolOutput {
     let mut out = Vec::with_capacity(matches.len().saturating_add(2));
@@ -319,8 +351,7 @@ fn group_consecutive(mut lines: Vec<usize>) -> Vec<LineRange> {
     ranges
 }
 
-/// Append the appropriate [`LineRange::Single`] or [`LineRange::Range`] for a
-/// finalized run.
+/// Append the appropriate [`LineRange`] variant for a finalized run.
 ///
 /// Helper for [`group_consecutive`]: once a run of consecutive lines ends (or
 /// the input ends), this decides whether the run was a single line (`start ==

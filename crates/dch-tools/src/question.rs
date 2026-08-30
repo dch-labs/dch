@@ -11,8 +11,10 @@
 /// carries its own response one-shot, so the UI answers them independently
 /// and the asking tool awaits each.
 pub struct QuestionRequest {
-    /// The questions to present to the user. Sent as a batch so the UI can
-    /// render them together; each carries its own response channel.
+    /// The questions to present to the user.
+    ///
+    /// Sent as a batch so the UI can render them together; each carries its
+    /// own response channel.
     pub questions: Vec<Question>,
 }
 
@@ -30,19 +32,25 @@ pub struct Question {
     /// question ending in `?`; the UI renders it verbatim.
     pub question: String,
 
-    /// Optional short label shown above the question in the UI. Should be at
-    /// most ~12 characters so it fits a chip/tag header.
+    /// Optional short label shown above the question in the UI.
+    ///
+    /// Should be at most ~12 characters so it fits a chip/tag header.
     pub header: Option<String>,
 
-    /// The selectable answers. Should be non-empty; the UI renders one option
-    /// per row and returns the chosen [`QuestionOption::label`] values.
+    /// The selectable answers.
+    ///
+    /// Should be non-empty; the UI renders one option per row and returns the
+    /// chosen [`QuestionOption::label`] values.
     pub options: Vec<QuestionOption>,
 
-    /// Whether multiple options may be selected. When `false` the UI should
-    /// return exactly one answer; when `true` it may return several.
+    /// Whether multiple options may be selected.
+    ///
+    /// When `false` the UI should return exactly one answer; when `true` it
+    /// may return several.
     pub multi_select: bool,
 
     /// One-shot channel carrying the user's answer back to the asking tool.
+    ///
     /// The tool awaits this; the UI sends exactly one [`QuestionResponse`]
     /// and then the channel closes.
     pub response_tx: tokio::sync::oneshot::Sender<QuestionResponse>,
@@ -55,16 +63,17 @@ pub struct Question {
 /// the `label` is what flows back in [`QuestionResponse::answers`].
 #[derive(Debug, Clone)]
 pub struct QuestionOption {
-    /// The answer text, shown to the user and echoed back in
-    /// [`QuestionResponse::answers`] when selected. This is the value the
+    /// The answer text, shown to the user and echoed back when selected.
+    ///
+    /// Flows back in [`QuestionResponse::answers`]; this is the value the
     /// asking tool matches against.
     pub label: String,
 
     /// Optional longer explanation of this answer, shown beneath the label.
     ///
     /// Use it to state the trade-off or consequence of picking this option so
-    /// the user can decide without extra context. `None` leaves the label
-    /// alone; the UI hides the row.
+    /// the user can decide without extra context. `None` hides the
+    /// description row; the label still renders.
     pub description: Option<String>,
 }
 
@@ -76,12 +85,16 @@ pub struct QuestionOption {
 /// user dismissed the question without choosing.
 #[derive(Debug, Clone)]
 pub struct QuestionResponse {
-    /// The question text that was answered. Echoed back so the asking tool can
-    /// correlate the response to the question it posed.
+    /// The question text that was answered.
+    ///
+    /// Echoed back so the asking tool can correlate the response to the
+    /// question it posed.
     pub question: String,
 
-    /// The selected answer labels. Empty if the user dismissed the question,
-    /// one entry for single-select, or several when `multi_select` was `true`.
+    /// The selected answer labels.
+    ///
+    /// Empty if the user dismissed the question, one entry for single-select,
+    /// or several when `multi_select` was `true`.
     pub answers: Vec<String>,
 }
 

@@ -17,13 +17,16 @@ use std::path::Path;
 /// multi-error reporting in future without changing the public type.
 #[derive(Debug, Clone)]
 pub struct LinterResult {
-    /// Whether the content passed all validation checks. When `false`,
-    /// `errors` is guaranteed non-empty.
+    /// Whether the content passed all validation checks.
+    ///
+    /// When `false`, `errors` is guaranteed non-empty.
     pub is_valid: bool,
 
-    /// Validation errors found. Empty when `is_valid` is `true`; currently
-    /// holds exactly one entry (validators return early), but the `Vec` leaves
-    /// room for multi-error reporting without changing the public type.
+    /// Validation errors found.
+    ///
+    /// Empty when `is_valid` is `true`; currently holds exactly one entry
+    /// (validators return early), but the `Vec` leaves room for multi-error
+    /// reporting without changing the public type.
     pub errors: Vec<LinterError>,
 }
 
@@ -35,8 +38,9 @@ pub struct LinterResult {
 /// the Rust `syn` validator does not on stable toolchains).
 #[derive(Debug, Clone)]
 pub struct LinterError {
-    /// 1-indexed line number of the error, when the validator can determine
-    /// it. `None` for validators without position info (e.g. `syn` on stable
+    /// 1-indexed line number of the error, when the validator can determine it.
+    ///
+    /// `None` for validators without position info (e.g. `syn` on stable
     /// toolchains); always `Some` for the Python indentation heuristic.
     pub line: Option<usize>,
 
@@ -349,6 +353,7 @@ fn update_triple_state(line: &str, state: &mut Option<char>) {
         i = i.saturating_add(1);
     }
 }
+
 /// Net delimiter delta for one line of Python source.
 ///
 /// Drives a [`PythonScanner`] over the line, summing `+1` per opener and `-1`
@@ -383,13 +388,18 @@ fn python_net_delimiters(line: &str) -> i32 {
 /// [`python_indent_check`] drive this scanner so the string/comment-skipping
 /// logic lives in exactly one place.
 struct PythonScanner<'a> {
-    /// The underlying character stream, peekable so a quote can be checked
-    /// for a triple-quote run before the scanner commits to consuming it.
+    /// The underlying character stream, peekable for quote lookahead.
+    ///
+    /// Peekable so a quote can be checked for a triple-quote run before the
+    /// scanner commits to consuming it.
     chars: std::iter::Peekable<std::str::Chars<'a>>,
 }
 
 impl<'a> PythonScanner<'a> {
     /// Build a scanner over `source`.
+    ///
+    /// The scanner borrows `source` for its lifetime and starts positioned at
+    /// the first character.
     fn new(source: &'a str) -> Self {
         Self {
             chars: source.chars().peekable(),

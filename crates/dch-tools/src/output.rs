@@ -112,8 +112,9 @@ fn truncate_inline(content: &str) -> String {
     )
 }
 
-/// Take the first `PREVIEW_BYTES` bytes of `content`, sliced on a character
-/// boundary so the preview never ends mid-code-point.
+/// Take the first `PREVIEW_BYTES` bytes of `content`, sliced on a character boundary.
+///
+/// The boundary slice ensures the preview never ends mid-code-point.
 fn preview_slice(content: &str) -> &str {
     let cutoff = PREVIEW_BYTES.min(content.len());
     &content[..content.floor_char_boundary(cutoff)]

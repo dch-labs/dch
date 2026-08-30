@@ -41,11 +41,11 @@ use crate::write::format_lint_failure;
 /// Maximum number of edits permitted in a single call.
 const MAX_EDITS: usize = 50;
 
-/// Edit multiple files atomically. All edits are validated before any writes.
-/// Use `dry_run=true` to preview changes without writing.
+/// Edit multiple files atomically.
 ///
-/// Not concurrency-safe and not read-only: it mutates files, and two
-/// concurrent batches touching overlapping paths would race.
+/// All edits are validated before any writes; use `dry_run=true` to preview
+/// changes without writing. Not concurrency-safe and not read-only: it mutates
+/// files, and two concurrent batches touching overlapping paths would race.
 pub struct MultiEditTool;
 
 impl Tool for MultiEditTool {
@@ -109,8 +109,8 @@ impl Tool for MultiEditTool {
 impl MultiEditTool {
     /// Body of [`Tool::call`].
     ///
-    /// Orchestrates the five-phase pipeline: parse → read+locate+symlink →
-    /// overlap-detect → lint → preview/write. Recoverable conditions (text not
+    /// Orchestrates the pipeline: parse → dup-path → read → symlink →
+    /// overlap-detect → locate+merge → lint → preview/write. Recoverable conditions (text not
     /// found, ambiguous match, overlap, symlink target, linter failure) are
     /// surfaced as soft [`ToolOutput`] errors; hard failures (bad args,
     /// missing file, I/O fault) become [`ToolError`].
@@ -213,12 +213,14 @@ struct ParsedInput<'a> {
     /// this struct is built; item-level field validation happens later in
     /// [`build_operations`].
     edits: &'a [Value],
+
     /// Whether to preview without writing.
     ///
     /// When `true`, the pipeline stops after building the diff preview and no
     /// file is touched; when `false` (the default), the writes run after
     /// validation.
     dry_run: bool,
+
     /// Whether to skip the linter gate on the merged content.
     ///
     /// Defaults to `false`. When `true`, [`lint_all`] is not consulted and the
@@ -273,18 +275,25 @@ fn parse_input(input: &Value) -> Result<ParsedInput<'_>, ToolError> {
 /// messages; `full_path` is what every read/write actually targets.
 #[derive(Debug, Clone)]
 struct EditOperation {
-    /// The caller-supplied path (pre-resolution), used in messages so the model
-    /// sees the path it named, not the canonicalized form.
+    /// The caller-supplied path (pre-resolution).
+    ///
+    /// Used in messages so the model sees the path it named, not the
+    /// canonicalized form.
     file_path: String,
-    /// The path resolved against the runner's `cwd` — what every read/write
-    /// and the duplicate-path / symlink checks actually target.
+
+    /// The path resolved against the runner's `cwd`.
+    ///
+    /// This is what every read/write and the duplicate-path / symlink checks
+    /// actually target.
     full_path: PathBuf,
+
     /// The text to find in the file.
     ///
     /// Must be non-empty and, at merge time, appear exactly once in the
     /// running content of the target file (see [`merge_per_file`]); an
     /// absent or ambiguous match aborts the whole batch.
     old_text: String,
+
     /// The text to replace `old_text` with.
     ///
     /// Spliced over the matched range by [`splice`]; may be empty, which
@@ -292,10 +301,11 @@ struct EditOperation {
     new_text: String,
 }
 
-/// Parse each edit item into an [`EditOperation`], validating fields and
-/// rejecting empty `old_text` and URL `file_path`.
+/// Parse each edit item into an [`EditOperation`].
 ///
-/// Relative paths are resolved against `cwd`; absolute paths are used as-is.
+/// Validates fields, rejecting empty `old_text` and URL `file_path`; relative
+/// paths are resolved against `cwd`; absolute paths are accepted only when
+/// they stay inside `cwd`.
 ///
 /// # Errors
 ///
@@ -372,21 +382,30 @@ async fn read_files(operations: &[EditOperation]) -> Result<BTreeMap<String, Str
 /// faults that the model cannot simply retry around.
 #[derive(Debug)]
 enum AbortReason {
-    /// One edit's target is a symbolic link (named in the message). Produced
-    /// by [`symlink_check`], before any file is written.
+    /// One edit's target is a symbolic link (named in the message).
+    ///
+    /// Produced by [`symlink_check`], before any file is written.
     Symlink(String),
-    /// Two edits resolve to the same physical file under different path
-    /// aliases (named in the message) — the result would be ambiguous.
+
+    /// Two edits resolve to the same physical file under different path aliases.
+    ///
+    /// The aliases are named in the message; the result would be ambiguous.
     /// Produced by [`dup_path_check`].
     DupPath(String),
-    /// One edit's `old_text` is absent or not unique in the running content
-    /// (named in the message). Produced by [`merge_per_file`].
+
+    /// One edit's `old_text` is absent or not unique in the running content.
+    ///
+    /// The file is named in the message. Produced by [`merge_per_file`].
     Locate(String),
+
     /// Two edits' byte-ranges overlap in the same file (named in the message).
+    ///
     /// Produced by [`overlap_check`], which runs in both `dry_run` and apply
     /// modes so the preview shows exactly what an apply would catch.
     Overlap(String),
+
     /// The linter rejected one file's merged content (named in the message).
+    ///
     /// Produced by [`lint_all`] (skipped when `skip_linter` is set).
     Lint(String),
 }
@@ -407,10 +426,9 @@ impl AbortReason {
     }
 }
 
-/// Reject the batch if two edits resolve to the same physical file under
-/// different path aliases (e.g. `a.rs` and `./a.rs`).
+/// Reject the batch if two edits resolve to the same physical file under different path aliases.
 ///
-/// Maps each resolved path to the first caller-supplied path seen for it and
+/// Aliases like `a.rs` and `./a.rs` are the trigger. Maps each resolved path to the first caller-supplied path seen for it and
 /// rejects on any later alias. Each edit would otherwise be merged
 /// independently against the same original, and the second write would
 /// silently clobber the first — losing one edit-set. Refusing is safer than
@@ -438,8 +456,7 @@ fn dup_path_check(operations: &[EditOperation]) -> Option<AbortReason> {
     None
 }
 
-/// Reject the batch if any distinct target — or any of its ancestor
-/// directories — is a symbolic link.
+/// Reject the batch if any distinct target — or any of its ancestor directories — is a symbolic link.
 ///
 /// `atomic_write`'s own symlink guard fires at write time and checks only the
 /// final component, too late for the atomic contract (file #1 could already be
@@ -511,8 +528,9 @@ struct EditConflict {
 /// other's (one contains the other, or they share text). Applying either first
 /// would invalidate the other's match. Different files never conflict, even
 /// with identical `old_text`; a file needs at least two edits before a pair
-/// can exist. Each edit contributes at most one range, since uniqueness of
-/// `old_text` is already enforced by [`locate_unique`] at merge time. Each
+/// can exist. Each edit contributes at most one range — the first
+/// occurrence's, since full uniqueness is only enforced later by
+/// [`locate_unique`] at merge time. Each
 /// conflicting pair is reported once, deduplicated by its sorted index pair.
 fn detect_edit_conflicts(
     operations: &[EditOperation],
@@ -645,13 +663,13 @@ fn overlap_check(
     Some(AbortReason::Overlap(msg))
 }
 
-/// Merge each file's edits sequentially (array order, each seeing the prior's
-/// output) into a final content map, validating each edit's `old_text` is
-/// unique in the *running* content at that point.
+/// Merge each file's edits sequentially into a final content map, validating uniqueness as it goes.
 ///
-/// A later edit to the same file may target text that only exists after an
-/// earlier edit runs — so the locate check must be against the accumulated
-/// content, not the original.
+/// Edits run in array order, each seeing the prior's output; each edit's
+/// `old_text` must be unique in the *running* content at that point. A later
+/// edit to the same file may target text that only exists after an earlier
+/// edit runs — so the locate check must be against the accumulated content,
+/// not the original.
 ///
 /// # Errors
 ///

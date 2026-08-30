@@ -49,22 +49,41 @@ const MAX_MAX_DEPTH: usize = 50;
          Respects .gitignore."
 )]
 pub struct TreeInput {
-    /// Directory to display (defaults to current working directory)
+    /// The directory to display, defaulting to the current working directory.
+    ///
+    /// May be relative, in which case it is resolved against the runner's cwd,
+    /// not the process's. URLs are rejected, and the path must exist and be a
+    /// directory.
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<String>,
-    /// Maximum depth to display (clamped to 1-50)
+
+    /// Maximum directory depth to display (default: 3, clamped to 1-50).
+    ///
+    /// Values below 1 are raised to 1 and values above 50 are lowered to 50,
+    /// so an out-of-range request still yields a sensible tree. Depth 1 shows
+    /// only the direct children of `path`.
     #[serde(skip_serializing_if = "Option::is_none")]
     max_depth: Option<usize>,
-    /// Whether to include files (true) or only directories (false)
+
+    /// Whether to include files in addition to directories (default: true).
+    ///
+    /// When `false`, only directories are listed and every file is filtered
+    /// out, including ones matching `pattern`. The `N directories, M files`
+    /// summary reflects the filtered result.
     #[serde(skip_serializing_if = "Option::is_none")]
     include_files: Option<bool>,
-    /// Glob pattern to filter files (e.g., '*.rs')
+
+    /// Glob pattern filtering which files are shown (e.g., '*.rs').
+    ///
+    /// Applied to files only — directories are always kept. A pattern
+    /// containing `/` matches the path relative to `path`; otherwise it
+    /// matches the filename alone.
     #[serde(skip_serializing_if = "Option::is_none")]
     pattern: Option<String>,
 }
 
 impl TreeInput {
-    /// Deserializes the typed input and delegates to `tree_inner`.
+    /// Serializes the typed input and delegates to `tree_inner`.
     ///
     /// # Errors
     ///

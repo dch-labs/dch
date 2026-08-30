@@ -10,8 +10,8 @@
 //! themselves at runtime.
 //!
 //! The builder is pure and side-effect-free: given the same inputs it yields
-//! the same string. Working and temporary directory context is appended by
-//! the caller at runner construction, not here.
+//! the same string. It does not embed working-directory or temp-dir paths;
+//! the shared discipline section refers to directories generically.
 
 use crate::project::render_techs;
 use dch_config::Role;
@@ -52,11 +52,12 @@ FILE PATHS
   Do not write to system directories. Use the temp directory for scratch and
   intermediate output.";
 
-/// Assemble the system prompt from the default role, no tech profiles, and
-/// each registered tool's [`loopctl::tool::Tool::system_prompt`] fragment.
+/// Assemble the system prompt from the default role and tool fragments.
 ///
-/// Equivalent to [`with_context`] with [`Role::General`] (the default), no
-/// techs, and no project conventions. The runner composes the full prompt —
+/// Uses [`Role::General`] (the default), no tech profiles, and no project
+/// conventions; each registered tool contributes its
+/// [`loopctl::tool::Tool::system_prompt`] fragment. Equivalent to
+/// [`with_context`] with those inputs. The runner composes the full prompt —
 /// with detected techs and cwd/temp — via [`with_context`].
 ///
 /// # Examples
@@ -72,26 +73,27 @@ pub fn build_system_prompt(tools: &ToolRegistry) -> String {
     with_context(Role::General, &[], None, None, tools)
 }
 
-/// Assemble the system prompt from a chosen [`Role`] and each registered
-/// tool's [`loopctl::tool::Tool::system_prompt`] fragment, with no tech
-/// profiles.
+/// Assemble the system prompt from a chosen [`Role`] and tool fragments.
 ///
 /// Convenience for callers that have selected a role but have no detected
-/// stack; equivalent to [`with_context`] with empty techs and no conventions.
+/// stack: no tech profiles and no project conventions are included, and each
+/// registered tool contributes its
+/// [`loopctl::tool::Tool::system_prompt`] fragment. Equivalent to
+/// [`with_context`] with empty techs and no conventions.
 #[must_use]
 pub fn with_role(role: Role, tools: &ToolRegistry) -> String {
     with_context(role, &[], None, None, tools)
 }
 
-/// Assemble the full system prompt from a [`Role`], tech profiles, and each
-/// registered tool's [`loopctl::tool::Tool::system_prompt`] fragment.
+/// Assemble the full system prompt from a [`Role`] and tech profiles.
 ///
 /// The result is the shared discipline, then the role body, then (when
 /// non-empty) a `PROJECT` section rendered from `techs` and
-/// `project_conventions`, then one `## <Tool>` section per tool whose
-/// `system_prompt()` returns `Some` — appended in alphabetical order by tool
-/// name. Tools returning `None` contribute nothing. Order is deterministic:
-/// the same inputs always yield the same string.
+/// `project_conventions`, then one `## <Tool>` section per registered tool
+/// whose [`Tool::system_prompt`](loopctl::tool::Tool::system_prompt)
+/// fragment is `Some` — appended in alphabetical order by tool name. Tools
+/// returning `None` contribute nothing. Order is deterministic: the same
+/// inputs always yield the same string.
 ///
 /// `role_prompt_override`, when `Some`, replaces the role body — the shared
 /// discipline, tech profile, and per-tool fragments still append. The runner
@@ -99,8 +101,8 @@ pub fn with_role(role: Role, tools: &ToolRegistry) -> String {
 /// `RunnerConfig::role_override`); pass `None` to use the role's built-in
 /// [`Role::system_prompt`].
 ///
-/// The caller (the runner) is responsible for appending the working and temp
-/// directory paths; this function returns role + project + fragments only.
+/// This function returns role + project + fragments only; working-directory
+/// and temp-dir paths are not embedded.
 #[must_use]
 pub fn with_context(
     role: Role,
@@ -123,12 +125,12 @@ pub fn with_context(
     out
 }
 
-/// Append one `## <Name>` section per tool that has a `system_prompt`
-/// fragment, in alphabetical order by tool name.
+/// Append one `## <Name>` section per tool with a prompt fragment.
 ///
-/// Tools whose [`Tool::system_prompt`] returns `None` are skipped — they
-/// contribute nothing to the prompt. The local re-sort keeps the ordering
-/// contract owned by this module, so a future loopctl change to
+/// Sections are appended in alphabetical order by tool name; tools whose
+/// [`Tool::system_prompt`] returns `None` are skipped — they contribute
+/// nothing to the prompt. The local re-sort keeps the ordering contract
+/// owned by this module, so a future loopctl change to
 /// [`ToolRegistry::all_tools`] ordering cannot silently reorder fragments.
 fn append_fragments(out: &mut String, tools: &ToolRegistry) {
     let mut fragments: Vec<(String, String)> = tools

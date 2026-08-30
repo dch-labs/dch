@@ -123,10 +123,11 @@ pub fn require_cwd(runner_context: Option<RunnerContext>) -> Result<PathBuf, Too
     })
 }
 
-/// Statically asserts `RunnerContext: Send + Sync`, the bound required to
-/// store it as a `ToolContext` extension. `Arc<Mutex<Vec<TodoEntry>>>` is
-/// `Send + Sync`, `Arc<Mutex<Option<mpsc::Sender<_>>>>` is `Send + Sync`, and
-/// `PathBuf` is trivially so.
+/// Statically asserts `RunnerContext: Send + Sync`, the bound required to store it as a `ToolContext` extension.
+///
+/// `Arc<Mutex<Vec<TodoEntry>>>` is `Send + Sync`,
+/// `Arc<Mutex<Option<mpsc::Sender<_>>>>` is `Send + Sync`, and `PathBuf` is
+/// trivially so.
 const _: fn() = || {
     fn assert_bounds<T: Send + Sync>() {}
     assert_bounds::<RunnerContext>();

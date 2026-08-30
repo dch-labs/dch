@@ -39,19 +39,39 @@ use crate::write::format_lint_failure;
          performed for supported file types."
 )]
 pub struct EditInput {
-    /// The path to the file to edit
+    /// The path to the file to edit.
+    ///
+    /// May be absolute or relative; relative paths are resolved against the
+    /// runner's working directory. The file must already exist — creating new
+    /// files is the Write tool's job — and URLs are rejected.
     file_path: String,
-    /// The text to replace
+
+    /// The text to replace.
+    ///
+    /// Must appear exactly once in the file: uniqueness is enforced, and a
+    /// non-unique match returns a soft error asking the model to add
+    /// surrounding context (or use `MultiEdit`) to disambiguate. Must be
+    /// non-empty; include enough context to make the match unique.
     old_text: String,
-    /// The replacement text
+
+    /// The replacement text.
+    ///
+    /// Written in place of `old_text` once the unique match is located. May be
+    /// empty (a pure deletion) or longer than `old_text` (an insertion); the
+    /// result is checked by the linter gate before the file is written.
     new_text: String,
-    /// Skip syntax validation (not recommended)
+
+    /// Skip syntax validation (not recommended).
+    ///
+    /// When `true`, the linter gate is bypassed and the file is written even
+    /// if the resulting content has syntax errors. Defaults to `false`; the
+    /// gate exists to prevent file corruption from malformed edits.
     #[serde(skip_serializing_if = "Option::is_none")]
     skip_linter: Option<bool>,
 }
 
 impl EditInput {
-    /// Deserializes the typed input and delegates to `edit_inner`.
+    /// Serializes the typed input and delegates to `edit_inner`.
     ///
     /// # Errors
     ///
@@ -334,8 +354,8 @@ pub(crate) enum FindResult {
     /// `old_text` appears more than once in `content`.
     ///
     /// The model needs to supply a longer, more specific `old_text` that
-    /// matches only the intended site, or use `MultiEdit` if it genuinely wants
-    /// all occurrences changed. Maps to [`EditError::Ambiguous`].
+    /// matches only the intended site, or issue several `MultiEdit` edits,
+    /// each with its own unique `old_text`. Maps to [`EditError::Ambiguous`].
     Ambiguous {
         /// The non-overlapping occurrence count.
         ///
@@ -370,9 +390,10 @@ pub(crate) fn locate_unique(content: &str, old_text: &str) -> FindResult {
 
 /// Splice `replacement` into `content`, replacing the byte `range`.
 ///
-/// The `range` must be a valid UTF-8-boundary slice of `content` as produced by
-/// [`locate_unique`]; this holds by construction because `str::find` returns
-/// char-boundary offsets. The result is the prefix before `range.start`, the
+/// The `range` comes from [`locate_unique`], whose `str::find`-derived
+/// offsets are char boundaries, so the slicing cannot split a code point; the
+/// `get` fallbacks cover only unreachable non-boundary input. The result is
+/// the prefix before `range.start`, the
 /// `replacement`, then the suffix from `range.end`.
 pub(crate) fn splice(content: &str, range: Range<usize>, replacement: &str) -> String {
     let prefix = content.get(..range.start).unwrap_or("");

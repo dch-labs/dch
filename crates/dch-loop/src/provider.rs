@@ -1,4 +1,8 @@
 //! Construction of the loopctl API client from dch configuration.
+//!
+//! Maps the provider settings in [`dch_config::ApiConfig`] onto loopctl's
+//! concrete provider clients, wrapping the result in the [`DchClient`] enum
+//! the agent loop monomorphizes over.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -30,17 +34,18 @@ const NO_AUTH_KEY: &str = "ollama";
 
 /// The concrete provider client dch monomorphizes the agent loop over.
 ///
-/// A runtime-selected enum over loopctl's three provider client families, so
+/// A runtime-selected enum over loopctl's four provider client families, so
 /// the agent loop's per-turn LLM call is statically dispatched rather than
 /// going through `dyn ApiClient`. [`create_client`] picks the variant from
 /// [`ApiConfig::api_type`] (by wire-protocol family: OpenAI-compatible
 /// providers map to [`OpenAi`], Anthropic-compatible to [`Anthropic`], Gemini
-/// to [`Gemini`]); every other method on `DchClient` forwards to the inner
-/// client unchanged.
+/// to [`Gemini`], AWS Bedrock to [`Bedrock`]); every other method on
+/// `DchClient` forwards to the inner client unchanged.
 ///
 /// [`OpenAi`]: Self::OpenAi
 /// [`Anthropic`]: Self::Anthropic
 /// [`Gemini`]: Self::Gemini
+/// [`Bedrock`]: Self::Bedrock
 pub enum DchClient {
     /// An OpenAI-protocol provider client.
     ///

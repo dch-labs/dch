@@ -105,7 +105,8 @@ pub fn format_file_change(file_path: &str, old_content: Option<&str>, new_conten
     }
 }
 
-/// Build a one-line `N lines removed, M added` summary for a line diff.
+/// Build a one-line `N lines removed, M added` summary, prefixed with the
+/// diff gutter character, for a line diff.
 ///
 /// Returns `None` when the diff has no removed and no inserted lines (a no-op
 /// edit), so an unchanged file renders header-only with no spurious summary.
@@ -163,8 +164,7 @@ fn eof_change_note(old: &str, new: &str) -> Option<String> {
     Some(format!("│ {note}\n"))
 }
 
-/// Format a diff for files too large for the LCS algorithm (product exceeds
-/// [`MAX_LCS_PRODUCT`]).
+/// Format a diff for files too large for the LCS algorithm (product exceeds [`MAX_LCS_PRODUCT`]).
 ///
 /// Shows a truncated before/after preview instead of computing the full diff:
 /// up to [`LARGE_DIFF_PREVIEW_LINES`] lines of old content (prefixed `- `) and
@@ -338,8 +338,7 @@ fn backtrack_lcs(
     result
 }
 
-/// Determine whether the new line at position `j-1` is an insertion (not part
-/// of the common subsequence).
+/// Determine whether the new line at position `j-1` is an insertion (not part of the common subsequence).
 ///
 /// Returns `true` if the LCS value to the left `dp[i][j-1]` is >= the value
 /// above `dp[i-1][j]`, meaning the new line has no match in old.
@@ -355,8 +354,7 @@ fn is_new_line_inserted(dp: &[usize], stride: usize, i: usize, j: usize) -> bool
     left >= up
 }
 
-/// Format a diff with `context` lines of surrounding context around each
-/// change region.
+/// Format a diff with `context` lines of surrounding context around each change region.
 ///
 /// Walks the [`LineDiff`] sequence and renders it as plain text:
 ///
