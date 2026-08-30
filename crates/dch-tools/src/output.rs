@@ -7,11 +7,10 @@
 //! full content. This keeps a single oversized search from blowing out a
 //! model's context window.
 //!
-//! Spilled files land in a per-session subdir (see [`session_temp_dir`]) so one
-//! session's results don't intermingle with another's. The subdir is created on
-//! first spill; cleanup on session shutdown is the runner's responsibility (the
-//! `Loop` trait has no shutdown hook today — see the dch `SESSION-MODEL-AUDIT`
-//! and loopctl Change 13).
+//! Spilled files land in the tool context's `temp_dir`, which the agent loop
+//! scopes per session and removes when the loop is dropped — one session's
+//! results never intermingle with another's, and nothing accumulates across
+//! sessions.
 //!
 //! Any failure along the spill path (the temp dir cannot be created, the file
 //! cannot be written) degrades gracefully to inline truncation: the caller
@@ -19,7 +18,6 @@
 
 use std::io::Write;
 use std::path::Path;
-use std::path::PathBuf;
 
 use loopctl::tool::ToolOutput;
 
@@ -28,22 +26,6 @@ pub const MAX_INLINE_OUTPUT_BYTES: usize = 50 * 1024;
 
 /// Preview size when output spills/truncates (~10 `KiB`), sliced on a char boundary.
 const PREVIEW_BYTES: usize = 10 * 1024;
-
-/// Resolve a per-session temp directory under `base_temp_dir`.
-///
-/// Returns `{base_temp_dir}/dch-spill-{session_id}`. Each agent session gets
-/// its own subdir so spilled search results stay isolated from other sessions
-/// — giving a future runner-shutdown cleanup (or a manual `rm -rf`) one clear
-/// target per session instead of a flat pile of files in the OS temp dir.
-/// `truncate_or_write_to_temp` creates the subdir on first spill via
-/// `create_dir_all`; this function only computes the path.
-///
-/// `session_id` is generic over [`Display`](std::fmt::Display) so the helper
-/// does not depend on a specific id type (loopctl's `Uuid` formats straight in).
-#[must_use]
-pub fn session_temp_dir(base_temp_dir: &Path, session_id: impl std::fmt::Display) -> PathBuf {
-    base_temp_dir.join(format!("dch-spill-{session_id}"))
-}
 
 /// Return `content` as a tool result, spilling to a temp file when oversized.
 ///
@@ -134,25 +116,7 @@ fn truncate_inline(content: &str) -> String {
 /// boundary so the preview never ends mid-code-point.
 fn preview_slice(content: &str) -> &str {
     let cutoff = PREVIEW_BYTES.min(content.len());
-    let boundary = floor_char_boundary(content, cutoff);
-    &content[..boundary]
-}
-
-/// Largest byte index `<= target` that lands on a UTF-8 character boundary.
-///
-/// Manual implementation of `str::floor_char_boundary`, which is stable only
-/// from Rust 1.91 — our MSRV is earlier, so we walk back until the byte at
-/// `target` is not a UTF-8 continuation byte (i.e. `(b & 0xC0) != 0x80`).
-fn floor_char_boundary(s: &str, target: usize) -> usize {
-    let mut i = target.min(s.len());
-    while i > 0 {
-        let byte = s.as_bytes().get(i).copied().unwrap_or(0);
-        if (byte & 0xC0) != 0x80 {
-            break;
-        }
-        i = i.saturating_sub(1);
-    }
-    i
+    &content[..content.floor_char_boundary(cutoff)]
 }
 
 #[cfg(test)]
@@ -166,19 +130,6 @@ fn floor_char_boundary(s: &str, target: usize) -> usize {
 )]
 mod tests {
     use super::*;
-
-    #[test]
-    fn session_temp_dir_joins_session_id() {
-        let dir = session_temp_dir(Path::new("/tmp"), "abc-123");
-        assert_eq!(dir, PathBuf::from("/tmp/dch-spill-abc-123"));
-    }
-
-    #[test]
-    fn session_temp_dir_distinct_per_session() {
-        let a = session_temp_dir(Path::new("/tmp"), "session-a");
-        let b = session_temp_dir(Path::new("/tmp"), "session-b");
-        assert_ne!(a, b);
-    }
 
     #[test]
     fn inline_when_under_threshold() {

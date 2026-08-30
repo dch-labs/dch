@@ -4,102 +4,66 @@
 //! once (non-overlapping). The replacement is run through the linter gate
 //! before writing, and the result is returned as a line diff preview.
 
-use std::future::Future;
 use std::ops::Range;
 use std::path::Path;
-use std::pin::Pin;
 
-use loopctl::tool::Tool;
+use loopctl::Tool;
+use loopctl::tool::DisplayHint;
 use loopctl::tool::ToolContext;
 use loopctl::tool::ToolError;
 use loopctl::tool::ToolOutput;
-use loopctl::tool::ToolSchema;
+use serde::Deserialize;
+use serde::Serialize;
 use serde_json::Value;
-use serde_json::json;
 
 use crate::context::RunnerContext;
+use crate::context::require_cwd;
 use crate::context::runner_ctx;
 use crate::diff::format_file_change;
 use crate::linter::LinterResult;
 use crate::linter::lint_content;
-use crate::util::is_url;
+use crate::util::reject_url;
 use crate::util::resolve_path;
 use crate::write::format_lint_failure;
 
-/// Edit a file by replacing a **unique** occurrence of text. Runs the linter
-/// gate on the result before writing; returns a line diff preview.
+/// Input for the Edit tool.
 ///
-/// Not concurrency-safe and not read-only: editing mutates a file, and two
-/// concurrent edits to the same path would race.
-pub struct EditTool;
-
-impl Tool for EditTool {
-    fn name(&self) -> &'static str {
-        "Edit"
-    }
-
-    fn description(&self) -> &'static str {
-        "Edit a file by replacing text. Syntax validation is automatically \
+/// Replaces a unique occurrence of text in a file, runs the linter gate on
+/// the result before writing, and returns a line diff preview of the change.
+#[derive(Default, Deserialize, Serialize, Tool)]
+#[tool(
+    name = "Edit",
+    system_prompt = "old_text must be unique in the file. For multiple changes, use \
+             MultiEdit. Both run the linter after applying.",
+    description = "Edit a file by replacing text. Syntax validation is automatically \
          performed for supported file types."
-    }
-
-    fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            tool: self.name().to_string(),
-            description: self.description().to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "file_path": {
-                        "type": "string",
-                        "description": "The path to the file to edit"
-                    },
-                    "old_text": {
-                        "type": "string",
-                        "description": "The text to replace"
-                    },
-                    "new_text": {
-                        "type": "string",
-                        "description": "The replacement text"
-                    },
-                    "skip_linter": {
-                        "type": "boolean",
-                        "description": "Skip syntax validation (not recommended)",
-                        "default": false
-                    }
-                },
-                "required": ["file_path", "old_text", "new_text"]
-            }),
-        }
-    }
-
-    fn call(
-        &self,
-        input: Value,
-        ctx: &ToolContext,
-    ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
-        let rc = runner_ctx(ctx).cloned();
-        Box::pin(self.edit_inner(input, rc))
-    }
-
-    fn is_read_only(&self) -> bool {
-        false
-    }
-
-    fn is_concurrency_safe(&self) -> bool {
-        false
-    }
-
-    fn system_prompt(&self) -> Option<String> {
-        Some(
-            "old_text must be unique in the file. For multiple changes, use \
-             MultiEdit. Both run the linter after applying."
-                .to_string(),
-        )
-    }
+)]
+pub struct EditInput {
+    /// The path to the file to edit
+    file_path: String,
+    /// The text to replace
+    old_text: String,
+    /// The replacement text
+    new_text: String,
+    /// Skip syntax validation (not recommended)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    skip_linter: Option<bool>,
 }
 
-impl EditTool {
+impl EditInput {
+    /// Deserializes the typed input and delegates to `edit_inner`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError`] when the input cannot be serialized back to JSON
+    /// or when `edit_inner` fails.
+    async fn run(&self, input: Self, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let rc = runner_ctx(ctx).cloned();
+        let value = serde_json::to_value(&input)
+            .map_err(|e| ToolError::Execution(format!("serialize tool input: {e}")))?;
+        self.edit_inner(value, rc).await
+    }
+
     /// Body of [`Tool::call`].
     ///
     /// Orchestrates parse → read → apply → lint → write. Recoverable conditions
@@ -118,12 +82,7 @@ impl EditTool {
         input: Value,
         rc: Option<RunnerContext>,
     ) -> Result<ToolOutput, ToolError> {
-        let rc = rc.ok_or_else(|| {
-            ToolError::Execution(
-                "RunnerContext extension is not installed on the ToolContext".to_string(),
-            )
-        })?;
-        let cwd = rc.cwd.clone();
+        let cwd = require_cwd(rc)?;
         let parsed = parse_input(&input)?;
         let full_path = resolve_path(parsed.file_path, &cwd)?;
         let old_content = read_existing(&full_path, parsed.file_path).await?;
@@ -142,7 +101,7 @@ impl EditTool {
 
         crate::fs::atomic_write(&full_path, &new_content)?;
         let message = format_file_change(parsed.file_path, Some(&old_content), &new_content);
-        Ok(ToolOutput::text(message))
+        Ok(ToolOutput::text(message).with_hint(DisplayHint::Diff))
     }
 }
 
@@ -154,13 +113,13 @@ impl EditTool {
 /// be non-empty and `file_path` must not be a URL, both checked before this
 /// struct is constructed.
 #[derive(Debug)]
-struct EditInput<'a> {
+struct EditArgs<'a> {
     /// The file path exactly as supplied by the caller, before cwd resolution.
     ///
     /// Borrowed from the input JSON. Kept in its raw (pre-resolution) form so
     /// error messages and the diff preview show the path the model named, not
     /// the canonicalized absolute path. Resolution against `cwd` happens later
-    /// in [`edit_inner`](EditTool::edit_inner).
+    /// in [`edit_inner`](EditInput::edit_inner).
     file_path: &'a str,
 
     /// The text to find in the file.
@@ -255,7 +214,7 @@ impl EditError {
 ///
 /// Returns [`ToolError::InvalidInput`] for a missing field, an empty
 /// `old_text`, or a URL `file_path`.
-fn parse_input(input: &Value) -> Result<EditInput<'_>, ToolError> {
+fn parse_input(input: &Value) -> Result<EditArgs<'_>, ToolError> {
     let file_path = input
         .get("file_path")
         .and_then(Value::as_str)
@@ -279,12 +238,8 @@ fn parse_input(input: &Value) -> Result<EditInput<'_>, ToolError> {
         ));
     }
 
-    if is_url(file_path) {
-        return Err(ToolError::InvalidInput(
-            "URLs are not supported by the Edit tool. Use WebFetch for URLs.".to_string(),
-        ));
-    }
-    Ok(EditInput {
+    reject_url("Edit", file_path)?;
+    Ok(EditArgs {
         file_path,
         old_text,
         new_text,
@@ -446,6 +401,7 @@ mod tests {
     use super::*;
     use crate::context::RunnerContext;
     use loopctl::tool::ToolContext;
+    use serde_json::json;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -469,7 +425,7 @@ mod tests {
         let target = tmp.path().join("src.rs");
         std::fs::write(&target, "fn main() { println!(\"hi\"); }\n").unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = EditTool;
+        let tool = EditInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({
             "file_path": "src.rs",
@@ -492,7 +448,7 @@ mod tests {
         let original = "line one\nline two\n";
         std::fs::write(&target, original).unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = EditTool;
+        let tool = EditInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({
             "file_path": "f.txt",
@@ -514,7 +470,7 @@ mod tests {
         let original = "dup\ndup\ndup\n";
         std::fs::write(&target, original).unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = EditTool;
+        let tool = EditInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({
             "file_path": "f.txt",
@@ -535,7 +491,7 @@ mod tests {
         let target = tmp.path().join("f.txt");
         std::fs::write(&target, "content\n").unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = EditTool;
+        let tool = EditInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({
             "file_path": "f.txt",
@@ -556,7 +512,7 @@ mod tests {
         let target = tmp.path().join("bad.rs");
         std::fs::write(&target, "fn main() { let x = 1; }\n").unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = EditTool;
+        let tool = EditInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({
             "file_path": "bad.rs",
@@ -581,7 +537,7 @@ mod tests {
         let target = tmp.path().join("bad.rs");
         std::fs::write(&target, "fn main() { let x = 1; }\n").unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = EditTool;
+        let tool = EditInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({
             "file_path": "bad.rs",
@@ -603,7 +559,7 @@ mod tests {
         let target = tmp.path().join("notes.md");
         std::fs::write(&target, "# Title\nbody\n").unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = EditTool;
+        let tool = EditInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({
             "file_path": "notes.md",
@@ -623,7 +579,7 @@ mod tests {
     async fn file_not_found_is_file_not_found_variant() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = EditTool;
+        let tool = EditInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({
             "file_path": "nope.rs",
@@ -642,7 +598,7 @@ mod tests {
         let target = nested.join("rel.rs");
         std::fs::write(&target, "fn old() {}\n").unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = EditTool;
+        let tool = EditInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({
             "file_path": "sub/rel.rs",
@@ -658,7 +614,7 @@ mod tests {
     async fn missing_new_text_is_invalid_input() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = EditTool;
+        let tool = EditInput::default();
         let ctx = ctx_in(cwd);
         let err = tool
             .call(json!({ "file_path": "x.rs", "old_text": "a" }), &ctx)
@@ -671,7 +627,7 @@ mod tests {
     async fn url_rejected() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = EditTool;
+        let tool = EditInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({
             "file_path": "https://example.com/page",
@@ -687,7 +643,7 @@ mod tests {
 
     #[test]
     fn not_read_only_and_not_concurrency_safe() {
-        let tool = EditTool;
+        let tool = EditInput::default();
         assert!(!tool.is_read_only());
         assert!(!tool.is_concurrency_safe());
     }
@@ -695,7 +651,7 @@ mod tests {
     #[test]
     fn edittool_registered_in_builtin_registry() {
         let reg = crate::registry::builtin_registry();
-        let tool = reg.get("Edit").expect("EditTool registered");
+        let tool = reg.get("Edit").expect("Edit registered");
         assert!(!tool.is_read_only());
         assert!(!tool.is_concurrency_safe());
     }
@@ -706,7 +662,7 @@ mod tests {
         let target = tmp.path().join("clean.rs");
         std::fs::write(&target, "fn main() {}\n").unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = EditTool;
+        let tool = EditInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({
             "file_path": "clean.rs",

@@ -3,15 +3,15 @@
 use loopctl::tool::ToolRegistry;
 
 use crate::bash::BashTool;
-use crate::code_search::CodeSearchTool;
-use crate::edit::EditTool;
-use crate::file_viewer::FileViewerTool;
-use crate::glob::GlobTool;
-use crate::grep::GrepTool;
+use crate::code_search::CodeSearchInput;
+use crate::edit::EditInput;
+use crate::file_viewer::FileViewerInput;
+use crate::glob::GlobInput;
+use crate::grep::GrepInput;
 use crate::multi_edit::MultiEditTool;
-use crate::read::ReadTool;
-use crate::tree::TreeTool;
-use crate::write::WriteTool;
+use crate::read::ReadInput;
+use crate::tree::TreeInput;
+use crate::write::WriteInput;
 
 /// Build a [`ToolRegistry`] populated with every builtin tool.
 ///
@@ -20,16 +20,16 @@ use crate::write::WriteTool;
 #[must_use]
 pub fn builtin_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
-    registry.register(ReadTool);
+    registry.register(ReadInput::default());
     registry.register(BashTool);
-    registry.register(WriteTool);
-    registry.register(EditTool);
+    registry.register(WriteInput::default());
+    registry.register(EditInput::default());
     registry.register(MultiEditTool);
-    registry.register(FileViewerTool);
-    registry.register(GlobTool);
-    registry.register(GrepTool);
-    registry.register(CodeSearchTool);
-    registry.register(TreeTool);
+    registry.register(FileViewerInput::default());
+    registry.register(GlobInput::default());
+    registry.register(GrepInput::default());
+    registry.register(CodeSearchInput::default());
+    registry.register(TreeInput::default());
     registry
 }
 
@@ -53,18 +53,20 @@ mod tests {
         let first = builtin_registry();
         let second = builtin_registry();
 
-        let first_names = first.tool_names();
-        let second_names = second.tool_names();
-        assert_eq!(first_names, second_names, "tool sets must match");
-        assert!(!first_names.is_empty(), "registry must not be empty");
-
-        for name in &first_names {
-            let (Some(a), Some(b)) = (first.get(name), second.get(name)) else {
-                panic!("{name} must resolve in both registries");
-            };
-            let schema_a = serde_json::to_string(&a.schema()).expect("schema serializes");
-            let schema_b = serde_json::to_string(&b.schema()).expect("schema serializes");
-            assert_eq!(schema_a, schema_b, "{name} schema must match");
-        }
+        let first_schemas: Vec<_> = first
+            .all_tools()
+            .into_iter()
+            .map(|tool| serde_json::to_string(&tool.schema()).expect("schema serializes"))
+            .collect();
+        let second_schemas: Vec<_> = second
+            .all_tools()
+            .into_iter()
+            .map(|tool| serde_json::to_string(&tool.schema()).expect("schema serializes"))
+            .collect();
+        assert_eq!(
+            first_schemas, second_schemas,
+            "registries must agree in order"
+        );
+        assert!(!first_schemas.is_empty(), "registry must not be empty");
     }
 }

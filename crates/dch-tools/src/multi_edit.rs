@@ -17,6 +17,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
 
+use loopctl::tool::DisplayHint;
 use loopctl::tool::Tool;
 use loopctl::tool::ToolContext;
 use loopctl::tool::ToolError;
@@ -26,13 +27,14 @@ use serde_json::Value;
 use serde_json::json;
 
 use crate::context::RunnerContext;
+use crate::context::require_cwd;
 use crate::context::runner_ctx;
 use crate::diff::format_file_change;
 use crate::edit::FindResult;
 use crate::edit::locate_unique;
 use crate::edit::splice;
 use crate::linter::lint_content;
-use crate::util::is_url;
+use crate::util::reject_url;
 use crate::util::resolve_path;
 use crate::write::format_lint_failure;
 
@@ -136,21 +138,11 @@ impl MultiEditTool {
         input: Value,
         rc: Option<RunnerContext>,
     ) -> Result<ToolOutput, ToolError> {
-        let cwd = rc
-            .as_ref()
-            .ok_or_else(|| {
-                ToolError::Execution(
-                    "RunnerContext extension is not installed on the ToolContext".to_string(),
-                )
-            })?
-            .cwd
-            .clone();
+        let cwd = require_cwd(rc)?;
 
-        // Phase 0: parse + bounds-check.
         let parsed = parse_input(&input)?;
         let operations = build_operations(parsed.edits, &cwd)?;
 
-        // Phase 1: read each distinct file once, pre-check symlinks.
         if let Some(reason) = dup_path_check(&operations) {
             return Ok(reason.into_output());
         }
@@ -158,17 +150,10 @@ impl MultiEditTool {
         if let Some(reason) = symlink_check(&operations) {
             return Ok(reason.into_output());
         }
-
-        // Phase 1.5: overlap detection. Runs in both dry_run and apply modes
-        // so the preview shows exactly what the apply would catch.
         if let Some(reason) = overlap_check(&operations, &originals) {
             return Ok(reason.into_output());
         }
 
-        // Phase 2: merge each file's edits sequentially (array order, each
-        // seeing the prior's output), locating old_text in the *running*
-        // content (unique check). This is also where edit #N's old_text that
-        // only exists after edit #N-1 is validated.
         let finals = match merge_per_file(&operations, &originals) {
             Ok(f) => f,
             Err(reason) => return Ok(reason.into_output()),
@@ -179,27 +164,41 @@ impl MultiEditTool {
             return Ok(reason.into_output());
         }
 
-        // Phase 3: build the preview/diff block (always).
         let summary = build_preview(&operations, &originals, &finals, parsed.dry_run);
         if parsed.dry_run {
-            return Ok(ToolOutput::text(summary));
+            return Ok(ToolOutput::text(summary).with_hint(DisplayHint::Diff));
         }
-
-        // Phase 4: write each distinct physical file once.
-        let mut written: std::collections::HashSet<&Path> = std::collections::HashSet::new();
-        for op in &operations {
-            if !written.insert(&op.full_path) {
-                continue;
-            }
-            if let Some(final_content) = finals.get(&op.file_path) {
-                crate::fs::atomic_write(&op.full_path, final_content)?;
-            }
-        }
+        write_finals(&operations, &finals)?;
 
         let applied: Vec<&str> = finals.keys().map(String::as_str).collect();
         let message = apply_summary(&summary, &applied, &operations);
-        Ok(ToolOutput::text(message))
+        Ok(ToolOutput::text(message).with_hint(DisplayHint::Diff))
     }
+}
+
+/// Write each distinct physical target file once with its merged content.
+///
+/// Multiple edits can share one physical file; the deduplication by resolved
+/// path ensures the merged content is written exactly once per file, in the
+/// batch's first-seen order.
+///
+/// # Errors
+///
+/// Returns [`ToolError`] when an atomic temp-then-rename write fails.
+fn write_finals(
+    operations: &[EditOperation],
+    finals: &BTreeMap<String, String>,
+) -> Result<(), ToolError> {
+    let mut written: std::collections::HashSet<&Path> = std::collections::HashSet::new();
+    for op in operations {
+        if !written.insert(&op.full_path) {
+            continue;
+        }
+        if let Some(final_content) = finals.get(&op.file_path) {
+            crate::fs::atomic_write(&op.full_path, final_content)?;
+        }
+    }
+    Ok(())
 }
 
 /// Parsed top-level `MultiEdit` input.
@@ -208,12 +207,22 @@ impl MultiEditTool {
 /// option flags, consumed by the rest of the pipeline.
 #[derive(Debug)]
 struct ParsedInput<'a> {
-    /// The edits array, borrowed from the caller's input. Validated non-empty
-    /// and within `MAX_EDITS` by [`parse_input`] before this struct is built.
+    /// The edits array, borrowed from the caller's input.
+    ///
+    /// Validated non-empty and within `MAX_EDITS` by [`parse_input`] before
+    /// this struct is built; item-level field validation happens later in
+    /// [`build_operations`].
     edits: &'a [Value],
     /// Whether to preview without writing.
+    ///
+    /// When `true`, the pipeline stops after building the diff preview and no
+    /// file is touched; when `false` (the default), the writes run after
+    /// validation.
     dry_run: bool,
     /// Whether to skip the linter gate on the merged content.
+    ///
+    /// Defaults to `false`. When `true`, [`lint_all`] is not consulted and the
+    /// batch proceeds to write (or preview) without syntax validation.
     skip_linter: bool,
 }
 
@@ -271,8 +280,15 @@ struct EditOperation {
     /// and the duplicate-path / symlink checks actually target.
     full_path: PathBuf,
     /// The text to find in the file.
+    ///
+    /// Must be non-empty and, at merge time, appear exactly once in the
+    /// running content of the target file (see [`merge_per_file`]); an
+    /// absent or ambiguous match aborts the whole batch.
     old_text: String,
     /// The text to replace `old_text` with.
+    ///
+    /// Spliced over the matched range by [`splice`]; may be empty, which
+    /// deletes the matched text.
     new_text: String,
 }
 
@@ -306,11 +322,7 @@ fn build_operations(edits: &[Value], cwd: &Path) -> Result<Vec<EditOperation>, T
                 "old_text must not be empty".to_string(),
             ));
         }
-        if is_url(file_path) {
-            return Err(ToolError::InvalidInput(
-                "URLs are not supported by the MultiEdit tool. Use WebFetch for URLs.".to_string(),
-            ));
-        }
+        reject_url("MultiEdit", file_path)?;
 
         let full_path = resolve_path(file_path, cwd)?;
         operations.push(EditOperation {
@@ -361,20 +373,21 @@ async fn read_files(operations: &[EditOperation]) -> Result<BTreeMap<String, Str
 #[derive(Debug)]
 enum AbortReason {
     /// One edit's target is a symbolic link (named in the message). Produced
-    /// by the Phase 1 symlink pre-check, before any file is read or written.
+    /// by [`symlink_check`], before any file is written.
     Symlink(String),
     /// Two edits resolve to the same physical file under different path
     /// aliases (named in the message) — the result would be ambiguous.
-    /// Produced by the Phase 1 duplicate-path check.
+    /// Produced by [`dup_path_check`].
     DupPath(String),
     /// One edit's `old_text` is absent or not unique in the running content
-    /// (named in the message). Produced by [`merge_per_file`] during Phase 2.
+    /// (named in the message). Produced by [`merge_per_file`].
     Locate(String),
     /// Two edits' byte-ranges overlap in the same file (named in the message).
-    /// Produced by the Phase 1.5 overlap check (skipped in `dry_run`).
+    /// Produced by [`overlap_check`], which runs in both `dry_run` and apply
+    /// modes so the preview shows exactly what an apply would catch.
     Overlap(String),
     /// The linter rejected one file's merged content (named in the message).
-    /// Produced by the Phase 2 linter gate (skipped when `skip_linter`).
+    /// Produced by [`lint_all`] (skipped when `skip_linter` is set).
     Lint(String),
 }
 
@@ -397,13 +410,13 @@ impl AbortReason {
 /// Reject the batch if two edits resolve to the same physical file under
 /// different path aliases (e.g. `a.rs` and `./a.rs`).
 ///
-/// Each edit would otherwise be merged independently against the same original,
-/// and the second write would silently clobber the first — losing one
-/// edit-set. Refusing is safer than picking a winner. Multiple edits sharing
-/// both `file_path` and `full_path` (the normal multi-edit-to-one-file case)
-/// are allowed.
+/// Maps each resolved path to the first caller-supplied path seen for it and
+/// rejects on any later alias. Each edit would otherwise be merged
+/// independently against the same original, and the second write would
+/// silently clobber the first — losing one edit-set. Refusing is safer than
+/// picking a winner. Multiple edits sharing both `file_path` and `full_path`
+/// (the normal multi-edit-to-one-file case) are allowed.
 fn dup_path_check(operations: &[EditOperation]) -> Option<AbortReason> {
-    // Map each resolved path to the first caller-supplied path seen for it.
     let mut owner: std::collections::HashMap<&Path, &str> = std::collections::HashMap::new();
     for op in operations {
         match owner.get(op.full_path.as_path()) {
@@ -436,7 +449,6 @@ fn dup_path_check(operations: &[EditOperation]) -> Option<AbortReason> {
 fn symlink_check(operations: &[EditOperation]) -> Option<AbortReason> {
     let mut seen = std::collections::HashSet::new();
     for op in operations {
-        // Walk from the target up through each ancestor, without following links.
         for ancestor in op.full_path.ancestors() {
             if !seen.insert(ancestor) {
                 continue;
@@ -498,14 +510,16 @@ struct EditConflict {
 /// Two edits to one file conflict when one's matched byte-range intersects the
 /// other's (one contains the other, or they share text). Applying either first
 /// would invalidate the other's match. Different files never conflict, even
-/// with identical `old_text`.
+/// with identical `old_text`; a file needs at least two edits before a pair
+/// can exist. Each edit contributes at most one range, since uniqueness of
+/// `old_text` is already enforced by [`locate_unique`] at merge time. Each
+/// conflicting pair is reported once, deduplicated by its sorted index pair.
 fn detect_edit_conflicts(
     operations: &[EditOperation],
     file_contents: &BTreeMap<String, String>,
 ) -> Vec<EditConflict> {
     let mut conflicts = Vec::new();
 
-    // Group edits by file.
     let mut file_edits: BTreeMap<String, Vec<(usize, &str)>> = BTreeMap::new();
     for (i, op) in operations.iter().enumerate() {
         file_edits
@@ -515,7 +529,6 @@ fn detect_edit_conflicts(
     }
 
     for (file_path, edits) in &file_edits {
-        // Only check files with 2+ edits.
         if edits.len() < 2 {
             continue;
         }
@@ -523,7 +536,6 @@ fn detect_edit_conflicts(
             continue;
         };
 
-        // One range per edit (uniqueness already enforced by locate_unique).
         let mut ranges: Vec<(usize, usize, usize, &str)> = Vec::new();
         for (edit_idx, old_text) in edits {
             if let Some(start) = content.find(old_text) {
@@ -533,10 +545,8 @@ fn detect_edit_conflicts(
             }
         }
 
-        // Sort by start position.
         ranges.sort_by_key(|r| r.0);
 
-        // Check for overlapping ranges between different edits.
         for i in 0..ranges.len() {
             let Some(&(_start_a, end_a, idx_a, snippet_a)) = ranges.get(i) else {
                 continue;
@@ -559,7 +569,6 @@ fn detect_edit_conflicts(
         }
     }
 
-    // Deduplicate by sorted index pair.
     let mut seen = std::collections::HashSet::new();
     conflicts.retain(|c| {
         let key = (
@@ -594,11 +603,12 @@ fn truncate_str(s: &str, max_len: usize) -> &str {
 /// Delegates the detection to [`detect_edit_conflicts`] and, on the first
 /// conflict, formats a message naming both edits (by 1-indexed position and a
 /// truncated `old_text` snippet) with a hint to split the batch or dry-run.
+/// Runs in both `dry_run` and apply modes so the preview shows exactly what
+/// an apply would catch.
 fn overlap_check(
     operations: &[EditOperation],
     originals: &BTreeMap<String, String>,
 ) -> Option<AbortReason> {
-    use std::fmt::Write;
     let conflicts = detect_edit_conflicts(operations, originals);
     if conflicts.is_empty() {
         return None;
@@ -728,7 +738,6 @@ fn build_preview(
     }
     lines.push(String::new());
 
-    // Distinct files in first-seen order, so the preview follows the batch.
     let mut seen = std::collections::HashSet::new();
     let mut index = 1usize;
     for op in operations {

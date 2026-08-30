@@ -2,11 +2,23 @@
 //! shared runner context.
 //!
 //! [`Runner`] is pure composition glue — it holds no agent-loop logic of its
-//! own. [`Runner::new`] constructs the loopctl ingredients (a concrete provider
-//! client, a tool registry, a session config carrying the composed system
-//! prompt, and the observer-bearing managers bundle), wires them into a
-//! [`BareLoop`], and exposes [`Runner::run`] / [`Runner::cancel`] as one-line
-//! delegations.
+//! own. [`Runner::builder`] constructs the loopctl ingredients (a concrete
+//! provider client, a tool registry, a session config carrying the composed
+//! system prompt, and the observer-bearing managers bundle), wires them into
+//! a [`BareLoop`], and exposes [`Runner::run`] / [`Runner::cancel`] as
+//! one-line delegations.
+//!
+//! The loop offers two extension axes with distinct contracts, and the
+//! builder exposes both symmetrically:
+//!
+//! - **Observers** ([`LoopObserver`]) — passive, read-only lifecycle events
+//!   (streaming deltas, tool pre/post, compaction, model switches). They
+//!   never affect execution; a display, a logger, and a metrics recorder
+//!   can all observe the same run.
+//! - **Middleware** ([`ToolMiddleware`]) — intercepts every tool dispatch
+//!   and may rewrite the context, the output, or the control flow. This is
+//!   where the runner installs its context injector and (unless disabled)
+//!   the secrets-redaction pass.
 //!
 //! Tools reach per-call state (the working directory, the todo list, the
 //! optional question channel) through a [`RunnerContext`] extension. The
@@ -19,6 +31,7 @@
 
 use std::future::Future;
 use std::path::Path;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -29,7 +42,13 @@ use loopctl::engine::Loop;
 use loopctl::engine::Run;
 use loopctl::engine::RunConfig;
 use loopctl::error::LoopError;
+use loopctl::fallback::FallbackManager;
 use loopctl::managers::LoopManagers;
+use loopctl::mcp::CommandSpec;
+use loopctl::mcp::McpClient;
+use loopctl::mcp::McpToolProvider;
+use loopctl::middleware::RedactingMiddleware;
+use loopctl::middleware::SecretPatternSet;
 use loopctl::middleware::ToolDispatchContext;
 use loopctl::middleware::ToolMiddleware;
 use loopctl::middleware::ToolPipeline;
@@ -45,23 +64,24 @@ use crate::with_context;
 /// The top-level agent: the single type the rest of the application holds.
 ///
 /// `Runner` is pure composition glue — it owns no agent-loop logic of its own.
-/// [`Runner::new`] assembles the loopctl ingredients (a concrete provider
+/// [`Runner::builder`] assembles the loopctl ingredients (a concrete provider
 /// client, a tool registry whose every dispatch sees the shared
 /// [`RunnerContext`], a session config carrying the composed system prompt,
 /// and the observer-bearing managers bundle) into one [`BareLoop`], and the
 /// public surface stays thin: runs reset the per-run todo list and delegate
 /// to the loop, the rest are accessors.
 ///
-/// Construct once per agent identity with [`Runner::new`], then drive it with
-/// [`Runner::run`]: each call is one prompt → loop → final answer against the
-/// configured provider, sharing one conversation across calls. Each run starts
-/// by resetting the per-run todo list (a new prompt plans fresh). Cancellation
-/// is cooperative via [`Runner::cancel`] or [`Runner::cancel_signal`].
+/// Construct once per agent identity with [`Runner::builder`]…`.build()`,
+/// then drive it with [`Runner::run`]: each call is one prompt → loop →
+/// final answer against the configured provider, sharing one conversation
+/// across calls. Each run starts by resetting the per-run todo list (a new
+/// prompt plans fresh). Cancellation is cooperative via [`Runner::cancel`]
+/// or [`Runner::cancel_signal`].
 pub struct Runner {
     /// The agent loop, monomorphized over the concrete [`DchClient`].
     ///
-    /// Constructed once in [`Runner::new`] via `new_with_managers` with the
-    /// builtin tool registry, the composed session config, and the
+    /// Constructed once in [`RunnerBuilder::build`] via `new_with_managers`
+    /// with the builtin tool registry, the composed session config, and the
     /// observer-carrying managers (which carry the dispatch pipeline with the
     /// context injector installed). Every public method delegates to it; the
     /// concrete (non-`dyn`) client keeps the per-turn LLM call statically
@@ -70,8 +90,8 @@ pub struct Runner {
 
     /// The shared per-runner context, cloned into every tool dispatch.
     ///
-    /// Built from `workdir` in [`Runner::new`] and carried by the private
-    /// context-injector middleware in the dispatch pipeline, so every
+    /// Built from `workdir` in [`RunnerBuilder::build`] and carried by the
+    /// private context-injector middleware in the dispatch pipeline, so every
     /// builtin tool reaches `cwd`, the todo list, and the question channel
     /// slot through the `ToolContext` extension. Exposed via
     /// [`Runner::context`] for host wiring, and mutated by
@@ -80,68 +100,32 @@ pub struct Runner {
 
     /// The session-default run policy (turn budget, dispatch policy).
     ///
-    /// Mapped once from `DchConfig` in [`Runner::new`] and used by every
-    /// [`Runner::run`] call — the underlying `Loop::run` contract takes the
-    /// run config per call, so this field supplies dch's default. A caller
-    /// that needs a different budget for one run passes an override to
+    /// Mapped once from `DchConfig` in [`RunnerBuilder::build`] and used by
+    /// every [`Runner::run`] call — the underlying `Loop::run` contract takes
+    /// the run config per call, so this field supplies dch's default. A
+    /// caller that needs a different budget for one run passes an override to
     /// [`Runner::run_with`] rather than rebuilding the `Runner` (rebuilding
     /// creates a fresh `BareLoop` and discards the conversation).
     run_config: RunConfig,
 }
 
 impl Runner {
-    /// Construct a runner from configuration, observers, and the working
-    /// directory the agent operates within.
+    /// Start building a runner for `config` operating within `workdir`.
     ///
-    /// `observers` are registered with the loop in the order given; the caller
-    /// owns their construction. The system prompt is composed from the active
-    /// role, the tech stack detected under `workdir` (merged with any
-    /// `[project]` overrides), and per-tool fragments, then installed on the
-    /// session config before the [`BareLoop`] is built.
-    ///
+    /// Returns a [`RunnerBuilder`]; register observers and dispatch
+    /// middleware on it, then [`build`](RunnerBuilder::build) the runner.
     /// `workdir` is taken explicitly rather than read from the process's
-    /// current directory so a resumed session or a test fixture can point the
-    /// agent at the correct tree.
-    ///
-    /// # Errors
-    ///
-    /// - [`RunnerError::Client`] if the provider client cannot be constructed
-    ///   (missing API key, HTTP client failure).
-    pub fn new(
-        config: &dch_config::DchConfig,
-        observers: Vec<Arc<dyn LoopObserver>>,
-        workdir: &Path,
-    ) -> Result<Self, RunnerError> {
-        let context = Arc::new(RunnerContext {
-            cwd: workdir.to_path_buf(),
-            todos: Arc::new(std::sync::Mutex::new(Vec::new())),
-            question_tx: Arc::new(std::sync::Mutex::new(None)),
-        });
-
-        let registry = builtin_registry();
-
-        let session_config = build_session(config, &registry, workdir);
-        let run_config = config.to_run_config();
-        let client = crate::create_client(&config.api)?;
-
-        let mut managers = LoopManagers::new();
-        for observer in observers {
-            managers.register_observer(observer);
+    /// current directory so a resumed session or a test fixture can point
+    /// the agent at the correct tree.
+    #[must_use]
+    pub fn builder<'a>(config: &'a dch_config::DchConfig, workdir: &Path) -> RunnerBuilder<'a> {
+        RunnerBuilder {
+            config,
+            workdir: workdir.to_path_buf(),
+            observers: Vec::new(),
+            middleware: Vec::new(),
+            mcp_providers: Vec::new(),
         }
-        managers.set_pipeline(build_pipeline(&context)?);
-
-        let inner = BareLoop::<DchClient>::new_with_managers(
-            Arc::new(client),
-            registry,
-            session_config,
-            managers,
-        );
-
-        Ok(Self {
-            inner,
-            context,
-            run_config,
-        })
     }
 
     /// Run one prompt → loop → final answer, with the session-default policy.
@@ -248,6 +232,218 @@ impl Runner {
     }
 }
 
+/// Incremental construction of a [`Runner`].
+///
+/// Created by [`Runner::builder`]; register extension points with
+/// [`with_observer`](Self::with_observer) and
+/// [`with_middleware`](Self::with_middleware), then
+/// [`build`](Self::build). The two axes are independent and may each be
+/// registered any number of times:
+///
+/// - Observers receive read-only lifecycle events and never affect
+///   execution — displays, loggers, and metrics recorders coexist freely.
+/// - Middleware intercept every tool dispatch in registration order and may
+///   rewrite the dispatch context, the tool output, or the control flow.
+///
+/// # Examples
+///
+/// ```no_run
+/// # async fn example() {
+/// use std::sync::Arc;
+/// use dch_loop::Runner;
+///
+/// let config = dch_config::DchConfig::default();
+/// let runner = Runner::builder(&config, std::path::Path::new("."))
+///     .build()
+///     .await;
+/// # }
+/// ```
+pub struct RunnerBuilder<'a> {
+    /// The application configuration the runner is built from.
+    config: &'a dch_config::DchConfig,
+
+    /// The directory the agent operates within.
+    workdir: PathBuf,
+
+    /// Lifecycle observers, registered with the loop in the order added.
+    observers: Vec<Arc<dyn LoopObserver>>,
+
+    /// Host dispatch middleware, installed under the runner's context
+    /// injector in the order added.
+    middleware: Vec<Arc<dyn ToolMiddleware>>,
+
+    /// Pre-connected MCP tool providers, registered alongside any
+    /// config-declared stdio servers.
+    mcp_providers: Vec<McpToolProvider>,
+}
+
+impl RunnerBuilder<'_> {
+    /// Register a lifecycle observer.
+    ///
+    /// Observers may be added freely; each one receives every event. The
+    /// registration order only determines notification order among them.
+    #[must_use]
+    pub fn with_observer(mut self, observer: Arc<dyn LoopObserver>) -> Self {
+        self.observers.push(observer);
+        self
+    }
+
+    /// Register a dispatch middleware.
+    ///
+    /// Middleware run in registration order, inside the runner's context
+    /// injector (so they see the enriched [`ToolContext`](loopctl::tool::ToolContext)) and outside the
+    /// secrets-redaction pass (so they observe scrubbed output). The same
+    /// instance may be shared across runners.
+    #[must_use]
+    pub fn with_middleware(mut self, middleware: Arc<dyn ToolMiddleware>) -> Self {
+        self.middleware.push(middleware);
+        self
+    }
+
+    /// Register an already-connected MCP tool provider.
+    ///
+    /// The provider's tools join the registry beside the builtin tools (and
+    /// beside any `[[mcp.servers]]` stdio connections from the config). Use
+    /// this for transports the config cannot express — an in-process server or
+    /// an HTTP endpoint with a custom client.
+    #[must_use]
+    pub fn with_mcp_provider(mut self, provider: McpToolProvider) -> Self {
+        self.mcp_providers.push(provider);
+        self
+    }
+
+    /// Assemble the [`Runner`].
+    ///
+    /// Constructs the provider client, composes the system prompt (role,
+    /// tech stack detected under the workdir merged with `[project]`
+    /// overrides, per-tool fragments), builds the dispatch pipeline
+    /// (context injector → host middleware → secrets redaction when enabled
+    /// → builtin tools), and — when `api.fallback_model` is configured —
+    /// arms the model fallback breaker so a failing primary is routed
+    /// around automatically.
+    ///
+    /// # Errors
+    ///
+    /// - [`RunnerError::Client`] if the provider client cannot be constructed
+    ///   (missing API key, HTTP client failure).
+    /// - [`RunnerError::Config`] if the fallback breaker cannot be armed.
+    pub async fn build(self) -> Result<Runner, RunnerError> {
+        let context = Arc::new(RunnerContext {
+            cwd: self.workdir.clone(),
+            todos: Arc::new(std::sync::Mutex::new(Vec::new())),
+            question_tx: Arc::new(std::sync::Mutex::new(None)),
+        });
+
+        let mut providers = connect_mcp_servers(self.config).await?;
+        providers.extend(self.mcp_providers);
+        let registry = compose_registry(&providers);
+        let core_registry = compose_registry(&providers);
+
+        let session_config = build_session(self.config, &registry, &self.workdir);
+        let run_config = self.config.to_run_config();
+        let client = crate::create_client(&self.config.api)?;
+
+        let mut managers = LoopManagers::new();
+        for observer in self.observers {
+            managers.register_observer(observer);
+        }
+        if let Some(fallback_model) = &self.config.api.fallback_model {
+            managers =
+                managers.with_fallback(arm_fallback(&self.config.api.model, fallback_model)?);
+        }
+        managers.set_pipeline(build_pipeline(
+            &context,
+            &self.middleware,
+            self.config.security.redact_secrets,
+            core_registry,
+        )?);
+
+        let inner = BareLoop::<DchClient>::new_with_managers(
+            Arc::new(client),
+            registry,
+            session_config,
+            managers,
+        );
+
+        Ok(Runner {
+            inner,
+            context,
+            run_config,
+        })
+    }
+}
+
+/// Spawn and adapt every config-declared MCP server.
+///
+/// Each `[[mcp.servers]]` entry is launched over the stdio transport and its
+/// tools discovered under the server's name prefix. A server that fails to
+/// spawn or complete the MCP handshake fails construction naming the server —
+/// a silently missing tool set is worse than a clear startup error.
+///
+/// # Errors
+///
+/// Returns [`RunnerError::Config`] naming the failing server on any transport
+/// or handshake failure.
+async fn connect_mcp_servers(
+    config: &dch_config::DchConfig,
+) -> Result<Vec<McpToolProvider>, RunnerError> {
+    let mut providers = Vec::new();
+    for server in &config.mcp.servers {
+        let command = CommandSpec {
+            program: server.command.clone(),
+            args: server.args.clone(),
+            env: server
+                .env
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+            cwd: None,
+        };
+        let client = McpClient::stdio(command)
+            .await
+            .map_err(|e| RunnerError::Config(format!("mcp server '{}': {e}", server.name)))?;
+        let provider = McpToolProvider::connect(client, Some(server.name.clone()))
+            .await
+            .map_err(|e| RunnerError::Config(format!("mcp server '{}': {e}", server.name)))?;
+        providers.push(provider);
+    }
+    Ok(providers)
+}
+
+/// Compose the full tool registry: the builtin tools plus every MCP server's.
+///
+/// Called once per consumer — the engine's by-value registry and the dispatch
+/// pipeline's core cannot share boxed tools, so each gets its own composition
+/// from the same providers (an MCP tool clones into both, keeping the two
+/// positions identical by construction).
+fn compose_registry(providers: &[McpToolProvider]) -> ToolRegistry {
+    let mut registry = builtin_registry();
+    for provider in providers {
+        provider.register_into(&mut registry);
+    }
+    registry
+}
+
+/// Arm the model-fallback breaker for a primary/fallback pair.
+///
+/// The breaker starts closed: the primary serves until it accumulates enough
+/// failures to trip, after which the fallback serves until a recovery probe
+/// on the primary succeeds.
+///
+/// # Errors
+///
+/// Returns [`RunnerError::Config`] only when the breaker's internal state
+/// lock is poisoned.
+fn arm_fallback(primary: &str, fallback: &str) -> Result<FallbackManager, RunnerError> {
+    let manager = FallbackManager::for_model(primary)
+        .and_then(|m| {
+            m.set_fallback_models(vec![fallback.to_string()])
+                .map(|()| m)
+        })
+        .map_err(|e| RunnerError::Config(format!("fallback breaker: {e}")))?;
+    Ok(manager)
+}
+
 /// Compose the session config — including the system prompt — for `config`.
 ///
 /// Maps the runner settings onto a [`loopctl::config::SessionConfig`], detects
@@ -281,31 +477,41 @@ fn build_session(
 
 /// Build the dispatch pipeline with the [`ContextInjector`] installed.
 ///
-/// The engine routes every tool call through this pipeline (when one is set on
-/// the managers) instead of calling tools directly, and hands each middleware
-/// the per-dispatch [`ToolDispatchContext`] — whose `tool_context` field is
-/// documented for exactly this augmentation. Putting the injector first
-/// (outermost) means any later middleware also sees the enriched context.
+/// Layering, outermost first: the context injector (every layer below — and
+/// the tool — sees the enriched context), the host middleware in
+/// registration order, the secrets-redaction pass when `redact` is set
+/// (everything above observes scrubbed output), and the builtin-tool core.
 ///
 /// The pipeline's core holds its own registry instance for execution while the
 /// [`BareLoop`] holds the one it advertises to the model; the registry stores
 /// boxed tools that cannot be shared, so the engine's by-value registry and
-/// the pipeline's core registry cannot be one instance. Both come from
-/// [`dch_tools::builtin_registry`], whose construction is deterministic —
-/// pinned by a dch-tools test asserting two constructions register the
-/// identical tool set and schemas.
+/// the pipeline's core registry cannot be one instance. Both are composed from
+/// the same providers by [`compose_registry`], keeping the advertised and
+/// executable tool sets identical by construction.
 ///
 /// # Errors
 ///
 /// - [`RunnerError::Config`] if the builder rejects the composition — cannot
 ///   happen with this fixed stack (the core is always set), but mapped to a
 ///   typed error rather than panicked on.
-fn build_pipeline(context: &Arc<RunnerContext>) -> Result<ToolPipeline, RunnerError> {
-    ToolPipeline::builder()
-        .with_middleware(ContextInjector {
-            context: Arc::clone(context),
-        })
-        .with_core(Arc::new(builtin_registry()))
+fn build_pipeline(
+    context: &Arc<RunnerContext>,
+    middleware: &[Arc<dyn ToolMiddleware>],
+    redact: bool,
+    core_registry: ToolRegistry,
+) -> Result<ToolPipeline, RunnerError> {
+    let mut builder = ToolPipeline::builder().with_middleware(ContextInjector {
+        context: Arc::clone(context),
+    });
+    for host_middleware in middleware {
+        builder = builder.with_middleware_arc(Arc::clone(host_middleware));
+    }
+    if redact {
+        builder =
+            builder.with_middleware(RedactingMiddleware::new(SecretPatternSet::default_common()));
+    }
+    builder
+        .with_core(Arc::new(core_registry))
         .build()
         .map_err(|e| RunnerError::Config(format!("dispatch pipeline: {e}")))
 }
@@ -432,6 +638,23 @@ mod tests {
         )
     }
 
+    /// A pass-through middleware whose name proves pipeline placement.
+    struct HostProbe;
+
+    impl ToolMiddleware for HostProbe {
+        fn name(&self) -> &'static str {
+            "host-probe"
+        }
+        fn dispatch<'a>(
+            &'a self,
+            ctx: &'a mut ToolDispatchContext,
+            next: &'a ToolPipeline,
+        ) -> Pin<Box<dyn Future<Output = loopctl::middleware::ToolDispatchResult> + Send + 'a>>
+        {
+            Box::pin(async move { next.dispatch(ctx).await })
+        }
+    }
+
     fn sample_context(cwd: &str) -> Arc<RunnerContext> {
         Arc::new(RunnerContext {
             cwd: PathBuf::from(cwd),
@@ -506,12 +729,45 @@ mod tests {
 
     #[test]
     fn build_pipeline_places_the_injector_outermost_over_the_core() {
-        let pipeline =
-            build_pipeline(&sample_context("/tmp/probe-cwd")).expect("static composition builds");
+        let pipeline = build_pipeline(
+            &sample_context("/tmp/probe-cwd"),
+            &[],
+            false,
+            builtin_registry(),
+        )
+        .expect("static composition builds");
         assert_eq!(
             pipeline.middleware_names(),
             vec!["dch-context", "tool_call"],
             "the injector must be the outermost layer over the tool-call core"
+        );
+    }
+
+    #[test]
+    fn build_pipeline_layers_host_middleware_between_injector_and_redaction() {
+        let redacting = build_pipeline(
+            &sample_context("/tmp/probe-cwd"),
+            &[],
+            true,
+            builtin_registry(),
+        )
+        .expect("static composition builds");
+        assert_eq!(
+            redacting.middleware_names(),
+            vec!["dch-context", "redaction", "tool_call"],
+            "redaction wraps the core under the injector"
+        );
+        let layered = build_pipeline(
+            &sample_context("/tmp/probe-cwd"),
+            &[Arc::new(HostProbe)],
+            true,
+            builtin_registry(),
+        )
+        .expect("static composition builds");
+        assert_eq!(
+            layered.middleware_names(),
+            vec!["dch-context", "host-probe", "redaction", "tool_call"],
+            "host middleware sit under the injector and above redaction"
         );
     }
 
@@ -551,11 +807,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn set_question_tx_installs_the_channel_into_the_shared_context() {
+    #[tokio::test]
+    async fn set_question_tx_installs_the_channel_into_the_shared_context() {
         let dir = TempDir::new().expect("tempdir");
-        let runner =
-            Runner::new(&offline_config(), Vec::new(), dir.path()).expect("Runner::new constructs");
+        let runner = Runner::builder(&offline_config(), dir.path())
+            .build()
+            .await
+            .expect("Runner::new constructs");
         let (tx, _rx) = std::sync::mpsc::channel();
         runner.set_question_tx(tx);
         assert!(
@@ -569,11 +827,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn set_question_tx_replaces_an_existing_channel() {
+    #[tokio::test]
+    async fn set_question_tx_replaces_an_existing_channel() {
         let dir = TempDir::new().expect("tempdir");
-        let runner =
-            Runner::new(&offline_config(), Vec::new(), dir.path()).expect("Runner::new constructs");
+        let runner = Runner::builder(&offline_config(), dir.path())
+            .build()
+            .await
+            .expect("Runner::new constructs");
         let (first_tx, first_rx) = std::sync::mpsc::channel();
         runner.set_question_tx(first_tx);
         let (second_tx, second_rx) = std::sync::mpsc::channel();
@@ -693,16 +953,18 @@ mod tests {
         config
     }
 
-    #[test]
-    fn runner_new_constructs_offline_and_cancel_signal_trips() {
+    #[tokio::test]
+    async fn runner_builder_constructs_offline_and_cancel_signal_trips() {
         // Runner::new must construct without a network connection (the provider
         // builder is lazy), and cancel()/cancel_signal() must delegate to the
         // BareLoop. Cancelling trips the shared signal a subsequent run would
         // observe.
         let dir = TempDir::new().expect("tempdir");
         let config = offline_config();
-        let runner =
-            Runner::new(&config, Vec::new(), dir.path()).expect("Runner::new constructs offline");
+        let runner = Runner::builder(&config, dir.path())
+            .build()
+            .await
+            .expect("Runner::new constructs offline");
         let signal = runner.cancel_signal();
         assert!(
             !signal.is_cancelled(),
@@ -774,12 +1036,35 @@ mod tests {
         requests: Arc<Mutex<Vec<String>>>,
     }
 
+    /// One canned HTTP response: status code plus body.
+    struct CannedResponse {
+        /// HTTP status the server answers with.
+        status: u16,
+        /// Response body bytes.
+        body: String,
+    }
+
     impl SseServer {
         async fn start(responses: Vec<String>) -> Self {
             Self::start_with_delay(responses, std::time::Duration::ZERO).await
         }
 
+        async fn start_canned(responses: Vec<CannedResponse>) -> Self {
+            Self::start_canned_with_delay(responses, std::time::Duration::ZERO).await
+        }
+
         async fn start_with_delay(responses: Vec<String>, delay: std::time::Duration) -> Self {
+            let canned = responses
+                .into_iter()
+                .map(|body| CannedResponse { status: 200, body })
+                .collect();
+            Self::start_canned_with_delay(canned, delay).await
+        }
+
+        async fn start_canned_with_delay(
+            responses: Vec<CannedResponse>,
+            delay: std::time::Duration,
+        ) -> Self {
             // Bind here (not inside the task) so the port is known before the
             // first request is sent; the listener moves into the accept loop.
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -793,12 +1078,12 @@ mod tests {
             let task_requests = Arc::clone(&requests);
             tokio::spawn(async move {
                 use tokio::io::AsyncWriteExt as _;
-                let mut queue: std::collections::VecDeque<String> = responses.into();
+                let mut queue: std::collections::VecDeque<CannedResponse> = responses.into();
                 loop {
                     let Ok((mut sock, _)) = listener.accept().await else {
                         break;
                     };
-                    let body = queue.pop_front();
+                    let canned = queue.pop_front();
                     if let (Some(req), Ok(mut recorded)) =
                         (read_http_request(&mut sock).await, task_requests.lock())
                     {
@@ -807,18 +1092,25 @@ mod tests {
                     if delay > std::time::Duration::ZERO {
                         tokio::time::sleep(delay).await;
                     }
-                    let bytes = body.map_or_else(
+                    let bytes = canned.map_or_else(
                         || {
                             "HTTP/1.1 500 No canned response\r\nContent-Length: 0\r\n\
                              Connection: close\r\n\r\n"
                                 .to_string()
                         },
-                        |b| {
+                        |r| {
+                            let content_type = if r.status == 200 {
+                                "text/event-stream"
+                            } else {
+                                "application/json"
+                            };
                             format!(
-                                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                                "HTTP/1.1 {} {}\r\nContent-Type: {content_type}\r\n\
                                  Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-                                b.len(),
-                                b
+                                r.status,
+                                reason_phrase(r.status),
+                                r.body.len(),
+                                r.body
                             )
                         },
                     );
@@ -826,6 +1118,20 @@ mod tests {
                 }
             });
             Self { port, requests }
+        }
+    }
+
+    /// Reason phrase for the statuses the canned server emits.
+    fn reason_phrase(status: u16) -> &'static str {
+        match status {
+            200 => "OK",
+            401 => "Unauthorized",
+            403 => "Forbidden",
+            404 => "Not Found",
+            429 => "Too Many Requests",
+            500 => "Internal Server Error",
+            503 => "Service Unavailable",
+            _ => "Status",
         }
     }
 
@@ -912,6 +1218,9 @@ mod tests {
         fn on_run_end(&self, _: &loopctl::observer::RunEndContext) {
             self.record("run_end");
         }
+        fn on_compaction(&self, _: &loopctl::observer::CompactedContext) {
+            self.record("compaction");
+        }
     }
 
     fn wire_config(port: u16, max_turns: usize) -> DchConfig {
@@ -942,8 +1251,10 @@ mod tests {
     async fn run_completes_with_the_session_default_policy() {
         let server = SseServer::start(vec![sse_text_turn("probe says hello")]).await;
         let dir = TempDir::new().expect("tempdir");
-        let mut runner =
-            Runner::new(&wire_config(server.port, 7), Vec::new(), dir.path()).expect("constructs");
+        let mut runner = Runner::builder(&wire_config(server.port, 7), dir.path())
+            .build()
+            .await
+            .expect("constructs");
         let run = tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("hi"))
             .await
             .expect("run completes within timeout")
@@ -955,11 +1266,235 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn default_compaction_fires_when_the_context_crosses_the_threshold() {
+        // Several tool turns of medium results accumulate past the compact
+        // threshold; the next request must be preceded by a compaction pass
+        // that drops the older exchanges instead of serving over-window.
+        // The loop seeds a default compactor from the session config, so the
+        // threshold is enforced machinery.
+        let dir = TempDir::new().expect("tempdir");
+        let chunk = "payload line for the context budget\n".repeat(170);
+        std::fs::write(dir.path().join("chunk.txt"), &chunk).expect("write fixture");
+        let cat_turn =
+            || sse_tool_call_turn("Bash", &serde_json::json!({"command": "cat chunk.txt"}));
+        let server = SseServer::start(vec![
+            cat_turn(),
+            cat_turn(),
+            cat_turn(),
+            cat_turn(),
+            cat_turn(),
+            sse_text_turn("recovered"),
+        ])
+        .await;
+        let mut config = wire_config(server.port, 10);
+        config.api.context_window = 12_000;
+        let observer = Arc::new(RecordingObserver::new());
+        let mut runner = Runner::builder(&config, dir.path())
+            .with_observer(Arc::clone(&observer) as Arc<dyn LoopObserver>)
+            .build()
+            .await
+            .expect("constructs");
+        let run = tokio::time::timeout(std::time::Duration::from_secs(20), runner.run("grow"))
+            .await
+            .expect("run completes")
+            .expect("run succeeds across the compaction boundary");
+        assert_eq!(run.output.as_deref(), Some("recovered"));
+        assert!(
+            observer.snapshot().contains(&"compaction"),
+            "the over-threshold request must compact first: {:?}",
+            observer.snapshot()
+        );
+        assert_eq!(
+            recorded_requests(&server).len(),
+            6,
+            "five tool turns plus the final text turn, no extras"
+        );
+    }
+
+    /// An rmcp server exposing one `greet` tool, for the MCP registration test.
+    #[derive(Clone)]
+    struct GreetServer {
+        // rmcp's tool_handler macro reaches the router through its generated
+        // trait impl, so rustc cannot see the read.
+        #[allow(dead_code)]
+        router: rmcp::handler::server::router::tool::ToolRouter<Self>,
+    }
+
+    #[rmcp::tool_router]
+    impl GreetServer {
+        fn new() -> Self {
+            Self {
+                router: Self::tool_router(),
+            }
+        }
+
+        #[rmcp::tool(description = "Return a friendly greeting")]
+        async fn greet(&self) -> String {
+            "hello, world!".to_string()
+        }
+    }
+
+    #[allow(clippy::unused_async_trait_impl)] // rmcp's tool_handler emits un-awaited trait impls
+    #[rmcp::tool_handler]
+    impl rmcp::handler::server::ServerHandler for GreetServer {}
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mcp_provider_tools_join_the_registry_and_dispatch() {
+        let client = loopctl::mcp::McpClient::in_process(GreetServer::new())
+            .await
+            .expect("mcp handshake");
+        let provider = loopctl::mcp::McpToolProvider::connect(client, Some("demo".to_string()))
+            .await
+            .expect("tool discovery");
+        let server = SseServer::start(vec![
+            sse_tool_call_turn("demo__greet", &serde_json::json!({})),
+            sse_text_turn("done"),
+        ])
+        .await;
+        let dir = TempDir::new().expect("tempdir");
+        let config = wire_config(server.port, 7);
+        let mut runner = Runner::builder(&config, dir.path())
+            .with_mcp_provider(provider)
+            .build()
+            .await
+            .expect("constructs");
+        let run = tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("greet"))
+            .await
+            .expect("run completes")
+            .expect("run succeeds");
+        assert_eq!(run.output.as_deref(), Some("done"));
+        assert_eq!(run.tool_call_count(), 1, "the MCP tool was dispatched");
+        let requests = recorded_requests(&server);
+        assert!(
+            requests.len() >= 2 && requests[1].contains("hello, world!"),
+            "the MCP tool result must flow back to the model: {requests:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_configured_fallback_model_serves_once_the_primary_trips() {
+        // A permanent auth failure costs exactly one attempt, so three
+        // failing runs trip the breaker deterministically; the next run's
+        // request must name the fallback model and succeed.
+        let denied = r#"{"error":{"message":"invalid api key"}}"#.to_string();
+        let server = SseServer::start_canned(vec![
+            CannedResponse {
+                status: 401,
+                body: denied.clone(),
+            },
+            CannedResponse {
+                status: 401,
+                body: denied.clone(),
+            },
+            CannedResponse {
+                status: 401,
+                body: denied,
+            },
+            CannedResponse {
+                status: 200,
+                body: sse_text_turn("saved by the fallback"),
+            },
+        ])
+        .await;
+        let dir = TempDir::new().expect("tempdir");
+        let mut config = wire_config(server.port, 10);
+        config.api.fallback_model = Some("dch-fallback-model".to_string());
+        let mut runner = Runner::builder(&config, dir.path())
+            .build()
+            .await
+            .expect("constructs");
+        for attempt in 1..=3 {
+            let result = runner.run("fail").await;
+            assert!(result.is_err(), "denial {attempt} must fail the run");
+        }
+        let recovered = runner.run("recover").await.expect("fallback serves");
+        assert_eq!(recovered.output.as_deref(), Some("saved by the fallback"));
+        let requests = recorded_requests(&server);
+        assert_eq!(
+            requests.len(),
+            4,
+            "one request per run, no retry ladder on 401"
+        );
+        for (index, request) in requests.iter().enumerate().take(3) {
+            assert!(
+                request.contains("\"model\":\"test-model\""),
+                "request {index} must name the primary model: {request}"
+            );
+        }
+        assert!(
+            requests[3].contains("\"model\":\"dch-fallback-model\""),
+            "the post-trip request must carry the fallback model: {}",
+            requests[3]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tool_output_secrets_are_scrubbed_before_reaching_the_model() {
+        let leak = "Authorization: Bearer sk-ant-api03-0123456789abcdef0123456789abcdef";
+        let server = SseServer::start(vec![
+            sse_tool_call_turn(
+                "Bash",
+                &serde_json::json!({"command": format!("echo '{leak}'")}),
+            ),
+            sse_text_turn("done"),
+        ])
+        .await;
+        let dir = TempDir::new().expect("tempdir");
+        let config = wire_config(server.port, 7);
+        let mut runner = Runner::builder(&config, dir.path())
+            .build()
+            .await
+            .expect("constructs");
+        let run = tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("leak"))
+            .await
+            .expect("run completes")
+            .expect("run succeeds");
+        assert_eq!(run.output.as_deref(), Some("done"));
+        let requests = recorded_requests(&server);
+        assert!(
+            requests.len() >= 2 && requests[1].contains("[REDACTED:"),
+            "the tool result fed back to the model must be scrubbed: {requests:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disabling_redaction_passes_tool_output_through_verbatim() {
+        let leak = "Authorization: Bearer sk-ant-api03-0123456789abcdef0123456789abcdef";
+        let server = SseServer::start(vec![
+            sse_tool_call_turn(
+                "Bash",
+                &serde_json::json!({"command": format!("echo '{leak}'")}),
+            ),
+            sse_text_turn("done"),
+        ])
+        .await;
+        let dir = TempDir::new().expect("tempdir");
+        let mut config = wire_config(server.port, 7);
+        config.security.redact_secrets = false;
+        let mut runner = Runner::builder(&config, dir.path())
+            .build()
+            .await
+            .expect("constructs");
+        let run = tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("leak"))
+            .await
+            .expect("run completes")
+            .expect("run succeeds");
+        assert_eq!(run.output.as_deref(), Some("done"));
+        let requests = recorded_requests(&server);
+        assert!(
+            requests.len() >= 2 && !requests[1].contains("[REDACTED:"),
+            "with redaction off the result must pass through unscrubbed: {requests:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_with_applies_the_override_for_that_call_only() {
         let server = SseServer::start(vec![sse_text_turn("first"), sse_text_turn("second")]).await;
         let dir = TempDir::new().expect("tempdir");
-        let mut runner =
-            Runner::new(&wire_config(server.port, 7), Vec::new(), dir.path()).expect("constructs");
+        let mut runner = Runner::builder(&wire_config(server.port, 7), dir.path())
+            .build()
+            .await
+            .expect("constructs");
         let override_config = loopctl::engine::RunConfig::default().with_max_turns(3);
         let first = tokio::time::timeout(
             std::time::Duration::from_secs(10),
@@ -987,12 +1522,11 @@ mod tests {
         let server = SseServer::start(vec![sse_text_turn("hello")]).await;
         let dir = TempDir::new().expect("tempdir");
         let observer = Arc::new(RecordingObserver::new());
-        let mut runner = Runner::new(
-            &wire_config(server.port, 7),
-            vec![Arc::clone(&observer) as Arc<dyn LoopObserver>],
-            dir.path(),
-        )
-        .expect("constructs");
+        let mut runner = Runner::builder(&wire_config(server.port, 7), dir.path())
+            .with_observer(Arc::clone(&observer) as Arc<dyn LoopObserver>)
+            .build()
+            .await
+            .expect("constructs");
         tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("hi"))
             .await
             .expect("run completes")
@@ -1008,8 +1542,10 @@ mod tests {
     async fn composed_system_prompt_and_tool_schemas_reach_the_provider() {
         let server = SseServer::start(vec![sse_text_turn("hello")]).await;
         let dir = TempDir::new().expect("tempdir");
-        let mut runner =
-            Runner::new(&wire_config(server.port, 7), Vec::new(), dir.path()).expect("constructs");
+        let mut runner = Runner::builder(&wire_config(server.port, 7), dir.path())
+            .build()
+            .await
+            .expect("constructs");
         tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("hi"))
             .await
             .expect("run completes")
@@ -1035,8 +1571,10 @@ mod tests {
         let server = SseServer::start(vec![sse_read_tool_call_turn(), sse_text_turn("done")]).await;
         let dir = TempDir::new().expect("tempdir");
         std::fs::write(dir.path().join("note.txt"), "probe payload\n").expect("write fixture");
-        let mut runner =
-            Runner::new(&wire_config(server.port, 7), Vec::new(), dir.path()).expect("constructs");
+        let mut runner = Runner::builder(&wire_config(server.port, 7), dir.path())
+            .build()
+            .await
+            .expect("constructs");
         let run = tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("read it"))
             .await
             .expect("run completes")
@@ -1114,8 +1652,10 @@ mod tests {
         ])
         .await;
         let dir = TempDir::new().expect("tempdir");
-        let mut runner =
-            Runner::new(&wire_config(server.port, 7), Vec::new(), dir.path()).expect("constructs");
+        let mut runner = Runner::builder(&wire_config(server.port, 7), dir.path())
+            .build()
+            .await
+            .expect("constructs");
         tokio::time::timeout(
             std::time::Duration::from_secs(10),
             runner.run("first question"),
@@ -1147,8 +1687,10 @@ mod tests {
         )
         .await;
         let dir = TempDir::new().expect("tempdir");
-        let mut runner =
-            Runner::new(&wire_config(server.port, 7), Vec::new(), dir.path()).expect("constructs");
+        let mut runner = Runner::builder(&wire_config(server.port, 7), dir.path())
+            .build()
+            .await
+            .expect("constructs");
         let signal = runner.cancel_signal();
         let task = tokio::spawn(async move { runner.run("slow").await });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1173,8 +1715,10 @@ mod tests {
         let port = listener.local_addr().expect("addr").port();
         drop(listener);
         let dir = TempDir::new().expect("tempdir");
-        let mut runner =
-            Runner::new(&wire_config(port, 7), Vec::new(), dir.path()).expect("constructs");
+        let mut runner = Runner::builder(&wire_config(port, 7), dir.path())
+            .build()
+            .await
+            .expect("constructs");
         let result =
             tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("hi")).await;
         assert!(
@@ -1193,8 +1737,10 @@ mod tests {
         let port = listener.local_addr().expect("addr").port();
         drop(listener);
         let dir = TempDir::new().expect("tempdir");
-        let mut runner =
-            Runner::new(&wire_config(port, 7), Vec::new(), dir.path()).expect("constructs");
+        let mut runner = Runner::builder(&wire_config(port, 7), dir.path())
+            .build()
+            .await
+            .expect("constructs");
         runner
             .context()
             .todos
@@ -1228,8 +1774,10 @@ mod tests {
             SseServer::start(vec![sse_read_tool_call_turn(), sse_read_tool_call_turn()]).await;
         let dir = TempDir::new().expect("tempdir");
         std::fs::write(dir.path().join("note.txt"), "probe payload\n").expect("write fixture");
-        let mut runner =
-            Runner::new(&wire_config(server.port, 2), Vec::new(), dir.path()).expect("constructs");
+        let mut runner = Runner::builder(&wire_config(server.port, 2), dir.path())
+            .build()
+            .await
+            .expect("constructs");
         let result = tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("loop"))
             .await
             .expect("run terminates at the budget");

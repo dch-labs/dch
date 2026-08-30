@@ -114,7 +114,7 @@ mod tests {
 
     #[test]
     fn response_round_trips_through_the_one_shot_channel() {
-        // AskUserQuestion (T-38) awaits response_tx; the UI answers on it.
+        // The asking tool awaits response_tx; the UI answers on it.
         // Verify the chosen labels come back verbatim and the question text is
         // echoed for correlation.
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel::<QuestionResponse>();

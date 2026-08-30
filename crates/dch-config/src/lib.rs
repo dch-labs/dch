@@ -56,6 +56,26 @@ pub enum ApiType {
     /// A standalone variant so the default [`ApiType::default_base_url`] resolves
     /// to the correct Z.AI host.
     Zai,
+
+    /// Azure OpenAI.
+    ///
+    /// The deployment-style endpoint under `https://{resource}.openai.azure.com`.
+    /// The resource name comes from [`ApiConfig::azure_resource`] or the
+    /// `AZURE_OPENAI_RESOURCE` environment variable; credentials follow the
+    /// provider profile (`AZURE_OPENAI_API_KEY`).
+    Azure,
+
+    /// Moonshot AI.
+    ///
+    /// An OpenAI-compatible API served by Moonshot; the default base URL and
+    /// model come from the provider profile (`MOONSHOT_API_KEY`).
+    Moonshot,
+
+    /// AWS Bedrock.
+    ///
+    /// SigV4-authenticated native endpoint; credentials come from the standard
+    /// `AWS_*` environment variables, and `api_key`/`base_url` do not apply.
+    Bedrock,
 }
 
 impl ApiType {
@@ -75,6 +95,8 @@ impl ApiType {
             Self::DeepSeek => "https://api.deepseek.com",
             Self::Grok => "https://api.x.ai/v1",
             Self::Zai => "https://api.z.ai/api",
+            Self::Azure | Self::Bedrock => "",
+            Self::Moonshot => "https://api.moonshot.ai/v1",
         }
     }
 }
@@ -371,6 +393,48 @@ pub enum DchConfigError {
     Parse(#[from] toml::de::Error),
 }
 
+/// MCP tool-server settings, in the `[mcp]` config section.
+///
+/// Each entry names one external MCP server whose tools are adapted into the
+/// agent's tool registry at startup, exposed as `{name}__{tool}`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct McpConfig {
+    /// Servers to connect at startup, in configuration order.
+    ///
+    /// Defaults to empty — no external tools.
+    pub servers: Vec<McpServerConfig>,
+}
+
+/// One `[[mcp.servers]]` entry: an MCP server to spawn over stdio.
+///
+/// The command is launched as a child process and speaks the MCP stdio
+/// transport; a server that fails to start or complete its handshake is a
+/// startup error (fail-closed) rather than a silently missing tool set.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct McpServerConfig {
+    /// Short name used to prefix the server's tools (`{name}__{tool}`).
+    ///
+    /// Also names the server in startup errors.
+    pub name: String,
+
+    /// Executable to spawn.
+    ///
+    /// Resolved on `PATH` or taken as an absolute path.
+    pub command: String,
+
+    /// Arguments passed to the executable.
+    ///
+    /// Defaults to empty.
+    #[serde(default)]
+    pub args: Vec<String>,
+
+    /// Extra environment variables for the child process.
+    ///
+    /// Defaults to empty.
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+}
+
 /// Top-level configuration loaded from `~/.dch/config.toml`.
 ///
 /// The root of the config TOML; every section maps onto one of its fields, each
@@ -412,6 +476,19 @@ pub struct DchConfig {
     /// Log level and output format. See [`TelemetryConfig`].
     #[serde(default)]
     pub telemetry: TelemetryConfig,
+
+    /// Security settings.
+    ///
+    /// Controls how tool output is sanitized before it re-enters the
+    /// conversation. See [`SecurityConfig`].
+    #[serde(default)]
+    pub security: SecurityConfig,
+
+    /// External MCP tool servers.
+    ///
+    /// Servers to spawn and adapt at startup. See [`McpConfig`].
+    #[serde(default)]
+    pub mcp: McpConfig,
 }
 
 /// Provider connection settings.
@@ -470,6 +547,13 @@ pub struct ApiConfig {
     /// Falls back to this model identifier when a primary request fails.
     /// Defaults to `None`, meaning no fallback is configured.
     pub fallback_model: Option<String>,
+
+    /// Azure OpenAI resource name.
+    ///
+    /// The `{resource}` in `https://{resource}.openai.azure.com`. Consulted only
+    /// for [`ApiType::Azure`]; falls back to the `AZURE_OPENAI_RESOURCE`
+    /// environment variable when `None`.
+    pub azure_resource: Option<String>,
 }
 
 /// Display / rendering preferences.
@@ -685,6 +769,24 @@ pub struct TelemetryConfig {
     pub json_logs: bool,
 }
 
+/// Secrets-redaction settings, in the `[security]` config section.
+///
+/// Controls whether tool output is scrubbed of credential-shaped content
+/// (bearer tokens, API keys, PEM blocks, …) before it re-enters the model's
+/// context. The scrubbing itself is performed by loopctl's redaction
+/// middleware; this section only decides whether dch installs it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct SecurityConfig {
+    /// Scrub credential-shaped content from tool output.
+    ///
+    /// When true (the default), every tool result passes through a
+    /// redaction middleware that replaces detected secrets with
+    /// `[REDACTED:<kind>]` markers. Disable only for trusted, isolated
+    /// environments where raw output must be preserved verbatim.
+    pub redact_secrets: bool,
+}
+
 impl Default for ApiConfig {
     fn default() -> Self {
         Self {
@@ -696,6 +798,7 @@ impl Default for ApiConfig {
             context_window: 200_000,
             request_timeout_secs: 120,
             fallback_model: None,
+            azure_resource: None,
         }
     }
 }
@@ -728,6 +831,14 @@ impl Default for TelemetryConfig {
         Self {
             level: "info".to_string(),
             json_logs: false,
+        }
+    }
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            redact_secrets: true,
         }
     }
 }
@@ -774,15 +885,14 @@ impl DchConfig {
     /// Map the session-scoped fields to a [`loopctl::config::SessionConfig`].
     ///
     /// Carries the context window, compaction threshold, and auto-compact
-    /// flag — the settings that are stable across `run()` calls. The
-    /// `system_prompt` is **not** carried here (it is set to `None`); the
-    /// runner composes it from the selected role, detected tech stack, and
-    /// per-tool fragments via the prompt builder and installs it on
-    /// the session after construction.
-    /// on the same agent. Provider-specific fields (`model`, `max_tokens`) are
-    /// not session-config concerns; they are consumed by the API client via
-    /// [`ApiConfig`] directly. The session id is minted at runtime by loopctl,
-    /// not carried in config.
+    /// flag — the settings that are stable across `run()` calls on the same
+    /// agent. The `system_prompt` is **not** carried here (it is set to
+    /// `None`); the runner composes it from the selected role, detected tech
+    /// stack, and per-tool fragments via the prompt builder and installs it
+    /// on the session after construction. Provider-specific fields (`model`,
+    /// `max_tokens`) are not session-config concerns; they are consumed by
+    /// the API client via [`ApiConfig`] directly. The session id is minted
+    /// at runtime by loopctl, not carried in config.
     ///
     /// `compact_threshold` is clamped to `100` here (the struct-literal
     /// bypasses `SessionConfig`'s own construction clamp), so an out-of-range
@@ -865,6 +975,15 @@ max_tokens = 8192
 context_window = 128000
 request_timeout_secs = 60
 fallback_model = "glm-4.7-flash"
+azure_resource = "my-resource"
+
+[[mcp.servers]]
+name = "docs"
+command = "npx"
+args = ["-y", "@example/mcp-docs"]
+
+[mcp.servers.env]
+DOCS_KEY = "secret"
 
 [display]
 no_color = false
@@ -885,6 +1004,9 @@ prompt = "You are a careful coding assistant."
 [telemetry]
 level = "debug"
 json_logs = true
+
+[security]
+redact_secrets = false
 "#;
 
     fn write_config(dir: &Path, name: &str, contents: &str) {
@@ -906,6 +1028,7 @@ json_logs = true
         assert_eq!(c.runner.compact_threshold, 80);
         assert_eq!(c.runner.permission_mode, PermissionMode::Auto);
         assert_eq!(c.telemetry.level, "info");
+        assert!(c.security.redact_secrets);
     }
 
     #[test]
@@ -921,6 +1044,15 @@ json_logs = true
         assert_eq!(c.api.max_tokens, 8192);
         assert_eq!(c.api.request_timeout_secs, 60);
         assert_eq!(c.api.fallback_model.as_deref(), Some("glm-4.7-flash"));
+        assert_eq!(c.api.azure_resource.as_deref(), Some("my-resource"));
+        assert_eq!(c.mcp.servers.len(), 1);
+        assert_eq!(c.mcp.servers[0].name, "docs");
+        assert_eq!(c.mcp.servers[0].command, "npx");
+        assert_eq!(c.mcp.servers[0].args, vec!["-y", "@example/mcp-docs"]);
+        assert_eq!(
+            c.mcp.servers[0].env.get("DOCS_KEY").map(String::as_str),
+            Some("secret")
+        );
 
         assert_eq!(c.display.verbosity, Verbosity::Verbose);
         assert_eq!(c.display.theme, "dracula");

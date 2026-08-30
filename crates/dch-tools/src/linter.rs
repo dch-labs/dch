@@ -349,15 +349,15 @@ fn update_triple_state(line: &str, state: &mut Option<char>) {
         i = i.saturating_add(1);
     }
 }
+/// Net delimiter delta for one line of Python source.
 ///
 /// Drives a [`PythonScanner`] over the line, summing `+1` per opener and `-1`
 /// per closer, so the string/comment-skipping logic is shared with
 /// [`python_delimiter_check`]. Returns 0 for a line that is entirely inside a
 /// string or comment. A limitation: a triple-quoted string opened on a prior
 /// line makes this line's content "inside a string," which a per-line scanner
-/// cannot detect — such a line is scanned as if top-level. This rarely matters
-/// (continuation lines inside triple strings are unusual) and was already the
-/// behavior of the per-line heuristic this replaces.
+/// cannot detect — such a line is scanned as if top-level. This rarely
+/// matters, because continuation lines inside triple strings are unusual.
 fn python_net_delimiters(line: &str) -> i32 {
     let mut depth = 0i32;
     let mut scanner = PythonScanner::new(line);
@@ -383,6 +383,8 @@ fn python_net_delimiters(line: &str) -> i32 {
 /// [`python_indent_check`] drive this scanner so the string/comment-skipping
 /// logic lives in exactly one place.
 struct PythonScanner<'a> {
+    /// The underlying character stream, peekable so a quote can be checked
+    /// for a triple-quote run before the scanner commits to consuming it.
     chars: std::iter::Peekable<std::str::Chars<'a>>,
 }
 
@@ -527,8 +529,8 @@ fn python_delimiter_check(content: &str) -> Option<LinterError> {
 ///
 /// Tracks the nesting depth of `()`, `[]`, and `{}` as a single-pass scan.
 /// String literals (`"`, `'`, `` ` ``), line comments (`//`), and block
-/// comments (`/* */`) are skipped so that braces inside strings or comments
-/// don't affect the count.
+/// comments (`/* */`) are skipped via the `skip_js_*` helpers so that braces
+/// inside strings or comments don't affect the count.
 ///
 /// If any counter goes negative (an unmatched closer) or any counter is
 /// nonzero at EOF (an unmatched opener), the content is rejected. This
@@ -541,42 +543,9 @@ fn lint_js(content: &str) -> LinterResult {
     let mut chars = content.chars().peekable();
     while let Some(ch) = chars.next() {
         match ch {
-            '/' if matches!(chars.peek(), Some('/')) => {
-                // Line comment — skip to end of line.
-                while let Some(&c) = chars.peek() {
-                    chars.next();
-                    if c == '\n' {
-                        break;
-                    }
-                }
-            }
-            '/' if matches!(chars.peek(), Some('*')) => {
-                chars.next();
-                // Block comment — skip to closing */.
-                let mut prev = '\0';
-                for c in chars.by_ref() {
-                    if prev == '*' && c == '/' {
-                        break;
-                    }
-                    prev = c;
-                }
-            }
-            '"' | '\'' | '`' => {
-                // String literal — scan until the matching quote, skipping
-                // escaped chars via a flag (no inner chars.next() needed,
-                // so a for-loop works without borrow conflicts).
-                let quote = ch;
-                let mut in_escape = false;
-                for c in chars.by_ref() {
-                    if in_escape {
-                        in_escape = false;
-                    } else if c == '\\' {
-                        in_escape = true;
-                    } else if c == quote {
-                        break;
-                    }
-                }
-            }
+            '/' if matches!(chars.peek(), Some('/')) => skip_js_line_comment(&mut chars),
+            '/' if matches!(chars.peek(), Some('*')) => skip_js_block_comment(&mut chars),
+            quote @ ('"' | '\'' | '`') => skip_js_string(quote, &mut chars),
             '(' => paren = paren.saturating_add(1),
             ')' => {
                 if paren == 0 {
@@ -619,6 +588,55 @@ fn lint_js(content: &str) -> LinterResult {
         )));
     }
     LinterResult::pass()
+}
+
+/// Consume a `//` line comment, with only the first `/` consumed.
+///
+/// Consumes the second `/` and everything through the terminating newline
+/// (or to EOF), so nothing inside the comment body can affect the delimiter
+/// counters.
+fn skip_js_line_comment(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    chars.next();
+    while let Some(&c) = chars.peek() {
+        chars.next();
+        if c == '\n' {
+            break;
+        }
+    }
+}
+
+/// Consume a `/* */` block comment, with only the leading `/` consumed.
+///
+/// Consumes the `*` and reads through the closing `*/` (or to EOF for an
+/// unterminated comment), so delimiters inside the comment body never reach
+/// the counters.
+fn skip_js_block_comment(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    chars.next();
+    let mut prev = '\0';
+    for c in chars.by_ref() {
+        if prev == '*' && c == '/' {
+            break;
+        }
+        prev = c;
+    }
+}
+
+/// Consume a string literal, with the opening `quote` consumed.
+///
+/// Reads until the matching `quote`, honoring `\` escapes so an escaped
+/// quote does not terminate the literal; an unterminated literal runs to
+/// EOF.
+fn skip_js_string(quote: char, chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    let mut in_escape = false;
+    for c in chars.by_ref() {
+        if in_escape {
+            in_escape = false;
+        } else if c == '\\' {
+            in_escape = true;
+        } else if c == quote {
+            break;
+        }
+    }
 }
 
 #[cfg(test)]

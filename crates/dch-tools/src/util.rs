@@ -47,31 +47,13 @@ pub fn mime_type_from_path(path: &Path) -> Option<&'static str> {
         .and_then(mime_type_from_extension)
 }
 
-/// Whether a path has a recognized image extension.
-///
-/// # Examples
-///
-/// ```
-/// use dch_tools::util::is_image_file;
-/// assert!(is_image_file("screenshot.png"));
-/// assert!(is_image_file("photo.JPG"));
-/// assert!(!is_image_file("document.txt"));
-/// ```
-#[must_use]
-pub fn is_image_file(path: &str) -> bool {
-    Path::new(path)
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| mime_type_from_extension(ext).is_some())
-}
-
 /// Whether a string looks like an HTTP(S) URL.
 ///
-/// Used by every file-touching tool to reject URLs early with a consistent
-/// "use `WebFetch`" message, so a model that sends `Read` against `https://…`
-/// gets a clear redirect instead of a confusing filesystem error.
-/// Case-insensitive (`HTTP://`, `Https://` also match). Returns `false` for
-/// `file://`, `ftp://`, bare paths, and empty strings.
+/// Used by [`reject_url`] to refuse URLs where a filesystem path is required,
+/// so a model that sends `Read` against `https://…` gets a clear redirect
+/// instead of a confusing filesystem error. Case-insensitive (`HTTP://`,
+/// `Https://` also match). Returns `false` for `file://`, `ftp://`, bare
+/// paths, and empty strings.
 #[must_use]
 pub fn is_url(path: &str) -> bool {
     path.get(..7)
@@ -79,6 +61,26 @@ pub fn is_url(path: &str) -> bool {
         || path
             .get(..8)
             .is_some_and(|p| p.eq_ignore_ascii_case("https://"))
+}
+
+/// Reject a URL where a filesystem path is required.
+///
+/// Every file-touching tool guards its path arguments with this check, so a
+/// model that sends `https://…` receives a consistent error naming the tool
+/// it called and redirecting it to the web-fetch tool, rather than a
+/// confusing filesystem error.
+///
+/// # Errors
+///
+/// Returns [`ToolError::InvalidInput`] naming `tool` and pointing at the
+/// web-fetch tool, when `path` parses as a URL (see [`is_url`]).
+pub fn reject_url(tool: &str, path: &str) -> Result<(), ToolError> {
+    if is_url(path) {
+        return Err(ToolError::InvalidInput(format!(
+            "URLs are not supported by the {tool} tool. Use WebFetch for URLs."
+        )));
+    }
+    Ok(())
 }
 
 /// Resolve a possibly-relative `file_path` against `cwd`, enforcing that the
@@ -294,21 +296,6 @@ mod tests {
     }
 
     #[test]
-    fn is_image_file_true_for_images() {
-        assert!(is_image_file("screenshot.png"));
-        assert!(is_image_file("photo.JPG"));
-        assert!(is_image_file("/path/to/img.webp"));
-        assert!(is_image_file("anim.gif"));
-    }
-
-    #[test]
-    fn is_image_file_false_for_non_images() {
-        assert!(!is_image_file("document.txt"));
-        assert!(!is_image_file("archive.zip"));
-        assert!(!is_image_file("noext"));
-    }
-
-    #[test]
     fn is_url_detects_http_and_https() {
         assert!(is_url("http://example.com"));
         assert!(is_url("https://example.com/page"));
@@ -348,6 +335,26 @@ mod tests {
         // must not panic on get(..7)/get(..8).
         assert!(!is_url("éttp://"));
         assert!(!is_url("éxample"));
+    }
+
+    #[test]
+    fn reject_url_message_names_the_calling_tool_byte_for_byte() {
+        let ToolError::InvalidInput(msg) = reject_url("Read", "https://example.com/x").unwrap_err()
+        else {
+            panic!("expected InvalidInput");
+        };
+        assert_eq!(
+            msg,
+            "URLs are not supported by the Read tool. Use WebFetch for URLs."
+        );
+    }
+
+    #[test]
+    fn reject_url_accepts_plain_paths() {
+        assert!(reject_url("Read", "src/main.rs").is_ok());
+        assert!(reject_url("Write", "/abs/path.txt").is_ok());
+        assert!(reject_url("Tree", ".").is_ok());
+        assert!(reject_url("Grep", "file:///tmp/x").is_ok());
     }
 
     #[test]

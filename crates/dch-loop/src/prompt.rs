@@ -127,20 +127,20 @@ pub fn with_context(
 /// fragment, in alphabetical order by tool name.
 ///
 /// Tools whose [`Tool::system_prompt`] returns `None` are skipped — they
-/// contribute nothing to the prompt. The local re-sort (after `tool_names()`
-/// already sorts) keeps the ordering contract owned by this module, so a
-/// future loopctl change to `tool_names()` cannot silently reorder fragments.
+/// contribute nothing to the prompt. The local re-sort keeps the ordering
+/// contract owned by this module, so a future loopctl change to
+/// [`ToolRegistry::all_tools`] ordering cannot silently reorder fragments.
 fn append_fragments(out: &mut String, tools: &ToolRegistry) {
     let mut fragments: Vec<(String, String)> = tools
-        .tool_names()
+        .all_tools()
         .into_iter()
-        .filter_map(|name| {
-            let tool = tools.get(&name)?;
-            tool.system_prompt().map(|frag| (name, frag))
+        .filter_map(|tool| {
+            tool.system_prompt()
+                .map(|frag| (tool.name().to_string(), frag))
         })
         .collect();
-    // tool_names() is already sorted; re-sort locally so the ordering
-    // contract is owned by this module and survives a future change upstream.
+    // Registry order is registration order; the prompt contract is
+    // alphabetical, so sort locally rather than trusting the source order.
     fragments.sort_by(|a, b| a.0.cmp(&b.0));
     for (name, frag) in fragments {
         out.push_str("\n\n## ");

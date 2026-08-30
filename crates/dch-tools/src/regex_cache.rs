@@ -83,9 +83,10 @@ pub fn get_or_compile(pattern: &str, case_insensitive: bool) -> Result<Regex, re
 
 /// Drop every cached entry.
 ///
-/// Intended for tests that need a known cache state, and for runtime memory
-/// pressure (the cache is bounded, so calling this is rarely necessary in
-/// production).
+/// Exists for tests that need a known cache state before asserting on hit or
+/// miss behavior; the cache is LRU-bounded, so production code never needs to
+/// clear it.
+#[cfg(test)]
 pub fn clear_cache() {
     if let Ok(mut guard) = cache().lock() {
         guard.clear();

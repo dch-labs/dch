@@ -7,31 +7,31 @@
 //! via the [`regex_cache`](crate::regex_cache) module so repeated calls with
 //! the same pattern skip recompilation.
 
-use std::future::Future;
 use std::path::Path;
 use std::path::PathBuf;
-use std::pin::Pin;
 
-use loopctl::tool::Tool;
+use loopctl::Tool;
+use loopctl::tool::DisplayHint;
 use loopctl::tool::ToolContext;
 use loopctl::tool::ToolError;
 use loopctl::tool::ToolOutput;
-use loopctl::tool::ToolSchema;
 use regex::Regex;
+use serde::Deserialize;
+use serde::Serialize;
 use serde_json::Value;
 use serde_json::json;
 
 use crate::context::RunnerContext;
+use crate::context::require_cwd;
 use crate::context::runner_ctx;
 use crate::input::get_usize;
 use crate::output::MAX_INLINE_OUTPUT_BYTES;
-use crate::output::session_temp_dir;
 use crate::output::truncate_or_write_to_temp;
 use crate::search::Match;
 use crate::search::SearchJob;
 use crate::search::compile_pattern;
 use crate::search::no_matches_message;
-use crate::util::is_url;
+use crate::util::reject_url;
 use crate::util::resolve_path;
 
 /// Default per-file match cap when the caller omits `max_matches`.
@@ -43,102 +43,59 @@ const DEFAULT_MAX_RESULTS: usize = 1000;
 /// Hard ceiling `max_results` is clamped to, regardless of what the caller asks.
 const MAX_RESULTS_CAP: usize = 1000;
 
-/// Regex content-search tool — the "show me every matching line" search.
+/// Input for the Grep tool.
 ///
-/// Walks a directory with the shared gitignore-aware walker, reads each
-/// non-binary file, and returns every line matching the user-supplied regex
-/// as a JSON object `{file, line, content}`. The full result is a
-/// pretty-printed JSON array; when it exceeds the inline-output limit it
-/// spills to a temp file with a preview and a pointer to the file-viewer
-/// tool, so a large search cannot blow out the model's context window.
-///
-/// Two caps compose: `max_matches` bounds the matches kept **per file**
-/// (default 100), and `max_results` bounds the total **across all files**
-/// (default 1000). The per-file cap stops one huge file from saturating the
-/// result before the walker moves on; the global cap bounds the overall
-/// output regardless of how many files match.
-///
-/// Compiled patterns are cached process-globally via the shared
-/// [`regex_cache`](crate::regex_cache) module, so a pattern compiled by this
-/// tool is a cache hit when `CodeSearch` (or a later `Grep` call) compiles
-/// the same pattern. An empty match set is a successful "No matches found"
-/// message, not an error — the model uses it as a signal to broaden or
-/// refine the pattern.
-pub struct GrepTool;
-
-impl Tool for GrepTool {
-    fn name(&self) -> &'static str {
-        "Grep"
-    }
-
-    fn description(&self) -> &'static str {
-        "Search for a regex pattern in file contents within a directory. \
+/// Regex content search: walks a directory with the shared gitignore-aware
+/// walker and returns every line matching the pattern as a JSON object
+/// `{file, line, content}`, spilling oversized results to a temp file.
+#[derive(Default, Deserialize, Serialize, Tool)]
+#[tool(
+    name = "Grep",
+    read_only,
+    concurrency_safe,
+    description = "Search for a regex pattern in file contents within a directory. \
          Returns matching lines with file paths and line numbers."
-    }
-
-    fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            tool: self.name().to_string(),
-            description: self.description().to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "pattern": {
-                        "type": "string",
-                        "description": "Regular expression pattern to search for"
-                    },
-                    "path": {
-                        "type": "string",
-                        "description": "Directory to search in (defaults to current working directory)"
-                    },
-                    "include_patterns": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "File patterns to include (e.g., ['*.rs', '*.json'])"
-                    },
-                    "exclude_patterns": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "File patterns to exclude (e.g., ['*.lock', 'target/*'])"
-                    },
-                    "case_insensitive": {
-                        "type": "boolean",
-                        "description": "Enable case-insensitive matching"
-                    },
-                    "max_matches": {
-                        "type": "integer",
-                        "description": "Maximum number of matches per file (default: 100)"
-                    },
-                    "max_results": {
-                        "type": "integer",
-                        "description": "Maximum total matches across all files (default: 1000)"
-                    }
-                },
-                "required": ["pattern"]
-            }),
-        }
-    }
-
-    fn call(
-        &self,
-        input: Value,
-        ctx: &ToolContext,
-    ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
-        let rc = runner_ctx(ctx).cloned();
-        let temp_dir = session_temp_dir(Path::new(&ctx.temp_dir), ctx.session_id);
-        Box::pin(self.grep_inner(input, rc, temp_dir))
-    }
-
-    fn is_read_only(&self) -> bool {
-        true
-    }
-
-    fn is_concurrency_safe(&self) -> bool {
-        true
-    }
+)]
+pub struct GrepInput {
+    /// Regular expression pattern to search for
+    pattern: String,
+    /// Directory to search in (defaults to current working directory)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    /// File patterns to include (e.g., ['*.rs', '*.json'])
+    #[allow(clippy::doc_link_with_quotes)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    include_patterns: Option<Vec<String>>,
+    /// File patterns to exclude (e.g., ['*.lock', 'target/*'])
+    #[allow(clippy::doc_link_with_quotes)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exclude_patterns: Option<Vec<String>>,
+    /// Enable case-insensitive matching
+    #[serde(skip_serializing_if = "Option::is_none")]
+    case_insensitive: Option<bool>,
+    /// Maximum number of matches per file (default: 100)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_matches: Option<usize>,
+    /// Maximum total matches across all files (default: 1000)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_results: Option<usize>,
 }
 
-impl GrepTool {
+impl GrepInput {
+    /// Deserializes the typed input and delegates to `grep_inner`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError`] when the input cannot be serialized back to JSON
+    /// or when `grep_inner` fails.
+    async fn run(&self, input: Self, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let rc = runner_ctx(ctx).cloned();
+        let temp_dir = PathBuf::from(&ctx.temp_dir);
+        let value = serde_json::to_value(&input)
+            .map_err(|e| ToolError::Execution(format!("serialize tool input: {e}")))?;
+        self.grep_inner(value, rc, temp_dir).await
+    }
+
     /// Body of [`Tool::call`].
     ///
     /// Orchestrates parse → compile → walk → render. An empty match set is a
@@ -157,15 +114,7 @@ impl GrepTool {
         rc: Option<RunnerContext>,
         temp_dir: PathBuf,
     ) -> Result<ToolOutput, ToolError> {
-        let cwd = rc
-            .as_ref()
-            .ok_or_else(|| {
-                ToolError::Execution(
-                    "RunnerContext extension is not installed on the ToolContext".to_string(),
-                )
-            })?
-            .cwd
-            .clone();
+        let cwd = require_cwd(rc)?;
 
         let parsed_input = crate::search::parse_input(&input, DEFAULT_MAX_RESULTS)?;
         let max_results = parsed_input.max_results.min(MAX_RESULTS_CAP);
@@ -173,11 +122,7 @@ impl GrepTool {
             .unwrap_or(DEFAULT_MAX_MATCHES)
             .max(1);
 
-        if is_url(&parsed_input.base_path) {
-            return Err(ToolError::InvalidInput(
-                "URLs are not supported by the Grep tool. Use WebFetch for URLs.".to_string(),
-            ));
-        }
+        reject_url("Grep", &parsed_input.base_path)?;
 
         let regex = compile_pattern(&parsed_input.pattern, parsed_input.case_insensitive)?;
         let base = resolve_path(&parsed_input.base_path, &cwd)?;
@@ -202,7 +147,7 @@ impl GrepTool {
             return Ok(no_matches_message(&parsed_input.pattern));
         }
 
-        Ok(render(&matches, &temp_dir))
+        Ok(render(&matches, &temp_dir).with_hint(DisplayHint::Json))
     }
 }
 
@@ -477,7 +422,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         write_file(tmp.path(), "a.rs", "fn foo() {}\nconst X = 1;\n");
         write_file(tmp.path(), "b.txt", "foo bar\nbaz\n");
-        let tool = GrepTool;
+        let tool = GrepInput::default();
         let ctx = ctx_in(tmp.path());
         let input = json!({"pattern": "foo"});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -493,7 +438,7 @@ mod tests {
     async fn case_insensitive_off_by_default() {
         let tmp = tempfile::TempDir::new().unwrap();
         write_file(tmp.path(), "a.rs", "fn foo() {}\n");
-        let tool = GrepTool;
+        let tool = GrepInput::default();
         let ctx = ctx_in(tmp.path());
         let input = json!({"pattern": "FN"});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -504,7 +449,7 @@ mod tests {
     async fn case_insensitive_on_matches() {
         let tmp = tempfile::TempDir::new().unwrap();
         write_file(tmp.path(), "a.rs", "fn foo() {}\n");
-        let tool = GrepTool;
+        let tool = GrepInput::default();
         let ctx = ctx_in(tmp.path());
         let input = json!({"pattern": "FN", "case_insensitive": true});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -517,7 +462,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         write_file(tmp.path(), "a.rs", "foo\n");
         write_file(tmp.path(), "b.txt", "foo\n");
-        let tool = GrepTool;
+        let tool = GrepInput::default();
         let ctx = ctx_in(tmp.path());
         let input = json!({"pattern": "foo", "include_patterns": ["*.rs"]});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -531,7 +476,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         write_file(tmp.path(), "a.rs", "foo\n");
         write_file(tmp.path(), "b.txt", "foo\n");
-        let tool = GrepTool;
+        let tool = GrepInput::default();
         let ctx = ctx_in(tmp.path());
         let input = json!({"pattern": "foo", "exclude_patterns": ["*.txt"]});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -545,7 +490,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let body: String = (0..300).map(|_| "x\n".to_string()).collect();
         write_file(tmp.path(), "a.txt", &body);
-        let tool = GrepTool;
+        let tool = GrepInput::default();
         let ctx = ctx_in(tmp.path());
         let input = json!({"pattern": "x", "max_matches": 5});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -559,7 +504,7 @@ mod tests {
         write_file(tmp.path(), "a.rs", "x\nx\nx\n");
         write_file(tmp.path(), "b.rs", "x\nx\nx\n");
         write_file(tmp.path(), "c.rs", "x\nx\nx\n");
-        let tool = GrepTool;
+        let tool = GrepInput::default();
         let ctx = ctx_in(tmp.path());
         let input = json!({"pattern": "x", "max_matches": 100, "max_results": 4});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -572,7 +517,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         write_file(tmp.path(), "a.rs", "x\nx\nx\n");
         write_file(tmp.path(), "b.rs", "x\nx\nx\n");
-        let tool = GrepTool;
+        let tool = GrepInput::default();
         let ctx = ctx_in(tmp.path());
         let input = json!({"pattern": "x", "max_matches": 2, "max_results": 3});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -594,7 +539,7 @@ mod tests {
     async fn no_matches_is_success_message() {
         let tmp = tempfile::TempDir::new().unwrap();
         write_file(tmp.path(), "a.rs", "fn foo() {}\n");
-        let tool = GrepTool;
+        let tool = GrepInput::default();
         let ctx = ctx_in(tmp.path());
         let input = json!({"pattern": "zzz_nomatch"});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -610,7 +555,7 @@ mod tests {
         // Explicit zero should not zero-out all results; clamp to 1.
         let tmp = tempfile::TempDir::new().unwrap();
         write_file(tmp.path(), "a.rs", "x\nx\nx\n");
-        let tool = GrepTool;
+        let tool = GrepInput::default();
         let ctx = ctx_in(tmp.path());
         let input = json!({"pattern": "x", "max_matches": 0});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -628,7 +573,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         write_file(tmp.path(), "a.rs", "x\n");
         write_file(tmp.path(), "b.rs", "x\n");
-        let tool = GrepTool;
+        let tool = GrepInput::default();
         let ctx = ctx_in(tmp.path());
         let input = json!({"pattern": "x", "max_results": 0});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -644,7 +589,7 @@ mod tests {
     #[tokio::test]
     async fn missing_pattern_errors() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let tool = GrepTool;
+        let tool = GrepInput::default();
         let ctx = ctx_in(tmp.path());
         let input = json!({});
         let err = tool.call(input, &ctx).await.unwrap_err();
@@ -657,7 +602,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_regex_errors() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let tool = GrepTool;
+        let tool = GrepInput::default();
         let ctx = ctx_in(tmp.path());
         let input = json!({"pattern": "(unclosed"});
         let err = tool.call(input, &ctx).await.unwrap_err();
@@ -670,7 +615,7 @@ mod tests {
     #[tokio::test]
     async fn url_path_rejected() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let tool = GrepTool;
+        let tool = GrepInput::default();
         let ctx = ctx_in(tmp.path());
         let input = json!({"pattern": "x", "path": "https://example.com/y"});
         let err = tool.call(input, &ctx).await.unwrap_err();
@@ -687,7 +632,7 @@ mod tests {
         bytes.extend_from_slice(b"foo\n");
         std::fs::write(tmp.path().join("data.png"), &bytes).unwrap();
         write_file(tmp.path(), "a.rs", "foo\n");
-        let tool = GrepTool;
+        let tool = GrepInput::default();
         let ctx = ctx_in(tmp.path());
         let input = json!({"pattern": "foo", "include_patterns": ["*.png", "*.rs"]});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -700,7 +645,7 @@ mod tests {
     async fn relative_path_resolved_against_cwd() {
         let tmp = tempfile::TempDir::new().unwrap();
         write_file(tmp.path(), "a.rs", "foo\n");
-        let tool = GrepTool;
+        let tool = GrepInput::default();
         let ctx = ctx_in(tmp.path());
         let input = json!({"pattern": "foo", "path": "."});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -714,7 +659,7 @@ mod tests {
         std::fs::write(tmp.path().join(".gitignore"), "ignored.rs\n").unwrap();
         write_file(tmp.path(), "ignored.rs", "foo\n");
         write_file(tmp.path(), "kept.rs", "foo\n");
-        let tool = GrepTool;
+        let tool = GrepInput::default();
         let ctx = ctx_in(tmp.path());
         let input = json!({"pattern": "foo"});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -735,7 +680,7 @@ mod tests {
             writeln!(body, "match_long_line_{i}").ok();
         }
         write_file(tmp.path(), "big.txt", &body);
-        let tool = GrepTool;
+        let tool = GrepInput::default();
         let ctx = ctx_in(tmp.path());
         let input = json!({"pattern": "match_long_line", "max_matches": 5000});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -751,7 +696,7 @@ mod tests {
         let big: String = "x".repeat(usize::try_from(crate::walk::MAX_FILE_BYTES + 1).unwrap());
         std::fs::write(tmp.path().join("big.txt"), &big).unwrap();
         write_file(tmp.path(), "small.txt", "x\n");
-        let tool = GrepTool;
+        let tool = GrepInput::default();
         let ctx = ctx_in(tmp.path());
         let input = json!({"pattern": "x"});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -762,7 +707,7 @@ mod tests {
 
     #[test]
     fn trait_contract_and_registry() {
-        let tool = GrepTool;
+        let tool = GrepInput::default();
         assert!(tool.is_read_only());
         assert!(tool.is_concurrency_safe());
         assert_eq!(tool.name(), "Grep");

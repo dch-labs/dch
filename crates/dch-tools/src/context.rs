@@ -13,6 +13,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::mpsc;
 
+use loopctl::tool::ToolError;
+
 use crate::question::QuestionRequest;
 use crate::todo::TodoEntry;
 
@@ -103,10 +105,28 @@ pub fn runner_ctx(ctx: &loopctl::tool::ToolContext) -> Option<&RunnerContext> {
     ctx.get_extension::<RunnerContext>()
 }
 
-// Statically asserts `RunnerContext: Send + Sync`, the bound required to store
-// it as a `ToolContext` extension. `Arc<Mutex<Vec<TodoEntry>>>` is
-// `Send + Sync`, `Arc<Mutex<Option<mpsc::Sender<_>>>>` is `Send + Sync`, and
-// `PathBuf` is trivially so.
+/// Extract the working directory from an optional [`RunnerContext`].
+///
+/// Every tool's dispatch starts with this resolution: the extension is
+/// installed by the runner before each tool call, so its absence means the
+/// tool ran outside a dch-composed pipeline.
+///
+/// # Errors
+///
+/// Returns [`ToolError::Execution`] naming the missing extension when
+/// `runner_context` is `None`.
+pub fn require_cwd(runner_context: Option<RunnerContext>) -> Result<PathBuf, ToolError> {
+    runner_context.map(|rc| rc.cwd).ok_or_else(|| {
+        ToolError::Execution(
+            "RunnerContext extension is not installed on the ToolContext".to_string(),
+        )
+    })
+}
+
+/// Statically asserts `RunnerContext: Send + Sync`, the bound required to
+/// store it as a `ToolContext` extension. `Arc<Mutex<Vec<TodoEntry>>>` is
+/// `Send + Sync`, `Arc<Mutex<Option<mpsc::Sender<_>>>>` is `Send + Sync`, and
+/// `PathBuf` is trivially so.
 const _: fn() = || {
     fn assert_bounds<T: Send + Sync>() {}
     assert_bounds::<RunnerContext>();

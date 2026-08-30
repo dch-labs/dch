@@ -1,27 +1,27 @@
 //! The Read file tool — reads a file from disk with line/byte truncation.
 
 use std::fmt::Write;
-use std::future::Future;
-use std::pin::Pin;
 
 use tokio::io::AsyncReadExt;
 
+use loopctl::Tool;
 use loopctl::message::ImageSource;
 use loopctl::message::ToolContent;
 use loopctl::message::ToolContentPart;
-use loopctl::tool::Tool;
+use loopctl::tool::DisplayHint;
 use loopctl::tool::ToolContext;
 use loopctl::tool::ToolError;
 use loopctl::tool::ToolOutput;
-use loopctl::tool::ToolSchema;
+use serde::Deserialize;
+use serde::Serialize;
 use serde_json::Value;
-use serde_json::json;
 
 use crate::context::RunnerContext;
+use crate::context::require_cwd;
 use crate::context::runner_ctx;
 use crate::input::get_usize;
-use crate::util::is_url;
 use crate::util::mime_type_from_path;
+use crate::util::reject_url;
 use crate::util::resolve_path;
 use crate::walk;
 
@@ -37,74 +37,47 @@ const MAX_FILE_READ_BYTES: usize = 400_000;
 /// Default limit when `offset` is provided but `limit` is not.
 const DEFAULT_OFFSET_LIMIT: usize = 200;
 
-/// Read the contents of a file (up to 200 lines).
+/// Input for the Read tool.
 ///
-/// For larger files or to continue reading past truncation, use `FileViewer`
-/// with offset/limit parameters. Read-only and concurrency-safe.
-pub struct ReadTool;
-
-impl Tool for ReadTool {
-    fn name(&self) -> &'static str {
-        "Read"
-    }
-
-    fn description(&self) -> &'static str {
-        "Read the contents of a file (up to 200 lines). For larger files or to \
+/// Reads a file from disk with line/byte truncation and returns its contents;
+/// images come back as multipart blocks and binary or oversized files are
+/// rejected with pointers to `FileViewer` and the search tools.
+#[derive(Default, Deserialize, Serialize, Tool)]
+#[tool(
+    name = "Read",
+    read_only,
+    concurrency_safe,
+    description = "Read the contents of a file (up to 200 lines). For larger files or to \
          continue reading past truncation, use FileViewer with offset/limit parameters."
-    }
-
-    fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            tool: self.name().to_string(),
-            description: self.description().to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "file_path": {
-                        "type": "string",
-                        "description": "The path to the file to read"
-                    },
-                    "offset": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "description": "Starting line number (1-indexed). Lines before this offset are skipped."
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 200,
-                        "description": "Maximum number of lines to return (default 200)."
-                    },
-                    "line_range": {
-                        "type": "string",
-                        "description": "Line range to read (alternative to offset/limit). \
-                        Examples: '1-100', '50:', ':100'. Ignored if offset or limit are also specified."
-                    }
-                },
-                "required": ["file_path"]
-            }),
-        }
-    }
-
-    fn call(
-        &self,
-        input: Value,
-        ctx: &ToolContext,
-    ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
-        let rc = runner_ctx(ctx).cloned();
-        Box::pin(self.read_inner(input, rc))
-    }
-
-    fn is_read_only(&self) -> bool {
-        true
-    }
-
-    fn is_concurrency_safe(&self) -> bool {
-        true
-    }
+)]
+pub struct ReadInput {
+    /// The path to the file to read
+    file_path: String,
+    /// Starting line number (1-indexed). Lines before this offset are skipped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    offset: Option<usize>,
+    /// Maximum number of lines to return (default 200).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    limit: Option<usize>,
+    /// Line range to read (alternative to offset/limit). Examples: '1-100', '50:', ':100'. Ignored if offset or limit are also specified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    line_range: Option<String>,
 }
 
-impl ReadTool {
+impl ReadInput {
+    /// Deserializes the typed input and delegates to `read_inner`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError`] when the input cannot be serialized back to JSON
+    /// or when `read_inner` fails.
+    async fn run(&self, input: Self, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let rc = runner_ctx(ctx).cloned();
+        let value = serde_json::to_value(&input)
+            .map_err(|e| ToolError::Execution(format!("serialize tool input: {e}")))?;
+        self.read_inner(value, rc).await
+    }
+
     /// Body of [`Tool::call`].
     ///
     /// # Errors
@@ -120,34 +93,12 @@ impl ReadTool {
             .get("file_path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidInput("Missing file_path".to_string()))?;
-        if is_url(file_path) {
-            return Err(ToolError::InvalidInput(
-                "URLs are not supported by the Read tool. Use WebFetch for URLs.".to_string(),
-            ));
-        }
+        reject_url("Read", file_path)?;
 
-        let cwd = runner_context
-            .clone()
-            .ok_or_else(|| {
-                ToolError::Execution(
-                    "RunnerContext extension is not installed on the ToolContext".to_string(),
-                )
-            })?
-            .cwd;
+        let cwd = require_cwd(runner_context)?;
         let full_path = resolve_path(file_path, &cwd)?;
 
-        let metadata = tokio::fs::metadata(&full_path).await.map_err(|_| {
-            let filename = full_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("*");
-            ToolError::FileNotFound(format!(
-                "{file_path}\n\nSuggestions:\n\
-                 - Use Glob with pattern '**/*{filename}*' to search for similar files\n\
-                 - Check the path for typos or incorrect casing"
-            ))
-        })?;
-
+        let metadata = metadata_or_not_found(&full_path, file_path).await?;
         if let Some(too_large) = too_large_if_over(metadata.len()) {
             return Ok(too_large);
         }
@@ -159,23 +110,12 @@ impl ReadTool {
             )));
         }
 
-        // Image branch: return a base64-encoded image block.
-        if let Some(mime) = mime_type_from_path(&full_path) {
-            let bytes = read_capped(&full_path).await?;
-            if let Some(too_large) = too_large_if_over(bytes.len() as u64) {
-                return Ok(too_large);
-            }
-            let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
-            let source = ImageSource::new_base64(mime, b64);
-            return Ok(ToolOutput::success(ToolContent::from_multipart(vec![
-                ToolContentPart::Image { source },
-            ])));
-        }
-
-        // Binary sniff: read bytes, check for NUL in the leading region.
         let bytes = read_capped(&full_path).await?;
         if let Some(too_large) = too_large_if_over(bytes.len() as u64) {
             return Ok(too_large);
+        }
+        if let Some(mime) = mime_type_from_path(&full_path) {
+            return Ok(image_output(mime, &bytes));
         }
         if walk::bytes_look_binary(&bytes) {
             return Ok(ToolOutput::error_text(format!(
@@ -184,14 +124,63 @@ impl ReadTool {
             )));
         }
 
-        // The file is text; convert bytes to string.
-        let content = String::from_utf8(bytes)
-            .map_err(|e| ToolError::Execution(format!("Failed to decode file as UTF-8: {e}")))?;
-
-        // Resolve offset/limit/line_range precedence.
+        let content = decode_utf8(bytes)?;
         let (offset, limit) = resolve_range(&input)?;
         Ok(format_text(&content, file_path, offset, limit))
     }
+}
+
+/// Fetch the target's metadata, mapping absence to the Read tool's not-found
+/// error.
+///
+/// The error names the file as the model wrote it and appends suggestions —
+/// a Glob pattern built from the file's name, and a typo reminder — so a
+/// misspelled path is recoverable on the next turn.
+///
+/// # Errors
+///
+/// Returns [`ToolError::FileNotFound`] when the path does not exist. Any other
+/// metadata fault also maps to [`ToolError::FileNotFound`], preserving this
+/// check's single-error shape.
+async fn metadata_or_not_found(
+    full_path: &std::path::Path,
+    file_path: &str,
+) -> Result<std::fs::Metadata, ToolError> {
+    tokio::fs::metadata(full_path).await.map_err(|_| {
+        let filename = full_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("*");
+        ToolError::FileNotFound(format!(
+            "{file_path}\n\nSuggestions:\n\
+             - Use Glob with pattern '**/*{filename}*' to search for similar files\n\
+             - Check the path for typos or incorrect casing"
+        ))
+    })
+}
+
+/// Encode `bytes` as a base64 multipart image block.
+///
+/// The image is returned as a single [`ToolContentPart::Image`] carrying the
+/// resolved `mime` type, so the model consumes it as an image rather than as
+/// raw bytes.
+fn image_output(mime: &'static str, bytes: &[u8]) -> ToolOutput {
+    let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
+    let source = ImageSource::new_base64(mime, b64);
+    ToolOutput::success(ToolContent::from_multipart(vec![ToolContentPart::Image {
+        source,
+    }]))
+}
+
+/// Decode the file's bytes as UTF-8 text.
+///
+/// # Errors
+///
+/// Returns [`ToolError::Execution`] carrying the underlying decode error when
+/// the bytes are not valid UTF-8.
+fn decode_utf8(bytes: Vec<u8>) -> Result<String, ToolError> {
+    String::from_utf8(bytes)
+        .map_err(|e| ToolError::Execution(format!("Failed to decode file as UTF-8: {e}")))
 }
 
 /// Build the "file too large" rejection when `byte_count` exceeds the cap.
@@ -336,7 +325,7 @@ fn format_text(content: &str, file_path: &str, offset: usize, limit: usize) -> T
     }
 
     if offset == 1 && effective_end >= total_lines && content.len() <= MAX_FILE_READ_BYTES {
-        return ToolOutput::text(content.to_string());
+        return ToolOutput::text(content.to_string()).with_hint(DisplayHint::Suppress);
     }
 
     let mut output = String::new();
@@ -365,7 +354,7 @@ fn format_text(content: &str, file_path: &str, offset: usize, limit: usize) -> T
         )
         .ok();
     }
-    ToolOutput::text(output)
+    ToolOutput::text(output).with_hint(DisplayHint::Suppress)
 }
 
 /// Parse a line range string into `(offset, limit)`.
@@ -423,6 +412,11 @@ fn parse_dash_range((left, right): (&str, &str)) -> Result<(usize, usize), Strin
 
 /// Parse a colon-separated range like `"50:"` or `":100"` into `(offset, limit)`.
 ///
+/// An empty right side is open-ended (`"50:"` reads from line 50 to the end,
+/// capped at [`MAX_FILE_READ_LINES`]); a present right side makes the range
+/// inclusive (`"50:100"` covers lines 50 through 100). An empty left side
+/// starts at line 1.
+///
 /// # Errors
 ///
 /// Returns a descriptive `String` if both sides are empty, a side is
@@ -446,7 +440,6 @@ fn parse_colon_range((left, right): (&str, &str)) -> Result<(usize, usize), Stri
     if start == 0 {
         return Err("line_range start must be >= 1".to_string());
     }
-    // Open-ended "50:" → to end; "50:100" → inclusive range.
     if right.is_empty() {
         return Ok((start, MAX_FILE_READ_LINES));
     }
@@ -498,6 +491,7 @@ mod tests {
     use super::*;
     use crate::context::RunnerContext;
     use loopctl::tool::ToolContext;
+    use serde_json::json;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -516,7 +510,7 @@ mod tests {
     }
 
     async fn read(input: Value, cwd: &str) -> Result<ToolOutput, ToolError> {
-        let tool = ReadTool;
+        let tool = ReadInput::default();
         let ctx = ctx_in(cwd);
         tool.call(input, &ctx).await
     }
@@ -651,8 +645,8 @@ mod tests {
         let input = json!({ "file_path": path.to_str().unwrap(), "offset": -5 });
         let err = read(input, cwd).await.unwrap_err();
         assert!(
-            matches!(err, ToolError::InvalidInput(ref s) if s.contains("'offset'")),
-            "negative offset should name the field: {err:?}"
+            matches!(err, ToolError::InvalidInput(ref s) if s.contains("integer `-5`")),
+            "negative offset should be rejected: {err:?}"
         );
     }
 
@@ -665,8 +659,8 @@ mod tests {
         let input = json!({ "file_path": path.to_str().unwrap(), "limit": -1 });
         let err = read(input, cwd).await.unwrap_err();
         assert!(
-            matches!(err, ToolError::InvalidInput(ref s) if s.contains("'limit'")),
-            "negative limit should name the field: {err:?}"
+            matches!(err, ToolError::InvalidInput(ref s) if s.contains("integer `-1`")),
+            "negative limit should be rejected: {err:?}"
         );
     }
 
@@ -792,21 +786,21 @@ mod tests {
 
     #[test]
     fn test_readtool_schema_matches_spec() {
-        let schema = ReadTool.schema();
+        let schema = ReadInput::default().schema();
         let input = schema.input_schema;
         let required = input.get("required").and_then(|v| v.as_array()).unwrap();
         assert_eq!(required.len(), 1);
         assert_eq!(required[0], "file_path");
         let limit = input
-            .pointer("/properties/limit/maximum")
-            .and_then(|v| v.as_u64());
-        assert_eq!(limit, Some(200));
+            .pointer("/properties/limit/type")
+            .and_then(|v| v.as_str());
+        assert_eq!(limit, Some("integer"));
     }
 
     #[test]
     fn test_readtool_registered_in_builtin_registry() {
         let reg = crate::registry::builtin_registry();
-        let tool = reg.get("Read").expect("ReadTool registered");
+        let tool = reg.get("Read").expect("Read registered");
         assert!(tool.is_read_only());
         assert!(tool.is_concurrency_safe());
     }

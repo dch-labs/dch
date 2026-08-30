@@ -1,25 +1,25 @@
 //! The `FileViewer` tool — paginated, token-efficient file viewing.
 //!
-//! The complement to [`ReadTool`](crate::ReadTool): where Read caps at ~200
+//! The complement to [`Read`](crate::ReadInput): where Read caps at ~200
 //! lines for quick lookups, `FileViewer` navigates large files in chunks via
 //! `page`/`page_size` (sequential) or `offset`/`limit` (direct seek), with a
 //! header naming the current window and a `[Navigate: …]` hint.
 
-use std::future::Future;
 use std::path::Path;
-use std::pin::Pin;
 
-use loopctl::tool::Tool;
+use loopctl::Tool;
+use loopctl::tool::DisplayHint;
 use loopctl::tool::ToolContext;
 use loopctl::tool::ToolError;
 use loopctl::tool::ToolOutput;
-use loopctl::tool::ToolSchema;
+use serde::Deserialize;
+use serde::Serialize;
 use serde_json::Value;
-use serde_json::json;
 
 use crate::context::RunnerContext;
+use crate::context::require_cwd;
 use crate::context::runner_ctx;
-use crate::util::is_url;
+use crate::util::reject_url;
 use crate::util::resolve_path;
 
 /// Default number of lines returned per page.
@@ -86,90 +86,56 @@ impl OutputFormat {
     }
 }
 
-/// Paginated, token-efficient file viewer.
+/// Input for the `FileViewer` tool.
 ///
-/// Returns a window of lines (default 100) from a local file, prefixed with a
-/// header naming the file + current window and a `[Navigate: …]` hint. Supports
-/// two navigation modes: `page`/`page_size` (sequential) and `offset`/`limit`
-/// (direct seek); `offset`+`limit` wins when both are given.
-pub struct FileViewerTool;
-
-impl Tool for FileViewerTool {
-    fn name(&self) -> &'static str {
-        "FileViewer"
-    }
-
-    fn description(&self) -> &'static str {
-        "View a file with pagination. Shows 100 lines per page by default. \
+/// Views a window of lines (default 100) from a local file, prefixed with a
+/// header naming the file + current window and a `[Navigate: …]` hint;
+/// navigation is via `page`/`page_size` (sequential) or `offset`/`limit`
+/// (direct seek), with `offset`+`limit` winning when both are given.
+#[derive(Default, Deserialize, Serialize, Tool)]
+#[tool(
+    name = "FileViewer",
+    read_only,
+    concurrency_safe,
+    description = "View a file with pagination. Shows 100 lines per page by default. \
          Use page parameter for sequential access or offset/limit for direct \
          line access."
-    }
-
-    fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            tool: self.name().to_string(),
-            description: self.description().to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "file_path": {
-                        "type": "string",
-                        "description": "The path to the file to view"
-                    },
-                    "page": {
-                        "type": "integer",
-                        "description": "Page number (1-indexed)",
-                        "default": 1,
-                        "minimum": 1
-                    },
-                    "page_size": {
-                        "type": "integer",
-                        "description": "Number of lines per page",
-                        "default": 100,
-                        "minimum": 1,
-                        "maximum": MAX_PAGE_SIZE
-                    },
-                    "offset": {
-                        "type": "integer",
-                        "description": "Starting line number (1-indexed, alternative to page)",
-                        "minimum": 1
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Maximum number of lines to return (alternative to page_size)",
-                        "minimum": 1,
-                        "maximum": MAX_PAGE_SIZE
-                    },
-                    "output_format": {
-                        "type": "string",
-                        "description": "Output format: 'plain' (default), 'colored', or 'markdown'",
-                        "enum": ["plain", "colored", "color", "ansi", "markdown", "md"]
-                    }
-                },
-                "required": ["file_path"]
-            }),
-        }
-    }
-
-    fn call(
-        &self,
-        input: Value,
-        ctx: &ToolContext,
-    ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
-        let rc = runner_ctx(ctx).cloned();
-        Box::pin(self.view_inner(input, rc))
-    }
-
-    fn is_read_only(&self) -> bool {
-        true
-    }
-
-    fn is_concurrency_safe(&self) -> bool {
-        true
-    }
+)]
+pub struct FileViewerInput {
+    /// The path to the file to view
+    file_path: String,
+    /// Page number (1-indexed)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    page: Option<usize>,
+    /// Number of lines per page
+    #[serde(skip_serializing_if = "Option::is_none")]
+    page_size: Option<usize>,
+    /// Starting line number (1-indexed, alternative to page)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    offset: Option<usize>,
+    /// Maximum number of lines to return (alternative to page_size)
+    #[allow(clippy::doc_markdown)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    limit: Option<usize>,
+    /// Output format: 'plain' (default), 'colored', or 'markdown'
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_format: Option<String>,
 }
 
-impl FileViewerTool {
+impl FileViewerInput {
+    /// Deserializes the typed input and delegates to `view_inner`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError`] when the input cannot be serialized back to JSON
+    /// or when `view_inner` fails.
+    async fn run(&self, input: Self, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let rc = runner_ctx(ctx).cloned();
+        let value = serde_json::to_value(&input)
+            .map_err(|e| ToolError::Execution(format!("serialize tool input: {e}")))?;
+        self.view_inner(value, rc).await
+    }
+
     /// Body of [`Tool::call`].
     ///
     /// Orchestrates parse → resolve → read → bounds → render. Recoverable
@@ -186,15 +152,7 @@ impl FileViewerTool {
         input: Value,
         rc: Option<RunnerContext>,
     ) -> Result<ToolOutput, ToolError> {
-        let cwd = rc
-            .as_ref()
-            .ok_or_else(|| {
-                ToolError::Execution(
-                    "RunnerContext extension is not installed on the ToolContext".to_string(),
-                )
-            })?
-            .cwd
-            .clone();
+        let cwd = require_cwd(rc)?;
 
         let parsed = parse_input(&input)?;
         let full_path = resolve_path(parsed.file_path, &cwd)?;
@@ -225,7 +183,9 @@ impl FileViewerTool {
             .unwrap_or(&[]);
 
         let output = render_output(parsed.file_path, &bounds, view_lines, parsed.output_format);
-        Ok(ToolOutput::text(output))
+        Ok(ToolOutput::text(output).with_hint(DisplayHint::Code {
+            language: detect_language(parsed.file_path).to_string(),
+        }))
     }
 }
 
@@ -234,7 +194,7 @@ impl FileViewerTool {
 /// Produced by [`parse_input`] from the raw JSON the model sends. The
 /// `file_path` is validated (present, not a URL) before this struct is
 /// constructed; resolution against `cwd` happens later in
-/// [`view_inner`](FileViewerTool::view_inner) via the shared
+/// [`view_inner`](FileViewerInput::view_inner) via the shared
 /// [`resolve_path`](crate::util::resolve_path).
 struct ParsedInput<'a> {
     /// The file path exactly as supplied by the caller, before cwd resolution.
@@ -264,11 +224,7 @@ fn parse_input(input: &Value) -> Result<ParsedInput<'_>, ToolError> {
         .and_then(Value::as_str)
         .ok_or_else(|| ToolError::InvalidInput("Missing file_path".to_string()))?;
 
-    if is_url(file_path) {
-        return Err(ToolError::InvalidInput(
-            "URLs are not supported by the FileViewer tool. Use WebFetch for URLs.".to_string(),
-        ));
-    }
+    reject_url("FileViewer", file_path)?;
 
     let output_format = input
         .get("output_format")
@@ -597,14 +553,12 @@ fn bounds_from_page(
 /// Detect a language tag from the file's extension.
 ///
 /// Used by [`OutputFormat::Markdown`] to tag the fenced code block (e.g. a
-/// `.rs` file produces ` ```rust `). The mapping is a small inline extension
-/// match — not a full language-detection heuristic. Extensions with no known
-/// mapping return an empty string, which renders as a bare fence (` ``` `)
-/// with no language hint.
-///
-/// This is separate from the TUI's `SyntaxTheme` tree-sitter capture system
-/// (T-22); it exists only to make markdown-fenced tool output useful for
-/// non-terminal consumers.
+/// `.rs` file produces ` ```rust `) and by the output hint so non-terminal
+/// consumers can apply their own highlighting. The mapping is a small inline
+/// extension match — not a full language-detection heuristic — and is purely
+/// for output tagging, independent of any terminal-side highlighting.
+/// Extensions with no known mapping return an empty string, which renders as
+/// a bare fence (` ``` `) with no language hint.
 fn detect_language(file_path: &str) -> &'static str {
     let ext = Path::new(file_path)
         .extension()
@@ -647,6 +601,7 @@ mod tests {
     use super::*;
     use crate::context::RunnerContext;
     use loopctl::tool::ToolContext;
+    use serde_json::json;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -827,7 +782,7 @@ mod tests {
         let content: String = (1..=250).map(|i| format!("line {i}\n")).collect();
         std::fs::write(&f, &content).unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = FileViewerTool;
+        let tool = FileViewerInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({"file_path": "f.txt"});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -847,7 +802,7 @@ mod tests {
         let content: String = (1..=250).map(|i| format!("line {i}\n")).collect();
         std::fs::write(&f, &content).unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = FileViewerTool;
+        let tool = FileViewerInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({"file_path": "f.txt", "page": 2});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -864,7 +819,7 @@ mod tests {
         let content: String = (1..=250).map(|i| format!("line {i}\n")).collect();
         std::fs::write(&f, &content).unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = FileViewerTool;
+        let tool = FileViewerInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({"file_path": "f.txt", "offset": 150, "limit": 25});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -881,7 +836,7 @@ mod tests {
         let f = tmp.path().join("f.txt");
         std::fs::write(&f, "short\n").unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = FileViewerTool;
+        let tool = FileViewerInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({"file_path": "f.txt", "offset": 9999});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -898,7 +853,7 @@ mod tests {
     async fn missing_file_is_soft_error() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = FileViewerTool;
+        let tool = FileViewerInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({"file_path": "nope.txt"});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -914,7 +869,7 @@ mod tests {
     async fn url_rejected() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = FileViewerTool;
+        let tool = FileViewerInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({"file_path": "https://example.com/x"});
         let err = tool.call(input, &ctx).await.unwrap_err();
@@ -932,7 +887,7 @@ mod tests {
         let f = nested.join("lib.rs");
         std::fs::write(&f, "fn main() {}\n").unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = FileViewerTool;
+        let tool = FileViewerInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({"file_path": "src/lib.rs"});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -951,7 +906,7 @@ mod tests {
         let content: String = (1..=600).map(|i| format!("line {i}\n")).collect();
         std::fs::write(&f, &content).unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = FileViewerTool;
+        let tool = FileViewerInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({"file_path": "big.txt", "page_size": 10000});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -966,7 +921,7 @@ mod tests {
         let f = tmp.path().join("code.rs");
         std::fs::write(&f, "fn main() {}\n").unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = FileViewerTool;
+        let tool = FileViewerInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({"file_path": "code.rs", "output_format": "markdown"});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -982,7 +937,7 @@ mod tests {
         let f = tmp.path().join("code.rs");
         std::fs::write(&f, "fn main() {}\n").unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = FileViewerTool;
+        let tool = FileViewerInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({"file_path": "code.rs", "output_format": "colored"});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -996,7 +951,7 @@ mod tests {
         let f = tmp.path().join("empty.txt");
         std::fs::write(&f, "").unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = FileViewerTool;
+        let tool = FileViewerInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({"file_path": "empty.txt"});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -1007,7 +962,7 @@ mod tests {
 
     #[test]
     fn trait_contract_and_registry() {
-        let tool = FileViewerTool;
+        let tool = FileViewerInput::default();
         assert!(tool.is_read_only());
         assert!(tool.is_concurrency_safe());
         let reg = crate::registry::builtin_registry();
@@ -1058,7 +1013,7 @@ mod tests {
         let f = tmp.path().join("short.txt");
         std::fs::write(&f, "a\nb\nc\n").unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = FileViewerTool;
+        let tool = FileViewerInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({"file_path": "short.txt"});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -1073,7 +1028,7 @@ mod tests {
         let f = tmp.path().join("empty.txt");
         std::fs::write(&f, "").unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = FileViewerTool;
+        let tool = FileViewerInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({"file_path": "empty.txt"});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -1090,7 +1045,7 @@ mod tests {
         let content: String = (1..=150).map(|i| format!("line {i}\n")).collect();
         std::fs::write(&f, &content).unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = FileViewerTool;
+        let tool = FileViewerInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({"file_path": "f.txt", "page": 2});
         let out = tool.call(input, &ctx).await.unwrap();

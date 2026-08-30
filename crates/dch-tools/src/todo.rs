@@ -83,3 +83,71 @@ pub enum TodoStatus {
     /// directly to [`Pending`](Self::Pending) (restart via `InProgress`).
     Completed,
 }
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc
+)]
+mod tests {
+    use super::*;
+
+    fn entry(status: TodoStatus, active_form: Option<&str>) -> TodoEntry {
+        TodoEntry {
+            id: "1".to_string(),
+            subject: "Ship the tool".to_string(),
+            description: "Wire it into the registry".to_string(),
+            status,
+            active_form: active_form.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn entry_construction_keeps_every_field() {
+        let e = entry(TodoStatus::InProgress, Some("Shipping the tool"));
+        assert_eq!(e.id, "1");
+        assert_eq!(e.subject, "Ship the tool");
+        assert_eq!(e.description, "Wire it into the registry");
+        assert_eq!(e.status, TodoStatus::InProgress);
+        assert_eq!(e.active_form.as_deref(), Some("Shipping the tool"));
+    }
+
+    #[test]
+    fn active_form_none_is_a_valid_construction() {
+        let e = entry(TodoStatus::Pending, None);
+        assert!(e.active_form.is_none());
+    }
+
+    #[test]
+    fn status_variants_are_distinct() {
+        assert_ne!(TodoStatus::Pending, TodoStatus::InProgress);
+        assert_ne!(TodoStatus::InProgress, TodoStatus::Completed);
+        assert_ne!(TodoStatus::Pending, TodoStatus::Completed);
+    }
+
+    #[test]
+    fn all_three_statuses_round_trip_through_an_entry() {
+        // The type imposes no transitions: any status is constructible. The
+        // documented Pending → InProgress → Completed progression is a
+        // tool-layer convention, asserted here as construction-level facts.
+        for status in [
+            TodoStatus::Pending,
+            TodoStatus::InProgress,
+            TodoStatus::Completed,
+        ] {
+            assert_eq!(entry(status, None).status, status);
+        }
+    }
+
+    #[test]
+    fn clone_round_trips_the_entry() {
+        let original = entry(TodoStatus::Completed, Some("Finishing"));
+        let twin = original.clone();
+        assert_eq!(twin.id, original.id);
+        assert_eq!(twin.status, original.status);
+        assert_eq!(twin.active_form, original.active_form);
+    }
+}

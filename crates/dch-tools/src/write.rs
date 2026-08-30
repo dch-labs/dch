@@ -1,88 +1,62 @@
 //! The Write tool — writes content to a file with syntax validation.
 
-use std::future::Future;
 use std::path::Path;
-use std::pin::Pin;
 
-use loopctl::tool::Tool;
+use loopctl::Tool;
+use loopctl::tool::DisplayHint;
 use loopctl::tool::ToolContext;
 use loopctl::tool::ToolError;
 use loopctl::tool::ToolOutput;
-use loopctl::tool::ToolSchema;
+use serde::Deserialize;
+use serde::Serialize;
 use serde_json::Value;
-use serde_json::json;
 
 use crate::context::RunnerContext;
+use crate::context::require_cwd;
 use crate::context::runner_ctx;
 use crate::diff::format_file_change;
 use crate::linter::LinterResult;
 use crate::linter::lint_content;
-use crate::util::is_url;
+use crate::util::reject_url;
 use crate::util::resolve_path;
 
-/// Write content to a file. Syntax validation is automatically performed for
-/// supported file types (.rs, .json, .py, .js, .ts, etc.).
+/// Input for the Write tool.
 ///
-/// Not concurrency-safe and not read-only: two concurrent writes to the same
-/// path would race, and the tool mutates the filesystem.
-pub struct WriteTool;
-
-impl Tool for WriteTool {
-    fn name(&self) -> &'static str {
-        "Write"
-    }
-
-    fn description(&self) -> &'static str {
-        "Write content to a file. Syntax validation is automatically performed \
-         for supported file types (.rs, .json, .py, .js, .ts, etc.)"
-    }
-
-    fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            tool: self.name().to_string(),
-            description: self.description().to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "file_path": {
-                        "type": "string",
-                        "description": "The path to the file to write"
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "The content to write"
-                    },
-                    "skip_linter": {
-                        "type": "boolean",
-                        "description": "Skip syntax validation (not recommended)",
-                        "default": false
-                    }
-                },
-                "required": ["file_path", "content"]
-            }),
-        }
-    }
-
-    fn call(
-        &self,
-        input: Value,
-        ctx: &ToolContext,
-    ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
-        let rc = runner_ctx(ctx).cloned();
-        Box::pin(self.write_inner(input, rc))
-    }
-
-    fn system_prompt(&self) -> Option<String> {
-        Some(
-            "Use Write for new files or full rewrites; prefer Edit for \
+/// Writes content to a file, creating parent directories as needed and
+/// running the linter gate on supported file types before the atomic write.
+#[derive(Default, Deserialize, Serialize, Tool)]
+#[tool(
+    name = "Write",
+    system_prompt = "Use Write for new files or full rewrites; prefer Edit for \
              targeted changes. The linter runs automatically on supported \
-             types — fix reported errors."
-                .to_string(),
-        )
-    }
+             types — fix reported errors.",
+    description = "Write content to a file. Syntax validation is automatically performed \
+         for supported file types (.rs, .json, .py, .js, .ts, etc.)"
+)]
+pub struct WriteInput {
+    /// The path to the file to write
+    file_path: String,
+    /// The content to write
+    content: String,
+    /// Skip syntax validation (not recommended)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    skip_linter: Option<bool>,
 }
 
-impl WriteTool {
+impl WriteInput {
+    /// Deserializes the typed input and delegates to `write_inner`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError`] when the input cannot be serialized back to JSON
+    /// or when `write_inner` fails.
+    async fn run(&self, input: Self, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let rc = runner_ctx(ctx).cloned();
+        let value = serde_json::to_value(&input)
+            .map_err(|e| ToolError::Execution(format!("serialize tool input: {e}")))?;
+        self.write_inner(value, rc).await
+    }
+
     /// Body of [`Tool::call`].
     ///
     /// # Errors
@@ -95,24 +69,12 @@ impl WriteTool {
         input: Value,
         rc: Option<RunnerContext>,
     ) -> Result<ToolOutput, ToolError> {
-        let cwd = rc
-            .as_ref()
-            .ok_or_else(|| {
-                ToolError::Execution(
-                    "RunnerContext extension is not installed on the ToolContext".to_string(),
-                )
-            })?
-            .cwd
-            .clone();
+        let cwd = require_cwd(rc)?;
         let file_path = input
             .get("file_path")
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidInput("Missing file_path".to_string()))?;
-        if is_url(file_path) {
-            return Err(ToolError::InvalidInput(
-                "URLs are not supported by the Write tool. Use WebFetch for URLs.".to_string(),
-            ));
-        }
+        reject_url("Write", file_path)?;
         let content = input
             .get("content")
             .and_then(Value::as_str)
@@ -142,7 +104,7 @@ impl WriteTool {
         let display_path = file_path;
         let message = format_file_change(display_path, old_content.as_deref(), content);
 
-        Ok(ToolOutput::text(message))
+        Ok(ToolOutput::text(message).with_hint(DisplayHint::Diff))
     }
 }
 
@@ -189,6 +151,7 @@ mod tests {
     use super::*;
     use crate::context::RunnerContext;
     use loopctl::tool::ToolContext;
+    use serde_json::json;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -209,7 +172,7 @@ mod tests {
     async fn write_new_file() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = WriteTool;
+        let tool = WriteInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({
             "file_path": "new.rs",
@@ -226,7 +189,7 @@ mod tests {
     async fn write_creates_parent_dirs() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = WriteTool;
+        let tool = WriteInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({
             "file_path": "sub/dir/new.rs",
@@ -243,7 +206,7 @@ mod tests {
         let target = tmp.path().join("existing.rs");
         std::fs::write(&target, "old content\n").unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = WriteTool;
+        let tool = WriteInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({
             "file_path": "existing.rs",
@@ -268,7 +231,7 @@ mod tests {
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let cwd = tmp.path().to_str().unwrap();
-        let tool = WriteTool;
+        let tool = WriteInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({
             "file_path": "script.sh",
@@ -290,7 +253,7 @@ mod tests {
     async fn lint_failure_blocks_write() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = WriteTool;
+        let tool = WriteInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({
             "file_path": "bad.rs",
@@ -306,7 +269,7 @@ mod tests {
     async fn skip_linter_bypasses_gate() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = WriteTool;
+        let tool = WriteInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({
             "file_path": "bad.rs",
@@ -322,7 +285,7 @@ mod tests {
     async fn unsupported_extension_writes() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = WriteTool;
+        let tool = WriteInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({
             "file_path": "notes.txt",
@@ -337,7 +300,7 @@ mod tests {
     async fn no_temp_file_left_on_success() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = WriteTool;
+        let tool = WriteInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({
             "file_path": "clean.rs",
@@ -356,7 +319,7 @@ mod tests {
     async fn missing_file_path_errors() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = WriteTool;
+        let tool = WriteInput::default();
         let ctx = ctx_in(cwd);
         let err = tool
             .call(json!({ "content": "x" }), &ctx)
@@ -369,7 +332,7 @@ mod tests {
     async fn missing_content_errors() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = WriteTool;
+        let tool = WriteInput::default();
         let ctx = ctx_in(cwd);
         let err = tool
             .call(json!({ "file_path": "x.rs" }), &ctx)
@@ -382,7 +345,7 @@ mod tests {
     async fn url_file_path_rejected() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = WriteTool;
+        let tool = WriteInput::default();
         let ctx = ctx_in(cwd);
         let err = tool
             .call(
@@ -402,7 +365,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let target = tmp.path().join("abs.rs");
         let cwd = tmp.path().to_str().unwrap();
-        let tool = WriteTool;
+        let tool = WriteInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({
             "file_path": target.to_str().unwrap(),
@@ -416,14 +379,14 @@ mod tests {
     #[tokio::test]
     async fn writetool_registered_in_builtin_registry() {
         let reg = crate::registry::builtin_registry();
-        let tool = reg.get("Write").expect("WriteTool registered");
+        let tool = reg.get("Write").expect("Write registered");
         assert!(!tool.is_read_only());
         assert!(!tool.is_concurrency_safe());
     }
 
     #[test]
     fn schema_matches_spec() {
-        let schema = WriteTool.schema();
+        let schema = WriteInput::default().schema();
         let props = schema
             .input_schema
             .get("properties")
@@ -457,7 +420,7 @@ mod tests {
         symlink(&real, &link).unwrap();
 
         let cwd = work.path().to_str().unwrap();
-        let tool = WriteTool;
+        let tool = WriteInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({
             "file_path": "link.rs",
