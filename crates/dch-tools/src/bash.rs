@@ -919,12 +919,7 @@ mod tests {
     fn ctx_in(cwd: &str) -> ToolContext {
         let mut ctx = ToolContext::default();
         ctx.cwd = cwd.to_string();
-        let rc = RunnerContext {
-            cwd: std::path::PathBuf::from(cwd),
-            todos: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            question_tx: std::sync::Arc::new(std::sync::Mutex::new(None)),
-        };
-        ctx.set_extension(rc);
+        ctx.set_extension(RunnerContext::new(std::path::PathBuf::from(cwd)));
         ctx
     }
 

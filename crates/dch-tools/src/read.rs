@@ -116,7 +116,7 @@ impl ReadInput {
             .ok_or_else(|| ToolError::InvalidInput("Missing file_path".to_string()))?;
         reject_url("Read", file_path)?;
 
-        let cwd = require_cwd(runner_context)?;
+        let cwd = require_cwd(runner_context.clone())?;
         let full_path = resolve_path(file_path, &cwd)?;
 
         let metadata = metadata_or_not_found(&full_path, file_path).await?;
@@ -129,6 +129,15 @@ impl ReadInput {
                 "{file_path} is a directory, not a file. \
                  Use Glob or Grep to explore its contents."
             )));
+        }
+
+        if let Some(rc) = &runner_context {
+            let mtime = crate::state::current_mtime(&full_path).await;
+            let mut baselines = rc
+                .file_baselines
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            crate::state::record(&mut baselines, file_path, mtime);
         }
 
         let bytes = read_capped(&full_path).await?;
@@ -516,19 +525,12 @@ mod tests {
     use loopctl::tool::ToolContext;
     use serde_json::json;
     use std::path::PathBuf;
-    use std::sync::Arc;
-    use std::sync::Mutex;
 
     /// Builds a `ToolContext` with a `RunnerContext` pointing at `cwd`.
     fn ctx_in(cwd: &str) -> ToolContext {
         let mut ctx = ToolContext::default();
         ctx.cwd = cwd.to_string();
-        let rc = RunnerContext {
-            cwd: PathBuf::from(cwd),
-            todos: Arc::new(Mutex::new(Vec::new())),
-            question_tx: Arc::new(Mutex::new(None)),
-        };
-        ctx.set_extension(rc);
+        ctx.set_extension(RunnerContext::new(PathBuf::from(cwd)));
         ctx
     }
 
@@ -947,5 +949,37 @@ mod tests {
             matches!(err, ToolError::InvalidInput(ref s) if s.contains("symlink")),
             "expected symlink-escape rejection, got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn read_records_the_file_mtime_in_the_shared_history() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("small.txt");
+        std::fs::write(&path, "hello world\n").unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let ctx = ctx_in(cwd);
+
+        // Drive the tool with THIS test's context (not the `read` helper,
+        // which owns its own) so the history entry lands where we look.
+        let tool = ReadInput::default();
+        tool.call(input(path.to_str().unwrap()), &ctx)
+            .await
+            .unwrap();
+
+        let rc = runner_ctx(&ctx).unwrap();
+        let baselines = rc
+            .file_baselines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(baselines.len(), 1, "one successful read, one baseline");
+        let actual = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(
+            crate::state::baseline(&baselines, path.to_str().unwrap()),
+            Some(actual)
+        );
+
+        // The best-effort half of the contract (a failed stat records `None`
+        // instead of failing the read) is pinned by `current_mtime`'s unit
+        // test in `state.rs`, which is the capture helper this site calls.
     }
 }

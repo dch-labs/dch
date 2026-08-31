@@ -1,11 +1,9 @@
 //! The runner context extension stored on each `loopctl::tool::ToolContext`.
 //!
 //! Tools retrieve it with [`runner_ctx`] to reach per-call, tool-facing state:
-//! the working directory, the agent's per-run todo list, and the channel slot
-//! for asking the user interactive questions. Session-lifetime records
-//! (file-touch history for staleness detection, etc.) are owned by the outer
-//! runner layer and recorded via an observer on tool dispatch — not by the
-//! tools and not via this context.
+//! the working directory, the agent's per-run todo list, the channel slot
+//! for asking the user interactive questions, and the session's file-read
+//! history that backs the Write tool's staleness check.
 
 use std::fmt;
 use std::path::PathBuf;
@@ -16,22 +14,25 @@ use std::sync::mpsc;
 use loopctl::tool::ToolError;
 
 use crate::question::QuestionRequest;
+use crate::state::FileBaselines;
 use crate::todo::TodoEntry;
 
 /// Per-call, tool-facing context attached to every `ToolContext`.
 ///
 /// Carries what a tool invocation needs that is specific to this run and isn't
 /// already on loopctl's `ToolContext`: the working directory (as a `PathBuf`,
-/// the form the file tools prefer), the agent's per-run todo list, and the
-/// optional channel a tool uses during its call to ask the user a question.
-/// Stored as a typed extension via
+/// the form the file tools prefer), the agent's per-run todo list, the
+/// optional channel a tool uses during its call to ask the user a question,
+/// and the model's file-baseline map backing the Write tool's staleness
+/// check. Stored as a typed extension via
 /// [`ToolContext::set_extension`](loopctl::tool::ToolContext::set_extension)
 /// and retrieved with [`runner_ctx`].
 ///
-/// Cloning is cheap — `todos` and `question_tx` are behind `Arc`s, so clones
-/// share the same mutable list and the same channel slot rather than copying
-/// them. This is how multiple tool invocations within one run observe each
-/// other's todo-list mutations.
+/// Cloning is cheap — `todos`, `question_tx`, and `file_baselines` are
+/// behind `Arc`s, so clones share the same mutable list, the same channel
+/// slot, and the same map rather than copying them. This is how multiple
+/// tool invocations within one run observe each other's todo-list mutations
+/// (and how a Write sees what a prior Read recorded).
 #[derive(Clone)]
 pub struct RunnerContext {
     /// The working directory the agent operates within.
@@ -61,6 +62,29 @@ pub struct RunnerContext {
     /// installation affects subsequent dispatches immediately. Cloning
     /// [`RunnerContext`] shares the same slot.
     pub question_tx: Arc<Mutex<Option<mpsc::Sender<QuestionRequest>>>>,
+
+    /// The model's latest known `mtime` per touched file.
+    ///
+    /// Read records what it observes; a successful write records the
+    /// post-write `mtime` (see [`FileBaselines`]). The Write tool's
+    /// detect-on-write conflict check compares the target's current `mtime`
+    /// against this record before overwriting. Cloning [`RunnerContext`]
+    /// shares the same map.
+    pub file_baselines: Arc<Mutex<FileBaselines>>,
+}
+
+impl RunnerContext {
+    /// Create a context for `cwd` with an empty todo list, no question
+    /// channel, and no recorded file baselines.
+    #[must_use]
+    pub fn new(cwd: PathBuf) -> Self {
+        Self {
+            cwd,
+            todos: Arc::new(Mutex::new(Vec::new())),
+            question_tx: Arc::new(Mutex::new(None)),
+            file_baselines: Arc::new(Mutex::new(FileBaselines::default())),
+        }
+    }
 }
 
 impl fmt::Debug for RunnerContext {
@@ -70,10 +94,16 @@ impl fmt::Debug for RunnerContext {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_some();
+        let baselines = self
+            .file_baselines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
         f.debug_struct("RunnerContext")
             .field("cwd", &self.cwd)
             .field("todos", &self.todos)
             .field("question_tx", &has_channel)
+            .field("file_baselines", &baselines)
             .finish()
     }
 }
@@ -92,12 +122,7 @@ impl fmt::Debug for RunnerContext {
 /// let mut ctx = loopctl::tool::ToolContext::default();
 /// assert!(runner_ctx(&ctx).is_none());
 ///
-/// let rc = RunnerContext {
-///     cwd: ".".into(),
-///     todos: Default::default(),
-///     question_tx: Default::default(),
-/// };
-/// ctx.set_extension(rc);
+/// ctx.set_extension(RunnerContext::new(".".into()));
 /// assert!(runner_ctx(&ctx).is_some());
 /// ```
 #[must_use]
@@ -150,11 +175,7 @@ mod tests {
     use loopctl::tool::ToolContext;
 
     fn sample() -> RunnerContext {
-        RunnerContext {
-            cwd: PathBuf::from("/tmp/workspace"),
-            todos: Arc::new(Mutex::new(Vec::new())),
-            question_tx: Arc::new(Mutex::new(None)),
-        }
+        RunnerContext::new(PathBuf::from("/tmp/workspace"))
     }
 
     #[test]

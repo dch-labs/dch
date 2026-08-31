@@ -1,8 +1,9 @@
 //! The Edit tool — replace a unique occurrence of text in a file.
 //!
 //! Edit reads a file, locates `old_text`, and requires it to appear exactly
-//! once (non-overlapping). The replacement is run through the linter gate
-//! before writing, and the result is returned as a line diff preview.
+//! once (non-overlapping). The replacement is run through the linter gate and
+//! a staleness check before writing, and the result is returned as a line
+//! diff preview.
 
 use std::ops::Range;
 use std::path::Path;
@@ -86,10 +87,13 @@ impl EditInput {
 
     /// Body of [`Tool::call`].
     ///
-    /// Orchestrates parse → read → apply → lint → write. Recoverable conditions
-    /// (text not found, ambiguous match, linter failure) are surfaced as soft
-    /// [`ToolOutput`] errors; hard failures (bad args, missing file, I/O fault)
-    /// become [`ToolError`].
+    /// Orchestrates parse → read → apply → lint → staleness check → write.
+    /// Recoverable conditions (text not found, ambiguous match, linter
+    /// failure, a file changed on disk since this call read it) are surfaced
+    /// as soft [`ToolOutput`] errors; hard failures (bad args, missing file,
+    /// I/O fault) become [`ToolError`]. A successful write refreshes the
+    /// path's recorded baseline, so the model's own edit never registers as
+    /// a later external change.
     ///
     /// # Errors
     ///
@@ -102,7 +106,7 @@ impl EditInput {
         input: Value,
         rc: Option<RunnerContext>,
     ) -> Result<ToolOutput, ToolError> {
-        let cwd = require_cwd(rc)?;
+        let cwd = require_cwd(rc.clone())?;
         let parsed = parse_input(&input)?;
         let full_path = resolve_path(parsed.file_path, &cwd)?;
         let old_content = read_existing(&full_path, parsed.file_path).await?;
@@ -119,7 +123,26 @@ impl EditInput {
             )));
         }
 
+        if let Err(failure) =
+            crate::conflict::check_content_unchanged(&old_content, &full_path).await
+        {
+            return match failure {
+                crate::conflict::CheckFailure::Changed(_) => Ok(EditError::Conflict.into_output()),
+                crate::conflict::CheckFailure::Fault(e) => Err(e),
+            };
+        }
+
         crate::fs::atomic_write(&full_path, &new_content)?;
+
+        if let Some(rc) = &rc {
+            let mtime = crate::state::current_mtime(&full_path).await;
+            let mut baselines = rc
+                .file_baselines
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            crate::state::record(&mut baselines, parsed.file_path, mtime);
+        }
+
         let message = format_file_change(parsed.file_path, Some(&old_content), &new_content);
         Ok(ToolOutput::text(message).with_hint(DisplayHint::Diff))
     }
@@ -199,6 +222,14 @@ enum EditError {
         /// [`locate_unique`] via `str::matches(...).count()`.
         count: usize,
     },
+
+    /// The file changed on disk between this call's read and its write.
+    ///
+    /// Detected by the detect-on-write check immediately before the write: an
+    /// external writer (another process, the user's editor) modified the file
+    /// after this call read it. Writing would clobber the newer content, so
+    /// the edit is refused and the model re-reads and retries.
+    Conflict,
 }
 
 impl EditError {
@@ -221,6 +252,13 @@ impl EditError {
                 "old_text appears {count} times in the file; it must be unique. \
                  Add surrounding context to disambiguate, or use MultiEdit."
             )),
+            EditError::Conflict => ToolOutput::error_text(
+                "File changed on disk since this call read it; not writing to \
+                 avoid clobbering the newer content.\n\n\
+                 Hints:\n  \
+                 - Re-read the file with `Read`\n  \
+                 - Re-issue the edit against the current content",
+            ),
         }
     }
 }
@@ -424,19 +462,12 @@ mod tests {
     use loopctl::tool::ToolContext;
     use serde_json::json;
     use std::path::PathBuf;
-    use std::sync::Arc;
-    use std::sync::Mutex;
 
     /// Builds a `ToolContext` with a `RunnerContext` pointing at `cwd`.
     fn ctx_in(cwd: &str) -> ToolContext {
         let mut ctx = ToolContext::default();
         ctx.cwd = cwd.to_string();
-        let rc = RunnerContext {
-            cwd: PathBuf::from(cwd),
-            todos: Arc::new(Mutex::new(Vec::new())),
-            question_tx: Arc::new(Mutex::new(None)),
-        };
-        ctx.set_extension(rc);
+        ctx.set_extension(RunnerContext::new(PathBuf::from(cwd)));
         ctx
     }
 
@@ -882,5 +913,42 @@ mod tests {
         // .txt is not a linted extension — passes regardless of content.
         let path = Path::new("a.txt");
         assert!(check_linter(path, "garbage {{{ not code").is_ok());
+    }
+
+    #[test]
+    fn edit_conflict_into_output_is_a_soft_error_with_recovery_guidance() {
+        let out = EditError::Conflict.into_output();
+        assert!(out.is_error);
+        let text = out.text_content();
+        assert!(text.contains("changed on disk"), "{text}");
+        assert!(text.contains("Read"), "{text}");
+    }
+
+    /// The end-to-end conflict path (mutate between the call's read and its
+    /// re-read) is not interposable from outside `call`, so the refuse-to-
+    /// write behavior is pinned at the helper level (see `conflict.rs`'s
+    /// external-writer test); this test pins the remaining tool-level
+    /// contract: an unchanged file still writes normally with the check
+    /// wired in.
+    #[tokio::test]
+    async fn edit_still_writes_when_the_conflict_check_sees_no_change() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("src.rs");
+        std::fs::write(&target, "fn main() { println!(\"hi\"); }\n").unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let tool = EditInput::default();
+        let ctx = ctx_in(cwd);
+        let input = json!({
+            "file_path": "src.rs",
+            "old_text": "println!(\"hi\")",
+            "new_text": "println!(\"bye\")"
+        });
+        let out = tool.call(input, &ctx).await.unwrap();
+        assert!(!out.is_error, "{}", out.text_content());
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "fn main() { println!(\"bye\"); }\n",
+            "the edit must apply when the re-read matches the baseline"
+        );
     }
 }

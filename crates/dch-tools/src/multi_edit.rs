@@ -16,6 +16,8 @@ use std::future::Future;
 use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use loopctl::tool::DisplayHint;
 use loopctl::tool::Tool;
@@ -26,6 +28,9 @@ use loopctl::tool::ToolSchema;
 use serde_json::Value;
 use serde_json::json;
 
+use crate::conflict::CheckFailure;
+use crate::conflict::Conflict;
+use crate::conflict::check_content_unchanged;
 use crate::context::RunnerContext;
 use crate::context::require_cwd;
 use crate::context::runner_ctx;
@@ -34,6 +39,7 @@ use crate::edit::FindResult;
 use crate::edit::locate_unique;
 use crate::edit::splice;
 use crate::linter::lint_content;
+use crate::state::FileBaselines;
 use crate::util::reject_url;
 use crate::util::resolve_path;
 use crate::write::format_lint_failure;
@@ -110,10 +116,13 @@ impl MultiEditTool {
     /// Body of [`Tool::call`].
     ///
     /// Orchestrates the pipeline: parse → dup-path → read → symlink →
-    /// overlap-detect → locate+merge → lint → preview/write. Recoverable conditions (text not
-    /// found, ambiguous match, overlap, symlink target, linter failure) are
-    /// surfaced as soft [`ToolOutput`] errors; hard failures (bad args,
-    /// missing file, I/O fault) become [`ToolError`].
+    /// overlap-detect → locate+merge → lint → preview, then a per-file
+    /// staleness check immediately before each write. Recoverable conditions
+    /// (text not found, ambiguous match, overlap, symlink target, linter
+    /// failure, a file changed on disk since the batch read it) are surfaced
+    /// as soft [`ToolOutput`] errors; hard failures (bad args, missing file,
+    /// I/O fault) become [`ToolError`]. Each successful write refreshes the
+    /// path's recorded baseline.
     ///
     /// # Atomicity scope
     ///
@@ -138,7 +147,8 @@ impl MultiEditTool {
         input: Value,
         rc: Option<RunnerContext>,
     ) -> Result<ToolOutput, ToolError> {
-        let cwd = require_cwd(rc)?;
+        let cwd = require_cwd(rc.clone())?;
+        let history = rc.as_ref().map(|rc| Arc::clone(&rc.file_baselines));
 
         let parsed = parse_input(&input)?;
         let operations = build_operations(parsed.edits, &cwd)?;
@@ -168,7 +178,11 @@ impl MultiEditTool {
         if parsed.dry_run {
             return Ok(ToolOutput::text(summary).with_hint(DisplayHint::Diff));
         }
-        write_finals(&operations, &finals)?;
+        if let Some((path, reason)) =
+            write_finals(&operations, &originals, &finals, history.as_ref()).await?
+        {
+            return Ok(ToolOutput::error_text(reason.message(Path::new(&path))));
+        }
 
         let applied: Vec<&str> = finals.keys().map(String::as_str).collect();
         let message = apply_summary(&summary, &applied, &operations);
@@ -180,25 +194,52 @@ impl MultiEditTool {
 ///
 /// Multiple edits can share one physical file; the deduplication by resolved
 /// path ensures the merged content is written exactly once per file, in the
-/// batch's first-seen order.
+/// batch's first-seen order. Before each write, the file's current bytes are
+/// compared against the content this batch read in phase 1 (`originals`); a
+/// file changed by an external writer aborts the batch at that file — files
+/// already written in earlier iterations stay written. Each successful write
+/// refreshes the path's recorded baseline (`history`), so the model's own
+/// batch never registers as a later external change.
+///
+/// Returns `Ok(Some((path, reason)))` when the batch aborted on a conflict;
+/// `path` is the caller-supplied path of the file that changed.
 ///
 /// # Errors
 ///
-/// Returns [`ToolError`] when an atomic temp-then-rename write fails.
-fn write_finals(
+/// Returns [`ToolError`] when an atomic temp-then-rename write fails or the
+/// conflict check hits a genuine I/O fault.
+async fn write_finals(
     operations: &[EditOperation],
+    originals: &BTreeMap<String, String>,
     finals: &BTreeMap<String, String>,
-) -> Result<(), ToolError> {
+    history: Option<&Arc<Mutex<FileBaselines>>>,
+) -> Result<Option<(String, Conflict)>, ToolError> {
     let mut written: std::collections::HashSet<&Path> = std::collections::HashSet::new();
     for op in operations {
         if !written.insert(&op.full_path) {
             continue;
         }
         if let Some(final_content) = finals.get(&op.file_path) {
+            if let Some(baseline) = originals.get(&op.file_path).map(String::as_str) {
+                match check_content_unchanged(baseline, &op.full_path).await {
+                    Ok(()) => {}
+                    Err(CheckFailure::Changed(reason)) => {
+                        return Ok(Some((op.file_path.clone(), reason)));
+                    }
+                    Err(CheckFailure::Fault(e)) => return Err(e),
+                }
+            }
             crate::fs::atomic_write(&op.full_path, final_content)?;
+            if let Some(history) = history {
+                let mtime = crate::state::current_mtime(&op.full_path).await;
+                let mut baselines = history
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                crate::state::record(&mut baselines, &op.file_path, mtime);
+            }
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Parsed top-level `MultiEdit` input.
@@ -816,19 +857,12 @@ mod tests {
     use crate::context::RunnerContext;
     use loopctl::tool::ToolContext;
     use std::path::PathBuf;
-    use std::sync::Arc;
-    use std::sync::Mutex;
 
     /// Builds a `ToolContext` with a `RunnerContext` pointing at `cwd`.
     fn ctx_in(cwd: &str) -> ToolContext {
         let mut ctx = ToolContext::default();
         ctx.cwd = cwd.to_string();
-        let rc = RunnerContext {
-            cwd: PathBuf::from(cwd),
-            todos: Arc::new(Mutex::new(Vec::new())),
-            question_tx: Arc::new(Mutex::new(None)),
-        };
-        ctx.set_extension(rc);
+        ctx.set_extension(RunnerContext::new(PathBuf::from(cwd)));
         ctx
     }
 
@@ -1889,5 +1923,62 @@ mod tests {
         );
         // Nothing written.
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "content\n");
+    }
+
+    /// The per-file conflict check itself cannot be triggered end-to-end (the
+    /// mutation would have to land inside one `call`), so the batch-abort
+    /// contract is pinned by driving `write_finals` directly: a phase-1
+    /// baseline of "A" against on-disk "EXTERNAL" must abort before the
+    /// atomic write.
+    #[tokio::test]
+    async fn write_finals_aborts_on_an_externally_changed_file_without_writing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("a.rs");
+        std::fs::write(&target, "EXTERNAL").unwrap();
+        let mut originals = BTreeMap::new();
+        originals.insert("a.rs".to_string(), "A".to_string());
+        let mut finals = BTreeMap::new();
+        finals.insert("a.rs".to_string(), "rewritten".to_string());
+        let operations = vec![EditOperation {
+            file_path: "a.rs".to_string(),
+            full_path: target.clone(),
+            old_text: "A".to_string(),
+            new_text: "rewritten".to_string(),
+        }];
+
+        let outcome = write_finals(&operations, &originals, &finals, None)
+            .await
+            .unwrap();
+        let (path, reason) = outcome.expect("an externally changed file aborts the batch");
+        assert_eq!(path, "a.rs");
+        assert_eq!(reason, Conflict::Content);
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "EXTERNAL",
+            "the conflicted file must not be written"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_finals_writes_through_when_disk_matches_the_batch_baseline() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("a.rs");
+        std::fs::write(&target, "A").unwrap();
+        let mut originals = BTreeMap::new();
+        originals.insert("a.rs".to_string(), "A".to_string());
+        let mut finals = BTreeMap::new();
+        finals.insert("a.rs".to_string(), "rewritten".to_string());
+        let operations = vec![EditOperation {
+            file_path: "a.rs".to_string(),
+            full_path: target.clone(),
+            old_text: "A".to_string(),
+            new_text: "rewritten".to_string(),
+        }];
+
+        let outcome = write_finals(&operations, &originals, &finals, None)
+            .await
+            .unwrap();
+        assert!(outcome.is_none(), "matching disk content must not abort");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "rewritten");
     }
 }

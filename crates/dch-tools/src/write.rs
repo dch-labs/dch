@@ -1,4 +1,5 @@
-//! The Write tool — writes content to a file with syntax validation.
+//! The Write tool — writes content to a file, after syntax validation and a
+//! staleness check against the path's last-recorded read.
 
 use std::path::Path;
 
@@ -74,6 +75,12 @@ impl WriteInput {
 
     /// Body of [`Tool::call`].
     ///
+    /// Orchestrates validate → lint → staleness check → write. When the path
+    /// has a recorded baseline (a prior Read this session), a moved `mtime`
+    /// refuses the write as a soft conflict; a successful write refreshes the
+    /// recorded baseline, so the model's own write never registers as a later
+    /// external change.
+    ///
     /// # Errors
     ///
     /// Returns [`ToolError`] for a missing `RunnerContext`, a missing
@@ -84,7 +91,7 @@ impl WriteInput {
         input: Value,
         rc: Option<RunnerContext>,
     ) -> Result<ToolOutput, ToolError> {
-        let cwd = require_cwd(rc)?;
+        let cwd = require_cwd(rc.clone())?;
         let file_path = input
             .get("file_path")
             .and_then(Value::as_str)
@@ -110,11 +117,42 @@ impl WriteInput {
         }
 
         let old_content = tokio::fs::read_to_string(&full_path).await.ok();
+
+        if let Some(rc) = &rc {
+            let baseline_mtime = {
+                let baselines = rc
+                    .file_baselines
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                crate::state::baseline(&baselines, file_path)
+            };
+            if let Some(baseline_mtime) = baseline_mtime
+                && let Err(failure) =
+                    crate::conflict::check_mtime_unchanged(baseline_mtime, &full_path).await
+            {
+                return match failure {
+                    crate::conflict::CheckFailure::Changed(reason) => {
+                        Ok(ToolOutput::error_text(reason.message(&full_path)))
+                    }
+                    crate::conflict::CheckFailure::Fault(e) => Err(e),
+                };
+            }
+        }
+
         if let Some(parent) = full_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
 
         crate::fs::atomic_write(&full_path, content)?;
+
+        if let Some(rc) = &rc {
+            let mtime = crate::state::current_mtime(&full_path).await;
+            let mut baselines = rc
+                .file_baselines
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            crate::state::record(&mut baselines, file_path, mtime);
+        }
 
         let display_path = file_path;
         let message = format_file_change(display_path, old_content.as_deref(), content);
@@ -168,18 +206,11 @@ mod tests {
     use loopctl::tool::ToolContext;
     use serde_json::json;
     use std::path::PathBuf;
-    use std::sync::Arc;
-    use std::sync::Mutex;
 
     fn ctx_in(cwd: &str) -> ToolContext {
         let mut ctx = ToolContext::default();
         ctx.cwd = cwd.to_string();
-        let rc = RunnerContext {
-            cwd: PathBuf::from(cwd),
-            todos: Arc::new(Mutex::new(Vec::new())),
-            question_tx: Arc::new(Mutex::new(None)),
-        };
-        ctx.set_extension(rc);
+        ctx.set_extension(RunnerContext::new(PathBuf::from(cwd)));
         ctx
     }
 
@@ -451,6 +482,95 @@ mod tests {
             std::fs::read_to_string(&real).unwrap(),
             "original",
             "external target must be untouched"
+        );
+    }
+
+    /// Drives a real Read (which records the mtime baseline on the shared
+    /// context) before the Write. The external mutation's mtime is forced
+    /// with `set_modified` so the test never depends on filesystem timestamp
+    /// granularity.
+    #[tokio::test]
+    async fn write_refuses_to_clobber_a_file_changed_since_it_was_read() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("note.txt");
+        std::fs::write(&target, "original\n").unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let ctx = ctx_in(cwd);
+
+        let read = crate::read::ReadInput::default();
+        read.call(json!({ "file_path": "note.txt" }), &ctx)
+            .await
+            .unwrap();
+
+        std::fs::write(&target, "EXTERNAL\n").unwrap();
+        let baseline = std::fs::metadata(&target).unwrap().modified().unwrap();
+        let forced = baseline + std::time::Duration::from_secs(30);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&target)
+            .unwrap();
+        file.set_modified(forced).unwrap();
+
+        let tool = WriteInput::default();
+        let input = json!({ "file_path": "note.txt", "content": "clobber\n" });
+        let out = tool.call(input, &ctx).await.unwrap();
+        assert!(out.is_error, "{}", out.text_content());
+        let text = out.text_content();
+        assert!(text.contains("changed on disk"), "{text}");
+        assert!(text.contains("Read"), "{text}");
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "EXTERNAL\n",
+            "the clobbering write must not happen"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_allows_an_existing_file_that_was_never_read() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("existing.txt");
+        std::fs::write(&target, "old\n").unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let tool = WriteInput::default();
+        let ctx = ctx_in(cwd);
+        let input = json!({ "file_path": "existing.txt", "content": "new\n" });
+        let out = tool.call(input, &ctx).await.unwrap();
+        assert!(!out.is_error, "{}", out.text_content());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
+    }
+
+    #[tokio::test]
+    async fn write_allows_an_unchanged_file_that_was_read() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("note.txt");
+        std::fs::write(&target, "original\n").unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let ctx = ctx_in(cwd);
+
+        let read = crate::read::ReadInput::default();
+        read.call(json!({ "file_path": "note.txt" }), &ctx)
+            .await
+            .unwrap();
+
+        let tool = WriteInput::default();
+        let input = json!({ "file_path": "note.txt", "content": "rewritten\n" });
+        let out = tool.call(input, &ctx).await.unwrap();
+        assert!(!out.is_error, "{}", out.text_content());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "rewritten\n");
+    }
+
+    #[tokio::test]
+    async fn write_allows_a_brand_new_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let tool = WriteInput::default();
+        let ctx = ctx_in(cwd);
+        let input = json!({ "file_path": "fresh.txt", "content": "hello\n" });
+        let out = tool.call(input, &ctx).await.unwrap();
+        assert!(!out.is_error, "{}", out.text_content());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("fresh.txt")).unwrap(),
+            "hello\n"
         );
     }
 }

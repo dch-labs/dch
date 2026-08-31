@@ -2,13 +2,15 @@
 //!
 //! The runner context ([`RunnerContext`]) is installed as a typed extension on
 //! each `ToolContext`; tools retrieve it with [`runner_ctx`] to reach the
-//! working directory, the per-run todo list, and the interactive question
-//! channel.
+//! working directory, the per-run todo list, the interactive question
+//! channel, and the file-baseline map that backs the Write tool's staleness
+//! check.
 
 #![warn(missing_docs)]
 
 pub mod bash;
 pub mod code_search;
+pub(crate) mod conflict;
 pub mod context;
 pub mod diff;
 pub mod edit;
@@ -25,6 +27,7 @@ pub mod read;
 pub mod regex_cache;
 pub mod registry;
 pub mod search;
+pub mod state;
 pub mod todo;
 pub mod tree;
 pub mod util;

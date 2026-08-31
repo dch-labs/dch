@@ -348,11 +348,7 @@ impl RunnerBuilder<'_> {
     ///   `[[mcp.servers]]` entry fails to spawn or handshake, or the dispatch
     ///   pipeline cannot be built.
     pub async fn build(self) -> Result<Runner, RunnerError> {
-        let context = Arc::new(RunnerContext {
-            cwd: self.workdir.clone(),
-            todos: Arc::new(std::sync::Mutex::new(Vec::new())),
-            question_tx: Arc::new(std::sync::Mutex::new(None)),
-        });
+        let context = Arc::new(RunnerContext::new(self.workdir.clone()));
 
         let client = crate::create_client(&self.config.api)?;
         let mut providers = connect_mcp_servers(self.config, &self.workdir).await?;
@@ -679,11 +675,7 @@ mod tests {
     }
 
     fn sample_context(cwd: &str) -> Arc<RunnerContext> {
-        Arc::new(RunnerContext {
-            cwd: PathBuf::from(cwd),
-            todos: Arc::new(Mutex::new(Vec::new())),
-            question_tx: Arc::new(Mutex::new(None)),
-        })
+        Arc::new(RunnerContext::new(PathBuf::from(cwd)))
     }
 
     fn probe_dispatch_context() -> loopctl::middleware::ToolDispatchContext {
