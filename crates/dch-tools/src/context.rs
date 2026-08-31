@@ -78,8 +78,17 @@ pub struct RunnerContext {
 impl RunnerContext {
     /// Create a context for `cwd` with an empty todo list, no question
     /// channel, and no recorded file baselines.
+    ///
+    /// A relative `cwd` is anchored to the process's current directory.
+    /// [`resolve_path`](crate::util::resolve_path) decides containment by
+    /// comparing lexical prefixes, and a bare `.` normalizes to nothing —
+    /// left un-anchored, it would reject every relative target. `.` and
+    /// trailing separators are stripped; symlinks are not resolved, matching
+    /// the lexical philosophy applied to targets. On the rare failure of the
+    /// current-directory probe, `cwd` is stored as given.
     #[must_use]
     pub fn new(cwd: PathBuf) -> Self {
+        let cwd = std::path::absolute(&cwd).unwrap_or(cwd);
         Self {
             cwd,
             todos: Arc::new(Mutex::new(Vec::new())),
@@ -203,6 +212,28 @@ mod tests {
 
     fn sample() -> RunnerContext {
         RunnerContext::new(PathBuf::from("/tmp/workspace"))
+    }
+
+    #[test]
+    fn new_makes_a_relative_cwd_absolute() {
+        let rc = RunnerContext::new(PathBuf::from("."));
+        assert!(
+            rc.cwd.is_absolute(),
+            "a bare `.` must anchor to the process cwd: {:?}",
+            rc.cwd
+        );
+        assert_eq!(rc.cwd, std::env::current_dir().unwrap());
+    }
+
+    #[test]
+    fn a_relative_cwd_resolves_relative_targets() {
+        let rc = RunnerContext::new(PathBuf::from("."));
+        let resolved = crate::util::resolve_path("src/main.rs", &rc.cwd).unwrap();
+        assert!(
+            resolved.is_absolute(),
+            "the target must resolve against the anchored cwd: {resolved:?}"
+        );
+        assert!(resolved.ends_with(Path::new("src/main.rs")));
     }
 
     #[test]
