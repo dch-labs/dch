@@ -352,7 +352,7 @@ impl RunnerBuilder<'_> {
         let context = Arc::new(RunnerContext::new(self.workdir.clone()));
 
         let client = crate::create_client(&self.config.api)?;
-        let connections = connect_mcp_servers(self.config, &self.workdir).await?;
+        let connections = connect_mcp_servers(self.config, &context.cwd).await?;
         let mut registry = compose_registry(&connections);
         let mut core_registry = compose_registry(&connections);
         for provider in &self.mcp_providers {

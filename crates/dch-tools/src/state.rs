@@ -17,7 +17,10 @@ use std::path::PathBuf;
 ///
 /// Keyed by the resolved absolute path (each tool's [`resolve_path`](crate::util::resolve_path)
 /// output), so equivalent spellings of the same file share one baseline and a
-/// staleness check can't be dodged by re-spelling a path.
+/// staleness check can't be dodged by re-spelling a path. Concurrent touches
+/// are serialized by the map's lock; if two reads of one path interleave
+/// around an external write, whichever insert lands last stands — the worst
+/// case is a spurious refusal (the next Read re-arms), never a missed one.
 ///
 /// The hash is a process-local [`DefaultHasher`] fingerprint of the file's
 /// bytes — deliberately not a stable or cryptographic digest: baselines live
