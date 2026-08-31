@@ -113,6 +113,11 @@ impl ReadInput {
 
     /// Body of [`Tool::call`].
     ///
+    /// A successful text read also records the path's content hash as its
+    /// staleness baseline. The record happens after the decode and
+    /// range-resolution gates, so a read that fails anywhere leaves no
+    /// baseline for content the model never received.
+    ///
     /// # Errors
     ///
     /// Returns [`ToolError`] for a missing `file_path`, a URL, a missing
@@ -148,9 +153,6 @@ impl ReadInput {
             return Ok(too_large);
         }
 
-        if let Some(rc) = &runner_context {
-            rc.record_baseline(&full_path, crate::state::content_hash(&bytes));
-        }
         if let Some(mime) = mime_type_from_path(&full_path) {
             return Ok(image_output(mime, &bytes));
         }
@@ -163,6 +165,11 @@ impl ReadInput {
 
         let content = decode_utf8(bytes)?;
         let (offset, limit) = resolve_range(&input)?;
+
+        if let Some(rc) = &runner_context {
+            rc.record_baseline(&full_path, crate::state::content_hash(content.as_bytes()));
+        }
+
         Ok(format_text(&content, file_path, offset, limit))
     }
 }
@@ -982,6 +989,28 @@ mod tests {
         assert_eq!(
             crate::state::baseline(&baselines, path.as_path()),
             Some(crate::state::content_hash("hello world\n".as_bytes()))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_read_records_no_baseline() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("small.txt");
+        std::fs::write(&path, "hello world\n").unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let ctx = ctx_in(cwd);
+
+        let bad = json!({ "file_path": path.to_str().unwrap(), "offset": -5 });
+        assert!(read(bad, cwd).await.is_err());
+
+        let rc = runner_ctx(&ctx).unwrap();
+        let baselines = rc
+            .file_baselines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            baselines.is_empty(),
+            "a read that fails must not record a baseline: {baselines:?}"
         );
     }
 }

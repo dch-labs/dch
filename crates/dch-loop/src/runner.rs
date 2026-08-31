@@ -355,10 +355,6 @@ impl RunnerBuilder<'_> {
         let connections = connect_mcp_servers(self.config, &self.workdir).await?;
         let mut registry = compose_registry(&connections);
         let mut core_registry = compose_registry(&connections);
-        for connection in &connections {
-            connection.provider.register_into(&mut registry);
-            connection.provider.register_into(&mut core_registry);
-        }
         for provider in &self.mcp_providers {
             provider.register_into(&mut registry);
             provider.register_into(&mut core_registry);
@@ -1418,6 +1414,11 @@ mod tests {
         async fn greet(&self) -> String {
             "hello, world!".to_string()
         }
+
+        #[rmcp::tool(description = "Say goodbye")]
+        async fn farewell(&self) -> String {
+            "goodbye!".to_string()
+        }
     }
 
     #[allow(clippy::unused_async_trait_impl)] // rmcp's tool_handler emits un-awaited trait impls
@@ -1482,6 +1483,10 @@ mod tests {
         assert!(
             registry.contains("demo__greet"),
             "the allowlisted tool must be registered"
+        );
+        assert!(
+            !registry.contains("demo__farewell"),
+            "an unlisted tool must stay unregistered"
         );
         let expected = builtin_registry().len() + 1;
         assert_eq!(registry.len(), expected, "exactly one external tool joins");
