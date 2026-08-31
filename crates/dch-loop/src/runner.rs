@@ -430,6 +430,7 @@ async fn connect_mcp_servers(
 }
 
 /// Connect an already-running MCP `client` as `server` and snapshot its
+///
 /// tools under the server's allowlist.
 ///
 /// # Errors
@@ -469,6 +470,7 @@ async fn adopt_mcp_server(
 }
 
 /// One connected MCP server and its containment policy.
+///
 /// One connected MCP server and its containment policy.
 struct McpConnection {
     /// The connected provider.
@@ -603,6 +605,7 @@ fn build_pipeline(
 }
 
 /// A dispatch middleware that populates the per-call tool context with the
+///
 /// shared [`RunnerContext`] before the tool runs.
 ///
 /// The engine builds each dispatch's [`ToolContext`](loopctl::tool::ToolContext)

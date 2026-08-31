@@ -34,8 +34,9 @@ pub(crate) enum CheckFailure {
 
 /// Format the soft-error message for a refused write of `path`.
 ///
-/// The text states what happened and directs the model to the recovery path
-/// (re-read, then re-issue).
+/// The text states what happened and directs the model to the recovery
+/// path. Both check flavors produce the same shape — only the refused file
+/// differs — so a consumer can render either uniformly.
 pub(crate) fn changed_message(path: &Path) -> String {
     format!(
         "{path} changed on disk since it was read; not writing to avoid \
