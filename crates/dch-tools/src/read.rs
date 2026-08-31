@@ -113,10 +113,13 @@ impl ReadInput {
 
     /// Body of [`Tool::call`].
     ///
-    /// A successful text read also records the path's content hash as its
-    /// staleness baseline. The record happens after the decode and
-    /// range-resolution gates, so a read that fails anywhere leaves no
-    /// baseline for content the model never received.
+    /// Every read that serves the file's bytes arms the path's staleness
+    /// baseline with their content hash — text and image reads deliver them,
+    /// and a binary-content read reports the file while still arming the
+    /// guard. Reads that fail before any bytes are served record nothing.
+    /// Arming happens before decoding and range checks on purpose: content
+    /// the model has seen stays guarded even if a later parse step rejects
+    /// the read, and a re-read re-arms it.
     ///
     /// # Errors
     ///
@@ -153,6 +156,10 @@ impl ReadInput {
             return Ok(too_large);
         }
 
+        if let Some(rc) = &runner_context {
+            rc.record_baseline(&full_path, crate::state::content_hash(&bytes));
+        }
+
         if let Some(mime) = mime_type_from_path(&full_path) {
             return Ok(image_output(mime, &bytes));
         }
@@ -165,11 +172,6 @@ impl ReadInput {
 
         let content = decode_utf8(bytes)?;
         let (offset, limit) = resolve_range(&input)?;
-
-        if let Some(rc) = &runner_context {
-            rc.record_baseline(&full_path, crate::state::content_hash(content.as_bytes()));
-        }
-
         Ok(format_text(&content, file_path, offset, limit))
     }
 }
@@ -993,15 +995,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_read_records_no_baseline() {
+    async fn a_read_that_fails_before_any_bytes_are_served_records_no_baseline() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let path = tmp.path().join("small.txt");
-        std::fs::write(&path, "hello world\n").unwrap();
         let cwd = tmp.path().to_str().unwrap();
         let ctx = ctx_in(cwd);
 
-        let bad = json!({ "file_path": path.to_str().unwrap(), "offset": -5 });
-        assert!(read(bad, cwd).await.is_err());
+        // Fails at the metadata gate: no bytes were ever served.
+        let bad = json!({ "file_path": "missing.txt" });
+        let tool = ReadInput::default();
+        assert!(tool.call(bad, &ctx).await.is_err());
 
         let rc = runner_ctx(&ctx).unwrap();
         let baselines = rc
@@ -1010,7 +1012,90 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(
             baselines.is_empty(),
-            "a read that fails must not record a baseline: {baselines:?}"
+            "no bytes served, no baseline: {baselines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_that_fails_after_serving_bytes_still_arms_the_baseline() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("small.txt");
+        std::fs::write(&path, "hello world\n").unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let ctx = ctx_in(cwd);
+
+        // Serves the bytes, then fails on the inverted range (`offset: -5`
+        // would fail earlier, at deserialization). Deliberately fail-safe:
+        // the armed baseline guards what was on disk at that moment, and a
+        // re-read re-arms it.
+        let bad = json!({ "file_path": path.to_str().unwrap(), "line_range": "5-2" });
+        let tool = ReadInput::default();
+        assert!(tool.call(bad, &ctx).await.is_err());
+
+        let rc = runner_ctx(&ctx).unwrap();
+        let baselines = rc
+            .file_baselines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            crate::state::baseline(&baselines, path.as_path()),
+            Some(crate::state::content_hash("hello world\n".as_bytes()))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_binary_content_read_arms_a_baseline() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let bytes: [u8; 8] = [0x00, 0x01, 0x02, 0xFF, 0x00, 0x03, 0xFE, 0x04];
+        let path = tmp.path().join("blob.bin");
+        std::fs::write(&path, bytes).unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let ctx = ctx_in(cwd);
+
+        let tool = ReadInput::default();
+        let out = tool
+            .call(json!({ "file_path": path.to_str().unwrap() }), &ctx)
+            .await
+            .unwrap();
+        assert!(out.is_error, "binary content is reported, not returned");
+
+        let rc = runner_ctx(&ctx).unwrap();
+        let baselines = rc
+            .file_baselines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            crate::state::baseline(&baselines, path.as_path()),
+            Some(crate::state::content_hash(&bytes)),
+            "the model was told this file is binary — that notice arms the guard"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_image_read_records_a_baseline() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let bytes: [u8; 6] = [0x89, b'P', b'N', b'G', 0x00, 0x01];
+        let path = tmp.path().join("pic.png");
+        std::fs::write(&path, bytes).unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let ctx = ctx_in(cwd);
+
+        let tool = ReadInput::default();
+        let out = tool
+            .call(json!({ "file_path": path.to_str().unwrap() }), &ctx)
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.text_content());
+
+        let rc = runner_ctx(&ctx).unwrap();
+        let baselines = rc
+            .file_baselines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(baselines.len(), 1, "an image the model saw is a baseline");
+        assert_eq!(
+            crate::state::baseline(&baselines, path.as_path()),
+            Some(crate::state::content_hash(&bytes))
         );
     }
 }
