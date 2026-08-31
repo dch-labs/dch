@@ -118,25 +118,16 @@ impl WriteInput {
 
         let old_content = tokio::fs::read_to_string(&full_path).await.ok();
 
-        if let Some(rc) = &rc {
-            let baseline_mtime = {
-                let baselines = rc
-                    .file_baselines
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                crate::state::baseline(&baselines, file_path)
+        if let Some(baseline_mtime) = rc.as_ref().and_then(|rc| rc.baseline_for(&full_path))
+            && let Err(failure) =
+                crate::conflict::check_mtime_unchanged(baseline_mtime, &full_path).await
+        {
+            return match failure {
+                crate::conflict::CheckFailure::Changed(reason) => {
+                    Ok(ToolOutput::error_text(reason.message(&full_path)))
+                }
+                crate::conflict::CheckFailure::Fault(e) => Err(e),
             };
-            if let Some(baseline_mtime) = baseline_mtime
-                && let Err(failure) =
-                    crate::conflict::check_mtime_unchanged(baseline_mtime, &full_path).await
-            {
-                return match failure {
-                    crate::conflict::CheckFailure::Changed(reason) => {
-                        Ok(ToolOutput::error_text(reason.message(&full_path)))
-                    }
-                    crate::conflict::CheckFailure::Fault(e) => Err(e),
-                };
-            }
         }
 
         if let Some(parent) = full_path.parent() {
@@ -147,11 +138,7 @@ impl WriteInput {
 
         if let Some(rc) = &rc {
             let mtime = crate::state::current_mtime(&full_path).await;
-            let mut baselines = rc
-                .file_baselines
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            crate::state::record(&mut baselines, file_path, mtime);
+            rc.record_baseline(&full_path, mtime);
         }
 
         let display_path = file_path;

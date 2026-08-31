@@ -133,11 +133,7 @@ impl ReadInput {
 
         if let Some(rc) = &runner_context {
             let mtime = crate::state::current_mtime(&full_path).await;
-            let mut baselines = rc
-                .file_baselines
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            crate::state::record(&mut baselines, file_path, mtime);
+            rc.record_baseline(&full_path, mtime);
         }
 
         let bytes = read_capped(&full_path).await?;
@@ -974,7 +970,7 @@ mod tests {
         assert_eq!(baselines.len(), 1, "one successful read, one baseline");
         let actual = std::fs::metadata(&path).unwrap().modified().unwrap();
         assert_eq!(
-            crate::state::baseline(&baselines, path.to_str().unwrap()),
+            crate::state::baseline(&baselines, path.as_path()),
             Some(actual)
         );
 

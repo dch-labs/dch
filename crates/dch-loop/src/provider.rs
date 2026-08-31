@@ -241,9 +241,10 @@ pub fn create_client(config: &ApiConfig) -> Result<DchClient, RunnerError> {
 
 /// Build the Azure OpenAI client for `config`.
 ///
-/// The resource name comes from [`ApiConfig::azure_resource`] or, when that
-/// is unset or empty, the `AZURE_OPENAI_RESOURCE` environment variable; the
-/// endpoint is the resource's deployment-style URL. Credential and model
+/// The endpoint is [`ApiConfig::base_url`] when explicitly set (a gateway or
+/// proxy deployment); otherwise it is derived from the resource name, which
+/// comes from [`ApiConfig::azure_resource`] or, when that is unset or empty,
+/// the `AZURE_OPENAI_RESOURCE` environment variable. Credential and model
 /// resolve like every other provider: [`ApiConfig::api_key`] wins, otherwise
 /// `AZURE_OPENAI_API_KEY`; [`ApiConfig::model`] wins, otherwise the
 /// `AZURE_OPENAI_MODEL` environment variable. `request_timeout_secs` bounds
@@ -251,27 +252,32 @@ pub fn create_client(config: &ApiConfig) -> Result<DchClient, RunnerError> {
 ///
 /// # Errors
 ///
-/// Returns [`RunnerError::Client`] when the resource name is unset or
-/// malformed, the model is unresolvable, the API key is missing, or the HTTP
-/// client cannot be constructed.
+/// Returns [`RunnerError::Client`] when the endpoint must be derived but the
+/// resource name is unset or malformed, the model is unresolvable, the API
+/// key is missing, or the HTTP client cannot be constructed.
 fn build_azure(config: &ApiConfig) -> Result<OpenAiClient, RunnerError> {
-    let resource = config
-        .azure_resource
-        .clone()
-        .filter(|value| !value.is_empty())
-        .or_else(|| {
-            std::env::var("AZURE_OPENAI_RESOURCE")
-                .ok()
-                .filter(|value| !value.is_empty())
-        });
-    let resource = resource.ok_or_else(|| {
-        RunnerError::Client(
-            "azure: no resource name: set api.azure_resource or AZURE_OPENAI_RESOURCE".to_string(),
-        )
-    })?;
-    validate_azure_resource(&resource)?;
+    let base_url = if config.base_url.is_empty() {
+        let resource = config
+            .azure_resource
+            .clone()
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                std::env::var("AZURE_OPENAI_RESOURCE")
+                    .ok()
+                    .filter(|value| !value.is_empty())
+            });
+        let resource = resource.ok_or_else(|| {
+            RunnerError::Client(
+                "azure: no resource name: set api.azure_resource or AZURE_OPENAI_RESOURCE"
+                    .to_string(),
+            )
+        })?;
+        validate_azure_resource(&resource)?;
+        format!("https://{resource}.openai.azure.com/openai/v1")
+    } else {
+        config.base_url.clone()
+    };
     let model = model_or_env(config, "azure", "AZURE_OPENAI_MODEL")?;
-    let base_url = format!("https://{resource}.openai.azure.com/openai/v1");
     profile_openai_client(config, base_url, model)
 }
 
@@ -900,6 +906,21 @@ mod tests {
             "the env resource must form the endpoint: {}",
             client.base_url()
         );
+    }
+
+    #[test]
+    fn azure_base_url_override_replaces_the_derived_endpoint() {
+        let env = loopctl::testing::EnvGuard::acquire(&[
+            "AZURE_OPENAI_RESOURCE",
+            "AZURE_OPENAI_API_KEY",
+            "AZURE_OPENAI_MODEL",
+        ]);
+        env.remove("AZURE_OPENAI_RESOURCE");
+        env.set("AZURE_OPENAI_API_KEY", "env-key");
+        env.remove("AZURE_OPENAI_MODEL");
+        let c = cfg(ApiType::Azure, "https://gateway.example/v1", Some("k"));
+        let client = create_client(&c).expect("an explicit base_url needs no resource name");
+        assert_eq!(client.base_url(), "https://gateway.example/v1");
     }
 
     #[test]

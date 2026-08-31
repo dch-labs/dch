@@ -16,8 +16,6 @@ use std::future::Future;
 use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::Mutex;
 
 use loopctl::tool::DisplayHint;
 use loopctl::tool::Tool;
@@ -39,7 +37,6 @@ use crate::edit::FindResult;
 use crate::edit::locate_unique;
 use crate::edit::splice;
 use crate::linter::lint_content;
-use crate::state::FileBaselines;
 use crate::util::reject_url;
 use crate::util::resolve_path;
 use crate::write::format_lint_failure;
@@ -148,7 +145,6 @@ impl MultiEditTool {
         rc: Option<RunnerContext>,
     ) -> Result<ToolOutput, ToolError> {
         let cwd = require_cwd(rc.clone())?;
-        let history = rc.as_ref().map(|rc| Arc::clone(&rc.file_baselines));
 
         let parsed = parse_input(&input)?;
         let operations = build_operations(parsed.edits, &cwd)?;
@@ -178,16 +174,44 @@ impl MultiEditTool {
         if parsed.dry_run {
             return Ok(ToolOutput::text(summary).with_hint(DisplayHint::Diff));
         }
-        if let Some((path, reason)) =
-            write_finals(&operations, &originals, &finals, history.as_ref()).await?
-        {
-            return Ok(ToolOutput::error_text(reason.message(Path::new(&path))));
+        if let Some(conflict) = write_finals(&operations, &originals, &finals, rc.as_ref()).await? {
+            let mut message = conflict.reason.message(Path::new(&conflict.path));
+            if !conflict.applied.is_empty() {
+                message.push_str("\n\nAlready written by this batch: ");
+                message.push_str(&conflict.applied.join(", "));
+                message.push('.');
+            }
+            return Ok(ToolOutput::error_text(message));
         }
 
         let applied: Vec<&str> = finals.keys().map(String::as_str).collect();
         let message = apply_summary(&summary, &applied, &operations);
         Ok(ToolOutput::text(message).with_hint(DisplayHint::Diff))
     }
+}
+
+/// Why and where a batch write stopped.
+///
+/// `applied` lists the caller-supplied paths successfully written before the
+/// conflict, in write order — their new content is already on disk. `path`
+/// names the file that changed, in the caller-supplied spelling.
+#[derive(Debug)]
+struct BatchConflict {
+    /// Files written before the abort.
+    ///
+    /// Caller-supplied spellings, in write order — their new content is
+    /// already on disk.
+    applied: Vec<String>,
+
+    /// The conflicted file.
+    ///
+    /// The caller-supplied spelling of the path whose staleness check failed.
+    path: String,
+
+    /// Why the write was refused.
+    ///
+    /// Maps to the soft message the caller surfaces.
+    reason: Conflict,
 }
 
 /// Write each distinct physical target file once with its merged content.
@@ -197,12 +221,13 @@ impl MultiEditTool {
 /// batch's first-seen order. Before each write, the file's current bytes are
 /// compared against the content this batch read in phase 1 (`originals`); a
 /// file changed by an external writer aborts the batch at that file — files
-/// already written in earlier iterations stay written. Each successful write
-/// refreshes the path's recorded baseline (`history`), so the model's own
-/// batch never registers as a later external change.
+/// already written in earlier iterations stay written, and are reported in
+/// the returned [`BatchConflict`]. Each successful write refreshes the path's
+/// recorded baseline (`history`), so the model's own batch never registers as
+/// a later external change.
 ///
-/// Returns `Ok(Some((path, reason)))` when the batch aborted on a conflict;
-/// `path` is the caller-supplied path of the file that changed.
+/// Returns `Ok(Some(conflict))` when the batch aborted; `Ok(None)` when every
+/// file was written.
 ///
 /// # Errors
 ///
@@ -212,9 +237,10 @@ async fn write_finals(
     operations: &[EditOperation],
     originals: &BTreeMap<String, String>,
     finals: &BTreeMap<String, String>,
-    history: Option<&Arc<Mutex<FileBaselines>>>,
-) -> Result<Option<(String, Conflict)>, ToolError> {
+    history: Option<&RunnerContext>,
+) -> Result<Option<BatchConflict>, ToolError> {
     let mut written: std::collections::HashSet<&Path> = std::collections::HashSet::new();
+    let mut applied: Vec<String> = Vec::new();
     for op in operations {
         if !written.insert(&op.full_path) {
             continue;
@@ -224,18 +250,20 @@ async fn write_finals(
                 match check_content_unchanged(baseline, &op.full_path).await {
                     Ok(()) => {}
                     Err(CheckFailure::Changed(reason)) => {
-                        return Ok(Some((op.file_path.clone(), reason)));
+                        return Ok(Some(BatchConflict {
+                            applied,
+                            path: op.file_path.clone(),
+                            reason,
+                        }));
                     }
                     Err(CheckFailure::Fault(e)) => return Err(e),
                 }
             }
             crate::fs::atomic_write(&op.full_path, final_content)?;
-            if let Some(history) = history {
+            applied.push(op.file_path.clone());
+            if let Some(rc) = history {
                 let mtime = crate::state::current_mtime(&op.full_path).await;
-                let mut baselines = history
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                crate::state::record(&mut baselines, &op.file_path, mtime);
+                rc.record_baseline(&op.full_path, mtime);
             }
         }
     }
@@ -1949,11 +1977,57 @@ mod tests {
         let outcome = write_finals(&operations, &originals, &finals, None)
             .await
             .unwrap();
-        let (path, reason) = outcome.expect("an externally changed file aborts the batch");
-        assert_eq!(path, "a.rs");
-        assert_eq!(reason, Conflict::Content);
+        let conflict = outcome.expect("an externally changed file aborts the batch");
+        assert_eq!(conflict.path, "a.rs");
+        assert_eq!(conflict.reason, Conflict::Content);
+        assert!(
+            conflict.applied.is_empty(),
+            "nothing is written before the conflict on the first file"
+        );
         assert_eq!(
             std::fs::read_to_string(&target).unwrap(),
+            "EXTERNAL",
+            "the conflicted file must not be written"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_finals_reports_the_files_written_before_a_later_conflict() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let first = tmp.path().join("a.rs");
+        let second = tmp.path().join("b.rs");
+        std::fs::write(&first, "A").unwrap();
+        std::fs::write(&second, "EXTERNAL").unwrap();
+        let mut originals = BTreeMap::new();
+        originals.insert("a.rs".to_string(), "A".to_string());
+        originals.insert("b.rs".to_string(), "B".to_string());
+        let mut finals = BTreeMap::new();
+        finals.insert("a.rs".to_string(), "a2".to_string());
+        finals.insert("b.rs".to_string(), "b2".to_string());
+        let operations = vec![
+            EditOperation {
+                file_path: "a.rs".to_string(),
+                full_path: first.clone(),
+                old_text: "A".to_string(),
+                new_text: "a2".to_string(),
+            },
+            EditOperation {
+                file_path: "b.rs".to_string(),
+                full_path: second.clone(),
+                old_text: "B".to_string(),
+                new_text: "b2".to_string(),
+            },
+        ];
+
+        let outcome = write_finals(&operations, &originals, &finals, None)
+            .await
+            .unwrap();
+        let conflict = outcome.expect("the second file's conflict aborts the batch");
+        assert_eq!(conflict.path, "b.rs");
+        assert_eq!(conflict.applied, vec!["a.rs".to_string()]);
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "a2");
+        assert_eq!(
+            std::fs::read_to_string(&second).unwrap(),
             "EXTERNAL",
             "the conflicted file must not be written"
         );

@@ -136,11 +136,7 @@ impl EditInput {
 
         if let Some(rc) = &rc {
             let mtime = crate::state::current_mtime(&full_path).await;
-            let mut baselines = rc
-                .file_baselines
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            crate::state::record(&mut baselines, parsed.file_path, mtime);
+            rc.record_baseline(&full_path, mtime);
         }
 
         let message = format_file_change(parsed.file_path, Some(&old_content), &new_content);

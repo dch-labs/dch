@@ -6,10 +6,12 @@
 //! history that backs the Write tool's staleness check.
 
 use std::fmt;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::mpsc;
+use std::time::SystemTime;
 
 use loopctl::tool::ToolError;
 
@@ -84,6 +86,31 @@ impl RunnerContext {
             question_tx: Arc::new(Mutex::new(None)),
             file_baselines: Arc::new(Mutex::new(FileBaselines::default())),
         }
+    }
+
+    /// Record `mtime` as the model's latest known state of `path`.
+    ///
+    /// Thin locking wrapper over [`record`](crate::state::record), which owns
+    /// the semantics (latest touch wins; an unmeasurable touch clears the
+    /// baseline).
+    pub(crate) fn record_baseline(&self, path: &Path, mtime: Option<SystemTime>) {
+        let mut baselines = self
+            .file_baselines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::state::record(&mut baselines, path, mtime);
+    }
+
+    /// The recorded baseline for `path`, when the latest touch measured an
+    /// `mtime`.
+    ///
+    /// Thin locking wrapper over [`baseline`](crate::state::baseline).
+    pub(crate) fn baseline_for(&self, path: &Path) -> Option<SystemTime> {
+        let baselines = self
+            .file_baselines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::state::baseline(&baselines, path)
     }
 }
 

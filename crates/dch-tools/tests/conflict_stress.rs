@@ -171,14 +171,24 @@ async fn an_edit_between_read_and_write_keeps_the_write_unblocked() {
 }
 
 #[tokio::test]
-async fn alias_spelling_finds_no_baseline_and_allows_the_write() {
+async fn alias_spelling_shares_the_baseline_and_still_conflicts_on_change() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("note.txt"), "v1\n").unwrap();
     let ctx = ctx_in(tmp.path().to_str().unwrap());
 
     read(&ctx, "note.txt").await;
-    // A differently-spelled name for the same file carries no recorded
-    // baseline (documented lookup contract) — Write proceeds unchecked.
+    std::fs::write(tmp.path().join("note.txt"), "EXTERNAL\n").unwrap();
+    force_mtime_change(&tmp.path().join("note.txt"));
+
+    // Baselines are keyed by the resolved path, so a differently-spelled
+    // name for the same file cannot dodge the staleness check.
+    assert!(
+        !write(&ctx, "./note.txt", "v2\n").await,
+        "the alias resolves to the same file — its baseline must guard it"
+    );
+    assert_eq!(disk(tmp.path(), "note.txt"), "EXTERNAL\n");
+
+    read(&ctx, "./note.txt").await;
     assert!(write(&ctx, "./note.txt", "v2\n").await);
     assert_eq!(disk(tmp.path(), "note.txt"), "v2\n");
 }
