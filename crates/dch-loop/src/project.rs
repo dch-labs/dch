@@ -26,11 +26,10 @@ use serde::Serialize;
 /// `Makefile` could belong to any language's task runner); the `[project]`
 /// override exists to correct wrong guesses.
 struct Marker {
-    /// Filename (or glob) to look for at the repo root, e.g. `"Cargo.toml"`
-    /// or `"*.csproj"`.
+    /// Filename (or glob) to look for at the repo root.
     ///
-    /// Compared literally for fixed names; a `*` triggers a glob match via
-    /// [`has_glob_match`].
+    /// Fixed names like `"Cargo.toml"` are compared literally; a `*` in the
+    /// pattern triggers a glob match via [`has_glob_match`].
     file: &'static str,
 
     /// The language name this marker implies.
@@ -202,10 +201,11 @@ fn marker_profile(m: &Marker) -> TechProfile {
 
 /// Look up the default [`TechProfile`] for a language name.
 ///
-/// Shared by detection ([`detect_tech_stack`]) and inference
-/// ([`infer_from_message`]) so they agree on what a language means —
-/// "rust" resolves to the same build/test/lint whether it was found by a
-/// `Cargo.toml` marker or inferred from a "build a Rust CLI" message.
+/// Used by message inference ([`MessageAnalysis::tech_profiles`]); detection
+/// reads the same [`MARKERS`] table via [`marker_profile`], so both paths
+/// agree on what a language means — "rust" resolves to the same
+/// build/test/lint whether it was found by a `Cargo.toml` marker or inferred
+/// from a "build a Rust CLI" message.
 /// Returns `None` for an unknown language (e.g. an inferred name with no
 /// marker row); the caller skips it.
 fn language_profile(language: &str) -> Option<TechProfile> {
@@ -218,26 +218,21 @@ fn language_profile(language: &str) -> Option<TechProfile> {
 
 /// The model's analysis of a first user message: its intent and its stack.
 ///
-/// Captured pre-session via [`analyze_message`] so the runner can resolve the
-/// role (suggesting a switch if the configured role doesn't fit) and assemble
-/// the tech profile (unioning analyzed languages with filesystem detection)
-/// *before* the loopctl session is constructed. Both fields degrade gracefully
-/// — `None` role / empty languages leave the configured role and filesystem
-/// detection in charge.
+/// Produced by [`analyze_message`] from the first user message. Both fields
+/// degrade gracefully — `None` role / empty languages leave the configured
+/// role and filesystem detection in charge.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MessageAnalysis {
     /// The role that best fits the user's intent.
     ///
     /// `Some(Role::Coding)` for "create a CLI", `Some(Role::General)` for "how
-    /// does systemd work?", `None` when unclear. Compared against the
-    /// configured role by the runner; a mismatch prompts a TUI suggestion or
-    /// is respected in headless.
+    /// does systemd work?", `None` when unclear.
     pub suggested_role: Option<Role>,
 
     /// Languages the message implies.
     ///
     /// E.g. `["rust"]`, or `["rust", "typescript"]` for polyglot intent. Empty
-    /// for non-code messages. Unioned with filesystem detection by the runner.
+    /// for non-code messages.
     pub languages: Vec<String>,
 }
 
@@ -316,13 +311,13 @@ pub async fn analyze_message(
     request_structured::<MessageAnalysis>(client, messages, system).await
 }
 
-/// True if any direct child of `root` matches the single-segment `glob`
-/// (e.g. `"*.csproj"`).
+/// True if any direct child of `root` matches the single-segment `glob`.
 ///
 /// Used by [`detect_tech_stack`] for glob-based markers (those whose `file`
-/// contains `*`). Reads only the immediate children of `root` — does not
-/// descend into subdirectories, since markers are root-level files. A
-/// nonexistent or unreadable `root` returns `false` rather than panicking.
+/// contains `*`, e.g. `"*.csproj"`). Reads only the immediate children of
+/// `root` — does not descend into subdirectories, since markers are
+/// root-level files. A nonexistent or unreadable `root` returns `false`
+/// rather than panicking.
 fn has_glob_match(root: &Path, glob: &str) -> bool {
     let Ok(entries) = std::fs::read_dir(root) else {
         return false;
@@ -376,7 +371,8 @@ pub fn merge_by_language(
 /// Render a polyglot tech list plus project-wide conventions as the prose
 /// block injected into the system prompt.
 ///
-/// Returns an empty string when there are no techs and no project conventions,
+/// Returns an empty string when there is nothing to render — no project
+/// conventions and every tech profile bare (no commands, no conventions) —
 /// so the caller can skip the section entirely.
 #[must_use]
 pub fn render_techs(techs: &[TechProfile], project_conventions: Option<&str>) -> String {

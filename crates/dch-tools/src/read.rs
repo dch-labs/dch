@@ -1,111 +1,125 @@
 //! The Read file tool — reads a file from disk with line/byte truncation.
 
 use std::fmt::Write;
-use std::future::Future;
-use std::pin::Pin;
 
 use tokio::io::AsyncReadExt;
 
+use loopctl::Tool;
 use loopctl::message::ImageSource;
 use loopctl::message::ToolContent;
 use loopctl::message::ToolContentPart;
-use loopctl::tool::Tool;
+use loopctl::tool::DisplayHint;
 use loopctl::tool::ToolContext;
 use loopctl::tool::ToolError;
 use loopctl::tool::ToolOutput;
-use loopctl::tool::ToolSchema;
+use serde::Deserialize;
+use serde::Serialize;
 use serde_json::Value;
-use serde_json::json;
 
 use crate::context::RunnerContext;
+use crate::context::require_cwd;
 use crate::context::runner_ctx;
 use crate::input::get_usize;
-use crate::util::is_url;
 use crate::util::mime_type_from_path;
+use crate::util::reject_url;
 use crate::util::resolve_path;
 use crate::walk;
 
 /// Maximum number of lines returned by the Read tool.
+///
+/// Larger views go through [`FileViewer`](crate::FileViewerInput), which
+/// paginates instead of truncating.
 pub const MAX_FILE_READ_LINES: usize = 200;
 
 /// Maximum file size before we refuse to read entirely.
+///
+/// Distinct from the truncation caps below: past this size the tool refuses
+/// outright and points at `FileViewer` rather than truncating.
 pub const MAX_FILE_SIZE_BYTES: usize = 10 * 1024 * 1024;
 
 /// Maximum bytes of content returned (~100K tokens); guards long-line files.
+///
+/// A minified bundle or one-line log can blow past the line cap in a single
+/// line, so the byte cap truncates it with a pointer to `FileViewer`.
 const MAX_FILE_READ_BYTES: usize = 400_000;
 
 /// Default limit when `offset` is provided but `limit` is not.
+///
+/// Reads that start mid-file get a smaller window than the
+/// from-the-top default: the model is paging, not skimming.
 const DEFAULT_OFFSET_LIMIT: usize = 200;
 
-/// Read the contents of a file (up to 200 lines).
+/// Input for the Read tool.
 ///
-/// For larger files or to continue reading past truncation, use `FileViewer`
-/// with offset/limit parameters. Read-only and concurrency-safe.
-pub struct ReadTool;
-
-impl Tool for ReadTool {
-    fn name(&self) -> &'static str {
-        "Read"
-    }
-
-    fn description(&self) -> &'static str {
-        "Read the contents of a file (up to 200 lines). For larger files or to \
+/// Reads a file from disk with line/byte truncation and returns its contents;
+/// images come back as multipart blocks and binary or oversized files are
+/// rejected with pointers to `FileViewer` and the search tools.
+#[derive(Default, Deserialize, Serialize, Tool)]
+#[tool(
+    name = "Read",
+    read_only,
+    concurrency_safe,
+    description = "Read the contents of a file (up to 200 lines). For larger files or to \
          continue reading past truncation, use FileViewer with offset/limit parameters."
-    }
+)]
+pub struct ReadInput {
+    /// The path to the file to read.
+    ///
+    /// May be absolute or relative; relative paths are resolved against the
+    /// runner's working directory. The path must name a regular file — a
+    /// directory yields a soft error pointing at `Glob`/`Grep` — and URLs are
+    /// rejected.
+    file_path: String,
 
-    fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            tool: self.name().to_string(),
-            description: self.description().to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "file_path": {
-                        "type": "string",
-                        "description": "The path to the file to read"
-                    },
-                    "offset": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "description": "Starting line number (1-indexed). Lines before this offset are skipped."
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 200,
-                        "description": "Maximum number of lines to return (default 200)."
-                    },
-                    "line_range": {
-                        "type": "string",
-                        "description": "Line range to read (alternative to offset/limit). \
-                        Examples: '1-100', '50:', ':100'. Ignored if offset or limit are also specified."
-                    }
-                },
-                "required": ["file_path"]
-            }),
-        }
-    }
+    /// Starting line number (1-indexed).
+    ///
+    /// Lines before this offset are skipped, and the output is prefixed with a
+    /// marker telling the model earlier lines were omitted. Defaults to 1
+    /// (read from the start); must be at least 1.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    offset: Option<usize>,
 
-    fn call(
-        &self,
-        input: Value,
-        ctx: &ToolContext,
-    ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
-        let rc = runner_ctx(ctx).cloned();
-        Box::pin(self.read_inner(input, rc))
-    }
+    /// Maximum number of lines to return (default 200).
+    ///
+    /// Counted from the offset; when the view extends past the end of the
+    /// file, the output ends with a truncation marker naming the next offset
+    /// to use. Values above the 200-line ceiling are clamped to it; like
+    /// `offset`, zero is rejected as invalid input.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    limit: Option<usize>,
 
-    fn is_read_only(&self) -> bool {
-        true
-    }
-
-    fn is_concurrency_safe(&self) -> bool {
-        true
-    }
+    /// Line range to read, as an alternative to `offset`/`limit`.
+    ///
+    /// Supported formats: `'1-100'` (lines 1 to 100), `'50:'` (line 50 to the
+    /// end), `':100'` (first 100 lines), or a single line number. Ignored when
+    /// `offset` or `limit` is also specified — the explicit fields win.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    line_range: Option<String>,
 }
 
-impl ReadTool {
+impl ReadInput {
+    /// Serializes the typed input and delegates to `read_inner`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError`] when the input cannot be serialized back to JSON
+    /// or when `read_inner` fails.
+    async fn run(&self, input: Self, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let rc = runner_ctx(ctx).cloned();
+        let value = serde_json::to_value(&input)
+            .map_err(|e| ToolError::Execution(format!("serialize tool input: {e}")))?;
+        self.read_inner(value, rc).await
+    }
+
     /// Body of [`Tool::call`].
+    ///
+    /// Every read that serves the file's bytes arms the path's staleness
+    /// baseline with their content hash — text and image reads deliver them,
+    /// and a binary-content read reports the file while still arming the
+    /// guard. Reads that fail before any bytes are served record nothing.
+    /// Arming happens before decoding and range checks on purpose: content
+    /// the model has seen stays guarded even if a later parse step rejects
+    /// the read, and a re-read re-arms it.
     ///
     /// # Errors
     ///
@@ -120,34 +134,12 @@ impl ReadTool {
             .get("file_path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidInput("Missing file_path".to_string()))?;
-        if is_url(file_path) {
-            return Err(ToolError::InvalidInput(
-                "URLs are not supported by the Read tool. Use WebFetch for URLs.".to_string(),
-            ));
-        }
+        reject_url("Read", file_path)?;
 
-        let cwd = runner_context
-            .clone()
-            .ok_or_else(|| {
-                ToolError::Execution(
-                    "RunnerContext extension is not installed on the ToolContext".to_string(),
-                )
-            })?
-            .cwd;
+        let cwd = require_cwd(runner_context.clone())?;
         let full_path = resolve_path(file_path, &cwd)?;
 
-        let metadata = tokio::fs::metadata(&full_path).await.map_err(|_| {
-            let filename = full_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("*");
-            ToolError::FileNotFound(format!(
-                "{file_path}\n\nSuggestions:\n\
-                 - Use Glob with pattern '**/*{filename}*' to search for similar files\n\
-                 - Check the path for typos or incorrect casing"
-            ))
-        })?;
-
+        let metadata = metadata_or_not_found(&full_path, file_path).await?;
         if let Some(too_large) = too_large_if_over(metadata.len()) {
             return Ok(too_large);
         }
@@ -159,23 +151,18 @@ impl ReadTool {
             )));
         }
 
-        // Image branch: return a base64-encoded image block.
-        if let Some(mime) = mime_type_from_path(&full_path) {
-            let bytes = read_capped(&full_path).await?;
-            if let Some(too_large) = too_large_if_over(bytes.len() as u64) {
-                return Ok(too_large);
-            }
-            let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
-            let source = ImageSource::new_base64(mime, b64);
-            return Ok(ToolOutput::success(ToolContent::from_multipart(vec![
-                ToolContentPart::Image { source },
-            ])));
-        }
-
-        // Binary sniff: read bytes, check for NUL in the leading region.
         let bytes = read_capped(&full_path).await?;
         if let Some(too_large) = too_large_if_over(bytes.len() as u64) {
             return Ok(too_large);
+        }
+
+        let baseline = crate::state::observe_bytes(&bytes);
+        if let Some(rc) = &runner_context {
+            rc.record_baseline(&full_path, baseline);
+        }
+
+        if let Some(mime) = mime_type_from_path(&full_path) {
+            return Ok(image_output(mime, &bytes));
         }
         if walk::bytes_look_binary(&bytes) {
             return Ok(ToolOutput::error_text(format!(
@@ -184,14 +171,63 @@ impl ReadTool {
             )));
         }
 
-        // The file is text; convert bytes to string.
-        let content = String::from_utf8(bytes)
-            .map_err(|e| ToolError::Execution(format!("Failed to decode file as UTF-8: {e}")))?;
-
-        // Resolve offset/limit/line_range precedence.
+        let content = decode_utf8(bytes)?;
         let (offset, limit) = resolve_range(&input)?;
         Ok(format_text(&content, file_path, offset, limit))
     }
+}
+
+/// Fetch the target's metadata, mapping absence to the Read tool's not-found
+/// error.
+///
+/// The error names the file as the model wrote it and appends suggestions —
+/// a Glob pattern built from the file's name, and a typo reminder — so a
+/// misspelled path is recoverable on the next turn.
+///
+/// # Errors
+///
+/// Returns [`ToolError::FileNotFound`] when the path does not exist. Any other
+/// metadata fault also maps to [`ToolError::FileNotFound`], preserving this
+/// check's single-error shape.
+async fn metadata_or_not_found(
+    full_path: &std::path::Path,
+    file_path: &str,
+) -> Result<std::fs::Metadata, ToolError> {
+    tokio::fs::metadata(full_path).await.map_err(|_| {
+        let filename = full_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("*");
+        ToolError::FileNotFound(format!(
+            "{file_path}\n\nSuggestions:\n\
+             - Use Glob with pattern '**/*{filename}*' to search for similar files\n\
+             - Check the path for typos or incorrect casing"
+        ))
+    })
+}
+
+/// Encode `bytes` as a base64 multipart image block.
+///
+/// The image is returned as a single [`ToolContentPart::Image`] carrying the
+/// resolved `mime` type, so the model consumes it as an image rather than as
+/// raw bytes.
+fn image_output(mime: &'static str, bytes: &[u8]) -> ToolOutput {
+    let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
+    let source = ImageSource::new_base64(mime, b64);
+    ToolOutput::success(ToolContent::from_multipart(vec![ToolContentPart::Image {
+        source,
+    }]))
+}
+
+/// Decode the file's bytes as UTF-8 text.
+///
+/// # Errors
+///
+/// Returns [`ToolError::Execution`] carrying the underlying decode error when
+/// the bytes are not valid UTF-8.
+fn decode_utf8(bytes: Vec<u8>) -> Result<String, ToolError> {
+    String::from_utf8(bytes)
+        .map_err(|e| ToolError::Execution(format!("Failed to decode file as UTF-8: {e}")))
 }
 
 /// Build the "file too large" rejection when `byte_count` exceeds the cap.
@@ -234,18 +270,19 @@ async fn read_capped(path: &std::path::Path) -> Result<Vec<u8>, ToolError> {
     Ok(buf)
 }
 
-/// Resolve `(offset, limit)` from the input, honoring the documented precedence:
-/// explicit `offset`/`limit` win; otherwise `line_range`; otherwise full file.
+/// Resolve `(offset, limit)` from the input, honoring the documented
+/// precedence.
 ///
-/// Integer parsing goes through [`get_usize`], so a negative or non-integer
-/// `offset`/`limit` is rejected loudly with the field named rather than
-/// silently coerced to a default.
+/// Explicit `offset`/`limit` win; otherwise `line_range`; otherwise the full
+/// file. The input arrives as [`ReadInput`], whose serde deserialization has
+/// already rejected negative or non-integer values as invalid input, so a
+/// missing field here means the caller omitted it — never that it was
+/// malformed.
 ///
 /// # Errors
 ///
-/// Returns [`ToolError::InvalidInput`] when `offset` or `limit` is zero, when
-/// either is not a valid non-negative integer (per [`get_usize`]), or when
-/// `line_range` fails to parse.
+/// Returns [`ToolError::InvalidInput`] when `offset` or `limit` is zero or
+/// when `line_range` fails to parse.
 fn resolve_range(input: &Value) -> Result<(usize, usize), ToolError> {
     let offset = get_usize(input, "offset")?;
     let limit = get_usize(input, "limit")?;
@@ -297,8 +334,9 @@ fn resolve_range(input: &Value) -> Result<(usize, usize), ToolError> {
 /// Three fast paths bypass the marker logic:
 ///
 /// - `offset` beyond the file length → a one-line "beyond file length" message.
-/// - The whole file fits (`offset == 1` and the view reaches the last line) →
-///   the raw content is returned with no markers.
+/// - The whole file fits (`offset == 1`, the view reaches the last line, and
+///   the joined view is under the byte cap) → the raw content is returned
+///   with no markers.
 /// - A partial view that starts past line 1 → a `[Lines before offset N
 ///   omitted]` header precedes the content.
 fn format_text(content: &str, file_path: &str, offset: usize, limit: usize) -> ToolOutput {
@@ -336,7 +374,7 @@ fn format_text(content: &str, file_path: &str, offset: usize, limit: usize) -> T
     }
 
     if offset == 1 && effective_end >= total_lines && content.len() <= MAX_FILE_READ_BYTES {
-        return ToolOutput::text(content.to_string());
+        return ToolOutput::text(content.to_string()).with_hint(DisplayHint::Suppress);
     }
 
     let mut output = String::new();
@@ -365,7 +403,7 @@ fn format_text(content: &str, file_path: &str, offset: usize, limit: usize) -> T
         )
         .ok();
     }
-    ToolOutput::text(output)
+    ToolOutput::text(output).with_hint(DisplayHint::Suppress)
 }
 
 /// Parse a line range string into `(offset, limit)`.
@@ -423,6 +461,11 @@ fn parse_dash_range((left, right): (&str, &str)) -> Result<(usize, usize), Strin
 
 /// Parse a colon-separated range like `"50:"` or `":100"` into `(offset, limit)`.
 ///
+/// An empty right side is open-ended (`"50:"` reads from line 50 to the end,
+/// capped at [`MAX_FILE_READ_LINES`]); a present right side makes the range
+/// inclusive (`"50:100"` covers lines 50 through 100). An empty left side
+/// starts at line 1.
+///
 /// # Errors
 ///
 /// Returns a descriptive `String` if both sides are empty, a side is
@@ -446,7 +489,6 @@ fn parse_colon_range((left, right): (&str, &str)) -> Result<(usize, usize), Stri
     if start == 0 {
         return Err("line_range start must be >= 1".to_string());
     }
-    // Open-ended "50:" → to end; "50:100" → inclusive range.
     if right.is_empty() {
         return Ok((start, MAX_FILE_READ_LINES));
     }
@@ -498,25 +540,19 @@ mod tests {
     use super::*;
     use crate::context::RunnerContext;
     use loopctl::tool::ToolContext;
+    use serde_json::json;
     use std::path::PathBuf;
-    use std::sync::Arc;
-    use std::sync::Mutex;
 
     /// Builds a `ToolContext` with a `RunnerContext` pointing at `cwd`.
     fn ctx_in(cwd: &str) -> ToolContext {
         let mut ctx = ToolContext::default();
         ctx.cwd = cwd.to_string();
-        let rc = RunnerContext {
-            cwd: PathBuf::from(cwd),
-            todos: Arc::new(Mutex::new(Vec::new())),
-            question_tx: Arc::new(Mutex::new(None)),
-        };
-        ctx.set_extension(rc);
+        ctx.set_extension(RunnerContext::new(PathBuf::from(cwd)));
         ctx
     }
 
     async fn read(input: Value, cwd: &str) -> Result<ToolOutput, ToolError> {
-        let tool = ReadTool;
+        let tool = ReadInput::default();
         let ctx = ctx_in(cwd);
         tool.call(input, &ctx).await
     }
@@ -534,6 +570,7 @@ mod tests {
         let out = read(input(path.to_str().unwrap()), cwd).await.unwrap();
         assert!(!out.is_error);
         assert_eq!(out.text_content(), "hello world\n");
+        assert_eq!(out.display_hint, Some(DisplayHint::Suppress));
     }
 
     #[tokio::test]
@@ -651,8 +688,8 @@ mod tests {
         let input = json!({ "file_path": path.to_str().unwrap(), "offset": -5 });
         let err = read(input, cwd).await.unwrap_err();
         assert!(
-            matches!(err, ToolError::InvalidInput(ref s) if s.contains("'offset'")),
-            "negative offset should name the field: {err:?}"
+            matches!(err, ToolError::InvalidInput(ref s) if s.contains("integer `-5`")),
+            "negative offset should be rejected: {err:?}"
         );
     }
 
@@ -665,8 +702,8 @@ mod tests {
         let input = json!({ "file_path": path.to_str().unwrap(), "limit": -1 });
         let err = read(input, cwd).await.unwrap_err();
         assert!(
-            matches!(err, ToolError::InvalidInput(ref s) if s.contains("'limit'")),
-            "negative limit should name the field: {err:?}"
+            matches!(err, ToolError::InvalidInput(ref s) if s.contains("integer `-1`")),
+            "negative limit should be rejected: {err:?}"
         );
     }
 
@@ -792,21 +829,21 @@ mod tests {
 
     #[test]
     fn test_readtool_schema_matches_spec() {
-        let schema = ReadTool.schema();
+        let schema = ReadInput::default().schema();
         let input = schema.input_schema;
         let required = input.get("required").and_then(|v| v.as_array()).unwrap();
         assert_eq!(required.len(), 1);
         assert_eq!(required[0], "file_path");
         let limit = input
-            .pointer("/properties/limit/maximum")
-            .and_then(|v| v.as_u64());
-        assert_eq!(limit, Some(200));
+            .pointer("/properties/limit/type")
+            .and_then(|v| v.as_str());
+        assert_eq!(limit, Some("integer"));
     }
 
     #[test]
     fn test_readtool_registered_in_builtin_registry() {
         let reg = crate::registry::builtin_registry();
-        let tool = reg.get("Read").expect("ReadTool registered");
+        let tool = reg.get("Read").expect("Read registered");
         assert!(tool.is_read_only());
         assert!(tool.is_concurrency_safe());
     }
@@ -928,6 +965,138 @@ mod tests {
         assert!(
             matches!(err, ToolError::InvalidInput(ref s) if s.contains("symlink")),
             "expected symlink-escape rejection, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_records_the_file_mtime_in_the_shared_history() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("small.txt");
+        std::fs::write(&path, "hello world\n").unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let ctx = ctx_in(cwd);
+
+        // Drive the tool with THIS test's context (not the `read` helper,
+        // which owns its own) so the history entry lands where we look.
+        let tool = ReadInput::default();
+        tool.call(input(path.to_str().unwrap()), &ctx)
+            .await
+            .unwrap();
+
+        let rc = runner_ctx(&ctx).unwrap();
+        let baselines = rc
+            .file_baselines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(baselines.len(), 1, "one successful read, one baseline");
+        assert_eq!(
+            crate::state::baseline(&baselines, path.as_path()),
+            Some(crate::state::content_hash("hello world\n".as_bytes()))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_that_fails_before_any_bytes_are_served_records_no_baseline() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let ctx = ctx_in(cwd);
+
+        // Fails at the metadata gate: no bytes were ever served.
+        let bad = json!({ "file_path": "missing.txt" });
+        let tool = ReadInput::default();
+        assert!(tool.call(bad, &ctx).await.is_err());
+
+        let rc = runner_ctx(&ctx).unwrap();
+        let baselines = rc
+            .file_baselines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            baselines.is_empty(),
+            "no bytes served, no baseline: {baselines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_that_fails_after_serving_bytes_still_arms_the_baseline() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("small.txt");
+        std::fs::write(&path, "hello world\n").unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let ctx = ctx_in(cwd);
+
+        // Serves the bytes, then fails on the inverted range (`offset: -5`
+        // would fail earlier, at deserialization). Deliberately fail-safe:
+        // the armed baseline guards what was on disk at that moment, and a
+        // re-read re-arms it.
+        let bad = json!({ "file_path": path.to_str().unwrap(), "line_range": "5-2" });
+        let tool = ReadInput::default();
+        assert!(tool.call(bad, &ctx).await.is_err());
+
+        let rc = runner_ctx(&ctx).unwrap();
+        let baselines = rc
+            .file_baselines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            crate::state::baseline(&baselines, path.as_path()),
+            Some(crate::state::content_hash("hello world\n".as_bytes()))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_binary_content_read_arms_a_baseline() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let bytes: [u8; 8] = [0x00, 0x01, 0x02, 0xFF, 0x00, 0x03, 0xFE, 0x04];
+        let path = tmp.path().join("blob.bin");
+        std::fs::write(&path, bytes).unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let ctx = ctx_in(cwd);
+
+        let tool = ReadInput::default();
+        let out = tool
+            .call(json!({ "file_path": path.to_str().unwrap() }), &ctx)
+            .await
+            .unwrap();
+        assert!(out.is_error, "binary content is reported, not returned");
+
+        let rc = runner_ctx(&ctx).unwrap();
+        let baselines = rc
+            .file_baselines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            crate::state::baseline(&baselines, path.as_path()),
+            Some(crate::state::content_hash(&bytes)),
+            "the model was told this file is binary — that notice arms the guard"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_image_read_records_a_baseline() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let bytes: [u8; 6] = [0x89, b'P', b'N', b'G', 0x00, 0x01];
+        let path = tmp.path().join("pic.png");
+        std::fs::write(&path, bytes).unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let ctx = ctx_in(cwd);
+
+        let tool = ReadInput::default();
+        let out = tool
+            .call(json!({ "file_path": path.to_str().unwrap() }), &ctx)
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.text_content());
+
+        let rc = runner_ctx(&ctx).unwrap();
+        let baselines = rc
+            .file_baselines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(baselines.len(), 1, "an image the model saw is a baseline");
+        assert_eq!(
+            crate::state::baseline(&baselines, path.as_path()),
+            Some(crate::state::content_hash(&bytes))
         );
     }
 }

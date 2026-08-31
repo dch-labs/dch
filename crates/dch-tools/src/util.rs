@@ -17,6 +17,8 @@ const IMAGE_EXTENSIONS: &[(&str, &str)] = &[
 
 /// MIME type for an image extension, if recognized.
 ///
+/// Lookup is case-insensitive; unrecognized extensions return `None`.
+///
 /// # Examples
 ///
 /// ```
@@ -47,31 +49,13 @@ pub fn mime_type_from_path(path: &Path) -> Option<&'static str> {
         .and_then(mime_type_from_extension)
 }
 
-/// Whether a path has a recognized image extension.
-///
-/// # Examples
-///
-/// ```
-/// use dch_tools::util::is_image_file;
-/// assert!(is_image_file("screenshot.png"));
-/// assert!(is_image_file("photo.JPG"));
-/// assert!(!is_image_file("document.txt"));
-/// ```
-#[must_use]
-pub fn is_image_file(path: &str) -> bool {
-    Path::new(path)
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| mime_type_from_extension(ext).is_some())
-}
-
 /// Whether a string looks like an HTTP(S) URL.
 ///
-/// Used by every file-touching tool to reject URLs early with a consistent
-/// "use `WebFetch`" message, so a model that sends `Read` against `https://…`
-/// gets a clear redirect instead of a confusing filesystem error.
-/// Case-insensitive (`HTTP://`, `Https://` also match). Returns `false` for
-/// `file://`, `ftp://`, bare paths, and empty strings.
+/// Used by [`reject_url`] to refuse URLs where a filesystem path is required,
+/// so a model that sends `Read` against `https://…` gets a clear redirect
+/// instead of a confusing filesystem error. Case-insensitive (`HTTP://`,
+/// `Https://` also match). Returns `false` for `file://`, `ftp://`, bare
+/// paths, and empty strings.
 #[must_use]
 pub fn is_url(path: &str) -> bool {
     path.get(..7)
@@ -81,12 +65,31 @@ pub fn is_url(path: &str) -> bool {
             .is_some_and(|p| p.eq_ignore_ascii_case("https://"))
 }
 
-/// Resolve a possibly-relative `file_path` against `cwd`, enforcing that the
-/// result stays inside the `cwd` workspace both lexically and on the
-/// filesystem.
+/// Reject a URL where a filesystem path is required.
 ///
-/// Relative paths are joined to `cwd`; absolute paths are taken as-is. Two
-/// checks then run, in order:
+/// Every file-touching tool guards its path arguments with this check, so a
+/// model that sends `https://…` receives a consistent error naming the tool
+/// it called and redirecting it to the web-fetch tool, rather than a
+/// confusing filesystem error.
+///
+/// # Errors
+///
+/// Returns [`ToolError::InvalidInput`] naming `tool` and pointing at the
+/// web-fetch tool, when `path` parses as a URL (see [`is_url`]).
+pub fn reject_url(tool: &str, path: &str) -> Result<(), ToolError> {
+    if is_url(path) {
+        return Err(ToolError::InvalidInput(format!(
+            "URLs are not supported by the {tool} tool. Use WebFetch for URLs."
+        )));
+    }
+    Ok(())
+}
+
+/// Resolve a possibly-relative `file_path` against `cwd`, keeping the result inside the workspace.
+///
+/// The result must stay inside the `cwd` workspace both lexically and on the
+/// filesystem. Relative paths are joined to `cwd`; absolute paths are
+/// accepted only when they stay inside `cwd`. Both then pass two checks:
 ///
 /// 1. **Lexical containment** — both the result and `cwd` are normalized (`.`/
 ///    `..` collapsed without touching the filesystem, so not-yet-existing
@@ -129,8 +132,7 @@ pub fn resolve_path(file_path: &str, cwd: &Path) -> Result<PathBuf, ToolError> {
     Ok(normalized)
 }
 
-/// Lexically normalize `path`, collapsing `.` and `..` without touching the
-/// filesystem.
+/// Lexically normalize `path`, collapsing `.` and `..` without touching the filesystem.
 ///
 /// A leading `..` that would escape above the root is dropped, matching the
 /// behavior of the shared `normalize_path` helper.
@@ -167,8 +169,7 @@ fn lexically_inside(path: &Path, base: &Path) -> bool {
     true
 }
 
-/// Walk the *existing* prefix of `resolved` and reject any symlink whose
-/// target chain leaves `base`.
+/// Walk the *existing* prefix of `resolved` and reject any symlink whose target chain leaves `base`.
 ///
 /// `resolved` is assumed already lexically contained in `base` (the caller's
 /// responsibility). This function adds the filesystem check: each ancestor of
@@ -176,7 +177,8 @@ fn lexically_inside(path: &Path, base: &Path) -> bool {
 /// verified (recursively, for chains). The walk stops at the first
 /// non-existent component, so a not-yet-existing write leaf is never rejected
 /// — only the existing directory prefix is checked. Symlink loops are bounded
-/// by a visited-set of canonicalized paths so a cycle (A → B → A) terminates
+/// by a visited-set of lexically normalized paths so a cycle (A → B → A)
+/// terminates
 /// rather than recurses forever.
 ///
 /// # Errors
@@ -213,14 +215,13 @@ fn verify_symlinks_inside(resolved: &Path, base: &Path) -> Result<(), ToolError>
     Ok(())
 }
 
-/// Recursively verify that `target` (a resolved symlink target) stays within
-/// `base`, following further symlinks in its existing prefix.
+/// Recursively verify that `target` (a resolved symlink target) stays within `base`.
 ///
-/// `visited` accumulates canonicalized paths already examined, bounding
-/// symlink cycles. A target that itself contains symlinks is walked the same
-/// way [`verify_symlinks_inside`] walks the original path. Returns `true`
-/// when `target` (and every symlink in its existing prefix) stays inside
-/// `base`.
+/// Follows further symlinks in its existing prefix. `visited` accumulates the
+/// lexically normalized paths already examined, bounding symlink cycles. A
+/// target that itself contains symlinks is walked the same way
+/// [`verify_symlinks_inside`] walks the original path. Returns `true` when
+/// `target` (and every symlink in its existing prefix) stays inside `base`.
 ///
 /// # Errors
 ///
@@ -294,21 +295,6 @@ mod tests {
     }
 
     #[test]
-    fn is_image_file_true_for_images() {
-        assert!(is_image_file("screenshot.png"));
-        assert!(is_image_file("photo.JPG"));
-        assert!(is_image_file("/path/to/img.webp"));
-        assert!(is_image_file("anim.gif"));
-    }
-
-    #[test]
-    fn is_image_file_false_for_non_images() {
-        assert!(!is_image_file("document.txt"));
-        assert!(!is_image_file("archive.zip"));
-        assert!(!is_image_file("noext"));
-    }
-
-    #[test]
     fn is_url_detects_http_and_https() {
         assert!(is_url("http://example.com"));
         assert!(is_url("https://example.com/page"));
@@ -348,6 +334,26 @@ mod tests {
         // must not panic on get(..7)/get(..8).
         assert!(!is_url("éttp://"));
         assert!(!is_url("éxample"));
+    }
+
+    #[test]
+    fn reject_url_message_names_the_calling_tool_byte_for_byte() {
+        let ToolError::InvalidInput(msg) = reject_url("Read", "https://example.com/x").unwrap_err()
+        else {
+            panic!("expected InvalidInput");
+        };
+        assert_eq!(
+            msg,
+            "URLs are not supported by the Read tool. Use WebFetch for URLs."
+        );
+    }
+
+    #[test]
+    fn reject_url_accepts_plain_paths() {
+        assert!(reject_url("Read", "src/main.rs").is_ok());
+        assert!(reject_url("Write", "/abs/path.txt").is_ok());
+        assert!(reject_url("Tree", ".").is_ok());
+        assert!(reject_url("Grep", "file:///tmp/x").is_ok());
     }
 
     #[test]

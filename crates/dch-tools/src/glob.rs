@@ -6,90 +6,67 @@
 //! supports `*`, `?`, `**`, character classes `[abc]`, and brace expansion
 //! `{a,b}`. A pattern with no `/` matches the basename anywhere in the tree.
 
-use std::future::Future;
 use std::path::Path;
 use std::path::PathBuf;
-use std::pin::Pin;
 
-use loopctl::tool::Tool;
+use loopctl::Tool;
 use loopctl::tool::ToolContext;
 use loopctl::tool::ToolError;
 use loopctl::tool::ToolOutput;
-use loopctl::tool::ToolSchema;
+use serde::Deserialize;
+use serde::Serialize;
 use serde_json::Value;
-use serde_json::json;
 
 use crate::context::RunnerContext;
+use crate::context::require_cwd;
 use crate::context::runner_ctx;
-use crate::util::is_url;
+use crate::util::reject_url;
 use crate::util::resolve_path;
 use crate::walk;
 
-/// Gitignore-aware file globbing tool.
+/// Input for the Glob tool.
 ///
-/// `Glob` resolves its `path` against the runner's cwd (or walks `.` when no
-/// path is given), filters the file tree with [`walk_files`](crate::walk::walk_files)
-/// (which honors `.gitignore`, `.git/info/exclude`, global gitignore,
-/// `.dchignore`, and an always-exclude list), and returns the relative paths
-/// of files matching the user's `pattern`. Pattern matching uses ripgrep's
-/// glob engine, so a pattern with no `/` matches the basename anywhere in the
-/// tree (so `*.rs` matches both `top.rs` and `src/a.rs`). Results are sorted
-/// alphabetically and returned as a pretty-printed JSON string array.
-///
-/// An empty result is a successful `ToolOutput::text("No files found…")`, not
-/// an error: callers distinguish "matched nothing" from "failed" via `is_error`.
-pub struct GlobTool;
-
-impl Tool for GlobTool {
-    fn name(&self) -> &'static str {
-        "Glob"
-    }
-
-    fn description(&self) -> &'static str {
-        "Find files matching a glob pattern in the specified directory. \
+/// Gitignore-aware file globbing: walks the target directory with the shared
+/// walker and returns the relative paths of files matching the glob pattern,
+/// sorted alphabetically as a pretty-printed JSON array.
+#[derive(Default, Deserialize, Serialize, Tool)]
+#[tool(
+    name = "Glob",
+    read_only,
+    concurrency_safe,
+    description = "Find files matching a glob pattern in the specified directory. \
          Supports *, **, ? patterns. Returns matching file paths."
-    }
+)]
+pub struct GlobInput {
+    /// The glob pattern selecting which files to return (e.g., '**/*.rs').
+    ///
+    /// Interpreted with gitignore-flavored semantics by the `ignore` crate:
+    /// `*`, `?`, `**`, character classes, and brace expansion are supported. A
+    /// pattern with no `/` matches the basename at any depth.
+    pattern: String,
 
-    fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            tool: self.name().to_string(),
-            description: self.description().to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "pattern": {
-                        "type": "string",
-                        "description": "Glob pattern to match files (e.g., '**/*.rs', 'src/**/*.json')"
-                    },
-                    "path": {
-                        "type": "string",
-                        "description": "Directory to search in (defaults to current working directory)"
-                    }
-                },
-                "required": ["pattern"]
-            }),
-        }
-    }
-
-    fn call(
-        &self,
-        input: Value,
-        ctx: &ToolContext,
-    ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
-        let rc = runner_ctx(ctx).cloned();
-        Box::pin(self.glob_inner(input, rc))
-    }
-
-    fn is_read_only(&self) -> bool {
-        true
-    }
-
-    fn is_concurrency_safe(&self) -> bool {
-        true
-    }
+    /// The directory to search in, defaulting to the current working directory.
+    ///
+    /// May be relative, in which case it is resolved against the runner's cwd,
+    /// not the process's. URLs are rejected; the walk honors `.gitignore`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
 }
 
-impl GlobTool {
+impl GlobInput {
+    /// Serializes the typed input and delegates to `glob_inner`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError`] when the input cannot be serialized back to JSON
+    /// or when `glob_inner` fails.
+    async fn run(&self, input: Self, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let rc = runner_ctx(ctx).cloned();
+        let value = serde_json::to_value(&input)
+            .map_err(|e| ToolError::Execution(format!("serialize tool input: {e}")))?;
+        self.glob_inner(value, rc).await
+    }
+
     /// Body of [`Tool::call`].
     ///
     /// Orchestrates: extract cwd → parse args → build matcher → walk → sort
@@ -112,21 +89,9 @@ impl GlobTool {
         input: Value,
         rc: Option<RunnerContext>,
     ) -> Result<ToolOutput, ToolError> {
-        let cwd = rc
-            .as_ref()
-            .ok_or_else(|| {
-                ToolError::Execution(
-                    "RunnerContext extension is not installed on the ToolContext".to_string(),
-                )
-            })?
-            .cwd
-            .clone();
+        let cwd = require_cwd(rc)?;
         let parsed = parse_input(&input)?;
-        if is_url(&parsed.base_path) {
-            return Err(ToolError::InvalidInput(
-                "URLs are not supported by the Glob tool. Use WebFetch for URLs.".to_string(),
-            ));
-        }
+        reject_url("Glob", &parsed.base_path)?;
 
         let base = resolve_path(&parsed.base_path, &cwd)?;
         let glob_override = build_glob_override(&base, &parsed.pattern)?;
@@ -170,8 +135,7 @@ fn collect_matches(base: &Path, glob_override: &ignore::overrides::Override) -> 
 /// either as supplied or defaulted to `"."` (the search root, resolved against
 /// the runner cwd by the caller). It may be relative.
 struct ParsedInput {
-    /// The glob pattern supplied by the caller, copied verbatim from the input
-    /// JSON.
+    /// The glob pattern supplied by the caller, copied verbatim.
     ///
     /// No normalization happens here — backslashes, brace expansion, character
     /// classes all pass through unchanged. The pattern is fed directly to the
@@ -268,6 +232,7 @@ fn push_match_string(matches: &mut Vec<String>, path: &Path, base: &Path) {
 )]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::path::PathBuf;
 
     /// A matcher built against a fake root, for the no-I/O unit tests.
@@ -451,9 +416,8 @@ mod integration_tests {
     use super::*;
     use crate::context::RunnerContext;
     use loopctl::tool::ToolContext;
+    use serde_json::json;
     use std::path::PathBuf;
-    use std::sync::Arc;
-    use std::sync::Mutex;
 
     /// Build a `ToolContext` carrying a `RunnerContext` whose cwd is `dir`.
     ///
@@ -462,12 +426,7 @@ mod integration_tests {
     fn ctx_in(dir: &std::path::Path) -> ToolContext {
         let mut ctx = ToolContext::default();
         ctx.cwd = dir.to_string_lossy().into_owned();
-        let rc = RunnerContext {
-            cwd: PathBuf::from(dir),
-            todos: Arc::new(Mutex::new(Vec::new())),
-            question_tx: Arc::new(Mutex::new(None)),
-        };
-        ctx.set_extension(rc);
+        ctx.set_extension(RunnerContext::new(PathBuf::from(dir)));
         ctx
     }
 
@@ -486,7 +445,7 @@ mod integration_tests {
         write_file(tmp.path(), "src/main.rs", "");
         write_file(tmp.path(), "src/util.rs", "");
         write_file(tmp.path(), "README.md", "");
-        let tool = GlobTool;
+        let tool = GlobInput::default();
         let ctx = ctx_in(tmp.path());
         let input = json!({"pattern": "src/**/*.rs"});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -503,7 +462,7 @@ mod integration_tests {
         let tmp = tempfile::TempDir::new().unwrap();
         write_file(tmp.path(), "top.rs", "");
         write_file(tmp.path(), "src/nested.rs", "");
-        let tool = GlobTool;
+        let tool = GlobInput::default();
         let ctx = ctx_in(tmp.path());
         let input = json!({"pattern": "*.rs"});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -522,7 +481,7 @@ mod integration_tests {
         write_file(tmp.path(), "a.rs", "");
         write_file(tmp.path(), "b/c.rs", "");
         write_file(tmp.path(), "d/e/f.rs", "");
-        let tool = GlobTool;
+        let tool = GlobInput::default();
         let ctx = ctx_in(tmp.path());
         let input = json!({"pattern": "**/*.rs"});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -537,7 +496,7 @@ mod integration_tests {
     async fn no_matches_is_success_message() {
         let tmp = tempfile::TempDir::new().unwrap();
         write_file(tmp.path(), "a.rs", "");
-        let tool = GlobTool;
+        let tool = GlobInput::default();
         let ctx = ctx_in(tmp.path());
         let input = json!({"pattern": "**/*.nonexistent"});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -559,7 +518,7 @@ mod integration_tests {
         write_file(tmp.path(), ".gitignore", "ignored.rs\n");
         write_file(tmp.path(), "ignored.rs", "");
         write_file(tmp.path(), "kept.rs", "");
-        let tool = GlobTool;
+        let tool = GlobInput::default();
         let ctx = ctx_in(tmp.path());
         let input = json!({"pattern": "**/*.rs"});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -578,7 +537,7 @@ mod integration_tests {
         let tmp = tempfile::TempDir::new().unwrap();
         write_file(tmp.path(), "target/debug/foo.rs", "");
         write_file(tmp.path(), "main.rs", "");
-        let tool = GlobTool;
+        let tool = GlobInput::default();
         let ctx = ctx_in(tmp.path());
         let input = json!({"pattern": "**/*.rs"});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -593,7 +552,7 @@ mod integration_tests {
         write_file(tmp.path(), ".dchignore", "secret.rs\n");
         write_file(tmp.path(), "secret.rs", "");
         write_file(tmp.path(), "public.rs", "");
-        let tool = GlobTool;
+        let tool = GlobInput::default();
         let ctx = ctx_in(tmp.path());
         let input = json!({"pattern": "**/*.rs"});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -610,7 +569,7 @@ mod integration_tests {
         let tmp = tempfile::TempDir::new().unwrap();
         write_file(tmp.path(), "a.txt", "");
         write_file(tmp.path(), "b.txt", "");
-        let tool = GlobTool;
+        let tool = GlobInput::default();
         let ctx = ctx_in(tmp.path());
         let input = json!({"pattern": "*.txt", "path": "."});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -623,7 +582,7 @@ mod integration_tests {
         let tmp = tempfile::TempDir::new().unwrap();
         write_file(tmp.path(), "src/a.rs", "");
         write_file(tmp.path(), "other/b.rs", "");
-        let tool = GlobTool;
+        let tool = GlobInput::default();
         let ctx = ctx_in(tmp.path());
         let input = json!({"pattern": "*.rs", "path": "src"});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -635,7 +594,7 @@ mod integration_tests {
     #[tokio::test]
     async fn url_path_rejected() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let tool = GlobTool;
+        let tool = GlobInput::default();
         let ctx = ctx_in(tmp.path());
         let input = json!({"pattern": "*.rs", "path": "https://example.com/y"});
         let err = tool.call(input, &ctx).await.unwrap_err();
@@ -648,7 +607,7 @@ mod integration_tests {
     #[tokio::test]
     async fn missing_pattern_errors() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let tool = GlobTool;
+        let tool = GlobInput::default();
         let ctx = ctx_in(tmp.path());
         let input = json!({});
         let err = tool.call(input, &ctx).await.unwrap_err();
@@ -661,7 +620,7 @@ mod integration_tests {
     #[tokio::test]
     async fn invalid_glob_pattern_errors() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let tool = GlobTool;
+        let tool = GlobInput::default();
         let ctx = ctx_in(tmp.path());
         let input = json!({"pattern": "[unclosed"});
         let err = tool.call(input, &ctx).await.unwrap_err();
@@ -678,7 +637,7 @@ mod integration_tests {
         write_file(tmp.path(), "zebra.rs", "");
         write_file(tmp.path(), "alpha.rs", "");
         write_file(tmp.path(), "mike.rs", "");
-        let tool = GlobTool;
+        let tool = GlobInput::default();
         let ctx = ctx_in(tmp.path());
         let input = json!({"pattern": "*.rs"});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -691,7 +650,7 @@ mod integration_tests {
     #[tokio::test]
     async fn empty_directory_no_panic() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let tool = GlobTool;
+        let tool = GlobInput::default();
         let ctx = ctx_in(tmp.path());
         let input = json!({"pattern": "**/*"});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -709,7 +668,7 @@ mod integration_tests {
         write_file(tmp.path(), "a.rs", "");
         write_file(tmp.path(), "a.ss", "");
         write_file(tmp.path(), "a.cs", "");
-        let tool = GlobTool;
+        let tool = GlobInput::default();
         let ctx = ctx_in(tmp.path());
         let input = json!({"pattern": "*.[rs]s"});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -723,7 +682,7 @@ mod integration_tests {
         write_file(tmp.path(), "a.rs", "");
         write_file(tmp.path(), "b.toml", "");
         write_file(tmp.path(), "c.json", "");
-        let tool = GlobTool;
+        let tool = GlobInput::default();
         let ctx = ctx_in(tmp.path());
         let input = json!({"pattern": "*.{rs,toml}"});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -733,7 +692,7 @@ mod integration_tests {
 
     #[test]
     fn trait_contract_and_registry() {
-        let tool = GlobTool;
+        let tool = GlobInput::default();
         assert!(tool.is_read_only());
         assert!(tool.is_concurrency_safe());
         assert_eq!(tool.name(), "Glob");

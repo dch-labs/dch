@@ -22,6 +22,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 use crate::context::RunnerContext;
+use crate::context::require_cwd;
 use crate::context::runner_ctx;
 use crate::input::get_u64;
 
@@ -85,7 +86,7 @@ const UNSAFE_SUBSTRINGS: &[&str] = &[
 /// [`Completed`](Self::Completed) or [`Failed`](Self::Failed) when the process
 /// exits or the timeout fires. Once terminal, the status never changes again.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum JobStatus {
+enum JobStatus {
     /// Still running.
     ///
     /// No output is available yet — the process has not exited. The payload is
@@ -93,11 +94,11 @@ pub enum JobStatus {
     /// Polled by `job_status` until it transitions to a terminal variant.
     Running,
 
-    /// Finished successfully (exit code zero).
+    /// Finished successfully.
     ///
-    /// The payload is the combined stdout and stderr captured over the job's
-    /// lifetime, merged in arrival order. Returned to the model as the tool
-    /// output when it polls a completed job.
+    /// The payload is the job's final tool output: stdout followed by stderr,
+    /// plus the `[exit …, …ms]` metadata line. Returned to the model when it
+    /// polls a completed job.
     Completed(String),
 
     /// Failed or timed out.
@@ -129,32 +130,25 @@ impl std::fmt::Display for JobStatus {
 /// `spawn_background_job` when the Bash tool runs with `background: true`;
 /// updated by the process-wait future when the job exits or times out.
 #[derive(Debug, Clone)]
-pub struct BackgroundJob {
+struct BackgroundJob {
     /// Monotonic job identifier.
     ///
     /// Allocated from the global ID counter at spawn time and never reused.
     /// The model uses this to poll status via `operation: "job_status"`.
-    pub id: u64,
+    id: u64,
 
     /// The command string.
     ///
     /// Stored verbatim (exactly as the model supplied it) for display in the
     /// `jobs` listing. Not used for execution — that happens at spawn time.
-    pub command: String,
+    command: String,
 
     /// Current status of the job.
     ///
     /// Polled by `job_status` on each request. Updated in place when the
     /// process exits (success or failure) or when the timeout fires — the job
     /// table entry is mutated under the table's mutex.
-    pub status: JobStatus,
-
-    /// When the job started.
-    ///
-    /// A UNIX timestamp in seconds, captured at spawn time. Used to compute
-    /// elapsed time (`now - started_at`) for the `jobs` listing so the model
-    /// can see how long a background job has been running.
-    pub started_at: u64,
+    status: JobStatus,
 }
 
 /// Global background job table.
@@ -177,15 +171,10 @@ static JOB_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 /// recorded, matching the rest of the job-table accessors' handling.
 fn spawn_background_job(command: &str, cwd: &str, timeout_secs: u64) -> u64 {
     let id = JOB_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let started_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
     let job = BackgroundJob {
         id,
         command: command.to_owned(),
         status: JobStatus::Running,
-        started_at,
     };
 
     if let Ok(mut table) = JOB_TABLE.lock() {
@@ -269,6 +258,12 @@ fn cleanup_jobs() -> usize {
 /// grandchildren die too — not just the `bash` child.
 #[cfg(unix)]
 struct ChildGuard {
+    /// Process-group ID of the child, when it was successfully spawned into its own group.
+    ///
+    /// `None` when no live group exists to signal — the guard then has
+    /// nothing to do on drop. The guard stores the PGID rather than the PID
+    /// because killing the negated PGID reaches the whole group (sub-shells,
+    /// pipelines, and grandchildren), not just the direct `bash` child.
     pgid: Option<libc::pid_t>,
 }
 
@@ -276,9 +271,10 @@ struct ChildGuard {
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         if let Some(pgid) = self.pgid {
-            // Negative pid → signal the whole process group.
-            // SAFETY: libc::kill with SIGKILL on a negative pid signals the
-            // process group (standard Unix pgroup-kill idiom).
+            // SAFETY: a negative pid makes libc::kill signal the entire
+            // process group (the standard Unix pgroup-kill idiom); SIGKILL
+            // delivery cannot fail on a live group in a way the caller could
+            // recover from, so the return value is deliberately ignored.
             unsafe {
                 libc::kill(pgid.wrapping_neg(), libc::SIGKILL);
             }
@@ -286,8 +282,12 @@ impl Drop for ChildGuard {
     }
 }
 
-/// Execute a bash command. Supports background jobs, timeout enforcement, and
-/// a dynamic concurrency check (read-only commands are safe to run concurrently).
+/// Execute a bash command.
+///
+/// Supports background jobs, timeout enforcement, and a dynamic concurrency
+/// check (read-only commands are safe to run concurrently). Not read-only
+/// overall: any command that fails the concurrency check runs serialized
+/// against other writes.
 pub struct BashTool;
 
 impl Tool for BashTool {
@@ -383,15 +383,7 @@ impl BashTool {
         input: Value,
         runner_context: Option<RunnerContext>,
     ) -> Result<ToolOutput, ToolError> {
-        let cwd = runner_context
-            .ok_or_else(|| {
-                ToolError::Execution(
-                    "RunnerContext extension is not installed on the ToolContext".to_string(),
-                )
-            })?
-            .cwd
-            .to_string_lossy()
-            .to_string();
+        let cwd = require_cwd(runner_context)?.to_string_lossy().to_string();
 
         if let Some(op) = input.get("operation").and_then(Value::as_str) {
             return dispatch_operation(op, &input);
@@ -582,8 +574,7 @@ where
     String::from_utf8_lossy(&buf).into_owned()
 }
 
-/// Truncate `s` in place to at most `max_bytes`, landing on a UTF-8 char
-/// boundary.
+/// Truncate `s` in place to at most `max_bytes`, landing on a UTF-8 char boundary.
 ///
 /// If `s` already fits, it is left untouched. Otherwise the cut point walks
 /// back from `max_bytes` to the preceding char boundary so the result stays
@@ -618,16 +609,12 @@ fn is_read_only_command(input: &Value) -> bool {
     if normalized.is_empty() {
         return false;
     }
-    // Compound commands and redirections can hide a write.
     if SHELL_OPERATORS.iter().any(|op| normalized.contains(op)) {
         return false;
     }
-    // Destructive subcommands that a prefix match alone would miss.
     if UNSAFE_SUBSTRINGS.iter().any(|sub| normalized.contains(sub)) {
         return false;
     }
-    // Boundary-aware prefix match: the command must start with a prefix
-    // followed by end-of-string or whitespace.
     READ_ONLY_PREFIXES.iter().any(|prefix| {
         if normalized.len() == prefix.len() {
             return normalized == *prefix;
@@ -932,12 +919,7 @@ mod tests {
     fn ctx_in(cwd: &str) -> ToolContext {
         let mut ctx = ToolContext::default();
         ctx.cwd = cwd.to_string();
-        let rc = RunnerContext {
-            cwd: std::path::PathBuf::from(cwd),
-            todos: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            question_tx: std::sync::Arc::new(std::sync::Mutex::new(None)),
-        };
-        ctx.set_extension(rc);
+        ctx.set_extension(RunnerContext::new(std::path::PathBuf::from(cwd)));
         ctx
     }
 

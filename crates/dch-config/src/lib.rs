@@ -14,10 +14,12 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ApiType {
-    /// `OpenAI`-compatible API (also used by `DeepSeek`, `Grok`, `vLLM`).
+    /// `OpenAI`-compatible API.
     ///
-    /// The Chat Completions schema that several other providers mirror, so they
-    /// reuse this variant rather than getting one of their own.
+    /// The Chat Completions schema that several other providers (including
+    /// vLLM servers) speak, so they map to this variant's client family;
+    /// `DeepSeek` and `Grok` carry their own variants for host-specific
+    /// defaults while reusing the same wire protocol.
     OpenAi,
 
     /// `Anthropic` Messages API (also used by Z.AI).
@@ -56,13 +58,35 @@ pub enum ApiType {
     /// A standalone variant so the default [`ApiType::default_base_url`] resolves
     /// to the correct Z.AI host.
     Zai,
+
+    /// Azure OpenAI.
+    ///
+    /// The deployment-style endpoint under `https://{resource}.openai.azure.com`.
+    /// The resource name comes from [`ApiConfig::azure_resource`] or the
+    /// `AZURE_OPENAI_RESOURCE` environment variable; credentials follow the
+    /// provider profile (`AZURE_OPENAI_API_KEY`).
+    Azure,
+
+    /// Moonshot AI.
+    ///
+    /// An OpenAI-compatible API served by Moonshot; the default base URL and
+    /// model resolve to Moonshot's host, with the key taken from the
+    /// `MOONSHOT_API_KEY` provider profile.
+    Moonshot,
+
+    /// AWS Bedrock.
+    ///
+    /// SigV4-authenticated native endpoint; credentials come from the standard
+    /// `AWS_*` environment variables, and `api_key`/`base_url` do not apply.
+    Bedrock,
 }
 
 impl ApiType {
     /// The default `base_url` for this provider.
     ///
-    /// Returns a sensible public or local endpoint for each variant, used to
-    /// populate [`ApiConfig::base_url`] when the user has not set one. These are
+    /// Returns a sensible public or local endpoint for each variant,
+    /// consulted as the effective endpoint when [`ApiConfig::base_url`] is
+    /// unset. These are
     /// the canonical host roots; provider clients may append their own path
     /// suffixes on top.
     #[must_use]
@@ -75,6 +99,8 @@ impl ApiType {
             Self::DeepSeek => "https://api.deepseek.com",
             Self::Grok => "https://api.x.ai/v1",
             Self::Zai => "https://api.z.ai/api",
+            Self::Azure | Self::Bedrock => "",
+            Self::Moonshot => "https://api.moonshot.ai/v1",
         }
     }
 }
@@ -213,7 +239,10 @@ pub enum Role {
     Tests,
 }
 
-/// Role body for [`Role::General`]: general assistance and sysadmin work.
+/// Role body for [`Role::General`].
+///
+/// General assistance and sysadmin work — the default for non-programming
+/// sessions.
 pub(crate) const GENERAL_ROLE: &str = "\
 YOUR ROLE: GENERAL ASSISTANCE
 - Help with the user's machine: diagnose issues, configure applications, inspect
@@ -228,7 +257,9 @@ YOUR ROLE: GENERAL ASSISTANCE
 - For commands you are unsure of, check `--help` or the man page before
   running; a wrong flag on a system tool can be costly.";
 
-/// Role body for [`Role::Coding`]: implement features end-to-end.
+/// Role body for [`Role::Coding`].
+///
+/// Implement features end-to-end: read first, change, then build and test.
 pub(crate) const CODING_ROLE: &str = "\
 YOUR ROLE: IMPLEMENT FEATURES AND FIXES
 - Read enough of the surrounding code to make a correct, idiomatic change.
@@ -243,7 +274,9 @@ YOUR ROLE: IMPLEMENT FEATURES AND FIXES
 - For unfamiliar or complex operations, look up the established pattern in the
   repo before inventing a new one.";
 
-/// Role body for [`Role::Refactor`]: restructure without behavior change.
+/// Role body for [`Role::Refactor`].
+///
+/// Restructure without behavior change; the suite is the referee.
 pub(crate) const REFACTOR_ROLE: &str = "\
 YOUR ROLE: IMPROVE STRUCTURE WITHOUT CHANGING BEHAVIOR
 - First characterize the behavior you must preserve: read the code and its
@@ -256,7 +289,9 @@ YOUR ROLE: IMPROVE STRUCTURE WITHOUT CHANGING BEHAVIOR
 - Prefer the smallest mechanical move that clarifies the code. Rename, extract,
   inline — one kind of step at a time is easier to review than a mixed rewrite.";
 
-/// Role body for [`Role::Debug`]: reproduce, isolate, then fix.
+/// Role body for [`Role::Debug`].
+///
+/// Reproduce, isolate, then fix — evidence before edits.
 pub(crate) const DEBUG_ROLE: &str = "\
 YOUR ROLE: REPRODUCE, ISOLATE, AND FIX
 - Reproduce the failure first. A reproducible failure is fixable; an
@@ -271,7 +306,9 @@ YOUR ROLE: REPRODUCE, ISOLATE, AND FIX
   catch regressions. Distinguish clearly between what you observed, what you
   inferred, and what you changed.";
 
-/// Role body for [`Role::Review`]: read-only critical pass.
+/// Role body for [`Role::Review`].
+///
+/// A read-only critical pass; findings are reported, not applied.
 pub(crate) const REVIEW_ROLE: &str = "\
 YOUR ROLE: REVIEW AND REPORT — DO NOT EDIT SOURCE
 - Treat this as a read-only pass. Inspect the diff or area with Read, Grep, and
@@ -285,7 +322,9 @@ YOUR ROLE: REVIEW AND REPORT — DO NOT EDIT SOURCE
 - Call out anything you could not verify. A reviewer's value is honesty about
   what was checked and what wasn't.";
 
-/// Role body for [`Role::Docs`]: author or revise documentation.
+/// Role body for [`Role::Docs`].
+///
+/// Author or revise documentation; prose and examples, not source logic.
 pub(crate) const DOCS_ROLE: &str = "\
 YOUR ROLE: WRITE OR REVISE DOCUMENTATION
 - Match the existing voice, structure, and formatting of the docs around you.
@@ -299,7 +338,10 @@ YOUR ROLE: WRITE OR REVISE DOCUMENTATION
   logic under the documentation — if the docs and the code disagree, flag the
   discrepancy rather than silently \"fixing\" one to match the other.";
 
-/// Role body for [`Role::Tests`]: write and improve tests.
+/// Role body for [`Role::Tests`].
+///
+/// Write and improve tests; production code changes only to make them
+/// testable.
 pub(crate) const TESTS_ROLE: &str = "\
 YOUR ROLE: WRITE AND IMPROVE TESTS
 - Cover behavior, not implementation. A test that pins a public outcome
@@ -371,6 +413,57 @@ pub enum DchConfigError {
     Parse(#[from] toml::de::Error),
 }
 
+/// MCP tool-server settings, in the `[mcp]` config section.
+///
+/// Each entry names one external MCP server whose tools are adapted into the
+/// agent's tool registry at startup, exposed as `{name}__{tool}`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct McpConfig {
+    /// Servers to connect at startup, in configuration order.
+    ///
+    /// Defaults to empty — no external tools.
+    #[serde(default)]
+    pub servers: Vec<McpServerConfig>,
+}
+
+/// One `[[mcp.servers]]` entry: an MCP server to spawn over stdio.
+///
+/// The command is launched as a child process and speaks the MCP stdio
+/// transport; a server that fails to start or complete its handshake is a
+/// startup error (fail-closed) rather than a silently missing tool set.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct McpServerConfig {
+    /// Short name used to prefix the server's tools (`{name}__{tool}`).
+    ///
+    /// Also names the server in startup errors.
+    pub name: String,
+
+    /// Executable to spawn.
+    ///
+    /// Resolved on `PATH` or taken as an absolute path.
+    pub command: String,
+
+    /// Arguments passed to the executable.
+    ///
+    /// Defaults to empty.
+    #[serde(default)]
+    pub args: Vec<String>,
+
+    /// Extra environment variables for the child process.
+    ///
+    /// Defaults to empty.
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+
+    /// Restrict the server to these tool names.
+    ///
+    /// Defaults to `None` — every tool the server exposes is adapted. A
+    /// listed name the server does not offer is a startup error rather than
+    /// a silently missing tool.
+    #[serde(default)]
+    pub tools: Option<Vec<String>>,
+}
+
 /// Top-level configuration loaded from `~/.dch/config.toml`.
 ///
 /// The root of the config TOML; every section maps onto one of its fields, each
@@ -412,6 +505,19 @@ pub struct DchConfig {
     /// Log level and output format. See [`TelemetryConfig`].
     #[serde(default)]
     pub telemetry: TelemetryConfig,
+
+    /// Security settings.
+    ///
+    /// Controls how tool output is sanitized before it re-enters the
+    /// conversation. See [`SecurityConfig`].
+    #[serde(default)]
+    pub security: SecurityConfig,
+
+    /// External MCP tool servers.
+    ///
+    /// Servers to spawn and adapt at startup. See [`McpConfig`].
+    #[serde(default)]
+    pub mcp: McpConfig,
 }
 
 /// Provider connection settings.
@@ -467,9 +573,17 @@ pub struct ApiConfig {
 
     /// Secondary model used if the primary errors out.
     ///
-    /// Falls back to this model identifier when a primary request fails.
-    /// Defaults to `None`, meaning no fallback is configured.
+    /// Routes to this model once the primary has failed often enough to trip
+    /// the fallback breaker — not on the first failure. Defaults to `None`,
+    /// meaning no fallback is configured.
     pub fallback_model: Option<String>,
+
+    /// Azure OpenAI resource name.
+    ///
+    /// The `{resource}` in `https://{resource}.openai.azure.com`. Consulted only
+    /// for [`ApiType::Azure`]; falls back to the `AZURE_OPENAI_RESOURCE`
+    /// environment variable when `None`.
+    pub azure_resource: Option<String>,
 }
 
 /// Display / rendering preferences.
@@ -520,10 +634,10 @@ pub struct RunnerConfig {
 
     /// Compaction threshold as a percentage (0–100) of the context window.
     ///
-    /// Matches the `u8` percentage loopctl's `SessionConfig` expects, so the
-    /// value passes through `to_session_config` with no conversion. Values
-    /// above 100 are clamped to 100 by `SessionConfig`'s construction clamp;
-    /// the meaningful range is `0..=100`.
+    /// Defaults to `80`. Matches the `u8` percentage loopctl's
+    /// `SessionConfig` expects, so the value passes through
+    /// `to_session_config` with no conversion; that conversion clamps values
+    /// above 100 to 100. The meaningful range is `0..=100`.
     pub compact_threshold: u8,
 
     /// When to prompt the user before side-effecting actions.
@@ -633,9 +747,11 @@ pub struct TechProfile {
     /// keeps the detected value.
     pub lint: Option<String>,
 
-    /// Free-form conventions for this language: style rules, module layout,
-    /// anything detection can't capture. Appended to the prompt verbatim under
-    /// this language's section.
+    /// Free-form conventions for this language.
+    ///
+    /// Style rules, module layout, anything detection can't capture. Appended
+    /// to the prompt verbatim under this language's section. `None` keeps the
+    /// detected value.
     pub conventions: Option<String>,
 }
 
@@ -685,6 +801,24 @@ pub struct TelemetryConfig {
     pub json_logs: bool,
 }
 
+/// Secrets-redaction settings, in the `[security]` config section.
+///
+/// Controls whether tool output is scrubbed of credential-shaped content
+/// (bearer tokens, API keys, PEM blocks, …) before it re-enters the model's
+/// context. The scrubbing itself is performed by loopctl's redaction
+/// middleware; this section only decides whether dch installs it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct SecurityConfig {
+    /// Scrub credential-shaped content from tool output.
+    ///
+    /// When true (the default), every tool result passes through a
+    /// redaction middleware that replaces detected secrets with
+    /// `[REDACTED:<kind>]` markers. Disable only for trusted, isolated
+    /// environments where raw output must be preserved verbatim.
+    pub redact_secrets: bool,
+}
+
 impl Default for ApiConfig {
     fn default() -> Self {
         Self {
@@ -696,6 +830,7 @@ impl Default for ApiConfig {
             context_window: 200_000,
             request_timeout_secs: 120,
             fallback_model: None,
+            azure_resource: None,
         }
     }
 }
@@ -728,6 +863,14 @@ impl Default for TelemetryConfig {
         Self {
             level: "info".to_string(),
             json_logs: false,
+        }
+    }
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            redact_secrets: true,
         }
     }
 }
@@ -774,15 +917,14 @@ impl DchConfig {
     /// Map the session-scoped fields to a [`loopctl::config::SessionConfig`].
     ///
     /// Carries the context window, compaction threshold, and auto-compact
-    /// flag — the settings that are stable across `run()` calls. The
-    /// `system_prompt` is **not** carried here (it is set to `None`); the
-    /// runner composes it from the selected role, detected tech stack, and
-    /// per-tool fragments via the prompt builder and installs it on
-    /// the session after construction.
-    /// on the same agent. Provider-specific fields (`model`, `max_tokens`) are
-    /// not session-config concerns; they are consumed by the API client via
-    /// [`ApiConfig`] directly. The session id is minted at runtime by loopctl,
-    /// not carried in config.
+    /// flag — the settings that are stable across `run()` calls on the same
+    /// agent. The `system_prompt` is **not** carried here (it is set to
+    /// `None`); the runner composes it from the selected role, detected tech
+    /// stack, and per-tool fragments via the prompt builder and installs it
+    /// before the loop reads it. Provider-specific fields (`model`,
+    /// `max_tokens`) are not session-config concerns; they are consumed by
+    /// the API client via [`ApiConfig`] directly. The session id is minted
+    /// at runtime by loopctl, not carried in config.
     ///
     /// `compact_threshold` is clamped to `100` here (the struct-literal
     /// bypasses `SessionConfig`'s own construction clamp), so an out-of-range
@@ -865,6 +1007,16 @@ max_tokens = 8192
 context_window = 128000
 request_timeout_secs = 60
 fallback_model = "glm-4.7-flash"
+azure_resource = "my-resource"
+
+[[mcp.servers]]
+name = "docs"
+command = "npx"
+args = ["-y", "@example/mcp-docs"]
+tools = ["search", "fetch"]
+
+[mcp.servers.env]
+DOCS_KEY = "secret"
 
 [display]
 no_color = false
@@ -885,6 +1037,9 @@ prompt = "You are a careful coding assistant."
 [telemetry]
 level = "debug"
 json_logs = true
+
+[security]
+redact_secrets = false
 "#;
 
     fn write_config(dir: &Path, name: &str, contents: &str) {
@@ -906,6 +1061,7 @@ json_logs = true
         assert_eq!(c.runner.compact_threshold, 80);
         assert_eq!(c.runner.permission_mode, PermissionMode::Auto);
         assert_eq!(c.telemetry.level, "info");
+        assert!(c.security.redact_secrets);
     }
 
     #[test]
@@ -921,6 +1077,19 @@ json_logs = true
         assert_eq!(c.api.max_tokens, 8192);
         assert_eq!(c.api.request_timeout_secs, 60);
         assert_eq!(c.api.fallback_model.as_deref(), Some("glm-4.7-flash"));
+        assert_eq!(c.api.azure_resource.as_deref(), Some("my-resource"));
+        assert_eq!(c.mcp.servers.len(), 1);
+        assert_eq!(c.mcp.servers[0].name, "docs");
+        assert_eq!(c.mcp.servers[0].command, "npx");
+        assert_eq!(c.mcp.servers[0].args, vec!["-y", "@example/mcp-docs"]);
+        assert_eq!(
+            c.mcp.servers[0].env.get("DOCS_KEY").map(String::as_str),
+            Some("secret")
+        );
+        assert_eq!(
+            c.mcp.servers[0].tools,
+            Some(vec!["search".to_string(), "fetch".to_string()])
+        );
 
         assert_eq!(c.display.verbosity, Verbosity::Verbose);
         assert_eq!(c.display.theme, "dracula");
@@ -987,6 +1156,12 @@ json_logs = true
         write_config(tmp.path(), "config.toml", "[api model = \"x\"\n");
         let err = DchConfig::load_from_dir(tmp.path()).unwrap_err();
         assert!(matches!(err, DchConfigError::Parse(_)));
+    }
+
+    #[test]
+    fn present_but_empty_mcp_section_parses_as_no_servers() {
+        let c: DchConfig = toml::from_str("[mcp]\n").unwrap();
+        assert!(c.mcp.servers.is_empty());
     }
 
     #[test]

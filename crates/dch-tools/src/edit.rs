@@ -1,111 +1,99 @@
 //! The Edit tool — replace a unique occurrence of text in a file.
 //!
 //! Edit reads a file, locates `old_text`, and requires it to appear exactly
-//! once (non-overlapping). The replacement is run through the linter gate
-//! before writing, and the result is returned as a line diff preview.
+//! once (non-overlapping). The replacement is run through the linter gate and
+//! a staleness check before writing, and the result is returned as a line
+//! diff preview.
 
-use std::future::Future;
 use std::ops::Range;
 use std::path::Path;
-use std::pin::Pin;
 
-use loopctl::tool::Tool;
+use loopctl::Tool;
+use loopctl::tool::DisplayHint;
 use loopctl::tool::ToolContext;
 use loopctl::tool::ToolError;
 use loopctl::tool::ToolOutput;
-use loopctl::tool::ToolSchema;
+use serde::Deserialize;
+use serde::Serialize;
 use serde_json::Value;
-use serde_json::json;
 
 use crate::context::RunnerContext;
+use crate::context::require_cwd;
 use crate::context::runner_ctx;
 use crate::diff::format_file_change;
 use crate::linter::LinterResult;
 use crate::linter::lint_content;
-use crate::util::is_url;
+use crate::util::reject_url;
 use crate::util::resolve_path;
 use crate::write::format_lint_failure;
 
-/// Edit a file by replacing a **unique** occurrence of text. Runs the linter
-/// gate on the result before writing; returns a line diff preview.
+/// Input for the Edit tool.
 ///
-/// Not concurrency-safe and not read-only: editing mutates a file, and two
-/// concurrent edits to the same path would race.
-pub struct EditTool;
-
-impl Tool for EditTool {
-    fn name(&self) -> &'static str {
-        "Edit"
-    }
-
-    fn description(&self) -> &'static str {
-        "Edit a file by replacing text. Syntax validation is automatically \
+/// Replaces a unique occurrence of text in a file, runs the linter gate on
+/// the result before writing, and returns a line diff preview of the change.
+#[derive(Default, Deserialize, Serialize, Tool)]
+#[tool(
+    name = "Edit",
+    system_prompt = "old_text must be unique in the file. For multiple changes, use \
+             MultiEdit. Both run the linter after applying.",
+    description = "Edit a file by replacing text. Syntax validation is automatically \
          performed for supported file types."
-    }
+)]
+pub struct EditInput {
+    /// The path to the file to edit.
+    ///
+    /// May be absolute or relative; relative paths are resolved against the
+    /// runner's working directory. The file must already exist — creating new
+    /// files is the Write tool's job — and URLs are rejected.
+    file_path: String,
 
-    fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            tool: self.name().to_string(),
-            description: self.description().to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "file_path": {
-                        "type": "string",
-                        "description": "The path to the file to edit"
-                    },
-                    "old_text": {
-                        "type": "string",
-                        "description": "The text to replace"
-                    },
-                    "new_text": {
-                        "type": "string",
-                        "description": "The replacement text"
-                    },
-                    "skip_linter": {
-                        "type": "boolean",
-                        "description": "Skip syntax validation (not recommended)",
-                        "default": false
-                    }
-                },
-                "required": ["file_path", "old_text", "new_text"]
-            }),
-        }
-    }
+    /// The text to replace.
+    ///
+    /// Must appear exactly once in the file: uniqueness is enforced, and a
+    /// non-unique match returns a soft error asking the model to add
+    /// surrounding context (or use `MultiEdit`) to disambiguate. Must be
+    /// non-empty; include enough context to make the match unique.
+    old_text: String,
 
-    fn call(
-        &self,
-        input: Value,
-        ctx: &ToolContext,
-    ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
-        let rc = runner_ctx(ctx).cloned();
-        Box::pin(self.edit_inner(input, rc))
-    }
+    /// The replacement text.
+    ///
+    /// Written in place of `old_text` once the unique match is located. May be
+    /// empty (a pure deletion) or longer than `old_text` (an insertion); the
+    /// result is checked by the linter gate before the file is written.
+    new_text: String,
 
-    fn is_read_only(&self) -> bool {
-        false
-    }
-
-    fn is_concurrency_safe(&self) -> bool {
-        false
-    }
-
-    fn system_prompt(&self) -> Option<String> {
-        Some(
-            "old_text must be unique in the file. For multiple changes, use \
-             MultiEdit. Both run the linter after applying."
-                .to_string(),
-        )
-    }
+    /// Skip syntax validation (not recommended).
+    ///
+    /// When `true`, the linter gate is bypassed and the file is written even
+    /// if the resulting content has syntax errors. Defaults to `false`; the
+    /// gate exists to prevent file corruption from malformed edits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    skip_linter: Option<bool>,
 }
 
-impl EditTool {
+impl EditInput {
+    /// Serializes the typed input and delegates to `edit_inner`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError`] when the input cannot be serialized back to JSON
+    /// or when `edit_inner` fails.
+    async fn run(&self, input: Self, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let rc = runner_ctx(ctx).cloned();
+        let value = serde_json::to_value(&input)
+            .map_err(|e| ToolError::Execution(format!("serialize tool input: {e}")))?;
+        self.edit_inner(value, rc).await
+    }
+
     /// Body of [`Tool::call`].
     ///
-    /// Orchestrates parse → read → apply → lint → write. Recoverable conditions
-    /// (text not found, ambiguous match, linter failure) are surfaced as soft
-    /// [`ToolOutput`] errors; hard failures (bad args, missing file, I/O fault)
-    /// become [`ToolError`].
+    /// Orchestrates parse → read → apply → lint → staleness check → write.
+    /// Recoverable conditions (text not found, ambiguous match, linter
+    /// failure, a file changed on disk since this call read it) are surfaced
+    /// as soft [`ToolOutput`] errors; hard failures (bad args, missing file,
+    /// I/O fault) become [`ToolError`]. A successful write refreshes the
+    /// path's recorded baseline, so the model's own edit never registers as
+    /// a later external change.
     ///
     /// # Errors
     ///
@@ -118,12 +106,7 @@ impl EditTool {
         input: Value,
         rc: Option<RunnerContext>,
     ) -> Result<ToolOutput, ToolError> {
-        let rc = rc.ok_or_else(|| {
-            ToolError::Execution(
-                "RunnerContext extension is not installed on the ToolContext".to_string(),
-            )
-        })?;
-        let cwd = rc.cwd.clone();
+        let cwd = require_cwd(rc.clone())?;
         let parsed = parse_input(&input)?;
         let full_path = resolve_path(parsed.file_path, &cwd)?;
         let old_content = read_existing(&full_path, parsed.file_path).await?;
@@ -140,9 +123,26 @@ impl EditTool {
             )));
         }
 
+        if let Err(failure) =
+            crate::conflict::check_content_unchanged(&old_content, &full_path).await
+        {
+            return match failure {
+                crate::conflict::CheckFailure::Changed => Ok(EditError::Conflict.into_output()),
+                crate::conflict::CheckFailure::Fault(e) => Err(e),
+            };
+        }
+
         crate::fs::atomic_write(&full_path, &new_content)?;
+
+        if let Some(rc) = &rc {
+            rc.record_baseline(
+                &full_path,
+                crate::state::observe_bytes(new_content.as_bytes()),
+            );
+        }
+
         let message = format_file_change(parsed.file_path, Some(&old_content), &new_content);
-        Ok(ToolOutput::text(message))
+        Ok(ToolOutput::text(message).with_hint(DisplayHint::Diff))
     }
 }
 
@@ -154,13 +154,13 @@ impl EditTool {
 /// be non-empty and `file_path` must not be a URL, both checked before this
 /// struct is constructed.
 #[derive(Debug)]
-struct EditInput<'a> {
+struct EditArgs<'a> {
     /// The file path exactly as supplied by the caller, before cwd resolution.
     ///
     /// Borrowed from the input JSON. Kept in its raw (pre-resolution) form so
     /// error messages and the diff preview show the path the model named, not
     /// the canonicalized absolute path. Resolution against `cwd` happens later
-    /// in [`edit_inner`](EditTool::edit_inner).
+    /// in [`edit_inner`](EditInput::edit_inner).
     file_path: &'a str,
 
     /// The text to find in the file.
@@ -220,6 +220,14 @@ enum EditError {
         /// [`locate_unique`] via `str::matches(...).count()`.
         count: usize,
     },
+
+    /// The file changed on disk between this call's read and its write.
+    ///
+    /// Detected by the detect-on-write check immediately before the write: an
+    /// external writer (another process, the user's editor) modified the file
+    /// after this call read it. Writing would clobber the newer content, so
+    /// the edit is refused and the model re-reads and retries.
+    Conflict,
 }
 
 impl EditError {
@@ -242,6 +250,13 @@ impl EditError {
                 "old_text appears {count} times in the file; it must be unique. \
                  Add surrounding context to disambiguate, or use MultiEdit."
             )),
+            EditError::Conflict => ToolOutput::error_text(
+                "File changed on disk since this call read it; not writing to \
+                 avoid clobbering the newer content.\n\n\
+                 Hints:\n  \
+                 - Re-read the file with `Read`\n  \
+                 - Re-issue the edit against the current content",
+            ),
         }
     }
 }
@@ -255,7 +270,7 @@ impl EditError {
 ///
 /// Returns [`ToolError::InvalidInput`] for a missing field, an empty
 /// `old_text`, or a URL `file_path`.
-fn parse_input(input: &Value) -> Result<EditInput<'_>, ToolError> {
+fn parse_input(input: &Value) -> Result<EditArgs<'_>, ToolError> {
     let file_path = input
         .get("file_path")
         .and_then(Value::as_str)
@@ -279,12 +294,8 @@ fn parse_input(input: &Value) -> Result<EditInput<'_>, ToolError> {
         ));
     }
 
-    if is_url(file_path) {
-        return Err(ToolError::InvalidInput(
-            "URLs are not supported by the Edit tool. Use WebFetch for URLs.".to_string(),
-        ));
-    }
-    Ok(EditInput {
+    reject_url("Edit", file_path)?;
+    Ok(EditArgs {
         file_path,
         old_text,
         new_text,
@@ -379,8 +390,8 @@ pub(crate) enum FindResult {
     /// `old_text` appears more than once in `content`.
     ///
     /// The model needs to supply a longer, more specific `old_text` that
-    /// matches only the intended site, or use `MultiEdit` if it genuinely wants
-    /// all occurrences changed. Maps to [`EditError::Ambiguous`].
+    /// matches only the intended site, or issue several `MultiEdit` edits,
+    /// each with its own unique `old_text`. Maps to [`EditError::Ambiguous`].
     Ambiguous {
         /// The non-overlapping occurrence count.
         ///
@@ -415,9 +426,10 @@ pub(crate) fn locate_unique(content: &str, old_text: &str) -> FindResult {
 
 /// Splice `replacement` into `content`, replacing the byte `range`.
 ///
-/// The `range` must be a valid UTF-8-boundary slice of `content` as produced by
-/// [`locate_unique`]; this holds by construction because `str::find` returns
-/// char-boundary offsets. The result is the prefix before `range.start`, the
+/// The `range` comes from [`locate_unique`], whose `str::find`-derived
+/// offsets are char boundaries, so the slicing cannot split a code point; the
+/// `get` fallbacks cover only unreachable non-boundary input. The result is
+/// the prefix before `range.start`, the
 /// `replacement`, then the suffix from `range.end`.
 pub(crate) fn splice(content: &str, range: Range<usize>, replacement: &str) -> String {
     let prefix = content.get(..range.start).unwrap_or("");
@@ -446,20 +458,14 @@ mod tests {
     use super::*;
     use crate::context::RunnerContext;
     use loopctl::tool::ToolContext;
+    use serde_json::json;
     use std::path::PathBuf;
-    use std::sync::Arc;
-    use std::sync::Mutex;
 
     /// Builds a `ToolContext` with a `RunnerContext` pointing at `cwd`.
     fn ctx_in(cwd: &str) -> ToolContext {
         let mut ctx = ToolContext::default();
         ctx.cwd = cwd.to_string();
-        let rc = RunnerContext {
-            cwd: PathBuf::from(cwd),
-            todos: Arc::new(Mutex::new(Vec::new())),
-            question_tx: Arc::new(Mutex::new(None)),
-        };
-        ctx.set_extension(rc);
+        ctx.set_extension(RunnerContext::new(PathBuf::from(cwd)));
         ctx
     }
 
@@ -469,7 +475,7 @@ mod tests {
         let target = tmp.path().join("src.rs");
         std::fs::write(&target, "fn main() { println!(\"hi\"); }\n").unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = EditTool;
+        let tool = EditInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({
             "file_path": "src.rs",
@@ -483,6 +489,7 @@ mod tests {
         assert!(!written.contains("hi"));
         assert!(out.text_content().contains("Changed: src.rs"));
         assert!(out.text_content().contains("+ "));
+        assert_eq!(out.display_hint, Some(DisplayHint::Diff));
     }
 
     #[tokio::test]
@@ -492,7 +499,7 @@ mod tests {
         let original = "line one\nline two\n";
         std::fs::write(&target, original).unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = EditTool;
+        let tool = EditInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({
             "file_path": "f.txt",
@@ -514,7 +521,7 @@ mod tests {
         let original = "dup\ndup\ndup\n";
         std::fs::write(&target, original).unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = EditTool;
+        let tool = EditInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({
             "file_path": "f.txt",
@@ -535,7 +542,7 @@ mod tests {
         let target = tmp.path().join("f.txt");
         std::fs::write(&target, "content\n").unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = EditTool;
+        let tool = EditInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({
             "file_path": "f.txt",
@@ -556,7 +563,7 @@ mod tests {
         let target = tmp.path().join("bad.rs");
         std::fs::write(&target, "fn main() { let x = 1; }\n").unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = EditTool;
+        let tool = EditInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({
             "file_path": "bad.rs",
@@ -581,7 +588,7 @@ mod tests {
         let target = tmp.path().join("bad.rs");
         std::fs::write(&target, "fn main() { let x = 1; }\n").unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = EditTool;
+        let tool = EditInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({
             "file_path": "bad.rs",
@@ -603,7 +610,7 @@ mod tests {
         let target = tmp.path().join("notes.md");
         std::fs::write(&target, "# Title\nbody\n").unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = EditTool;
+        let tool = EditInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({
             "file_path": "notes.md",
@@ -623,7 +630,7 @@ mod tests {
     async fn file_not_found_is_file_not_found_variant() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = EditTool;
+        let tool = EditInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({
             "file_path": "nope.rs",
@@ -642,7 +649,7 @@ mod tests {
         let target = nested.join("rel.rs");
         std::fs::write(&target, "fn old() {}\n").unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = EditTool;
+        let tool = EditInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({
             "file_path": "sub/rel.rs",
@@ -658,7 +665,7 @@ mod tests {
     async fn missing_new_text_is_invalid_input() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = EditTool;
+        let tool = EditInput::default();
         let ctx = ctx_in(cwd);
         let err = tool
             .call(json!({ "file_path": "x.rs", "old_text": "a" }), &ctx)
@@ -671,7 +678,7 @@ mod tests {
     async fn url_rejected() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = EditTool;
+        let tool = EditInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({
             "file_path": "https://example.com/page",
@@ -687,7 +694,7 @@ mod tests {
 
     #[test]
     fn not_read_only_and_not_concurrency_safe() {
-        let tool = EditTool;
+        let tool = EditInput::default();
         assert!(!tool.is_read_only());
         assert!(!tool.is_concurrency_safe());
     }
@@ -695,7 +702,7 @@ mod tests {
     #[test]
     fn edittool_registered_in_builtin_registry() {
         let reg = crate::registry::builtin_registry();
-        let tool = reg.get("Edit").expect("EditTool registered");
+        let tool = reg.get("Edit").expect("Edit registered");
         assert!(!tool.is_read_only());
         assert!(!tool.is_concurrency_safe());
     }
@@ -706,7 +713,7 @@ mod tests {
         let target = tmp.path().join("clean.rs");
         std::fs::write(&target, "fn main() {}\n").unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = EditTool;
+        let tool = EditInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({
             "file_path": "clean.rs",
@@ -904,5 +911,42 @@ mod tests {
         // .txt is not a linted extension — passes regardless of content.
         let path = Path::new("a.txt");
         assert!(check_linter(path, "garbage {{{ not code").is_ok());
+    }
+
+    #[test]
+    fn edit_conflict_into_output_is_a_soft_error_with_recovery_guidance() {
+        let out = EditError::Conflict.into_output();
+        assert!(out.is_error);
+        let text = out.text_content();
+        assert!(text.contains("changed on disk"), "{text}");
+        assert!(text.contains("Read"), "{text}");
+    }
+
+    /// The end-to-end conflict path (mutate between the call's read and its
+    /// re-read) is not interposable from outside `call`, so the refuse-to-
+    /// write behavior is pinned at the helper level (see `conflict.rs`'s
+    /// external-writer test); this test pins the remaining tool-level
+    /// contract: an unchanged file still writes normally with the check
+    /// wired in.
+    #[tokio::test]
+    async fn edit_still_writes_when_the_conflict_check_sees_no_change() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("src.rs");
+        std::fs::write(&target, "fn main() { println!(\"hi\"); }\n").unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let tool = EditInput::default();
+        let ctx = ctx_in(cwd);
+        let input = json!({
+            "file_path": "src.rs",
+            "old_text": "println!(\"hi\")",
+            "new_text": "println!(\"bye\")"
+        });
+        let out = tool.call(input, &ctx).await.unwrap();
+        assert!(!out.is_error, "{}", out.text_content());
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "fn main() { println!(\"bye\"); }\n",
+            "the edit must apply when the re-read matches the baseline"
+        );
     }
 }

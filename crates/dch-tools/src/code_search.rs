@@ -1,37 +1,36 @@
 //! The `CodeSearch` tool — token-efficient regex code search.
 //!
-//! Same regex + walker engine as [`Grep`](crate::GrepTool), but returns
+//! Same regex + walker engine as [`Grep`](crate::GrepInput), but returns
 //! grouped `file` headers with collapsed consecutive-line ranges by default
 //! (no matched content), and only includes matched content when the caller
 //! opts in via `context_lines > 0`. A global `max_results` cap (default 50,
 //! clamp 200) bounds the total output regardless of how many matches one
 //! file contains.
 
-use std::future::Future;
 use std::path::Path;
 use std::path::PathBuf;
-use std::pin::Pin;
 
-use loopctl::tool::Tool;
+use loopctl::Tool;
+use loopctl::tool::DisplayHint;
 use loopctl::tool::ToolContext;
 use loopctl::tool::ToolError;
 use loopctl::tool::ToolOutput;
-use loopctl::tool::ToolSchema;
 use regex::Regex;
+use serde::Deserialize;
+use serde::Serialize;
 use serde_json::Value;
-use serde_json::json;
 
 use crate::context::RunnerContext;
+use crate::context::require_cwd;
 use crate::context::runner_ctx;
 use crate::input::get_usize;
 use crate::output::MAX_INLINE_OUTPUT_BYTES;
-use crate::output::session_temp_dir;
 use crate::output::truncate_or_write_to_temp;
 use crate::search::Match;
 use crate::search::SearchJob;
 use crate::search::compile_pattern;
 use crate::search::no_matches_message;
-use crate::util::is_url;
+use crate::util::reject_url;
 use crate::util::resolve_path;
 
 /// Default total match cap across all files when the caller omits `max_results`.
@@ -43,102 +42,91 @@ const RESULTS_CAP: usize = 200;
 /// Hard ceiling `context_lines` is clamped to, regardless of what the caller asks.
 const MAX_CONTEXT_LINES: usize = 5;
 
-/// Token-efficient regex code search — the "show me where matches are" search.
+/// Input for the `CodeSearch` tool.
 ///
-/// Same regex + walker engine as [`Grep`](crate::GrepTool), but returns the
-/// *smallest* useful answer: by default it emits a `file` header followed by
-/// collapsed consecutive-line ranges (`12-47` instead of 36 separate lines),
-/// with **no matched content**. Matched content appears only when the caller
-/// opts in via `context_lines > 0`, in which case each match is rendered as
-/// `file:line` plus an indented `>`-marked snippet of the surrounding lines.
-/// This is the whole reason `CodeSearch` exists separately from `Grep`:
-/// `Grep` streams full matched lines (faithful but verbose); `CodeSearch`
-/// returns a token-efficient map first, and the model can follow up with
-/// `Read` on the few interesting spots.
-///
-/// A single global `max_results` cap (default 50, clamped to 200) bounds the
-/// total output regardless of how many matches one file contains — distinct
-/// from `Grep`'s per-file `max_matches`. The global cap is what makes the
-/// output size predictable for a tool whose stated job is token-efficiency.
-///
-/// Like `Grep`, compiled patterns are cached process-globally and an empty
-/// match set is a successful "No matches found" message rather than an error.
-pub struct CodeSearchTool;
-
-impl Tool for CodeSearchTool {
-    fn name(&self) -> &'static str {
-        "CodeSearch"
-    }
-
-    fn description(&self) -> &'static str {
-        "Search code with succinct, token-efficient results. Returns file:line \
+/// Token-efficient regex code search: same engine as `Grep`, but returns the
+/// smallest useful answer — `file` headers with collapsed consecutive-line
+/// ranges by default, and matched-content snippets only when
+/// `context_lines > 0`.
+#[derive(Default, Deserialize, Serialize, Tool)]
+#[tool(
+    name = "CodeSearch",
+    read_only,
+    concurrency_safe,
+    description = "Search code with succinct, token-efficient results. Returns file:line \
          format by default. Use context_lines > 0 to include matched content."
-    }
+)]
+pub struct CodeSearchInput {
+    /// The regular expression to search file contents for.
+    ///
+    /// Compiled with the shared [`compile_pattern`] helper, so an unparseable
+    /// pattern is rejected as invalid input before any walking starts. Matched
+    /// against whole lines.
+    pattern: String,
 
-    fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            tool: self.name().to_string(),
-            description: self.description().to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "pattern": {
-                        "type": "string",
-                        "description": "Regular expression pattern to search for"
-                    },
-                    "path": {
-                        "type": "string",
-                        "description": "Directory to search in (defaults to current working directory)"
-                    },
-                    "include_patterns": {
-                        "type": "array",
-                        "items": {"type": "string"}
-                    },
-                    "exclude_patterns": {
-                        "type": "array",
-                        "items": {"type": "string"}
-                    },
-                    "case_insensitive": {
-                        "type": "boolean"
-                    },
-                    "max_results": {
-                        "type": "integer",
-                        "description": "Maximum results (default: 50)",
-                        "minimum": 1,
-                        "maximum": 200
-                    },
-                    "context_lines": {
-                        "type": "integer",
-                        "description": "Context lines around matches (default: 0)",
-                        "minimum": 0,
-                        "maximum": 5
-                    }
-                },
-                "required": ["pattern"]
-            }),
-        }
-    }
+    /// The directory to search in, defaulting to the current working directory.
+    ///
+    /// May be relative, in which case it is resolved against the runner's cwd,
+    /// not the process's. URLs are rejected; the walk honors `.gitignore`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
 
-    fn call(
-        &self,
-        input: Value,
-        ctx: &ToolContext,
-    ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
-        let rc = runner_ctx(ctx).cloned();
-        let temp_dir = session_temp_dir(Path::new(&ctx.temp_dir), ctx.session_id);
-        Box::pin(self.code_search_inner(input, rc, temp_dir))
-    }
+    /// File patterns restricting the search to matching files (e.g., ['*.rs']).
+    ///
+    /// Applied in addition to the walker's `.gitignore` handling. Files that
+    /// match no pattern are skipped entirely; binary files are always skipped.
+    #[allow(clippy::doc_link_with_quotes)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    include_patterns: Option<Vec<String>>,
 
-    fn is_read_only(&self) -> bool {
-        true
-    }
+    /// File patterns removing files from the search (e.g., ['*.lock']).
+    ///
+    /// Takes precedence over `include_patterns`: a file matching both is
+    /// excluded. Useful for pruning large generated directories such as
+    /// `target/*`.
+    #[allow(clippy::doc_link_with_quotes)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exclude_patterns: Option<Vec<String>>,
 
-    fn is_concurrency_safe(&self) -> bool {
-        true
-    }
+    /// Whether to match the pattern case-insensitively.
+    ///
+    /// Defaults to `false` (case-sensitive). When `true`, the compiled regex
+    /// has the case-insensitive flag set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    case_insensitive: Option<bool>,
+
+    /// Lines of context shown around each match (default: 0, cap: 5).
+    ///
+    /// At 0 the output is the succinct form: file headers with collapsed line
+    /// ranges and no content. Above 0, each match also renders a
+    /// `±context_lines` snippet with `>` marking the matched line.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_lines: Option<usize>,
+
+    /// Maximum total matches across all files (default: 50, cap: 200).
+    ///
+    /// Bounds the output regardless of how many matches a single file
+    /// contains; the walk stops once the cap is reached. Requests above the
+    /// hard cap are lowered to it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_results: Option<usize>,
 }
 
-impl CodeSearchTool {
+impl CodeSearchInput {
+    /// Serializes the typed input and delegates to `code_search_inner`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError`] when the input cannot be serialized back to JSON
+    /// or when `code_search_inner` fails.
+    async fn run(&self, input: Self, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let rc = runner_ctx(ctx).cloned();
+        let temp_dir = PathBuf::from(&ctx.temp_dir);
+        let value = serde_json::to_value(&input)
+            .map_err(|e| ToolError::Execution(format!("serialize tool input: {e}")))?;
+        self.code_search_inner(value, rc, temp_dir).await
+    }
+
     /// Body of [`Tool::call`].
     ///
     /// Orchestrates parse → compile → walk → render. An empty match set is a
@@ -157,26 +145,14 @@ impl CodeSearchTool {
         rc: Option<RunnerContext>,
         temp_dir: PathBuf,
     ) -> Result<ToolOutput, ToolError> {
-        let cwd = rc
-            .as_ref()
-            .ok_or_else(|| {
-                ToolError::Execution(
-                    "RunnerContext extension is not installed on the ToolContext".to_string(),
-                )
-            })?
-            .cwd
-            .clone();
+        let cwd = require_cwd(rc)?;
 
         let parsed_input = crate::search::parse_input(&input, DEFAULT_MAX_RESULTS)?;
         let context_lines = get_usize(&input, "context_lines")?
             .unwrap_or(0)
             .min(MAX_CONTEXT_LINES);
 
-        if is_url(&parsed_input.base_path) {
-            return Err(ToolError::InvalidInput(
-                "URLs are not supported by the CodeSearch tool. Use WebFetch for URLs.".to_string(),
-            ));
-        }
+        reject_url("CodeSearch", &parsed_input.base_path)?;
 
         let regex = compile_pattern(&parsed_input.pattern, parsed_input.case_insensitive)?;
         let base = resolve_path(&parsed_input.base_path, &cwd)?;
@@ -201,12 +177,10 @@ impl CodeSearchTool {
             return Ok(no_matches_message(&parsed_input.pattern));
         }
 
-        Ok(render(
-            &matches,
-            &parsed_input.pattern,
-            context_lines,
-            &temp_dir,
-        ))
+        Ok(
+            render(&matches, &parsed_input.pattern, context_lines, &temp_dir)
+                .with_hint(DisplayHint::Json),
+        )
     }
 }
 
@@ -276,7 +250,8 @@ fn render_snippet(lines: &[&str], line_num: usize, context_lines: usize) -> Stri
 /// `context_lines == 0` → grouped: `Found N match(es) for "{pattern}":` header,
 /// a blank line, then per file the path and collapsed line ranges
 /// (`  {N}` or `  {A}-{B}`). `context_lines > 0` → the same header followed by
-/// `file:line` per match and its indented snippet. Output spills to a temp
+/// `file:line` per match and its snippet (the first snippet line indented).
+/// Output spills to a temp
 /// file via the shared helper if it exceeds the inline limit.
 fn render(matches: &[Match], pattern: &str, context_lines: usize, temp_dir: &Path) -> ToolOutput {
     let mut out = Vec::with_capacity(matches.len().saturating_add(2));
@@ -376,8 +351,7 @@ fn group_consecutive(mut lines: Vec<usize>) -> Vec<LineRange> {
     ranges
 }
 
-/// Append the appropriate [`LineRange::Single`] or [`LineRange::Range`] for a
-/// finalized run.
+/// Append the appropriate [`LineRange`] variant for a finalized run.
 ///
 /// Helper for [`group_consecutive`]: once a run of consecutive lines ends (or
 /// the input ends), this decides whether the run was a single line (`start ==
@@ -405,19 +379,13 @@ mod tests {
     use super::*;
     use crate::context::RunnerContext;
     use loopctl::tool::ToolContext;
+    use serde_json::json;
     use std::path::PathBuf;
-    use std::sync::Arc;
-    use std::sync::Mutex;
 
     fn ctx_in(dir: &Path) -> ToolContext {
         let mut ctx = ToolContext::default();
         ctx.cwd = dir.to_string_lossy().into_owned();
-        let rc = RunnerContext {
-            cwd: PathBuf::from(dir),
-            todos: Arc::new(Mutex::new(Vec::new())),
-            question_tx: Arc::new(Mutex::new(None)),
-        };
-        ctx.set_extension(rc);
+        ctx.set_extension(RunnerContext::new(PathBuf::from(dir)));
         ctx
     }
 
@@ -770,7 +738,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         write_file(tmp.path(), "a.rs", "fn foo() {}\nconst X = 1;\n");
         write_file(tmp.path(), "b.txt", "foo bar\n");
-        let tool = CodeSearchTool;
+        let tool = CodeSearchInput::default();
         let ctx = ctx_in(tmp.path());
         let out = tool.call(json!({"pattern": "foo"}), &ctx).await.unwrap();
         let text = out.text_content();
@@ -781,6 +749,7 @@ mod tests {
             !text.contains("fn foo()"),
             "no content in succinct mode: {text}"
         );
+        assert_eq!(out.display_hint, Some(DisplayHint::Json));
     }
 
     #[tokio::test]
@@ -788,7 +757,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let body = "foo\nfoo\nfoo\n";
         write_file(tmp.path(), "a.rs", body);
-        let tool = CodeSearchTool;
+        let tool = CodeSearchInput::default();
         let ctx = ctx_in(tmp.path());
         let out = tool.call(json!({"pattern": "foo"}), &ctx).await.unwrap();
         let text = out.text_content();
@@ -799,7 +768,7 @@ mod tests {
     async fn context_lines_renders_snippet() {
         let tmp = tempfile::TempDir::new().unwrap();
         write_file(tmp.path(), "a.rs", "one\ntwo\nthree\nfour\n");
-        let tool = CodeSearchTool;
+        let tool = CodeSearchInput::default();
         let ctx = ctx_in(tmp.path());
         let out = tool
             .call(json!({"pattern": "two", "context_lines": 1}), &ctx)
@@ -817,7 +786,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         write_file(tmp.path(), "a.rs", &"x\n".repeat(100));
         write_file(tmp.path(), "b.rs", &"x\n".repeat(100));
-        let tool = CodeSearchTool;
+        let tool = CodeSearchInput::default();
         let ctx = ctx_in(tmp.path());
         let out = tool
             .call(json!({"pattern": "x", "max_results": 5}), &ctx)
@@ -831,7 +800,7 @@ mod tests {
     async fn max_results_clamped_to_max() {
         let tmp = tempfile::TempDir::new().unwrap();
         write_file(tmp.path(), "a.rs", "x\n");
-        let tool = CodeSearchTool;
+        let tool = CodeSearchInput::default();
         let ctx = ctx_in(tmp.path());
         let out = tool
             .call(json!({"pattern": "x", "max_results": 99999}), &ctx)
@@ -844,7 +813,7 @@ mod tests {
     async fn case_insensitive_matches() {
         let tmp = tempfile::TempDir::new().unwrap();
         write_file(tmp.path(), "a.rs", "foo\n");
-        let tool = CodeSearchTool;
+        let tool = CodeSearchInput::default();
         let ctx = ctx_in(tmp.path());
         let out = tool
             .call(json!({"pattern": "FOO", "case_insensitive": true}), &ctx)
@@ -862,7 +831,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         write_file(tmp.path(), "a.rs", "foo\n");
         write_file(tmp.path(), "b.txt", "foo\n");
-        let tool = CodeSearchTool;
+        let tool = CodeSearchInput::default();
         let ctx = ctx_in(tmp.path());
         let out = tool
             .call(
@@ -881,7 +850,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         write_file(tmp.path(), "a.rs", "foo\n");
         write_file(tmp.path(), "b.lock", "foo\n");
-        let tool = CodeSearchTool;
+        let tool = CodeSearchInput::default();
         let ctx = ctx_in(tmp.path());
         let out = tool
             .call(
@@ -902,7 +871,7 @@ mod tests {
         bytes.extend_from_slice(b"foo\n");
         std::fs::write(tmp.path().join("data.png"), &bytes).unwrap();
         write_file(tmp.path(), "a.rs", "foo\n");
-        let tool = CodeSearchTool;
+        let tool = CodeSearchInput::default();
         let ctx = ctx_in(tmp.path());
         let out = tool
             .call(
@@ -919,7 +888,7 @@ mod tests {
     async fn no_matches_is_success_message() {
         let tmp = tempfile::TempDir::new().unwrap();
         write_file(tmp.path(), "a.rs", "foo\n");
-        let tool = CodeSearchTool;
+        let tool = CodeSearchInput::default();
         let ctx = ctx_in(tmp.path());
         let out = tool.call(json!({"pattern": "zzz"}), &ctx).await.unwrap();
         assert!(!out.is_error);
@@ -932,7 +901,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_regex_errors() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let tool = CodeSearchTool;
+        let tool = CodeSearchInput::default();
         let ctx = ctx_in(tmp.path());
         let err = tool
             .call(json!({"pattern": "(unclosed"}), &ctx)
@@ -947,7 +916,7 @@ mod tests {
     #[tokio::test]
     async fn url_path_rejected() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let tool = CodeSearchTool;
+        let tool = CodeSearchInput::default();
         let ctx = ctx_in(tmp.path());
         let err = tool
             .call(
@@ -966,7 +935,7 @@ mod tests {
     async fn relative_path_resolved_against_cwd() {
         let tmp = tempfile::TempDir::new().unwrap();
         write_file(tmp.path(), "a.rs", "foo\n");
-        let tool = CodeSearchTool;
+        let tool = CodeSearchInput::default();
         let ctx = ctx_in(tmp.path());
         let out = tool
             .call(json!({"pattern": "foo", "path": "."}), &ctx)
@@ -982,7 +951,7 @@ mod tests {
         std::fs::write(tmp.path().join(".gitignore"), "ignored.rs\n").unwrap();
         write_file(tmp.path(), "ignored.rs", "foo\n");
         write_file(tmp.path(), "kept.rs", "foo\n");
-        let tool = CodeSearchTool;
+        let tool = CodeSearchInput::default();
         let ctx = ctx_in(tmp.path());
         let out = tool.call(json!({"pattern": "foo"}), &ctx).await.unwrap();
         let text = out.text_content();
@@ -994,7 +963,7 @@ mod tests {
     async fn empty_file_no_panic() {
         let tmp = tempfile::TempDir::new().unwrap();
         std::fs::write(tmp.path().join("empty.rs"), "").unwrap();
-        let tool = CodeSearchTool;
+        let tool = CodeSearchInput::default();
         let ctx = ctx_in(tmp.path());
         let out = tool.call(json!({"pattern": "foo"}), &ctx).await.unwrap();
         assert!(out.text_content().contains("No matches found"));
@@ -1003,7 +972,7 @@ mod tests {
     #[tokio::test]
     async fn malformed_max_results_rejected() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let tool = CodeSearchTool;
+        let tool = CodeSearchInput::default();
         let ctx = ctx_in(tmp.path());
         let err = tool
             .call(json!({"pattern": "x", "max_results": -5}), &ctx)
@@ -1019,7 +988,7 @@ mod tests {
         let line = format!("match {padding}");
         let body: String = std::iter::repeat_n(format!("{line}\n"), 600).collect();
         write_file(tmp.path(), "big.rs", &body);
-        let tool = CodeSearchTool;
+        let tool = CodeSearchInput::default();
         let ctx = ctx_in(tmp.path());
         let out = tool
             .call(
@@ -1036,7 +1005,7 @@ mod tests {
 
     #[test]
     fn trait_contract_and_registry() {
-        let tool = CodeSearchTool;
+        let tool = CodeSearchInput::default();
         assert!(tool.is_read_only());
         assert!(tool.is_concurrency_safe());
         assert_eq!(tool.name(), "CodeSearch");

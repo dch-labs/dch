@@ -17,6 +17,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
 
+use loopctl::tool::DisplayHint;
 use loopctl::tool::Tool;
 use loopctl::tool::ToolContext;
 use loopctl::tool::ToolError;
@@ -25,25 +26,32 @@ use loopctl::tool::ToolSchema;
 use serde_json::Value;
 use serde_json::json;
 
+use crate::conflict::CheckFailure;
+use crate::conflict::check_content_unchanged;
 use crate::context::RunnerContext;
+use crate::context::require_cwd;
 use crate::context::runner_ctx;
 use crate::diff::format_file_change;
 use crate::edit::FindResult;
 use crate::edit::locate_unique;
 use crate::edit::splice;
 use crate::linter::lint_content;
-use crate::util::is_url;
+use crate::util::reject_url;
 use crate::util::resolve_path;
 use crate::write::format_lint_failure;
 
 /// Maximum number of edits permitted in a single call.
+///
+/// Bounds the preview size, the lint pass, and the write loop; a larger
+/// batch should be split so a failure surfaces before the whole plan is
+/// built.
 const MAX_EDITS: usize = 50;
 
-/// Edit multiple files atomically. All edits are validated before any writes.
-/// Use `dry_run=true` to preview changes without writing.
+/// Edit multiple files atomically.
 ///
-/// Not concurrency-safe and not read-only: it mutates files, and two
-/// concurrent batches touching overlapping paths would race.
+/// All edits are validated before any writes; use `dry_run=true` to preview
+/// changes without writing. Not concurrency-safe and not read-only: it mutates
+/// files, and two concurrent batches touching overlapping paths would race.
 pub struct MultiEditTool;
 
 impl Tool for MultiEditTool {
@@ -107,11 +115,14 @@ impl Tool for MultiEditTool {
 impl MultiEditTool {
     /// Body of [`Tool::call`].
     ///
-    /// Orchestrates the five-phase pipeline: parse → read+locate+symlink →
-    /// overlap-detect → lint → preview/write. Recoverable conditions (text not
-    /// found, ambiguous match, overlap, symlink target, linter failure) are
-    /// surfaced as soft [`ToolOutput`] errors; hard failures (bad args,
-    /// missing file, I/O fault) become [`ToolError`].
+    /// Orchestrates the pipeline: parse → dup-path → read → symlink →
+    /// overlap-detect → locate+merge → lint → preview, then a per-file
+    /// staleness check immediately before each write. Recoverable conditions
+    /// (text not found, ambiguous match, overlap, symlink target, linter
+    /// failure, a file changed on disk since the batch read it) are surfaced
+    /// as soft [`ToolOutput`] errors; hard failures (bad args, missing file,
+    /// I/O fault) become [`ToolError`]. Each successful write refreshes the
+    /// path's recorded baseline.
     ///
     /// # Atomicity scope
     ///
@@ -136,21 +147,11 @@ impl MultiEditTool {
         input: Value,
         rc: Option<RunnerContext>,
     ) -> Result<ToolOutput, ToolError> {
-        let cwd = rc
-            .as_ref()
-            .ok_or_else(|| {
-                ToolError::Execution(
-                    "RunnerContext extension is not installed on the ToolContext".to_string(),
-                )
-            })?
-            .cwd
-            .clone();
+        let cwd = require_cwd(rc.clone())?;
 
-        // Phase 0: parse + bounds-check.
         let parsed = parse_input(&input)?;
         let operations = build_operations(parsed.edits, &cwd)?;
 
-        // Phase 1: read each distinct file once, pre-check symlinks.
         if let Some(reason) = dup_path_check(&operations) {
             return Ok(reason.into_output());
         }
@@ -158,17 +159,10 @@ impl MultiEditTool {
         if let Some(reason) = symlink_check(&operations) {
             return Ok(reason.into_output());
         }
-
-        // Phase 1.5: overlap detection. Runs in both dry_run and apply modes
-        // so the preview shows exactly what the apply would catch.
         if let Some(reason) = overlap_check(&operations, &originals) {
             return Ok(reason.into_output());
         }
 
-        // Phase 2: merge each file's edits sequentially (array order, each
-        // seeing the prior's output), locating old_text in the *running*
-        // content (unique check). This is also where edit #N's old_text that
-        // only exists after edit #N-1 is validated.
         let finals = match merge_per_file(&operations, &originals) {
             Ok(f) => f,
             Err(reason) => return Ok(reason.into_output()),
@@ -179,27 +173,100 @@ impl MultiEditTool {
             return Ok(reason.into_output());
         }
 
-        // Phase 3: build the preview/diff block (always).
         let summary = build_preview(&operations, &originals, &finals, parsed.dry_run);
         if parsed.dry_run {
-            return Ok(ToolOutput::text(summary));
+            return Ok(ToolOutput::text(summary).with_hint(DisplayHint::Diff));
         }
-
-        // Phase 4: write each distinct physical file once.
-        let mut written: std::collections::HashSet<&Path> = std::collections::HashSet::new();
-        for op in &operations {
-            if !written.insert(&op.full_path) {
-                continue;
+        if let Some(conflict) = write_finals(&operations, &originals, &finals, rc.as_ref()).await? {
+            let mut message = crate::conflict::changed_message(Path::new(&conflict.path));
+            if !conflict.applied.is_empty() {
+                message.push_str("\n\nAlready written by this batch: ");
+                message.push_str(&conflict.applied.join(", "));
+                message.push('.');
             }
-            if let Some(final_content) = finals.get(&op.file_path) {
-                crate::fs::atomic_write(&op.full_path, final_content)?;
-            }
+            return Ok(ToolOutput::error_text(message));
         }
 
         let applied: Vec<&str> = finals.keys().map(String::as_str).collect();
         let message = apply_summary(&summary, &applied, &operations);
-        Ok(ToolOutput::text(message))
+        Ok(ToolOutput::text(message).with_hint(DisplayHint::Diff))
     }
+}
+
+/// Why and where a batch write stopped.
+///
+/// `applied` lists the caller-supplied paths successfully written before the
+/// conflict, in write order — their new content is already on disk. `path`
+/// names the file that changed, in the caller-supplied spelling.
+#[derive(Debug)]
+struct BatchConflict {
+    /// Files written before the abort.
+    ///
+    /// Caller-supplied spellings, in write order — their new content is
+    /// already on disk.
+    applied: Vec<String>,
+
+    /// The conflicted file.
+    ///
+    /// The caller-supplied spelling of the path whose staleness check failed.
+    path: String,
+}
+
+/// Write each distinct physical target file once with its merged content.
+///
+/// Multiple edits can share one physical file; the deduplication by resolved
+/// path ensures the merged content is written exactly once per file, in the
+/// batch's first-seen order. Before each write, the file's current bytes are
+/// compared against the content this batch read in phase 1 (`originals`); a
+/// file changed by an external writer aborts the batch at that file — files
+/// already written in earlier iterations stay written, and are reported in
+/// the returned [`BatchConflict`]. Each successful write refreshes the path's
+/// recorded baseline (`history`), so the model's own batch never registers as
+/// a later external change.
+///
+/// Returns `Ok(Some(conflict))` when the batch aborted; `Ok(None)` when every
+/// file was written.
+///
+/// # Errors
+///
+/// Returns [`ToolError`] when an atomic temp-then-rename write fails or the
+/// conflict check hits a genuine I/O fault.
+async fn write_finals(
+    operations: &[EditOperation],
+    originals: &BTreeMap<String, String>,
+    finals: &BTreeMap<String, String>,
+    history: Option<&RunnerContext>,
+) -> Result<Option<BatchConflict>, ToolError> {
+    let mut written: std::collections::HashSet<&Path> = std::collections::HashSet::new();
+    let mut applied: Vec<String> = Vec::new();
+    for op in operations {
+        if !written.insert(&op.full_path) {
+            continue;
+        }
+        if let Some(final_content) = finals.get(&op.file_path) {
+            if let Some(baseline) = originals.get(&op.file_path).map(String::as_str) {
+                match check_content_unchanged(baseline, &op.full_path).await {
+                    Ok(()) => {}
+                    Err(CheckFailure::Changed) => {
+                        return Ok(Some(BatchConflict {
+                            applied,
+                            path: op.file_path.clone(),
+                        }));
+                    }
+                    Err(CheckFailure::Fault(e)) => return Err(e),
+                }
+            }
+            crate::fs::atomic_write(&op.full_path, final_content)?;
+            applied.push(op.file_path.clone());
+            if let Some(rc) = history {
+                rc.record_baseline(
+                    &op.full_path,
+                    crate::state::observe_bytes(final_content.as_bytes()),
+                );
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Parsed top-level `MultiEdit` input.
@@ -208,12 +275,24 @@ impl MultiEditTool {
 /// option flags, consumed by the rest of the pipeline.
 #[derive(Debug)]
 struct ParsedInput<'a> {
-    /// The edits array, borrowed from the caller's input. Validated non-empty
-    /// and within `MAX_EDITS` by [`parse_input`] before this struct is built.
+    /// The edits array, borrowed from the caller's input.
+    ///
+    /// Validated non-empty and within `MAX_EDITS` by [`parse_input`] before
+    /// this struct is built; item-level field validation happens later in
+    /// [`build_operations`].
     edits: &'a [Value],
+
     /// Whether to preview without writing.
+    ///
+    /// When `true`, the pipeline stops after building the diff preview and no
+    /// file is touched; when `false` (the default), the writes run after
+    /// validation.
     dry_run: bool,
+
     /// Whether to skip the linter gate on the merged content.
+    ///
+    /// Defaults to `false`. When `true`, [`lint_all`] is not consulted and the
+    /// batch proceeds to write (or preview) without syntax validation.
     skip_linter: bool,
 }
 
@@ -264,22 +343,37 @@ fn parse_input(input: &Value) -> Result<ParsedInput<'_>, ToolError> {
 /// messages; `full_path` is what every read/write actually targets.
 #[derive(Debug, Clone)]
 struct EditOperation {
-    /// The caller-supplied path (pre-resolution), used in messages so the model
-    /// sees the path it named, not the canonicalized form.
+    /// The caller-supplied path (pre-resolution).
+    ///
+    /// Used in messages so the model sees the path it named, not the
+    /// canonicalized form.
     file_path: String,
-    /// The path resolved against the runner's `cwd` — what every read/write
-    /// and the duplicate-path / symlink checks actually target.
+
+    /// The path resolved against the runner's `cwd`.
+    ///
+    /// This is what every read/write and the duplicate-path / symlink checks
+    /// actually target.
     full_path: PathBuf,
+
     /// The text to find in the file.
+    ///
+    /// Must be non-empty and, at merge time, appear exactly once in the
+    /// running content of the target file (see [`merge_per_file`]); an
+    /// absent or ambiguous match aborts the whole batch.
     old_text: String,
+
     /// The text to replace `old_text` with.
+    ///
+    /// Spliced over the matched range by [`splice`]; may be empty, which
+    /// deletes the matched text.
     new_text: String,
 }
 
-/// Parse each edit item into an [`EditOperation`], validating fields and
-/// rejecting empty `old_text` and URL `file_path`.
+/// Parse each edit item into an [`EditOperation`].
 ///
-/// Relative paths are resolved against `cwd`; absolute paths are used as-is.
+/// Validates fields, rejecting empty `old_text` and URL `file_path`; relative
+/// paths are resolved against `cwd`; absolute paths are accepted only when
+/// they stay inside `cwd`.
 ///
 /// # Errors
 ///
@@ -306,11 +400,7 @@ fn build_operations(edits: &[Value], cwd: &Path) -> Result<Vec<EditOperation>, T
                 "old_text must not be empty".to_string(),
             ));
         }
-        if is_url(file_path) {
-            return Err(ToolError::InvalidInput(
-                "URLs are not supported by the MultiEdit tool. Use WebFetch for URLs.".to_string(),
-            ));
-        }
+        reject_url("MultiEdit", file_path)?;
 
         let full_path = resolve_path(file_path, cwd)?;
         operations.push(EditOperation {
@@ -360,21 +450,31 @@ async fn read_files(operations: &[EditOperation]) -> Result<BTreeMap<String, Str
 /// faults that the model cannot simply retry around.
 #[derive(Debug)]
 enum AbortReason {
-    /// One edit's target is a symbolic link (named in the message). Produced
-    /// by the Phase 1 symlink pre-check, before any file is read or written.
+    /// One edit's target is a symbolic link (named in the message).
+    ///
+    /// Produced by [`symlink_check`], before any file is written.
     Symlink(String),
-    /// Two edits resolve to the same physical file under different path
-    /// aliases (named in the message) — the result would be ambiguous.
-    /// Produced by the Phase 1 duplicate-path check.
+
+    /// Two edits resolve to the same physical file under different path aliases.
+    ///
+    /// The aliases are named in the message; the result would be ambiguous.
+    /// Produced by [`dup_path_check`].
     DupPath(String),
-    /// One edit's `old_text` is absent or not unique in the running content
-    /// (named in the message). Produced by [`merge_per_file`] during Phase 2.
+
+    /// One edit's `old_text` is absent or not unique in the running content.
+    ///
+    /// The file is named in the message. Produced by [`merge_per_file`].
     Locate(String),
+
     /// Two edits' byte-ranges overlap in the same file (named in the message).
-    /// Produced by the Phase 1.5 overlap check (skipped in `dry_run`).
+    ///
+    /// Produced by [`overlap_check`], which runs in both `dry_run` and apply
+    /// modes so the preview shows exactly what an apply would catch.
     Overlap(String),
+
     /// The linter rejected one file's merged content (named in the message).
-    /// Produced by the Phase 2 linter gate (skipped when `skip_linter`).
+    ///
+    /// Produced by [`lint_all`] (skipped when `skip_linter` is set).
     Lint(String),
 }
 
@@ -394,16 +494,15 @@ impl AbortReason {
     }
 }
 
-/// Reject the batch if two edits resolve to the same physical file under
-/// different path aliases (e.g. `a.rs` and `./a.rs`).
+/// Reject the batch if two edits resolve to the same physical file under different path aliases.
 ///
-/// Each edit would otherwise be merged independently against the same original,
-/// and the second write would silently clobber the first — losing one
-/// edit-set. Refusing is safer than picking a winner. Multiple edits sharing
-/// both `file_path` and `full_path` (the normal multi-edit-to-one-file case)
-/// are allowed.
+/// Aliases like `a.rs` and `./a.rs` are the trigger. Maps each resolved path to the first caller-supplied path seen for it and
+/// rejects on any later alias. Each edit would otherwise be merged
+/// independently against the same original, and the second write would
+/// silently clobber the first — losing one edit-set. Refusing is safer than
+/// picking a winner. Multiple edits sharing both `file_path` and `full_path`
+/// (the normal multi-edit-to-one-file case) are allowed.
 fn dup_path_check(operations: &[EditOperation]) -> Option<AbortReason> {
-    // Map each resolved path to the first caller-supplied path seen for it.
     let mut owner: std::collections::HashMap<&Path, &str> = std::collections::HashMap::new();
     for op in operations {
         match owner.get(op.full_path.as_path()) {
@@ -425,8 +524,7 @@ fn dup_path_check(operations: &[EditOperation]) -> Option<AbortReason> {
     None
 }
 
-/// Reject the batch if any distinct target — or any of its ancestor
-/// directories — is a symbolic link.
+/// Reject the batch if any distinct target — or any of its ancestor directories — is a symbolic link.
 ///
 /// `atomic_write`'s own symlink guard fires at write time and checks only the
 /// final component, too late for the atomic contract (file #1 could already be
@@ -436,7 +534,6 @@ fn dup_path_check(operations: &[EditOperation]) -> Option<AbortReason> {
 fn symlink_check(operations: &[EditOperation]) -> Option<AbortReason> {
     let mut seen = std::collections::HashSet::new();
     for op in operations {
-        // Walk from the target up through each ancestor, without following links.
         for ancestor in op.full_path.ancestors() {
             if !seen.insert(ancestor) {
                 continue;
@@ -498,14 +595,17 @@ struct EditConflict {
 /// Two edits to one file conflict when one's matched byte-range intersects the
 /// other's (one contains the other, or they share text). Applying either first
 /// would invalidate the other's match. Different files never conflict, even
-/// with identical `old_text`.
+/// with identical `old_text`; a file needs at least two edits before a pair
+/// can exist. Each edit contributes at most one range — the first
+/// occurrence's, since full uniqueness is only enforced later by
+/// [`locate_unique`] at merge time. Each
+/// conflicting pair is reported once, deduplicated by its sorted index pair.
 fn detect_edit_conflicts(
     operations: &[EditOperation],
     file_contents: &BTreeMap<String, String>,
 ) -> Vec<EditConflict> {
     let mut conflicts = Vec::new();
 
-    // Group edits by file.
     let mut file_edits: BTreeMap<String, Vec<(usize, &str)>> = BTreeMap::new();
     for (i, op) in operations.iter().enumerate() {
         file_edits
@@ -515,7 +615,6 @@ fn detect_edit_conflicts(
     }
 
     for (file_path, edits) in &file_edits {
-        // Only check files with 2+ edits.
         if edits.len() < 2 {
             continue;
         }
@@ -523,7 +622,6 @@ fn detect_edit_conflicts(
             continue;
         };
 
-        // One range per edit (uniqueness already enforced by locate_unique).
         let mut ranges: Vec<(usize, usize, usize, &str)> = Vec::new();
         for (edit_idx, old_text) in edits {
             if let Some(start) = content.find(old_text) {
@@ -533,10 +631,8 @@ fn detect_edit_conflicts(
             }
         }
 
-        // Sort by start position.
         ranges.sort_by_key(|r| r.0);
 
-        // Check for overlapping ranges between different edits.
         for i in 0..ranges.len() {
             let Some(&(_start_a, end_a, idx_a, snippet_a)) = ranges.get(i) else {
                 continue;
@@ -559,7 +655,6 @@ fn detect_edit_conflicts(
         }
     }
 
-    // Deduplicate by sorted index pair.
     let mut seen = std::collections::HashSet::new();
     conflicts.retain(|c| {
         let key = (
@@ -594,11 +689,12 @@ fn truncate_str(s: &str, max_len: usize) -> &str {
 /// Delegates the detection to [`detect_edit_conflicts`] and, on the first
 /// conflict, formats a message naming both edits (by 1-indexed position and a
 /// truncated `old_text` snippet) with a hint to split the batch or dry-run.
+/// Runs in both `dry_run` and apply modes so the preview shows exactly what
+/// an apply would catch.
 fn overlap_check(
     operations: &[EditOperation],
     originals: &BTreeMap<String, String>,
 ) -> Option<AbortReason> {
-    use std::fmt::Write;
     let conflicts = detect_edit_conflicts(operations, originals);
     if conflicts.is_empty() {
         return None;
@@ -635,13 +731,13 @@ fn overlap_check(
     Some(AbortReason::Overlap(msg))
 }
 
-/// Merge each file's edits sequentially (array order, each seeing the prior's
-/// output) into a final content map, validating each edit's `old_text` is
-/// unique in the *running* content at that point.
+/// Merge each file's edits sequentially into a final content map, validating uniqueness as it goes.
 ///
-/// A later edit to the same file may target text that only exists after an
-/// earlier edit runs — so the locate check must be against the accumulated
-/// content, not the original.
+/// Edits run in array order, each seeing the prior's output; each edit's
+/// `old_text` must be unique in the *running* content at that point. A later
+/// edit to the same file may target text that only exists after an earlier
+/// edit runs — so the locate check must be against the accumulated content,
+/// not the original.
 ///
 /// # Errors
 ///
@@ -728,7 +824,6 @@ fn build_preview(
     }
     lines.push(String::new());
 
-    // Distinct files in first-seen order, so the preview follows the batch.
     let mut seen = std::collections::HashSet::new();
     let mut index = 1usize;
     for op in operations {
@@ -789,19 +884,12 @@ mod tests {
     use crate::context::RunnerContext;
     use loopctl::tool::ToolContext;
     use std::path::PathBuf;
-    use std::sync::Arc;
-    use std::sync::Mutex;
 
     /// Builds a `ToolContext` with a `RunnerContext` pointing at `cwd`.
     fn ctx_in(cwd: &str) -> ToolContext {
         let mut ctx = ToolContext::default();
         ctx.cwd = cwd.to_string();
-        let rc = RunnerContext {
-            cwd: PathBuf::from(cwd),
-            todos: Arc::new(Mutex::new(Vec::new())),
-            question_tx: Arc::new(Mutex::new(None)),
-        };
-        ctx.set_extension(rc);
+        ctx.set_extension(RunnerContext::new(PathBuf::from(cwd)));
         ctx
     }
 
@@ -1438,6 +1526,7 @@ mod tests {
         let written = std::fs::read_to_string(&f).unwrap();
         assert!(written.contains("delta"), "{written}");
         assert!(written.contains("alpha"), "{written}");
+        assert_eq!(out.display_hint, Some(DisplayHint::Diff));
     }
 
     #[tokio::test]
@@ -1466,6 +1555,7 @@ mod tests {
             "{}",
             out.text_content()
         );
+        assert_eq!(out.display_hint, Some(DisplayHint::Diff));
         // Nothing written.
         assert_eq!(std::fs::read_to_string(&f1).unwrap(), orig1);
         assert_eq!(std::fs::read_to_string(&f2).unwrap(), orig2);
@@ -1860,5 +1950,107 @@ mod tests {
         );
         // Nothing written.
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "content\n");
+    }
+
+    /// The per-file conflict check itself cannot be triggered end-to-end (the
+    /// mutation would have to land inside one `call`), so the batch-abort
+    /// contract is pinned by driving `write_finals` directly: a phase-1
+    /// baseline of "A" against on-disk "EXTERNAL" must abort before the
+    /// atomic write.
+    #[tokio::test]
+    async fn write_finals_aborts_on_an_externally_changed_file_without_writing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("a.rs");
+        std::fs::write(&target, "EXTERNAL").unwrap();
+        let mut originals = BTreeMap::new();
+        originals.insert("a.rs".to_string(), "A".to_string());
+        let mut finals = BTreeMap::new();
+        finals.insert("a.rs".to_string(), "rewritten".to_string());
+        let operations = vec![EditOperation {
+            file_path: "a.rs".to_string(),
+            full_path: target.clone(),
+            old_text: "A".to_string(),
+            new_text: "rewritten".to_string(),
+        }];
+
+        let outcome = write_finals(&operations, &originals, &finals, None)
+            .await
+            .unwrap();
+        let conflict = outcome.expect("an externally changed file aborts the batch");
+        assert_eq!(conflict.path, "a.rs");
+        assert!(
+            conflict.applied.is_empty(),
+            "nothing is written before the conflict on the first file"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "EXTERNAL",
+            "the conflicted file must not be written"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_finals_reports_the_files_written_before_a_later_conflict() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let first = tmp.path().join("a.rs");
+        let second = tmp.path().join("b.rs");
+        std::fs::write(&first, "A").unwrap();
+        std::fs::write(&second, "EXTERNAL").unwrap();
+        let mut originals = BTreeMap::new();
+        originals.insert("a.rs".to_string(), "A".to_string());
+        originals.insert("b.rs".to_string(), "B".to_string());
+        let mut finals = BTreeMap::new();
+        finals.insert("a.rs".to_string(), "a2".to_string());
+        finals.insert("b.rs".to_string(), "b2".to_string());
+        let operations = vec![
+            EditOperation {
+                file_path: "a.rs".to_string(),
+                full_path: first.clone(),
+                old_text: "A".to_string(),
+                new_text: "a2".to_string(),
+            },
+            EditOperation {
+                file_path: "b.rs".to_string(),
+                full_path: second.clone(),
+                old_text: "B".to_string(),
+                new_text: "b2".to_string(),
+            },
+        ];
+
+        let outcome = write_finals(&operations, &originals, &finals, None)
+            .await
+            .unwrap();
+        let conflict = outcome.expect("the second file's conflict aborts the batch");
+        assert_eq!(conflict.path, "b.rs");
+        assert_eq!(conflict.applied, vec!["a.rs".to_string()]);
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "a2");
+        assert_eq!(
+            std::fs::read_to_string(&second).unwrap(),
+            "EXTERNAL",
+            "the conflicted file must not be written"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_finals_writes_through_when_disk_matches_the_batch_baseline() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("a.rs");
+        std::fs::write(&target, "A").unwrap();
+        let mut originals = BTreeMap::new();
+        originals.insert("a.rs".to_string(), "A".to_string());
+        let mut finals = BTreeMap::new();
+        finals.insert("a.rs".to_string(), "rewritten".to_string());
+        let operations = vec![EditOperation {
+            file_path: "a.rs".to_string(),
+            full_path: target.clone(),
+            old_text: "A".to_string(),
+            new_text: "rewritten".to_string(),
+        }];
+
+        let outcome = write_finals(&operations, &originals, &finals, None)
+            .await
+            .unwrap();
+        assert!(outcome.is_none(), "matching disk content must not abort");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "rewritten");
     }
 }

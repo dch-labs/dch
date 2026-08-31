@@ -1,35 +1,39 @@
 //! The runner context extension stored on each `loopctl::tool::ToolContext`.
 //!
 //! Tools retrieve it with [`runner_ctx`] to reach per-call, tool-facing state:
-//! the working directory, the agent's per-run todo list, and the channel slot
-//! for asking the user interactive questions. Session-lifetime records
-//! (file-touch history for staleness detection, etc.) are owned by the outer
-//! runner layer and recorded via an observer on tool dispatch — not by the
-//! tools and not via this context.
+//! the working directory, the agent's per-run todo list, the channel slot
+//! for asking the user interactive questions, and the session's file-read
+//! history that backs the Write tool's staleness check.
 
 use std::fmt;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::mpsc;
 
+use loopctl::tool::ToolError;
+
 use crate::question::QuestionRequest;
+use crate::state::FileBaselines;
 use crate::todo::TodoEntry;
 
 /// Per-call, tool-facing context attached to every `ToolContext`.
 ///
 /// Carries what a tool invocation needs that is specific to this run and isn't
 /// already on loopctl's `ToolContext`: the working directory (as a `PathBuf`,
-/// the form the file tools prefer), the agent's per-run todo list, and the
-/// optional channel a tool uses during its call to ask the user a question.
-/// Stored as a typed extension via
+/// the form the file tools prefer), the agent's per-run todo list, the
+/// optional channel a tool uses during its call to ask the user a question,
+/// and the model's file-baseline map backing the Write tool's staleness
+/// check. Stored as a typed extension via
 /// [`ToolContext::set_extension`](loopctl::tool::ToolContext::set_extension)
 /// and retrieved with [`runner_ctx`].
 ///
-/// Cloning is cheap — `todos` and `question_tx` are behind `Arc`s, so clones
-/// share the same mutable list and the same channel slot rather than copying
-/// them. This is how multiple tool invocations within one run observe each
-/// other's todo-list mutations.
+/// Cloning is cheap — `todos`, `question_tx`, and `file_baselines` are
+/// behind `Arc`s, so clones share the same mutable list, the same channel
+/// slot, and the same map rather than copying them. This is how multiple
+/// tool invocations within one run observe each other's todo-list mutations
+/// (and how a Write sees what a prior Read recorded).
 #[derive(Clone)]
 pub struct RunnerContext {
     /// The working directory the agent operates within.
@@ -59,6 +63,63 @@ pub struct RunnerContext {
     /// installation affects subsequent dispatches immediately. Cloning
     /// [`RunnerContext`] shares the same slot.
     pub question_tx: Arc<Mutex<Option<mpsc::Sender<QuestionRequest>>>>,
+
+    /// The model's latest known content hash per touched file.
+    ///
+    /// Read records what it observes; a successful write records the
+    /// post-write content (see [`FileBaselines`]). The Write tool's
+    /// detect-on-write conflict check compares the target's current content
+    /// hash against this record before overwriting. Concurrent touches of
+    /// one path resolve to the newest observation. Cloning
+    /// [`RunnerContext`] shares the same map.
+    pub file_baselines: Arc<Mutex<FileBaselines>>,
+}
+
+impl RunnerContext {
+    /// Create a context for `cwd` with an empty todo list, no question
+    /// channel, and no recorded file baselines.
+    ///
+    /// A relative `cwd` is anchored to the process's current directory.
+    /// [`resolve_path`](crate::util::resolve_path) decides containment by
+    /// comparing lexical prefixes, and a bare `.` normalizes to nothing —
+    /// left un-anchored, it would reject every relative target. `.` and
+    /// trailing separators are stripped; symlinks are not resolved, matching
+    /// the lexical philosophy applied to targets. On the rare failure of the
+    /// current-directory probe, `cwd` is stored as given.
+    #[must_use]
+    pub fn new(cwd: PathBuf) -> Self {
+        let cwd = std::path::absolute(&cwd).unwrap_or(cwd);
+        Self {
+            cwd,
+            todos: Arc::new(Mutex::new(Vec::new())),
+            question_tx: Arc::new(Mutex::new(None)),
+            file_baselines: Arc::new(Mutex::new(FileBaselines::default())),
+        }
+    }
+
+    /// Record an observation as the model's latest known state of `path`.
+    ///
+    /// Thin locking wrapper over [`record`](crate::state::record), which owns
+    /// the ordering semantics (newest observation wins; an older one arriving
+    /// out of order is discarded).
+    pub(crate) fn record_baseline(&self, path: &Path, baseline: crate::state::FileBaseline) {
+        let mut baselines = self
+            .file_baselines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::state::record(&mut baselines, path, baseline);
+    }
+
+    /// The content hash recorded for `path`, if the path was touched.
+    ///
+    /// Thin locking wrapper over [`baseline`](crate::state::baseline).
+    pub(crate) fn baseline_for(&self, path: &Path) -> Option<u64> {
+        let baselines = self
+            .file_baselines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::state::baseline(&baselines, path)
+    }
 }
 
 impl fmt::Debug for RunnerContext {
@@ -68,10 +129,16 @@ impl fmt::Debug for RunnerContext {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_some();
+        let baselines = self
+            .file_baselines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
         f.debug_struct("RunnerContext")
             .field("cwd", &self.cwd)
             .field("todos", &self.todos)
             .field("question_tx", &has_channel)
+            .field("file_baselines", &baselines)
             .finish()
     }
 }
@@ -90,12 +157,7 @@ impl fmt::Debug for RunnerContext {
 /// let mut ctx = loopctl::tool::ToolContext::default();
 /// assert!(runner_ctx(&ctx).is_none());
 ///
-/// let rc = RunnerContext {
-///     cwd: ".".into(),
-///     todos: Default::default(),
-///     question_tx: Default::default(),
-/// };
-/// ctx.set_extension(rc);
+/// ctx.set_extension(RunnerContext::new(".".into()));
 /// assert!(runner_ctx(&ctx).is_some());
 /// ```
 #[must_use]
@@ -103,10 +165,29 @@ pub fn runner_ctx(ctx: &loopctl::tool::ToolContext) -> Option<&RunnerContext> {
     ctx.get_extension::<RunnerContext>()
 }
 
-// Statically asserts `RunnerContext: Send + Sync`, the bound required to store
-// it as a `ToolContext` extension. `Arc<Mutex<Vec<TodoEntry>>>` is
-// `Send + Sync`, `Arc<Mutex<Option<mpsc::Sender<_>>>>` is `Send + Sync`, and
-// `PathBuf` is trivially so.
+/// Extract the working directory from an optional [`RunnerContext`].
+///
+/// Every tool's dispatch starts with this resolution: the extension is
+/// installed by the runner before each tool call, so its absence means the
+/// tool ran outside a dch-composed pipeline.
+///
+/// # Errors
+///
+/// Returns [`ToolError::Execution`] naming the missing extension when
+/// `runner_context` is `None`.
+pub fn require_cwd(runner_context: Option<RunnerContext>) -> Result<PathBuf, ToolError> {
+    runner_context.map(|rc| rc.cwd).ok_or_else(|| {
+        ToolError::Execution(
+            "RunnerContext extension is not installed on the ToolContext".to_string(),
+        )
+    })
+}
+
+/// Statically asserts `RunnerContext: Send + Sync`, the bound required to store it as a `ToolContext` extension.
+///
+/// `Arc<Mutex<Vec<TodoEntry>>>` is `Send + Sync`,
+/// `Arc<Mutex<Option<mpsc::Sender<_>>>>` is `Send + Sync`, and `PathBuf` is
+/// trivially so.
 const _: fn() = || {
     fn assert_bounds<T: Send + Sync>() {}
     assert_bounds::<RunnerContext>();
@@ -129,11 +210,29 @@ mod tests {
     use loopctl::tool::ToolContext;
 
     fn sample() -> RunnerContext {
-        RunnerContext {
-            cwd: PathBuf::from("/tmp/workspace"),
-            todos: Arc::new(Mutex::new(Vec::new())),
-            question_tx: Arc::new(Mutex::new(None)),
-        }
+        RunnerContext::new(PathBuf::from("/tmp/workspace"))
+    }
+
+    #[test]
+    fn new_makes_a_relative_cwd_absolute() {
+        let rc = RunnerContext::new(PathBuf::from("."));
+        assert!(
+            rc.cwd.is_absolute(),
+            "a bare `.` must anchor to the process cwd: {:?}",
+            rc.cwd
+        );
+        assert_eq!(rc.cwd, std::env::current_dir().unwrap());
+    }
+
+    #[test]
+    fn a_relative_cwd_resolves_relative_targets() {
+        let rc = RunnerContext::new(PathBuf::from("."));
+        let resolved = crate::util::resolve_path("src/main.rs", &rc.cwd).unwrap();
+        assert!(
+            resolved.is_absolute(),
+            "the target must resolve against the anchored cwd: {resolved:?}"
+        );
+        assert!(resolved.ends_with(Path::new("src/main.rs")));
     }
 
     #[test]

@@ -6,22 +6,21 @@
 //! `.gitignore`'d paths via the shared gitignore-aware walker.
 
 use std::collections::HashMap;
-use std::future::Future;
 use std::path::Path;
 use std::path::PathBuf;
-use std::pin::Pin;
 
-use loopctl::tool::Tool;
+use loopctl::Tool;
 use loopctl::tool::ToolContext;
 use loopctl::tool::ToolError;
 use loopctl::tool::ToolOutput;
-use loopctl::tool::ToolSchema;
+use serde::Deserialize;
+use serde::Serialize;
 use serde_json::Value;
-use serde_json::json;
 
 use crate::context::RunnerContext;
+use crate::context::require_cwd;
 use crate::context::runner_ctx;
-use crate::util::is_url;
+use crate::util::reject_url;
 use crate::util::resolve_path;
 use crate::walk::WalkEntry;
 use crate::walk::matches_any_glob;
@@ -36,74 +35,67 @@ const MIN_MAX_DEPTH: usize = 1;
 /// Ceiling for a caller-supplied `max_depth`; values above this are lowered.
 const MAX_MAX_DEPTH: usize = 50;
 
-/// Display directory tree structure with depth limits and filtering.
+/// Input for the Tree tool.
 ///
-/// Respects `.gitignore`. Read-only and concurrency-safe — Tree only reads
-/// directory metadata and never mutates the filesystem.
-pub struct TreeTool;
-
-impl Tool for TreeTool {
-    fn name(&self) -> &'static str {
-        "Tree"
-    }
-
-    fn description(&self) -> &'static str {
-        "Display directory tree structure with depth limits and filtering. \
+/// Displays a Unicode box-drawing directory tree up to `max_depth`, honoring
+/// `.gitignore`, optionally including files and filtering them by a glob
+/// pattern, with an `N directories, M files` summary.
+#[derive(Default, Deserialize, Serialize, Tool)]
+#[tool(
+    name = "Tree",
+    read_only,
+    concurrency_safe,
+    description = "Display directory tree structure with depth limits and filtering. \
          Respects .gitignore."
-    }
+)]
+pub struct TreeInput {
+    /// The directory to display, defaulting to the current working directory.
+    ///
+    /// May be relative, in which case it is resolved against the runner's cwd,
+    /// not the process's. URLs are rejected, and the path must exist and be a
+    /// directory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
 
-    fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            tool: self.name().to_string(),
-            description: self.description().to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Directory to display (defaults to current working directory)",
-                        "default": "."
-                    },
-                    "max_depth": {
-                        "type": "integer",
-                        "description": "Maximum depth to display (clamped to 1-50)",
-                        "minimum": 1,
-                        "maximum": 50,
-                        "default": 3
-                    },
-                    "include_files": {
-                        "type": "boolean",
-                        "description": "Whether to include files (true) or only directories (false)",
-                        "default": true
-                    },
-                    "pattern": {
-                        "type": "string",
-                        "description": "Glob pattern to filter files (e.g., '*.rs')"
-                    }
-                }
-            }),
-        }
-    }
+    /// Maximum directory depth to display (default: 3, clamped to 1-50).
+    ///
+    /// Values below 1 are raised to 1 and values above 50 are lowered to 50,
+    /// so an out-of-range request still yields a sensible tree. Depth 1 shows
+    /// only the direct children of `path`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_depth: Option<usize>,
 
-    fn call(
-        &self,
-        input: Value,
-        ctx: &ToolContext,
-    ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
-        let rc = runner_ctx(ctx).cloned();
-        Box::pin(self.tree_inner(input, rc))
-    }
+    /// Whether to include files in addition to directories (default: true).
+    ///
+    /// When `false`, only directories are listed and every file is filtered
+    /// out, including ones matching `pattern`. The `N directories, M files`
+    /// summary reflects the filtered result.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    include_files: Option<bool>,
 
-    fn is_read_only(&self) -> bool {
-        true
-    }
-
-    fn is_concurrency_safe(&self) -> bool {
-        true
-    }
+    /// Glob pattern filtering which files are shown (e.g., '*.rs').
+    ///
+    /// Applied to files only — directories are always kept. A pattern
+    /// containing `/` matches the path relative to `path`; otherwise it
+    /// matches the filename alone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pattern: Option<String>,
 }
 
-impl TreeTool {
+impl TreeInput {
+    /// Serializes the typed input and delegates to `tree_inner`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError`] when the input cannot be serialized back to JSON
+    /// or when `tree_inner` fails.
+    async fn run(&self, input: Self, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        let rc = runner_ctx(ctx).cloned();
+        let value = serde_json::to_value(&input)
+            .map_err(|e| ToolError::Execution(format!("serialize tool input: {e}")))?;
+        self.tree_inner(value, rc).await
+    }
+
     /// Body of [`Tool::call`].
     ///
     /// # Errors
@@ -117,22 +109,10 @@ impl TreeTool {
         input: Value,
         rc: Option<RunnerContext>,
     ) -> Result<ToolOutput, ToolError> {
-        let cwd = rc
-            .as_ref()
-            .ok_or_else(|| {
-                ToolError::Execution(
-                    "RunnerContext extension is not installed on the ToolContext".to_string(),
-                )
-            })?
-            .cwd
-            .clone();
+        let cwd = require_cwd(rc)?;
 
         let base_path = input.get("path").and_then(Value::as_str).unwrap_or(".");
-        if is_url(base_path) {
-            return Err(ToolError::InvalidInput(
-                "URLs are not supported by the Tree tool. Use WebFetch for URLs.".to_string(),
-            ));
-        }
+        reject_url("Tree", base_path)?;
 
         let max_depth = input
             .get("max_depth")
@@ -297,9 +277,11 @@ fn render_children(
 
 /// Build the `N director(y|ies), M file(s)` summary line.
 ///
-/// Singularizes both nouns when the count is exactly one; otherwise uses
-/// the plural forms. The format and pluralization rules are part of the
-/// tool's output contract, ported verbatim from the source.
+/// The output is a single `{dirs} {dir_word}, {files} {file_word}` line:
+/// directory and file counts separated by a comma, with each noun
+/// singularized only when its count is exactly one and pluralized otherwise
+/// (including zero, which reads as `0 directories, 0 files`). Counts cover
+/// the filtered entry list only, not the unfiltered walk.
 fn format_summary(filtered: &[WalkEntry]) -> String {
     let dir_count = filtered.iter().filter(|e| e.is_dir).count();
     let file_count = filtered.iter().filter(|e| !e.is_dir).count();
@@ -326,19 +308,13 @@ mod tests {
     use super::*;
     use crate::context::RunnerContext;
     use loopctl::tool::ToolContext;
+    use serde_json::json;
     use std::path::PathBuf;
-    use std::sync::Arc;
-    use std::sync::Mutex;
 
     fn ctx_in(cwd: &str) -> ToolContext {
         let mut ctx = ToolContext::default();
         ctx.cwd = cwd.to_string();
-        let rc = RunnerContext {
-            cwd: PathBuf::from(cwd),
-            todos: Arc::new(Mutex::new(Vec::new())),
-            question_tx: Arc::new(Mutex::new(None)),
-        };
-        ctx.set_extension(rc);
+        ctx.set_extension(RunnerContext::new(PathBuf::from(cwd)));
         ctx
     }
 
@@ -475,7 +451,7 @@ mod tests {
         std::fs::write(root.join("a/file.rs"), "x").unwrap();
 
         let cwd = root.to_str().unwrap();
-        let tool = TreeTool;
+        let tool = TreeInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({"path": "."});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -495,7 +471,7 @@ mod tests {
         std::fs::write(root.join("a/b/deep.rs"), "x").unwrap();
 
         let cwd = root.to_str().unwrap();
-        let tool = TreeTool;
+        let tool = TreeInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({"path": ".", "max_depth": 1});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -512,7 +488,7 @@ mod tests {
         std::fs::write(root.join("file.txt"), "x").unwrap();
 
         let cwd = root.to_str().unwrap();
-        let tool = TreeTool;
+        let tool = TreeInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({"path": ".", "include_files": false});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -529,7 +505,7 @@ mod tests {
         std::fs::write(root.join("b.md"), "x").unwrap();
 
         let cwd = root.to_str().unwrap();
-        let tool = TreeTool;
+        let tool = TreeInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({"path": ".", "pattern": "*.rs"});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -550,7 +526,7 @@ mod tests {
         std::fs::write(root.join("b.md"), "x").unwrap();
 
         let cwd = root.to_str().unwrap();
-        let tool = TreeTool;
+        let tool = TreeInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({"path": ".", "include_files": false});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -576,7 +552,7 @@ mod tests {
         std::fs::write(root.join("b.md"), "x").unwrap();
 
         let cwd = root.to_str().unwrap();
-        let tool = TreeTool;
+        let tool = TreeInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({"path": ".", "pattern": "*.nomatch"});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -603,7 +579,7 @@ mod tests {
         std::fs::write(root.join("a/b/deep.rs"), "x").unwrap();
 
         let cwd = root.to_str().unwrap();
-        let tool = TreeTool;
+        let tool = TreeInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({"path": ".", "max_depth": 0});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -629,7 +605,7 @@ mod tests {
         std::fs::write(root.join("a/b/deep.rs"), "x").unwrap();
 
         let cwd = root.to_str().unwrap();
-        let tool = TreeTool;
+        let tool = TreeInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({"path": ".", "max_depth": 9999});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -642,7 +618,7 @@ mod tests {
     async fn missing_path_is_soft_error() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = TreeTool;
+        let tool = TreeInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({"path": "nope"});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -656,7 +632,7 @@ mod tests {
         let file = tmp.path().join("f.txt");
         std::fs::write(&file, "x").unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = TreeTool;
+        let tool = TreeInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({"path": "f.txt"});
         let err = tool.call(input, &ctx).await.unwrap_err();
@@ -670,7 +646,7 @@ mod tests {
     async fn url_rejected() {
         let tmp = tempfile::TempDir::new().unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = TreeTool;
+        let tool = TreeInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({"path": "https://example.com/x"});
         let err = tool.call(input, &ctx).await.unwrap_err();
@@ -686,7 +662,7 @@ mod tests {
         let sub = tmp.path().join("empty");
         std::fs::create_dir(&sub).unwrap();
         let cwd = tmp.path().to_str().unwrap();
-        let tool = TreeTool;
+        let tool = TreeInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({"path": "empty"});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -704,7 +680,7 @@ mod tests {
         std::fs::write(root.join("f2.txt"), "x").unwrap();
 
         let cwd = root.to_str().unwrap();
-        let tool = TreeTool;
+        let tool = TreeInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({"path": "."});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -722,7 +698,7 @@ mod tests {
         std::fs::write(root.join("kept.txt"), "x").unwrap();
 
         let cwd = root.to_str().unwrap();
-        let tool = TreeTool;
+        let tool = TreeInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({"path": "."});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -744,7 +720,7 @@ mod tests {
         std::fs::write(root.join("main.rs"), "x").unwrap();
 
         let cwd = root.to_str().unwrap();
-        let tool = TreeTool;
+        let tool = TreeInput::default();
         let ctx = ctx_in(cwd);
         let input = json!({"path": "."});
         let out = tool.call(input, &ctx).await.unwrap();
@@ -758,11 +734,11 @@ mod tests {
 
     #[test]
     fn trait_contract_and_registry() {
-        let tool = TreeTool;
+        let tool = TreeInput::default();
         assert_eq!(tool.name(), "Tree");
         assert!(tool.is_read_only());
         assert!(tool.is_concurrency_safe());
         let reg = crate::registry::builtin_registry();
-        assert!(reg.get("Tree").is_some(), "TreeTool registered");
+        assert!(reg.get("Tree").is_some(), "Tree registered");
     }
 }
