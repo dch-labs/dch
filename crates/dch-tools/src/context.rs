@@ -11,7 +11,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::mpsc;
-use std::time::SystemTime;
 
 use loopctl::tool::ToolError;
 
@@ -65,13 +64,13 @@ pub struct RunnerContext {
     /// [`RunnerContext`] shares the same slot.
     pub question_tx: Arc<Mutex<Option<mpsc::Sender<QuestionRequest>>>>,
 
-    /// The model's latest known `mtime` per touched file.
+    /// The model's latest known content hash per touched file.
     ///
     /// Read records what it observes; a successful write records the
-    /// post-write `mtime` (see [`FileBaselines`]). The Write tool's
-    /// detect-on-write conflict check compares the target's current `mtime`
-    /// against this record before overwriting. Cloning [`RunnerContext`]
-    /// shares the same map.
+    /// post-write content (see [`FileBaselines`]). The Write tool's
+    /// detect-on-write conflict check compares the target's current content
+    /// hash against this record before overwriting. Cloning
+    /// [`RunnerContext`] shares the same map.
     pub file_baselines: Arc<Mutex<FileBaselines>>,
 }
 
@@ -97,24 +96,22 @@ impl RunnerContext {
         }
     }
 
-    /// Record `mtime` as the model's latest known state of `path`.
+    /// Record `hash` as the model's latest known state of `path`.
     ///
     /// Thin locking wrapper over [`record`](crate::state::record), which owns
-    /// the semantics (latest touch wins; an unmeasurable touch clears the
-    /// baseline).
-    pub(crate) fn record_baseline(&self, path: &Path, mtime: Option<SystemTime>) {
+    /// the semantics (latest touch wins).
+    pub(crate) fn record_baseline(&self, path: &Path, hash: u64) {
         let mut baselines = self
             .file_baselines
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        crate::state::record(&mut baselines, path, mtime);
+        crate::state::record(&mut baselines, path, hash);
     }
 
-    /// The recorded baseline for `path`, when the latest touch measured an
-    /// `mtime`.
+    /// The recorded baseline for `path`, if the path was touched.
     ///
     /// Thin locking wrapper over [`baseline`](crate::state::baseline).
-    pub(crate) fn baseline_for(&self, path: &Path) -> Option<SystemTime> {
+    pub(crate) fn baseline_for(&self, path: &Path) -> Option<u64> {
         let baselines = self
             .file_baselines
             .lock()

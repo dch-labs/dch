@@ -26,15 +26,27 @@ use crate::util::resolve_path;
 use crate::walk;
 
 /// Maximum number of lines returned by the Read tool.
+///
+/// Larger views go through [`FileViewer`](crate::FileViewerInput), which
+/// paginates instead of truncating.
 pub const MAX_FILE_READ_LINES: usize = 200;
 
 /// Maximum file size before we refuse to read entirely.
+///
+/// Distinct from the truncation caps below: past this size the tool refuses
+/// outright and points at `FileViewer` rather than truncating.
 pub const MAX_FILE_SIZE_BYTES: usize = 10 * 1024 * 1024;
 
 /// Maximum bytes of content returned (~100K tokens); guards long-line files.
+///
+/// A minified bundle or one-line log can blow past the line cap in a single
+/// line, so the byte cap truncates it with a pointer to `FileViewer`.
 const MAX_FILE_READ_BYTES: usize = 400_000;
 
 /// Default limit when `offset` is provided but `limit` is not.
+///
+/// Reads that start mid-file get a smaller window than the
+/// from-the-top default: the model is paging, not skimming.
 const DEFAULT_OFFSET_LIMIT: usize = 200;
 
 /// Input for the Read tool.
@@ -131,14 +143,13 @@ impl ReadInput {
             )));
         }
 
-        if let Some(rc) = &runner_context {
-            let mtime = crate::state::current_mtime(&full_path).await;
-            rc.record_baseline(&full_path, mtime);
-        }
-
         let bytes = read_capped(&full_path).await?;
         if let Some(too_large) = too_large_if_over(bytes.len() as u64) {
             return Ok(too_large);
+        }
+
+        if let Some(rc) = &runner_context {
+            rc.record_baseline(&full_path, crate::state::content_hash(&bytes));
         }
         if let Some(mime) = mime_type_from_path(&full_path) {
             return Ok(image_output(mime, &bytes));
@@ -968,14 +979,9 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(baselines.len(), 1, "one successful read, one baseline");
-        let actual = std::fs::metadata(&path).unwrap().modified().unwrap();
         assert_eq!(
             crate::state::baseline(&baselines, path.as_path()),
-            Some(actual)
+            Some(crate::state::content_hash("hello world\n".as_bytes()))
         );
-
-        // The best-effort half of the contract (a failed stat records `None`
-        // instead of failing the read) is pinned by `current_mtime`'s unit
-        // test in `state.rs`, which is the capture helper this site calls.
     }
 }

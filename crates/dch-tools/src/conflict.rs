@@ -1,62 +1,17 @@
 //! Detect-on-write conflict checks for the file-writing tools.
 //!
-//! Each writing tool re-verifies that its target has not changed on disk
+//! Each writing tool re-verifies that its target's bytes have not changed
 //! since the tool captured its baseline, immediately before the write. This
 //! narrows the read→write race window from the whole call to the gap between
-//! the check and the write; that residual gap is deliberate (see
-//! [`check_content_unchanged`]). Two baselines exist because the tools hold
-//! different data: `Edit` and `MultiEdit` hold the bytes they read, so they
-//! compare content exactly; `Write` never reads first, so it compares the
-//! `mtime` that Read recorded for the path.
+//! the check and the write; that residual gap is deliberate (both checks
+//! document it). The tools hold baselines in two shapes, and each has a
+//! matching check: `Edit` and `MultiEdit` hold the bytes they read and
+//! compare them exactly; `Write` holds the content hash Read recorded for
+//! the path and compares hashes.
 
 use std::path::Path;
-use std::time::SystemTime;
 
 use loopctl::tool::ToolError;
-
-/// The file changed on disk between baseline capture and the write.
-///
-/// Recoverable: the model re-reads the file and re-issues the write against
-/// the current content. Mirrors the existing soft-error shapes (the Edit
-/// tool's not-found and ambiguous-match outputs).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Conflict {
-    /// Bytes on disk differ from the baseline bytes.
-    ///
-    /// Used by `Edit` and `MultiEdit`, which hold the content they read and
-    /// can therefore compare exactly.
-    Content,
-
-    /// The `mtime` on disk differs from the baseline `mtime`.
-    ///
-    /// Used by `Write`, whose baseline is the `mtime` Read recorded for the
-    /// path.
-    Mtime,
-}
-
-impl Conflict {
-    /// Format this reason as the soft-error message returned to the loop.
-    ///
-    /// `path` names the target in the message. The text states what happened
-    /// and directs the model to the recovery path (re-read, then re-issue).
-    pub(crate) fn message(self, path: &Path) -> String {
-        let guidance = "Re-read the file with Read, then re-issue the write against the \
-             current content.";
-        match self {
-            Conflict::Content => format!(
-                "{} changed on disk since it was read; not writing to avoid \
-                 clobbering the newer content.\n\n{guidance}",
-                path.display()
-            ),
-            Conflict::Mtime => format!(
-                "{} changed on disk since it was last read (its modification \
-                 time moved); not writing to avoid clobbering the newer \
-                 content.\n\n{guidance}",
-                path.display()
-            ),
-        }
-    }
-}
 
 /// Why a conflict check did not approve the write.
 ///
@@ -65,16 +20,29 @@ impl Conflict {
 /// [`ToolError`].
 #[derive(Debug)]
 pub(crate) enum CheckFailure {
-    /// The target differs from the baseline.
+    /// The target's bytes differ from the baseline.
     ///
     /// A recoverable conflict: the caller refuses the write and surfaces
-    /// [`Conflict::message`] as a soft error.
-    Changed(Conflict),
+    /// [`changed_message`] as a soft error.
+    Changed,
 
     /// A genuine I/O fault while re-reading or statting the target.
     ///
-    /// A missing file is a [`Conflict`], not a fault.
+    /// A missing file is a [`CheckFailure::Changed`], not a fault.
     Fault(ToolError),
+}
+
+/// Format the soft-error message for a refused write of `path`.
+///
+/// The text states what happened and directs the model to the recovery path
+/// (re-read, then re-issue).
+pub(crate) fn changed_message(path: &Path) -> String {
+    format!(
+        "{path} changed on disk since it was read; not writing to avoid \
+         clobbering the newer content.\n\nRe-read the file with Read, then \
+         re-issue the write against the current content.",
+        path = path.display()
+    )
 }
 
 /// Re-read `path` and compare its bytes against `baseline`.
@@ -101,12 +69,40 @@ pub(crate) async fn check_content_unchanged(
     baseline: &str,
     path: &Path,
 ) -> Result<(), CheckFailure> {
+    check_bytes_unchanged(baseline.as_bytes(), path).await
+}
+
+/// Re-read `path` and compare its content hash against `baseline_hash`.
+///
+/// Used by Write, whose baseline is the content hash Read recorded for the
+/// path — Write holds no prior bytes to compare. Hash comparison inherits the
+/// exactness of the underlying byte comparison and has no timestamp
+/// blind spot: any content change is caught regardless of filesystem
+/// timestamp granularity. Missing-at-reread is a conflict.
+///
+/// # Errors
+///
+/// Returns `Err(CheckFailure::Fault)` only on a genuine I/O fault that is not
+/// "file missing".
+///
+/// # Race window
+///
+/// As with [`check_content_unchanged`], the check narrows the race window to
+/// the gap between this compare and the caller's write; it does not eliminate
+/// it.
+pub(crate) async fn check_content_hash_unchanged(
+    baseline_hash: u64,
+    path: &Path,
+) -> Result<(), CheckFailure> {
     match tokio::fs::read(path).await {
-        Ok(current) if current == baseline.as_bytes() => Ok(()),
-        Ok(_) => Err(CheckFailure::Changed(Conflict::Content)),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            Err(CheckFailure::Changed(Conflict::Content))
+        Ok(bytes) => {
+            if crate::state::content_hash(&bytes) == baseline_hash {
+                Ok(())
+            } else {
+                Err(CheckFailure::Changed)
+            }
         }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(CheckFailure::Changed),
         Err(err) => Err(CheckFailure::Fault(ToolError::Execution(format!(
             "conflict check for {}: {err}",
             path.display()
@@ -114,34 +110,17 @@ pub(crate) async fn check_content_unchanged(
     }
 }
 
-/// `stat` `path` and compare its `mtime` against `baseline_mtime`.
-///
-/// Used by Write, whose baseline is the extrinsic `mtime` recorded at Read
-/// time — Write holds no prior bytes to compare. Same-mtime edits are
-/// possible on filesystems with coarse timestamps; that miss rate is the
-/// accepted cost of not holding full content per read. Missing-at-reread is
-/// a [`Conflict::Mtime`].
+/// Shared body of the two checks: compare candidate bytes against a baseline.
 ///
 /// # Errors
 ///
-/// Returns `Err(CheckFailure::Fault)` on a genuine I/O fault other than
+/// Returns `Err(CheckFailure::Fault)` only on a genuine I/O fault that is not
 /// "file missing".
-pub(crate) async fn check_mtime_unchanged(
-    baseline_mtime: SystemTime,
-    path: &Path,
-) -> Result<(), CheckFailure> {
-    match tokio::fs::metadata(path).await {
-        Ok(metadata) => match metadata.modified() {
-            Ok(mtime) if mtime == baseline_mtime => Ok(()),
-            Ok(_) => Err(CheckFailure::Changed(Conflict::Mtime)),
-            Err(err) => Err(CheckFailure::Fault(ToolError::Execution(format!(
-                "conflict check for {}: {err}",
-                path.display()
-            )))),
-        },
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            Err(CheckFailure::Changed(Conflict::Mtime))
-        }
+async fn check_bytes_unchanged(baseline: &[u8], path: &Path) -> Result<(), CheckFailure> {
+    match tokio::fs::read(path).await {
+        Ok(current) if current == baseline => Ok(()),
+        Ok(_) => Err(CheckFailure::Changed),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(CheckFailure::Changed),
         Err(err) => Err(CheckFailure::Fault(ToolError::Execution(format!(
             "conflict check for {}: {err}",
             path.display()
@@ -180,7 +159,7 @@ mod tests {
         std::fs::write(&path, "EXTERNAL").unwrap();
         assert!(matches!(
             check_content_unchanged("A", &path).await,
-            Err(CheckFailure::Changed(Conflict::Content))
+            Err(CheckFailure::Changed)
         ));
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
@@ -196,7 +175,7 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         assert!(matches!(
             check_content_unchanged("A", &path).await,
-            Err(CheckFailure::Changed(Conflict::Content))
+            Err(CheckFailure::Changed)
         ));
     }
 
@@ -218,32 +197,36 @@ mod tests {
         assert!(
             matches!(
                 check_content_unchanged("text", &path).await,
-                Err(CheckFailure::Changed(Conflict::Content))
+                Err(CheckFailure::Changed)
             ),
             "a binary swap is a content change, not an io fault"
         );
     }
 
     #[tokio::test]
-    async fn mtime_check_passes_when_the_file_is_unchanged() {
+    async fn hash_check_passes_when_the_file_is_unchanged() {
         let tmp = tempfile::tempdir().unwrap();
         let path = temp_file(tmp.path(), "a.txt", "A");
-        let baseline = crate::state::current_mtime(&path).await.unwrap();
-        assert!(check_mtime_unchanged(baseline, &path).await.is_ok());
+        let baseline = crate::state::content_hash(b"A");
+        assert!(check_content_hash_unchanged(baseline, &path).await.is_ok());
     }
 
     #[tokio::test]
-    async fn mtime_check_fails_after_an_external_write_that_bumps_mtime() {
+    async fn hash_check_catches_a_same_mtime_content_change() {
+        // The regression that motivated the hash check: an external writer
+        // swaps the bytes but pins the mtime back to the baseline's value.
+        // The mtime method allowed this; the content hash does not.
         let tmp = tempfile::tempdir().unwrap();
         let path = temp_file(tmp.path(), "a.txt", "A");
-        let baseline = crate::state::current_mtime(&path).await.unwrap();
+        let baseline_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let baseline_hash = crate::state::content_hash(b"A");
         std::fs::write(&path, "EXTERNAL").unwrap();
-        let bumped = baseline + std::time::Duration::from_secs(30);
         let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-        file.set_modified(bumped).unwrap();
+        file.set_modified(baseline_mtime).unwrap();
+
         assert!(matches!(
-            check_mtime_unchanged(baseline, &path).await,
-            Err(CheckFailure::Changed(Conflict::Mtime))
+            check_content_hash_unchanged(baseline_hash, &path).await,
+            Err(CheckFailure::Changed)
         ));
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
@@ -253,24 +236,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mtime_check_treats_a_deleted_file_as_a_conflict() {
+    async fn hash_check_treats_a_deleted_file_as_a_conflict() {
         let tmp = tempfile::tempdir().unwrap();
         let path = temp_file(tmp.path(), "a.txt", "A");
-        let baseline = crate::state::current_mtime(&path).await.unwrap();
+        let baseline = crate::state::content_hash(b"A");
         std::fs::remove_file(&path).unwrap();
         assert!(matches!(
-            check_mtime_unchanged(baseline, &path).await,
-            Err(CheckFailure::Changed(Conflict::Mtime))
+            check_content_hash_unchanged(baseline, &path).await,
+            Err(CheckFailure::Changed)
         ));
     }
 
     #[test]
-    fn messages_name_the_file_and_the_recovery_path() {
-        for reason in [Conflict::Content, Conflict::Mtime] {
-            let message = reason.message(Path::new("src/a.rs"));
-            assert!(message.contains("src/a.rs"), "{message}");
-            assert!(message.contains("changed"), "{message}");
-            assert!(message.contains("Read"), "{message}");
-        }
+    fn changed_message_names_the_file_and_the_recovery_path() {
+        let message = changed_message(Path::new("src/a.rs"));
+        assert!(message.contains("src/a.rs"), "{message}");
+        assert!(message.contains("changed"), "{message}");
+        assert!(message.contains("Read"), "{message}");
     }
 }

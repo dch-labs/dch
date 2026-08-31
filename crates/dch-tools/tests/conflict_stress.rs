@@ -111,7 +111,6 @@ async fn external_change_conflicts_the_write_and_a_reread_recovers_the_loop() {
 
     read(&ctx, "note.txt").await;
     std::fs::write(tmp.path().join("note.txt"), "EXTERNAL\n").unwrap();
-    force_mtime_change(&tmp.path().join("note.txt"));
     assert!(
         !write(&ctx, "note.txt", "clobber\n").await,
         "the stale write must be refused"
@@ -127,27 +126,49 @@ async fn external_change_conflicts_the_write_and_a_reread_recovers_the_loop() {
 }
 
 #[tokio::test]
-async fn external_revert_with_restored_bytes_still_conflicts_on_mtime() {
+async fn external_revert_with_restored_bytes_rearms_the_write() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("note.txt"), "v1\n").unwrap();
     let ctx = ctx_in(tmp.path().to_str().unwrap());
 
     read(&ctx, "note.txt").await;
     std::fs::write(tmp.path().join("note.txt"), "EXTERNAL\n").unwrap();
-    force_mtime_change(&tmp.path().join("note.txt"));
-    std::fs::write(tmp.path().join("note.txt"), "v1\n").unwrap();
-    force_mtime_change(&tmp.path().join("note.txt"));
+    assert!(!write(&ctx, "note.txt", "v2\n").await);
 
-    // The bytes match the baseline again, but the mtime moved twice while the
-    // model was not looking. Write's mtime method refuses — the cheap,
-    // documented false-positive of the extrinsic baseline. A fresh Read
-    // re-arms the write.
+    // The external writer reverted the bytes to exactly what the model read.
+    // The content hash matches the baseline again, so the write goes through
+    // — no timestamp false-positive to work around.
+    std::fs::write(tmp.path().join("note.txt"), "v1\n").unwrap();
+    assert!(write(&ctx, "note.txt", "v2\n").await);
+    assert_eq!(disk(tmp.path(), "note.txt"), "v2\n");
+}
+
+#[tokio::test]
+async fn a_same_mtime_content_change_is_still_caught() {
+    // The regression the content-hash baseline exists for: an external writer
+    // swaps the bytes and pins the mtime back to the value the model's Read
+    // recorded. The hash differs even though the timestamp matches.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("note.txt"), "v1\n").unwrap();
+    let ctx = ctx_in(tmp.path().to_str().unwrap());
+
+    read(&ctx, "note.txt").await;
+    std::fs::write(tmp.path().join("note.txt"), "EXTERNAL\n").unwrap();
+    let recorded = std::fs::metadata(tmp.path().join("note.txt"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(tmp.path().join("note.txt"))
+        .unwrap();
+    file.set_modified(recorded).unwrap();
+
     assert!(
         !write(&ctx, "note.txt", "v2\n").await,
-        "a moved mtime conflicts even when the bytes match"
+        "matching timestamps must not hide changed bytes"
     );
-    read(&ctx, "note.txt").await;
-    assert!(write(&ctx, "note.txt", "v2\n").await);
+    assert_eq!(disk(tmp.path(), "note.txt"), "EXTERNAL\n");
 }
 
 #[tokio::test]

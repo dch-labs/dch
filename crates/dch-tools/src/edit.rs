@@ -127,7 +127,7 @@ impl EditInput {
             crate::conflict::check_content_unchanged(&old_content, &full_path).await
         {
             return match failure {
-                crate::conflict::CheckFailure::Changed(_) => Ok(EditError::Conflict.into_output()),
+                crate::conflict::CheckFailure::Changed => Ok(EditError::Conflict.into_output()),
                 crate::conflict::CheckFailure::Fault(e) => Err(e),
             };
         }
@@ -135,8 +135,10 @@ impl EditInput {
         crate::fs::atomic_write(&full_path, &new_content)?;
 
         if let Some(rc) = &rc {
-            let mtime = crate::state::current_mtime(&full_path).await;
-            rc.record_baseline(&full_path, mtime);
+            rc.record_baseline(
+                &full_path,
+                crate::state::content_hash(new_content.as_bytes()),
+            );
         }
 
         let message = format_file_change(parsed.file_path, Some(&old_content), &new_content);

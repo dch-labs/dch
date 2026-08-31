@@ -118,14 +118,14 @@ impl WriteInput {
 
         let old_content = tokio::fs::read_to_string(&full_path).await.ok();
 
-        if let Some(baseline_mtime) = rc.as_ref().and_then(|rc| rc.baseline_for(&full_path))
+        if let Some(baseline_hash) = rc.as_ref().and_then(|rc| rc.baseline_for(&full_path))
             && let Err(failure) =
-                crate::conflict::check_mtime_unchanged(baseline_mtime, &full_path).await
+                crate::conflict::check_content_hash_unchanged(baseline_hash, &full_path).await
         {
             return match failure {
-                crate::conflict::CheckFailure::Changed(reason) => {
-                    Ok(ToolOutput::error_text(reason.message(&full_path)))
-                }
+                crate::conflict::CheckFailure::Changed => Ok(ToolOutput::error_text(
+                    crate::conflict::changed_message(&full_path),
+                )),
                 crate::conflict::CheckFailure::Fault(e) => Err(e),
             };
         }
@@ -137,8 +137,7 @@ impl WriteInput {
         crate::fs::atomic_write(&full_path, content)?;
 
         if let Some(rc) = &rc {
-            let mtime = crate::state::current_mtime(&full_path).await;
-            rc.record_baseline(&full_path, mtime);
+            rc.record_baseline(&full_path, crate::state::content_hash(content.as_bytes()));
         }
 
         let display_path = file_path;

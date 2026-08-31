@@ -239,7 +239,10 @@ pub enum Role {
     Tests,
 }
 
-/// Role body for [`Role::General`]: general assistance and sysadmin work.
+/// Role body for [`Role::General`].
+///
+/// General assistance and sysadmin work — the default for non-programming
+/// sessions.
 pub(crate) const GENERAL_ROLE: &str = "\
 YOUR ROLE: GENERAL ASSISTANCE
 - Help with the user's machine: diagnose issues, configure applications, inspect
@@ -254,7 +257,9 @@ YOUR ROLE: GENERAL ASSISTANCE
 - For commands you are unsure of, check `--help` or the man page before
   running; a wrong flag on a system tool can be costly.";
 
-/// Role body for [`Role::Coding`]: implement features end-to-end.
+/// Role body for [`Role::Coding`].
+///
+/// Implement features end-to-end: read first, change, then build and test.
 pub(crate) const CODING_ROLE: &str = "\
 YOUR ROLE: IMPLEMENT FEATURES AND FIXES
 - Read enough of the surrounding code to make a correct, idiomatic change.
@@ -269,7 +274,9 @@ YOUR ROLE: IMPLEMENT FEATURES AND FIXES
 - For unfamiliar or complex operations, look up the established pattern in the
   repo before inventing a new one.";
 
-/// Role body for [`Role::Refactor`]: restructure without behavior change.
+/// Role body for [`Role::Refactor`].
+///
+/// Restructure without behavior change; the suite is the referee.
 pub(crate) const REFACTOR_ROLE: &str = "\
 YOUR ROLE: IMPROVE STRUCTURE WITHOUT CHANGING BEHAVIOR
 - First characterize the behavior you must preserve: read the code and its
@@ -282,7 +289,9 @@ YOUR ROLE: IMPROVE STRUCTURE WITHOUT CHANGING BEHAVIOR
 - Prefer the smallest mechanical move that clarifies the code. Rename, extract,
   inline — one kind of step at a time is easier to review than a mixed rewrite.";
 
-/// Role body for [`Role::Debug`]: reproduce, isolate, then fix.
+/// Role body for [`Role::Debug`].
+///
+/// Reproduce, isolate, then fix — evidence before edits.
 pub(crate) const DEBUG_ROLE: &str = "\
 YOUR ROLE: REPRODUCE, ISOLATE, AND FIX
 - Reproduce the failure first. A reproducible failure is fixable; an
@@ -297,7 +306,9 @@ YOUR ROLE: REPRODUCE, ISOLATE, AND FIX
   catch regressions. Distinguish clearly between what you observed, what you
   inferred, and what you changed.";
 
-/// Role body for [`Role::Review`]: read-only critical pass.
+/// Role body for [`Role::Review`].
+///
+/// A read-only critical pass; findings are reported, not applied.
 pub(crate) const REVIEW_ROLE: &str = "\
 YOUR ROLE: REVIEW AND REPORT — DO NOT EDIT SOURCE
 - Treat this as a read-only pass. Inspect the diff or area with Read, Grep, and
@@ -311,7 +322,9 @@ YOUR ROLE: REVIEW AND REPORT — DO NOT EDIT SOURCE
 - Call out anything you could not verify. A reviewer's value is honesty about
   what was checked and what wasn't.";
 
-/// Role body for [`Role::Docs`]: author or revise documentation.
+/// Role body for [`Role::Docs`].
+///
+/// Author or revise documentation; prose and examples, not source logic.
 pub(crate) const DOCS_ROLE: &str = "\
 YOUR ROLE: WRITE OR REVISE DOCUMENTATION
 - Match the existing voice, structure, and formatting of the docs around you.
@@ -325,7 +338,10 @@ YOUR ROLE: WRITE OR REVISE DOCUMENTATION
   logic under the documentation — if the docs and the code disagree, flag the
   discrepancy rather than silently \"fixing\" one to match the other.";
 
-/// Role body for [`Role::Tests`]: write and improve tests.
+/// Role body for [`Role::Tests`].
+///
+/// Write and improve tests; production code changes only to make them
+/// testable.
 pub(crate) const TESTS_ROLE: &str = "\
 YOUR ROLE: WRITE AND IMPROVE TESTS
 - Cover behavior, not implementation. A test that pins a public outcome
@@ -438,6 +454,14 @@ pub struct McpServerConfig {
     /// Defaults to empty.
     #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
+
+    /// Restrict the server to these tool names.
+    ///
+    /// Defaults to `None` — every tool the server exposes is adapted. A
+    /// listed name the server does not offer is a startup error rather than
+    /// a silently missing tool.
+    #[serde(default)]
+    pub tools: Option<Vec<String>>,
 }
 
 /// Top-level configuration loaded from `~/.dch/config.toml`.
@@ -989,6 +1013,7 @@ azure_resource = "my-resource"
 name = "docs"
 command = "npx"
 args = ["-y", "@example/mcp-docs"]
+tools = ["search", "fetch"]
 
 [mcp.servers.env]
 DOCS_KEY = "secret"
@@ -1060,6 +1085,10 @@ redact_secrets = false
         assert_eq!(
             c.mcp.servers[0].env.get("DOCS_KEY").map(String::as_str),
             Some("secret")
+        );
+        assert_eq!(
+            c.mcp.servers[0].tools,
+            Some(vec!["search".to_string(), "fetch".to_string()])
         );
 
         assert_eq!(c.display.verbosity, Verbosity::Verbose);

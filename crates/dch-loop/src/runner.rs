@@ -53,6 +53,7 @@ use loopctl::middleware::ToolDispatchContext;
 use loopctl::middleware::ToolMiddleware;
 use loopctl::middleware::ToolPipeline;
 use loopctl::observer::LoopObserver;
+use loopctl::tool::Tool;
 use loopctl::tool::ToolRegistry;
 
 use crate::DchClient;
@@ -351,10 +352,17 @@ impl RunnerBuilder<'_> {
         let context = Arc::new(RunnerContext::new(self.workdir.clone()));
 
         let client = crate::create_client(&self.config.api)?;
-        let mut providers = connect_mcp_servers(self.config, &self.workdir).await?;
-        providers.extend(self.mcp_providers);
-        let registry = compose_registry(&providers);
-        let core_registry = compose_registry(&providers);
+        let connections = connect_mcp_servers(self.config, &self.workdir).await?;
+        let mut registry = compose_registry(&connections);
+        let mut core_registry = compose_registry(&connections);
+        for connection in &connections {
+            connection.provider.register_into(&mut registry);
+            connection.provider.register_into(&mut core_registry);
+        }
+        for provider in &self.mcp_providers {
+            provider.register_into(&mut registry);
+            provider.register_into(&mut core_registry);
+        }
 
         let session_config = build_session(self.config, &registry, &self.workdir);
         let run_config = self.config.to_run_config();
@@ -404,8 +412,8 @@ impl RunnerBuilder<'_> {
 async fn connect_mcp_servers(
     config: &dch_config::DchConfig,
     workdir: &Path,
-) -> Result<Vec<McpToolProvider>, RunnerError> {
-    let mut providers = Vec::new();
+) -> Result<Vec<McpConnection>, RunnerError> {
+    let mut connections = Vec::new();
     for server in &config.mcp.servers {
         let command = CommandSpec {
             program: server.command.clone(),
@@ -420,24 +428,87 @@ async fn connect_mcp_servers(
         let client = McpClient::stdio(command)
             .await
             .map_err(|e| RunnerError::Config(format!("mcp server '{}': {e}", server.name)))?;
-        let provider = McpToolProvider::connect(client, Some(server.name.clone()))
-            .await
-            .map_err(|e| RunnerError::Config(format!("mcp server '{}': {e}", server.name)))?;
-        providers.push(provider);
+        connections.push(adopt_mcp_server(server, client).await?);
     }
-    Ok(providers)
+    Ok(connections)
+}
+
+/// Connect an already-running MCP `client` as `server` and snapshot its
+/// tools under the server's allowlist.
+///
+/// # Errors
+///
+/// Returns [`RunnerError::Config`] when the handshake fails or an
+/// allowlisted tool name is not offered by the server.
+async fn adopt_mcp_server(
+    server: &dch_config::McpServerConfig,
+    client: McpClient,
+) -> Result<McpConnection, RunnerError> {
+    let provider = McpToolProvider::connect(client, Some(server.name.clone()))
+        .await
+        .map_err(|e| RunnerError::Config(format!("mcp server '{}': {e}", server.name)))?;
+    let allowed = match &server.tools {
+        None => None,
+        Some(names) => {
+            let exposed: std::collections::HashSet<String> = provider
+                .tools()
+                .iter()
+                .map(|tool| tool.name().to_string())
+                .collect();
+            let mut allowlist = std::collections::HashSet::new();
+            for name in names {
+                let exposed_name = format!("{}__{name}", server.name);
+                if !exposed.contains(&exposed_name) {
+                    return Err(RunnerError::Config(format!(
+                        "mcp server '{}': tool '{name}' is not offered by the server",
+                        server.name
+                    )));
+                }
+                allowlist.insert(exposed_name);
+            }
+            Some(allowlist)
+        }
+    };
+    Ok(McpConnection { provider, allowed })
+}
+
+/// One connected MCP server and its containment policy.
+/// One connected MCP server and its containment policy.
+struct McpConnection {
+    /// The connected provider.
+    ///
+    /// `tools` lists what the server exposed at discovery; `register_into`
+    /// adapts them into a [`ToolRegistry`].
+    provider: McpToolProvider,
+
+    /// The exposed (prefixed) tool names to adapt.
+    ///
+    /// `None` adapts every discovered tool; a populated set adapts only the
+    /// listed ones and leaves the rest unregistered.
+    allowed: Option<std::collections::HashSet<String>>,
 }
 
 /// Compose the full tool registry: the builtin tools plus every MCP server's.
 ///
-/// Called once per consumer — the engine's by-value registry and the dispatch
-/// pipeline's core cannot share boxed tools, so each gets its own composition
-/// from the same providers (an MCP tool clones into both, keeping the two
-/// positions identical by construction).
-fn compose_registry(providers: &[McpToolProvider]) -> ToolRegistry {
+/// Each server contributes per its containment policy: a connection without
+/// an allowlist registers every discovered tool, an allowlisted connection
+/// only the listed ones. Called once per consumer — the engine's by-value
+/// registry and the dispatch pipeline's core cannot share boxed tools, so
+/// each gets its own composition from the same connections (an MCP tool
+/// clones into both, keeping the two positions identical by construction).
+fn compose_registry(connections: &[McpConnection]) -> ToolRegistry {
     let mut registry = builtin_registry();
-    for provider in providers {
-        provider.register_into(&mut registry);
+    for connection in connections {
+        match &connection.allowed {
+            None => connection.provider.register_into(&mut registry),
+            Some(allowed) => {
+                for tool in connection.provider.tools() {
+                    if allowed.contains(tool.name()) {
+                        registry.register(tool.clone());
+                    }
+                }
+            }
+        }
     }
     registry
 }
@@ -1383,6 +1454,56 @@ mod tests {
         assert!(
             requests.len() >= 2 && requests[1].contains("hello, world!"),
             "the MCP tool result must flow back to the model: {requests:?}"
+        );
+    }
+
+    fn demo_server_config(tools: Option<Vec<String>>) -> dch_config::McpServerConfig {
+        dch_config::McpServerConfig {
+            name: "demo".to_string(),
+            command: "unused".to_string(),
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            tools,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_mcp_allowlist_registers_only_listed_tools() {
+        let connection = adopt_mcp_server(
+            &demo_server_config(Some(vec!["greet".to_string()])),
+            loopctl::mcp::McpClient::in_process(GreetServer::new())
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let registry = compose_registry(&[connection]);
+
+        assert!(
+            registry.contains("demo__greet"),
+            "the allowlisted tool must be registered"
+        );
+        let expected = builtin_registry().len() + 1;
+        assert_eq!(registry.len(), expected, "exactly one external tool joins");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_allowlisted_tool_fails_startup_naming_both() {
+        let err = adopt_mcp_server(
+            &demo_server_config(Some(vec!["nope".to_string()])),
+            loopctl::mcp::McpClient::in_process(GreetServer::new())
+                .await
+                .unwrap(),
+        )
+        .await
+        .map(|_| ())
+        .unwrap_err();
+        let RunnerError::Config(msg) = &err else {
+            panic!("expected Config error, got {err:?}");
+        };
+        assert!(
+            msg.contains("demo") && msg.contains("nope"),
+            "the error must name the server and the missing tool: {msg}"
         );
     }
 

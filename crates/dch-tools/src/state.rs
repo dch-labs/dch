@@ -1,52 +1,58 @@
-//! Per-session record of the model's latest known state per touched file.
+//! Per-session record of the model's latest known content per touched file.
 //!
-//! The Write tool's detect-on-write conflict check compares a target's
-//! current `mtime` against the `mtime` recorded when the path was last
+//! The Write tool's detect-on-write conflict check compares the target's
+//! current content hash against the hash recorded when the path was last
 //! touched; this module supplies that record. Read records what it observes;
-//! a successful Write/Edit/MultiEdit records the post-write `mtime`, so the
+//! a successful Write/Edit/MultiEdit records the post-write content, so the
 //! model's own writes never register as external changes. The map holds one
 //! entry per path — the latest touch wins.
 
 use std::collections::BTreeMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::path::PathBuf;
-use std::time::SystemTime;
 
-/// The model's latest known `mtime` per touched file.
+/// The model's latest known content hash per touched file.
 ///
 /// Keyed by the resolved absolute path (each tool's [`resolve_path`](crate::util::resolve_path)
 /// output), so equivalent spellings of the same file share one baseline and a
-/// staleness check can't be dodged by re-spelling a path. A value of `None`
-/// means the path was touched but its `mtime` could not be measured (the
-/// `stat` failed at read time); it clears any older baseline rather than
-/// leaving a stale one to be trusted.
-pub type FileBaselines = BTreeMap<PathBuf, Option<SystemTime>>;
-
-/// Record `mtime` as the model's latest known state of `path`.
+/// staleness check can't be dodged by re-spelling a path.
 ///
-/// `path` is the resolved identity both the recording tool and the checking
-/// tool compute for the file. A `None` `mtime` (the `stat` failed) overwrites
-/// any older baseline — the newest observation wins, and an unmeasurable one
-/// is no basis for a staleness verdict.
-pub(crate) fn record(baselines: &mut FileBaselines, path: &Path, mtime: Option<SystemTime>) {
-    baselines.insert(path.to_path_buf(), mtime);
+/// The hash is a process-local [`DefaultHasher`] fingerprint of the file's
+/// bytes — deliberately not a stable or cryptographic digest: baselines live
+/// and die with the session, and the hash only ever answers "did the bytes
+/// change since the model last touched this file".
+pub type FileBaselines = BTreeMap<PathBuf, u64>;
+
+/// Fingerprint `bytes` for baseline comparison.
+///
+/// Process-local by design (see [`FileBaselines`]): the same bytes always
+/// produce the same hash within a session, which is the only guarantee the
+/// staleness check needs.
+pub(crate) fn content_hash(bytes: &[u8]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
 }
 
-/// The recorded baseline for `path`, when the latest touch measured an
-/// `mtime`.
-pub(crate) fn baseline(baselines: &FileBaselines, path: &Path) -> Option<SystemTime> {
-    baselines.get(path).copied().flatten()
+/// Record `hash` as the model's latest known state of `path`.
+///
+/// Called after every successful touch: Read records the hash of the bytes
+/// it served, the writing tools record the hash of the content they wrote —
+/// which is why the model's own writes never register as external changes.
+/// Inserting an existing key overwrites, so the map stays one-entry-per-file.
+pub(crate) fn record(baselines: &mut FileBaselines, path: &Path, hash: u64) {
+    baselines.insert(path.to_path_buf(), hash);
 }
 
-/// The file's `mtime`, or `None` when the `stat` fails for any reason.
+/// The recorded baseline for `path`, if the path was touched.
 ///
-/// Best-effort by contract: callers record what they could observe and treat
-/// `None` as "no baseline", never as an error.
-pub(crate) async fn current_mtime(path: &Path) -> Option<SystemTime> {
-    tokio::fs::metadata(path)
-        .await
-        .ok()
-        .and_then(|metadata| metadata.modified().ok())
+/// `None` means either an unknown path or no check to make: with no recorded
+/// touch there is nothing to compare the file's current content against, and
+/// the caller lets the write proceed.
+pub(crate) fn baseline(baselines: &FileBaselines, path: &Path) -> Option<u64> {
+    baselines.get(path).copied()
 }
 
 #[cfg(test)]
@@ -63,51 +69,33 @@ mod tests {
     #[test]
     fn baseline_follows_the_latest_recorded_touch() {
         let mut baselines = FileBaselines::default();
-        let epoch = SystemTime::UNIX_EPOCH;
-        record(&mut baselines, Path::new("a.rs"), Some(epoch));
-        record(
-            &mut baselines,
-            Path::new("b.rs"),
-            Some(epoch + std::time::Duration::from_secs(5)),
-        );
-        record(
-            &mut baselines,
-            Path::new("a.rs"),
-            Some(epoch + std::time::Duration::from_secs(10)),
-        );
+        let a = Path::new("a.rs");
+        let b = Path::new("b.rs");
+        record(&mut baselines, a, content_hash(b"one"));
+        record(&mut baselines, b, content_hash(b"two"));
+        record(&mut baselines, a, content_hash(b"three"));
 
         assert_eq!(
-            baseline(&baselines, Path::new("a.rs")),
-            Some(epoch + std::time::Duration::from_secs(10)),
+            baseline(&baselines, a),
+            Some(content_hash(b"three")),
             "the latest touch wins"
         );
         assert_eq!(
-            baseline(&baselines, Path::new("b.rs")),
-            Some(epoch + std::time::Duration::from_secs(5)),
+            baseline(&baselines, b),
+            Some(content_hash(b"two")),
             "other paths keep their own baselines"
         );
         assert_eq!(baseline(&baselines, Path::new("missing.rs")), None);
     }
 
     #[test]
-    fn an_unmeasured_touch_clears_the_baseline() {
-        let mut baselines = FileBaselines::default();
-        let epoch = SystemTime::UNIX_EPOCH;
-        record(&mut baselines, Path::new("a.rs"), Some(epoch));
-        record(&mut baselines, Path::new("a.rs"), None);
-
-        assert_eq!(
-            baseline(&baselines, Path::new("a.rs")),
-            None,
-            "an unmeasurable latest touch is no basis for a staleness verdict"
-        );
+    fn equal_bytes_hash_equal_and_different_bytes_differ() {
+        assert_eq!(content_hash(b"same"), content_hash(b"same"));
+        assert_ne!(content_hash(b"one"), content_hash(b"two"));
     }
 
-    #[tokio::test]
-    async fn current_mtime_is_none_for_a_missing_path() {
-        assert_eq!(
-            current_mtime(Path::new("/nonexistent/dch-mtime-probe")).await,
-            None
-        );
+    #[test]
+    fn a_single_byte_flip_changes_the_hash() {
+        assert_ne!(content_hash(b"v1"), content_hash(b"v2"));
     }
 }

@@ -27,7 +27,6 @@ use serde_json::Value;
 use serde_json::json;
 
 use crate::conflict::CheckFailure;
-use crate::conflict::Conflict;
 use crate::conflict::check_content_unchanged;
 use crate::context::RunnerContext;
 use crate::context::require_cwd;
@@ -42,6 +41,10 @@ use crate::util::resolve_path;
 use crate::write::format_lint_failure;
 
 /// Maximum number of edits permitted in a single call.
+///
+/// Bounds the preview size, the lint pass, and the write loop; a larger
+/// batch should be split so a failure surfaces before the whole plan is
+/// built.
 const MAX_EDITS: usize = 50;
 
 /// Edit multiple files atomically.
@@ -175,7 +178,7 @@ impl MultiEditTool {
             return Ok(ToolOutput::text(summary).with_hint(DisplayHint::Diff));
         }
         if let Some(conflict) = write_finals(&operations, &originals, &finals, rc.as_ref()).await? {
-            let mut message = conflict.reason.message(Path::new(&conflict.path));
+            let mut message = crate::conflict::changed_message(Path::new(&conflict.path));
             if !conflict.applied.is_empty() {
                 message.push_str("\n\nAlready written by this batch: ");
                 message.push_str(&conflict.applied.join(", "));
@@ -207,11 +210,6 @@ struct BatchConflict {
     ///
     /// The caller-supplied spelling of the path whose staleness check failed.
     path: String,
-
-    /// Why the write was refused.
-    ///
-    /// Maps to the soft message the caller surfaces.
-    reason: Conflict,
 }
 
 /// Write each distinct physical target file once with its merged content.
@@ -249,11 +247,10 @@ async fn write_finals(
             if let Some(baseline) = originals.get(&op.file_path).map(String::as_str) {
                 match check_content_unchanged(baseline, &op.full_path).await {
                     Ok(()) => {}
-                    Err(CheckFailure::Changed(reason)) => {
+                    Err(CheckFailure::Changed) => {
                         return Ok(Some(BatchConflict {
                             applied,
                             path: op.file_path.clone(),
-                            reason,
                         }));
                     }
                     Err(CheckFailure::Fault(e)) => return Err(e),
@@ -262,8 +259,10 @@ async fn write_finals(
             crate::fs::atomic_write(&op.full_path, final_content)?;
             applied.push(op.file_path.clone());
             if let Some(rc) = history {
-                let mtime = crate::state::current_mtime(&op.full_path).await;
-                rc.record_baseline(&op.full_path, mtime);
+                rc.record_baseline(
+                    &op.full_path,
+                    crate::state::content_hash(final_content.as_bytes()),
+                );
             }
         }
     }
@@ -1979,7 +1978,6 @@ mod tests {
             .unwrap();
         let conflict = outcome.expect("an externally changed file aborts the batch");
         assert_eq!(conflict.path, "a.rs");
-        assert_eq!(conflict.reason, Conflict::Content);
         assert!(
             conflict.applied.is_empty(),
             "nothing is written before the conflict on the first file"
