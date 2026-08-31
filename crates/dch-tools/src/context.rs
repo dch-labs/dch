@@ -69,7 +69,8 @@ pub struct RunnerContext {
     /// Read records what it observes; a successful write records the
     /// post-write content (see [`FileBaselines`]). The Write tool's
     /// detect-on-write conflict check compares the target's current content
-    /// hash against this record before overwriting. Cloning
+    /// hash against this record before overwriting. Concurrent touches of
+    /// one path resolve to the newest observation. Cloning
     /// [`RunnerContext`] shares the same map.
     pub file_baselines: Arc<Mutex<FileBaselines>>,
 }
@@ -96,19 +97,20 @@ impl RunnerContext {
         }
     }
 
-    /// Record `hash` as the model's latest known state of `path`.
+    /// Record an observation as the model's latest known state of `path`.
     ///
     /// Thin locking wrapper over [`record`](crate::state::record), which owns
-    /// the semantics (latest touch wins).
-    pub(crate) fn record_baseline(&self, path: &Path, hash: u64) {
+    /// the ordering semantics (newest observation wins; an older one arriving
+    /// out of order is discarded).
+    pub(crate) fn record_baseline(&self, path: &Path, baseline: crate::state::FileBaseline) {
         let mut baselines = self
             .file_baselines
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        crate::state::record(&mut baselines, path, hash);
+        crate::state::record(&mut baselines, path, baseline);
     }
 
-    /// The recorded baseline for `path`, if the path was touched.
+    /// The content hash recorded for `path`, if the path was touched.
     ///
     /// Thin locking wrapper over [`baseline`](crate::state::baseline).
     pub(crate) fn baseline_for(&self, path: &Path) -> Option<u64> {

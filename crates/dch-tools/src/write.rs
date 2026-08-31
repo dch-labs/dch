@@ -76,10 +76,10 @@ impl WriteInput {
     /// Body of [`Tool::call`].
     ///
     /// Orchestrates validate → lint → staleness check → write. When the path
-    /// has a recorded baseline (a prior Read this session), a moved `mtime`
-    /// refuses the write as a soft conflict; a successful write refreshes the
-    /// recorded baseline, so the model's own write never registers as a later
-    /// external change.
+    /// has a recorded baseline (a prior Read this session), content that
+    /// differs from the recorded hash refuses the write as a soft conflict;
+    /// a successful write refreshes the recorded baseline, so the model's
+    /// own write never registers as a later external change.
     ///
     /// # Errors
     ///
@@ -137,7 +137,7 @@ impl WriteInput {
         crate::fs::atomic_write(&full_path, content)?;
 
         if let Some(rc) = &rc {
-            rc.record_baseline(&full_path, crate::state::content_hash(content.as_bytes()));
+            rc.record_baseline(&full_path, crate::state::observe_bytes(content.as_bytes()));
         }
 
         let display_path = file_path;
@@ -471,7 +471,7 @@ mod tests {
         );
     }
 
-    /// Drives a real Read (which records the mtime baseline on the shared
+    /// Drives a real Read (which records the content baseline on the shared
     /// context) before the Write. The external mutation's mtime is forced
     /// with `set_modified` so the test never depends on filesystem timestamp
     /// granularity.

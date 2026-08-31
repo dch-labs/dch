@@ -137,7 +137,7 @@ impl EditInput {
         if let Some(rc) = &rc {
             rc.record_baseline(
                 &full_path,
-                crate::state::content_hash(new_content.as_bytes()),
+                crate::state::observe_bytes(new_content.as_bytes()),
             );
         }
 

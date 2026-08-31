@@ -156,8 +156,9 @@ impl ReadInput {
             return Ok(too_large);
         }
 
+        let baseline = crate::state::observe_bytes(&bytes);
         if let Some(rc) = &runner_context {
-            rc.record_baseline(&full_path, crate::state::content_hash(&bytes));
+            rc.record_baseline(&full_path, baseline);
         }
 
         if let Some(mime) = mime_type_from_path(&full_path) {

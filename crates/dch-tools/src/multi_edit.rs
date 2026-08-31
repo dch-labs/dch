@@ -261,7 +261,7 @@ async fn write_finals(
             if let Some(rc) = history {
                 rc.record_baseline(
                     &op.full_path,
-                    crate::state::content_hash(final_content.as_bytes()),
+                    crate::state::observe_bytes(final_content.as_bytes()),
                 );
             }
         }
