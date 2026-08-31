@@ -133,14 +133,17 @@ mod tests {
 
     #[test]
     fn an_older_observation_never_supersedes_a_newer_one() {
+        // Older is observed first, newer second — both stamps are generated,
+        // and the inserts below land in both orders to model the
+        // concurrent-insert race.
         let mut baselines = FileBaselines::default();
+        let older = observe_bytes(b"old");
         let newer = observe_bytes(b"new");
-        let mut older = observe_bytes(b"old");
-        older.observed = newer.observed - 1;
 
-        // The older observation arrives last (the concurrent-insert case).
-        record(&mut baselines, Path::new("a.rs"), older);
+        // Newer lands first; the older observation arrives last and must be
+        // discarded.
         record(&mut baselines, Path::new("a.rs"), newer);
+        record(&mut baselines, Path::new("a.rs"), older);
         assert_eq!(
             baseline(&baselines, Path::new("a.rs")),
             Some(newer.hash),
@@ -148,8 +151,8 @@ mod tests {
         );
 
         let mut baselines = FileBaselines::default();
-        record(&mut baselines, Path::new("a.rs"), newer);
         record(&mut baselines, Path::new("a.rs"), older);
+        record(&mut baselines, Path::new("a.rs"), newer);
         assert_eq!(
             baseline(&baselines, Path::new("a.rs")),
             Some(newer.hash),
