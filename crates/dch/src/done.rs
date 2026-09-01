@@ -88,20 +88,71 @@ impl DoneStatus {
 
 /// Serialize `status` as pretty JSON to `path` with a trailing newline.
 ///
-/// Uses temp-then-rename so a reader never sees a half-written JSON file.
+/// Uses temp-then-rename so a reader never sees a half-written JSON file,
+/// and preserves an existing marker's permissions across the replacement
+/// (a rename swaps the file, not its metadata, so the marker's mode would
+/// otherwise reset to the platform default — silently widening a
+/// restrictive marker). A first-time marker keeps the platform default.
 ///
 /// # Errors
 ///
 /// Returns the underlying I/O or serialization error when the file cannot
 /// be written. Callers should log and continue — the done-file is a status
-/// marker, not the source of truth.
+/// marker, not the source of truth. A failed write leaves no marker behind
+/// and removes the temporary file.
 pub fn write_done_file(path: &Path, status: &DoneStatus) -> Result<(), Box<dyn std::error::Error>> {
     let json = serde_json::to_string_pretty(status)?;
     let tmp = unique_sibling(path);
-    let mut handle = std::fs::File::create(&tmp)?;
+    let result = write_marker(&tmp, path, &json);
+    if result.is_err() {
+        drop(std::fs::remove_file(&tmp));
+    }
+    result
+}
+
+/// Write `json` to `tmp`, carry over `target`'s permissions, then rename
+/// it into place.
+///
+/// # Errors
+///
+/// Returns any error from creating or writing the temporary file, from
+/// applying the target's permissions, or from the final rename.
+fn write_marker(tmp: &Path, target: &Path, json: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut handle = std::fs::File::create(tmp)?;
     handle.write_all(format!("{json}\n").as_bytes())?;
     drop(handle);
-    std::fs::rename(&tmp, path)?;
+    preserve_target_mode(target, tmp)?;
+    std::fs::rename(tmp, target)?;
+    Ok(())
+}
+
+/// Apply `target`'s existing permissions to `tmp` before the rename.
+///
+/// Without this, the replacement carries the platform default mode and a
+/// restrictive marker (for example `0600`) is silently widened. A target
+/// that does not exist yet is left at the platform default.
+///
+/// # Errors
+///
+/// Returns the underlying I/O error when the target's metadata cannot be
+/// read or the temporary file's permissions cannot be set.
+#[cfg(unix)]
+fn preserve_target_mode(target: &Path, tmp: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(metadata) = std::fs::metadata(target) {
+        let permissions = std::fs::Permissions::from_mode(metadata.permissions().mode());
+        std::fs::set_permissions(tmp, permissions)?;
+    }
+    Ok(())
+}
+
+/// Non-Unix fallback: no permission bits to carry over.
+///
+/// # Errors
+///
+/// Never fails.
+#[cfg(not(unix))]
+fn preserve_target_mode(_target: &Path, _tmp: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -173,6 +224,29 @@ mod tests {
         assert!(residue.is_empty(), "temp residue: {residue:?}");
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("\"success\": true"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacing_a_restricted_marker_preserves_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("done.json");
+        std::fs::write(&path, "old").unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(&path, permissions).unwrap();
+
+        write_done_file(&path, &DoneStatus::success("new", 1, 1)).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "replacement must keep the marker's mode"
+        );
+        assert!(std::fs::read_to_string(&path).unwrap().contains("new"));
     }
 
     #[test]
