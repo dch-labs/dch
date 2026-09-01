@@ -123,14 +123,15 @@ impl WriteInput {
         }
 
         let old_content = match tokio::fs::File::open(&full_path).await.ok() {
-            Some(file) => {
+            Some(mut file) => {
                 if policy == ResolvePolicy::Contained {
                     crate::util::verify_handle_inside(&file, &cwd)?;
                 }
                 let mut buffer = String::new();
-                let mut file = file;
-                file.read_to_string(&mut buffer).await.ok();
-                Some(buffer)
+                match file.read_to_string(&mut buffer).await {
+                    Ok(_) => Some(buffer),
+                    Err(_) => None,
+                }
             }
             None => None,
         };

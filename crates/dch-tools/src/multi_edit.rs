@@ -156,13 +156,20 @@ impl MultiEditTool {
         let cwd = require_cwd(rc.clone())?;
 
         let parsed = parse_input(&input)?;
-        let operations = build_operations(parsed.edits, &cwd, policy)?;
+        let mut operations = build_operations(parsed.edits, &cwd, policy)?;
 
         if let Some(reason) = dup_path_check(&operations) {
             return Ok(reason.into_output());
         }
+        if policy == ResolvePolicy::Unrestricted
+            && let Some(reason) = honor_symlink_targets(&mut operations)
+        {
+            return Ok(reason.into_output());
+        }
         let originals = read_files(&operations, &cwd, policy).await?;
-        if let Some(reason) = symlink_check(&operations) {
+        if policy == ResolvePolicy::Contained
+            && let Some(reason) = symlink_check(&operations)
+        {
             return Ok(reason.into_output());
         }
         if let Some(reason) = overlap_check(&operations, &originals) {
@@ -572,6 +579,33 @@ fn symlink_check(operations: &[EditOperation]) -> Option<AbortReason> {
                     ancestor.display()
                 )));
             }
+        }
+    }
+    None
+}
+
+/// Rewrite each target to its physical path, refusing aliases (Unrestricted).
+///
+/// Unrestricted writes honor symbolic links, so each target is canonicalized
+/// and the write lands on the real file with the link left intact — and two
+/// entries resolving to the same file would write it twice, which is
+/// rejected. The original `file_path` is kept for display. Targets that do
+/// not exist yet (new files) keep their submitted path.
+///
+/// Returns the abort reason for the first alias pair found, if any.
+fn honor_symlink_targets(operations: &mut [EditOperation]) -> Option<AbortReason> {
+    let mut physical: std::collections::HashSet<std::path::PathBuf> =
+        std::collections::HashSet::new();
+    for op in operations {
+        if let Ok(real) = std::fs::canonicalize(&op.full_path) {
+            if !physical.insert(real.clone()) {
+                return Some(AbortReason::Symlink(format!(
+                    "Refusing to write: '{}' and an earlier entry are the same file ({}).",
+                    op.file_path,
+                    real.display()
+                )));
+            }
+            op.full_path = real;
         }
     }
     None
@@ -2176,5 +2210,81 @@ mod tests {
         .unwrap();
         assert!(outcome.is_none(), "matching disk content must not abort");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "rewritten");
+    }
+
+    /// A tool context carrying an Unrestricted runner policy.
+    fn unrestricted_ctx(dir: &std::path::Path) -> ToolContext {
+        let mut ctx = ToolContext::default();
+        ctx.cwd = dir.to_string_lossy().into_owned();
+        ctx.set_extension(
+            RunnerContext::new(std::path::PathBuf::from(dir))
+                .with_resolve_policy(ResolvePolicy::Unrestricted),
+        );
+        ctx
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unrestricted_writes_through_a_symlink_target() {
+        // The whole point of Unrestricted: the submitted path is honored as
+        // given — the write lands on the linked file and the link survives.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let real = tmp.path().join("real.rs");
+        std::fs::write(&real, "fn main() {}\n").unwrap();
+        let link = tmp.path().join("link.rs");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let tool = MultiEditTool;
+        let input = json!({"edits": [edit(
+            link.to_str().unwrap(),
+            "fn main() {}",
+            "fn main() { let _ = 1; }",
+        )]});
+        let out = tool
+            .call(input, &unrestricted_ctx(tmp.path()))
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.text_content());
+
+        assert_eq!(
+            std::fs::read_to_string(&real).unwrap(),
+            "fn main() { let _ = 1; }\n"
+        );
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link must survive an unrestricted write"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unrestricted_rejects_alias_pairs_writing_one_file_twice() {
+        // With links honored, two entries can name the same physical file —
+        // the batch is refused instead of writing it twice in a row.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let real = tmp.path().join("real.rs");
+        std::fs::write(&real, "A\n").unwrap();
+        let link = tmp.path().join("link.rs");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let tool = MultiEditTool;
+        let input = json!({"edits": [
+            edit(real.to_str().unwrap(), "A", "B"),
+            edit(link.to_str().unwrap(), "A", "C"),
+        ]});
+        let out = tool
+            .call(input, &unrestricted_ctx(tmp.path()))
+            .await
+            .unwrap();
+        assert!(out.is_error, "{}", out.text_content());
+        assert!(
+            out.text_content().contains("same file"),
+            "{}",
+            out.text_content()
+        );
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "A\n");
     }
 }

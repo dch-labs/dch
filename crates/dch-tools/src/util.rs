@@ -138,10 +138,11 @@ pub enum ResolvePolicy {
 /// tool (`Read`, `Write`, `Edit`, `MultiEdit`, `FileViewer`, and the
 /// navigation tools `Glob`, `Grep`, `CodeSearch`, `Tree`), so they can't
 /// drift apart. The symlink check closes the traversal vector where an
-/// in-workspace link points outside it, but it leaves a TOCTOU window open:
-/// a link could be swapped between the check and the caller's `open`.
-/// Closing that race requires descriptor-relative, `O_NOFOLLOW` opens and
-/// is deferred.
+/// in-workspace link points outside it. A TOCTOU window remains between
+/// this check and the caller's open: on Linux, file tools close it by
+/// verifying the opened handle via `/proc/self/fd` before any bytes move;
+/// directory-walk tools and non-Linux targets keep the window, which needs
+/// descriptor-relative, `O_NOFOLLOW` opens to close.
 ///
 /// # Errors
 ///
@@ -213,14 +214,20 @@ pub(crate) fn verify_handle_inside<F: std::os::unix::io::AsRawFd>(
     }
 }
 
-/// Non-Linux fallback: containment rests on the pre-open checks alone.
+/// Non-Linux fallback: fail closed.
+///
+/// The post-open verification this crate relies on is Linux-only; contained
+/// dispatch must not proceed unverified, so file tools return an error on
+/// platforms where the check cannot run.
 ///
 /// # Errors
 ///
-/// Never fails.
+/// Always returns [`ToolError::Execution`].
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn verify_handle_inside<F>(_handle: &F, _workspace: &Path) -> Result<(), ToolError> {
-    Ok(())
+    Err(ToolError::Execution(
+        "path containment cannot be verified on this platform".to_string(),
+    ))
 }
 
 /// Lexically normalize `path`, collapsing `.` and `..` without touching the filesystem.

@@ -32,7 +32,9 @@ pub(crate) fn atomic_write(
     workspace: &Path,
     policy: ResolvePolicy,
 ) -> Result<(), ToolError> {
-    if std::fs::symlink_metadata(target).is_ok_and(|m| m.file_type().is_symlink()) {
+    if policy == ResolvePolicy::Contained
+        && std::fs::symlink_metadata(target).is_ok_and(|m| m.file_type().is_symlink())
+    {
         return Err(ToolError::InvalidInput(format!(
             "Refusing to write: {} is a symbolic link. Resolve it and pass the real path.",
             target.display()
@@ -101,7 +103,7 @@ mod tests {
         assert_eq!(entries, vec!["clean.rs"]);
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn atomic_write_preserves_permissions() {
         use std::os::unix::fs::PermissionsExt;
@@ -154,7 +156,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&real).unwrap(), "original\n");
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn atomic_write_rejects_a_swapped_parent_directory_when_contained() {
         // The TOCTOU race, deterministically: `resolve_path` validated the
