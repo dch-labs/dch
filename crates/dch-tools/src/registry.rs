@@ -10,6 +10,7 @@ use crate::glob::GlobInput;
 use crate::grep::GrepInput;
 use crate::multi_edit::MultiEditTool;
 use crate::read::ReadInput;
+use crate::todo::TodoTool;
 use crate::tree::TreeInput;
 use crate::write::WriteInput;
 
@@ -31,6 +32,7 @@ pub fn builtin_registry() -> ToolRegistry {
     registry.register(GrepInput::default());
     registry.register(CodeSearchInput::default());
     registry.register(TreeInput::default());
+    registry.register(TodoTool);
     registry
 }
 
