@@ -64,6 +64,14 @@ const RED: &str = "31";
 /// The `Mutex`-wrapped sinks keep the observer `Send + Sync` (the observer
 /// trait requires both) and serialize writes so concurrent events never
 /// interleave mid-line. Locks are held only for the duration of a write.
+///
+/// Two contract points for hosts: the observer is designed for **one run
+/// per process** — its counters reset at run start, and overlapping runs
+/// sharing one observer would interleave their output. And model-derived
+/// text (streamed deltas, responses) is written **verbatim**: stdout is
+/// the capture payload, so embedded terminal control sequences are not
+/// sanitized, and consumers that render the stream in a terminal should
+/// treat it as untrusted text.
 pub struct ConsoleObserver {
     /// Output detail level, from configuration.
     ///
