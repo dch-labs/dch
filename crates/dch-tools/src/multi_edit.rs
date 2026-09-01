@@ -36,6 +36,7 @@ use crate::edit::FindResult;
 use crate::edit::locate_unique;
 use crate::edit::splice;
 use crate::linter::lint_content;
+use crate::util::ResolvePolicy;
 use crate::util::reject_url;
 use crate::util::resolve_path;
 use crate::write::format_lint_failure;
@@ -147,10 +148,14 @@ impl MultiEditTool {
         input: Value,
         rc: Option<RunnerContext>,
     ) -> Result<ToolOutput, ToolError> {
+        let policy = rc
+            .as_ref()
+            .map(|context| context.resolve_policy)
+            .unwrap_or_default();
         let cwd = require_cwd(rc.clone())?;
 
         let parsed = parse_input(&input)?;
-        let operations = build_operations(parsed.edits, &cwd)?;
+        let operations = build_operations(parsed.edits, &cwd, policy)?;
 
         if let Some(reason) = dup_path_check(&operations) {
             return Ok(reason.into_output());
@@ -372,14 +377,19 @@ struct EditOperation {
 /// Parse each edit item into an [`EditOperation`].
 ///
 /// Validates fields, rejecting empty `old_text` and URL `file_path`; relative
-/// paths are resolved against `cwd`; absolute paths are accepted only when
-/// they stay inside `cwd`.
+/// paths are resolved against `cwd` under `policy`; absolute paths are
+/// accepted only when they stay inside `cwd` (contained resolution).
 ///
 /// # Errors
 ///
 /// Returns [`ToolError::InvalidInput`] for a missing `file_path`/`old_text`/
-/// `new_text`, an empty `old_text`, or a URL `file_path`.
-fn build_operations(edits: &[Value], cwd: &Path) -> Result<Vec<EditOperation>, ToolError> {
+/// `new_text`, an empty `old_text`, a URL `file_path`, or — under contained
+/// resolution — a path that escapes `cwd`.
+fn build_operations(
+    edits: &[Value],
+    cwd: &Path,
+    policy: ResolvePolicy,
+) -> Result<Vec<EditOperation>, ToolError> {
     let mut operations = Vec::with_capacity(edits.len());
     for edit_value in edits {
         let file_path = edit_value
@@ -402,7 +412,7 @@ fn build_operations(edits: &[Value], cwd: &Path) -> Result<Vec<EditOperation>, T
         }
         reject_url("MultiEdit", file_path)?;
 
-        let full_path = resolve_path(file_path, cwd)?;
+        let full_path = resolve_path(file_path, cwd, policy)?;
         operations.push(EditOperation {
             file_path: file_path.to_string(),
             full_path,
@@ -882,6 +892,7 @@ fn apply_summary(preview: &str, applied: &[&str], operations: &[EditOperation]) 
 mod tests {
     use super::*;
     use crate::context::RunnerContext;
+    use crate::util::ResolvePolicy;
     use loopctl::tool::ToolContext;
     use std::path::PathBuf;
 
@@ -890,6 +901,14 @@ mod tests {
         let mut ctx = ToolContext::default();
         ctx.cwd = cwd.to_string();
         ctx.set_extension(RunnerContext::new(PathBuf::from(cwd)));
+        ctx
+    }
+
+    /// Builds a `ToolContext` whose runner context resolves under `policy`.
+    fn ctx_with_policy(cwd: &std::path::Path, policy: ResolvePolicy) -> ToolContext {
+        let mut ctx = ToolContext::default();
+        ctx.cwd = cwd.to_string_lossy().into_owned();
+        ctx.set_extension(RunnerContext::new(PathBuf::from(cwd)).with_resolve_policy(policy));
         ctx
     }
 
@@ -1044,7 +1063,7 @@ mod tests {
     #[test]
     fn build_operations_resolves_relative_path() {
         let edits = vec![edit("a.rs", "x", "y")];
-        let ops = build_operations(&edits, Path::new("/work")).unwrap();
+        let ops = build_operations(&edits, Path::new("/work"), ResolvePolicy::Contained).unwrap();
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].file_path, "a.rs");
         assert_eq!(ops[0].full_path, PathBuf::from("/work/a.rs"));
@@ -1053,22 +1072,37 @@ mod tests {
     #[test]
     fn build_operations_rejects_unrelated_absolute_path() {
         let edits = vec![edit("/abs/a.rs", "x", "y")];
-        assert!(build_operations(&edits, Path::new("/work")).is_err());
+        assert!(build_operations(&edits, Path::new("/work"), ResolvePolicy::Contained).is_err());
     }
 
     #[test]
     fn build_operations_missing_fields_are_invalid() {
         let cwd = Path::new("/work");
         assert!(matches!(
-            build_operations(&[json!({ "old_text": "x", "new_text": "y" })], cwd).unwrap_err(),
+            build_operations(
+                &[json!({ "old_text": "x", "new_text": "y" })],
+                cwd,
+                ResolvePolicy::Contained
+            )
+            .unwrap_err(),
             ToolError::InvalidInput(_)
         ));
         assert!(matches!(
-            build_operations(&[json!({ "file_path": "a", "new_text": "y" })], cwd).unwrap_err(),
+            build_operations(
+                &[json!({ "file_path": "a", "new_text": "y" })],
+                cwd,
+                ResolvePolicy::Contained
+            )
+            .unwrap_err(),
             ToolError::InvalidInput(_)
         ));
         assert!(matches!(
-            build_operations(&[json!({ "file_path": "a", "old_text": "x" })], cwd).unwrap_err(),
+            build_operations(
+                &[json!({ "file_path": "a", "old_text": "x" })],
+                cwd,
+                ResolvePolicy::Contained
+            )
+            .unwrap_err(),
             ToolError::InvalidInput(_)
         ));
     }
@@ -1076,14 +1110,20 @@ mod tests {
     #[test]
     fn build_operations_empty_old_text_is_invalid() {
         let cwd = Path::new("/work");
-        let err = build_operations(&[edit("a.rs", "", "y")], cwd).unwrap_err();
+        let err =
+            build_operations(&[edit("a.rs", "", "y")], cwd, ResolvePolicy::Contained).unwrap_err();
         assert!(matches!(err, ToolError::InvalidInput(ref s) if s.contains("empty")));
     }
 
     #[test]
     fn build_operations_url_is_invalid() {
         let cwd = Path::new("/work");
-        let err = build_operations(&[edit("https://e.com/x", "a", "b")], cwd).unwrap_err();
+        let err = build_operations(
+            &[edit("https://e.com/x", "a", "b")],
+            cwd,
+            ResolvePolicy::Contained,
+        )
+        .unwrap_err();
         assert!(matches!(err, ToolError::InvalidInput(ref s) if s.contains("WebFetch")));
     }
 
@@ -1339,6 +1379,47 @@ mod tests {
         // Neither file written.
         assert_eq!(std::fs::read_to_string(&f1).unwrap(), "fn one() {}\n");
         assert_eq!(std::fs::read_to_string(&f2).unwrap(), "fn two() {}\n");
+    }
+
+    #[tokio::test]
+    async fn multi_edit_honors_the_context_resolve_policy_outside_the_workspace() {
+        // `build_operations` is the one call site where the policy threads
+        // through a second function — pin the whole tool path: an edit of a
+        // file outside the workspace errors contained and lands unrestricted.
+        let workspace = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let target = outside.path().join("lib.rs");
+        std::fs::write(&target, "fn one() {}\n").unwrap();
+        let tool = MultiEditTool;
+        let input = json!({
+            "edits": [edit(
+                target.to_str().unwrap(),
+                "fn one() {}",
+                "fn one(x: i32) {}",
+            )],
+        });
+
+        let contained = tool
+            .call(input.clone(), &ctx_in(workspace.path().to_str().unwrap()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(contained, ToolError::InvalidInput(ref msg) if msg.contains("escapes")),
+            "the contained default must reject the escape: {contained:?}"
+        );
+
+        let unrestricted = tool
+            .call(
+                input,
+                &ctx_with_policy(workspace.path(), ResolvePolicy::Unrestricted),
+            )
+            .await
+            .unwrap();
+        assert!(!unrestricted.is_error, "{}", unrestricted.text_content());
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "fn one(x: i32) {}\n"
+        );
     }
 
     #[tokio::test]

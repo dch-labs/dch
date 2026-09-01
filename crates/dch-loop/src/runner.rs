@@ -35,6 +35,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use dch_tools::ResolvePolicy;
 use dch_tools::RunnerContext;
 use dch_tools::builtin_registry;
 use loopctl::engine::BareLoop;
@@ -349,7 +350,10 @@ impl RunnerBuilder<'_> {
     ///   `[[mcp.servers]]` entry fails to spawn or handshake, or the dispatch
     ///   pipeline cannot be built.
     pub async fn build(self) -> Result<Runner, RunnerError> {
-        let context = Arc::new(RunnerContext::new(self.workdir.clone()));
+        let context = Arc::new(
+            RunnerContext::new(self.workdir.clone())
+                .with_resolve_policy(resolve_policy_for(&self.config.runner)),
+        );
 
         let client = crate::create_client(&self.config.api)?;
         let connections = connect_mcp_servers(self.config, &context.cwd).await?;
@@ -484,6 +488,19 @@ struct McpConnection {
     /// `None` adapts every discovered tool; a populated set adapts only the
     /// listed ones and leaves the rest unregistered.
     allowed: Option<std::collections::HashSet<String>>,
+}
+
+/// The resolve policy a runner context carries for the given runner config.
+///
+/// `unsafe_paths` is the explicit opt-out: off (the default) keeps every
+/// file tool confined to the working directory, on lets them reach any path
+/// the OS permits.
+fn resolve_policy_for(runner: &dch_config::RunnerConfig) -> ResolvePolicy {
+    if runner.unsafe_paths {
+        ResolvePolicy::Unrestricted
+    } else {
+        ResolvePolicy::Contained
+    }
 }
 
 /// Compose the full tool registry: the builtin tools plus every MCP server's.
@@ -865,6 +882,25 @@ mod tests {
         assert!(
             ctx.tool_context.is_non_interactive,
             "no question channel means non-interactive"
+        );
+    }
+
+    #[test]
+    fn unsafe_paths_config_wires_unrestricted_resolution() {
+        // The config switch maps onto the policy the runner context carries;
+        // anything the config leaves unset stays contained.
+        let config = dch_config::DchConfig::default();
+        assert_eq!(
+            resolve_policy_for(&config.runner),
+            ResolvePolicy::Contained,
+            "the default config keeps tools contained"
+        );
+        let mut opted_out = dch_config::DchConfig::default();
+        opted_out.runner.unsafe_paths = true;
+        assert_eq!(
+            resolve_policy_for(&opted_out.runner),
+            ResolvePolicy::Unrestricted,
+            "the opt-out must lift containment"
         );
     }
 

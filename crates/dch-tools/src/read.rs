@@ -136,8 +136,12 @@ impl ReadInput {
             .ok_or_else(|| ToolError::InvalidInput("Missing file_path".to_string()))?;
         reject_url("Read", file_path)?;
 
+        let policy = runner_context
+            .as_ref()
+            .map(|context| context.resolve_policy)
+            .unwrap_or_default();
         let cwd = require_cwd(runner_context.clone())?;
-        let full_path = resolve_path(file_path, &cwd)?;
+        let full_path = resolve_path(file_path, &cwd, policy)?;
 
         let metadata = metadata_or_not_found(&full_path, file_path).await?;
         if let Some(too_large) = too_large_if_over(metadata.len()) {
@@ -539,6 +543,7 @@ fn parse_single_line(range: &str) -> Result<(usize, usize), String> {
 mod tests {
     use super::*;
     use crate::context::RunnerContext;
+    use crate::util::ResolvePolicy;
     use loopctl::tool::ToolContext;
     use serde_json::json;
     use std::path::PathBuf;
@@ -559,6 +564,45 @@ mod tests {
 
     fn input(path: &str) -> Value {
         json!({ "file_path": path })
+    }
+
+    /// Builds a `ToolContext` whose runner context resolves under `policy`.
+    fn ctx_with_policy(cwd: &std::path::Path, policy: ResolvePolicy) -> ToolContext {
+        let mut ctx = ToolContext::default();
+        ctx.cwd = cwd.to_string_lossy().into_owned();
+        ctx.set_extension(RunnerContext::new(PathBuf::from(cwd)).with_resolve_policy(policy));
+        ctx
+    }
+
+    #[tokio::test]
+    async fn read_honors_the_context_resolve_policy_outside_the_workspace() {
+        // The context policy is what lifts containment end to end: the same
+        // request errors under the default and succeeds unrestricted.
+        let workspace = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, "s3cret\n").unwrap();
+        let target = input(secret.to_str().unwrap());
+        let tool = ReadInput::default();
+
+        let contained = tool
+            .call(target.clone(), &ctx_in(workspace.path().to_str().unwrap()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(contained, ToolError::InvalidInput(ref msg) if msg.contains("escapes")),
+            "the contained default must reject the escape: {contained:?}"
+        );
+
+        let unrestricted = tool
+            .call(
+                target,
+                &ctx_with_policy(workspace.path(), ResolvePolicy::Unrestricted),
+            )
+            .await
+            .unwrap();
+        assert!(!unrestricted.is_error, "{unrestricted:?}");
+        assert_eq!(unrestricted.text_content(), "s3cret\n");
     }
 
     #[tokio::test]

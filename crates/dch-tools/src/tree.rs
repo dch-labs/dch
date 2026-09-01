@@ -109,6 +109,10 @@ impl TreeInput {
         input: Value,
         rc: Option<RunnerContext>,
     ) -> Result<ToolOutput, ToolError> {
+        let policy = rc
+            .as_ref()
+            .map(|context| context.resolve_policy)
+            .unwrap_or_default();
         let cwd = require_cwd(rc)?;
 
         let base_path = input.get("path").and_then(Value::as_str).unwrap_or(".");
@@ -125,7 +129,7 @@ impl TreeInput {
             .and_then(Value::as_bool)
             .unwrap_or(true);
         let pattern = input.get("pattern").and_then(Value::as_str);
-        let full_path = resolve_path(base_path, &cwd)?;
+        let full_path = resolve_path(base_path, &cwd, policy)?;
 
         if !tokio::fs::try_exists(&full_path)
             .await

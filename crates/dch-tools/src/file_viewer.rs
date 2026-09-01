@@ -177,10 +177,14 @@ impl FileViewerInput {
         input: Value,
         rc: Option<RunnerContext>,
     ) -> Result<ToolOutput, ToolError> {
+        let policy = rc
+            .as_ref()
+            .map(|context| context.resolve_policy)
+            .unwrap_or_default();
         let cwd = require_cwd(rc)?;
 
         let parsed = parse_input(&input)?;
-        let full_path = resolve_path(parsed.file_path, &cwd)?;
+        let full_path = resolve_path(parsed.file_path, &cwd, policy)?;
 
         let Some(content) = read_content(&full_path).await? else {
             return Ok(ToolOutput::error_text(format!(

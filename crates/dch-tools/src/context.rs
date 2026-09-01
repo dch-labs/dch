@@ -2,8 +2,9 @@
 //!
 //! Tools retrieve it with [`runner_ctx`] to reach per-call, tool-facing state:
 //! the working directory, the agent's per-run todo list, the channel slot
-//! for asking the user interactive questions, and the session's file-read
-//! history that backs the Write tool's staleness check.
+//! for asking the user interactive questions, the session's file-baseline
+//! map backing the Write tool's staleness check, and the path-containment
+//! policy the file tools resolve under.
 
 use std::fmt;
 use std::path::Path;
@@ -17,6 +18,7 @@ use loopctl::tool::ToolError;
 use crate::question::QuestionRequest;
 use crate::state::FileBaselines;
 use crate::todo::TodoEntry;
+use crate::util::ResolvePolicy;
 
 /// Per-call, tool-facing context attached to every `ToolContext`.
 ///
@@ -24,8 +26,9 @@ use crate::todo::TodoEntry;
 /// already on loopctl's `ToolContext`: the working directory (as a `PathBuf`,
 /// the form the file tools prefer), the agent's per-run todo list, the
 /// optional channel a tool uses during its call to ask the user a question,
-/// and the model's file-baseline map backing the Write tool's staleness
-/// check. Stored as a typed extension via
+/// the model's file-baseline map backing the Write tool's staleness check,
+/// and the path-containment policy the file tools resolve under. Stored as
+/// a typed extension via
 /// [`ToolContext::set_extension`](loopctl::tool::ToolContext::set_extension)
 /// and retrieved with [`runner_ctx`].
 ///
@@ -73,11 +76,19 @@ pub struct RunnerContext {
     /// one path resolve to the newest observation. Cloning
     /// [`RunnerContext`] shares the same map.
     pub file_baselines: Arc<Mutex<FileBaselines>>,
+
+    /// Whether file tools confine paths to [`cwd`](Self::cwd).
+    ///
+    /// [`ResolvePolicy::Contained`] (the default) rejects paths that escape
+    /// the working directory; [`ResolvePolicy::Unrestricted`] lets tools
+    /// reach any path the OS permits. Set from the config/CLI `unsafe_paths`
+    /// switch at runner construction.
+    pub resolve_policy: ResolvePolicy,
 }
 
 impl RunnerContext {
     /// Create a context for `cwd` with an empty todo list, no question
-    /// channel, and no recorded file baselines.
+    /// channel, no recorded file baselines, and contained path resolution.
     ///
     /// A relative `cwd` is anchored to the process's current directory.
     /// [`resolve_path`](crate::util::resolve_path) decides containment by
@@ -94,7 +105,20 @@ impl RunnerContext {
             todos: Arc::new(Mutex::new(Vec::new())),
             question_tx: Arc::new(Mutex::new(None)),
             file_baselines: Arc::new(Mutex::new(FileBaselines::default())),
+            resolve_policy: ResolvePolicy::default(),
         }
+    }
+
+    /// Set the path-containment policy the file tools resolve under.
+    ///
+    /// Builder-style companion to [`new`](Self::new), used by the runner
+    /// wiring to lift the configured `unsafe_paths` switch onto the context.
+    /// Contained resolution is the default; only an explicit opt-out
+    /// produces [`ResolvePolicy::Unrestricted`].
+    #[must_use]
+    pub fn with_resolve_policy(mut self, resolve_policy: ResolvePolicy) -> Self {
+        self.resolve_policy = resolve_policy;
+        self
     }
 
     /// Record an observation as the model's latest known state of `path`.
@@ -139,6 +163,7 @@ impl fmt::Debug for RunnerContext {
             .field("todos", &self.todos)
             .field("question_tx", &has_channel)
             .field("file_baselines", &baselines)
+            .field("resolve_policy", &self.resolve_policy)
             .finish()
     }
 }
@@ -227,12 +252,42 @@ mod tests {
     #[test]
     fn a_relative_cwd_resolves_relative_targets() {
         let rc = RunnerContext::new(PathBuf::from("."));
-        let resolved = crate::util::resolve_path("src/main.rs", &rc.cwd).unwrap();
+        let resolved =
+            crate::util::resolve_path("src/main.rs", &rc.cwd, ResolvePolicy::Contained).unwrap();
         assert!(
             resolved.is_absolute(),
             "the target must resolve against the anchored cwd: {resolved:?}"
         );
         assert!(resolved.ends_with(Path::new("src/main.rs")));
+    }
+
+    #[test]
+    fn the_resolve_policy_round_trips_through_the_extension() {
+        // The runner wiring lifts the configured unsafe_paths switch onto
+        // the context; tools must read the same policy back out.
+        let mut ctx = ToolContext::default();
+        ctx.set_extension(sample().with_resolve_policy(ResolvePolicy::Unrestricted));
+        let rc = runner_ctx(&ctx).expect("extension was set");
+        assert_eq!(
+            rc.resolve_policy,
+            ResolvePolicy::Unrestricted,
+            "the policy must survive the extension round trip"
+        );
+    }
+
+    #[test]
+    fn debug_reports_the_resolve_policy() {
+        let unrestricted = sample().with_resolve_policy(ResolvePolicy::Unrestricted);
+        let rendered = format!("{unrestricted:?}");
+        assert!(
+            rendered.contains("resolve_policy: Unrestricted"),
+            "Debug should carry the policy: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn a_new_context_defaults_to_contained_resolution() {
+        assert_eq!(sample().resolve_policy, ResolvePolicy::Contained);
     }
 
     #[test]

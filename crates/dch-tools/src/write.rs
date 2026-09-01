@@ -91,6 +91,10 @@ impl WriteInput {
         input: Value,
         rc: Option<RunnerContext>,
     ) -> Result<ToolOutput, ToolError> {
+        let policy = rc
+            .as_ref()
+            .map(|context| context.resolve_policy)
+            .unwrap_or_default();
         let cwd = require_cwd(rc.clone())?;
         let file_path = input
             .get("file_path")
@@ -105,7 +109,7 @@ impl WriteInput {
             .get("skip_linter")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let full_path = resolve_path(file_path, &cwd)?;
+        let full_path = resolve_path(file_path, &cwd, policy)?;
 
         if !skip_linter {
             let result = lint_content(&full_path, content);

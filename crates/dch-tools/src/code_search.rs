@@ -145,6 +145,10 @@ impl CodeSearchInput {
         rc: Option<RunnerContext>,
         temp_dir: PathBuf,
     ) -> Result<ToolOutput, ToolError> {
+        let policy = rc
+            .as_ref()
+            .map(|context| context.resolve_policy)
+            .unwrap_or_default();
         let cwd = require_cwd(rc)?;
 
         let parsed_input = crate::search::parse_input(&input, DEFAULT_MAX_RESULTS)?;
@@ -155,7 +159,7 @@ impl CodeSearchInput {
         reject_url("CodeSearch", &parsed_input.base_path)?;
 
         let regex = compile_pattern(&parsed_input.pattern, parsed_input.case_insensitive)?;
-        let base = resolve_path(&parsed_input.base_path, &cwd)?;
+        let base = resolve_path(&parsed_input.base_path, &cwd, policy)?;
         let job = SearchJob {
             regex,
             include: parsed_input.include_patterns,

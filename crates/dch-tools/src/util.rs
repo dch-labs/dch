@@ -85,36 +85,70 @@ pub fn reject_url(tool: &str, path: &str) -> Result<(), ToolError> {
     Ok(())
 }
 
-/// Resolve a possibly-relative `file_path` against `cwd`, keeping the result inside the workspace.
+/// Whether path resolution confines results to the working directory.
 ///
-/// The result must stay inside the `cwd` workspace both lexically and on the
-/// filesystem. Relative paths are joined to `cwd`; absolute paths are
-/// accepted only when they stay inside `cwd`. Both then pass two checks:
+/// File tools thread the policy carried on the run's runner context through
+/// [`resolve_path`]. The external config/CLI surface is a boolean
+/// (`unsafe_paths`), which maps onto this enum at the boundary — the enum is
+/// the internal, call-site-readable form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ResolvePolicy {
+    /// Reject paths that escape the working directory, both lexically and
+    /// through symlinks. The default, so every caller that does not name a
+    /// policy gets containment.
+    #[default]
+    Contained,
+    /// Lexical normalization only: any path the OS permits resolves, with
+    /// no containment check and no filesystem probing. Restores the reach
+    /// workflows like reading `/etc` or `~/.ssh` need.
+    Unrestricted,
+}
+
+/// Resolve a possibly-relative `file_path` against `cwd` under `policy`.
 ///
-/// 1. **Lexical containment** — both the result and `cwd` are normalized (`.`/
-///    `..` collapsed without touching the filesystem, so not-yet-existing
-///    write targets work) and the result must start with `cwd`'s components.
-///    Rejects `..` traversal and unrelated absolute paths.
+/// The result is lexically normalized under both policies (`.`/`..`
+/// collapsed without touching the filesystem, so not-yet-existing write
+/// targets work). Relative paths are joined to `cwd`; absolute paths are
+/// taken as given.
+///
+/// Under [`ResolvePolicy::Contained`] the result must additionally stay
+/// inside the workspace, checked in two layers:
+///
+/// 1. **Lexical containment** — the normalized result must start with
+///    `cwd`'s components. Rejects `..` traversal and unrelated absolute
+///    paths.
 /// 2. **Symlink containment** — each *existing* component of the resolved
-///    path is probed with `symlink_metadata`. A symlink's target is resolved
-///    (absolute, or relative to the link's directory) and recursively checked
-///    against the same workspace boundary. A symlink whose chain leaves `cwd`
-///    is rejected. Non-existent components stop the walk, so writing a new
-///    file still works — only the existing prefix is verified.
+///    path is probed with `symlink_metadata`. A symlink's target is
+///    resolved (absolute, or relative to the link's directory) and
+///    recursively checked against the same workspace boundary. A symlink
+///    whose chain leaves `cwd` is rejected. Non-existent components stop
+///    the walk, so writing a new file still works — only the existing
+///    prefix is verified.
+///
+/// Under [`ResolvePolicy::Unrestricted`] neither check runs — resolution
+/// makes no filesystem calls at all.
 ///
 /// This is the shared path-resolution primitive used by every file-touching
 /// tool (`Read`, `Write`, `Edit`, `MultiEdit`, `FileViewer`, and the
-/// navigation tools `Glob`, `Grep`, `CodeSearch`, `Tree`) so they can't drift
-/// apart. The symlink check closes the traversal vector where an in-workspace
-/// link points outside it, but it leaves a TOCTOU window open: a link could
-/// be swapped between the check and the caller's `open`. Closing that race
-/// requires descriptor-relative, `O_NOFOLLOW` opens and is deferred.
+/// navigation tools `Glob`, `Grep`, `CodeSearch`, `Tree`), so they can't
+/// drift apart. The symlink check closes the traversal vector where an
+/// in-workspace link points outside it, but it leaves a TOCTOU window open:
+/// a link could be swapped between the check and the caller's `open`.
+/// Closing that race requires descriptor-relative, `O_NOFOLLOW` opens and
+/// is deferred.
 ///
 /// # Errors
 ///
-/// Returns [`ToolError::InvalidInput`] when the resolved path does not stay
-/// within `cwd`, either lexically or via a symlink.
-pub fn resolve_path(file_path: &str, cwd: &Path) -> Result<PathBuf, ToolError> {
+/// Under [`ResolvePolicy::Contained`], returns
+/// [`ToolError::InvalidInput`] when the resolved path does not stay within
+/// `cwd`, either lexically or via a symlink, and [`ToolError::Execution`]
+/// when a symlink cannot be read. [`ResolvePolicy::Unrestricted`] never
+/// fails on policy grounds.
+pub fn resolve_path(
+    file_path: &str,
+    cwd: &Path,
+    policy: ResolvePolicy,
+) -> Result<PathBuf, ToolError> {
     let path = Path::new(file_path);
     let joined = if path.is_relative() {
         cwd.join(path)
@@ -122,6 +156,10 @@ pub fn resolve_path(file_path: &str, cwd: &Path) -> Result<PathBuf, ToolError> {
         path.to_path_buf()
     };
     let normalized = normalize_lexical(&joined);
+    match policy {
+        ResolvePolicy::Unrestricted => return Ok(normalized),
+        ResolvePolicy::Contained => {}
+    }
     let base = normalize_lexical(cwd);
     if !lexically_inside(&normalized, &base) {
         return Err(ToolError::InvalidInput(format!(
@@ -360,7 +398,7 @@ mod tests {
     fn resolve_path_relative_joins_cwd_and_normalizes() {
         let cwd = Path::new("/work");
         assert_eq!(
-            resolve_path("sub/a.rs", cwd).unwrap(),
+            resolve_path("sub/a.rs", cwd, ResolvePolicy::Contained).unwrap(),
             PathBuf::from("/work/sub/a.rs")
         );
     }
@@ -368,7 +406,7 @@ mod tests {
     #[test]
     fn resolve_path_rejects_unrelated_absolute() {
         let cwd = Path::new("/work");
-        let err = resolve_path("/abs/a.rs", cwd).unwrap_err();
+        let err = resolve_path("/abs/a.rs", cwd, ResolvePolicy::Contained).unwrap_err();
         assert!(
             matches!(err, ToolError::InvalidInput(ref msg) if msg.contains("escapes")),
             "{err:?}"
@@ -378,9 +416,9 @@ mod tests {
     #[test]
     fn resolve_path_rejects_traversal_escape() {
         let cwd = Path::new("/work");
-        assert!(resolve_path("../escape/a.rs", cwd).is_err());
-        assert!(resolve_path("sub/../../escape/a.rs", cwd).is_err());
-        assert!(resolve_path("../../..", cwd).is_err());
+        assert!(resolve_path("../escape/a.rs", cwd, ResolvePolicy::Contained).is_err());
+        assert!(resolve_path("sub/../../escape/a.rs", cwd, ResolvePolicy::Contained).is_err());
+        assert!(resolve_path("../../..", cwd, ResolvePolicy::Contained).is_err());
     }
 
     #[test]
@@ -388,22 +426,25 @@ mod tests {
         let cwd = Path::new("/work");
         // `..` that stays inside resolves and normalizes.
         assert_eq!(
-            resolve_path("sub/../a.rs", cwd).unwrap(),
+            resolve_path("sub/../a.rs", cwd, ResolvePolicy::Contained).unwrap(),
             PathBuf::from("/work/a.rs")
         );
         assert_eq!(
-            resolve_path("a/./b/../c.rs", cwd).unwrap(),
+            resolve_path("a/./b/../c.rs", cwd, ResolvePolicy::Contained).unwrap(),
             PathBuf::from("/work/a/c.rs")
         );
         // `..` back to the workspace root itself is still inside.
-        assert_eq!(resolve_path("sub/..", cwd).unwrap(), PathBuf::from("/work"));
+        assert_eq!(
+            resolve_path("sub/..", cwd, ResolvePolicy::Contained).unwrap(),
+            PathBuf::from("/work")
+        );
     }
 
     #[test]
     fn resolve_path_accepts_absolute_inside_workspace() {
         let cwd = Path::new("/work");
         assert_eq!(
-            resolve_path("/work/src/a.rs", cwd).unwrap(),
+            resolve_path("/work/src/a.rs", cwd, ResolvePolicy::Contained).unwrap(),
             PathBuf::from("/work/src/a.rs")
         );
     }
@@ -414,7 +455,64 @@ mod tests {
         // a child — must be rejected. The check is component-wise, so a naive
         // starts-with-string test would wrongly accept this.
         let cwd = Path::new("/work");
-        assert!(resolve_path("/workspace/a.rs", cwd).is_err());
+        assert!(resolve_path("/workspace/a.rs", cwd, ResolvePolicy::Contained).is_err());
+    }
+
+    #[test]
+    fn resolve_path_unrestricted_allows_traversal_escape() {
+        // Unrestricted is the escape hatch: traversal the contained policy
+        // rejects resolves to its normalized target instead.
+        assert_eq!(
+            resolve_path(
+                "../etc/passwd",
+                Path::new("/work"),
+                ResolvePolicy::Unrestricted
+            )
+            .unwrap(),
+            PathBuf::from("/etc/passwd")
+        );
+    }
+
+    #[test]
+    fn resolve_path_unrestricted_allows_unrelated_absolute() {
+        assert_eq!(
+            resolve_path("/abs/a.rs", Path::new("/work"), ResolvePolicy::Unrestricted).unwrap(),
+            PathBuf::from("/abs/a.rs")
+        );
+    }
+
+    #[test]
+    fn resolve_path_unrestricted_still_normalizes_dots() {
+        // Normalization is policy-independent: unrestricted results are
+        // canonical in `.`/`..` just like contained ones.
+        assert_eq!(
+            resolve_path(
+                "a/./b/../c.rs",
+                Path::new("/work"),
+                ResolvePolicy::Unrestricted
+            )
+            .unwrap(),
+            PathBuf::from("/work/a/c.rs")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_path_unrestricted_ignores_an_escaping_symlink() {
+        // The symlink walk exists solely to enforce containment, so the
+        // unrestricted policy skips it entirely — a link pointing outside
+        // the workspace resolves instead of being rejected.
+        use std::os::unix::fs::symlink;
+        let work = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let secret = outside.path().join("secret");
+        std::fs::write(&secret, "x").unwrap();
+        let link = work.path().join("link.txt");
+        symlink(&secret, &link).unwrap();
+        assert_eq!(
+            resolve_path("link.txt", work.path(), ResolvePolicy::Unrestricted).unwrap(),
+            work.path().join("link.txt")
+        );
     }
 
     #[test]
@@ -499,7 +597,7 @@ mod tests {
         symlink(&real, &link).unwrap();
         // Resolving the link (both exist, both inside) must succeed.
         assert_eq!(
-            resolve_path("link.txt", work.path()).unwrap(),
+            resolve_path("link.txt", work.path(), ResolvePolicy::Contained).unwrap(),
             work.path().join("link.txt")
         );
     }
@@ -514,7 +612,7 @@ mod tests {
         std::fs::write(&secret, "x").unwrap();
         let link = work.path().join("link.txt");
         symlink(&secret, &link).unwrap();
-        let err = resolve_path("link.txt", work.path()).unwrap_err();
+        let err = resolve_path("link.txt", work.path(), ResolvePolicy::Contained).unwrap_err();
         assert!(
             matches!(err, ToolError::InvalidInput(ref s) if s.contains("symlink")),
             "{err:?}"
@@ -537,7 +635,7 @@ mod tests {
         symlink(&secret, &hop).unwrap();
         let link = work.path().join("link.txt");
         symlink(&hop, &link).unwrap();
-        let err = resolve_path("link.txt", work.path()).unwrap_err();
+        let err = resolve_path("link.txt", work.path(), ResolvePolicy::Contained).unwrap_err();
         assert!(
             matches!(err, ToolError::InvalidInput(ref s) if s.contains("symlink")),
             "{err:?}"
@@ -556,7 +654,7 @@ mod tests {
         // `src/new.rs` does not exist; resolving it must succeed because its
         // existing prefix (`work/src`) is inside cwd.
         assert_eq!(
-            resolve_path("src/new.rs", work.path()).unwrap(),
+            resolve_path("src/new.rs", work.path(), ResolvePolicy::Contained).unwrap(),
             work.path().join("src/new.rs")
         );
     }

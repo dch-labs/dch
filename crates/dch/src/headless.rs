@@ -141,7 +141,7 @@ pub async fn run_headless(args: &Args) -> u8 {
 async fn run_headless_inner(args: &Args) -> Result<HeadlessOutcome, HeadlessOutcome> {
     let prompt = resolve_prompt(args).map_err(|message| construction_failure(args, message))?;
 
-    let mut config = load_config(args.config_path.as_deref())
+    let mut config = load_config(args.config.config_path.as_deref())
         .map_err(|message| construction_failure(args, message))?;
     apply_cli_overrides(&mut config, args);
 
@@ -273,12 +273,16 @@ fn load_config(path: Option<&Path>) -> Result<dch_config::DchConfig, String> {
 
 /// Apply CLI overrides to the config before agent construction.
 ///
-/// Deliberately small: `--model` is the only per-run provider override.
-/// Verbosity resolves separately when the observer is built, and display
-/// preferences remain config-file concerns.
+/// Deliberately small: `--model` is the only per-run provider override and
+/// `--unsafe-paths` the only per-run access switch. Verbosity resolves
+/// separately when the observer is built, and display preferences remain
+/// config-file concerns.
 fn apply_cli_overrides(config: &mut dch_config::DchConfig, args: &Args) {
     if let Some(model) = &args.model {
         config.api.model.clone_from(model);
+    }
+    if args.config.unsafe_paths {
+        config.runner.unsafe_paths = true;
     }
 }
 
@@ -531,6 +535,19 @@ mod tests {
         let original = config.api.model.clone();
         apply_cli_overrides(&mut config, &parse(&[]));
         assert_eq!(config.api.model, original);
+    }
+
+    #[test]
+    fn the_unsafe_paths_flag_overrides_the_config() {
+        // Containment stays on unless the flag is passed; the flag can only
+        // lift it, never re-impose it over a config that opted out.
+        let mut config = dch_config::DchConfig::default();
+        apply_cli_overrides(&mut config, &parse(&["--unsafe-paths"]));
+        assert!(config.runner.unsafe_paths);
+
+        let mut config = dch_config::DchConfig::default();
+        apply_cli_overrides(&mut config, &parse(&[]));
+        assert!(!config.runner.unsafe_paths);
     }
 
     #[test]

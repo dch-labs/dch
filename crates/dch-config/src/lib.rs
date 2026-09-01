@@ -668,6 +668,17 @@ pub struct RunnerConfig {
     /// `[[runner.role_overrides]]`.
     #[serde(default)]
     pub role_overrides: Vec<RoleOverride>,
+
+    /// Whether file tools may reach paths outside the working directory.
+    ///
+    /// `false` (the default) keeps every file-touching tool confined to the
+    /// working directory — traversal, unrelated absolute paths, and escaping
+    /// symlinks are rejected. `true` lifts that containment so system-file
+    /// workflows work (`/etc`, `~/.ssh`, `/var/log`); the CLI flag
+    /// `--unsafe-paths` forces it on for one run. It never crosses into the
+    /// session/run configuration — path containment is a tool-layer concern.
+    #[serde(default)]
+    pub unsafe_paths: bool,
 }
 
 /// A user-supplied replacement for one [`Role`]'s built-in prose.
@@ -854,6 +865,7 @@ impl Default for RunnerConfig {
             permission_mode: PermissionMode::default(),
             role: Role::default(),
             role_overrides: Vec::new(),
+            unsafe_paths: false,
         }
     }
 }
@@ -1308,6 +1320,24 @@ redact_secrets = false
         assert!(
             serialized.contains("role = \"refactor\""),
             "snake_case serialization: {serialized}"
+        );
+    }
+
+    #[test]
+    fn unsafe_paths_defaults_to_contained() {
+        // The safe-by-default contract: absent from the config, containment
+        // stays on.
+        assert!(!DchConfig::default().runner.unsafe_paths);
+    }
+
+    #[test]
+    fn unsafe_paths_parses_from_toml() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_config(tmp.path(), "config.toml", "[runner]\nunsafe_paths = true\n");
+        let c = DchConfig::load_from_dir(tmp.path()).unwrap();
+        assert!(
+            c.runner.unsafe_paths,
+            "the opt-out must parse through serde"
         );
     }
 }

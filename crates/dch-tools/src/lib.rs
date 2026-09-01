@@ -54,4 +54,5 @@ pub use registry::builtin_registry;
 pub use todo::TodoEntry;
 pub use todo::TodoStatus;
 pub use tree::TreeInput;
+pub use util::ResolvePolicy;
 pub use write::WriteInput;

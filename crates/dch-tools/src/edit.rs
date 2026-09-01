@@ -106,9 +106,13 @@ impl EditInput {
         input: Value,
         rc: Option<RunnerContext>,
     ) -> Result<ToolOutput, ToolError> {
+        let policy = rc
+            .as_ref()
+            .map(|context| context.resolve_policy)
+            .unwrap_or_default();
         let cwd = require_cwd(rc.clone())?;
         let parsed = parse_input(&input)?;
-        let full_path = resolve_path(parsed.file_path, &cwd)?;
+        let full_path = resolve_path(parsed.file_path, &cwd, policy)?;
         let old_content = read_existing(&full_path, parsed.file_path).await?;
         let new_content = match apply_edit(&old_content, parsed.old_text, parsed.new_text) {
             Ok(c) => c,

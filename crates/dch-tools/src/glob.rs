@@ -89,11 +89,15 @@ impl GlobInput {
         input: Value,
         rc: Option<RunnerContext>,
     ) -> Result<ToolOutput, ToolError> {
+        let policy = rc
+            .as_ref()
+            .map(|context| context.resolve_policy)
+            .unwrap_or_default();
         let cwd = require_cwd(rc)?;
         let parsed = parse_input(&input)?;
         reject_url("Glob", &parsed.base_path)?;
 
-        let base = resolve_path(&parsed.base_path, &cwd)?;
+        let base = resolve_path(&parsed.base_path, &cwd, policy)?;
         let glob_override = build_glob_override(&base, &parsed.pattern)?;
         let pattern = parsed.pattern.clone();
         let matches = tokio::task::spawn_blocking(move || collect_matches(&base, &glob_override))
@@ -415,6 +419,7 @@ mod tests {
 mod integration_tests {
     use super::*;
     use crate::context::RunnerContext;
+    use crate::util::ResolvePolicy;
     use loopctl::tool::ToolContext;
     use serde_json::json;
     use std::path::PathBuf;
@@ -454,6 +459,52 @@ mod integration_tests {
         assert_eq!(
             parsed,
             vec!["src/main.rs".to_string(), "src/util.rs".to_string()]
+        );
+    }
+
+    /// Builds a `ToolContext` whose runner context resolves under `policy`.
+    fn ctx_with_policy(dir: &std::path::Path, policy: ResolvePolicy) -> ToolContext {
+        let mut ctx = ToolContext::default();
+        ctx.cwd = dir.to_string_lossy().into_owned();
+        ctx.set_extension(RunnerContext::new(PathBuf::from(dir)).with_resolve_policy(policy));
+        ctx
+    }
+
+    #[tokio::test]
+    async fn glob_honors_the_context_resolve_policy_outside_the_workspace() {
+        // The navigation tools take the same context policy: a base path
+        // outside the workspace is rejected by default and scanned
+        // unrestricted.
+        let workspace = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        write_file(outside.path(), "logs/app.log", "boom");
+        let tool = GlobInput::default();
+        let input = json!({
+            "pattern": "*.log",
+            "path": outside.path().join("logs").to_str().unwrap(),
+        });
+
+        let contained = tool
+            .call(input.clone(), &ctx_in(workspace.path()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(contained, ToolError::InvalidInput(ref msg) if msg.contains("escapes")),
+            "the contained default must reject the escape: {contained:?}"
+        );
+
+        let unrestricted = tool
+            .call(
+                input,
+                &ctx_with_policy(workspace.path(), ResolvePolicy::Unrestricted),
+            )
+            .await
+            .unwrap();
+        assert!(!unrestricted.is_error, "{}", unrestricted.text_content());
+        assert!(
+            unrestricted.text_content().contains("app.log"),
+            "{}",
+            unrestricted.text_content()
         );
     }
 
