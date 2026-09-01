@@ -20,6 +20,7 @@ tracing = { workspace = true }
 [dev-dependencies]
 rmcp = { version = "3", default-features = false, features = ["server", "macros"] }
 tempfile = { workspace = true }
+uuid = { workspace = true }
 loopctl = { workspace = true, features = ["testing"] }
 
 [lints]

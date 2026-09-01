@@ -38,6 +38,7 @@ static OBSERVATION_SEQ: AtomicU64 = AtomicU64::new(0);
 pub type FileBaselines = BTreeMap<PathBuf, FileBaseline>;
 
 /// One observation of a file's content, at a known point in the session's
+///
 /// observation order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileBaseline {

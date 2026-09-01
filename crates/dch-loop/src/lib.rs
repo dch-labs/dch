@@ -2,12 +2,15 @@
 
 #![warn(missing_docs)]
 
+pub mod console_observer;
 pub mod error;
 pub mod project;
 pub mod prompt;
 pub mod provider;
 pub mod runner;
 
+pub use console_observer::ConsoleObserver;
+pub use dch_config::Verbosity;
 pub use dch_config::{ApiConfig, ApiType, DchConfigError, TechProfile};
 pub use error::RunnerError;
 pub use project::MessageAnalysis;
