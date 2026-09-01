@@ -15,6 +15,7 @@ use loopctl::tool::ToolOutput;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
+use tokio::io::AsyncReadExt;
 
 use crate::context::RunnerContext;
 use crate::context::require_cwd;
@@ -187,7 +188,7 @@ impl FileViewerInput {
         let parsed = parse_input(&input)?;
         let full_path = resolve_path(parsed.file_path, &cwd, policy)?;
 
-        let Some(content) = read_content(&full_path).await? else {
+        let Some(content) = read_content(&full_path, &cwd, policy).await? else {
             return Ok(ToolOutput::error_text(format!(
                 "File not found: {}",
                 parsed.file_path
@@ -279,14 +280,25 @@ fn parse_input(input: &Value) -> Result<ParsedInput<'_>, ToolError> {
 /// # Errors
 ///
 /// Returns [`ToolError::Execution`] on any read fault other than "not found".
-async fn read_content(full_path: &Path) -> Result<Option<String>, ToolError> {
+async fn read_content(
+    full_path: &Path,
+    workspace: &Path,
+    policy: ResolvePolicy,
+) -> Result<Option<String>, ToolError> {
     if !tokio::fs::try_exists(full_path)
         .await
         .map_err(|e| ToolError::Execution(e.to_string()))?
     {
         return Ok(None);
     }
-    let content = tokio::fs::read_to_string(full_path)
+    let mut file = tokio::fs::File::open(full_path)
+        .await
+        .map_err(|e| ToolError::Execution(e.to_string()))?;
+    if policy == ResolvePolicy::Contained {
+        crate::util::verify_handle_inside(&file, workspace)?;
+    }
+    let mut content = String::new();
+    file.read_to_string(&mut content)
         .await
         .map_err(|e| ToolError::Execution(e.to_string()))?;
     Ok(Some(content))

@@ -11,6 +11,7 @@ use loopctl::tool::ToolOutput;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
+use tokio::io::AsyncReadExt;
 
 use crate::context::RunnerContext;
 use crate::context::require_cwd;
@@ -121,7 +122,18 @@ impl WriteInput {
             }
         }
 
-        let old_content = tokio::fs::read_to_string(&full_path).await.ok();
+        let old_content = match tokio::fs::File::open(&full_path).await.ok() {
+            Some(file) => {
+                if policy == ResolvePolicy::Contained {
+                    crate::util::verify_handle_inside(&file, &cwd)?;
+                }
+                let mut buffer = String::new();
+                let mut file = file;
+                file.read_to_string(&mut buffer).await.ok();
+                Some(buffer)
+            }
+            None => None,
+        };
 
         if let Some(baseline_hash) = rc.as_ref().and_then(|rc| rc.baseline_for(&full_path))
             && let Err(failure) =
@@ -139,7 +151,7 @@ impl WriteInput {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        crate::fs::atomic_write(&full_path, content)?;
+        crate::fs::atomic_write(&full_path, content, &cwd, policy)?;
 
         if let Some(rc) = &rc {
             rc.record_baseline(&full_path, crate::state::observe_bytes(content.as_bytes()));

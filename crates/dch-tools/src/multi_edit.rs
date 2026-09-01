@@ -25,6 +25,7 @@ use loopctl::tool::ToolOutput;
 use loopctl::tool::ToolSchema;
 use serde_json::Value;
 use serde_json::json;
+use tokio::io::AsyncReadExt;
 
 use crate::conflict::CheckFailure;
 use crate::conflict::check_content_unchanged;
@@ -160,7 +161,7 @@ impl MultiEditTool {
         if let Some(reason) = dup_path_check(&operations) {
             return Ok(reason.into_output());
         }
-        let originals = read_files(&operations).await?;
+        let originals = read_files(&operations, &cwd, policy).await?;
         if let Some(reason) = symlink_check(&operations) {
             return Ok(reason.into_output());
         }
@@ -182,7 +183,9 @@ impl MultiEditTool {
         if parsed.dry_run {
             return Ok(ToolOutput::text(summary).with_hint(DisplayHint::Diff));
         }
-        if let Some(conflict) = write_finals(&operations, &originals, &finals, rc.as_ref()).await? {
+        if let Some(conflict) =
+            write_finals(&operations, &originals, &finals, rc.as_ref(), &cwd, policy).await?
+        {
             let mut message = crate::conflict::changed_message(Path::new(&conflict.path));
             if !conflict.applied.is_empty() {
                 message.push_str("\n\nAlready written by this batch: ");
@@ -241,6 +244,8 @@ async fn write_finals(
     originals: &BTreeMap<String, String>,
     finals: &BTreeMap<String, String>,
     history: Option<&RunnerContext>,
+    workspace: &Path,
+    policy: ResolvePolicy,
 ) -> Result<Option<BatchConflict>, ToolError> {
     let mut written: std::collections::HashSet<&Path> = std::collections::HashSet::new();
     let mut applied: Vec<String> = Vec::new();
@@ -261,7 +266,7 @@ async fn write_finals(
                     Err(CheckFailure::Fault(e)) => return Err(e),
                 }
             }
-            crate::fs::atomic_write(&op.full_path, final_content)?;
+            crate::fs::atomic_write(&op.full_path, final_content, workspace, policy)?;
             applied.push(op.file_path.clone());
             if let Some(rc) = history {
                 rc.record_baseline(
@@ -432,7 +437,11 @@ fn build_operations(
 ///
 /// Returns [`ToolError::FileNotFound`] when a target does not exist, and
 /// [`ToolError::Execution`] on any other read fault (including non-UTF-8).
-async fn read_files(operations: &[EditOperation]) -> Result<BTreeMap<String, String>, ToolError> {
+async fn read_files(
+    operations: &[EditOperation],
+    workspace: &Path,
+    policy: ResolvePolicy,
+) -> Result<BTreeMap<String, String>, ToolError> {
     let mut originals = BTreeMap::new();
     for op in operations {
         if originals.contains_key(&op.file_path) {
@@ -444,7 +453,14 @@ async fn read_files(operations: &[EditOperation]) -> Result<BTreeMap<String, Str
         {
             return Err(ToolError::FileNotFound(op.file_path.clone()));
         }
-        let content = tokio::fs::read_to_string(&op.full_path)
+        let mut file = tokio::fs::File::open(&op.full_path)
+            .await
+            .map_err(|e| ToolError::Execution(e.to_string()))?;
+        if policy == ResolvePolicy::Contained {
+            crate::util::verify_handle_inside(&file, workspace)?;
+        }
+        let mut content = String::new();
+        file.read_to_string(&mut content)
             .await
             .map_err(|e| ToolError::Execution(e.to_string()))?;
         originals.insert(op.file_path.clone(), content);
@@ -1160,7 +1176,9 @@ mod tests {
             old_text: "a".to_string(),
             new_text: "b".to_string(),
         }];
-        let err = read_files(&ops).await.unwrap_err();
+        let err = read_files(&ops, tmp.path(), ResolvePolicy::Contained)
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::FileNotFound(_)), "{err:?}");
     }
 
@@ -1175,7 +1193,9 @@ mod tests {
             old_text: "a".to_string(),
             new_text: "b".to_string(),
         }];
-        let err = read_files(&ops).await.unwrap_err();
+        let err = read_files(&ops, tmp.path(), ResolvePolicy::Contained)
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::Execution(_)), "{err:?}");
     }
 
@@ -1199,7 +1219,9 @@ mod tests {
                 new_text: "d".to_string(),
             },
         ];
-        let map = read_files(&ops).await.unwrap();
+        let map = read_files(&ops, tmp.path(), ResolvePolicy::Contained)
+            .await
+            .unwrap();
         assert_eq!(map.len(), 1);
         assert_eq!(map.get("a.rs").unwrap(), "content\n");
     }
@@ -2054,9 +2076,16 @@ mod tests {
             new_text: "rewritten".to_string(),
         }];
 
-        let outcome = write_finals(&operations, &originals, &finals, None)
-            .await
-            .unwrap();
+        let outcome = write_finals(
+            &operations,
+            &originals,
+            &finals,
+            None,
+            tmp.path(),
+            ResolvePolicy::Contained,
+        )
+        .await
+        .unwrap();
         let conflict = outcome.expect("an externally changed file aborts the batch");
         assert_eq!(conflict.path, "a.rs");
         assert!(
@@ -2098,9 +2127,16 @@ mod tests {
             },
         ];
 
-        let outcome = write_finals(&operations, &originals, &finals, None)
-            .await
-            .unwrap();
+        let outcome = write_finals(
+            &operations,
+            &originals,
+            &finals,
+            None,
+            tmp.path(),
+            ResolvePolicy::Contained,
+        )
+        .await
+        .unwrap();
         let conflict = outcome.expect("the second file's conflict aborts the batch");
         assert_eq!(conflict.path, "b.rs");
         assert_eq!(conflict.applied, vec!["a.rs".to_string()]);
@@ -2128,9 +2164,16 @@ mod tests {
             new_text: "rewritten".to_string(),
         }];
 
-        let outcome = write_finals(&operations, &originals, &finals, None)
-            .await
-            .unwrap();
+        let outcome = write_finals(
+            &operations,
+            &originals,
+            &finals,
+            None,
+            tmp.path(),
+            ResolvePolicy::Contained,
+        )
+        .await
+        .unwrap();
         assert!(outcome.is_none(), "matching disk content must not abort");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "rewritten");
     }

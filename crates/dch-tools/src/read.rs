@@ -156,7 +156,7 @@ impl ReadInput {
             )));
         }
 
-        let bytes = read_capped(&full_path).await?;
+        let bytes = read_capped(&full_path, &cwd, policy).await?;
         if let Some(too_large) = too_large_if_over(bytes.len() as u64) {
             return Ok(too_large);
         }
@@ -262,10 +262,17 @@ fn too_large_if_over(byte_count: u64) -> Option<ToolOutput> {
 /// # Errors
 ///
 /// Returns [`ToolError::Execution`] if the file cannot be opened or read.
-async fn read_capped(path: &std::path::Path) -> Result<Vec<u8>, ToolError> {
+async fn read_capped(
+    path: &std::path::Path,
+    workspace: &std::path::Path,
+    policy: ResolvePolicy,
+) -> Result<Vec<u8>, ToolError> {
     let file = tokio::fs::File::open(path)
         .await
         .map_err(|e| ToolError::Execution(format!("Failed to open file: {e}")))?;
+    if policy == ResolvePolicy::Contained {
+        crate::util::verify_handle_inside(&file, workspace)?;
+    }
     let cap = MAX_FILE_SIZE_BYTES.saturating_add(1);
     let mut buf = Vec::with_capacity(cap.min(8192));
     file.take(cap as u64)
@@ -950,7 +957,9 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("small.txt");
         std::fs::write(&path, b"hello world").unwrap();
-        let bytes = read_capped(&path).await.unwrap();
+        let bytes = read_capped(&path, tmp.path(), ResolvePolicy::Contained)
+            .await
+            .unwrap();
         assert_eq!(bytes, b"hello world");
     }
 
@@ -959,7 +968,9 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("exact.bin");
         std::fs::write(&path, vec![b'x'; MAX_FILE_SIZE_BYTES]).unwrap();
-        let bytes = read_capped(&path).await.unwrap();
+        let bytes = read_capped(&path, tmp.path(), ResolvePolicy::Contained)
+            .await
+            .unwrap();
         assert_eq!(bytes.len(), MAX_FILE_SIZE_BYTES);
     }
 
@@ -968,7 +979,9 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("over.bin");
         std::fs::write(&path, vec![b'x'; MAX_FILE_SIZE_BYTES + 100]).unwrap();
-        let bytes = read_capped(&path).await.unwrap();
+        let bytes = read_capped(&path, tmp.path(), ResolvePolicy::Contained)
+            .await
+            .unwrap();
         assert_eq!(bytes.len(), MAX_FILE_SIZE_BYTES + 1);
     }
 
@@ -977,7 +990,9 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("empty.txt");
         std::fs::write(&path, b"").unwrap();
-        let bytes = read_capped(&path).await.unwrap();
+        let bytes = read_capped(&path, tmp.path(), ResolvePolicy::Contained)
+            .await
+            .unwrap();
         assert!(bytes.is_empty());
     }
 
@@ -985,7 +1000,9 @@ mod tests {
     async fn read_capped_missing_file_is_execution_error() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("nope.txt");
-        let err = read_capped(&path).await.unwrap_err();
+        let err = read_capped(&path, tmp.path(), ResolvePolicy::Contained)
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::Execution(_)));
     }
 

@@ -16,6 +16,7 @@ use loopctl::tool::ToolOutput;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
+use tokio::io::AsyncReadExt;
 
 use crate::context::RunnerContext;
 use crate::context::require_cwd;
@@ -114,7 +115,7 @@ impl EditInput {
         let cwd = require_cwd(rc.clone())?;
         let parsed = parse_input(&input)?;
         let full_path = resolve_path(parsed.file_path, &cwd, policy)?;
-        let old_content = read_existing(&full_path, parsed.file_path).await?;
+        let old_content = read_existing(&full_path, parsed.file_path, &cwd, policy).await?;
         let new_content = match apply_edit(&old_content, parsed.old_text, parsed.new_text) {
             Ok(c) => c,
             Err(reason) => return Ok(reason.into_output()),
@@ -137,7 +138,7 @@ impl EditInput {
             };
         }
 
-        crate::fs::atomic_write(&full_path, &new_content)?;
+        crate::fs::atomic_write(&full_path, &new_content, &cwd, policy)?;
 
         if let Some(rc) = &rc {
             rc.record_baseline(
@@ -318,16 +319,29 @@ fn parse_input(input: &Value) -> Result<EditArgs<'_>, ToolError> {
 ///
 /// Returns [`ToolError::FileNotFound`] when the file does not exist, and
 /// [`ToolError::Execution`] on any other I/O error (including non-UTF-8 reads).
-async fn read_existing(full_path: &Path, display_path: &str) -> Result<String, ToolError> {
+async fn read_existing(
+    full_path: &Path,
+    display_path: &str,
+    workspace: &Path,
+    policy: ResolvePolicy,
+) -> Result<String, ToolError> {
     if !tokio::fs::try_exists(full_path)
         .await
         .map_err(|e| ToolError::Execution(e.to_string()))?
     {
         return Err(ToolError::FileNotFound(display_path.to_string()));
     }
-    tokio::fs::read_to_string(full_path)
+    let mut file = tokio::fs::File::open(full_path)
         .await
-        .map_err(|e| ToolError::Execution(e.to_string()))
+        .map_err(|e| ToolError::Execution(e.to_string()))?;
+    if policy == ResolvePolicy::Contained {
+        crate::util::verify_handle_inside(&file, workspace)?;
+    }
+    let mut content = String::new();
+    file.read_to_string(&mut content)
+        .await
+        .map_err(|e| ToolError::Execution(e.to_string()))?;
+    Ok(content)
 }
 
 /// Locate `old_text` in `content` and splice `new_text` into its place.
@@ -829,7 +843,9 @@ mod tests {
     async fn read_existing_missing_file_is_file_not_found() {
         let tmp = tempfile::TempDir::new().unwrap();
         let missing = tmp.path().join("nope.txt");
-        let err = read_existing(&missing, "nope.txt").await.unwrap_err();
+        let err = read_existing(&missing, "nope.txt", tmp.path(), ResolvePolicy::Contained)
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, ToolError::FileNotFound(ref s) if s == "nope.txt"),
             "{err:?}"
@@ -842,7 +858,9 @@ mod tests {
         let target = tmp.path().join("bin.dat");
         // Invalid UTF-8 (lone continuation byte) — read_to_string rejects it.
         std::fs::write(&target, b"\xFF\xFE\x00").unwrap();
-        let err = read_existing(&target, "bin.dat").await.unwrap_err();
+        let err = read_existing(&target, "bin.dat", tmp.path(), ResolvePolicy::Contained)
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::Execution(_)), "{err:?}");
     }
 
@@ -851,7 +869,9 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let target = tmp.path().join("ok.txt");
         std::fs::write(&target, "hello\n").unwrap();
-        let content = read_existing(&target, "ok.txt").await.unwrap();
+        let content = read_existing(&target, "ok.txt", tmp.path(), ResolvePolicy::Contained)
+            .await
+            .unwrap();
         assert_eq!(content, "hello\n");
     }
 

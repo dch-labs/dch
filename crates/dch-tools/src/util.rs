@@ -90,7 +90,9 @@ pub fn reject_url(tool: &str, path: &str) -> Result<(), ToolError> {
 /// File tools thread the policy carried on the run's runner context through
 /// [`resolve_path`]. The external config/CLI surface is a boolean
 /// (`unsafe_paths`), which maps onto this enum at the boundary — the enum is
-/// the internal, call-site-readable form.
+/// the internal, call-site-readable form. Enablement is operator-only: the
+/// policy is fixed at runner construction from the config file or CLI
+/// switch, and a running agent cannot widen it mid-run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ResolvePolicy {
     /// Reject paths that escape the working directory, both lexically and
@@ -172,6 +174,53 @@ pub fn resolve_path(
     }
     verify_symlinks_inside(&normalized, &base)?;
     Ok(normalized)
+}
+
+/// Verify an opened handle actually resolved inside `workspace` (Linux).
+///
+/// Closes the check-to-use race the symlink walk cannot: a concurrent
+/// process may swap a path component between validation and the open, and
+/// the open follows the swap. The kernel pins whatever the swap produced
+/// into the handle, and `/proc/self/fd` reveals its true location — a
+/// handle resolving outside the canonicalized workspace is rejected before
+/// any bytes move. Unrestricted dispatches skip this check: outside paths
+/// are permitted there by policy.
+///
+/// # Errors
+///
+/// Returns [`ToolError::Execution`] when the handle's real location is
+/// outside the workspace, or when the check cannot be performed (fail
+/// closed).
+#[cfg(target_os = "linux")]
+pub(crate) fn verify_handle_inside<F: std::os::unix::io::AsRawFd>(
+    handle: &F,
+    workspace: &Path,
+) -> Result<(), ToolError> {
+    let actual =
+        std::fs::read_link(format!("/proc/self/fd/{}", handle.as_raw_fd())).map_err(|error| {
+            ToolError::Execution(format!("cannot verify path containment: {error}"))
+        })?;
+    let workspace = std::fs::canonicalize(workspace).map_err(|error| {
+        ToolError::Execution(format!("cannot verify path containment: {error}"))
+    })?;
+    if actual.starts_with(&workspace) {
+        Ok(())
+    } else {
+        Err(ToolError::Execution(format!(
+            "Path escaped the working directory: {}",
+            actual.display()
+        )))
+    }
+}
+
+/// Non-Linux fallback: containment rests on the pre-open checks alone.
+///
+/// # Errors
+///
+/// Never fails.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn verify_handle_inside<F>(_handle: &F, _workspace: &Path) -> Result<(), ToolError> {
+    Ok(())
 }
 
 /// Lexically normalize `path`, collapsing `.` and `..` without touching the filesystem.
@@ -282,6 +331,59 @@ fn symlink_target_inside(
     }
     visited.push(canonical);
     verify_symlinks_inside(target, base).map(|()| true)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::missing_panics_doc
+)]
+mod verify_tests {
+    use super::*;
+
+    #[test]
+    fn verify_accepts_a_handle_inside_the_workspace() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let inside = workspace.path().join("inside.txt");
+        std::fs::write(&inside, "x").unwrap();
+        let handle = std::fs::File::open(&inside).unwrap();
+        assert!(verify_handle_inside(&handle, workspace.path()).is_ok());
+    }
+
+    #[test]
+    fn verify_rejects_a_handle_outside_the_workspace() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let file = outside.path().join("outside.txt");
+        std::fs::write(&file, "x").unwrap();
+        let handle = std::fs::File::open(&file).unwrap();
+        let err = verify_handle_inside(&handle, workspace.path()).unwrap_err();
+        assert!(
+            matches!(err, ToolError::Execution(ref s) if s.contains("escaped")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_detects_a_swap_that_happened_before_the_open() {
+        // The TOCTOU race, deterministically: the component was swapped for
+        // a symlink before the open, so the handle resolved outside even
+        // though the submitted path sits in the workspace.
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, "x").unwrap();
+        let link = workspace.path().join("link.txt");
+        symlink(&secret, &link).unwrap();
+
+        let handle = std::fs::File::open(&link).unwrap();
+        let err = verify_handle_inside(&handle, workspace.path()).unwrap_err();
+        assert!(err.to_string().contains("escaped"), "{err}");
+    }
 }
 
 #[cfg(test)]

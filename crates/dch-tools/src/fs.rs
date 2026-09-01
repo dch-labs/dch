@@ -5,12 +5,17 @@ use std::path::Path;
 
 use loopctl::tool::ToolError;
 
+use crate::util::ResolvePolicy;
+
 /// Write `content` to `target` atomically.
 ///
 /// Writes to a temp file in the target's directory, then renames it into
 /// place. Preserves the existing file's permissions when overwriting. The
 /// temp file is co-located with the target so the rename is a single
-/// filesystem operation with no torn-write window.
+/// filesystem operation with no torn-write window. Under
+/// [`ResolvePolicy::Contained`] the opened temp handle is verified to have
+/// resolved inside `workspace` (closing the check-to-use race a component
+/// swap would open); Unrestricted dispatch skips the check.
 ///
 /// A `target` that is itself a symbolic link is rejected: the rename would
 /// replace the link with a regular file, silently severing it. Callers should
@@ -21,7 +26,12 @@ use loopctl::tool::ToolError;
 /// Returns [`ToolError::InvalidInput`] when `target` is a symbolic link.
 /// Returns [`ToolError::Execution`] on any failure creating, writing, or
 /// persisting the temp file.
-pub(crate) fn atomic_write(target: &Path, content: &str) -> Result<(), ToolError> {
+pub(crate) fn atomic_write(
+    target: &Path,
+    content: &str,
+    workspace: &Path,
+    policy: ResolvePolicy,
+) -> Result<(), ToolError> {
     if std::fs::symlink_metadata(target).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err(ToolError::InvalidInput(format!(
             "Refusing to write: {} is a symbolic link. Resolve it and pass the real path.",
@@ -32,6 +42,9 @@ pub(crate) fn atomic_write(target: &Path, content: &str) -> Result<(), ToolError
     let dir = target.parent().unwrap_or_else(|| Path::new("."));
     let mut tmp = tempfile::NamedTempFile::new_in(dir)
         .map_err(|e| ToolError::Execution(format!("Failed to create temp file: {e}")))?;
+    if policy == ResolvePolicy::Contained {
+        crate::util::verify_handle_inside(tmp.as_file(), workspace)?;
+    }
     if let Ok(meta) = std::fs::metadata(target) {
         let perms = meta.permissions();
         tmp.as_file()
@@ -59,13 +72,14 @@ pub(crate) fn atomic_write(target: &Path, content: &str) -> Result<(), ToolError
 )]
 mod tests {
     use super::*;
+    use crate::util::ResolvePolicy;
 
     #[test]
     fn atomic_write_replaces_existing() {
         let tmp = tempfile::TempDir::new().unwrap();
         let target = tmp.path().join("out.txt");
         std::fs::write(&target, "old\n").unwrap();
-        atomic_write(&target, "new\n").unwrap();
+        atomic_write(&target, "new\n", tmp.path(), ResolvePolicy::Contained).unwrap();
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
     }
 
@@ -73,7 +87,13 @@ mod tests {
     fn atomic_write_no_temp_left() {
         let tmp = tempfile::TempDir::new().unwrap();
         let target = tmp.path().join("clean.rs");
-        atomic_write(&target, "fn main() {}\n").unwrap();
+        atomic_write(
+            &target,
+            "fn main() {}\n",
+            tmp.path(),
+            ResolvePolicy::Contained,
+        )
+        .unwrap();
         let entries: Vec<_> = std::fs::read_dir(tmp.path())
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -89,7 +109,13 @@ mod tests {
         let target = tmp.path().join("script.sh");
         std::fs::write(&target, "#!/bin/bash\necho old\n").unwrap();
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
-        atomic_write(&target, "#!/bin/bash\necho new\n").unwrap();
+        atomic_write(
+            &target,
+            "#!/bin/bash\necho new\n",
+            tmp.path(),
+            ResolvePolicy::Contained,
+        )
+        .unwrap();
         let mode = std::fs::metadata(&target).unwrap().permissions().mode();
         assert_eq!(
             mode & 0o777,
@@ -109,7 +135,8 @@ mod tests {
         let link = tmp.path().join("link.txt");
         symlink(&real, &link).unwrap();
 
-        let err = atomic_write(&link, "new content\n").unwrap_err();
+        let err =
+            atomic_write(&link, "new content\n", tmp.path(), ResolvePolicy::Contained).unwrap_err();
         assert!(
             matches!(err, ToolError::InvalidInput(ref s) if s.contains("symbolic link")),
             "{err:?}"
@@ -125,5 +152,47 @@ mod tests {
             "link should still be a symlink"
         );
         assert_eq!(std::fs::read_to_string(&real).unwrap(), "original\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_rejects_a_swapped_parent_directory_when_contained() {
+        // The TOCTOU race, deterministically: `resolve_path` validated the
+        // target before `dir` was swapped for a symlink out of the
+        // workspace. The fd verification must catch what the earlier walk
+        // can no longer see.
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let dir = workspace.path().join("dir");
+        symlink(outside.path(), &dir).unwrap();
+
+        let target = dir.join("file.txt");
+        let err =
+            atomic_write(&target, "x", workspace.path(), ResolvePolicy::Contained).unwrap_err();
+        assert!(
+            matches!(err, ToolError::Execution(ref s) if s.contains("escaped")),
+            "{err:?}"
+        );
+        assert!(
+            !outside.path().join("file.txt").exists(),
+            "the escape must not have written the file"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_allows_a_swapped_parent_directory_when_unrestricted() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let dir = workspace.path().join("dir");
+        symlink(outside.path(), &dir).unwrap();
+
+        let target = dir.join("file.txt");
+        atomic_write(&target, "x", workspace.path(), ResolvePolicy::Unrestricted).unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "x");
     }
 }
