@@ -128,8 +128,9 @@ pub struct ConfigArgs {
     ///
     /// Forces `[runner] unsafe_paths` on, overriding a `false` (or absent)
     /// config value; the flag cannot revoke a config-level opt-out. File
-    /// tools can then read, write, and scan system paths (`/etc`, `~/.ssh`,
-    /// `/var/log`) — use it when the task reaches outside the project
+    /// tools can then read, write, and scan system paths (`/etc/nginx`,
+    /// `/home/you/.ssh`, `/var/log`); paths are used verbatim and `~` is
+    /// not expanded — use it when the task reaches outside the project
     /// directory. The default keeps every file tool confined to the working
     /// directory.
     #[arg(long, help_heading = "Config")]

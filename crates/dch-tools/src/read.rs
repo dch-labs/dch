@@ -20,6 +20,7 @@ use crate::context::RunnerContext;
 use crate::context::require_cwd;
 use crate::context::runner_ctx;
 use crate::input::get_usize;
+use crate::util::ResolvePolicy;
 use crate::util::mime_type_from_path;
 use crate::util::reject_url;
 use crate::util::resolve_path;
@@ -136,10 +137,10 @@ impl ReadInput {
             .ok_or_else(|| ToolError::InvalidInput("Missing file_path".to_string()))?;
         reject_url("Read", file_path)?;
 
-        let policy = runner_context
-            .as_ref()
-            .map(|context| context.resolve_policy)
-            .unwrap_or_default();
+        let policy = match runner_context.as_ref() {
+            Some(context) => context.resolve_policy,
+            None => ResolvePolicy::Contained,
+        };
         let cwd = require_cwd(runner_context.clone())?;
         let full_path = resolve_path(file_path, &cwd, policy)?;
 

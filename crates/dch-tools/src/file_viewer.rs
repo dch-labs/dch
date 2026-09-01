@@ -19,6 +19,7 @@ use serde_json::Value;
 use crate::context::RunnerContext;
 use crate::context::require_cwd;
 use crate::context::runner_ctx;
+use crate::util::ResolvePolicy;
 use crate::util::reject_url;
 use crate::util::resolve_path;
 
@@ -177,10 +178,10 @@ impl FileViewerInput {
         input: Value,
         rc: Option<RunnerContext>,
     ) -> Result<ToolOutput, ToolError> {
-        let policy = rc
-            .as_ref()
-            .map(|context| context.resolve_policy)
-            .unwrap_or_default();
+        let policy = match rc.as_ref() {
+            Some(context) => context.resolve_policy,
+            None => ResolvePolicy::Contained,
+        };
         let cwd = require_cwd(rc)?;
 
         let parsed = parse_input(&input)?;

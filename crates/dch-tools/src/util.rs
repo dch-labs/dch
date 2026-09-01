@@ -98,9 +98,12 @@ pub enum ResolvePolicy {
     /// policy gets containment.
     #[default]
     Contained,
+
     /// Lexical normalization only: any path the OS permits resolves, with
     /// no containment check and no filesystem probing. Restores the reach
-    /// workflows like reading `/etc` or `~/.ssh` need.
+    /// workflows like reading `/etc/nginx` or `/home/you/.ssh` need. There
+    /// is no tilde expansion anywhere in resolution: a leading `~` is an
+    /// ordinary path component.
     Unrestricted,
 }
 
@@ -126,7 +129,8 @@ pub enum ResolvePolicy {
 ///    prefix is verified.
 ///
 /// Under [`ResolvePolicy::Unrestricted`] neither check runs — resolution
-/// makes no filesystem calls at all.
+/// makes no filesystem calls at all. Tilde (`~`) is never expanded; a
+/// leading `~` is an ordinary path component under either policy.
 ///
 /// This is the shared path-resolution primitive used by every file-touching
 /// tool (`Read`, `Write`, `Edit`, `MultiEdit`, `FileViewer`, and the
@@ -479,6 +483,20 @@ mod tests {
             resolve_path("/abs/a.rs", Path::new("/work"), ResolvePolicy::Unrestricted).unwrap(),
             PathBuf::from("/abs/a.rs")
         );
+    }
+
+    #[test]
+    fn resolve_path_treats_a_leading_tilde_as_a_literal_component() {
+        // The docs promise `~` is never expanded: it resolves like any
+        // other relative path, under both policies — a model sending
+        // `~/.ssh/config` addresses the workspace's own `~` directory, not
+        // the user's home.
+        for policy in [ResolvePolicy::Contained, ResolvePolicy::Unrestricted] {
+            assert_eq!(
+                resolve_path("~/.ssh/config", Path::new("/work"), policy).unwrap(),
+                PathBuf::from("/work/~/.ssh/config")
+            );
+        }
     }
 
     #[test]

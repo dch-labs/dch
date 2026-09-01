@@ -18,6 +18,7 @@ use crate::context::runner_ctx;
 use crate::diff::format_file_change;
 use crate::linter::LinterResult;
 use crate::linter::lint_content;
+use crate::util::ResolvePolicy;
 use crate::util::reject_url;
 use crate::util::resolve_path;
 
@@ -91,10 +92,10 @@ impl WriteInput {
         input: Value,
         rc: Option<RunnerContext>,
     ) -> Result<ToolOutput, ToolError> {
-        let policy = rc
-            .as_ref()
-            .map(|context| context.resolve_policy)
-            .unwrap_or_default();
+        let policy = match rc.as_ref() {
+            Some(context) => context.resolve_policy,
+            None => ResolvePolicy::Contained,
+        };
         let cwd = require_cwd(rc.clone())?;
         let file_path = input
             .get("file_path")

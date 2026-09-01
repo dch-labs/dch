@@ -30,6 +30,7 @@ use crate::search::Match;
 use crate::search::SearchJob;
 use crate::search::compile_pattern;
 use crate::search::no_matches_message;
+use crate::util::ResolvePolicy;
 use crate::util::reject_url;
 use crate::util::resolve_path;
 
@@ -145,10 +146,10 @@ impl CodeSearchInput {
         rc: Option<RunnerContext>,
         temp_dir: PathBuf,
     ) -> Result<ToolOutput, ToolError> {
-        let policy = rc
-            .as_ref()
-            .map(|context| context.resolve_policy)
-            .unwrap_or_default();
+        let policy = match rc.as_ref() {
+            Some(context) => context.resolve_policy,
+            None => ResolvePolicy::Contained,
+        };
         let cwd = require_cwd(rc)?;
 
         let parsed_input = crate::search::parse_input(&input, DEFAULT_MAX_RESULTS)?;

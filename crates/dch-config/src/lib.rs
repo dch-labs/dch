@@ -674,7 +674,8 @@ pub struct RunnerConfig {
     /// `false` (the default) keeps every file-touching tool confined to the
     /// working directory — traversal, unrelated absolute paths, and escaping
     /// symlinks are rejected. `true` lifts that containment so system-file
-    /// workflows work (`/etc`, `~/.ssh`, `/var/log`); the CLI flag
+    /// workflows work (`/etc/nginx`, `/home/you/.ssh`, `/var/log`); paths
+    /// are used verbatim, so a leading `~` is not expanded. The CLI flag
     /// `--unsafe-paths` forces it on for one run. It never crosses into the
     /// session/run configuration — path containment is a tool-layer concern.
     #[serde(default)]

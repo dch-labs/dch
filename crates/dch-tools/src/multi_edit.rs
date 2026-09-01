@@ -148,10 +148,10 @@ impl MultiEditTool {
         input: Value,
         rc: Option<RunnerContext>,
     ) -> Result<ToolOutput, ToolError> {
-        let policy = rc
-            .as_ref()
-            .map(|context| context.resolve_policy)
-            .unwrap_or_default();
+        let policy = match rc.as_ref() {
+            Some(context) => context.resolve_policy,
+            None => ResolvePolicy::Contained,
+        };
         let cwd = require_cwd(rc.clone())?;
 
         let parsed = parse_input(&input)?;
