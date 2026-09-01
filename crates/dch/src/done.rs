@@ -5,9 +5,11 @@
 //! poll for its existence instead of parsing stdout. Write failures are
 //! non-fatal: the run's exit code is the source of truth, not the marker.
 
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 /// Completion status written to the `--done-file` path on exit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,10 +97,26 @@ impl DoneStatus {
 /// marker, not the source of truth.
 pub fn write_done_file(path: &Path, status: &DoneStatus) -> Result<(), Box<dyn std::error::Error>> {
     let json = serde_json::to_string_pretty(status)?;
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, format!("{json}\n"))?;
+    let tmp = unique_sibling(path);
+    let mut handle = std::fs::File::create(&tmp)?;
+    handle.write_all(format!("{json}\n").as_bytes())?;
+    drop(handle);
     std::fs::rename(&tmp, path)?;
     Ok(())
+}
+
+/// A uniquely named sibling of `path` in the same directory.
+///
+/// Staying in the directory keeps the final rename atomic (one filesystem),
+/// and the per-call uuid keeps concurrent runs targeting the same marker
+/// path from writing into each other's temporary file.
+fn unique_sibling(path: &Path) -> PathBuf {
+    let file_name = path.file_name().map_or_else(
+        || "done".to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    let dir = path.parent().unwrap_or_else(|| Path::new(""));
+    dir.join(format!(".{file_name}.{}.tmp", Uuid::new_v4()))
 }
 
 #[cfg(test)]
@@ -146,7 +164,13 @@ mod tests {
         let status = DoneStatus::success("ok", 2, 4);
         write_done_file(&path, &status).unwrap();
         assert!(path.exists());
-        assert!(!tmp.path().join("done.tmp").exists(), "no temp residue");
+        let residue: Vec<String> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.to_ascii_lowercase().ends_with(".tmp"))
+            .collect();
+        assert!(residue.is_empty(), "temp residue: {residue:?}");
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("\"success\": true"));
     }
