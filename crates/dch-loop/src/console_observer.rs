@@ -22,11 +22,8 @@ use loopctl::observer::{
 
 /// ANSI reset sequence, appended after every colored span.
 ///
-/// Every colored span carries its own reset, so color never leaks
-/// across writes when a stream splits mid-line.
-///
-/// Every `paint` span carries it, so color never leaks across writes
-/// when spans are split mid-stream (as text deltas are).
+/// Every `paint` span carries its own reset, so color never leaks across
+/// writes when a stream splits mid-line.
 const RESET: &str = "\x1b[0m";
 
 /// ANSI dim intensity, used for turn separators.
@@ -173,9 +170,11 @@ impl ConsoleObserver {
         }
     }
 
-    /// Write one line to stdout, ignoring I/O faults (a broken pipe must
+    /// Write one line to stdout, newline included.
     ///
-    /// never take the run down).
+    /// I/O faults are ignored: stdout is line-buffered, so the newline
+    /// flushes the line anyway, and a broken pipe (a consumer that closed
+    /// early) must never take the run down.
     fn say(&self, msg: &str) {
         let mut out = self
             .out
@@ -185,17 +184,26 @@ impl ConsoleObserver {
     }
 
     /// Write a partial fragment to stdout with no newline — the streaming
+    /// path.
     ///
-    /// path. Ignoring I/O faults as in [`Self::say`].
+    /// Flushes immediately after writing: stdout is line-buffered, so an
+    /// unflushed fragment stays invisible until a later line closes it.
+    /// I/O faults are ignored, as in [`Self::say`] — a broken pipe must
+    /// never take the run down.
     fn say_raw(&self, fragment: &str) {
         let mut out = self
             .out
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         drop(write!(out, "{fragment}"));
+        out.flush().ok();
     }
 
-    /// Write one line to stderr, ignoring I/O faults as in [`Self::say`].
+    /// Write one line to stderr, newline included.
+    ///
+    /// Carries all progress chrome, token usage, and failure notices. I/O
+    /// faults are ignored as in [`Self::say`] — diagnostics must never
+    /// take the run down.
     fn note(&self, msg: &str) {
         let mut err = self
             .err
@@ -214,7 +222,8 @@ impl ConsoleObserver {
 
     /// Whether detail chrome (durations, token counts) is visible.
     ///
-    /// Verbose only.
+    /// True only at Verbose. Everything gated on this is supplementary
+    /// accounting, never primary output.
     fn detail_visible(&self) -> bool {
         matches!(self.verbosity, Verbosity::Verbose)
     }
@@ -244,10 +253,12 @@ impl LoopObserver for ConsoleObserver {
         self.stream_delta(&ctx.delta);
     }
 
-    /// Deliver the turn's assembled response: after streamed deltas this
+    /// Deliver the turn's assembled response to stdout.
     ///
-    /// only closes the line; otherwise the whole text is the sole delivery.
-    /// Verbose adds a token-usage line on stderr.
+    /// After streamed deltas this only closes the line the deltas opened —
+    /// reprinting the text would duplicate it. When nothing streamed, the
+    /// whole response arrives here as the sole copy. At Verbose, a
+    /// token-usage line accompanies it on stderr.
     fn on_response(&self, ctx: &ResponseContext) {
         let usage = ctx
             .usage
@@ -263,16 +274,19 @@ impl LoopObserver for ConsoleObserver {
         self.tool_started(&ctx.tool, ctx.turn);
     }
 
-    /// Report a finished tool with ✓/✗ (and the duration when verbose),
+    /// Report a finished tool with a ✓/✗ marker on stderr.
     ///
-    /// counting it toward the run summary.
+    /// Verbose adds the tool's duration in milliseconds. Every completion
+    /// counts toward the end-of-run summary's tool-call total.
     fn on_tool_post(&self, ctx: &ToolPostContext) {
         self.tool_finished(&ctx.tool, ctx.is_error, ctx.duration);
     }
 
-    /// Close a turn: a separator with token totals when verbose, a blank
+    /// Close a turn with its closing chrome, or its error.
     ///
-    /// line when normal, the error verbatim on failure.
+    /// Successful turns get a token-total separator at Verbose and a plain
+    /// blank line at Normal; failures print the error verbatim instead, at
+    /// every verbosity.
     fn on_turn_end(&self, ctx: &TurnEndContext) {
         self.turn_finished(
             ctx.turn,
@@ -284,31 +298,45 @@ impl LoopObserver for ConsoleObserver {
         );
     }
 
-    /// Report a stream failure — always, even at Quiet: a stream failure is
+    /// Report a stream failure to stderr.
     ///
-    /// the agent stopping, not progress noise.
+    /// Printed at every verbosity, Quiet included: a stream failure is the
+    /// agent stopping, not progress noise, and suppressing it would leave a
+    /// silent run.
     fn on_stream_failure(&self, ctx: &StreamFailureContext) {
         self.stream_failed(&ctx.model, &ctx.error.to_string());
     }
 
-    /// Note a compaction pass with its token reduction (verbose only).
+    /// Note a compaction pass with its token reduction.
+    ///
+    /// Verbose only: the before/after totals explain why earlier context
+    /// stopped being visible to the model.
     fn on_compaction(&self, ctx: &CompactedContext) {
         self.history_compacted(ctx.tokens_before, ctx.tokens_after);
     }
 
-    /// Note a model fallback with both endpoints (verbose only).
+    /// Note a model fallback with both endpoints.
+    ///
+    /// Verbose only. The primary model failed over to its fallback; the
+    /// message names the model that was left and the one that took over.
     fn on_fallback(&self, ctx: &FallbackContext) {
         self.model_changed("fallback", &ctx.from, &ctx.to);
     }
 
-    /// Note a hot-switched model with both endpoints (verbose only).
+    /// Note a hot-switched model with both endpoints.
+    ///
+    /// Verbose only, covering mid-run switches that are not failure
+    /// fallbacks.
     fn on_model_switched(&self, ctx: &ModelSwitchedContext) {
         self.model_changed("switched", &ctx.from, &ctx.to);
     }
 
-    /// Print the end-of-run summary (verbose only): outcome, turns, tool
+    /// Print the end-of-run summary to stderr.
     ///
-    /// calls, and the token totals accumulated across turns.
+    /// Verbose only: outcome, wall-clock duration, turn count, tool-call
+    /// count, and the token totals accumulated across turns. The totals are
+    /// the ones [`on_run_start`](Self::on_run_start) reset, so they cover
+    /// exactly this run.
     fn on_run_end(&self, ctx: &RunEndContext) {
         self.run_finished(
             ctx.success,
@@ -330,10 +358,12 @@ impl ConsoleObserver {
         self.say_raw(&fragment);
     }
 
-    /// Deliver the turn's assembled response: after streamed deltas this
+    /// Deliver the turn's assembled response to stdout.
     ///
-    /// only closes the line; otherwise the whole text is the sole delivery.
-    /// Verbose adds a token-usage line on stderr.
+    /// The closing half of the streaming contract: after deltas this emits
+    /// only the terminating newline; without deltas it paints and writes
+    /// the whole text as the sole delivery. The usage pair, when present,
+    /// becomes a token-usage line on stderr at Verbose.
     fn finish_response(&self, text: &str, usage: Option<(u32, u32)>) {
         if self.saw_text_delta.load(Ordering::Relaxed) {
             self.say("");
@@ -362,9 +392,11 @@ impl ConsoleObserver {
         self.note(&self.paint(YELLOW, &line));
     }
 
-    /// Report a finished tool with ✓/✗ (and the duration when verbose),
+    /// Announce a tool's completion on stderr.
     ///
-    /// counting it toward the run summary.
+    /// The line is a ✓/✗ marker with the tool's name, plus its duration in
+    /// milliseconds at Verbose. Hidden at Quiet, but still counted toward
+    /// the end-of-run summary.
     fn tool_finished(&self, tool: &str, is_error: bool, duration: std::time::Duration) {
         if !self.chrome_visible() {
             return;
@@ -383,9 +415,12 @@ impl ConsoleObserver {
         self.note(&line);
     }
 
-    /// Close a turn: a separator with token totals when verbose, a blank
+    /// Close a turn with its closing chrome, or its error.
     ///
-    /// line when normal, the error verbatim on failure.
+    /// Also accumulates a successful turn's token totals into the run
+    /// counters, so the end-of-run summary reflects every turn. Successful
+    /// turns render a token-total separator at Verbose and a blank line at
+    /// Normal; failures print the error verbatim at every verbosity.
     fn turn_finished(
         &self,
         turn: usize,
@@ -417,14 +452,19 @@ impl ConsoleObserver {
         }
     }
 
-    /// Report a stream failure — always, even at Quiet: a stream failure is
+    /// Render a stream failure to stderr, naming the model.
     ///
-    /// the agent stopping, not progress noise.
+    /// Printed at every verbosity, Quiet included — a stream failure is the
+    /// agent stopping, not progress noise, and suppressing it would leave
+    /// the user staring at a silent run.
     fn stream_failed(&self, model: &str, error: &str) {
         self.note(&format!("{model}: {error}"));
     }
 
-    /// Note a compaction pass with its token reduction (verbose only).
+    /// Note a compaction pass with its token reduction.
+    ///
+    /// Verbose only: the before/after totals explain why earlier context
+    /// stopped being visible to the model.
     fn history_compacted(&self, tokens_before: u64, tokens_after: u64) {
         if self.detail_visible() {
             self.note(&format!(
@@ -433,16 +473,22 @@ impl ConsoleObserver {
         }
     }
 
-    /// Note a model change (fallback or hot-switch) with both endpoints.
+    /// Note a model change with both endpoints.
+    ///
+    /// Shared by fallback and hot-switch reporting; the caller supplies the
+    /// verb that distinguishes them. Verbose only.
     fn model_changed(&self, kind: &str, from: &str, to: &str) {
         if self.detail_visible() {
             self.note(&format!("{kind}: {from} → {to}"));
         }
     }
 
-    /// Print the end-of-run summary (verbose only): outcome, turns, tool
+    /// Print the end-of-run summary to stderr.
     ///
-    /// calls, and the token totals accumulated across turns.
+    /// Verbose only: outcome, wall-clock duration, turn count, tool-call
+    /// count, and the token totals accumulated across turns. The totals are
+    /// the ones [`on_run_start`](Self::on_run_start) reset, so they cover
+    /// exactly this run.
     fn run_finished(
         &self,
         success: bool,
@@ -450,6 +496,9 @@ impl ConsoleObserver {
         total_turns: usize,
         duration_ms: u64,
     ) {
+        if !self.detail_visible() {
+            return;
+        }
         let tool_calls = self.tool_calls.load(Ordering::Relaxed);
         let input = self.input_tokens.load(Ordering::Relaxed);
         let output = self.output_tokens.load(Ordering::Relaxed);
@@ -721,6 +770,60 @@ mod tests {
         // on_run_start reset the counters, so nothing from the pre-reset
         // tool call leaks into the summary.
         assert!(stderr.contains("0 tool calls"), "{stderr}");
+    }
+
+    #[test]
+    fn run_end_summary_is_verbose_only() {
+        // The end-of-run summary is detail chrome: Quiet and Normal runs get
+        // the model's text and per-event errors, but no summary line.
+        for verbosity in [Verbosity::Quiet, Verbosity::Normal] {
+            let h = Harness::build(verbosity, false);
+            h.observer.on_run_end(&RunEndContext {
+                success: true,
+                error: None,
+                total_turns: 2,
+                duration_ms: 300,
+            });
+            assert!(
+                h.stderr().is_empty(),
+                "{verbosity:?}: the run summary is detail chrome: {:?}",
+                h.stderr()
+            );
+        }
+    }
+
+    #[test]
+    fn streamed_fragments_flush_stdout_immediately() {
+        // Stdout is line-buffered, so a streamed fragment without a newline
+        // would stay invisible until a later line closed it unless say_raw
+        // flushes after every write.
+        struct FlushSpy {
+            flushes: Arc<AtomicUsize>,
+        }
+        impl Write for FlushSpy {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.flushes.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+
+        let flushes = Arc::new(AtomicUsize::new(0));
+        let observer = ConsoleObserver::with_sinks(
+            Verbosity::Quiet,
+            false,
+            Box::new(FlushSpy {
+                flushes: Arc::clone(&flushes),
+            }),
+            Box::new(SharedSink(Arc::new(Mutex::new(Vec::new())))),
+        );
+        observer.stream_delta("hello");
+        assert!(
+            flushes.load(Ordering::Relaxed) >= 1,
+            "a streamed fragment must flush stdout immediately"
+        );
     }
 
     #[test]
