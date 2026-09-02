@@ -14,12 +14,14 @@ use crate::util::ResolvePolicy;
 /// temp file is co-located with the target so the rename is a single
 /// filesystem operation with no torn-write window. Under
 /// [`ResolvePolicy::Contained`] the opened temp handle is verified to have
-/// resolved inside `workspace` (closing the check-to-use race a component
-/// swap would open); Unrestricted dispatch skips the check.
+/// resolved inside `workspace`, and the renamed result is re-checked the
+/// same way (closing the check-to-use race a component swap would open);
+/// Unrestricted dispatch skips both checks.
 ///
-/// A `target` that is itself a symbolic link is rejected: the rename would
-/// replace the link with a regular file, silently severing it. Callers should
-/// resolve the link and pass the real path.
+/// Under [`ResolvePolicy::Contained`], a `target` that is itself a symbolic
+/// link is rejected: the rename would replace the link with a regular file,
+/// silently severing it. Unrestricted dispatch writes onto the path as
+/// given. Callers that resolve links themselves should pass the real path.
 ///
 /// # Errors
 ///
@@ -60,8 +62,37 @@ pub(crate) fn atomic_write(
         .map_err(|e| ToolError::Execution(format!("Failed to flush temp file: {e}")))?;
     tmp.persist(target)
         .map_err(|e| ToolError::Execution(format!("Failed to persist file: {e}")))?;
+    if policy == ResolvePolicy::Contained {
+        ensure_renamed_inside(target, workspace)?;
+    }
 
     Ok(())
+}
+
+/// Post-rename containment check: the renamed file must live in `workspace`.
+///
+/// `rename` re-resolves its destination, so a component swapped between the
+/// handle verification and the rename can land the file outside the
+/// workspace. When that is detected the escaped file is removed — the run
+/// fails, and nothing is left behind.
+///
+/// # Errors
+///
+/// Returns [`ToolError::Execution`] when the renamed file resolves outside
+/// `workspace` (removing it first), or when containment cannot be confirmed.
+fn ensure_renamed_inside(target: &Path, workspace: &Path) -> Result<(), ToolError> {
+    let actual = std::fs::canonicalize(target)
+        .map_err(|e| ToolError::Execution(format!("cannot verify path containment: {e}")))?;
+    let workspace = std::fs::canonicalize(workspace)
+        .map_err(|e| ToolError::Execution(format!("cannot verify path containment: {e}")))?;
+    if actual.starts_with(&workspace) {
+        return Ok(());
+    }
+    drop(std::fs::remove_file(&actual));
+    Err(ToolError::Execution(format!(
+        "Path escaped the working directory: {}",
+        actual.display()
+    )))
 }
 
 #[cfg(test)]
@@ -81,7 +112,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let target = tmp.path().join("out.txt");
         std::fs::write(&target, "old\n").unwrap();
-        atomic_write(&target, "new\n", tmp.path(), ResolvePolicy::Contained).unwrap();
+        atomic_write(&target, "new\n", tmp.path(), ResolvePolicy::Unrestricted).unwrap();
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
     }
 
@@ -93,7 +124,7 @@ mod tests {
             &target,
             "fn main() {}\n",
             tmp.path(),
-            ResolvePolicy::Contained,
+            ResolvePolicy::Unrestricted,
         )
         .unwrap();
         let entries: Vec<_> = std::fs::read_dir(tmp.path())
@@ -154,6 +185,26 @@ mod tests {
             "link should still be a symlink"
         );
         assert_eq!(std::fs::read_to_string(&real).unwrap(), "original\n");
+    }
+
+    #[test]
+    fn renamed_inside_the_workspace_passes_the_post_check() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("done.txt");
+        std::fs::write(&target, "x").unwrap();
+        assert!(ensure_renamed_inside(&target, tmp.path()).is_ok());
+    }
+
+    #[test]
+    fn renamed_outside_the_workspace_is_detected_and_removed() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let target = outside.path().join("escaped.txt");
+        std::fs::write(&target, "x").unwrap();
+
+        let err = ensure_renamed_inside(&target, workspace.path()).unwrap_err();
+        assert!(err.to_string().contains("escaped"), "{err}");
+        assert!(!target.exists(), "the escaped file must be removed");
     }
 
     #[cfg(target_os = "linux")]
