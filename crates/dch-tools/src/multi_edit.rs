@@ -1268,6 +1268,27 @@ mod tests {
         assert!(matches!(reason, AbortReason::Symlink(_)));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn honor_symlink_targets_keeps_a_broken_link_for_the_read_phase() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let link = tmp.path().join("link.rs");
+        symlink(tmp.path().join("absent.rs"), &link).unwrap();
+        let mut ops = vec![EditOperation {
+            file_path: "link.rs".to_string(),
+            full_path: link.clone(),
+            old_text: "x".to_string(),
+            new_text: "y".to_string(),
+        }];
+        assert!(honor_symlink_targets(&mut ops).is_none());
+        assert_eq!(
+            ops[0].full_path, link,
+            "an unresolved target keeps its submitted path and fails in the read phase"
+        );
+    }
+
     #[tokio::test]
     async fn read_files_missing_is_file_not_found() {
         let tmp = tempfile::TempDir::new().unwrap();

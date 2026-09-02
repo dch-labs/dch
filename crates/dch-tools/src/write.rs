@@ -633,6 +633,31 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn unrestricted_write_reaches_outside_the_workspace() {
+        // The headline promise of the opt-out: an unrestricted write lands
+        // on any path the process may touch, outside the workspace included.
+        let workspace = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let mut ctx = ToolContext::default();
+        ctx.cwd = workspace.path().to_string_lossy().into_owned();
+        ctx.set_extension(
+            RunnerContext::new(workspace.path().to_path_buf())
+                .with_resolve_policy(ResolvePolicy::Unrestricted),
+        );
+        let tool = WriteInput::default();
+        let input = json!({
+            "file_path": outside.path().join("out.txt").to_str().unwrap(),
+            "content": "fn main() {}\n"
+        });
+        let out = tool.call(input, &ctx).await.unwrap();
+        assert!(!out.is_error, "{}", out.text_content());
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("out.txt")).unwrap(),
+            "fn main() {}\n"
+        );
+    }
+
     /// Drives a real Read (which records the content baseline on the shared
     /// context) before the Write. The external mutation's mtime is forced
     /// with `set_modified` so the test never depends on filesystem timestamp
