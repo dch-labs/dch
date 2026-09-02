@@ -27,9 +27,18 @@ static OBSERVATION_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// The model's latest known content hash per touched file.
 ///
-/// Keyed by the resolved absolute path (each tool's [`resolve_path`](crate::util::resolve_path)
-/// output), so equivalent spellings of the same file share one baseline and a
-/// staleness check can't be dodged by re-spelling a path.
+/// Keyed by each tool's resolution of the submitted path: the
+/// [`resolve_path`](crate::util::resolve_path) output under the contained
+/// policy, and the canonicalized physical file on top of it under the
+/// unrestricted policy — so equivalent spellings of the same file,
+/// including spellings that pass through a symbolic link, share one
+/// baseline and a staleness check can't be dodged by re-spelling a path.
+/// One divergence: a *new* file created through a symlinked directory
+/// cannot be canonicalized (the path does not resolve yet), so its
+/// post-write baseline is recorded under the submitted spelling, and a
+/// later write through a different spelling falls back to the
+/// no-baseline rule — the same posture as a file that was never read, so
+/// no guard is bypassed.
 ///
 /// The hash is a process-local [`DefaultHasher`] fingerprint of the file's
 /// bytes — deliberately not a stable or cryptographic digest: baselines live

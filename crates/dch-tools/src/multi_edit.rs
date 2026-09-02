@@ -245,7 +245,9 @@ struct BatchConflict {
 /// # Errors
 ///
 /// Returns [`ToolError`] when an atomic temp-then-rename write fails or the
-/// conflict check hits a genuine I/O fault.
+/// conflict check hits a genuine I/O fault. A fault after earlier writes
+/// have landed names them in the error message, so a partial batch always
+/// reports what reached the disk.
 async fn write_finals(
     operations: &[EditOperation],
     originals: &BTreeMap<String, String>,
@@ -270,10 +272,11 @@ async fn write_finals(
                             path: op.file_path.clone(),
                         }));
                     }
-                    Err(CheckFailure::Fault(e)) => return Err(e),
+                    Err(CheckFailure::Fault(e)) => return Err(fault_with_applied(e, &applied)),
                 }
             }
-            crate::fs::atomic_write(&op.full_path, final_content, workspace, policy)?;
+            crate::fs::atomic_write(&op.full_path, final_content, workspace, policy)
+                .map_err(|e| fault_with_applied(e, &applied))?;
             applied.push(op.file_path.clone());
             if let Some(rc) = history {
                 rc.record_baseline(
@@ -284,6 +287,21 @@ async fn write_finals(
         }
     }
     Ok(None)
+}
+
+/// Fold the files already written into a mid-batch fault's message.
+///
+/// Earlier writes of a batch stay on disk when a later file faults, so the
+/// model must learn which files landed. When nothing has been written yet
+/// the error is returned untouched.
+fn fault_with_applied(error: ToolError, applied: &[String]) -> ToolError {
+    if applied.is_empty() {
+        return error;
+    }
+    ToolError::Execution(format!(
+        "{error}\n\nAlready written by this batch: {}.",
+        applied.join(", ")
+    ))
 }
 
 /// Parsed top-level `MultiEdit` input.
@@ -1269,8 +1287,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn honor_symlink_targets_keeps_a_broken_link_for_the_read_phase() {
+    #[tokio::test]
+    async fn broken_symlink_target_keeps_its_path_and_fails_the_read_phase() {
         use std::os::unix::fs::symlink;
 
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1285,7 +1303,15 @@ mod tests {
         assert!(honor_symlink_targets(&mut ops).is_none());
         assert_eq!(
             ops[0].full_path, link,
-            "an unresolved target keeps its submitted path and fails in the read phase"
+            "an unresolved target keeps its submitted path"
+        );
+
+        let err = read_files(&ops, tmp.path(), ResolvePolicy::Unrestricted)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::FileNotFound(_)),
+            "the broken link must abort the batch in the read phase: {err:?}"
         );
     }
 
@@ -2288,6 +2314,143 @@ mod tests {
             std::fs::read_to_string(&second).unwrap(),
             "EXTERNAL",
             "the conflicted file must not be written"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_finals_fault_after_earlier_writes_names_what_landed() {
+        // File #2 has no parent directory, so its atomic write faults after
+        // file #1 is already on disk; the hard error must carry the partial
+        // batch report instead of discarding it.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let first = tmp.path().join("a.rs");
+        std::fs::write(&first, "A").unwrap();
+        let mut originals = BTreeMap::new();
+        originals.insert("a.rs".to_string(), "A".to_string());
+        let mut finals = BTreeMap::new();
+        finals.insert("a.rs".to_string(), "a2".to_string());
+        finals.insert("b.rs".to_string(), "b2".to_string());
+        let operations = vec![
+            EditOperation {
+                file_path: "a.rs".to_string(),
+                full_path: first.clone(),
+                old_text: "A".to_string(),
+                new_text: "a2".to_string(),
+            },
+            EditOperation {
+                file_path: "b.rs".to_string(),
+                full_path: tmp.path().join("absent-dir").join("b.rs"),
+                old_text: "B".to_string(),
+                new_text: "b2".to_string(),
+            },
+        ];
+
+        let err = write_finals(
+            &operations,
+            &originals,
+            &finals,
+            None,
+            tmp.path(),
+            ResolvePolicy::Contained,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Already written by this batch: a.rs"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&first).unwrap(),
+            "a2",
+            "the earlier write stays on disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_finals_conflict_fault_after_earlier_writes_names_what_landed() {
+        // File #2's re-read faults (its path is a directory, an I/O error
+        // rather than a change) after file #1 is already on disk; the hard
+        // error must carry the partial-batch report.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let first = tmp.path().join("a.rs");
+        std::fs::write(&first, "A").unwrap();
+        let second = tmp.path().join("b-dir");
+        std::fs::create_dir(&second).unwrap();
+        let mut originals = BTreeMap::new();
+        originals.insert("a.rs".to_string(), "A".to_string());
+        originals.insert("b.rs".to_string(), "B".to_string());
+        let mut finals = BTreeMap::new();
+        finals.insert("a.rs".to_string(), "a2".to_string());
+        finals.insert("b.rs".to_string(), "b2".to_string());
+        let operations = vec![
+            EditOperation {
+                file_path: "a.rs".to_string(),
+                full_path: first.clone(),
+                old_text: "A".to_string(),
+                new_text: "a2".to_string(),
+            },
+            EditOperation {
+                file_path: "b.rs".to_string(),
+                full_path: second,
+                old_text: "B".to_string(),
+                new_text: "b2".to_string(),
+            },
+        ];
+
+        let err = write_finals(
+            &operations,
+            &originals,
+            &finals,
+            None,
+            tmp.path(),
+            ResolvePolicy::Contained,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Already written by this batch: a.rs"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&first).unwrap(),
+            "a2",
+            "the earlier write stays on disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_finals_fault_on_the_first_file_adds_no_applied_report() {
+        // Nothing has landed when the first file faults, so the error must
+        // be returned untouched rather than carrying an empty-file trailer.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("b-dir");
+        std::fs::create_dir(&target).unwrap();
+        let mut originals = BTreeMap::new();
+        originals.insert("b.rs".to_string(), "B".to_string());
+        let mut finals = BTreeMap::new();
+        finals.insert("b.rs".to_string(), "b2".to_string());
+        let operations = vec![EditOperation {
+            file_path: "b.rs".to_string(),
+            full_path: target,
+            old_text: "B".to_string(),
+            new_text: "b2".to_string(),
+        }];
+
+        let err = write_finals(
+            &operations,
+            &originals,
+            &finals,
+            None,
+            tmp.path(),
+            ResolvePolicy::Contained,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            !err.to_string().contains("Already written"),
+            "no files landed, so no applied report is due: {err}"
         );
     }
 

@@ -140,9 +140,10 @@ pub enum ResolvePolicy {
 /// drift apart. The symlink check closes the traversal vector where an
 /// in-workspace link points outside it. A TOCTOU window remains between
 /// this check and the caller's open: on Linux, file tools close it by
-/// verifying the opened handle via `/proc/self/fd` before any bytes move;
-/// directory-walk tools and non-Linux targets keep the window, which needs
-/// descriptor-relative, `O_NOFOLLOW` opens to close.
+/// verifying the opened handle via `/proc/self/fd` before any bytes move,
+/// and on other platforms contained file tools fail closed rather than
+/// proceed unverified; only the directory-walk tools keep the window,
+/// which needs descriptor-relative, `O_NOFOLLOW` opens to close.
 ///
 /// # Errors
 ///
@@ -177,29 +178,55 @@ pub fn resolve_path(
     Ok(normalized)
 }
 
-/// Canonicalize `path` when it resolves, failing on other resolution errors.
+/// Canonicalize `path` when it resolves, refusing a dangling link.
 ///
 /// Write-path callers use this under [`ResolvePolicy::Unrestricted`] to
 /// honor symbolic links: an existing target is rewritten to its physical
 /// file so the write lands on the referent and the link stays intact. A
 /// path that does not exist yet is returned as given, so new-file writes
-/// keep working. Any other resolution failure — an unreadable ancestor or
-/// a symlink loop — is propagated: the physical target cannot be
-/// determined, and silently writing the submitted path would replace the
-/// link entry instead of honoring it.
+/// keep working. A final component that is a symbolic link to a
+/// nonexistent file is refused: the caller's rename would replace the
+/// link entry with a regular file instead of creating the referent
+/// through it, silently severing the link. Any other resolution failure —
+/// an unreadable ancestor or a symlink loop — is propagated too: the
+/// physical target cannot be determined.
 ///
 /// # Errors
 ///
 /// Returns [`ToolError::Execution`] when canonicalization fails for any
-/// reason other than a missing path.
+/// reason other than a missing path, and when the final component is a
+/// dangling symbolic link.
 pub(crate) fn canonicalize_existing(path: &Path) -> Result<PathBuf, ToolError> {
     match std::fs::canonicalize(path) {
         Ok(real) => Ok(real),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(path.to_path_buf()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+                Err(dangling_link_error(path))
+            } else {
+                Ok(path.to_path_buf())
+            }
+        }
         Err(error) => Err(ToolError::Execution(format!(
             "cannot resolve {}: {error}",
             path.display()
         ))),
+    }
+}
+
+/// Build the refusal for a final component that is a link to nothing.
+///
+/// The message names the link's target so the caller can address the
+/// referent directly; when the target itself cannot be read, the read
+/// failure carries the reason instead.
+fn dangling_link_error(path: &Path) -> ToolError {
+    match std::fs::read_link(path) {
+        Ok(target) => ToolError::Execution(format!(
+            "cannot resolve {}: it is a symbolic link to {}, which does not \
+             exist; write to the target path to create the referent",
+            path.display(),
+            target.display()
+        )),
+        Err(error) => ToolError::Execution(format!("cannot resolve {}: {error}", path.display())),
     }
 }
 
@@ -733,6 +760,25 @@ mod tests {
         symlink(&looped, &looped).unwrap();
         let err = canonicalize_existing(&looped).unwrap_err();
         assert!(err.to_string().contains("cannot resolve"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonicalize_existing_refuses_a_dangling_symlink() {
+        // A link to a nonexistent file cannot be honored by the caller's
+        // rename, so the helper must refuse instead of returning the link
+        // path as given — returning it lets the rename sever the link.
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let link = tmp.path().join("link.rs");
+        symlink(tmp.path().join("absent.rs"), &link).unwrap();
+        let err = canonicalize_existing(&link).unwrap_err();
+        assert!(err.to_string().contains("cannot resolve"), "{err}");
+        assert!(
+            err.to_string().contains("absent.rs"),
+            "the refusal must name the broken target: {err}"
+        );
     }
 
     #[test]

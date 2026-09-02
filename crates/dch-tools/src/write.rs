@@ -587,6 +587,48 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn unrestricted_write_to_a_dangling_symlink_fails_without_severing() {
+        // A link to a nonexistent file is the reachable sibling of the loop
+        // case: a rename onto the link path would replace the entry instead
+        // of creating the referent, so the write must refuse and leave the
+        // link — and the absent referent — exactly as they were.
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let link = tmp.path().join("dangling.rs");
+        symlink(tmp.path().join("absent.rs"), &link).unwrap();
+
+        let mut ctx = ToolContext::default();
+        ctx.cwd = tmp.path().to_string_lossy().into_owned();
+        ctx.set_extension(
+            RunnerContext::new(tmp.path().to_path_buf())
+                .with_resolve_policy(ResolvePolicy::Unrestricted),
+        );
+        let tool = WriteInput::default();
+        let input = json!({
+            "file_path": "dangling.rs",
+            "content": "fn main() {}\n"
+        });
+        let err = tool.call(input, &ctx).await.unwrap_err();
+        assert!(err.to_string().contains("cannot resolve"), "{err}");
+        assert!(
+            err.to_string().contains("absent.rs"),
+            "the refusal must name the broken target: {err}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the dangling link must survive the failed write"
+        );
+        assert!(
+            !tmp.path().join("absent.rs").exists(),
+            "the refused write must not create the referent"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn unrestricted_conflict_guard_tracks_the_referent_through_a_symlink() {
         // Reading through a link arms the baseline on the physical file, so
         // an external change to the referent trips the write's staleness
