@@ -629,6 +629,55 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn unrestricted_write_through_a_symlinked_dir_keys_the_baseline_on_the_real_path() {
+        // A new file written through a symlinked directory cannot be
+        // canonicalized before the write (it does not exist yet); once it
+        // exists the post-write baseline must be re-keyed to the physical
+        // path, so a later write through the real spelling still runs the
+        // staleness guard instead of the no-baseline fallback.
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let realdir = tmp.path().join("realdir");
+        std::fs::create_dir(&realdir).unwrap();
+        let linkdir = tmp.path().join("linkdir");
+        symlink(&realdir, &linkdir).unwrap();
+
+        let mut ctx = ToolContext::default();
+        ctx.cwd = tmp.path().to_string_lossy().into_owned();
+        ctx.set_extension(
+            RunnerContext::new(tmp.path().to_path_buf())
+                .with_resolve_policy(ResolvePolicy::Unrestricted),
+        );
+        let tool = WriteInput::default();
+        let first = json!({
+            "file_path": "linkdir/new.rs",
+            "content": "fn v1() {}\n"
+        });
+        let out = tool.call(first, &ctx).await.unwrap();
+        assert!(!out.is_error, "{}", out.text_content());
+
+        std::fs::write(realdir.join("new.rs"), "EXTERNAL\n").unwrap();
+
+        let retry = json!({
+            "file_path": "realdir/new.rs",
+            "content": "fn v2() {}\n"
+        });
+        let out = tool.call(retry, &ctx).await.unwrap();
+        assert!(out.is_error, "{}", out.text_content());
+        assert!(
+            out.text_content().contains("changed on disk"),
+            "{}",
+            out.text_content()
+        );
+        assert_eq!(
+            std::fs::read_to_string(realdir.join("new.rs")).unwrap(),
+            "EXTERNAL\n",
+            "the refused retry must not clobber the external content"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn unrestricted_conflict_guard_tracks_the_referent_through_a_symlink() {
         // Reading through a link arms the baseline on the physical file, so
         // an external change to the referent trips the write's staleness

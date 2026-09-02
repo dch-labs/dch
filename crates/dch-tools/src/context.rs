@@ -74,7 +74,9 @@ pub struct RunnerContext {
     /// detect-on-write conflict check compares the target's current content
     /// hash against this record before overwriting. Concurrent touches of
     /// one path resolve to the newest observation. Cloning
-    /// [`RunnerContext`] shares the same map.
+    /// [`RunnerContext`] shares the same map. Keys are normalized by this
+    /// context's record and lookup methods — never by the tool call sites —
+    /// so every spelling of a file meets at one key.
     pub file_baselines: Arc<Mutex<FileBaselines>>,
 
     /// Whether file tools confine paths to [`cwd`](Self::cwd).
@@ -123,26 +125,54 @@ impl RunnerContext {
 
     /// Record an observation as the model's latest known state of `path`.
     ///
-    /// Thin locking wrapper over [`record`](crate::state::record), which owns
-    /// the ordering semantics (newest observation wins; an older one arriving
+    /// `path` is normalized to the map's key form before storing (see
+    /// [`RunnerContext::file_baselines`]), so a record made through a
+    /// symlinked-directory spelling of a just-created file lands on the same
+    /// key a later lookup through the physical spelling produces. Thin
+    /// locking wrapper over [`record`](crate::state::record), which owns the
+    /// ordering semantics (newest observation wins; an older one arriving
     /// out of order is discarded).
     pub(crate) fn record_baseline(&self, path: &Path, baseline: crate::state::FileBaseline) {
+        let key = self.baseline_map_key(path);
         let mut baselines = self
             .file_baselines
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        crate::state::record(&mut baselines, path, baseline);
+        crate::state::record(&mut baselines, &key, baseline);
     }
 
     /// The content hash recorded for `path`, if the path was touched.
     ///
-    /// Thin locking wrapper over [`baseline`](crate::state::baseline).
+    /// `path` is normalized with the same rule [`record_baseline`](Self::record_baseline)
+    /// applies, so a lookup through any spelling of a file finds the
+    /// baseline regardless of which spelling recorded it. Thin locking
+    /// wrapper over [`baseline`](crate::state::baseline).
     pub(crate) fn baseline_for(&self, path: &Path) -> Option<u64> {
+        let key = self.baseline_map_key(path);
         let baselines = self
             .file_baselines
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        crate::state::baseline(&baselines, path)
+        crate::state::baseline(&baselines, &key)
+    }
+
+    /// The baseline map key for `path`, per the run's resolve policy.
+    ///
+    /// Under [`ResolvePolicy::Contained`] the key is the path as given —
+    /// the tools' contained resolution output — so records and lookups stay
+    /// in sync without filesystem probes. Under
+    /// [`ResolvePolicy::Unrestricted`] the key is the canonicalized
+    /// physical file, falling back to the path as given when the probe
+    /// fails (a file removed again between its write and this call); this
+    /// is what lets a file first created through a symlinked directory be
+    /// re-keyed to its now-resolvable referent.
+    fn baseline_map_key(&self, path: &Path) -> PathBuf {
+        match self.resolve_policy {
+            ResolvePolicy::Contained => path.to_path_buf(),
+            ResolvePolicy::Unrestricted => {
+                std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+            }
+        }
     }
 }
 
@@ -428,6 +458,66 @@ mod tests {
         assert!(
             format!("{without_tx:?}").contains("question_tx: false"),
             "Debug should report question_tx absent"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn baseline_keys_meet_through_symlink_spellings_under_unrestricted() {
+        // The key rule lives here, not at the tool call sites: a record
+        // made through a symlinked-directory spelling and a lookup through
+        // the physical spelling must land on one key, so the staleness
+        // guard survives a spelling change — including for a file first
+        // created through the link, whose path could not be canonicalized
+        // before it existed.
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let realdir = tmp.path().join("realdir");
+        std::fs::create_dir(&realdir).unwrap();
+        let linkdir = tmp.path().join("linkdir");
+        symlink(&realdir, &linkdir).unwrap();
+
+        let rc = RunnerContext::new(tmp.path().to_path_buf())
+            .with_resolve_policy(ResolvePolicy::Unrestricted);
+        // Records happen after a successful write, so the referent exists
+        // by the time the key is computed — create it to reproduce that
+        // state; this is what makes the linkdir spelling resolvable.
+        std::fs::write(realdir.join("new.rs"), b"v1").unwrap();
+        rc.record_baseline(&linkdir.join("new.rs"), crate::state::observe_bytes(b"v1"));
+        assert_eq!(
+            rc.baseline_for(&realdir.join("new.rs")),
+            Some(crate::state::content_hash(b"v1")),
+            "the lookup must normalize to the recorded physical key"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn contained_baseline_keys_stay_as_given() {
+        // Contained keys are the tools' contained-resolution output; the
+        // map must not canonicalize them, so a symlinked spelling and the
+        // physical spelling are distinct keys exactly as they are distinct
+        // resolution results.
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let realdir = tmp.path().join("realdir");
+        std::fs::create_dir(&realdir).unwrap();
+        let linkdir = tmp.path().join("linkdir");
+        symlink(&realdir, &linkdir).unwrap();
+
+        let rc = RunnerContext::new(tmp.path().to_path_buf());
+        rc.record_baseline(&linkdir.join("a.rs"), crate::state::observe_bytes(b"A"));
+        assert_eq!(
+            rc.baseline_for(&linkdir.join("a.rs")),
+            Some(crate::state::content_hash(b"A")),
+            "the recorded spelling must find its own baseline"
+        );
+        assert_eq!(
+            rc.baseline_for(&realdir.join("a.rs")),
+            None,
+            "the physical spelling is a distinct key under Contained"
         );
     }
 }

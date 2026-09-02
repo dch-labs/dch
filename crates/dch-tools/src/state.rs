@@ -33,12 +33,11 @@ static OBSERVATION_SEQ: AtomicU64 = AtomicU64::new(0);
 /// unrestricted policy — so equivalent spellings of the same file,
 /// including spellings that pass through a symbolic link, share one
 /// baseline and a staleness check can't be dodged by re-spelling a path.
-/// One divergence: a *new* file created through a symlinked directory
-/// cannot be canonicalized (the path does not resolve yet), so its
-/// post-write baseline is recorded under the submitted spelling, and a
-/// later write through a different spelling falls back to the
-/// no-baseline rule — the same posture as a file that was never read, so
-/// no guard is bypassed.
+/// The rule is applied by the owning context — `RunnerContext`'s
+/// `record_baseline` and `baseline_for` normalize keys on the way in and
+/// out, so no call site can record or query under a divergent spelling,
+/// and a file first created through a symlinked directory is re-keyed to
+/// its now-resolvable physical path.
 ///
 /// The hash is a process-local [`DefaultHasher`] fingerprint of the file's
 /// bytes — deliberately not a stable or cryptographic digest: baselines live
