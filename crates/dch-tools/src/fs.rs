@@ -73,13 +73,17 @@ pub(crate) fn atomic_write(
 ///
 /// `rename` re-resolves its destination, so a component swapped between the
 /// handle verification and the rename can land the file outside the
-/// workspace. When that is detected the escaped file is removed — the run
-/// fails, and nothing is left behind.
+/// workspace. When that is detected the escaped entry is removed and the
+/// run fails. The removal unlinks `target` as given rather than its
+/// canonical path: unlink does not traverse a final-entry symlink, so a
+/// link substituted for the file after the rename is removed itself and
+/// its referent — a path this code did not create — is left untouched.
 ///
 /// # Errors
 ///
 /// Returns [`ToolError::Execution`] when the renamed file resolves outside
-/// `workspace` (removing it first), or when containment cannot be confirmed.
+/// `workspace` (removing the entry first), or when containment cannot be
+/// confirmed.
 fn ensure_renamed_inside(target: &Path, workspace: &Path) -> Result<(), ToolError> {
     let actual = std::fs::canonicalize(target)
         .map_err(|e| ToolError::Execution(format!("cannot verify path containment: {e}")))?;
@@ -88,7 +92,7 @@ fn ensure_renamed_inside(target: &Path, workspace: &Path) -> Result<(), ToolErro
     if actual.starts_with(&workspace) {
         return Ok(());
     }
-    drop(std::fs::remove_file(&actual));
+    drop(std::fs::remove_file(target));
     Err(ToolError::Execution(format!(
         "Path escaped the working directory: {}",
         actual.display()
@@ -205,6 +209,27 @@ mod tests {
         let err = ensure_renamed_inside(&target, workspace.path()).unwrap_err();
         assert!(err.to_string().contains("escaped"), "{err}");
         assert!(!target.exists(), "the escaped file must be removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_of_a_substituted_symlink_unlinks_the_link_not_the_referent() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let victim = outside.path().join("victim.txt");
+        std::fs::write(&victim, "keep me").unwrap();
+        let target = workspace.path().join("marker.json");
+        symlink(&victim, &target).unwrap();
+
+        let err = ensure_renamed_inside(&target, workspace.path()).unwrap_err();
+        assert!(err.to_string().contains("escaped"), "{err}");
+        assert!(victim.exists(), "the referent must survive the cleanup");
+        assert!(
+            std::fs::symlink_metadata(&target).is_err(),
+            "the substituted link entry itself must be removed"
+        );
     }
 
     #[cfg(target_os = "linux")]
