@@ -133,16 +133,19 @@ impl EditInput {
             )));
         }
 
-        if let Err(failure) =
-            crate::conflict::check_content_unchanged(&old_content, &full_path).await
+        let expected = match crate::conflict::check_content_unchanged(&old_content, &full_path)
+            .await
         {
-            return match failure {
-                crate::conflict::CheckFailure::Changed => Ok(EditError::Conflict.into_output()),
-                crate::conflict::CheckFailure::Fault(e) => Err(e),
-            };
-        }
+            Ok(identity) => Some(identity),
+            Err(failure) => {
+                return match failure {
+                    crate::conflict::CheckFailure::Changed => Ok(EditError::Conflict.into_output()),
+                    crate::conflict::CheckFailure::Fault(e) => Err(e),
+                };
+            }
+        };
 
-        crate::fs::atomic_write(&full_path, &new_content, &cwd, policy)?;
+        crate::fs::atomic_write(&full_path, &new_content, &cwd, policy, expected.as_ref())?;
 
         if let Some(rc) = &rc {
             rc.record_baseline(

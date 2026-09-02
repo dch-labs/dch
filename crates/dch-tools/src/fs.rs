@@ -5,6 +5,7 @@ use std::path::Path;
 
 use loopctl::tool::ToolError;
 
+use crate::conflict::TargetIdentity;
 use crate::util::ResolvePolicy;
 
 /// Write `content` to `target` atomically.
@@ -23,16 +24,25 @@ use crate::util::ResolvePolicy;
 /// silently severing it. Unrestricted dispatch writes onto the path as
 /// given. Callers that resolve links themselves should pass the real path.
 ///
+/// When `expected` carries the [`TargetIdentity`] a conflict check captured,
+/// the path's entry is compared against it immediately before the rename: a
+/// target swapped (or removed) between the byte comparison and this point
+/// aborts the write instead of silently replacing a file that was never
+/// compared. `None` skips the re-check — new-file writes and platforms
+/// without a stable identity.
+///
 /// # Errors
 ///
 /// Returns [`ToolError::InvalidInput`] when `target` is a symbolic link.
-/// Returns [`ToolError::Execution`] on any failure creating, writing, or
+/// Returns [`ToolError::Execution`] when the checked identity no longer
+/// matches the path's entry, and on any failure creating, writing, or
 /// persisting the temp file.
 pub(crate) fn atomic_write(
     target: &Path,
     content: &str,
     workspace: &Path,
     policy: ResolvePolicy,
+    expected: Option<&TargetIdentity>,
 ) -> Result<(), ToolError> {
     if policy == ResolvePolicy::Contained
         && std::fs::symlink_metadata(target).is_ok_and(|m| m.file_type().is_symlink())
@@ -60,6 +70,23 @@ pub(crate) fn atomic_write(
         .map_err(|e| ToolError::Execution(format!("Failed to write temp file: {e}")))?;
     tmp.flush()
         .map_err(|e| ToolError::Execution(format!("Failed to flush temp file: {e}")))?;
+    if let Some(identity) = expected {
+        let current = match std::fs::metadata(target) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err(swap_abort(target));
+            }
+            Err(err) => {
+                return Err(ToolError::Execution(format!(
+                    "cannot re-check the write target {}: {err}",
+                    target.display()
+                )));
+            }
+        };
+        if !identity.matches(&current) {
+            return Err(swap_abort(target));
+        }
+    }
     tmp.persist(target)
         .map_err(|e| ToolError::Execution(format!("Failed to persist file: {e}")))?;
     if policy == ResolvePolicy::Contained {
@@ -67,6 +94,256 @@ pub(crate) fn atomic_write(
     }
 
     Ok(())
+}
+
+/// The abort for a target that changed between the conflict check and the
+/// rename.
+///
+/// The swap is a fault rather than a plain content conflict, so the error
+/// stays on the hard [`ToolError`] channel the write's plumbing already
+/// carries. The message still points at the soft path's recovery: the
+/// model re-reads the file and re-issues the write against the current
+/// content.
+fn swap_abort(target: &Path) -> ToolError {
+    ToolError::Execution(format!(
+        "{} changed while the write was being prepared; re-read it and retry \
+         the write.",
+        target.display()
+    ))
+}
+
+/// Create every missing directory of `parent` without following symlinks.
+///
+/// The contained counterpart of `create_dir_all`: the walk descends from
+/// `workspace` one component at a time, opening each with `O_NOFOLLOW`, so
+/// a component swapped for a symbolic link after validation can never be
+/// traversed — directories are only ever created through a descriptor
+/// chain that stayed on the named, link-free path. A symbolic link found
+/// anywhere in the parent chain is refused (matching the batch tools'
+/// stricter pre-write posture): resolve it and pass the real path. This is
+/// deliberately stricter than reads, which may traverse in-workspace
+/// links — only creation, which leaves new filesystem entries behind, is
+/// no-follow.
+///
+/// Directories created before a failure are removed again, empty-directory
+/// removal only, so a concurrently filled directory is left standing
+/// rather than force-deleted. The workspace root itself is opened
+/// following links: it is the operator-supplied anchor, while the descent
+/// — where a concurrent swap would land — is strictly no-follow.
+///
+/// # Errors
+///
+/// Returns [`ToolError::Execution`] when `parent` is not inside
+/// `workspace`, when the workspace root cannot be opened, when a parent
+/// component is a symbolic link or not a directory, or when a directory
+/// cannot be created. Non-Linux platforms fail closed without creating
+/// anything, consistent with the platform's other contained checks.
+#[cfg(target_os = "linux")]
+pub(crate) fn create_contained_dirs(parent: &Path, workspace: &Path) -> Result<(), ToolError> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let relative = parent.strip_prefix(workspace).map_err(|_| {
+        ToolError::Execution(format!(
+            "cannot create directories safely: {} is not inside {}",
+            parent.display(),
+            workspace.display()
+        ))
+    })?;
+
+    let mut opened: Vec<i32> = Vec::new();
+    let mut created: Vec<(i32, CString)> = Vec::new();
+    let failure = (|| {
+        let root = open_dir_fd(workspace, libc::O_RDONLY | libc::O_DIRECTORY)?;
+        opened.push(root);
+        let mut current = root;
+        for component in relative.components() {
+            let name = CString::new(component.as_os_str().as_bytes())
+                .map_err(|_| ToolError::Execution("path contains a NUL byte".to_string()))?;
+            match openat_dir(current, &name) {
+                Ok(fd) => {
+                    opened.push(fd);
+                    current = fd;
+                }
+                Err(error) => {
+                    if is_symlink_entry(current, &name) {
+                        return Err(ToolError::Execution(format!(
+                            "Refusing to create directories: {} is a \
+                             symbolic link. Resolve it and pass the real \
+                             path.",
+                            component.as_os_str().to_string_lossy()
+                        )));
+                    }
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        return Err(ToolError::Execution(format!(
+                            "cannot descend into {}: {error}",
+                            component.as_os_str().to_string_lossy()
+                        )));
+                    }
+                    // SAFETY: `current` is a valid open directory descriptor
+                    // and `name` outlives the call; the mode is subject to
+                    // the umask like any mkdir(2).
+                    if unsafe { libc::mkdirat(current, name.as_ptr(), 0o777) } != 0 {
+                        return Err(ToolError::Execution(format!(
+                            "cannot create directory {}: {}",
+                            component.as_os_str().to_string_lossy(),
+                            std::io::Error::last_os_error()
+                        )));
+                    }
+                    let fd = openat_dir(current, &name).map_err(|error| {
+                        ToolError::Execution(format!(
+                            "cannot open the created directory {}: {error}",
+                            component.as_os_str().to_string_lossy()
+                        ))
+                    })?;
+                    opened.push(fd);
+                    // SAFETY: duplicating the valid parent descriptor for the
+                    // rollback table; the duplicate is closed exactly once
+                    // after the walk.
+                    let parent = unsafe { libc::dup(current) };
+                    if parent < 0 {
+                        return Err(ToolError::Execution(format!(
+                            "cannot track the created directory {}: {}",
+                            component.as_os_str().to_string_lossy(),
+                            std::io::Error::last_os_error()
+                        )));
+                    }
+                    created.push((parent, name));
+                    current = fd;
+                }
+            }
+        }
+        Ok(())
+    })();
+
+    for fd in opened {
+        // SAFETY: each descriptor was pushed exactly once by the walk.
+        let _ = unsafe { libc::close(fd) };
+    }
+    if failure.is_err() {
+        for (dir_fd, name) in created.into_iter().rev() {
+            // Best-effort rollback: empty-directory removal only, so a
+            // directory that gained content concurrently is left standing.
+            // SAFETY: `dir_fd` is a valid duplicate and `name` outlives the
+            // call.
+            let _ = unsafe { libc::unlinkat(dir_fd, name.as_ptr(), libc::AT_REMOVEDIR) };
+            // SAFETY: each duplicate is closed exactly once.
+            let _ = unsafe { libc::close(dir_fd) };
+        }
+    }
+    failure
+}
+
+/// Non-Linux fallback: fail closed without creating anything.
+///
+/// The bounded walk needs descriptor-relative directory operations this
+/// platform build does not implement; contained writes already fail closed
+/// at their handle verification here, so refusing before any directory is
+/// created only moves the failure earlier — and leaves no entries behind.
+///
+/// # Errors
+///
+/// Always returns [`ToolError::Execution`].
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn create_contained_dirs(_parent: &Path, _workspace: &Path) -> Result<(), ToolError> {
+    Err(ToolError::Execution(
+        "directories cannot be created under containment on this platform".to_string(),
+    ))
+}
+
+/// Open `path` as a directory descriptor with `flags`.
+///
+/// The workspace anchor is opened through this helper so every descriptor
+/// the walk holds carries close-on-exec. The `flags` argument is the
+/// caller's containment statement: the anchor itself is opened following
+/// links (it is the operator-supplied root), while the walk's own
+/// [`openat_dir`] calls add `O_NOFOLLOW` to their flags.
+///
+/// # Errors
+///
+/// Returns [`ToolError::Execution`] when the path cannot be opened as a
+/// directory, carrying the OS error.
+#[cfg(target_os = "linux")]
+fn open_dir_fd(path: &Path, flags: i32) -> Result<i32, ToolError> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| ToolError::Execution("path contains a NUL byte".to_string()))?;
+    // SAFETY: `path` outlives the call.
+    let fd = unsafe { libc::open(path.as_ptr(), flags | libc::O_CLOEXEC) };
+    if fd < 0 {
+        Err(ToolError::Execution(format!(
+            "cannot open {}: {}",
+            path.to_string_lossy(),
+            std::io::Error::last_os_error()
+        )))
+    } else {
+        Ok(fd)
+    }
+}
+
+/// Open `name` under the open directory `dir`, refusing symbolic links.
+///
+/// One component per call is what makes the bounded walk sound: with
+/// `O_NOFOLLOW`, `O_DIRECTORY`, and `O_CLOEXEC` set, a component can only
+/// resolve to a real directory descriptor, and a symbolic link fails
+/// instead of being traversed. With `O_DIRECTORY` in the mix the kernel
+/// reports that failure as a generic not-a-directory rather than a loop
+/// error, which is why the caller confirms the link case through
+/// [`is_symlink_entry`].
+///
+/// # Errors
+///
+/// Returns the OS error when the entry cannot be opened as a directory —
+/// including the not-a-directory or loop failure a symbolic-link component
+/// produces under `O_NOFOLLOW`.
+#[cfg(target_os = "linux")]
+fn openat_dir(dir: i32, name: &std::ffi::CString) -> std::io::Result<i32> {
+    // SAFETY: `dir` is a valid open descriptor and `name` outlives the call;
+    // O_NOFOLLOW makes a symbolic-link component fail instead of traverse.
+    let fd = unsafe {
+        libc::openat(
+            dir,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(fd)
+    }
+}
+
+/// Whether the entry `name` under the open directory `dir` is a symlink.
+///
+/// `O_NOFOLLOW` reports a symbolic-link component as a generic
+/// not-a-directory or loop error, indistinguishable from a component that
+/// is genuinely not a directory. Statting the entry without following —
+/// `fstatat` with `AT_SYMLINK_NOFOLLOW`, relative to the same descriptor
+/// the failed open used — separates the two, so the walk can refuse links
+/// with a precise message. An entry that cannot itself be stated is
+/// reported as not-a-link and lands in the caller's generic error path.
+#[cfg(target_os = "linux")]
+fn is_symlink_entry(dir: i32, name: &std::ffi::CString) -> bool {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `dir` is a valid open descriptor, `name` outlives the call,
+    // and the stat buffer is writable for the duration of the call.
+    let filled = unsafe {
+        libc::fstatat(
+            dir,
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if filled != 0 {
+        return false;
+    }
+    // SAFETY: `fstatat` fully initialized the buffer on success.
+    let stat = unsafe { stat.assume_init() };
+    (stat.st_mode & libc::S_IFMT) == libc::S_IFLNK
 }
 
 /// Post-rename containment check: the renamed file must live in `workspace`.
@@ -199,6 +476,7 @@ fn remove_bounded(parent: &Path, name: &std::ffi::OsStr) -> Result<(), ToolError
 )]
 mod tests {
     use super::*;
+    use crate::conflict::check_content_unchanged;
     use crate::util::ResolvePolicy;
 
     #[test]
@@ -206,7 +484,14 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let target = tmp.path().join("out.txt");
         std::fs::write(&target, "old\n").unwrap();
-        atomic_write(&target, "new\n", tmp.path(), ResolvePolicy::Unrestricted).unwrap();
+        atomic_write(
+            &target,
+            "new\n",
+            tmp.path(),
+            ResolvePolicy::Unrestricted,
+            None,
+        )
+        .unwrap();
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
     }
 
@@ -219,6 +504,7 @@ mod tests {
             "fn main() {}\n",
             tmp.path(),
             ResolvePolicy::Unrestricted,
+            None,
         )
         .unwrap();
         let entries: Vec<_> = std::fs::read_dir(tmp.path())
@@ -241,6 +527,7 @@ mod tests {
             "#!/bin/bash\necho new\n",
             tmp.path(),
             ResolvePolicy::Contained,
+            None,
         )
         .unwrap();
         let mode = std::fs::metadata(&target).unwrap().permissions().mode();
@@ -262,8 +549,14 @@ mod tests {
         let link = tmp.path().join("link.txt");
         symlink(&real, &link).unwrap();
 
-        let err =
-            atomic_write(&link, "new content\n", tmp.path(), ResolvePolicy::Contained).unwrap_err();
+        let err = atomic_write(
+            &link,
+            "new content\n",
+            tmp.path(),
+            ResolvePolicy::Contained,
+            None,
+        )
+        .unwrap_err();
         assert!(
             matches!(err, ToolError::InvalidInput(ref s) if s.contains("symbolic link")),
             "{err:?}"
@@ -396,6 +689,7 @@ mod tests {
             "replacement\n",
             tmp.path(),
             ResolvePolicy::Unrestricted,
+            None,
         )
         .unwrap();
 
@@ -428,8 +722,14 @@ mod tests {
         symlink(outside.path(), &dir).unwrap();
 
         let target = dir.join("file.txt");
-        let err =
-            atomic_write(&target, "x", workspace.path(), ResolvePolicy::Contained).unwrap_err();
+        let err = atomic_write(
+            &target,
+            "x",
+            workspace.path(),
+            ResolvePolicy::Contained,
+            None,
+        )
+        .unwrap_err();
         assert!(
             matches!(err, ToolError::Execution(ref s) if s.contains("escaped")),
             "{err:?}"
@@ -451,7 +751,181 @@ mod tests {
         symlink(outside.path(), &dir).unwrap();
 
         let target = dir.join("file.txt");
-        atomic_write(&target, "x", workspace.path(), ResolvePolicy::Unrestricted).unwrap();
+        atomic_write(
+            &target,
+            "x",
+            workspace.path(),
+            ResolvePolicy::Unrestricted,
+            None,
+        )
+        .unwrap();
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "x");
+    }
+
+    #[tokio::test]
+    async fn atomic_write_aborts_when_the_target_changed_since_the_check() {
+        // The swap window, deterministically: the conflict check compared
+        // one file, the path's entry was replaced before the write, and the
+        // identity re-check must abort instead of replacing the newcomer.
+        // The replacement is created while the checked file still exists
+        // and renamed into place — rename never changes the inode, and two
+        // simultaneously live files cannot share one, so the swap cannot
+        // alias the checked identity the way a remove-then-recreate can
+        // when the filesystem reclaims the freed inode.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("watched.txt");
+        std::fs::write(&target, "checked\n").unwrap();
+        let identity = check_content_unchanged("checked\n", &target).await.unwrap();
+        let newcomer = tmp.path().join("swapped-in.txt");
+        std::fs::write(&newcomer, "swapped in\n").unwrap();
+        std::fs::rename(&newcomer, &target).unwrap();
+
+        let err = atomic_write(
+            &target,
+            "ours\n",
+            tmp.path(),
+            ResolvePolicy::Unrestricted,
+            Some(&identity),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("changed while the write was being prepared"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "swapped in\n",
+            "the swapped-in file must be untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn atomic_write_proceeds_when_the_identity_still_matches() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("stable.txt");
+        std::fs::write(&target, "old\n").unwrap();
+        let identity = check_content_unchanged("old\n", &target).await.unwrap();
+
+        atomic_write(
+            &target,
+            "new\n",
+            tmp.path(),
+            ResolvePolicy::Unrestricted,
+            Some(&identity),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
+    }
+
+    #[tokio::test]
+    async fn atomic_write_aborts_when_the_target_vanished_since_the_check() {
+        // Missing-at-rename is a conflict, matching the check's own
+        // missing-at-reread doctrine — and nothing may be recreated.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("gone.txt");
+        std::fs::write(&target, "checked\n").unwrap();
+        let identity = check_content_unchanged("checked\n", &target).await.unwrap();
+        std::fs::remove_file(&target).unwrap();
+
+        let err = atomic_write(
+            &target,
+            "ours\n",
+            tmp.path(),
+            ResolvePolicy::Unrestricted,
+            Some(&identity),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("changed while the write was being prepared"),
+            "{err}"
+        );
+        assert!(!target.exists(), "the vanished target must stay absent");
+        let entries: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(entries.is_empty(), "no temp file may be left: {entries:?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn create_contained_dirs_builds_a_missing_chain() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let parent = tmp.path().join("a").join("b");
+        create_contained_dirs(&parent, tmp.path()).unwrap();
+        assert!(parent.is_dir());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn create_contained_dirs_is_a_no_op_for_an_existing_chain() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let parent = tmp.path().join("a");
+        std::fs::create_dir(&parent).unwrap();
+        create_contained_dirs(&parent, tmp.path()).unwrap();
+        assert!(parent.is_dir());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn create_contained_dirs_refuses_a_swapped_symlink_component_without_creating() {
+        // The escape, deterministically: the component was swapped for a
+        // link pointing outside after validation. The no-follow walk must
+        // refuse and create nothing on the far side.
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        symlink(outside.path(), workspace.path().join("dir")).unwrap();
+        let parent = workspace.path().join("dir").join("nested");
+
+        let err = create_contained_dirs(&parent, workspace.path()).unwrap_err();
+        assert!(err.to_string().contains("symbolic link"), "{err}");
+        assert!(
+            !outside.path().join("nested").exists(),
+            "nothing may be created beyond the link"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn create_contained_dirs_refuses_an_in_workspace_symlink_component() {
+        // The stricter creation posture, pinned: even a link resolving
+        // inside the workspace is refused during creation — resolve it and
+        // pass the real path.
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let real = workspace.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        symlink(&real, workspace.path().join("link")).unwrap();
+        let parent = workspace.path().join("link").join("new");
+
+        let err = create_contained_dirs(&parent, workspace.path()).unwrap_err();
+        assert!(err.to_string().contains("symbolic link"), "{err}");
+        assert!(!real.join("new").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn create_contained_dirs_rolls_back_created_dirs_on_a_later_failure() {
+        // A failure on a later component must not leave the earlier
+        // walk-created chain behind. The trigger is deterministic: a
+        // component longer than NAME_MAX fails only after its predecessor
+        // was created. (A symlink refusal cannot double as the trigger —
+        // a symlink's parent must pre-exist, so nothing can have been
+        // created before the walk reaches it.)
+        let workspace = tempfile::TempDir::new().unwrap();
+        let long = "n".repeat(300);
+        let parent = workspace.path().join("a").join(&long);
+
+        let err = create_contained_dirs(&parent, workspace.path()).unwrap_err();
+        assert!(err.to_string().contains("cannot"), "{err}");
+        assert!(
+            !workspace.path().join("a").exists(),
+            "the partially created chain must be rolled back"
+        );
     }
 }

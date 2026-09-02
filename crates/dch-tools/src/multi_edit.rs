@@ -263,9 +263,10 @@ async fn write_finals(
             continue;
         }
         if let Some(final_content) = finals.get(&op.file_path) {
+            let mut expected = None;
             if let Some(baseline) = originals.get(&op.file_path).map(String::as_str) {
                 match check_content_unchanged(baseline, &op.full_path).await {
-                    Ok(()) => {}
+                    Ok(identity) => expected = Some(identity),
                     Err(CheckFailure::Changed) => {
                         return Ok(Some(BatchConflict {
                             applied,
@@ -275,8 +276,14 @@ async fn write_finals(
                     Err(CheckFailure::Fault(e)) => return Err(fault_with_applied(e, &applied)),
                 }
             }
-            crate::fs::atomic_write(&op.full_path, final_content, workspace, policy)
-                .map_err(|e| fault_with_applied(e, &applied))?;
+            crate::fs::atomic_write(
+                &op.full_path,
+                final_content,
+                workspace,
+                policy,
+                expected.as_ref(),
+            )
+            .map_err(|e| fault_with_applied(e, &applied))?;
             applied.push(op.file_path.clone());
             if let Some(rc) = history {
                 rc.record_baseline(

@@ -81,14 +81,20 @@ impl WriteInput {
     /// Orchestrates validate → lint → staleness check → write. When the path
     /// has a recorded baseline (a prior Read this session), content that
     /// differs from the recorded hash refuses the write as a soft conflict;
-    /// a successful write refreshes the recorded baseline, so the model's
-    /// own write never registers as a later external change.
+    /// the compared file's identity is pinned and re-checked at the rename,
+    /// so a target swapped in between aborts instead of replacing an
+    /// uncompared file. Under the contained policy, missing parent
+    /// directories are created through a walk that never follows symbolic
+    /// links. A successful write refreshes the recorded baseline, so the
+    /// model's own write never registers as a later external change.
     ///
     /// # Errors
     ///
     /// Returns [`ToolError`] for a missing `RunnerContext`, a missing
     /// `file_path`, a missing `content`, a URL `file_path` or a path escaping
-    /// the working directory, or a file-system error during the atomic write.
+    /// the working directory, a target that changed while the write was
+    /// being prepared, or a file-system error during parent creation or the
+    /// atomic write.
     async fn write_inner(
         &self,
         input: Value,
@@ -140,23 +146,30 @@ impl WriteInput {
             None => None,
         };
 
-        if let Some(baseline_hash) = rc.as_ref().and_then(|rc| rc.baseline_for(&full_path))
-            && let Err(failure) =
-                crate::conflict::check_content_hash_unchanged(baseline_hash, &full_path).await
-        {
-            return match failure {
-                crate::conflict::CheckFailure::Changed => Ok(ToolOutput::error_text(
-                    crate::conflict::changed_message(&full_path),
-                )),
-                crate::conflict::CheckFailure::Fault(e) => Err(e),
-            };
+        let mut expected = None;
+        if let Some(baseline_hash) = rc.as_ref().and_then(|rc| rc.baseline_for(&full_path)) {
+            match crate::conflict::check_content_hash_unchanged(baseline_hash, &full_path).await {
+                Ok(identity) => expected = Some(identity),
+                Err(failure) => {
+                    return match failure {
+                        crate::conflict::CheckFailure::Changed => Ok(ToolOutput::error_text(
+                            crate::conflict::changed_message(&full_path),
+                        )),
+                        crate::conflict::CheckFailure::Fault(e) => Err(e),
+                    };
+                }
+            }
         }
 
         if let Some(parent) = full_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+            if policy == ResolvePolicy::Contained {
+                crate::fs::create_contained_dirs(parent, &cwd)?;
+            } else {
+                tokio::fs::create_dir_all(parent).await?;
+            }
         }
 
-        crate::fs::atomic_write(&full_path, content, &cwd, policy)?;
+        crate::fs::atomic_write(&full_path, content, &cwd, policy, expected.as_ref())?;
 
         if let Some(rc) = &rc {
             rc.record_baseline(&full_path, crate::state::observe_bytes(content.as_bytes()));
