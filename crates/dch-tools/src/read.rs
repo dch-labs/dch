@@ -142,7 +142,10 @@ impl ReadInput {
             None => ResolvePolicy::Contained,
         };
         let cwd = require_cwd(runner_context.clone())?;
-        let full_path = resolve_path(file_path, &cwd, policy)?;
+        let mut full_path = resolve_path(file_path, &cwd, policy)?;
+        if policy == ResolvePolicy::Unrestricted {
+            full_path = crate::util::canonicalize_existing(&full_path)?;
+        }
 
         let metadata = metadata_or_not_found(&full_path, file_path).await?;
         if let Some(too_large) = too_large_if_over(metadata.len()) {

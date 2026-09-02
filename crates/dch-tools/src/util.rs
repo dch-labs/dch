@@ -177,15 +177,30 @@ pub fn resolve_path(
     Ok(normalized)
 }
 
-/// Canonicalize `path` when it resolves, returning it unchanged otherwise.
+/// Canonicalize `path` when it resolves, failing on other resolution errors.
 ///
 /// Write-path callers use this under [`ResolvePolicy::Unrestricted`] to
 /// honor symbolic links: an existing target is rewritten to its physical
 /// file so the write lands on the referent and the link stays intact. A
-/// path that does not resolve — a not-yet-existing file — is returned as
-/// given.
-pub(crate) fn canonicalize_existing(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+/// path that does not exist yet is returned as given, so new-file writes
+/// keep working. Any other resolution failure — an unreadable ancestor or
+/// a symlink loop — is propagated: the physical target cannot be
+/// determined, and silently writing the submitted path would replace the
+/// link entry instead of honoring it.
+///
+/// # Errors
+///
+/// Returns [`ToolError::Execution`] when canonicalization fails for any
+/// reason other than a missing path.
+pub(crate) fn canonicalize_existing(path: &Path) -> Result<PathBuf, ToolError> {
+    match std::fs::canonicalize(path) {
+        Ok(real) => Ok(real),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(path.to_path_buf()),
+        Err(error) => Err(ToolError::Execution(format!(
+            "cannot resolve {}: {error}",
+            path.display()
+        ))),
+    }
 }
 
 /// Verify an opened handle actually resolved inside `workspace` (Linux).
@@ -695,6 +710,29 @@ mod tests {
             let once = normalize_lexical(Path::new(raw));
             assert_eq!(normalize_lexical(&once), once, "{raw}");
         }
+    }
+
+    #[test]
+    fn canonicalize_existing_returns_the_given_path_for_a_missing_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let missing = tmp.path().join("not-there.rs");
+        assert_eq!(
+            canonicalize_existing(&missing).unwrap(),
+            missing,
+            "a new-file target must come back as given"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonicalize_existing_propagates_an_unresolvable_link() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let looped = tmp.path().join("loop.rs");
+        symlink(&looped, &looped).unwrap();
+        let err = canonicalize_existing(&looped).unwrap_err();
+        assert!(err.to_string().contains("cannot resolve"), "{err}");
     }
 
     #[test]

@@ -114,7 +114,7 @@ impl WriteInput {
             .unwrap_or(false);
         let mut full_path = resolve_path(file_path, &cwd, policy)?;
         if policy == ResolvePolicy::Unrestricted {
-            full_path = canonicalize_existing(&full_path);
+            full_path = canonicalize_existing(&full_path)?;
         }
 
         if !skip_linter {
@@ -526,6 +526,111 @@ mod tests {
             "the link must survive the write"
         );
         assert_eq!(std::fs::read_to_string(&real).unwrap(), "fn new() {}\n");
+    }
+
+    #[tokio::test]
+    async fn unrestricted_write_creates_a_new_file() {
+        // A path that does not resolve is not an error: new-file writes
+        // must keep working under the unrestricted policy.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut ctx = ToolContext::default();
+        ctx.cwd = tmp.path().to_string_lossy().into_owned();
+        ctx.set_extension(
+            RunnerContext::new(tmp.path().to_path_buf())
+                .with_resolve_policy(ResolvePolicy::Unrestricted),
+        );
+        let tool = WriteInput::default();
+        let input = json!({
+            "file_path": "fresh.rs",
+            "content": "fn main() {}\n"
+        });
+        let out = tool.call(input, &ctx).await.unwrap();
+        assert!(!out.is_error, "{}", out.text_content());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("fresh.rs")).unwrap(),
+            "fn main() {}\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unrestricted_write_to_an_unresolvable_symlink_fails_without_severing() {
+        // A link whose target cannot be resolved (a loop here) cannot be
+        // honored; the write must fail rather than silently replace the
+        // link entry with a regular file.
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let link = tmp.path().join("loop.rs");
+        symlink(&link, &link).unwrap();
+
+        let mut ctx = ToolContext::default();
+        ctx.cwd = tmp.path().to_string_lossy().into_owned();
+        ctx.set_extension(
+            RunnerContext::new(tmp.path().to_path_buf())
+                .with_resolve_policy(ResolvePolicy::Unrestricted),
+        );
+        let tool = WriteInput::default();
+        let input = json!({
+            "file_path": "loop.rs",
+            "content": "fn main() {}\n"
+        });
+        let err = tool.call(input, &ctx).await.unwrap_err();
+        assert!(err.to_string().contains("cannot resolve"), "{err}");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the unresolvable link must survive the failed write"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unrestricted_conflict_guard_tracks_the_referent_through_a_symlink() {
+        // Reading through a link arms the baseline on the physical file, so
+        // an external change to the referent trips the write's staleness
+        // check even though both operations used the link spelling.
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let real = tmp.path().join("real.rs");
+        let link = tmp.path().join("link.rs");
+        std::fs::write(&real, "fn one() {}\n").unwrap();
+        symlink(&real, &link).unwrap();
+
+        let mut ctx = ToolContext::default();
+        ctx.cwd = tmp.path().to_string_lossy().into_owned();
+        ctx.set_extension(
+            RunnerContext::new(tmp.path().to_path_buf())
+                .with_resolve_policy(ResolvePolicy::Unrestricted),
+        );
+
+        let reader = crate::read::ReadInput::default();
+        let read_out = reader
+            .call(json!({ "file_path": "link.rs" }), &ctx)
+            .await
+            .unwrap();
+        assert!(!read_out.is_error);
+
+        std::fs::write(&real, "externally replaced\n").unwrap();
+
+        let tool = WriteInput::default();
+        let input = json!({
+            "file_path": "link.rs",
+            "content": "fn two() {}\n"
+        });
+        let out = tool.call(input, &ctx).await.unwrap();
+        assert!(out.is_error, "the changed referent must abort the write");
+        assert!(
+            out.text_content().contains("changed on disk"),
+            "{}",
+            out.text_content()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&real).unwrap(),
+            "externally replaced\n",
+            "the referent must be untouched by the refused write"
+        );
     }
 
     /// Drives a real Read (which records the content baseline on the shared

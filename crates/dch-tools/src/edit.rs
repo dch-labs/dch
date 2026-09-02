@@ -117,7 +117,7 @@ impl EditInput {
         let parsed = parse_input(&input)?;
         let mut full_path = resolve_path(parsed.file_path, &cwd, policy)?;
         if policy == ResolvePolicy::Unrestricted {
-            full_path = canonicalize_existing(&full_path);
+            full_path = canonicalize_existing(&full_path)?;
         }
         let old_content = read_existing(&full_path, parsed.file_path, &cwd, policy).await?;
         let new_content = match apply_edit(&old_content, parsed.old_text, parsed.new_text) {
