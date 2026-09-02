@@ -584,26 +584,41 @@ fn symlink_check(operations: &[EditOperation]) -> Option<AbortReason> {
     None
 }
 
-/// Rewrite each target to its physical path, refusing aliases (Unrestricted).
+/// Rewrite each target to its physical path, refusing symlink aliases
+/// (Unrestricted).
 ///
-/// Unrestricted writes honor symbolic links, so each target is canonicalized
-/// and the write lands on the real file with the link left intact — and two
-/// entries resolving to the same file would write it twice, which is
-/// rejected. The original `file_path` is kept for display. Targets that do
-/// not exist yet (new files) keep their submitted path.
+/// Unrestricted writes honor symbolic links, so each existing target is
+/// canonicalized and the write lands on the real file with the link left
+/// intact; repeated operations naming the same caller path are the normal
+/// multi-edit-to-one-file case and merge downstream. Two different caller
+/// paths resolving to one physical file are refused: each would merge
+/// independently against the same original, and the second write would
+/// silently clobber the first. The original `file_path` is kept for
+/// display. Targets that do not exist yet (new files) keep their submitted
+/// path.
 ///
 /// Returns the abort reason for the first alias pair found, if any.
 fn honor_symlink_targets(operations: &mut [EditOperation]) -> Option<AbortReason> {
-    let mut physical: std::collections::HashSet<std::path::PathBuf> =
-        std::collections::HashSet::new();
+    use std::collections::hash_map::Entry;
+
+    let mut physical: std::collections::HashMap<std::path::PathBuf, String> =
+        std::collections::HashMap::new();
     for op in operations {
         if let Ok(real) = std::fs::canonicalize(&op.full_path) {
-            if !physical.insert(real.clone()) {
-                return Some(AbortReason::Symlink(format!(
-                    "Refusing to write: '{}' and an earlier entry are the same file ({}).",
-                    op.file_path,
-                    real.display()
-                )));
+            match physical.entry(real.clone()) {
+                Entry::Occupied(existing) if existing.get() != &op.file_path => {
+                    return Some(AbortReason::Symlink(format!(
+                        "Refusing to write: '{}' and '{}' are the same file ({}). \
+                         Combine them into one set of edits.",
+                        existing.get(),
+                        op.file_path,
+                        real.display()
+                    )));
+                }
+                Entry::Occupied(_) => {}
+                Entry::Vacant(slot) => {
+                    slot.insert(op.file_path.clone());
+                }
             }
             op.full_path = real;
         }
@@ -1201,6 +1216,58 @@ mod tests {
         assert!(dup_path_check(&ops).unwrap().into_output().is_error);
     }
 
+    #[test]
+    fn honor_symlink_targets_accepts_repeated_ops_for_one_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("a.rs");
+        std::fs::write(&target, "x").unwrap();
+        let mut ops = vec![
+            EditOperation {
+                file_path: "a.rs".to_string(),
+                full_path: target.clone(),
+                old_text: "x".to_string(),
+                new_text: "y".to_string(),
+            },
+            EditOperation {
+                file_path: "a.rs".to_string(),
+                full_path: target.clone(),
+                old_text: "y".to_string(),
+                new_text: "z".to_string(),
+            },
+        ];
+        assert!(honor_symlink_targets(&mut ops).is_none());
+        let real = std::fs::canonicalize(&target).unwrap();
+        assert!(ops.iter().all(|op| op.full_path == real));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn honor_symlink_targets_rejects_distinct_paths_to_one_file() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let real = tmp.path().join("real.rs");
+        let link = tmp.path().join("link.rs");
+        std::fs::write(&real, "x").unwrap();
+        symlink(&real, &link).unwrap();
+        let mut ops = vec![
+            EditOperation {
+                file_path: "real.rs".to_string(),
+                full_path: real,
+                old_text: "x".to_string(),
+                new_text: "y".to_string(),
+            },
+            EditOperation {
+                file_path: "link.rs".to_string(),
+                full_path: link,
+                old_text: "x".to_string(),
+                new_text: "y".to_string(),
+            },
+        ];
+        let reason = honor_symlink_targets(&mut ops).expect("alias pair aborts");
+        assert!(matches!(reason, AbortReason::Symlink(_)));
+    }
+
     #[tokio::test]
     async fn read_files_missing_is_file_not_found() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1582,6 +1649,27 @@ mod tests {
         );
         // Nothing written.
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "fn one() {}\n");
+    }
+
+    #[tokio::test]
+    async fn unrestricted_batch_applies_repeated_edits_to_one_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let f = tmp.path().join("a.rs");
+        std::fs::write(&f, "fn one() {}\nfn two() {}\n").unwrap();
+        let tool = MultiEditTool;
+        let ctx = ctx_with_policy(tmp.path(), ResolvePolicy::Unrestricted);
+        let input = json!({
+            "edits": [
+                edit("a.rs", "fn one()", "fn uno()"),
+                edit("a.rs", "fn two()", "fn dos()"),
+            ]
+        });
+        let out = tool.call(input, &ctx).await.unwrap();
+        assert!(!out.is_error, "{}", out.text_content());
+        assert_eq!(
+            std::fs::read_to_string(&f).unwrap(),
+            "fn uno() {}\nfn dos() {}\n"
+        );
     }
 
     #[cfg(unix)]

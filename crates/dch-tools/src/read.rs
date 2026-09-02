@@ -613,6 +613,53 @@ mod tests {
         assert_eq!(unrestricted.text_content(), "s3cret\n");
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn read_capped_rejects_a_swapped_parent_directory_when_contained() {
+        // The read-path analogue of the write swap test: the path handed to
+        // `read_capped` was validated before `dir` was swapped for a symlink
+        // out of the workspace; the handle verification must catch it.
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, "outside\n").unwrap();
+        let dir = workspace.path().join("dir");
+        symlink(outside.path(), &dir).unwrap();
+
+        let err = read_capped(
+            &dir.join("secret.txt"),
+            workspace.path(),
+            ResolvePolicy::Contained,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("escaped"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_capped_follows_a_swapped_parent_directory_when_unrestricted() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, "outside\n").unwrap();
+        let dir = workspace.path().join("dir");
+        symlink(outside.path(), &dir).unwrap();
+
+        let bytes = read_capped(
+            &dir.join("secret.txt"),
+            workspace.path(),
+            ResolvePolicy::Unrestricted,
+        )
+        .await
+        .unwrap();
+        assert_eq!(bytes, b"outside\n");
+    }
+
     #[tokio::test]
     async fn test_read_small_file_returns_content() {
         let tmp = tempfile::TempDir::new().unwrap();

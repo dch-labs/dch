@@ -20,6 +20,7 @@ use crate::diff::format_file_change;
 use crate::linter::LinterResult;
 use crate::linter::lint_content;
 use crate::util::ResolvePolicy;
+use crate::util::canonicalize_existing;
 use crate::util::reject_url;
 use crate::util::resolve_path;
 
@@ -111,7 +112,10 @@ impl WriteInput {
             .get("skip_linter")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let full_path = resolve_path(file_path, &cwd, policy)?;
+        let mut full_path = resolve_path(file_path, &cwd, policy)?;
+        if policy == ResolvePolicy::Unrestricted {
+            full_path = canonicalize_existing(&full_path);
+        }
 
         if !skip_linter {
             let result = lint_content(&full_path, content);
@@ -487,6 +491,41 @@ mod tests {
             "original",
             "external target must be untouched"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unrestricted_write_to_a_symlink_updates_the_referent_and_keeps_the_link() {
+        // Unrestricted writes honor symbolic links: the content lands on the
+        // real file and the link entry survives as a link.
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let real = tmp.path().join("real.rs");
+        let link = tmp.path().join("link.rs");
+        std::fs::write(&real, "fn old() {}\n").unwrap();
+        symlink(&real, &link).unwrap();
+
+        let mut ctx = ToolContext::default();
+        ctx.cwd = tmp.path().to_string_lossy().into_owned();
+        ctx.set_extension(
+            RunnerContext::new(tmp.path().to_path_buf())
+                .with_resolve_policy(ResolvePolicy::Unrestricted),
+        );
+        let tool = WriteInput::default();
+        let input = json!({
+            "file_path": "link.rs",
+            "content": "fn new() {}\n"
+        });
+        let out = tool.call(input, &ctx).await.unwrap();
+        assert!(!out.is_error, "{}", out.text_content());
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link must survive the write"
+        );
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "fn new() {}\n");
     }
 
     /// Drives a real Read (which records the content baseline on the shared

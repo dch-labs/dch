@@ -177,6 +177,17 @@ pub fn resolve_path(
     Ok(normalized)
 }
 
+/// Canonicalize `path` when it resolves, returning it unchanged otherwise.
+///
+/// Write-path callers use this under [`ResolvePolicy::Unrestricted`] to
+/// honor symbolic links: an existing target is rewritten to its physical
+/// file so the write lands on the referent and the link stays intact. A
+/// path that does not resolve — a not-yet-existing file — is returned as
+/// given.
+pub(crate) fn canonicalize_existing(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// Verify an opened handle actually resolved inside `workspace` (Linux).
 ///
 /// Closes the check-to-use race the symlink walk cannot: a concurrent
@@ -674,6 +685,16 @@ mod tests {
         // would escape above `/` does not synthesize a phantom parent.
         assert_eq!(normalize_lexical(Path::new("/..")), PathBuf::from("/"));
         assert_eq!(normalize_lexical(Path::new("/a/../..")), PathBuf::from("/"));
+    }
+
+    #[test]
+    fn normalize_lexical_is_idempotent() {
+        // resolve_path re-normalizes already-normalized components in its
+        // symlink walk; the transform must be a fixed point.
+        for raw in ["./a/../b.rs", "/work/./x/../../y", "a/b/../..", "/"] {
+            let once = normalize_lexical(Path::new(raw));
+            assert_eq!(normalize_lexical(&once), once, "{raw}");
+        }
     }
 
     #[test]

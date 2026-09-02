@@ -25,6 +25,7 @@ use crate::diff::format_file_change;
 use crate::linter::LinterResult;
 use crate::linter::lint_content;
 use crate::util::ResolvePolicy;
+use crate::util::canonicalize_existing;
 use crate::util::reject_url;
 use crate::util::resolve_path;
 use crate::write::format_lint_failure;
@@ -114,7 +115,10 @@ impl EditInput {
         };
         let cwd = require_cwd(rc.clone())?;
         let parsed = parse_input(&input)?;
-        let full_path = resolve_path(parsed.file_path, &cwd, policy)?;
+        let mut full_path = resolve_path(parsed.file_path, &cwd, policy)?;
+        if policy == ResolvePolicy::Unrestricted {
+            full_path = canonicalize_existing(&full_path);
+        }
         let old_content = read_existing(&full_path, parsed.file_path, &cwd, policy).await?;
         let new_content = match apply_edit(&old_content, parsed.old_text, parsed.new_text) {
             Ok(c) => c,
@@ -973,5 +977,40 @@ mod tests {
             "fn main() { println!(\"bye\"); }\n",
             "the edit must apply when the re-read matches the baseline"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unrestricted_edit_through_a_symlink_updates_the_referent_and_keeps_the_link() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let real = tmp.path().join("real.rs");
+        let link = tmp.path().join("link.rs");
+        std::fs::write(&real, "fn one() {}\n").unwrap();
+        symlink(&real, &link).unwrap();
+
+        let mut ctx = ToolContext::default();
+        ctx.cwd = tmp.path().to_string_lossy().into_owned();
+        ctx.set_extension(
+            RunnerContext::new(tmp.path().to_path_buf())
+                .with_resolve_policy(ResolvePolicy::Unrestricted),
+        );
+        let tool = EditInput::default();
+        let input = json!({
+            "file_path": "link.rs",
+            "old_text": "fn one()",
+            "new_text": "fn uno()"
+        });
+        let out = tool.call(input, &ctx).await.unwrap();
+        assert!(!out.is_error, "{}", out.text_content());
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link must survive the edit"
+        );
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "fn uno() {}\n");
     }
 }
