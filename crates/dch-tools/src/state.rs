@@ -112,6 +112,60 @@ pub(crate) fn baseline(baselines: &FileBaselines, path: &Path) -> Option<u64> {
     baselines.get(path).map(|baseline| baseline.hash)
 }
 
+/// The model's latest known content per live file identity (unix device and
+/// inode).
+///
+/// The unrestricted policy's second index over the same observations: keys
+/// by path cannot unify aliases that canonicalization cannot see — two hard
+/// links to one file are two equally canonical spellings — so the recorded
+/// file's stat identity is kept alongside the path key, and a lookup stats
+/// the target to find the baseline whichever spelling arrives. Kept in step
+/// with [`FileBaselines`] by the same record calls.
+///
+/// Residual, mirroring the `TargetIdentity` field docs on the rename gate:
+/// an externally deleted-and-recreated file that reclaims the recorded
+/// device-inode pair reads as an identity match, arming a staleness guard
+/// for a file the model never touched. The direction is safe — a false
+/// *refusal*, recovered by re-reading, never a false pass — because the
+/// identity index is consulted only after a path-key miss, so it can arm
+/// guards but never weaken the path-keyed ones.
+pub type FileIdentities = BTreeMap<(u64, u64), FileBaseline>;
+
+/// Record an observation as the model's latest known state of the file
+/// `identity` names.
+///
+/// Mirrors [`record`]'s newest-observation-wins semantics with one entry
+/// per live identity: a later observation of the same file through any
+/// spelling supersedes the earlier one, so the entry always reflects the
+/// newest content the model is known to have produced for that file,
+/// however it is spelled. Called alongside [`record`] by the unrestricted
+/// policy's record path.
+pub(crate) fn record_identity(
+    identities: &mut FileIdentities,
+    identity: (u64, u64),
+    baseline: FileBaseline,
+) {
+    match identities.get(&identity) {
+        Some(existing) if existing.observed > baseline.observed => return,
+        _ => {}
+    }
+    identities.insert(identity, baseline);
+}
+
+/// The content hash recorded for the file `identity` names, if any.
+///
+/// The identity-side counterpart of [`baseline`]: alias spellings of one
+/// live file — hard links included — stat to the same device-inode pair,
+/// so whichever spelling asks, the pair resolves to the newest observation
+/// recorded for that file. `None` means no observation exists under this
+/// identity and the caller falls back to the no-baseline rule.
+///
+/// Written by [`record_identity`]; consulted under the unrestricted policy
+/// when the path key misses.
+pub(crate) fn baseline_identity(identities: &FileIdentities, identity: (u64, u64)) -> Option<u64> {
+    identities.get(&identity).map(|baseline| baseline.hash)
+}
+
 #[cfg(test)]
 #[allow(
     clippy::expect_used,

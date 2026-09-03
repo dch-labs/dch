@@ -583,16 +583,16 @@ fn open_dir_fd(path: &Path, flags: i32) -> Result<i32, ToolError> {
 /// One component per call is what makes the bounded walk sound: with
 /// `O_NOFOLLOW`, `O_DIRECTORY`, and `O_CLOEXEC` set, a component can only
 /// resolve to a real directory descriptor, and a symbolic link fails
-/// instead of being traversed. With `O_DIRECTORY` in the mix the kernel
-/// reports that failure as a generic not-a-directory rather than a loop
-/// error, which is why the caller confirms the link case through
+/// instead of being traversed. The failure kind is not distinguishable by
+/// [`std::io::ErrorKind`] alone (a loop error versus not-a-directory),
+/// which is why the caller confirms the link case through
 /// [`is_symlink_entry`].
 ///
 /// # Errors
 ///
-/// Returns the OS error when the entry cannot be opened as a directory —
-/// including the not-a-directory or loop failure a symbolic-link component
-/// produces under `O_NOFOLLOW`.
+/// Returns the OS error when the entry cannot be opened as a directory,
+/// including the failure a symbolic-link component produces under
+/// `O_NOFOLLOW`.
 #[cfg(target_os = "linux")]
 fn openat_dir(dir: i32, name: &std::ffi::CString) -> std::io::Result<i32> {
     // SAFETY: `dir` is a valid open descriptor and `name` outlives the call;

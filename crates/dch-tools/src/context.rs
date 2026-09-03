@@ -79,6 +79,24 @@ pub struct RunnerContext {
     /// so every spelling of a file meets at one key.
     pub file_baselines: Arc<Mutex<FileBaselines>>,
 
+    /// The model's latest known content per live file identity (unix
+    /// device and inode).
+    ///
+    /// The unrestricted policy's second baseline index (see
+    /// [`FileIdentities`](crate::state::FileIdentities)): path keys cannot
+    /// unify aliases that canonicalization cannot see — two hard links to
+    /// one file are two equally canonical spellings — so records and
+    /// lookups carry the file's stat identity alongside the path, and the
+    /// staleness guard holds whichever spelling of a file arrives. Only
+    /// populated and consulted under [`ResolvePolicy::Unrestricted`];
+    /// contained keys are the lexical resolution output by design. Cloning
+    /// [`RunnerContext`] shares the same map. Residual, mirroring the
+    /// `TargetIdentity` field docs: a delete-and-recreate that reclaims the
+    /// recorded device-inode pair arms a guard for a file the model never
+    /// touched — a false refusal, never a false pass, since the index is
+    /// consulted only after a path-key miss.
+    pub file_identities: Arc<Mutex<crate::state::FileIdentities>>,
+
     /// Whether file tools confine paths to [`cwd`](Self::cwd).
     ///
     /// [`ResolvePolicy::Contained`] (the default) rejects paths that escape
@@ -110,6 +128,7 @@ impl RunnerContext {
             todos: Arc::new(Mutex::new(Vec::new())),
             question_tx: Arc::new(Mutex::new(None)),
             file_baselines: Arc::new(Mutex::new(FileBaselines::default())),
+            file_identities: Arc::new(Mutex::new(crate::state::FileIdentities::default())),
             resolve_policy: ResolvePolicy::default(),
         }
     }
@@ -137,6 +156,15 @@ impl RunnerContext {
     /// out of order is discarded).
     pub(crate) fn record_baseline(&self, path: &Path, baseline: crate::state::FileBaseline) {
         let key = self.baseline_map_key(path);
+        if self.resolve_policy == ResolvePolicy::Unrestricted
+            && let Some(identity) = identity_of(path)
+        {
+            let mut identities = self
+                .file_identities
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            crate::state::record_identity(&mut identities, identity, baseline);
+        }
         let mut baselines = self
             .file_baselines
             .lock()
@@ -156,7 +184,17 @@ impl RunnerContext {
             .file_baselines
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        crate::state::baseline(&baselines, &key)
+        let by_path = crate::state::baseline(&baselines, &key);
+        drop(baselines);
+        if by_path.is_some() || self.resolve_policy != ResolvePolicy::Unrestricted {
+            return by_path;
+        }
+        let identity = identity_of(path)?;
+        let identities = self
+            .file_identities
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::state::baseline_identity(&identities, identity)
     }
 
     /// The baseline map key for `path`, per the run's resolve policy.
@@ -179,6 +217,41 @@ impl RunnerContext {
     }
 }
 
+/// The stat identity (device, inode) of the file `path` reaches, if the
+/// platform exposes one and the file exists.
+///
+/// The stat follows symbolic links, so the identity is the referent's —
+/// hard-link aliases, which canonicalization cannot unify, stat to the
+/// same pair and share one baseline. `None` covers the two cases where no
+/// identity can be recorded and callers fall back to path keys alone: the
+/// path does not resolve (nothing exists to guard yet), and the record
+/// side simply skips the identity index while the lookup side reports a
+/// miss.
+///
+/// Used by [`RunnerContext::record_baseline`] and
+/// [`RunnerContext::baseline_for`](Self::baseline_for) under the
+/// unrestricted policy only.
+#[cfg(unix)]
+fn identity_of(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.dev(), meta.ino()))
+}
+
+/// The identity of the file `path` reaches, on a platform without a stable
+/// stat identity.
+///
+/// Always `None`: there is nothing to key the identity index with, so
+/// records and lookups degrade to path keys alone and the hard-link alias
+/// guard is absent — consistent with this platform's other degraded
+/// checks, which fail closed where containment is at stake and merely
+/// narrow protection where it is not.
+#[cfg(not(unix))]
+fn identity_of(path: &Path) -> Option<(u64, u64)> {
+    let _ = path;
+    None
+}
+
 impl fmt::Debug for RunnerContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let has_channel = self
@@ -191,11 +264,17 @@ impl fmt::Debug for RunnerContext {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .len();
+        let identities = self
+            .file_identities
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
         f.debug_struct("RunnerContext")
             .field("cwd", &self.cwd)
             .field("todos", &self.todos)
             .field("question_tx", &has_channel)
             .field("file_baselines", &baselines)
+            .field("file_identities", &identities)
             .field("resolve_policy", &self.resolve_policy)
             .finish()
     }

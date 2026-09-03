@@ -97,7 +97,9 @@ pub fn reject_url(tool: &str, path: &str) -> Result<(), ToolError> {
 pub enum ResolvePolicy {
     /// Reject paths that escape the working directory, both lexically and
     /// through symlinks. The default, so every caller that does not name a
-    /// policy gets containment.
+    /// policy gets containment. On platforms where post-open verification
+    /// is unavailable, contained file operations fail closed — only the
+    /// read-only walk tools keep working there.
     #[default]
     Contained,
 
@@ -120,8 +122,11 @@ pub enum ResolvePolicy {
 /// inside the workspace, checked in two layers:
 ///
 /// 1. **Lexical containment** — the normalized result must start with
-///    `cwd`'s components. Rejects `..` traversal and unrelated absolute
-///    paths.
+///    `cwd`'s components or with the workspace's resolved form: both
+///    spellings name the same workspace, and the resolved one is what
+///    handle-verification and containment error messages print, so a model
+///    echoing it back must not be rejected. Rejects `..` traversal and
+///    unrelated absolute paths.
 /// 2. **Symlink containment** — the workspace's *resolved* form is taken
 ///    as the anchor (the operator-supplied spelling may itself cross
 ///    symlinks; that choice is not judged), and each *existing* component
@@ -147,9 +152,12 @@ pub enum ResolvePolicy {
 /// than proceed unverified; only the directory-walk tools keep the window,
 /// which needs descriptor-relative, `O_NOFOLLOW` opens to close. One
 /// accepted exception: the staleness re-read inside the conflict check
-/// opens the target by path to compare bytes, without a handle check — a
-/// swap there can only skew a hash comparison, which the write's
-/// pre-rename identity gate then catches.
+/// opens the target by path to compare bytes, without a handle check. A
+/// swap there changes which file the baseline is compared against; the
+/// compared bytes are still held against the recorded baseline (only a
+/// hash collision passes), the identity gate then pins the rename to
+/// exactly the compared entry, and under Contained the no-follow walk
+/// refuses a swapped link component anyway.
 ///
 /// # Errors
 ///
@@ -176,7 +184,8 @@ pub fn resolve_path(
         ResolvePolicy::Contained => {}
     }
     let base = normalize_lexical(cwd);
-    if !lexically_inside(&normalized, &base) {
+    let base_canonical = std::fs::canonicalize(cwd).unwrap_or_else(|_| base.clone());
+    if !lexically_inside(&normalized, &base) && !lexically_inside(&normalized, &base_canonical) {
         return Err(ToolError::InvalidInput(format!(
             "Path escapes the working directory: {file_path}"
         )));
@@ -184,7 +193,6 @@ pub fn resolve_path(
     // The workspace's own spelling is the operator's anchor choice and may
     // cross symlinks; the containment walk judges only what is below it,
     // against the workspace's resolved form.
-    let base_canonical = std::fs::canonicalize(cwd).unwrap_or_else(|_| base.clone());
     let mut visited = Vec::new();
     verify_symlinks_inside(&normalized, &base, &base_canonical, 0, &mut visited)?;
     Ok(normalized)
@@ -342,8 +350,8 @@ const MAX_SYMLINK_DEPTH: usize = 40;
 
 /// Walk the *existing* prefix of `resolved` and reject any symlink whose target chain leaves the workspace.
 ///
-/// `resolved` is assumed already lexically contained in `base_lex` (the
-/// caller's responsibility), and `base_canonical` is the workspace's
+/// `resolved` is assumed already lexically contained in `base_lex` or in
+/// `base_canonical` (the caller's responsibility), and `base_canonical` is the workspace's
 /// resolved form — `base_lex` may itself spell the workspace through
 /// symlinks, which is the operator's anchor choice and is not traversed or
 /// judged. Only the components *below* the anchor are probed, by path —
@@ -373,7 +381,10 @@ fn verify_symlinks_inside(
     depth: usize,
     visited: &mut Vec<PathBuf>,
 ) -> Result<(), ToolError> {
-    let relative = resolved.strip_prefix(base_lex).unwrap_or(resolved);
+    let relative = resolved
+        .strip_prefix(base_lex)
+        .or_else(|_| resolved.strip_prefix(base_canonical))
+        .unwrap_or(resolved);
     let mut acc = base_canonical.to_path_buf();
     for comp in relative.components() {
         acc.push(comp.as_os_str());
@@ -882,6 +893,24 @@ mod tests {
         assert_eq!(existing, link.join("src").join("a.rs"));
         let new_file = resolve_path("src/new.rs", &link, ResolvePolicy::Contained).unwrap();
         assert_eq!(new_file, link.join("src").join("new.rs"));
+
+        // The physical spelling is accepted too: it is what containment and
+        // handle-verification error messages print, so a model echoing it
+        // back must not trip the lexical gate.
+        let physical = real.path().join("src").join("a.rs");
+        assert_eq!(
+            resolve_path(physical.to_str().unwrap(), &link, ResolvePolicy::Contained).unwrap(),
+            physical
+        );
+        assert_eq!(
+            resolve_path(
+                real.path().join("src").join("new.rs").to_str().unwrap(),
+                &link,
+                ResolvePolicy::Contained
+            )
+            .unwrap(),
+            real.path().join("src").join("new.rs")
+        );
     }
 
     #[cfg(unix)]

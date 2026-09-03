@@ -764,6 +764,49 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unrestricted_write_guard_tracks_a_new_file_across_a_hard_link_alias() {
+        // Hard links are the alias canonicalization cannot unify: both
+        // directory entries are equally canonical, so the path-keyed
+        // baseline recorded for the first write is invisible to the second.
+        // The identity side of the map (device + inode) must carry the
+        // guard across — an external change through the alias refuses the
+        // write instead of silently clobbering it.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut ctx = ToolContext::default();
+        ctx.cwd = tmp.path().to_string_lossy().into_owned();
+        ctx.set_extension(
+            RunnerContext::new(tmp.path().to_path_buf())
+                .with_resolve_policy(ResolvePolicy::Unrestricted),
+        );
+        let tool = WriteInput::default();
+        let out = tool
+            .call(json!({ "file_path": "real.txt", "content": "v1\\n" }), &ctx)
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.text_content());
+
+        std::fs::hard_link(tmp.path().join("real.txt"), tmp.path().join("hard.txt")).unwrap();
+        std::fs::write(tmp.path().join("hard.txt"), "EXTERNAL\\n").unwrap();
+
+        let out = tool
+            .call(json!({ "file_path": "hard.txt", "content": "v2\\n" }), &ctx)
+            .await
+            .unwrap();
+        assert!(out.is_error, "{}", out.text_content());
+        assert!(
+            out.text_content().contains("changed on disk"),
+            "{}",
+            out.text_content()
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("real.txt")).unwrap(),
+            "EXTERNAL\\n",
+            "the refused write must not clobber the external content"
+        );
+    }
+
     #[tokio::test]
     async fn unrestricted_write_reaches_outside_the_workspace() {
         // The headline promise of the opt-out: an unrestricted write lands

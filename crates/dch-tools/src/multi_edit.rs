@@ -513,10 +513,20 @@ async fn read_files(
 /// faults that the model cannot simply retry around.
 #[derive(Debug)]
 enum AbortReason {
-    /// One edit's target is a symbolic link (named in the message).
+    /// A target, or an in-workspace parent directory, is a symbolic link
+    /// (named in the message).
     ///
-    /// Produced by [`symlink_check`], before any file is written.
+    /// Produced by [`symlink_check`] under the contained policy, before
+    /// any file is written: resolve the link and pass the real path.
     Symlink(String),
+
+    /// Two edits' caller-supplied paths resolve to one physical file (all
+    /// named in the message).
+    ///
+    /// Produced by [`honor_symlink_targets`] under the unrestricted
+    /// policy: each alias would merge independently against the same
+    /// original, and the second write would silently clobber the first.
+    Alias(String),
 
     /// Two edits resolve to the same physical file under different path aliases.
     ///
@@ -549,6 +559,7 @@ impl AbortReason {
     fn into_output(self) -> ToolOutput {
         match self {
             AbortReason::Symlink(msg)
+            | AbortReason::Alias(msg)
             | AbortReason::DupPath(msg)
             | AbortReason::Locate(msg)
             | AbortReason::Overlap(msg)
@@ -653,7 +664,7 @@ fn honor_symlink_targets(
         let real = canonicalize_existing(&op.full_path)?;
         match physical.entry(real.clone()) {
             Entry::Occupied(existing) if existing.get() != &op.file_path => {
-                return Ok(Some(AbortReason::Symlink(format!(
+                return Ok(Some(AbortReason::Alias(format!(
                     "Refusing to write: '{}' and '{}' are the same file ({}). \
                      Combine them into one set of edits.",
                     existing.get(),
@@ -1312,7 +1323,7 @@ mod tests {
         let reason = honor_symlink_targets(&mut ops)
             .unwrap()
             .expect("alias pair aborts");
-        assert!(matches!(reason, AbortReason::Symlink(_)));
+        assert!(matches!(reason, AbortReason::Alias(_)));
     }
 
     #[cfg(unix)]
