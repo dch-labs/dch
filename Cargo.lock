@@ -600,6 +600,7 @@ dependencies = [
  "loopctl",
  "lru 0.18.2",
  "regex",
+ "same-file",
  "serde",
  "serde_json",
  "serde_yaml",

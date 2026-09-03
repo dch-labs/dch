@@ -20,6 +20,7 @@ use serde_json::Value;
 use crate::context::RunnerContext;
 use crate::context::require_cwd;
 use crate::context::runner_ctx;
+use crate::util::ResolvePolicy;
 use crate::util::reject_url;
 use crate::util::resolve_path;
 use crate::walk::WalkEntry;
@@ -109,6 +110,10 @@ impl TreeInput {
         input: Value,
         rc: Option<RunnerContext>,
     ) -> Result<ToolOutput, ToolError> {
+        let policy = match rc.as_ref() {
+            Some(context) => context.resolve_policy,
+            None => ResolvePolicy::Contained,
+        };
         let cwd = require_cwd(rc)?;
 
         let base_path = input.get("path").and_then(Value::as_str).unwrap_or(".");
@@ -125,7 +130,7 @@ impl TreeInput {
             .and_then(Value::as_bool)
             .unwrap_or(true);
         let pattern = input.get("pattern").and_then(Value::as_str);
-        let full_path = resolve_path(base_path, &cwd)?;
+        let full_path = resolve_path(base_path, &cwd, policy)?;
 
         if !tokio::fs::try_exists(&full_path)
             .await

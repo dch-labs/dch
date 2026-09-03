@@ -73,17 +73,9 @@ pub struct Args {
     #[arg(long, short = 'm', value_name = "MODEL", help_heading = "Display")]
     pub model: Option<String>,
 
-    /// Path to an alternate config file (overrides the default `~/.dch`
-    /// config lookup). Points at a file, not a directory, and is kept
-    /// exactly as given — relative paths resolve against the process's
-    /// current directory when the file is loaded.
-    #[arg(
-        long = "config",
-        value_name = "PATH",
-        value_parser = clap::value_parser!(PathBuf),
-        help_heading = "Config"
-    )]
-    pub config_path: Option<PathBuf>,
+    /// Config-facing switches, flattened into [`Args`].
+    #[command(flatten)]
+    pub config: ConfigArgs,
 
     /// Increase verbosity.
     ///
@@ -111,6 +103,38 @@ pub struct Args {
         help_heading = "Mode"
     )]
     pub done_file: Option<PathBuf>,
+}
+
+/// The config-facing switches, flattened into [`Args`].
+///
+/// One group so the top-level struct stays a small bag of mode flags; the
+/// individual flags keep their own help headings and docs.
+#[derive(Debug, Clone, Parser)]
+pub struct ConfigArgs {
+    /// Path to an alternate config file (overrides the default `~/.dch`
+    /// config lookup). Points at a file, not a directory, and is kept
+    /// exactly as given — relative paths resolve against the process's
+    /// current directory when the file is loaded.
+    #[arg(
+        long = "config",
+        value_name = "PATH",
+        value_parser = clap::value_parser!(PathBuf),
+        help_heading = "Config"
+    )]
+    pub config_path: Option<PathBuf>,
+
+    /// Let file tools reach paths outside the working directory for this
+    /// run.
+    ///
+    /// Forces `[runner] unsafe_paths` on, overriding a `false` (or absent)
+    /// config value; the flag cannot revoke a config-level opt-out. File
+    /// tools can then read, write, and scan system paths (`/etc/nginx`,
+    /// `/home/you/.ssh`, `/var/log`); paths are used verbatim and `~` is
+    /// not expanded — use it when the task reaches outside the project
+    /// directory. The default keeps every file tool confined to the working
+    /// directory.
+    #[arg(long, help_heading = "Config")]
+    pub unsafe_paths: bool,
 }
 
 /// Parse the process's command-line arguments into [`Args`].
@@ -147,7 +171,8 @@ mod tests {
         assert!(!args.list_sessions);
         assert_eq!(args.theme, None);
         assert_eq!(args.model, None);
-        assert_eq!(args.config_path, None);
+        assert_eq!(args.config.config_path, None);
+        assert!(!args.config.unsafe_paths);
         assert!(!args.verbose);
         assert!(!args.quiet);
         assert_eq!(args.done_file, None);
@@ -197,7 +222,13 @@ mod tests {
     #[test]
     fn config_path_is_kept_relative_and_uncanonicalized() {
         let args = parse(&["--config", "./x.toml"]).unwrap();
-        assert_eq!(args.config_path, Some(PathBuf::from("./x.toml")));
+        assert_eq!(args.config.config_path, Some(PathBuf::from("./x.toml")));
+    }
+
+    #[test]
+    fn unsafe_paths_flag_parses_and_defaults_absent() {
+        assert!(!parse(&[]).unwrap().config.unsafe_paths);
+        assert!(parse(&["--unsafe-paths"]).unwrap().config.unsafe_paths);
     }
 
     #[test]
@@ -279,6 +310,7 @@ mod tests {
             "--theme",
             "--model",
             "--config",
+            "--unsafe-paths",
             "--verbose",
             "--quiet",
             "--done-file",

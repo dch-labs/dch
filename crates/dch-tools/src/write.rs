@@ -11,6 +11,7 @@ use loopctl::tool::ToolOutput;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
+use tokio::io::AsyncReadExt;
 
 use crate::context::RunnerContext;
 use crate::context::require_cwd;
@@ -18,6 +19,8 @@ use crate::context::runner_ctx;
 use crate::diff::format_file_change;
 use crate::linter::LinterResult;
 use crate::linter::lint_content;
+use crate::util::ResolvePolicy;
+use crate::util::canonicalize_existing;
 use crate::util::reject_url;
 use crate::util::resolve_path;
 
@@ -78,19 +81,29 @@ impl WriteInput {
     /// Orchestrates validate → lint → staleness check → write. When the path
     /// has a recorded baseline (a prior Read this session), content that
     /// differs from the recorded hash refuses the write as a soft conflict;
-    /// a successful write refreshes the recorded baseline, so the model's
-    /// own write never registers as a later external change.
+    /// the compared file's identity is pinned and re-checked at the rename,
+    /// so a target swapped in between aborts instead of replacing an
+    /// uncompared file. Under the contained policy, missing parent
+    /// directories are created through a walk that never follows symbolic
+    /// links. A successful write refreshes the recorded baseline, so the
+    /// model's own write never registers as a later external change.
     ///
     /// # Errors
     ///
     /// Returns [`ToolError`] for a missing `RunnerContext`, a missing
     /// `file_path`, a missing `content`, a URL `file_path` or a path escaping
-    /// the working directory, or a file-system error during the atomic write.
+    /// the working directory, a target that changed while the write was
+    /// being prepared, or a file-system error during parent creation or the
+    /// atomic write.
     async fn write_inner(
         &self,
         input: Value,
         rc: Option<RunnerContext>,
     ) -> Result<ToolOutput, ToolError> {
+        let policy = match rc.as_ref() {
+            Some(context) => context.resolve_policy,
+            None => ResolvePolicy::Contained,
+        };
         let cwd = require_cwd(rc.clone())?;
         let file_path = input
             .get("file_path")
@@ -105,7 +118,10 @@ impl WriteInput {
             .get("skip_linter")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let full_path = resolve_path(file_path, &cwd)?;
+        let mut full_path = resolve_path(file_path, &cwd, policy)?;
+        if policy == ResolvePolicy::Unrestricted {
+            full_path = canonicalize_existing(&full_path)?;
+        }
 
         if !skip_linter {
             let result = lint_content(&full_path, content);
@@ -116,25 +132,46 @@ impl WriteInput {
             }
         }
 
-        let old_content = tokio::fs::read_to_string(&full_path).await.ok();
+        let anchor = rc.as_ref().map(|rc| rc.workspace_anchor.as_ref());
+        let old_content = match tokio::fs::File::open(&full_path).await.ok() {
+            Some(mut file) => {
+                if policy == ResolvePolicy::Contained {
+                    crate::util::verify_handle_inside(&file, &cwd, anchor)?;
+                }
+                let mut buffer = String::new();
+                match file.read_to_string(&mut buffer).await {
+                    Ok(_) => Some(buffer),
+                    Err(_) => None,
+                }
+            }
+            None => None,
+        };
 
-        if let Some(baseline_hash) = rc.as_ref().and_then(|rc| rc.baseline_for(&full_path))
-            && let Err(failure) =
-                crate::conflict::check_content_hash_unchanged(baseline_hash, &full_path).await
-        {
-            return match failure {
-                crate::conflict::CheckFailure::Changed => Ok(ToolOutput::error_text(
-                    crate::conflict::changed_message(&full_path),
-                )),
-                crate::conflict::CheckFailure::Fault(e) => Err(e),
-            };
+        let mut expected = None;
+        if let Some(baseline_hash) = rc.as_ref().and_then(|rc| rc.baseline_for(&full_path)) {
+            match crate::conflict::check_content_hash_unchanged(baseline_hash, &full_path).await {
+                Ok(identity) => expected = Some(identity),
+                Err(failure) => {
+                    return match failure {
+                        crate::conflict::CheckFailure::Changed => Ok(ToolOutput::error_text(
+                            crate::conflict::changed_message(&full_path),
+                        )),
+                        crate::conflict::CheckFailure::Fault(e) => Err(e),
+                    };
+                }
+            }
         }
 
-        if let Some(parent) = full_path.parent() {
+        // The contained write creates its parents through the pinned,
+        // no-follow walk inside `atomic_write`; the unrestricted policy
+        // keeps the plain path-based creation.
+        if policy == ResolvePolicy::Unrestricted
+            && let Some(parent) = full_path.parent()
+        {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        crate::fs::atomic_write(&full_path, content)?;
+        crate::fs::atomic_write(&full_path, content, &cwd, policy, expected.as_ref(), anchor)?;
 
         if let Some(rc) = &rc {
             rc.record_baseline(&full_path, crate::state::observe_bytes(content.as_bytes()));
@@ -252,7 +289,7 @@ mod tests {
         assert!(out.text_content().contains("Changed: existing.rs"));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn write_preserves_existing_permissions() {
         use std::os::unix::fs::PermissionsExt;
@@ -438,6 +475,216 @@ mod tests {
         assert_eq!(required.len(), 2);
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn contained_write_pins_the_workspace_anchor_against_a_later_swap() {
+        // The workspace anchor descriptor is pinned when the context is
+        // constructed — the anchor symlink resolved to `real` at that
+        // moment. Swapping the symlink to `outside` afterwards cannot
+        // redirect the pinned walk: the write lands in the workspace the
+        // anchor resolved to, and the swapped-in directory stays untouched.
+        use std::os::unix::fs::symlink;
+
+        let real = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let anchor_link = workspace.path().join("project");
+        symlink(real.path(), &anchor_link).unwrap();
+
+        let ctx = ctx_in(anchor_link.to_str().unwrap());
+        std::fs::remove_file(&anchor_link).unwrap();
+        symlink(outside.path(), &anchor_link).unwrap();
+
+        let tool = WriteInput::default();
+        let input = json!({
+            "file_path": anchor_link.join("landed.rs").to_str().unwrap(),
+            "content": "fn main() {}\n"
+        });
+        let out = tool.call(input, &ctx).await.unwrap();
+        assert!(!out.is_error, "{}", out.text_content());
+        assert_eq!(
+            std::fs::read_to_string(real.path().join("landed.rs")).unwrap(),
+            "fn main() {}\n",
+            "the write must land where the anchor resolved at pin time"
+        );
+        assert!(
+            !outside.path().join("landed.rs").exists(),
+            "the swapped-in directory must stay untouched"
+        );
+
+        // A second write reuses the same pinned descriptor — it must not
+        // have been consumed by the first walk.
+        let out = tool
+            .call(
+                json!({ "file_path": anchor_link.join("again.rs"), "content": "fn sec() {}\n" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.text_content());
+        assert_eq!(
+            std::fs::read_to_string(real.path().join("again.rs")).unwrap(),
+            "fn sec() {}\n"
+        );
+        assert!(!outside.path().join("again.rs").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn contained_write_refuses_an_anchor_swap_during_the_old_content_read() {
+        // The write's old-content read is judged against the pinned root:
+        // after the anchor symlink is swapped, opening the target resolves
+        // outside the pinned workspace and the write must refuse — the
+        // model addressed a file the configuration never validated.
+        use std::os::unix::fs::symlink;
+
+        let real = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let anchor_link = workspace.path().join("project");
+        symlink(real.path(), &anchor_link).unwrap();
+        std::fs::write(real.path().join("data.txt"), "PINNED\n").unwrap();
+        std::fs::write(outside.path().join("data.txt"), "OUTSIDE\n").unwrap();
+
+        let ctx = ctx_in(anchor_link.to_str().unwrap());
+        std::fs::remove_file(&anchor_link).unwrap();
+        symlink(outside.path(), &anchor_link).unwrap();
+
+        let tool = WriteInput::default();
+        let input = json!({
+            "file_path": anchor_link.join("data.txt").to_str().unwrap(),
+            "content": "REPLACED\n"
+        });
+        let err = tool.call(input, &ctx).await.unwrap_err();
+        assert!(
+            err.to_string().contains("escaped"),
+            "the post-swap location must be rejected: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(real.path().join("data.txt")).unwrap(),
+            "PINNED\n",
+            "the pinned workspace's file must be untouched"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("data.txt")).unwrap(),
+            "OUTSIDE\n",
+            "the swapped-in file must be untouched"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_unpinnable_workspace_fails_contained_operations_after_a_later_swap() {
+        // The construction-time fail-open, pinned shut: a workspace that
+        // cannot be opened when the context is constructed leaves the
+        // anchor empty, and contained operations must refuse — not lazily
+        // pin whatever the workspace spelling resolves to once it exists
+        // again, which here is the attacker's directory.
+        use std::os::unix::fs::symlink;
+
+        let base = tempfile::TempDir::new().unwrap();
+        let attacker = tempfile::TempDir::new().unwrap();
+        std::fs::write(attacker.path().join("t.txt"), "ATTACKER\n").unwrap();
+        let workspace = base.path().join("vanished");
+
+        let ctx = ctx_in(workspace.to_str().unwrap());
+        symlink(attacker.path(), &workspace).unwrap();
+
+        let tool = WriteInput::default();
+        let err = tool
+            .call(
+                json!({
+                    "file_path": workspace.join("t.txt").to_str().unwrap(),
+                    "content": "REPLACED\n"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("could not be opened"),
+            "the unpinned anchor must fail the write closed: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(attacker.path().join("t.txt")).unwrap(),
+            "ATTACKER\n",
+            "nothing may be written into the swapped-in directory"
+        );
+
+        let reader = crate::read::ReadInput::default();
+        let err = reader
+            .call(
+                json!({ "file_path": workspace.join("t.txt").to_str().unwrap() }),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("could not be opened"),
+            "the unpinned anchor must fail the read closed: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_accepts_the_workspaces_canonical_spelling() {
+        // The resolved spelling passes containment; the pinned walk anchors
+        // at whichever spelling the target uses, so the write lands through
+        // it and the anchor link survives.
+        use std::os::unix::fs::symlink;
+
+        let real = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let anchor_link = workspace.path().join("project");
+        symlink(real.path(), &anchor_link).unwrap();
+
+        let ctx = ctx_in(anchor_link.to_str().unwrap());
+        let tool = WriteInput::default();
+        let input = json!({
+            "file_path": real.path().join("landed.rs").to_str().unwrap(),
+            "content": "fn main() {}\n"
+        });
+        let out = tool.call(input, &ctx).await.unwrap();
+        assert!(!out.is_error, "{}", out.text_content());
+        assert_eq!(
+            std::fs::read_to_string(real.path().join("landed.rs")).unwrap(),
+            "fn main() {}\n"
+        );
+        assert!(
+            std::fs::symlink_metadata(&anchor_link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the anchor link must survive the write"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_accepts_a_dotdot_workspace_spelling() {
+        // The runner anchors the workspace lexically: a `..` in the
+        // spelling is collapsed at construction so the pinned write's
+        // prefix matching compares against the resolved form — the write
+        // lands in the real workspace instead of failing with a misleading
+        // "not inside" error.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let spelling = format!("{}/sub/..", tmp.path().to_str().unwrap());
+        let mut ctx = ToolContext::default();
+        ctx.cwd = spelling.clone();
+        ctx.set_extension(RunnerContext::new(PathBuf::from(spelling)));
+
+        let tool = WriteInput::default();
+        let input = json!({
+            "file_path": "landed.rs",
+            "content": "fn main() {}\n"
+        });
+        let out = tool.call(input, &ctx).await.unwrap();
+        assert!(!out.is_error, "{}", out.text_content());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("landed.rs")).unwrap(),
+            "fn main() {}\n"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn write_through_in_workspace_symlink_to_outside_is_rejected() {
@@ -468,6 +715,401 @@ mod tests {
             std::fs::read_to_string(&real).unwrap(),
             "original",
             "external target must be untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unrestricted_write_to_a_symlink_updates_the_referent_and_keeps_the_link() {
+        // Unrestricted writes honor symbolic links: the content lands on the
+        // real file and the link entry survives as a link.
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let real = tmp.path().join("real.rs");
+        let link = tmp.path().join("link.rs");
+        std::fs::write(&real, "fn old() {}\n").unwrap();
+        symlink(&real, &link).unwrap();
+
+        let mut ctx = ToolContext::default();
+        ctx.cwd = tmp.path().to_string_lossy().into_owned();
+        ctx.set_extension(
+            RunnerContext::new(tmp.path().to_path_buf())
+                .with_resolve_policy(ResolvePolicy::Unrestricted),
+        );
+        let tool = WriteInput::default();
+        let input = json!({
+            "file_path": "link.rs",
+            "content": "fn new() {}\n"
+        });
+        let out = tool.call(input, &ctx).await.unwrap();
+        assert!(!out.is_error, "{}", out.text_content());
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link must survive the write"
+        );
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "fn new() {}\n");
+    }
+
+    #[tokio::test]
+    async fn unrestricted_write_creates_a_new_file() {
+        // A path that does not resolve is not an error: new-file writes
+        // must keep working under the unrestricted policy.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut ctx = ToolContext::default();
+        ctx.cwd = tmp.path().to_string_lossy().into_owned();
+        ctx.set_extension(
+            RunnerContext::new(tmp.path().to_path_buf())
+                .with_resolve_policy(ResolvePolicy::Unrestricted),
+        );
+        let tool = WriteInput::default();
+        let input = json!({
+            "file_path": "fresh.rs",
+            "content": "fn main() {}\n"
+        });
+        let out = tool.call(input, &ctx).await.unwrap();
+        assert!(!out.is_error, "{}", out.text_content());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("fresh.rs")).unwrap(),
+            "fn main() {}\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unrestricted_write_to_an_unresolvable_symlink_fails_without_severing() {
+        // A link whose target cannot be resolved (a loop here) cannot be
+        // honored; the write must fail rather than silently replace the
+        // link entry with a regular file.
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let link = tmp.path().join("loop.rs");
+        symlink(&link, &link).unwrap();
+
+        let mut ctx = ToolContext::default();
+        ctx.cwd = tmp.path().to_string_lossy().into_owned();
+        ctx.set_extension(
+            RunnerContext::new(tmp.path().to_path_buf())
+                .with_resolve_policy(ResolvePolicy::Unrestricted),
+        );
+        let tool = WriteInput::default();
+        let input = json!({
+            "file_path": "loop.rs",
+            "content": "fn main() {}\n"
+        });
+        let err = tool.call(input, &ctx).await.unwrap_err();
+        assert!(err.to_string().contains("cannot resolve"), "{err}");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the unresolvable link must survive the failed write"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unrestricted_write_to_a_dangling_symlink_fails_without_severing() {
+        // A link to a nonexistent file is the reachable sibling of the loop
+        // case: a rename onto the link path would replace the entry instead
+        // of creating the referent, so the write must refuse and leave the
+        // link — and the absent referent — exactly as they were.
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let link = tmp.path().join("dangling.rs");
+        symlink(tmp.path().join("absent.rs"), &link).unwrap();
+
+        let mut ctx = ToolContext::default();
+        ctx.cwd = tmp.path().to_string_lossy().into_owned();
+        ctx.set_extension(
+            RunnerContext::new(tmp.path().to_path_buf())
+                .with_resolve_policy(ResolvePolicy::Unrestricted),
+        );
+        let tool = WriteInput::default();
+        let input = json!({
+            "file_path": "dangling.rs",
+            "content": "fn main() {}\n"
+        });
+        let err = tool.call(input, &ctx).await.unwrap_err();
+        assert!(err.to_string().contains("cannot resolve"), "{err}");
+        assert!(
+            err.to_string().contains("absent.rs"),
+            "the refusal must name the broken target: {err}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the dangling link must survive the failed write"
+        );
+        assert!(
+            !tmp.path().join("absent.rs").exists(),
+            "the refused write must not create the referent"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unrestricted_write_through_a_symlinked_dir_keys_the_baseline_on_the_real_path() {
+        // A new file written through a symlinked directory cannot be
+        // canonicalized before the write (it does not exist yet); once it
+        // exists the post-write baseline must be re-keyed to the physical
+        // path, so a later write through the real spelling still runs the
+        // staleness guard instead of the no-baseline fallback.
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let realdir = tmp.path().join("realdir");
+        std::fs::create_dir(&realdir).unwrap();
+        let linkdir = tmp.path().join("linkdir");
+        symlink(&realdir, &linkdir).unwrap();
+
+        let mut ctx = ToolContext::default();
+        ctx.cwd = tmp.path().to_string_lossy().into_owned();
+        ctx.set_extension(
+            RunnerContext::new(tmp.path().to_path_buf())
+                .with_resolve_policy(ResolvePolicy::Unrestricted),
+        );
+        let tool = WriteInput::default();
+        let first = json!({
+            "file_path": "linkdir/new.rs",
+            "content": "fn v1() {}\n"
+        });
+        let out = tool.call(first, &ctx).await.unwrap();
+        assert!(!out.is_error, "{}", out.text_content());
+
+        std::fs::write(realdir.join("new.rs"), "EXTERNAL\n").unwrap();
+
+        let retry = json!({
+            "file_path": "realdir/new.rs",
+            "content": "fn v2() {}\n"
+        });
+        let out = tool.call(retry, &ctx).await.unwrap();
+        assert!(out.is_error, "{}", out.text_content());
+        assert!(
+            out.text_content().contains("changed on disk"),
+            "{}",
+            out.text_content()
+        );
+        assert_eq!(
+            std::fs::read_to_string(realdir.join("new.rs")).unwrap(),
+            "EXTERNAL\n",
+            "the refused retry must not clobber the external content"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unrestricted_conflict_guard_tracks_the_referent_through_a_symlink() {
+        // Reading through a link arms the baseline on the physical file, so
+        // an external change to the referent trips the write's staleness
+        // check even though both operations used the link spelling.
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let real = tmp.path().join("real.rs");
+        let link = tmp.path().join("link.rs");
+        std::fs::write(&real, "fn one() {}\n").unwrap();
+        symlink(&real, &link).unwrap();
+
+        let mut ctx = ToolContext::default();
+        ctx.cwd = tmp.path().to_string_lossy().into_owned();
+        ctx.set_extension(
+            RunnerContext::new(tmp.path().to_path_buf())
+                .with_resolve_policy(ResolvePolicy::Unrestricted),
+        );
+
+        let reader = crate::read::ReadInput::default();
+        let read_out = reader
+            .call(json!({ "file_path": "link.rs" }), &ctx)
+            .await
+            .unwrap();
+        assert!(!read_out.is_error);
+
+        std::fs::write(&real, "externally replaced\n").unwrap();
+
+        let tool = WriteInput::default();
+        let input = json!({
+            "file_path": "link.rs",
+            "content": "fn two() {}\n"
+        });
+        let out = tool.call(input, &ctx).await.unwrap();
+        assert!(out.is_error, "the changed referent must abort the write");
+        assert!(
+            out.text_content().contains("changed on disk"),
+            "{}",
+            out.text_content()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&real).unwrap(),
+            "externally replaced\n",
+            "the referent must be untouched by the refused write"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unrestricted_write_guard_tracks_a_new_file_across_a_hard_link_alias() {
+        // Hard links are the alias canonicalization cannot unify: both
+        // directory entries are equally canonical, so the path-keyed
+        // baseline recorded for the first write is invisible to the second.
+        // The identity side of the map (device + inode) must carry the
+        // guard across — an external change through the alias refuses the
+        // write instead of silently clobbering it.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut ctx = ToolContext::default();
+        ctx.cwd = tmp.path().to_string_lossy().into_owned();
+        ctx.set_extension(
+            RunnerContext::new(tmp.path().to_path_buf())
+                .with_resolve_policy(ResolvePolicy::Unrestricted),
+        );
+        let tool = WriteInput::default();
+        let out = tool
+            .call(json!({ "file_path": "real.txt", "content": "v1\\n" }), &ctx)
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.text_content());
+
+        std::fs::hard_link(tmp.path().join("real.txt"), tmp.path().join("hard.txt")).unwrap();
+        std::fs::write(tmp.path().join("hard.txt"), "EXTERNAL\\n").unwrap();
+
+        let out = tool
+            .call(json!({ "file_path": "hard.txt", "content": "v2\\n" }), &ctx)
+            .await
+            .unwrap();
+        assert!(out.is_error, "{}", out.text_content());
+        assert!(
+            out.text_content().contains("changed on disk"),
+            "{}",
+            out.text_content()
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("real.txt")).unwrap(),
+            "EXTERNAL\\n",
+            "the refused write must not clobber the external content"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_refuses_when_the_newest_alias_observation_differs_from_disk() {
+        // The integrity direction: the model's newest knowledge arrived
+        // through a hard-link alias (canonicalization unifies symlinks,
+        // not links, so the alias recorded a distinct path key). An
+        // external in-place revert then changed the file behind both
+        // spellings — the stale path entry of the write's own spelling
+        // must not downgrade the guard to a pass.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut ctx = ToolContext::default();
+        ctx.cwd = tmp.path().to_string_lossy().into_owned();
+        ctx.set_extension(
+            RunnerContext::new(tmp.path().to_path_buf())
+                .with_resolve_policy(ResolvePolicy::Unrestricted),
+        );
+
+        std::fs::write(tmp.path().join("real.txt"), "v1\n").unwrap();
+        let reader = crate::read::ReadInput::default();
+        reader
+            .call(json!({ "file_path": "real.txt" }), &ctx)
+            .await
+            .unwrap();
+
+        std::fs::hard_link(tmp.path().join("real.txt"), tmp.path().join("hard.txt")).unwrap();
+        std::fs::write(tmp.path().join("real.txt"), "EXT\n").unwrap();
+        reader
+            .call(json!({ "file_path": "hard.txt" }), &ctx)
+            .await
+            .unwrap();
+
+        std::fs::write(tmp.path().join("real.txt"), "v1\n").unwrap();
+
+        let tool = WriteInput::default();
+        let out = tool
+            .call(json!({ "file_path": "real.txt", "content": "NEW\n" }), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            out.is_error,
+            "the unobserved revert must be caught: {}",
+            out.text_content()
+        );
+        assert!(
+            out.text_content().contains("changed on disk"),
+            "{}",
+            out.text_content()
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("real.txt")).unwrap(),
+            "v1\n",
+            "the refused write must leave the reverted content standing"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_proceeds_when_the_alias_observation_matches_the_current_content() {
+        // The false-conflict direction: the same alias divergence without
+        // the revert — the model has seen the current content through the
+        // alias, and the write must not be blamed on an external change.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut ctx = ToolContext::default();
+        ctx.cwd = tmp.path().to_string_lossy().into_owned();
+        ctx.set_extension(
+            RunnerContext::new(tmp.path().to_path_buf())
+                .with_resolve_policy(ResolvePolicy::Unrestricted),
+        );
+
+        std::fs::write(tmp.path().join("real.txt"), "v1\n").unwrap();
+        let reader = crate::read::ReadInput::default();
+        reader
+            .call(json!({ "file_path": "real.txt" }), &ctx)
+            .await
+            .unwrap();
+
+        std::fs::hard_link(tmp.path().join("real.txt"), tmp.path().join("hard.txt")).unwrap();
+        std::fs::write(tmp.path().join("real.txt"), "EXT\n").unwrap();
+        reader
+            .call(json!({ "file_path": "hard.txt" }), &ctx)
+            .await
+            .unwrap();
+
+        let tool = WriteInput::default();
+        let out = tool
+            .call(json!({ "file_path": "real.txt", "content": "NEW\n" }), &ctx)
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.text_content());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("real.txt")).unwrap(),
+            "NEW\n",
+            "the alias's current observation must not block the write"
+        );
+    }
+
+    #[tokio::test]
+    async fn unrestricted_write_reaches_outside_the_workspace() {
+        // The headline promise of the opt-out: an unrestricted write lands
+        // on any path the process may touch, outside the workspace included.
+        let workspace = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let mut ctx = ToolContext::default();
+        ctx.cwd = workspace.path().to_string_lossy().into_owned();
+        ctx.set_extension(
+            RunnerContext::new(workspace.path().to_path_buf())
+                .with_resolve_policy(ResolvePolicy::Unrestricted),
+        );
+        let tool = WriteInput::default();
+        let input = json!({
+            "file_path": outside.path().join("out.txt").to_str().unwrap(),
+            "content": "fn main() {}\n"
+        });
+        let out = tool.call(input, &ctx).await.unwrap();
+        assert!(!out.is_error, "{}", out.text_content());
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("out.txt")).unwrap(),
+            "fn main() {}\n"
         );
     }
 

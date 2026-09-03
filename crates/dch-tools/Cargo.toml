@@ -19,6 +19,7 @@ libc       = "0.2"
 tempfile   = { workspace = true }
 ignore     = { workspace = true }
 regex      = { workspace = true }
+same-file  = "1.0.6"
 tracing    = { workspace = true }
 lru        = { workspace = true }
 

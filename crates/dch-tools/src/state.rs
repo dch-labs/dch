@@ -27,9 +27,20 @@ static OBSERVATION_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// The model's latest known content hash per touched file.
 ///
-/// Keyed by the resolved absolute path (each tool's [`resolve_path`](crate::util::resolve_path)
-/// output), so equivalent spellings of the same file share one baseline and a
-/// staleness check can't be dodged by re-spelling a path.
+/// Keyed by each tool's resolution of the submitted path: the
+/// [`resolve_path`](crate::util::resolve_path) output under the contained
+/// policy, and the canonicalized physical file on top of it under the
+/// unrestricted policy. Under Unrestricted, then, equivalent spellings of
+/// the same file — including spellings that pass through a symbolic link —
+/// share one baseline and a staleness check can't be dodged by re-spelling
+/// a path. Under Contained the keys are the lexical resolution output, so
+/// alias spellings are deliberately distinct keys; there the protection
+/// comes from the write layer refusing symbolic-link spellings rather than
+/// from key merging. The rule is applied by the owning context —
+/// `RunnerContext`'s `record_baseline` and `baseline_for` normalize keys
+/// on the way in and out, so no call site can record or query under a
+/// divergent spelling, and a file first created through a symlinked
+/// directory is re-keyed to its now-resolvable physical path.
 ///
 /// The hash is a process-local [`DefaultHasher`] fingerprint of the file's
 /// bytes — deliberately not a stable or cryptographic digest: baselines live
@@ -38,8 +49,10 @@ static OBSERVATION_SEQ: AtomicU64 = AtomicU64::new(0);
 pub type FileBaselines = BTreeMap<PathBuf, FileBaseline>;
 
 /// One observation of a file's content, at a known point in the session's
-///
 /// observation order.
+///
+/// Produced by `observe_bytes` at the moment the bytes were in hand; a
+/// map entry always holds the newest one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileBaseline {
     /// Where this observation sits in the session's touch order.
@@ -91,12 +104,68 @@ pub(crate) fn record(baselines: &mut FileBaselines, path: &Path, baseline: FileB
     baselines.insert(path.to_path_buf(), baseline);
 }
 
-/// The content hash recorded for `path`, if the path was touched.
+/// The observation recorded for `path`, if the path was touched.
 ///
-/// `None` means the path has never been touched this session — Write then
-/// proceeds unchecked, per the no-baseline rule.
-pub(crate) fn baseline(baselines: &FileBaselines, path: &Path) -> Option<u64> {
-    baselines.get(path).map(|baseline| baseline.hash)
+/// The stamp and hash together, for callers that consult both indexes and
+/// must hold whichever observation is newer.
+pub(crate) fn entry(baselines: &FileBaselines, path: &Path) -> Option<FileBaseline> {
+    baselines.get(path).copied()
+}
+
+/// The model's latest known content per live file identity (unix device and
+/// inode).
+///
+/// The unrestricted policy's second index over the same observations: keys
+/// by path cannot unify aliases that canonicalization cannot see — two hard
+/// links to one file are two equally canonical spellings — so the recorded
+/// file's stat identity is kept alongside the path key, and a lookup stats
+/// the target to find the baseline whichever spelling arrives. Kept in step
+/// with [`FileBaselines`] by the same record calls. A lookup consults both
+/// indexes and holds whichever of the two entries carries the newer
+/// observation stamp: the path entry of one alias spelling can be older
+/// than the identity entry, and letting it win would judge the file
+/// against content the model has since superseded.
+///
+/// Residual, mirroring the `TargetIdentity` field docs on the rename gate:
+/// an externally deleted-and-recreated file that reclaims the recorded
+/// device-inode pair reads as an identity match, arming a staleness guard
+/// for a file the model never touched. The direction is safe — a false
+/// *refusal*, recovered by re-reading, never a false pass, because the
+/// guard passes only when the current bytes hash-match the newest
+/// observation the model actually made of this file.
+pub type FileIdentities = BTreeMap<(u64, u64), FileBaseline>;
+
+/// Record an observation as the model's latest known state of the file
+/// `identity` names.
+///
+/// Mirrors [`record`]'s newest-observation-wins semantics with one entry
+/// per live identity: a later observation of the same file through any
+/// spelling supersedes the earlier one, so the entry always reflects the
+/// newest content the model is known to have produced for that file,
+/// however it is spelled. Called alongside [`record`] by the unrestricted
+/// policy's record path.
+pub(crate) fn record_identity(
+    identities: &mut FileIdentities,
+    identity: (u64, u64),
+    baseline: FileBaseline,
+) {
+    match identities.get(&identity) {
+        Some(existing) if existing.observed > baseline.observed => return,
+        _ => {}
+    }
+    identities.insert(identity, baseline);
+}
+
+/// The observation recorded for the file `identity` names, if any.
+///
+/// The identity-side counterpart of [`entry`]: carries the stamp, so a
+/// caller consulting both indexes can hold the newer of the two
+/// observations instead of letting a stale path entry shadow it.
+pub(crate) fn entry_identity(
+    identities: &FileIdentities,
+    identity: (u64, u64),
+) -> Option<FileBaseline> {
+    identities.get(&identity).copied()
 }
 
 #[cfg(test)]
@@ -120,16 +189,19 @@ mod tests {
         record(&mut baselines, a, observe_bytes(b"three"));
 
         assert_eq!(
-            baseline(&baselines, a),
+            entry(&baselines, a).map(|obs| obs.hash),
             Some(content_hash(b"three")),
             "the latest touch wins"
         );
         assert_eq!(
-            baseline(&baselines, b),
+            entry(&baselines, b).map(|obs| obs.hash),
             Some(content_hash(b"two")),
             "other paths keep their own baselines"
         );
-        assert_eq!(baseline(&baselines, Path::new("missing.rs")), None);
+        assert_eq!(
+            entry(&baselines, Path::new("missing.rs")).map(|obs| obs.hash),
+            None
+        );
     }
 
     #[test]
@@ -146,7 +218,7 @@ mod tests {
         record(&mut baselines, Path::new("a.rs"), newer);
         record(&mut baselines, Path::new("a.rs"), older);
         assert_eq!(
-            baseline(&baselines, Path::new("a.rs")),
+            entry(&baselines, Path::new("a.rs")).map(|obs| obs.hash),
             Some(newer.hash),
             "newer first, older second: newest must stand"
         );
@@ -155,7 +227,7 @@ mod tests {
         record(&mut baselines, Path::new("a.rs"), older);
         record(&mut baselines, Path::new("a.rs"), newer);
         assert_eq!(
-            baseline(&baselines, Path::new("a.rs")),
+            entry(&baselines, Path::new("a.rs")).map(|obs| obs.hash),
             Some(newer.hash),
             "newer last, older first: newest must still stand"
         );

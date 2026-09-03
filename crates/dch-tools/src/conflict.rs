@@ -8,10 +8,17 @@
 //! matching check: `Edit` and `MultiEdit` hold the bytes they read and
 //! compare them exactly; `Write` holds the content hash Read recorded for
 //! the path and compares hashes.
+//!
+//! The check returns the *identity* of the file the compared bytes came
+//! from, captured from the open handle rather than a path lookup. The write
+//! re-checks that identity on the path's entry immediately before its
+//! rename, so a target swapped between the check and the rename aborts
+//! instead of silently replacing a file that was never compared.
 
 use std::path::Path;
 
 use loopctl::tool::ToolError;
+use tokio::io::AsyncReadExt;
 
 /// Why a conflict check did not approve the write.
 ///
@@ -32,6 +39,107 @@ pub(crate) enum CheckFailure {
     Fault(ToolError),
 }
 
+/// The on-disk identity of the file whose bytes a conflict check compared.
+///
+/// Captured from the open read handle's own stat, so it pins the inode the
+/// bytes actually came from even if the path's directory entry is swapped
+/// concurrently. The write re-checks the path's entry against this identity
+/// immediately before its rename; a mismatch — or a missing entry — aborts
+/// the write, closing the swap window between the byte comparison and the
+/// rename that a byte or hash comparison alone cannot see.
+///
+/// Platforms without a stable file identity carry no distinguishing
+/// fields, and their identity matches any entry, degrading to the
+/// pre-check-only behavior documented on the race windows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TargetIdentity {
+    /// The file's device id, from the read-time handle stat.
+    ///
+    /// Paired with [`ino`](Self::ino) to name one live file uniquely across
+    /// the system; the re-check passes only when both fields match the
+    /// entry now at the path. A replacement file allocated while the
+    /// checked file still existed — the rename-swap case this gate targets
+    /// — always carries a different pairing.
+    #[cfg(unix)]
+    dev: u64,
+
+    /// The file's inode number, from the read-time handle stat.
+    ///
+    /// Stable for the file's lifetime within its filesystem and never
+    /// reused while the file exists. One case stays beyond the gate by
+    /// construction: a delete-then-recreate whose replacement reclaims the
+    /// freed inode on the same device reads as an identity match — a
+    /// filesystem-dependent residual shared with every inode-based guard,
+    /// not the concurrent swap this gate exists for.
+    #[cfg(unix)]
+    ino: u64,
+}
+
+impl TargetIdentity {
+    /// Extract the identity from a stat.
+    ///
+    /// The unix fields come from the platform's stat extensions, so the
+    /// identity belongs to the inode that was stated — never to whatever a
+    /// fresh path lookup would resolve. Platforms without a stable file
+    /// identity produce an empty identity whose
+    /// [`matches`](Self::matches) always succeeds.
+    fn from_metadata(meta: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Self {
+                dev: meta.dev(),
+                ino: meta.ino(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = meta;
+            Self {}
+        }
+    }
+
+    /// Whether the path entry `meta` describes is still the checked file.
+    ///
+    /// The comparison is exact on platforms with a stable file identity: a
+    /// swapped-in entry fails because its device-inode pairing differs
+    /// (see the field docs for the delete-and-reclaim residual). Only ever
+    /// false there — on platforms without one, every entry matches so the
+    /// write proceeds with the pre-check-only behavior documented on the
+    /// race windows.
+    pub(crate) fn matches(self, meta: &std::fs::Metadata) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            self.matches_parts(meta.dev(), meta.ino())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (self, meta);
+            true
+        }
+    }
+
+    /// Whether raw stat fields still identify the checked file.
+    ///
+    /// The descriptor-relative counterpart of [`matches`](Self::matches):
+    /// the contained write stats its target through the pinned directory's
+    /// descriptor, which yields raw fields rather than a
+    /// [`std::fs::Metadata`], and compares them here. Exact on platforms
+    /// with a stable file identity; always true without one.
+    pub(crate) fn matches_parts(self, dev: u64, ino: u64) -> bool {
+        #[cfg(unix)]
+        {
+            self.dev == dev && self.ino == ino
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (self, dev, ino);
+            true
+        }
+    }
+}
+
 /// Format the soft-error message for a refused write of `path`.
 ///
 /// The text states what happened and directs the model to the recovery
@@ -48,85 +156,143 @@ pub(crate) fn changed_message(path: &Path) -> String {
 
 /// Re-read `path` and compare its bytes against `baseline`.
 ///
-/// Returns `Ok(())` when the bytes match exactly. A differing file, or a file
-/// that no longer exists (a deletion between read and re-read is "the file
-/// changed"), is `Err(CheckFailure::Changed)`; the caller refuses the write
-/// and surfaces a soft error.
+/// Returns the identity of the file the compared bytes came from; the
+/// caller passes it to the write so the swap window between this check and
+/// the rename can be closed (see [`TargetIdentity`]). A differing file, or
+/// a file that no longer exists (a deletion between read and re-read is
+/// "the file changed"), is `Err(CheckFailure::Changed)`; the caller refuses
+/// the write and surfaces a soft error.
 ///
 /// # Errors
 ///
-/// Returns `Err(CheckFailure::Fault)` only on a genuine I/O fault that is not
-/// "file missing" (e.g. a permission problem). Byte comparison is deliberate:
-/// an external writer replacing the text file with non-UTF-8 content is a
-/// content change, not a fault.
+/// Returns `Err(CheckFailure::Fault)` only on a genuine I/O fault that is
+/// not "file missing" (e.g. a permission problem). Byte comparison is
+/// deliberate: an external writer replacing the text file with non-UTF-8
+/// content is a content change, not a fault.
 ///
 /// # Race window
 ///
 /// This check narrows the read→write race window from "the whole tool call"
-/// to "the gap between this compare and the caller's write" — it does not
-/// eliminate the race. Closing it entirely would require OS-level file
-/// locking, which this helper deliberately does not do.
+/// to "the gap between this compare and the caller's write"; the returned
+/// identity is what lets the caller close even that gap at rename time.
 pub(crate) async fn check_content_unchanged(
     baseline: &str,
     path: &Path,
-) -> Result<(), CheckFailure> {
+) -> Result<TargetIdentity, CheckFailure> {
     check_bytes_unchanged(baseline.as_bytes(), path).await
 }
 
 /// Re-read `path` and compare its content hash against `baseline_hash`.
 ///
 /// Used by Write, whose baseline is the content hash Read recorded for the
-/// path — Write holds no prior bytes to compare. Hash comparison inherits the
-/// exactness of the underlying byte comparison and has no timestamp
+/// path — Write holds no prior bytes to compare. Hash comparison inherits
+/// the exactness of the underlying byte comparison and has no timestamp
 /// blind spot: any content change is caught regardless of filesystem
-/// timestamp granularity. Missing-at-reread is a conflict.
+/// timestamp granularity. Missing-at-reread is a conflict. On success the
+/// identity of the compared file is returned for the caller's pre-rename
+/// re-check (see [`TargetIdentity`]).
 ///
 /// # Errors
 ///
-/// Returns `Err(CheckFailure::Fault)` only on a genuine I/O fault that is not
-/// "file missing".
+/// Returns `Err(CheckFailure::Fault)` only on a genuine I/O fault that is
+/// not "file missing".
 ///
 /// # Race window
 ///
-/// As with [`check_content_unchanged`], the check narrows the race window to
-/// the gap between this compare and the caller's write; it does not eliminate
-/// it.
+/// As with [`check_content_unchanged`], the check narrows the race window
+/// to the gap between this compare and the caller's write; the returned
+/// identity closes that gap at rename time.
 pub(crate) async fn check_content_hash_unchanged(
     baseline_hash: u64,
     path: &Path,
-) -> Result<(), CheckFailure> {
-    match tokio::fs::read(path).await {
-        Ok(bytes) => {
-            if crate::state::content_hash(&bytes) == baseline_hash {
-                Ok(())
-            } else {
-                Err(CheckFailure::Changed)
-            }
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(CheckFailure::Changed),
-        Err(err) => Err(CheckFailure::Fault(ToolError::Execution(format!(
-            "conflict check for {}: {err}",
-            path.display()
-        )))),
+) -> Result<TargetIdentity, CheckFailure> {
+    let mut file = open_target(path).await?;
+    let identity = TargetIdentity::from_metadata(&stat_target(&file, path).await?);
+    let mut current = Vec::new();
+    file.read_to_end(&mut current)
+        .await
+        .map_err(|e| read_fault(path, &e))?;
+    if crate::state::content_hash(&current) == baseline_hash {
+        Ok(identity)
+    } else {
+        Err(CheckFailure::Changed)
     }
 }
 
-/// Shared body of the two checks: compare candidate bytes against a baseline.
+/// Shared body of the byte-exact check: open, stat the handle, compare.
+///
+/// The identity comes from the handle's own stat, so it belongs to the
+/// inode the bytes were read from even under a concurrent swap of the
+/// path's entry.
 ///
 /// # Errors
 ///
-/// Returns `Err(CheckFailure::Fault)` only on a genuine I/O fault that is not
-/// "file missing".
-async fn check_bytes_unchanged(baseline: &[u8], path: &Path) -> Result<(), CheckFailure> {
-    match tokio::fs::read(path).await {
-        Ok(current) if current == baseline => Ok(()),
-        Ok(_) => Err(CheckFailure::Changed),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(CheckFailure::Changed),
-        Err(err) => Err(CheckFailure::Fault(ToolError::Execution(format!(
-            "conflict check for {}: {err}",
-            path.display()
-        )))),
+/// Returns `Err(CheckFailure::Fault)` only on a genuine I/O fault that is
+/// not "file missing".
+async fn check_bytes_unchanged(
+    baseline: &[u8],
+    path: &Path,
+) -> Result<TargetIdentity, CheckFailure> {
+    let mut file = open_target(path).await?;
+    let identity = TargetIdentity::from_metadata(&stat_target(&file, path).await?);
+    let mut current = Vec::new();
+    file.read_to_end(&mut current)
+        .await
+        .map_err(|e| read_fault(path, &e))?;
+    if current == baseline {
+        Ok(identity)
+    } else {
+        Err(CheckFailure::Changed)
     }
+}
+
+/// Open the check target for reading.
+///
+/// The check opens the target itself rather than reading through a helper
+/// so the same handle can be stated for the returned identity — a separate
+/// path lookup afterwards could name a different file under a concurrent
+/// swap. A missing file is a change, not a fault, matching the checks'
+/// deletion-between-reads doctrine.
+///
+/// # Errors
+///
+/// Returns `Err(CheckFailure::Changed)` for a missing file and
+/// `Err(CheckFailure::Fault)` for any other open failure.
+async fn open_target(path: &Path) -> Result<tokio::fs::File, CheckFailure> {
+    match tokio::fs::File::open(path).await {
+        Ok(file) => Ok(file),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(CheckFailure::Changed),
+        Err(err) => Err(read_fault(path, &err)),
+    }
+}
+
+/// Stat the open handle — the inode the bytes come from, not a path lookup.
+///
+/// The stat rides the open descriptor, so the identity reflects the file
+/// the check actually reads bytes from even if the path's directory entry
+/// is replaced while the read is in flight.
+///
+/// # Errors
+///
+/// Returns `Err(CheckFailure::Fault)` when the open handle cannot be
+/// stated, which would leave the identity unknown.
+async fn stat_target(
+    file: &tokio::fs::File,
+    path: &Path,
+) -> Result<std::fs::Metadata, CheckFailure> {
+    file.metadata().await.map_err(|e| read_fault(path, &e))
+}
+
+/// Map a check-side I/O error to the fault variant, naming the target.
+///
+/// Every I/O failure in the check's open-stat-read sequence funnels through
+/// this one mapper, so fault messages keep a consistent shape and always
+/// say which path was being verified when the check gave up.
+fn read_fault(path: &Path, err: &std::io::Error) -> CheckFailure {
+    CheckFailure::Fault(ToolError::Execution(format!(
+        "conflict check for {}: {err}",
+        path.display()
+    )))
 }
 
 #[cfg(test)]

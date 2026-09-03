@@ -20,6 +20,7 @@ use crate::context::RunnerContext;
 use crate::context::require_cwd;
 use crate::context::runner_ctx;
 use crate::input::get_usize;
+use crate::util::ResolvePolicy;
 use crate::util::mime_type_from_path;
 use crate::util::reject_url;
 use crate::util::resolve_path;
@@ -136,8 +137,15 @@ impl ReadInput {
             .ok_or_else(|| ToolError::InvalidInput("Missing file_path".to_string()))?;
         reject_url("Read", file_path)?;
 
+        let policy = match runner_context.as_ref() {
+            Some(context) => context.resolve_policy,
+            None => ResolvePolicy::Contained,
+        };
         let cwd = require_cwd(runner_context.clone())?;
-        let full_path = resolve_path(file_path, &cwd)?;
+        let mut full_path = resolve_path(file_path, &cwd, policy)?;
+        if policy == ResolvePolicy::Unrestricted {
+            full_path = crate::util::canonicalize_existing(&full_path)?;
+        }
 
         let metadata = metadata_or_not_found(&full_path, file_path).await?;
         if let Some(too_large) = too_large_if_over(metadata.len()) {
@@ -151,7 +159,10 @@ impl ReadInput {
             )));
         }
 
-        let bytes = read_capped(&full_path).await?;
+        let anchor = runner_context
+            .as_ref()
+            .map(|rc| rc.workspace_anchor.as_ref());
+        let bytes = read_capped(&full_path, &cwd, policy, anchor).await?;
         if let Some(too_large) = too_large_if_over(bytes.len() as u64) {
             return Ok(too_large);
         }
@@ -254,13 +265,28 @@ fn too_large_if_over(byte_count: u64) -> Option<ToolOutput> {
 /// metadata check and the read cannot OOM. If the returned buffer has more than
 /// `MAX_FILE_SIZE_BYTES` bytes, the caller rejects it via [`too_large_if_over`].
 ///
+/// Under the contained policy the opened handle is verified against the
+/// caller's retained workspace anchor when one is supplied, so a symlink
+/// swapped onto the workspace spelling after the runner context was
+/// constructed cannot turn the read into a byte source outside the pinned
+/// workspace.
+///
 /// # Errors
 ///
-/// Returns [`ToolError::Execution`] if the file cannot be opened or read.
-async fn read_capped(path: &std::path::Path) -> Result<Vec<u8>, ToolError> {
+/// Returns [`ToolError::Execution`] if the file cannot be opened or read,
+/// or when the contained handle check fails.
+async fn read_capped(
+    path: &std::path::Path,
+    workspace: &std::path::Path,
+    policy: ResolvePolicy,
+    anchor: Option<&crate::fs::WorkspaceAnchor>,
+) -> Result<Vec<u8>, ToolError> {
     let file = tokio::fs::File::open(path)
         .await
         .map_err(|e| ToolError::Execution(format!("Failed to open file: {e}")))?;
+    if policy == ResolvePolicy::Contained {
+        crate::util::verify_handle_inside(&file, workspace, anchor)?;
+    }
     let cap = MAX_FILE_SIZE_BYTES.saturating_add(1);
     let mut buf = Vec::with_capacity(cap.min(8192));
     file.take(cap as u64)
@@ -539,6 +565,7 @@ fn parse_single_line(range: &str) -> Result<(usize, usize), String> {
 mod tests {
     use super::*;
     use crate::context::RunnerContext;
+    use crate::util::ResolvePolicy;
     use loopctl::tool::ToolContext;
     use serde_json::json;
     use std::path::PathBuf;
@@ -559,6 +586,136 @@ mod tests {
 
     fn input(path: &str) -> Value {
         json!({ "file_path": path })
+    }
+
+    /// Builds a `ToolContext` whose runner context resolves under `policy`.
+    fn ctx_with_policy(cwd: &std::path::Path, policy: ResolvePolicy) -> ToolContext {
+        let mut ctx = ToolContext::default();
+        ctx.cwd = cwd.to_string_lossy().into_owned();
+        ctx.set_extension(RunnerContext::new(PathBuf::from(cwd)).with_resolve_policy(policy));
+        ctx
+    }
+
+    #[tokio::test]
+    async fn read_honors_the_context_resolve_policy_outside_the_workspace() {
+        // The context policy is what lifts containment end to end: the same
+        // request errors under the default and succeeds unrestricted.
+        let workspace = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, "s3cret\n").unwrap();
+        let target = input(secret.to_str().unwrap());
+        let tool = ReadInput::default();
+
+        let contained = tool
+            .call(target.clone(), &ctx_in(workspace.path().to_str().unwrap()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(contained, ToolError::InvalidInput(ref msg) if msg.contains("escapes")),
+            "the contained default must reject the escape: {contained:?}"
+        );
+
+        let unrestricted = tool
+            .call(
+                target,
+                &ctx_with_policy(workspace.path(), ResolvePolicy::Unrestricted),
+            )
+            .await
+            .unwrap();
+        assert!(!unrestricted.is_error, "{unrestricted:?}");
+        assert_eq!(unrestricted.text_content(), "s3cret\n");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn read_capped_rejects_a_swapped_parent_directory_when_contained() {
+        // The read-path analogue of the write swap test: the path handed to
+        // `read_capped` was validated before `dir` was swapped for a symlink
+        // out of the workspace; the handle verification must catch it.
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, "outside\n").unwrap();
+        let dir = workspace.path().join("dir");
+        symlink(outside.path(), &dir).unwrap();
+
+        let err = read_capped(
+            &dir.join("secret.txt"),
+            workspace.path(),
+            ResolvePolicy::Contained,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("escaped"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_capped_follows_a_swapped_parent_directory_when_unrestricted() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, "outside\n").unwrap();
+        let dir = workspace.path().join("dir");
+        symlink(outside.path(), &dir).unwrap();
+
+        let bytes = read_capped(
+            &dir.join("secret.txt"),
+            workspace.path(),
+            ResolvePolicy::Unrestricted,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(bytes, b"outside\n");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn contained_read_pins_the_workspace_anchor_against_a_later_swap() {
+        // Reads must be judged against the pinned root, not the current
+        // cwd: the anchor symlink resolved to `real` at context
+        // construction, and a swap to `outside` afterwards cannot make the
+        // read serve the swapped-in directory's bytes.
+        use std::os::unix::fs::symlink;
+
+        let real = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let anchor_link = workspace.path().join("project");
+        symlink(real.path(), &anchor_link).unwrap();
+        std::fs::write(real.path().join("data.txt"), "PINNED\n").unwrap();
+        std::fs::write(outside.path().join("data.txt"), "OUTSIDE\n").unwrap();
+
+        let ctx = ctx_in(anchor_link.to_str().unwrap());
+        std::fs::remove_file(&anchor_link).unwrap();
+        symlink(outside.path(), &anchor_link).unwrap();
+
+        let tool = ReadInput::default();
+        let input = json!({ "file_path": anchor_link.join("data.txt").to_str().unwrap() });
+        let err = tool.call(input, &ctx).await.unwrap_err();
+        assert!(
+            err.to_string().contains("escaped"),
+            "the post-swap location must be rejected: {err}"
+        );
+
+        // The outside file's bytes were never served: the read failed
+        // before any content reached the output, and nothing was recorded.
+        let rc = runner_ctx(&ctx).unwrap();
+        let baselines = rc
+            .file_baselines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            baselines.is_empty(),
+            "a refused read must arm no baseline: {baselines:?}"
+        );
     }
 
     #[tokio::test]
@@ -900,47 +1057,62 @@ mod tests {
         assert!(parse_line_range(":0").is_err());
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn read_capped_small_file_returns_all_bytes() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("small.txt");
         std::fs::write(&path, b"hello world").unwrap();
-        let bytes = read_capped(&path).await.unwrap();
+        let bytes = read_capped(&path, tmp.path(), ResolvePolicy::Contained, None)
+            .await
+            .unwrap();
         assert_eq!(bytes, b"hello world");
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn read_capped_exactly_at_cap_returns_all() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("exact.bin");
         std::fs::write(&path, vec![b'x'; MAX_FILE_SIZE_BYTES]).unwrap();
-        let bytes = read_capped(&path).await.unwrap();
+        let bytes = read_capped(&path, tmp.path(), ResolvePolicy::Contained, None)
+            .await
+            .unwrap();
         assert_eq!(bytes.len(), MAX_FILE_SIZE_BYTES);
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn read_capped_over_cap_returns_cap_plus_one() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("over.bin");
         std::fs::write(&path, vec![b'x'; MAX_FILE_SIZE_BYTES + 100]).unwrap();
-        let bytes = read_capped(&path).await.unwrap();
+        let bytes = read_capped(&path, tmp.path(), ResolvePolicy::Contained, None)
+            .await
+            .unwrap();
         assert_eq!(bytes.len(), MAX_FILE_SIZE_BYTES + 1);
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn read_capped_empty_file_returns_empty() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("empty.txt");
         std::fs::write(&path, b"").unwrap();
-        let bytes = read_capped(&path).await.unwrap();
+        let bytes = read_capped(&path, tmp.path(), ResolvePolicy::Contained, None)
+            .await
+            .unwrap();
         assert!(bytes.is_empty());
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn read_capped_missing_file_is_execution_error() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("nope.txt");
-        let err = read_capped(&path).await.unwrap_err();
+        let err = read_capped(&path, tmp.path(), ResolvePolicy::Contained, None)
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::Execution(_)));
     }
 
@@ -969,7 +1141,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_records_the_file_mtime_in_the_shared_history() {
+    async fn read_records_the_content_hash_in_the_shared_history() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("small.txt");
         std::fs::write(&path, "hello world\n").unwrap();
@@ -990,7 +1162,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(baselines.len(), 1, "one successful read, one baseline");
         assert_eq!(
-            crate::state::baseline(&baselines, path.as_path()),
+            crate::state::entry(&baselines, path.as_path()).map(|obs| obs.hash),
             Some(crate::state::content_hash("hello world\n".as_bytes()))
         );
     }
@@ -1039,7 +1211,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(
-            crate::state::baseline(&baselines, path.as_path()),
+            crate::state::entry(&baselines, path.as_path()).map(|obs| obs.hash),
             Some(crate::state::content_hash("hello world\n".as_bytes()))
         );
     }
@@ -1066,7 +1238,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(
-            crate::state::baseline(&baselines, path.as_path()),
+            crate::state::entry(&baselines, path.as_path()).map(|obs| obs.hash),
             Some(crate::state::content_hash(&bytes)),
             "the model was told this file is binary — that notice arms the guard"
         );
@@ -1095,7 +1267,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(baselines.len(), 1, "an image the model saw is a baseline");
         assert_eq!(
-            crate::state::baseline(&baselines, path.as_path()),
+            crate::state::entry(&baselines, path.as_path()).map(|obs| obs.hash),
             Some(crate::state::content_hash(&bytes))
         );
     }

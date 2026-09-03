@@ -15,10 +15,12 @@ use loopctl::tool::ToolOutput;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
+use tokio::io::AsyncReadExt;
 
 use crate::context::RunnerContext;
 use crate::context::require_cwd;
 use crate::context::runner_ctx;
+use crate::util::ResolvePolicy;
 use crate::util::reject_url;
 use crate::util::resolve_path;
 
@@ -177,12 +179,21 @@ impl FileViewerInput {
         input: Value,
         rc: Option<RunnerContext>,
     ) -> Result<ToolOutput, ToolError> {
+        let policy = match rc.as_ref() {
+            Some(context) => context.resolve_policy,
+            None => ResolvePolicy::Contained,
+        };
+        // Cloned before `require_cwd` consumes the context: the retained
+        // anchor is what contained handle verification is judged against.
+        let anchor = rc
+            .as_ref()
+            .map(|rc| std::sync::Arc::clone(&rc.workspace_anchor));
         let cwd = require_cwd(rc)?;
 
         let parsed = parse_input(&input)?;
-        let full_path = resolve_path(parsed.file_path, &cwd)?;
+        let full_path = resolve_path(parsed.file_path, &cwd, policy)?;
 
-        let Some(content) = read_content(&full_path).await? else {
+        let Some(content) = read_content(&full_path, &cwd, policy, anchor.as_deref()).await? else {
             return Ok(ToolOutput::error_text(format!(
                 "File not found: {}",
                 parsed.file_path
@@ -269,19 +280,36 @@ fn parse_input(input: &Value) -> Result<ParsedInput<'_>, ToolError> {
 ///
 /// Returns `None` when the file doesn't exist (the caller surfaces a soft
 /// error); `Some(content)` on success. OS read faults become
-/// [`ToolError::Execution`].
+/// [`ToolError::Execution`]. Under the contained policy the opened handle
+/// is verified against the caller's retained workspace anchor when one is
+/// supplied, so a symlink swapped onto the workspace spelling after the
+/// runner context was constructed cannot turn the view into a byte source
+/// outside the pinned workspace.
 ///
 /// # Errors
 ///
-/// Returns [`ToolError::Execution`] on any read fault other than "not found".
-async fn read_content(full_path: &Path) -> Result<Option<String>, ToolError> {
+/// Returns [`ToolError::Execution`] on any read fault other than "not
+/// found", and when the contained handle check fails.
+async fn read_content(
+    full_path: &Path,
+    workspace: &Path,
+    policy: ResolvePolicy,
+    anchor: Option<&crate::fs::WorkspaceAnchor>,
+) -> Result<Option<String>, ToolError> {
     if !tokio::fs::try_exists(full_path)
         .await
         .map_err(|e| ToolError::Execution(e.to_string()))?
     {
         return Ok(None);
     }
-    let content = tokio::fs::read_to_string(full_path)
+    let mut file = tokio::fs::File::open(full_path)
+        .await
+        .map_err(|e| ToolError::Execution(e.to_string()))?;
+    if policy == ResolvePolicy::Contained {
+        crate::util::verify_handle_inside(&file, workspace, anchor)?;
+    }
+    let mut content = String::new();
+    file.read_to_string(&mut content)
         .await
         .map_err(|e| ToolError::Execution(e.to_string()))?;
     Ok(Some(content))
@@ -1079,5 +1107,34 @@ mod tests {
         let text = out.text_content();
         assert!(text.contains("Lines 101-150 of 150"), "{text}");
         assert!(!text.contains("101-200"), "{text}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn contained_view_pins_the_workspace_anchor_against_a_later_swap() {
+        // The view's opened handle is judged against the pinned root, not
+        // the current cwd: a swap of the anchor symlink after context
+        // construction must not serve the swapped-in directory's bytes.
+        use std::os::unix::fs::symlink;
+
+        let real = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let anchor_link = workspace.path().join("project");
+        symlink(real.path(), &anchor_link).unwrap();
+        std::fs::write(real.path().join("data.txt"), "PINNED\n").unwrap();
+        std::fs::write(outside.path().join("data.txt"), "OUTSIDE\n").unwrap();
+
+        let ctx = ctx_in(anchor_link.to_str().unwrap());
+        std::fs::remove_file(&anchor_link).unwrap();
+        symlink(outside.path(), &anchor_link).unwrap();
+
+        let tool = FileViewerInput::default();
+        let input = json!({"file_path": anchor_link.join("data.txt").to_str().unwrap()});
+        let err = tool.call(input, &ctx).await.unwrap_err();
+        assert!(
+            err.to_string().contains("escaped"),
+            "the post-swap location must be rejected: {err}"
+        );
     }
 }

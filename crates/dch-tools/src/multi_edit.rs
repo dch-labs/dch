@@ -1,10 +1,15 @@
 //! The `MultiEdit` tool — apply a batch of text edits across one or more files.
 //!
 //! Every edit in the batch is validated before any file is written. One
-//! invalid edit (missing file, `old_text` not found or not unique, target is a
-//! symlink, linter rejects the merged content, two edits overlap in the same
-//! file) aborts the entire batch — no file is touched. `dry_run: true` previews
-//! diffs without writing.
+//! invalid edit (missing file, `old_text` not found or not unique, linter
+//! rejects the merged content, two edits overlap in the same file) aborts
+//! the entire batch — no file is touched — as does a symbolic-link target
+//! under the contained policy. Under the unrestricted policy links are
+//! honored and writes land on the referent. Under both policies, a batch
+//! that addresses one physical file through multiple alias spellings —
+//! hard links included — is refused: each alias would merge independently
+//! against the same original and the writes would clobber one another.
+//! `dry_run: true` previews diffs without writing.
 //!
 //! The atomicity guarantee covers *validation*: if any edit is invalid, nothing
 //! is written. It does **not** cover crashes mid-write-batch — see the
@@ -25,6 +30,7 @@ use loopctl::tool::ToolOutput;
 use loopctl::tool::ToolSchema;
 use serde_json::Value;
 use serde_json::json;
+use tokio::io::AsyncReadExt;
 
 use crate::conflict::CheckFailure;
 use crate::conflict::check_content_unchanged;
@@ -35,7 +41,10 @@ use crate::diff::format_file_change;
 use crate::edit::FindResult;
 use crate::edit::locate_unique;
 use crate::edit::splice;
+use crate::fs::WorkspaceAnchor;
 use crate::linter::lint_content;
+use crate::util::ResolvePolicy;
+use crate::util::canonicalize_existing;
 use crate::util::reject_url;
 use crate::util::resolve_path;
 use crate::write::format_lint_failure;
@@ -147,16 +156,29 @@ impl MultiEditTool {
         input: Value,
         rc: Option<RunnerContext>,
     ) -> Result<ToolOutput, ToolError> {
+        let policy = match rc.as_ref() {
+            Some(context) => context.resolve_policy,
+            None => ResolvePolicy::Contained,
+        };
         let cwd = require_cwd(rc.clone())?;
 
         let parsed = parse_input(&input)?;
-        let operations = build_operations(parsed.edits, &cwd)?;
+        let mut operations = build_operations(parsed.edits, &cwd, policy)?;
 
         if let Some(reason) = dup_path_check(&operations) {
             return Ok(reason.into_output());
         }
-        let originals = read_files(&operations).await?;
-        if let Some(reason) = symlink_check(&operations) {
+        if let Some(reason) = physical_alias_check(&operations) {
+            return Ok(reason.into_output());
+        }
+        if policy == ResolvePolicy::Unrestricted {
+            honor_symlink_targets(&mut operations)?;
+        }
+        let anchor = rc.as_ref().map(|rc| rc.workspace_anchor.as_ref());
+        let originals = read_files(&operations, &cwd, policy, anchor).await?;
+        if policy == ResolvePolicy::Contained
+            && let Some(reason) = symlink_check(&operations, &cwd)
+        {
             return Ok(reason.into_output());
         }
         if let Some(reason) = overlap_check(&operations, &originals) {
@@ -177,7 +199,9 @@ impl MultiEditTool {
         if parsed.dry_run {
             return Ok(ToolOutput::text(summary).with_hint(DisplayHint::Diff));
         }
-        if let Some(conflict) = write_finals(&operations, &originals, &finals, rc.as_ref()).await? {
+        if let Some(conflict) =
+            write_finals(&operations, &originals, &finals, rc.as_ref(), &cwd, policy).await?
+        {
             let mut message = crate::conflict::changed_message(Path::new(&conflict.path));
             if !conflict.applied.is_empty() {
                 message.push_str("\n\nAlready written by this batch: ");
@@ -230,13 +254,18 @@ struct BatchConflict {
 /// # Errors
 ///
 /// Returns [`ToolError`] when an atomic temp-then-rename write fails or the
-/// conflict check hits a genuine I/O fault.
+/// conflict check hits a genuine I/O fault. A fault after earlier writes
+/// have landed names them in the error message, so a partial batch always
+/// reports what reached the disk.
 async fn write_finals(
     operations: &[EditOperation],
     originals: &BTreeMap<String, String>,
     finals: &BTreeMap<String, String>,
     history: Option<&RunnerContext>,
+    workspace: &Path,
+    policy: ResolvePolicy,
 ) -> Result<Option<BatchConflict>, ToolError> {
+    let anchor = history.map(|rc| rc.workspace_anchor.as_ref());
     let mut written: std::collections::HashSet<&Path> = std::collections::HashSet::new();
     let mut applied: Vec<String> = Vec::new();
     for op in operations {
@@ -244,19 +273,28 @@ async fn write_finals(
             continue;
         }
         if let Some(final_content) = finals.get(&op.file_path) {
+            let mut expected = None;
             if let Some(baseline) = originals.get(&op.file_path).map(String::as_str) {
                 match check_content_unchanged(baseline, &op.full_path).await {
-                    Ok(()) => {}
+                    Ok(identity) => expected = Some(identity),
                     Err(CheckFailure::Changed) => {
                         return Ok(Some(BatchConflict {
                             applied,
                             path: op.file_path.clone(),
                         }));
                     }
-                    Err(CheckFailure::Fault(e)) => return Err(e),
+                    Err(CheckFailure::Fault(e)) => return Err(fault_with_applied(e, &applied)),
                 }
             }
-            crate::fs::atomic_write(&op.full_path, final_content)?;
+            crate::fs::atomic_write(
+                &op.full_path,
+                final_content,
+                workspace,
+                policy,
+                expected.as_ref(),
+                anchor,
+            )
+            .map_err(|e| fault_with_applied(e, &applied))?;
             applied.push(op.file_path.clone());
             if let Some(rc) = history {
                 rc.record_baseline(
@@ -267,6 +305,21 @@ async fn write_finals(
         }
     }
     Ok(None)
+}
+
+/// Fold the files already written into a mid-batch fault's message.
+///
+/// Earlier writes of a batch stay on disk when a later file faults, so the
+/// model must learn which files landed. When nothing has been written yet
+/// the error is returned untouched.
+fn fault_with_applied(error: ToolError, applied: &[String]) -> ToolError {
+    if applied.is_empty() {
+        return error;
+    }
+    ToolError::Execution(format!(
+        "{error}\n\nAlready written by this batch: {}.",
+        applied.join(", ")
+    ))
 }
 
 /// Parsed top-level `MultiEdit` input.
@@ -372,14 +425,19 @@ struct EditOperation {
 /// Parse each edit item into an [`EditOperation`].
 ///
 /// Validates fields, rejecting empty `old_text` and URL `file_path`; relative
-/// paths are resolved against `cwd`; absolute paths are accepted only when
-/// they stay inside `cwd`.
+/// paths are resolved against `cwd` under `policy`; absolute paths are
+/// accepted only when they stay inside `cwd` (contained resolution).
 ///
 /// # Errors
 ///
 /// Returns [`ToolError::InvalidInput`] for a missing `file_path`/`old_text`/
-/// `new_text`, an empty `old_text`, or a URL `file_path`.
-fn build_operations(edits: &[Value], cwd: &Path) -> Result<Vec<EditOperation>, ToolError> {
+/// `new_text`, an empty `old_text`, a URL `file_path`, or — under contained
+/// resolution — a path that escapes `cwd`.
+fn build_operations(
+    edits: &[Value],
+    cwd: &Path,
+    policy: ResolvePolicy,
+) -> Result<Vec<EditOperation>, ToolError> {
     let mut operations = Vec::with_capacity(edits.len());
     for edit_value in edits {
         let file_path = edit_value
@@ -402,7 +460,7 @@ fn build_operations(edits: &[Value], cwd: &Path) -> Result<Vec<EditOperation>, T
         }
         reject_url("MultiEdit", file_path)?;
 
-        let full_path = resolve_path(file_path, cwd)?;
+        let full_path = resolve_path(file_path, cwd, policy)?;
         operations.push(EditOperation {
             file_path: file_path.to_string(),
             full_path,
@@ -416,13 +474,23 @@ fn build_operations(edits: &[Value], cwd: &Path) -> Result<Vec<EditOperation>, T
 /// Read each distinct target file once into a map keyed by `file_path`.
 ///
 /// Returns the original contents keyed by the caller-supplied path (so the
-/// preview can address files the way the model named them).
+/// preview can address files the way the model named them). Under the
+/// contained policy each opened handle is verified against the caller's
+/// retained workspace anchor when one is supplied, so a symlink swapped
+/// onto the workspace spelling after the runner context was constructed
+/// cannot feed a batch from outside the pinned workspace.
 ///
 /// # Errors
 ///
-/// Returns [`ToolError::FileNotFound`] when a target does not exist, and
-/// [`ToolError::Execution`] on any other read fault (including non-UTF-8).
-async fn read_files(operations: &[EditOperation]) -> Result<BTreeMap<String, String>, ToolError> {
+/// Returns [`ToolError::FileNotFound`] when a target does not exist,
+/// [`ToolError::Execution`] on any other read fault (including non-UTF-8),
+/// and when a contained handle check fails.
+async fn read_files(
+    operations: &[EditOperation],
+    workspace: &Path,
+    policy: ResolvePolicy,
+    anchor: Option<&WorkspaceAnchor>,
+) -> Result<BTreeMap<String, String>, ToolError> {
     let mut originals = BTreeMap::new();
     for op in operations {
         if originals.contains_key(&op.file_path) {
@@ -434,7 +502,14 @@ async fn read_files(operations: &[EditOperation]) -> Result<BTreeMap<String, Str
         {
             return Err(ToolError::FileNotFound(op.file_path.clone()));
         }
-        let content = tokio::fs::read_to_string(&op.full_path)
+        let mut file = tokio::fs::File::open(&op.full_path)
+            .await
+            .map_err(|e| ToolError::Execution(e.to_string()))?;
+        if policy == ResolvePolicy::Contained {
+            crate::util::verify_handle_inside(&file, workspace, anchor)?;
+        }
+        let mut content = String::new();
+        file.read_to_string(&mut content)
             .await
             .map_err(|e| ToolError::Execution(e.to_string()))?;
         originals.insert(op.file_path.clone(), content);
@@ -450,10 +525,21 @@ async fn read_files(operations: &[EditOperation]) -> Result<BTreeMap<String, Str
 /// faults that the model cannot simply retry around.
 #[derive(Debug)]
 enum AbortReason {
-    /// One edit's target is a symbolic link (named in the message).
+    /// A target, or an in-workspace parent directory, is a symbolic link
+    /// (named in the message).
     ///
-    /// Produced by [`symlink_check`], before any file is written.
+    /// Produced by [`symlink_check`] under the contained policy, before
+    /// any file is written: resolve the link and pass the real path.
     Symlink(String),
+
+    /// Two edits' caller-supplied paths are physically the same file.
+    ///
+    /// Both spellings are named in the message, plus the shared stat
+    /// identity where the platform prints one. Produced by
+    /// [`physical_alias_check`] under both policies: each alias would
+    /// merge independently against the same original, and the second
+    /// write would silently clobber the first.
+    Alias(String),
 
     /// Two edits resolve to the same physical file under different path aliases.
     ///
@@ -486,6 +572,7 @@ impl AbortReason {
     fn into_output(self) -> ToolOutput {
         match self {
             AbortReason::Symlink(msg)
+            | AbortReason::Alias(msg)
             | AbortReason::DupPath(msg)
             | AbortReason::Locate(msg)
             | AbortReason::Overlap(msg)
@@ -496,12 +583,17 @@ impl AbortReason {
 
 /// Reject the batch if two edits resolve to the same physical file under different path aliases.
 ///
-/// Aliases like `a.rs` and `./a.rs` are the trigger. Maps each resolved path to the first caller-supplied path seen for it and
+/// Aliases like `a.rs` and `./a.rs` are the trigger — the lexically
+/// visible case. Maps each resolved path to the first caller-supplied path
+/// seen for it and
 /// rejects on any later alias. Each edit would otherwise be merged
 /// independently against the same original, and the second write would
 /// silently clobber the first — losing one edit-set. Refusing is safer than
 /// picking a winner. Multiple edits sharing both `file_path` and `full_path`
-/// (the normal multi-edit-to-one-file case) are allowed.
+/// (the normal multi-edit-to-one-file case) are allowed. Lexically distinct
+/// but physically identical targets — the workspace's resolved spelling
+/// beside the operator's, or hard links — are caught by
+/// [`physical_alias_check`], which runs after this check.
 fn dup_path_check(operations: &[EditOperation]) -> Option<AbortReason> {
     let mut owner: std::collections::HashMap<&Path, &str> = std::collections::HashMap::new();
     for op in operations {
@@ -524,17 +616,25 @@ fn dup_path_check(operations: &[EditOperation]) -> Option<AbortReason> {
     None
 }
 
-/// Reject the batch if any distinct target — or any of its ancestor directories — is a symbolic link.
+/// Reject the batch if any target — or any of its in-workspace ancestor
+/// directories — is a symbolic link.
 ///
 /// `atomic_write`'s own symlink guard fires at write time and checks only the
 /// final component, too late for the atomic contract (file #1 could already be
 /// written before file #2's symlink errors). This pre-check walks every
 /// ancestor of each target with `symlink_metadata` (no follow) during the read
 /// pass, before any write, so a symlinked parent directory is caught too.
-fn symlink_check(operations: &[EditOperation]) -> Option<AbortReason> {
+/// Ancestors at or above `workspace` are skipped: the anchor's own spelling is
+/// the operator's choice and may cross symlinks by design — the same
+/// below-anchor judgment the pinned write's walk applies — so only
+/// in-workspace components are judged.
+fn symlink_check(operations: &[EditOperation], workspace: &Path) -> Option<AbortReason> {
     let mut seen = std::collections::HashSet::new();
     for op in operations {
         for ancestor in op.full_path.ancestors() {
+            if workspace.starts_with(ancestor) {
+                continue;
+            }
             if !seen.insert(ancestor) {
                 continue;
             }
@@ -549,6 +649,167 @@ fn symlink_check(operations: &[EditOperation]) -> Option<AbortReason> {
         }
     }
     None
+}
+
+/// Rewrite each target to its physical path (Unrestricted).
+///
+/// Unrestricted writes honor symbolic links, so each existing target is
+/// canonicalized and the write lands on the real file with the link left
+/// intact; targets that do not exist yet (new files) keep their submitted
+/// path. An unresolvable link — dangling or looping — refuses the batch
+/// with the same resolution error Write and Edit surface, rather than a
+/// generic miss later in the read phase. Physically identical targets are
+/// refused earlier by [`physical_alias_check`], which also covers the
+/// hard-link aliases canonicalization cannot see.
+///
+/// # Errors
+///
+/// Returns [`ToolError`] when a target cannot be canonicalized.
+fn honor_symlink_targets(operations: &mut [EditOperation]) -> Result<(), ToolError> {
+    for op in operations {
+        op.full_path = canonicalize_existing(&op.full_path)?;
+    }
+    Ok(())
+}
+
+/// Reject the batch when two lexically distinct targets are physically the
+/// same file.
+///
+/// Path spellings can alias without any symlink: the workspace's resolved
+/// spelling and the operator's spelling both pass containment and name the
+/// same directories, and hard links alias any two entries. Each alias
+/// would merge independently against the same original and the writes
+/// would clobber one another — and the staleness re-read would then blame
+/// an external change the batch itself produced. Every distinct target is
+/// stated once and compared by physical identity; entries that cannot be
+/// stated do not exist yet and are left to the read phase to refuse. Runs
+/// under both policies: it protects the batch's own merge semantics, it is
+/// not containment.
+///
+/// Identity is per-platform (see [`physical_identity`]). Degradation: on
+/// platforms that expose no identity the check cannot fire — under
+/// Contained those platforms fail closed at the write anyway, while
+/// unrestricted multi-edit there keeps the alias hole. Two residuals are
+/// accepted and shared with the rest of the guard stack: separate
+/// (non-batch) calls to two hard-link spellings can still split a shared
+/// file — each call is internally consistent and no batch contract is at
+/// stake — and the universal stat-to-rename swap window applies here as
+/// everywhere else.
+fn physical_alias_check(operations: &[EditOperation]) -> Option<AbortReason> {
+    let mut seen = std::collections::HashSet::new();
+    let mut identities: std::collections::HashMap<PhysicalIdentity, String> =
+        std::collections::HashMap::new();
+    for op in operations {
+        if !seen.insert(op.full_path.as_path()) {
+            continue;
+        }
+        let Some(identity) = physical_identity(&op.full_path) else {
+            continue;
+        };
+        if let Some(existing) = identities.get(&identity) {
+            if *existing != op.file_path.as_str() {
+                return Some(AbortReason::Alias(alias_refusal(
+                    existing,
+                    &op.file_path,
+                    identity,
+                )));
+            }
+            continue;
+        }
+        identities.insert(identity, op.file_path.clone());
+    }
+    None
+}
+
+/// The physical identity of one filesystem entry, for alias comparison.
+///
+/// Unix keys by the stat pair (device, inode); platforms served by
+/// `same-file` key by its handle, whose equality and hash compare the
+/// underlying file rather than its name. A platform with neither has no
+/// identity and [`physical_alias_check`] degrades to no detection.
+#[cfg(unix)]
+type PhysicalIdentity = (u64, u64);
+
+/// The physical identity of one filesystem entry, for alias comparison.
+///
+/// Windows counterpart: the `same-file` handle (volume serial plus file
+/// index), hashable and comparable by what the entry points at.
+#[cfg(windows)]
+type PhysicalIdentity = same_file::Handle;
+
+/// The physical identity of one filesystem entry, for alias comparison.
+///
+/// Platforms with neither a stat identity nor a `same-file` handle have
+/// nothing to key on; the placeholder always resolves to `None`, so the
+/// alias check degrades to no detection there.
+#[cfg(not(any(unix, windows)))]
+type PhysicalIdentity = ();
+
+/// The identity of the file `path` reaches, or `None` when it cannot be
+/// determined.
+///
+/// `None` covers a not-yet-existing target — the read phase refuses that
+/// instead — and a platform or entry that exposes no identity.
+#[cfg(unix)]
+fn physical_identity(path: &Path) -> Option<PhysicalIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path)
+        .ok()
+        .map(|meta| (meta.dev(), meta.ino()))
+}
+
+/// The identity of the file `path` reaches, or `None` when it cannot be
+/// determined.
+///
+/// Windows counterpart: opening the entry through `same-file` and keying
+/// on its handle.
+#[cfg(windows)]
+fn physical_identity(path: &Path) -> Option<PhysicalIdentity> {
+    same_file::Handle::from_path(path).ok()
+}
+
+/// The identity of the file `path` reaches, or `None` when it cannot be
+/// determined.
+///
+/// Platform without an identity mechanism: always `None`.
+#[cfg(not(any(unix, windows)))]
+fn physical_identity(_path: &Path) -> Option<PhysicalIdentity> {
+    None
+}
+
+/// Format the refusal for two spellings of one physical file.
+///
+/// Unix names the shared stat pair so the caller can see the aliases
+/// collided at the inode level; platforms without a printable identity
+/// name the fact alone.
+#[cfg(unix)]
+fn alias_refusal(first: &str, second: &str, identity: PhysicalIdentity) -> String {
+    format!(
+        "Refusing to write: '{first}' and '{second}' are the same file (same \
+         inode: {}:{}). Combine them into one set of edits.",
+        identity.0, identity.1
+    )
+}
+
+/// Format the refusal for two spellings of one physical file.
+///
+/// Windows counterpart: no printable identity, so the message names the
+/// collision alone.
+#[cfg(windows)]
+fn alias_refusal(first: &str, second: &str, _identity: PhysicalIdentity) -> String {
+    format!(
+        "Refusing to write: '{first}' and '{second}' are the same file. \
+         Combine them into one set of edits."
+    )
+}
+
+/// Format the refusal for two spellings of one physical file.
+///
+/// Platform without an identity mechanism: the branch is unreachable (no
+/// identity, no collision), but the compilation unit needs the binding.
+#[cfg(not(any(unix, windows)))]
+fn alias_refusal(first: &str, second: &str, _identity: PhysicalIdentity) -> String {
+    format!("Refusing to write: '{first}' and '{second}' are the same file.")
 }
 
 /// A pair of edits whose `old_text` byte-ranges overlap in the same file.
@@ -882,6 +1143,7 @@ fn apply_summary(preview: &str, applied: &[&str], operations: &[EditOperation]) 
 mod tests {
     use super::*;
     use crate::context::RunnerContext;
+    use crate::util::ResolvePolicy;
     use loopctl::tool::ToolContext;
     use std::path::PathBuf;
 
@@ -890,6 +1152,14 @@ mod tests {
         let mut ctx = ToolContext::default();
         ctx.cwd = cwd.to_string();
         ctx.set_extension(RunnerContext::new(PathBuf::from(cwd)));
+        ctx
+    }
+
+    /// Builds a `ToolContext` whose runner context resolves under `policy`.
+    fn ctx_with_policy(cwd: &std::path::Path, policy: ResolvePolicy) -> ToolContext {
+        let mut ctx = ToolContext::default();
+        ctx.cwd = cwd.to_string_lossy().into_owned();
+        ctx.set_extension(RunnerContext::new(PathBuf::from(cwd)).with_resolve_policy(policy));
         ctx
     }
 
@@ -1044,7 +1314,7 @@ mod tests {
     #[test]
     fn build_operations_resolves_relative_path() {
         let edits = vec![edit("a.rs", "x", "y")];
-        let ops = build_operations(&edits, Path::new("/work")).unwrap();
+        let ops = build_operations(&edits, Path::new("/work"), ResolvePolicy::Contained).unwrap();
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].file_path, "a.rs");
         assert_eq!(ops[0].full_path, PathBuf::from("/work/a.rs"));
@@ -1053,22 +1323,37 @@ mod tests {
     #[test]
     fn build_operations_rejects_unrelated_absolute_path() {
         let edits = vec![edit("/abs/a.rs", "x", "y")];
-        assert!(build_operations(&edits, Path::new("/work")).is_err());
+        assert!(build_operations(&edits, Path::new("/work"), ResolvePolicy::Contained).is_err());
     }
 
     #[test]
     fn build_operations_missing_fields_are_invalid() {
         let cwd = Path::new("/work");
         assert!(matches!(
-            build_operations(&[json!({ "old_text": "x", "new_text": "y" })], cwd).unwrap_err(),
+            build_operations(
+                &[json!({ "old_text": "x", "new_text": "y" })],
+                cwd,
+                ResolvePolicy::Contained
+            )
+            .unwrap_err(),
             ToolError::InvalidInput(_)
         ));
         assert!(matches!(
-            build_operations(&[json!({ "file_path": "a", "new_text": "y" })], cwd).unwrap_err(),
+            build_operations(
+                &[json!({ "file_path": "a", "new_text": "y" })],
+                cwd,
+                ResolvePolicy::Contained
+            )
+            .unwrap_err(),
             ToolError::InvalidInput(_)
         ));
         assert!(matches!(
-            build_operations(&[json!({ "file_path": "a", "old_text": "x" })], cwd).unwrap_err(),
+            build_operations(
+                &[json!({ "file_path": "a", "old_text": "x" })],
+                cwd,
+                ResolvePolicy::Contained
+            )
+            .unwrap_err(),
             ToolError::InvalidInput(_)
         ));
     }
@@ -1076,14 +1361,20 @@ mod tests {
     #[test]
     fn build_operations_empty_old_text_is_invalid() {
         let cwd = Path::new("/work");
-        let err = build_operations(&[edit("a.rs", "", "y")], cwd).unwrap_err();
+        let err =
+            build_operations(&[edit("a.rs", "", "y")], cwd, ResolvePolicy::Contained).unwrap_err();
         assert!(matches!(err, ToolError::InvalidInput(ref s) if s.contains("empty")));
     }
 
     #[test]
     fn build_operations_url_is_invalid() {
         let cwd = Path::new("/work");
-        let err = build_operations(&[edit("https://e.com/x", "a", "b")], cwd).unwrap_err();
+        let err = build_operations(
+            &[edit("https://e.com/x", "a", "b")],
+            cwd,
+            ResolvePolicy::Contained,
+        )
+        .unwrap_err();
         assert!(matches!(err, ToolError::InvalidInput(ref s) if s.contains("WebFetch")));
     }
 
@@ -1111,6 +1402,207 @@ mod tests {
         assert!(dup_path_check(&ops).unwrap().into_output().is_error);
     }
 
+    #[test]
+    fn honor_symlink_targets_accepts_repeated_ops_for_one_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("a.rs");
+        std::fs::write(&target, "x").unwrap();
+        let mut ops = vec![
+            EditOperation {
+                file_path: "a.rs".to_string(),
+                full_path: target.clone(),
+                old_text: "x".to_string(),
+                new_text: "y".to_string(),
+            },
+            EditOperation {
+                file_path: "a.rs".to_string(),
+                full_path: target.clone(),
+                old_text: "y".to_string(),
+                new_text: "z".to_string(),
+            },
+        ];
+        honor_symlink_targets(&mut ops).unwrap();
+        let real = std::fs::canonicalize(&target).unwrap();
+        assert!(ops.iter().all(|op| op.full_path == real));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn multi_edit_accepts_the_workspaces_canonical_spelling() {
+        // The resolved spelling passes containment; the pinned walk anchors
+        // at whichever spelling the batch uses.
+        use std::os::unix::fs::symlink;
+
+        let real = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let anchor_link = workspace.path().join("project");
+        symlink(real.path(), &anchor_link).unwrap();
+        std::fs::create_dir_all(real.path().join("src")).unwrap();
+        std::fs::write(real.path().join("src").join("a.rs"), "fn one() {}\n").unwrap();
+
+        let tool = MultiEditTool;
+        // The context is anchored at the symlink; the edit addresses the
+        // file through the canonical spelling, exercising the walk's
+        // resolved-form branch with a symlinked workspace anchor.
+        let ctx = ctx_in(anchor_link.to_str().unwrap());
+        let input = json!({
+            "edits": [edit(
+                real.path().join("src").join("a.rs").to_str().unwrap(),
+                "fn one() {}",
+                "fn one(x: i32) {}",
+            )]
+        });
+        let out = tool.call(input, &ctx).await.unwrap();
+        assert!(!out.is_error, "{}", out.text_content());
+        assert_eq!(
+            std::fs::read_to_string(real.path().join("src").join("a.rs")).unwrap(),
+            "fn one(x: i32) {}\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mixed_spelling_batch_refuses_before_anything_is_written() {
+        // One file named via the anchor spelling and once via the resolved
+        // spelling: physically one file, lexically two targets. Each alias
+        // would merge against the same original and the writes would
+        // clobber one another — the identity check refuses before anything
+        // lands, and the blame cannot fall on an external change.
+        use std::os::unix::fs::symlink;
+
+        let real = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let anchor_link = workspace.path().join("project");
+        symlink(real.path(), &anchor_link).unwrap();
+        std::fs::create_dir_all(real.path().join("src")).unwrap();
+        std::fs::write(real.path().join("src").join("a.rs"), "fn one() {}\n").unwrap();
+
+        let tool = MultiEditTool;
+        let ctx = ctx_in(anchor_link.to_str().unwrap());
+        let input = json!({
+            "edits": [
+                edit("src/a.rs", "fn one() {}", "fn uno()"),
+                edit(
+                    real.path().join("src").join("a.rs").to_str().unwrap(),
+                    "fn one() {}",
+                    "fn dos()"
+                ),
+            ]
+        });
+        let out = tool.call(input, &ctx).await.unwrap();
+        assert!(out.is_error, "{}", out.text_content());
+        assert!(
+            out.text_content().contains("same file"),
+            "{}",
+            out.text_content()
+        );
+        assert_eq!(
+            std::fs::read_to_string(real.path().join("src").join("a.rs")).unwrap(),
+            "fn one() {}\n",
+            "nothing may be written by the refused batch"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn physical_alias_check_refuses_distinct_paths_to_one_file() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let real = tmp.path().join("real.rs");
+        let link = tmp.path().join("link.rs");
+        std::fs::write(&real, "x").unwrap();
+        symlink(&real, &link).unwrap();
+        let ops = vec![
+            EditOperation {
+                file_path: "real.rs".to_string(),
+                full_path: real,
+                old_text: "x".to_string(),
+                new_text: "y".to_string(),
+            },
+            EditOperation {
+                file_path: "link.rs".to_string(),
+                full_path: link,
+                old_text: "x".to_string(),
+                new_text: "y".to_string(),
+            },
+        ];
+        let reason = physical_alias_check(&ops).expect("physical alias aborts");
+        match &reason {
+            AbortReason::Alias(message) => assert!(
+                message.contains("same inode"),
+                "the refusal must name the shared identity: {message}"
+            ),
+            other => panic!("the physical-identity refusal fires: {other:?}"),
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn physical_alias_check_refuses_distinct_paths_to_one_file_on_windows() {
+        // The non-unix half of the alias guard: hard links are detected
+        // through `same-file`'s handle equality (volume serial plus file
+        // index) rather than a stat pair.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let real = tmp.path().join("real.rs");
+        let hard = tmp.path().join("hard.rs");
+        std::fs::write(&real, "x").unwrap();
+        std::fs::hard_link(&real, &hard).unwrap();
+        let ops = vec![
+            EditOperation {
+                file_path: "real.rs".to_string(),
+                full_path: real,
+                old_text: "x".to_string(),
+                new_text: "y".to_string(),
+            },
+            EditOperation {
+                file_path: "hard.rs".to_string(),
+                full_path: hard,
+                old_text: "x".to_string(),
+                new_text: "y".to_string(),
+            },
+        ];
+        let reason = physical_alias_check(&ops).expect("physical alias aborts");
+        assert!(
+            matches!(reason, AbortReason::Alias(_)),
+            "the hard-link pair must abort the batch: {reason:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broken_symlink_target_refuses_the_batch_with_the_resolution_error() {
+        // The unresolvable-link contract is Write/Edit's: a dangling link
+        // is refused where it is encountered, with the resolution error
+        // naming the target — not re-spelled and failed later in the read
+        // phase with a generic miss.
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let link = tmp.path().join("link.rs");
+        symlink(tmp.path().join("absent.rs"), &link).unwrap();
+        let mut ops = vec![EditOperation {
+            file_path: "link.rs".to_string(),
+            full_path: link.clone(),
+            old_text: "x".to_string(),
+            new_text: "y".to_string(),
+        }];
+
+        let err = honor_symlink_targets(&mut ops).unwrap_err();
+        assert!(
+            matches!(err, ToolError::Execution(ref s) if s.contains("cannot resolve")),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string().contains("absent.rs"),
+            "the refusal must name the broken target: {err}"
+        );
+        assert_eq!(
+            ops[0].full_path, link,
+            "the refusal leaves the submitted path untouched"
+        );
+    }
+
     #[tokio::test]
     async fn read_files_missing_is_file_not_found() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1120,7 +1612,9 @@ mod tests {
             old_text: "a".to_string(),
             new_text: "b".to_string(),
         }];
-        let err = read_files(&ops).await.unwrap_err();
+        let err = read_files(&ops, tmp.path(), ResolvePolicy::Contained, None)
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::FileNotFound(_)), "{err:?}");
     }
 
@@ -1135,7 +1629,9 @@ mod tests {
             old_text: "a".to_string(),
             new_text: "b".to_string(),
         }];
-        let err = read_files(&ops).await.unwrap_err();
+        let err = read_files(&ops, tmp.path(), ResolvePolicy::Contained, None)
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::Execution(_)), "{err:?}");
     }
 
@@ -1159,7 +1655,9 @@ mod tests {
                 new_text: "d".to_string(),
             },
         ];
-        let map = read_files(&ops).await.unwrap();
+        let map = read_files(&ops, tmp.path(), ResolvePolicy::Contained, None)
+            .await
+            .unwrap();
         assert_eq!(map.len(), 1);
         assert_eq!(map.get("a.rs").unwrap(), "content\n");
     }
@@ -1175,7 +1673,89 @@ mod tests {
             old_text: "x".to_string(),
             new_text: "y".to_string(),
         }];
-        assert!(symlink_check(&ops).is_none());
+        assert!(symlink_check(&ops, tmp.path()).is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_workspace_anchor_allows_a_contained_batch() {
+        // The workspace spelling is the operator's anchor choice and may
+        // cross symlinks; the ancestor walk judges only in-workspace
+        // components, so a contained batch in a link-anchored workspace
+        // succeeds exactly like Write and Edit.
+        use std::os::unix::fs::symlink;
+
+        let real = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let anchor = workspace.path().join("project");
+        symlink(real.path(), &anchor).unwrap();
+        std::fs::create_dir_all(real.path().join("src")).unwrap();
+        std::fs::write(real.path().join("src").join("a.rs"), "fn one() {}\n").unwrap();
+
+        let tool = MultiEditTool;
+        let ctx = ctx_in(anchor.to_str().unwrap());
+        let input = json!({
+            "edits": [edit("src/a.rs", "fn one() {}", "fn one(x: i32) {}")]
+        });
+        let out = tool.call(input, &ctx).await.unwrap();
+        assert!(!out.is_error, "{}", out.text_content());
+        assert_eq!(
+            std::fs::read_to_string(real.path().join("src").join("a.rs")).unwrap(),
+            "fn one(x: i32) {}\n"
+        );
+        assert!(
+            std::fs::symlink_metadata(&anchor)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the anchor link itself must survive the batch"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn contained_batch_pins_the_workspace_anchor_against_a_later_swap() {
+        // The batch's read phase is judged against the pinned root: after
+        // the anchor symlink is swapped, the batch must refuse before any
+        // validation result can act on content sourced from the
+        // swapped-in directory.
+        use std::os::unix::fs::symlink;
+
+        let real = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let anchor_link = workspace.path().join("project");
+        symlink(real.path(), &anchor_link).unwrap();
+        std::fs::write(real.path().join("a.rs"), "fn one() {}\n").unwrap();
+        std::fs::write(outside.path().join("a.rs"), "fn outside() {}\n").unwrap();
+
+        let ctx = ctx_in(anchor_link.to_str().unwrap());
+        std::fs::remove_file(&anchor_link).unwrap();
+        symlink(outside.path(), &anchor_link).unwrap();
+
+        let tool = MultiEditTool;
+        let input = json!({
+            "edits": [edit(
+                anchor_link.join("a.rs").to_str().unwrap(),
+                "fn outside()",
+                "fn replaced()"
+            )]
+        });
+        let err = tool.call(input, &ctx).await.unwrap_err();
+        assert!(
+            err.to_string().contains("escaped"),
+            "the post-swap location must be rejected: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(real.path().join("a.rs")).unwrap(),
+            "fn one() {}\n",
+            "the pinned workspace's file must be untouched"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("a.rs")).unwrap(),
+            "fn outside() {}\n",
+            "the swapped-in file must be untouched"
+        );
     }
 
     #[cfg(unix)]
@@ -1193,7 +1773,7 @@ mod tests {
             old_text: "x".to_string(),
             new_text: "y".to_string(),
         }];
-        let reason = symlink_check(&ops).expect("should abort");
+        let reason = symlink_check(&ops, tmp.path()).expect("should abort");
         assert!(matches!(reason, AbortReason::Symlink(_)));
     }
 
@@ -1342,6 +1922,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multi_edit_honors_the_context_resolve_policy_outside_the_workspace() {
+        // `build_operations` is the one call site where the policy threads
+        // through a second function — pin the whole tool path: an edit of a
+        // file outside the workspace errors contained and lands unrestricted.
+        let workspace = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let target = outside.path().join("lib.rs");
+        std::fs::write(&target, "fn one() {}\n").unwrap();
+        let tool = MultiEditTool;
+        let input = json!({
+            "edits": [edit(
+                target.to_str().unwrap(),
+                "fn one() {}",
+                "fn one(x: i32) {}",
+            )],
+        });
+
+        let contained = tool
+            .call(input.clone(), &ctx_in(workspace.path().to_str().unwrap()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(contained, ToolError::InvalidInput(ref msg) if msg.contains("escapes")),
+            "the contained default must reject the escape: {contained:?}"
+        );
+
+        let unrestricted = tool
+            .call(
+                input,
+                &ctx_with_policy(workspace.path(), ResolvePolicy::Unrestricted),
+            )
+            .await
+            .unwrap();
+        assert!(!unrestricted.is_error, "{}", unrestricted.text_content());
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "fn one(x: i32) {}\n"
+        );
+    }
+
+    #[tokio::test]
     async fn atomic_abort_on_ambiguous_old_text() {
         let tmp = tempfile::TempDir::new().unwrap();
         let f1 = tmp.path().join("a.rs");
@@ -1445,6 +2066,27 @@ mod tests {
         );
         // Nothing written.
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "fn one() {}\n");
+    }
+
+    #[tokio::test]
+    async fn unrestricted_batch_applies_repeated_edits_to_one_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let f = tmp.path().join("a.rs");
+        std::fs::write(&f, "fn one() {}\nfn two() {}\n").unwrap();
+        let tool = MultiEditTool;
+        let ctx = ctx_with_policy(tmp.path(), ResolvePolicy::Unrestricted);
+        let input = json!({
+            "edits": [
+                edit("a.rs", "fn one()", "fn uno()"),
+                edit("a.rs", "fn two()", "fn dos()"),
+            ]
+        });
+        let out = tool.call(input, &ctx).await.unwrap();
+        assert!(!out.is_error, "{}", out.text_content());
+        assert_eq!(
+            std::fs::read_to_string(&f).unwrap(),
+            "fn uno() {}\nfn dos() {}\n"
+        );
     }
 
     #[cfg(unix)]
@@ -1973,9 +2615,16 @@ mod tests {
             new_text: "rewritten".to_string(),
         }];
 
-        let outcome = write_finals(&operations, &originals, &finals, None)
-            .await
-            .unwrap();
+        let outcome = write_finals(
+            &operations,
+            &originals,
+            &finals,
+            None,
+            tmp.path(),
+            ResolvePolicy::Contained,
+        )
+        .await
+        .unwrap();
         let conflict = outcome.expect("an externally changed file aborts the batch");
         assert_eq!(conflict.path, "a.rs");
         assert!(
@@ -2017,9 +2666,16 @@ mod tests {
             },
         ];
 
-        let outcome = write_finals(&operations, &originals, &finals, None)
-            .await
-            .unwrap();
+        let outcome = write_finals(
+            &operations,
+            &originals,
+            &finals,
+            None,
+            tmp.path(),
+            ResolvePolicy::Contained,
+        )
+        .await
+        .unwrap();
         let conflict = outcome.expect("the second file's conflict aborts the batch");
         assert_eq!(conflict.path, "b.rs");
         assert_eq!(conflict.applied, vec!["a.rs".to_string()]);
@@ -2028,6 +2684,146 @@ mod tests {
             std::fs::read_to_string(&second).unwrap(),
             "EXTERNAL",
             "the conflicted file must not be written"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_finals_fault_after_earlier_writes_names_what_landed() {
+        // File #2 has no parent directory, so its atomic write faults after
+        // file #1 is already on disk; the hard error must carry the partial
+        // batch report instead of discarding it. The deterministic fault is
+        // the contained walk's: file #2's parent component is a regular
+        // file, which the no-follow descent refuses.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let first = tmp.path().join("a.rs");
+        std::fs::write(&first, "A").unwrap();
+        std::fs::write(tmp.path().join("blocker"), "not a dir").unwrap();
+        let mut originals = BTreeMap::new();
+        originals.insert("a.rs".to_string(), "A".to_string());
+        let mut finals = BTreeMap::new();
+        finals.insert("a.rs".to_string(), "a2".to_string());
+        finals.insert("b.rs".to_string(), "b2".to_string());
+        let operations = vec![
+            EditOperation {
+                file_path: "a.rs".to_string(),
+                full_path: first.clone(),
+                old_text: "A".to_string(),
+                new_text: "a2".to_string(),
+            },
+            EditOperation {
+                file_path: "b.rs".to_string(),
+                full_path: tmp.path().join("blocker").join("b.rs"),
+                old_text: "B".to_string(),
+                new_text: "b2".to_string(),
+            },
+        ];
+
+        let err = write_finals(
+            &operations,
+            &originals,
+            &finals,
+            None,
+            tmp.path(),
+            ResolvePolicy::Contained,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Already written by this batch: a.rs"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&first).unwrap(),
+            "a2",
+            "the earlier write stays on disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_finals_conflict_fault_after_earlier_writes_names_what_landed() {
+        // File #2's re-read faults (its path is a directory, an I/O error
+        // rather than a change) after file #1 is already on disk; the hard
+        // error must carry the partial-batch report.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let first = tmp.path().join("a.rs");
+        std::fs::write(&first, "A").unwrap();
+        let second = tmp.path().join("b-dir");
+        std::fs::create_dir(&second).unwrap();
+        let mut originals = BTreeMap::new();
+        originals.insert("a.rs".to_string(), "A".to_string());
+        originals.insert("b.rs".to_string(), "B".to_string());
+        let mut finals = BTreeMap::new();
+        finals.insert("a.rs".to_string(), "a2".to_string());
+        finals.insert("b.rs".to_string(), "b2".to_string());
+        let operations = vec![
+            EditOperation {
+                file_path: "a.rs".to_string(),
+                full_path: first.clone(),
+                old_text: "A".to_string(),
+                new_text: "a2".to_string(),
+            },
+            EditOperation {
+                file_path: "b.rs".to_string(),
+                full_path: second,
+                old_text: "B".to_string(),
+                new_text: "b2".to_string(),
+            },
+        ];
+
+        let err = write_finals(
+            &operations,
+            &originals,
+            &finals,
+            None,
+            tmp.path(),
+            ResolvePolicy::Contained,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Already written by this batch: a.rs"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&first).unwrap(),
+            "a2",
+            "the earlier write stays on disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_finals_fault_on_the_first_file_adds_no_applied_report() {
+        // Nothing has landed when the first file faults, so the error must
+        // be returned untouched rather than carrying an empty-file trailer.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("b-dir");
+        std::fs::create_dir(&target).unwrap();
+        let mut originals = BTreeMap::new();
+        originals.insert("b.rs".to_string(), "B".to_string());
+        let mut finals = BTreeMap::new();
+        finals.insert("b.rs".to_string(), "b2".to_string());
+        let operations = vec![EditOperation {
+            file_path: "b.rs".to_string(),
+            full_path: target,
+            old_text: "B".to_string(),
+            new_text: "b2".to_string(),
+        }];
+
+        let err = write_finals(
+            &operations,
+            &originals,
+            &finals,
+            None,
+            tmp.path(),
+            ResolvePolicy::Contained,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            !err.to_string().contains("Already written"),
+            "no files landed, so no applied report is due: {err}"
         );
     }
 
@@ -2047,10 +2843,93 @@ mod tests {
             new_text: "rewritten".to_string(),
         }];
 
-        let outcome = write_finals(&operations, &originals, &finals, None)
-            .await
-            .unwrap();
+        let outcome = write_finals(
+            &operations,
+            &originals,
+            &finals,
+            None,
+            tmp.path(),
+            ResolvePolicy::Contained,
+        )
+        .await
+        .unwrap();
         assert!(outcome.is_none(), "matching disk content must not abort");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "rewritten");
+    }
+
+    /// A tool context carrying an Unrestricted runner policy.
+    fn unrestricted_ctx(dir: &std::path::Path) -> ToolContext {
+        let mut ctx = ToolContext::default();
+        ctx.cwd = dir.to_string_lossy().into_owned();
+        ctx.set_extension(
+            RunnerContext::new(std::path::PathBuf::from(dir))
+                .with_resolve_policy(ResolvePolicy::Unrestricted),
+        );
+        ctx
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unrestricted_writes_through_a_symlink_target() {
+        // The whole point of Unrestricted: the submitted path is honored as
+        // given — the write lands on the linked file and the link survives.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let real = tmp.path().join("real.rs");
+        std::fs::write(&real, "fn main() {}\n").unwrap();
+        let link = tmp.path().join("link.rs");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let tool = MultiEditTool;
+        let input = json!({"edits": [edit(
+            link.to_str().unwrap(),
+            "fn main() {}",
+            "fn main() { let _ = 1; }",
+        )]});
+        let out = tool
+            .call(input, &unrestricted_ctx(tmp.path()))
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.text_content());
+
+        assert_eq!(
+            std::fs::read_to_string(&real).unwrap(),
+            "fn main() { let _ = 1; }\n"
+        );
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link must survive an unrestricted write"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unrestricted_rejects_alias_pairs_writing_one_file_twice() {
+        // With links honored, two entries can name the same physical file —
+        // the batch is refused instead of writing it twice in a row.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let real = tmp.path().join("real.rs");
+        std::fs::write(&real, "A\n").unwrap();
+        let link = tmp.path().join("link.rs");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let tool = MultiEditTool;
+        let input = json!({"edits": [
+            edit(real.to_str().unwrap(), "A", "B"),
+            edit(link.to_str().unwrap(), "A", "C"),
+        ]});
+        let out = tool
+            .call(input, &unrestricted_ctx(tmp.path()))
+            .await
+            .unwrap();
+        assert!(out.is_error, "{}", out.text_content());
+        assert!(
+            out.text_content().contains("same file"),
+            "{}",
+            out.text_content()
+        );
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "A\n");
     }
 }
