@@ -474,6 +474,40 @@ mod tests {
         assert_eq!(required.len(), 2);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_accepts_the_workspaces_canonical_spelling() {
+        // The resolved spelling passes containment; the pinned walk anchors
+        // at whichever spelling the target uses, so the write lands through
+        // it and the anchor link survives.
+        use std::os::unix::fs::symlink;
+
+        let real = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let anchor_link = workspace.path().join("project");
+        symlink(real.path(), &anchor_link).unwrap();
+
+        let ctx = ctx_in(anchor_link.to_str().unwrap());
+        let tool = WriteInput::default();
+        let input = json!({
+            "file_path": real.path().join("landed.rs").to_str().unwrap(),
+            "content": "fn main() {}\n"
+        });
+        let out = tool.call(input, &ctx).await.unwrap();
+        assert!(!out.is_error, "{}", out.text_content());
+        assert_eq!(
+            std::fs::read_to_string(real.path().join("landed.rs")).unwrap(),
+            "fn main() {}\n"
+        );
+        assert!(
+            std::fs::symlink_metadata(&anchor_link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the anchor link must survive the write"
+        );
+    }
+
     #[tokio::test]
     async fn write_accepts_a_dotdot_workspace_spelling() {
         // The runner anchors the workspace lexically: a `..` in the

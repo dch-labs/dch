@@ -5,8 +5,11 @@
 //! rejects the merged content, two edits overlap in the same file) aborts
 //! the entire batch — no file is touched — as does a symbolic-link target
 //! under the contained policy. Under the unrestricted policy links are
-//! honored and writes land on the referent; only physical alias pairs are
-//! refused. `dry_run: true` previews diffs without writing.
+//! honored and writes land on the referent. Under both policies, a batch
+//! that addresses one physical file through multiple alias spellings —
+//! hard links included — is refused: each alias would merge independently
+//! against the same original and the writes would clobber one another.
+//! `dry_run: true` previews diffs without writing.
 //!
 //! The atomicity guarantee covers *validation*: if any edit is invalid, nothing
 //! is written. It does **not** cover crashes mid-write-batch — see the
@@ -164,12 +167,11 @@ impl MultiEditTool {
         if let Some(reason) = dup_path_check(&operations) {
             return Ok(reason.into_output());
         }
+        if let Some(reason) = physical_alias_check(&operations) {
+            return Ok(reason.into_output());
+        }
         if policy == ResolvePolicy::Unrestricted {
-            match honor_symlink_targets(&mut operations) {
-                Ok(Some(reason)) => return Ok(reason.into_output()),
-                Ok(None) => {}
-                Err(error) => return Err(error),
-            }
+            honor_symlink_targets(&mut operations)?;
         }
         let originals = read_files(&operations, &cwd, policy).await?;
         if policy == ResolvePolicy::Contained
@@ -520,12 +522,12 @@ enum AbortReason {
     /// any file is written: resolve the link and pass the real path.
     Symlink(String),
 
-    /// Two edits' caller-supplied paths resolve to one physical file (all
-    /// named in the message).
+    /// Two edits' caller-supplied paths are physically the same file (all
+    /// three named in the message, including the shared inode).
     ///
-    /// Produced by [`honor_symlink_targets`] under the unrestricted
-    /// policy: each alias would merge independently against the same
-    /// original, and the second write would silently clobber the first.
+    /// Produced by [`physical_alias_check`] under both policies: each
+    /// alias would merge independently against the same original, and the
+    /// second write would silently clobber the first.
     Alias(String),
 
     /// Two edits resolve to the same physical file under different path aliases.
@@ -570,12 +572,17 @@ impl AbortReason {
 
 /// Reject the batch if two edits resolve to the same physical file under different path aliases.
 ///
-/// Aliases like `a.rs` and `./a.rs` are the trigger. Maps each resolved path to the first caller-supplied path seen for it and
+/// Aliases like `a.rs` and `./a.rs` are the trigger — the lexically
+/// visible case. Maps each resolved path to the first caller-supplied path
+/// seen for it and
 /// rejects on any later alias. Each edit would otherwise be merged
 /// independently against the same original, and the second write would
 /// silently clobber the first — losing one edit-set. Refusing is safer than
 /// picking a winner. Multiple edits sharing both `file_path` and `full_path`
-/// (the normal multi-edit-to-one-file case) are allowed.
+/// (the normal multi-edit-to-one-file case) are allowed. Lexically distinct
+/// but physically identical targets — the workspace's resolved spelling
+/// beside the operator's, or hard links — are caught by
+/// [`physical_alias_check`], which runs after this check.
 fn dup_path_check(operations: &[EditOperation]) -> Option<AbortReason> {
     let mut owner: std::collections::HashMap<&Path, &str> = std::collections::HashMap::new();
     for op in operations {
@@ -633,53 +640,80 @@ fn symlink_check(operations: &[EditOperation], workspace: &Path) -> Option<Abort
     None
 }
 
-/// Rewrite each target to its physical path, refusing symlink aliases
-/// (Unrestricted).
+/// Rewrite each target to its physical path (Unrestricted).
 ///
 /// Unrestricted writes honor symbolic links, so each existing target is
 /// canonicalized and the write lands on the real file with the link left
-/// intact; repeated operations naming the same caller path are the normal
-/// multi-edit-to-one-file case and merge downstream. Two different caller
-/// paths resolving to one physical file are refused: each would merge
-/// independently against the same original, and the second write would
-/// silently clobber the first. The original `file_path` is kept for
-/// display. Targets that do not exist yet (new files) keep their submitted
-/// path, and an unresolvable link — dangling or looping — refuses the
-/// batch with the same resolution error Write and Edit surface, rather
-/// than a generic miss later in the read phase.
-///
-/// Returns the abort reason for the first alias pair found, if any.
+/// intact; targets that do not exist yet (new files) keep their submitted
+/// path. An unresolvable link — dangling or looping — refuses the batch
+/// with the same resolution error Write and Edit surface, rather than a
+/// generic miss later in the read phase. Physically identical targets are
+/// refused earlier by [`physical_alias_check`], which also covers the
+/// hard-link aliases canonicalization cannot see.
 ///
 /// # Errors
 ///
 /// Returns [`ToolError`] when a target cannot be canonicalized.
-fn honor_symlink_targets(
-    operations: &mut [EditOperation],
-) -> Result<Option<AbortReason>, ToolError> {
-    use std::collections::hash_map::Entry;
+fn honor_symlink_targets(operations: &mut [EditOperation]) -> Result<(), ToolError> {
+    for op in operations {
+        op.full_path = canonicalize_existing(&op.full_path)?;
+    }
+    Ok(())
+}
 
-    let mut physical: std::collections::HashMap<std::path::PathBuf, String> =
+/// Reject the batch when two lexically distinct targets are physically the
+/// same file.
+///
+/// Path spellings can alias without any symlink: the workspace's resolved
+/// spelling and the operator's spelling both pass containment and name the
+/// same directories, and hard links alias any two entries. Each alias
+/// would merge independently against the same original and the writes
+/// would clobber one another — and the staleness re-read would then blame
+/// an external change the batch itself produced. Every distinct target is
+/// stated once and compared by stat identity; entries that cannot be
+/// stated do not exist yet and are left to the read phase to refuse. Runs
+/// under both policies: it protects the batch's own merge semantics, it is
+/// not containment.
+///
+/// Degradation: on platforms without a stable stat identity the check
+/// cannot fire — under Contained those platforms fail closed at the write
+/// anyway, while unrestricted multi-edit there keeps the alias hole. Two
+/// residuals are accepted and shared with the rest of the guard stack:
+/// separate (non-batch) calls to two hard-link spellings can still split a
+/// shared file — each call is internally consistent and no batch contract
+/// is at stake — and the universal stat-to-rename swap window applies here
+/// as everywhere else.
+fn physical_alias_check(operations: &[EditOperation]) -> Option<AbortReason> {
+    let mut seen = std::collections::HashSet::new();
+    let mut identities: std::collections::HashMap<(u64, u64), String> =
         std::collections::HashMap::new();
     for op in operations {
-        let real = canonicalize_existing(&op.full_path)?;
-        match physical.entry(real.clone()) {
-            Entry::Occupied(existing) if existing.get() != &op.file_path => {
-                return Ok(Some(AbortReason::Alias(format!(
-                    "Refusing to write: '{}' and '{}' are the same file ({}). \
-                     Combine them into one set of edits.",
-                    existing.get(),
-                    op.file_path,
-                    real.display()
-                ))));
-            }
-            Entry::Occupied(_) => {}
-            Entry::Vacant(slot) => {
-                slot.insert(op.file_path.clone());
-            }
+        if !seen.insert(op.full_path.as_path()) {
+            continue;
         }
-        op.full_path = real;
+        #[cfg(unix)]
+        let identity = std::fs::metadata(&op.full_path).ok().map(|meta| {
+            use std::os::unix::fs::MetadataExt;
+            (meta.dev(), meta.ino())
+        });
+        #[cfg(not(unix))]
+        let identity: Option<(u64, u64)> = None;
+        let Some(identity) = identity else {
+            continue;
+        };
+        if let Some(existing) = identities.get(&identity) {
+            if *existing != op.file_path.as_str() {
+                return Some(AbortReason::Alias(format!(
+                    "Refusing to write: '{}' and '{}' are the same file (same inode: \
+                     {}:{}). Combine them into one set of edits.",
+                    existing, op.file_path, identity.0, identity.1
+                )));
+            }
+            continue;
+        }
+        identities.insert(identity, op.file_path.clone());
     }
-    Ok(None)
+    None
 }
 
 /// A pair of edits whose `old_text` byte-ranges overlap in the same file.
@@ -1291,14 +1325,84 @@ mod tests {
                 new_text: "z".to_string(),
             },
         ];
-        assert!(honor_symlink_targets(&mut ops).unwrap().is_none());
+        honor_symlink_targets(&mut ops).unwrap();
         let real = std::fs::canonicalize(&target).unwrap();
         assert!(ops.iter().all(|op| op.full_path == real));
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn multi_edit_accepts_the_workspaces_canonical_spelling() {
+        // The resolved spelling passes containment; the pinned walk anchors
+        // at whichever spelling the batch uses.
+        use std::os::unix::fs::symlink;
+
+        let real = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let anchor_link = workspace.path().join("project");
+        symlink(real.path(), &anchor_link).unwrap();
+        std::fs::create_dir_all(real.path().join("src")).unwrap();
+        std::fs::write(real.path().join("src").join("a.rs"), "fn one() {}\n").unwrap();
+
+        let tool = MultiEditTool;
+        let ctx = ctx_in(real.path().to_str().unwrap());
+        let input = json!({
+            "edits": [edit("src/a.rs", "fn one() {}", "fn one(x: i32) {}")]
+        });
+        let out = tool.call(input, &ctx).await.unwrap();
+        assert!(!out.is_error, "{}", out.text_content());
+        assert_eq!(
+            std::fs::read_to_string(real.path().join("src").join("a.rs")).unwrap(),
+            "fn one(x: i32) {}\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mixed_spelling_batch_refuses_before_anything_is_written() {
+        // One file named via the anchor spelling and once via the resolved
+        // spelling: physically one file, lexically two targets. Each alias
+        // would merge against the same original and the writes would
+        // clobber one another — the identity check refuses before anything
+        // lands, and the blame cannot fall on an external change.
+        use std::os::unix::fs::symlink;
+
+        let real = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let anchor_link = workspace.path().join("project");
+        symlink(real.path(), &anchor_link).unwrap();
+        std::fs::create_dir_all(real.path().join("src")).unwrap();
+        std::fs::write(real.path().join("src").join("a.rs"), "fn one() {}\n").unwrap();
+
+        let tool = MultiEditTool;
+        let ctx = ctx_in(anchor_link.to_str().unwrap());
+        let input = json!({
+            "edits": [
+                edit("src/a.rs", "fn one() {}", "fn uno()"),
+                edit(
+                    real.path().join("src").join("a.rs").to_str().unwrap(),
+                    "fn one() {}",
+                    "fn dos()"
+                ),
+            ]
+        });
+        let out = tool.call(input, &ctx).await.unwrap();
+        assert!(out.is_error, "{}", out.text_content());
+        assert!(
+            out.text_content().contains("same file"),
+            "{}",
+            out.text_content()
+        );
+        assert_eq!(
+            std::fs::read_to_string(real.path().join("src").join("a.rs")).unwrap(),
+            "fn one() {}\n",
+            "nothing may be written by the refused batch"
+        );
+    }
+
+    #[cfg(unix)]
     #[test]
-    fn honor_symlink_targets_rejects_distinct_paths_to_one_file() {
+    fn physical_alias_check_refuses_distinct_paths_to_one_file() {
         use std::os::unix::fs::symlink;
 
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1306,7 +1410,7 @@ mod tests {
         let link = tmp.path().join("link.rs");
         std::fs::write(&real, "x").unwrap();
         symlink(&real, &link).unwrap();
-        let mut ops = vec![
+        let ops = vec![
             EditOperation {
                 file_path: "real.rs".to_string(),
                 full_path: real,
@@ -1320,10 +1424,14 @@ mod tests {
                 new_text: "y".to_string(),
             },
         ];
-        let reason = honor_symlink_targets(&mut ops)
-            .unwrap()
-            .expect("alias pair aborts");
-        assert!(matches!(reason, AbortReason::Alias(_)));
+        let reason = physical_alias_check(&ops).expect("physical alias aborts");
+        match &reason {
+            AbortReason::Alias(message) => assert!(
+                message.contains("same inode"),
+                "the refusal must name the shared identity: {message}"
+            ),
+            other => panic!("the physical-identity refusal fires: {other:?}"),
+        }
     }
 
     #[cfg(unix)]

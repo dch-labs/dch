@@ -219,7 +219,10 @@ impl Drop for PinnedDir {
 /// in-workspace links — only operations that leave new filesystem entries
 /// behind are no-follow. The workspace anchor itself is opened following
 /// links: it is the operator-supplied root, while the descent — where a
-/// concurrent swap would land — is strictly no-follow.
+/// concurrent swap would land — is strictly no-follow. `parent` may be
+/// spelled through the anchor or through the workspace's resolved form
+/// (both are accepted for containment); the walk anchors at whichever
+/// spelling matched — physically the same directory.
 ///
 /// With `create_missing`, directories that do not exist are created
 /// through the pinned chain (`mkdirat` on the current descriptor) and
@@ -244,13 +247,25 @@ fn open_contained_dir(
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
-    let relative = parent.strip_prefix(workspace).map_err(|_| {
-        ToolError::Execution(format!(
-            "cannot create directories safely: {} is not inside {}",
-            parent.display(),
-            workspace.display()
-        ))
-    })?;
+    // The parent may be spelled through the operator's anchor or through
+    // the workspace's resolved form — `resolve_path` accepts both. Match
+    // whichever spelling the parent uses and anchor the walk there; the
+    // no-follow descent below the anchor is identical either way.
+    let canonical_workspace =
+        std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+    let (anchor, relative) = match parent.strip_prefix(workspace) {
+        Ok(relative) => (workspace, relative),
+        Err(_) => match parent.strip_prefix(&canonical_workspace) {
+            Ok(relative) => (canonical_workspace.as_path(), relative),
+            Err(_) => {
+                return Err(ToolError::Execution(format!(
+                    "cannot create directories safely: {} is not inside {}",
+                    parent.display(),
+                    workspace.display()
+                )));
+            }
+        },
+    };
 
     let mut pinned = PinnedDir {
         dir_fd: -1,
@@ -258,7 +273,7 @@ fn open_contained_dir(
         created: Vec::new(),
     };
     let failure = (|| {
-        let root = open_dir_fd(workspace, libc::O_RDONLY | libc::O_DIRECTORY)?;
+        let root = open_dir_fd(anchor, libc::O_RDONLY | libc::O_DIRECTORY)?;
         pinned.walked.push(root);
         let mut current = root;
         for component in relative.components() {
