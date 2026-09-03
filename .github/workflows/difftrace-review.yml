@@ -1,0 +1,83 @@
+name: difftrace review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "Pull request number to review"
+        required: true
+      model:
+        description: "Model to review with"
+        required: false
+
+concurrency:
+  group: difftrace-review-${{ inputs.pr || github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  review:
+    name: Review the pull request
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.pull_request.user.login != 'dependabot[bot]'
+    steps:
+      - name: Resolve the pull request number
+        id: pr
+        env:
+          PR: ${{ inputs.pr || github.event.pull_request.number }}
+        run: |
+          case "$PR" in ''|*[!0-9]*) echo "invalid PR number: $PR" >&2; exit 1;; esac
+          echo "pr=$PR" >> "$GITHUB_OUTPUT"
+
+      - name: Install difftrace v0.1.1
+        run: |
+          curl -fsSL -o /tmp/difftrace.tar.gz \
+            https://github.com/dch-labs/difftrace/releases/download/v0.1.1/difftrace-0.1.1-x86_64-unknown-linux-gnu.tar.gz
+          echo "PENDING_V0_1_1_SHA256  /tmp/difftrace.tar.gz" | sha256sum -c -
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf /tmp/difftrace.tar.gz -C "$HOME/.local/bin"
+
+      - name: Check the required secrets are present
+        env:
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          DIFFTRACE_APP_ID: ${{ secrets.DIFFTRACE_APP_ID }}
+          DIFFTRACE_APP_PRIVATE_KEY: ${{ secrets.DIFFTRACE_APP_PRIVATE_KEY }}
+        run: |
+          : "${ZAI_API_KEY:?ZAI_API_KEY is not set - the review step would fail opaquely}"
+          : "${DIFFTRACE_APP_ID:?DIFFTRACE_APP_ID is not set - the review step would fail opaquely}"
+          : "${DIFFTRACE_APP_PRIVATE_KEY:?DIFFTRACE_APP_PRIVATE_KEY is not set - the review step would fail opaquely}"
+
+      - name: Mint the difftrace app token
+        uses: actions/create-github-app-token@v2
+        id: app-token
+        with:
+          app-id: ${{ secrets.DIFFTRACE_APP_ID }}
+          private-key: ${{ secrets.DIFFTRACE_APP_PRIVATE_KEY }}
+
+      - name: Review the pull request
+        run: |
+          difftrace review --repo "$REPO" --pr "$PR"
+        env:
+          PR: ${{ steps.pr.outputs.pr }}
+          REPO: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          DIFFTRACE_PROFILE: zai
+          DIFFTRACE_MODEL: ${{ inputs.model || 'glm-4.7' }}
+          RUST_LOG: info
+
+      - name: Upload trajectory
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: difftrace-trajectory-pr${{ steps.pr.outputs.pr }}
+          path: ~/.difftrace/trajectories/
+          if-no-files-found: ignore
+          retention-days: 7
