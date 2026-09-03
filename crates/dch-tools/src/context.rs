@@ -95,13 +95,16 @@ impl RunnerContext {
     /// A relative `cwd` is anchored to the process's current directory.
     /// [`resolve_path`](crate::util::resolve_path) decides containment by
     /// comparing lexical prefixes, and a bare `.` normalizes to nothing —
-    /// left un-anchored, it would reject every relative target. `.` and
-    /// trailing separators are stripped; symlinks are not resolved, matching
-    /// the lexical philosophy applied to targets. On the rare failure of the
-    /// current-directory probe, `cwd` is stored as given.
+    /// left un-anchored, it would reject every relative target. `.` and `..`
+    /// are collapsed lexically — a leftover `..` would break the pinned
+    /// write's prefix matching against this path — while symlinks are not
+    /// resolved, matching the lexical philosophy applied to targets. On the
+    /// rare failure of the current-directory probe, `cwd` is stored as
+    /// given.
     #[must_use]
     pub fn new(cwd: PathBuf) -> Self {
         let cwd = std::path::absolute(&cwd).unwrap_or(cwd);
+        let cwd = crate::util::normalize_lexical(&cwd);
         Self {
             cwd,
             todos: Arc::new(Mutex::new(Vec::new())),

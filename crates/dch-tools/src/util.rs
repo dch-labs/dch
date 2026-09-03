@@ -122,13 +122,15 @@ pub enum ResolvePolicy {
 /// 1. **Lexical containment** — the normalized result must start with
 ///    `cwd`'s components. Rejects `..` traversal and unrelated absolute
 ///    paths.
-/// 2. **Symlink containment** — each *existing* component of the resolved
-///    path is probed with `symlink_metadata`. A symlink's target is
+/// 2. **Symlink containment** — the workspace's *resolved* form is taken
+///    as the anchor (the operator-supplied spelling may itself cross
+///    symlinks; that choice is not judged), and each *existing* component
+///    below it is probed with `symlink_metadata`. A symlink's target is
 ///    resolved (absolute, or relative to the link's directory) and
-///    recursively checked against the same workspace boundary. A symlink
-///    whose chain leaves `cwd` is rejected. Non-existent components stop
-///    the walk, so writing a new file still works — only the existing
-///    prefix is verified.
+///    recursively checked against the resolved workspace boundary. A
+///    symlink whose chain leaves the workspace is rejected. Non-existent
+///    components stop the walk, so writing a new file still works — only
+///    the existing prefix is verified.
 ///
 /// Under [`ResolvePolicy::Unrestricted`] neither check runs — resolution
 /// makes no filesystem calls at all. Tilde (`~`) is never expanded; a
@@ -140,18 +142,23 @@ pub enum ResolvePolicy {
 /// drift apart. The symlink check closes the traversal vector where an
 /// in-workspace link points outside it. A TOCTOU window remains between
 /// this check and the caller's open: on Linux, file tools close it by
-/// verifying the opened handle via `/proc/self/fd` before any bytes move,
-/// and on other platforms contained file tools fail closed rather than
-/// proceed unverified; only the directory-walk tools keep the window,
-/// which needs descriptor-relative, `O_NOFOLLOW` opens to close.
+/// verifying the opened handle via `/proc/self/fd` before the write's bytes
+/// move, and on other platforms contained file tools fail closed rather
+/// than proceed unverified; only the directory-walk tools keep the window,
+/// which needs descriptor-relative, `O_NOFOLLOW` opens to close. One
+/// accepted exception: the staleness re-read inside the conflict check
+/// opens the target by path to compare bytes, without a handle check — a
+/// swap there can only skew a hash comparison, which the write's
+/// pre-rename identity gate then catches.
 ///
 /// # Errors
 ///
 /// Under [`ResolvePolicy::Contained`], returns
 /// [`ToolError::InvalidInput`] when the resolved path does not stay within
 /// `cwd`, either lexically or via a symlink, and [`ToolError::Execution`]
-/// when a symlink cannot be read. [`ResolvePolicy::Unrestricted`] never
-/// fails on policy grounds.
+/// when a symlink cannot be read or when a symlink chain exceeds
+/// `MAX_SYMLINK_DEPTH`. [`ResolvePolicy::Unrestricted`] never fails on
+/// policy grounds.
 pub fn resolve_path(
     file_path: &str,
     cwd: &Path,
@@ -174,7 +181,12 @@ pub fn resolve_path(
             "Path escapes the working directory: {file_path}"
         )));
     }
-    verify_symlinks_inside(&normalized, &base)?;
+    // The workspace's own spelling is the operator's anchor choice and may
+    // cross symlinks; the containment walk judges only what is below it,
+    // against the workspace's resolved form.
+    let base_canonical = std::fs::canonicalize(cwd).unwrap_or_else(|_| base.clone());
+    let mut visited = Vec::new();
+    verify_symlinks_inside(&normalized, &base, &base_canonical, 0, &mut visited)?;
     Ok(normalized)
 }
 
@@ -287,7 +299,7 @@ pub(crate) fn verify_handle_inside<F>(_handle: &F, _workspace: &Path) -> Result<
 ///
 /// A leading `..` that would escape above the root is dropped, matching the
 /// behavior of the shared `normalize_path` helper.
-fn normalize_lexical(path: &Path) -> PathBuf {
+pub(crate) fn normalize_lexical(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for comp in path.components() {
         match comp {
@@ -320,77 +332,92 @@ fn lexically_inside(path: &Path, base: &Path) -> bool {
     true
 }
 
-/// Walk the *existing* prefix of `resolved` and reject any symlink whose target chain leaves `base`.
+/// Deepest symbolic-link chain the containment walk follows before
+/// refusing.
 ///
-/// `resolved` is assumed already lexically contained in `base` (the caller's
-/// responsibility). This function adds the filesystem check: each ancestor of
-/// `resolved` is probed; a symlink is followed to its target, which is itself
-/// verified (recursively, for chains). The walk stops at the first
-/// non-existent component, so a not-yet-existing write leaf is never rejected
-/// — only the existing directory prefix is checked. Symlink loops are bounded
-/// by a visited-set of lexically normalized paths so a cycle (A → B → A)
-/// terminates
-/// rather than recurses forever.
+/// Matches the kernel's own per-resolution link limit, so the error a
+/// hostile chain produces here is the shape an over-long chain would
+/// produce at `open` anyway — a clean failure instead of stack exhaustion.
+const MAX_SYMLINK_DEPTH: usize = 40;
+
+/// Walk the *existing* prefix of `resolved` and reject any symlink whose target chain leaves the workspace.
+///
+/// `resolved` is assumed already lexically contained in `base_lex` (the
+/// caller's responsibility), and `base_canonical` is the workspace's
+/// resolved form — `base_lex` may itself spell the workspace through
+/// symlinks, which is the operator's anchor choice and is not traversed or
+/// judged. Only the components *below* the anchor are probed, by path —
+/// `symlink_metadata` on the accumulated spelling under `base_canonical` —
+/// and a symlink there is followed to its target, which must stay
+/// (lexically, after normalization) inside `base_canonical`, and its own
+/// existing prefix is walked the same way (recursively, for chains). The
+/// walk itself is not descriptor-pinned, so a component swapped mid-walk
+/// can skew a rejection; that residual is closed downstream by the pinned
+/// write and the handle verification. The walk stops at the first non-existent
+/// component, so a not-yet-existing write leaf is never rejected — only the
+/// existing prefix is checked. Cycles are bounded by `visited`, a set of
+/// lexically normalized paths already examined, and chains by `depth`
+/// against [`MAX_SYMLINK_DEPTH`] — a linear chain of distinct links
+/// terminates with an error instead of exhausting the stack.
 ///
 /// # Errors
 ///
 /// Returns [`ToolError::InvalidInput`] when an existing symlink component
-/// resolves (directly or via a chain) to a path outside `base`. Returns
-/// [`ToolError::Execution`] when a symlink cannot be read.
-fn verify_symlinks_inside(resolved: &Path, base: &Path) -> Result<(), ToolError> {
-    let mut visited: Vec<PathBuf> = Vec::new();
-    let mut acc = PathBuf::new();
-    for comp in resolved.components() {
+/// resolves (directly or via a chain) to a path outside `base_canonical`.
+/// Returns [`ToolError::Execution`] when a symlink cannot be read or when
+/// the chain exceeds [`MAX_SYMLINK_DEPTH`].
+fn verify_symlinks_inside(
+    resolved: &Path,
+    base_lex: &Path,
+    base_canonical: &Path,
+    depth: usize,
+    visited: &mut Vec<PathBuf>,
+) -> Result<(), ToolError> {
+    let relative = resolved.strip_prefix(base_lex).unwrap_or(resolved);
+    let mut acc = base_canonical.to_path_buf();
+    for comp in relative.components() {
         acc.push(comp.as_os_str());
         let Some(meta) = std::fs::symlink_metadata(&acc).ok() else {
             return Ok(());
         };
-        if meta.file_type().is_symlink() {
-            let target = std::fs::read_link(&acc).map_err(|e| {
-                ToolError::Execution(format!("Failed to read symlink {}: {e}", acc.display()))
-            })?;
-            let resolved_target = if target.is_absolute() {
-                target
-            } else {
-                acc.parent().unwrap_or_else(|| Path::new(".")).join(target)
-            };
-            let normalized_target = normalize_lexical(&resolved_target);
-            if !symlink_target_inside(&normalized_target, base, &mut visited)? {
-                return Err(ToolError::InvalidInput(format!(
-                    "Path escapes the working directory via symlink: {}",
-                    acc.display()
-                )));
-            }
+        if !meta.file_type().is_symlink() {
+            continue;
         }
+        if depth >= MAX_SYMLINK_DEPTH {
+            return Err(ToolError::Execution(format!(
+                "cannot resolve {}: too many levels of symbolic links",
+                acc.display()
+            )));
+        }
+        let target = std::fs::read_link(&acc).map_err(|e| {
+            ToolError::Execution(format!("Failed to read symlink {}: {e}", acc.display()))
+        })?;
+        let resolved_target = if target.is_absolute() {
+            target
+        } else {
+            acc.parent().unwrap_or_else(|| Path::new(".")).join(target)
+        };
+        let normalized_target = normalize_lexical(&resolved_target);
+        if !lexically_inside(&normalized_target, base_canonical) {
+            return Err(ToolError::InvalidInput(format!(
+                "Path escapes the working directory via symlink: {}",
+                acc.display()
+            )));
+        }
+        let canonical = normalize_lexical(&normalized_target);
+        if visited.iter().any(|seen| seen == &canonical) {
+            continue;
+        }
+        visited.push(canonical);
+        verify_symlinks_inside(
+            &normalized_target,
+            base_canonical,
+            base_canonical,
+            depth.saturating_add(1),
+            visited,
+        )?;
     }
     Ok(())
-}
-
-/// Recursively verify that `target` (a resolved symlink target) stays within `base`.
-///
-/// Follows further symlinks in its existing prefix. `visited` accumulates the
-/// lexically normalized paths already examined, bounding symlink cycles. A
-/// target that itself contains symlinks is walked the same way
-/// [`verify_symlinks_inside`] walks the original path. Returns `true` when
-/// `target` (and every symlink in its existing prefix) stays inside `base`.
-///
-/// # Errors
-///
-/// Propagates the same [`ToolError`] variants as [`verify_symlinks_inside`].
-fn symlink_target_inside(
-    target: &Path,
-    base: &Path,
-    visited: &mut Vec<PathBuf>,
-) -> Result<bool, ToolError> {
-    if !lexically_inside(target, base) {
-        return Ok(false);
-    }
-    let canonical = normalize_lexical(target);
-    if visited.iter().any(|v| v == &canonical) {
-        return Ok(true);
-    }
-    visited.push(canonical);
-    verify_symlinks_inside(target, base).map(|()| true)
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -831,6 +858,58 @@ mod tests {
         assert_eq!(
             resolve_path("link.txt", work.path(), ResolvePolicy::Contained).unwrap(),
             work.path().join("link.txt")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_path_accepts_a_symlinked_workspace_spelling() {
+        // The workspace spelling is the operator's anchor choice and may
+        // cross symlinks; containment judges only what is below it. Both
+        // an existing file and a not-yet-existing write leaf must resolve
+        // — a walk that probed the anchor's own components rejected every
+        // such path.
+        use std::os::unix::fs::symlink;
+
+        let real = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let link = workspace.path().join("project");
+        symlink(real.path(), &link).unwrap();
+        std::fs::create_dir_all(real.path().join("src")).unwrap();
+        std::fs::write(real.path().join("src").join("a.rs"), "x").unwrap();
+
+        let existing = resolve_path("src/a.rs", &link, ResolvePolicy::Contained).unwrap();
+        assert_eq!(existing, link.join("src").join("a.rs"));
+        let new_file = resolve_path("src/new.rs", &link, ResolvePolicy::Contained).unwrap();
+        assert_eq!(new_file, link.join("src").join("new.rs"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_path_caps_a_linear_symlink_chain() {
+        // A hostile chain of distinct links must fail cleanly instead of
+        // recursing to stack exhaustion: the walk refuses once the chain
+        // exceeds MAX_SYMLINK_DEPTH.
+        use std::os::unix::fs::symlink;
+
+        let work = tempfile::TempDir::new().unwrap();
+        let mut link = work.path().join("deep.txt");
+        std::fs::write(&link, "x").unwrap();
+        for i in 0..45 {
+            let next = work.path().join(format!("l{i}"));
+            symlink(&link, &next).unwrap();
+            link = next;
+        }
+
+        let err = resolve_path(
+            link.to_str().unwrap(),
+            work.path(),
+            ResolvePolicy::Contained,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ToolError::Execution(ref s) if s.contains("too many levels")),
+            "{err:?}"
         );
     }
 

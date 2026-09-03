@@ -30,14 +30,17 @@ static OBSERVATION_SEQ: AtomicU64 = AtomicU64::new(0);
 /// Keyed by each tool's resolution of the submitted path: the
 /// [`resolve_path`](crate::util::resolve_path) output under the contained
 /// policy, and the canonicalized physical file on top of it under the
-/// unrestricted policy — so equivalent spellings of the same file,
-/// including spellings that pass through a symbolic link, share one
-/// baseline and a staleness check can't be dodged by re-spelling a path.
-/// The rule is applied by the owning context — `RunnerContext`'s
-/// `record_baseline` and `baseline_for` normalize keys on the way in and
-/// out, so no call site can record or query under a divergent spelling,
-/// and a file first created through a symlinked directory is re-keyed to
-/// its now-resolvable physical path.
+/// unrestricted policy. Under Unrestricted, then, equivalent spellings of
+/// the same file — including spellings that pass through a symbolic link —
+/// share one baseline and a staleness check can't be dodged by re-spelling
+/// a path. Under Contained the keys are the lexical resolution output, so
+/// alias spellings are deliberately distinct keys; there the protection
+/// comes from the write layer refusing symbolic-link spellings rather than
+/// from key merging. The rule is applied by the owning context —
+/// `RunnerContext`'s `record_baseline` and `baseline_for` normalize keys
+/// on the way in and out, so no call site can record or query under a
+/// divergent spelling, and a file first created through a symlinked
+/// directory is re-keyed to its now-resolvable physical path.
 ///
 /// The hash is a process-local [`DefaultHasher`] fingerprint of the file's
 /// bytes — deliberately not a stable or cryptographic digest: baselines live
@@ -46,8 +49,10 @@ static OBSERVATION_SEQ: AtomicU64 = AtomicU64::new(0);
 pub type FileBaselines = BTreeMap<PathBuf, FileBaseline>;
 
 /// One observation of a file's content, at a known point in the session's
-///
 /// observation order.
+///
+/// Produced by `observe_bytes` at the moment the bytes were in hand; a
+/// map entry always holds the newest one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileBaseline {
     /// Where this observation sits in the session's touch order.

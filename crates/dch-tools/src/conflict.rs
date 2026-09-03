@@ -111,11 +111,30 @@ impl TargetIdentity {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            meta.dev() == self.dev && meta.ino() == self.ino
+            self.matches_parts(meta.dev(), meta.ino())
         }
         #[cfg(not(unix))]
         {
             let _ = (self, meta);
+            true
+        }
+    }
+
+    /// Whether raw stat fields still identify the checked file.
+    ///
+    /// The descriptor-relative counterpart of [`matches`](Self::matches):
+    /// the contained write stats its target through the pinned directory's
+    /// descriptor, which yields raw fields rather than a
+    /// [`std::fs::Metadata`], and compares them here. Exact on platforms
+    /// with a stable file identity; always true without one.
+    pub(crate) fn matches_parts(self, dev: u64, ino: u64) -> bool {
+        #[cfg(unix)]
+        {
+            self.dev == dev && self.ino == ino
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (self, dev, ino);
             true
         }
     }

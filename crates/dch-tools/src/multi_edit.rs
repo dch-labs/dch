@@ -1,10 +1,12 @@
 //! The `MultiEdit` tool — apply a batch of text edits across one or more files.
 //!
 //! Every edit in the batch is validated before any file is written. One
-//! invalid edit (missing file, `old_text` not found or not unique, target is a
-//! symlink, linter rejects the merged content, two edits overlap in the same
-//! file) aborts the entire batch — no file is touched. `dry_run: true` previews
-//! diffs without writing.
+//! invalid edit (missing file, `old_text` not found or not unique, linter
+//! rejects the merged content, two edits overlap in the same file) aborts
+//! the entire batch — no file is touched — as does a symbolic-link target
+//! under the contained policy. Under the unrestricted policy links are
+//! honored and writes land on the referent; only physical alias pairs are
+//! refused. `dry_run: true` previews diffs without writing.
 //!
 //! The atomicity guarantee covers *validation*: if any edit is invalid, nothing
 //! is written. It does **not** cover crashes mid-write-batch — see the
@@ -38,6 +40,7 @@ use crate::edit::locate_unique;
 use crate::edit::splice;
 use crate::linter::lint_content;
 use crate::util::ResolvePolicy;
+use crate::util::canonicalize_existing;
 use crate::util::reject_url;
 use crate::util::resolve_path;
 use crate::write::format_lint_failure;
@@ -161,14 +164,16 @@ impl MultiEditTool {
         if let Some(reason) = dup_path_check(&operations) {
             return Ok(reason.into_output());
         }
-        if policy == ResolvePolicy::Unrestricted
-            && let Some(reason) = honor_symlink_targets(&mut operations)
-        {
-            return Ok(reason.into_output());
+        if policy == ResolvePolicy::Unrestricted {
+            match honor_symlink_targets(&mut operations) {
+                Ok(Some(reason)) => return Ok(reason.into_output()),
+                Ok(None) => {}
+                Err(error) => return Err(error),
+            }
         }
         let originals = read_files(&operations, &cwd, policy).await?;
         if policy == ResolvePolicy::Contained
-            && let Some(reason) = symlink_check(&operations)
+            && let Some(reason) = symlink_check(&operations, &cwd)
         {
             return Ok(reason.into_output());
         }
@@ -582,17 +587,25 @@ fn dup_path_check(operations: &[EditOperation]) -> Option<AbortReason> {
     None
 }
 
-/// Reject the batch if any distinct target — or any of its ancestor directories — is a symbolic link.
+/// Reject the batch if any target — or any of its in-workspace ancestor
+/// directories — is a symbolic link.
 ///
 /// `atomic_write`'s own symlink guard fires at write time and checks only the
 /// final component, too late for the atomic contract (file #1 could already be
 /// written before file #2's symlink errors). This pre-check walks every
 /// ancestor of each target with `symlink_metadata` (no follow) during the read
 /// pass, before any write, so a symlinked parent directory is caught too.
-fn symlink_check(operations: &[EditOperation]) -> Option<AbortReason> {
+/// Ancestors at or above `workspace` are skipped: the anchor's own spelling is
+/// the operator's choice and may cross symlinks by design — the same
+/// below-anchor judgment the pinned write's walk applies — so only
+/// in-workspace components are judged.
+fn symlink_check(operations: &[EditOperation], workspace: &Path) -> Option<AbortReason> {
     let mut seen = std::collections::HashSet::new();
     for op in operations {
         for ancestor in op.full_path.ancestors() {
+            if workspace.starts_with(ancestor) {
+                continue;
+            }
             if !seen.insert(ancestor) {
                 continue;
             }
@@ -620,35 +633,42 @@ fn symlink_check(operations: &[EditOperation]) -> Option<AbortReason> {
 /// independently against the same original, and the second write would
 /// silently clobber the first. The original `file_path` is kept for
 /// display. Targets that do not exist yet (new files) keep their submitted
-/// path.
+/// path, and an unresolvable link — dangling or looping — refuses the
+/// batch with the same resolution error Write and Edit surface, rather
+/// than a generic miss later in the read phase.
 ///
 /// Returns the abort reason for the first alias pair found, if any.
-fn honor_symlink_targets(operations: &mut [EditOperation]) -> Option<AbortReason> {
+///
+/// # Errors
+///
+/// Returns [`ToolError`] when a target cannot be canonicalized.
+fn honor_symlink_targets(
+    operations: &mut [EditOperation],
+) -> Result<Option<AbortReason>, ToolError> {
     use std::collections::hash_map::Entry;
 
     let mut physical: std::collections::HashMap<std::path::PathBuf, String> =
         std::collections::HashMap::new();
     for op in operations {
-        if let Ok(real) = std::fs::canonicalize(&op.full_path) {
-            match physical.entry(real.clone()) {
-                Entry::Occupied(existing) if existing.get() != &op.file_path => {
-                    return Some(AbortReason::Symlink(format!(
-                        "Refusing to write: '{}' and '{}' are the same file ({}). \
-                         Combine them into one set of edits.",
-                        existing.get(),
-                        op.file_path,
-                        real.display()
-                    )));
-                }
-                Entry::Occupied(_) => {}
-                Entry::Vacant(slot) => {
-                    slot.insert(op.file_path.clone());
-                }
+        let real = canonicalize_existing(&op.full_path)?;
+        match physical.entry(real.clone()) {
+            Entry::Occupied(existing) if existing.get() != &op.file_path => {
+                return Ok(Some(AbortReason::Symlink(format!(
+                    "Refusing to write: '{}' and '{}' are the same file ({}). \
+                     Combine them into one set of edits.",
+                    existing.get(),
+                    op.file_path,
+                    real.display()
+                ))));
             }
-            op.full_path = real;
+            Entry::Occupied(_) => {}
+            Entry::Vacant(slot) => {
+                slot.insert(op.file_path.clone());
+            }
         }
+        op.full_path = real;
     }
-    None
+    Ok(None)
 }
 
 /// A pair of edits whose `old_text` byte-ranges overlap in the same file.
@@ -1260,7 +1280,7 @@ mod tests {
                 new_text: "z".to_string(),
             },
         ];
-        assert!(honor_symlink_targets(&mut ops).is_none());
+        assert!(honor_symlink_targets(&mut ops).unwrap().is_none());
         let real = std::fs::canonicalize(&target).unwrap();
         assert!(ops.iter().all(|op| op.full_path == real));
     }
@@ -1289,13 +1309,19 @@ mod tests {
                 new_text: "y".to_string(),
             },
         ];
-        let reason = honor_symlink_targets(&mut ops).expect("alias pair aborts");
+        let reason = honor_symlink_targets(&mut ops)
+            .unwrap()
+            .expect("alias pair aborts");
         assert!(matches!(reason, AbortReason::Symlink(_)));
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn broken_symlink_target_keeps_its_path_and_fails_the_read_phase() {
+    #[test]
+    fn broken_symlink_target_refuses_the_batch_with_the_resolution_error() {
+        // The unresolvable-link contract is Write/Edit's: a dangling link
+        // is refused where it is encountered, with the resolution error
+        // naming the target — not re-spelled and failed later in the read
+        // phase with a generic miss.
         use std::os::unix::fs::symlink;
 
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1307,18 +1333,19 @@ mod tests {
             old_text: "x".to_string(),
             new_text: "y".to_string(),
         }];
-        assert!(honor_symlink_targets(&mut ops).is_none());
+
+        let err = honor_symlink_targets(&mut ops).unwrap_err();
+        assert!(
+            matches!(err, ToolError::Execution(ref s) if s.contains("cannot resolve")),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string().contains("absent.rs"),
+            "the refusal must name the broken target: {err}"
+        );
         assert_eq!(
             ops[0].full_path, link,
-            "an unresolved target keeps its submitted path"
-        );
-
-        let err = read_files(&ops, tmp.path(), ResolvePolicy::Unrestricted)
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, ToolError::FileNotFound(_)),
-            "the broken link must abort the batch in the read phase: {err:?}"
+            "the refusal leaves the submitted path untouched"
         );
     }
 
@@ -1392,7 +1419,43 @@ mod tests {
             old_text: "x".to_string(),
             new_text: "y".to_string(),
         }];
-        assert!(symlink_check(&ops).is_none());
+        assert!(symlink_check(&ops, tmp.path()).is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_workspace_anchor_allows_a_contained_batch() {
+        // The workspace spelling is the operator's anchor choice and may
+        // cross symlinks; the ancestor walk judges only in-workspace
+        // components, so a contained batch in a link-anchored workspace
+        // succeeds exactly like Write and Edit.
+        use std::os::unix::fs::symlink;
+
+        let real = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let anchor = workspace.path().join("project");
+        symlink(real.path(), &anchor).unwrap();
+        std::fs::create_dir_all(real.path().join("src")).unwrap();
+        std::fs::write(real.path().join("src").join("a.rs"), "fn one() {}\n").unwrap();
+
+        let tool = MultiEditTool;
+        let ctx = ctx_in(anchor.to_str().unwrap());
+        let input = json!({
+            "edits": [edit("src/a.rs", "fn one() {}", "fn one(x: i32) {}")]
+        });
+        let out = tool.call(input, &ctx).await.unwrap();
+        assert!(!out.is_error, "{}", out.text_content());
+        assert_eq!(
+            std::fs::read_to_string(real.path().join("src").join("a.rs")).unwrap(),
+            "fn one(x: i32) {}\n"
+        );
+        assert!(
+            std::fs::symlink_metadata(&anchor)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the anchor link itself must survive the batch"
+        );
     }
 
     #[cfg(unix)]
@@ -1410,7 +1473,7 @@ mod tests {
             old_text: "x".to_string(),
             new_text: "y".to_string(),
         }];
-        let reason = symlink_check(&ops).expect("should abort");
+        let reason = symlink_check(&ops, tmp.path()).expect("should abort");
         assert!(matches!(reason, AbortReason::Symlink(_)));
     }
 
@@ -2328,10 +2391,13 @@ mod tests {
     async fn write_finals_fault_after_earlier_writes_names_what_landed() {
         // File #2 has no parent directory, so its atomic write faults after
         // file #1 is already on disk; the hard error must carry the partial
-        // batch report instead of discarding it.
+        // batch report instead of discarding it. The deterministic fault is
+        // the contained walk's: file #2's parent component is a regular
+        // file, which the no-follow descent refuses.
         let tmp = tempfile::TempDir::new().unwrap();
         let first = tmp.path().join("a.rs");
         std::fs::write(&first, "A").unwrap();
+        std::fs::write(tmp.path().join("blocker"), "not a dir").unwrap();
         let mut originals = BTreeMap::new();
         originals.insert("a.rs".to_string(), "A".to_string());
         let mut finals = BTreeMap::new();
@@ -2346,7 +2412,7 @@ mod tests {
             },
             EditOperation {
                 file_path: "b.rs".to_string(),
-                full_path: tmp.path().join("absent-dir").join("b.rs"),
+                full_path: tmp.path().join("blocker").join("b.rs"),
                 old_text: "B".to_string(),
                 new_text: "b2".to_string(),
             },

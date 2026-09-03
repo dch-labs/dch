@@ -1002,6 +1002,7 @@ mod tests {
         assert!(parse_line_range(":0").is_err());
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn read_capped_small_file_returns_all_bytes() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1013,6 +1014,7 @@ mod tests {
         assert_eq!(bytes, b"hello world");
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn read_capped_exactly_at_cap_returns_all() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1024,6 +1026,7 @@ mod tests {
         assert_eq!(bytes.len(), MAX_FILE_SIZE_BYTES);
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn read_capped_over_cap_returns_cap_plus_one() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1035,6 +1038,7 @@ mod tests {
         assert_eq!(bytes.len(), MAX_FILE_SIZE_BYTES + 1);
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn read_capped_empty_file_returns_empty() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1046,6 +1050,7 @@ mod tests {
         assert!(bytes.is_empty());
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn read_capped_missing_file_is_execution_error() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1081,7 +1086,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_records_the_file_mtime_in_the_shared_history() {
+    async fn read_records_the_content_hash_in_the_shared_history() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("small.txt");
         std::fs::write(&path, "hello world\n").unwrap();

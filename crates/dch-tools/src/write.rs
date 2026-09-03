@@ -161,12 +161,13 @@ impl WriteInput {
             }
         }
 
-        if let Some(parent) = full_path.parent() {
-            if policy == ResolvePolicy::Contained {
-                crate::fs::create_contained_dirs(parent, &cwd)?;
-            } else {
-                tokio::fs::create_dir_all(parent).await?;
-            }
+        // The contained write creates its parents through the pinned,
+        // no-follow walk inside `atomic_write`; the unrestricted policy
+        // keeps the plain path-based creation.
+        if policy == ResolvePolicy::Unrestricted
+            && let Some(parent) = full_path.parent()
+        {
+            tokio::fs::create_dir_all(parent).await?;
         }
 
         crate::fs::atomic_write(&full_path, content, &cwd, policy, expected.as_ref())?;
@@ -287,7 +288,7 @@ mod tests {
         assert!(out.text_content().contains("Changed: existing.rs"));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn write_preserves_existing_permissions() {
         use std::os::unix::fs::PermissionsExt;
@@ -471,6 +472,32 @@ mod tests {
             .as_array()
             .unwrap();
         assert_eq!(required.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn write_accepts_a_dotdot_workspace_spelling() {
+        // The runner anchors the workspace lexically: a `..` in the
+        // spelling is collapsed at construction so the pinned write's
+        // prefix matching compares against the resolved form — the write
+        // lands in the real workspace instead of failing with a misleading
+        // "not inside" error.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let spelling = format!("{}/sub/..", tmp.path().to_str().unwrap());
+        let mut ctx = ToolContext::default();
+        ctx.cwd = spelling.clone();
+        ctx.set_extension(RunnerContext::new(PathBuf::from(spelling)));
+
+        let tool = WriteInput::default();
+        let input = json!({
+            "file_path": "landed.rs",
+            "content": "fn main() {}\n"
+        });
+        let out = tool.call(input, &ctx).await.unwrap();
+        assert!(!out.is_error, "{}", out.text_content());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("landed.rs")).unwrap(),
+            "fn main() {}\n"
+        );
     }
 
     #[cfg(unix)]
