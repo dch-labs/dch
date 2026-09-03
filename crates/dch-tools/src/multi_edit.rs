@@ -41,6 +41,7 @@ use crate::diff::format_file_change;
 use crate::edit::FindResult;
 use crate::edit::locate_unique;
 use crate::edit::splice;
+use crate::fs::WorkspaceAnchor;
 use crate::linter::lint_content;
 use crate::util::ResolvePolicy;
 use crate::util::canonicalize_existing;
@@ -173,7 +174,8 @@ impl MultiEditTool {
         if policy == ResolvePolicy::Unrestricted {
             honor_symlink_targets(&mut operations)?;
         }
-        let originals = read_files(&operations, &cwd, policy).await?;
+        let anchor = rc.as_ref().map(|rc| rc.workspace_anchor.as_ref());
+        let originals = read_files(&operations, &cwd, policy, anchor).await?;
         if policy == ResolvePolicy::Contained
             && let Some(reason) = symlink_check(&operations, &cwd)
         {
@@ -472,16 +474,22 @@ fn build_operations(
 /// Read each distinct target file once into a map keyed by `file_path`.
 ///
 /// Returns the original contents keyed by the caller-supplied path (so the
-/// preview can address files the way the model named them).
+/// preview can address files the way the model named them). Under the
+/// contained policy each opened handle is verified against the caller's
+/// retained workspace anchor when one is supplied, so a symlink swapped
+/// onto the workspace spelling after the runner context was constructed
+/// cannot feed a batch from outside the pinned workspace.
 ///
 /// # Errors
 ///
-/// Returns [`ToolError::FileNotFound`] when a target does not exist, and
-/// [`ToolError::Execution`] on any other read fault (including non-UTF-8).
+/// Returns [`ToolError::FileNotFound`] when a target does not exist,
+/// [`ToolError::Execution`] on any other read fault (including non-UTF-8),
+/// and when a contained handle check fails.
 async fn read_files(
     operations: &[EditOperation],
     workspace: &Path,
     policy: ResolvePolicy,
+    anchor: Option<&WorkspaceAnchor>,
 ) -> Result<BTreeMap<String, String>, ToolError> {
     let mut originals = BTreeMap::new();
     for op in operations {
@@ -498,7 +506,7 @@ async fn read_files(
             .await
             .map_err(|e| ToolError::Execution(e.to_string()))?;
         if policy == ResolvePolicy::Contained {
-            crate::util::verify_handle_inside(&file, workspace)?;
+            crate::util::verify_handle_inside(&file, workspace, anchor)?;
         }
         let mut content = String::new();
         file.read_to_string(&mut content)
@@ -1486,7 +1494,7 @@ mod tests {
             old_text: "a".to_string(),
             new_text: "b".to_string(),
         }];
-        let err = read_files(&ops, tmp.path(), ResolvePolicy::Contained)
+        let err = read_files(&ops, tmp.path(), ResolvePolicy::Contained, None)
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::FileNotFound(_)), "{err:?}");
@@ -1503,7 +1511,7 @@ mod tests {
             old_text: "a".to_string(),
             new_text: "b".to_string(),
         }];
-        let err = read_files(&ops, tmp.path(), ResolvePolicy::Contained)
+        let err = read_files(&ops, tmp.path(), ResolvePolicy::Contained, None)
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Execution(_)), "{err:?}");
@@ -1529,7 +1537,7 @@ mod tests {
                 new_text: "d".to_string(),
             },
         ];
-        let map = read_files(&ops, tmp.path(), ResolvePolicy::Contained)
+        let map = read_files(&ops, tmp.path(), ResolvePolicy::Contained, None)
             .await
             .unwrap();
         assert_eq!(map.len(), 1);
@@ -1583,6 +1591,52 @@ mod tests {
                 .file_type()
                 .is_symlink(),
             "the anchor link itself must survive the batch"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn contained_batch_pins_the_workspace_anchor_against_a_later_swap() {
+        // The batch's read phase is judged against the pinned root: after
+        // the anchor symlink is swapped, the batch must refuse before any
+        // validation result can act on content sourced from the
+        // swapped-in directory.
+        use std::os::unix::fs::symlink;
+
+        let real = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let anchor_link = workspace.path().join("project");
+        symlink(real.path(), &anchor_link).unwrap();
+        std::fs::write(real.path().join("a.rs"), "fn one() {}\n").unwrap();
+        std::fs::write(outside.path().join("a.rs"), "fn outside() {}\n").unwrap();
+
+        let ctx = ctx_in(anchor_link.to_str().unwrap());
+        std::fs::remove_file(&anchor_link).unwrap();
+        symlink(outside.path(), &anchor_link).unwrap();
+
+        let tool = MultiEditTool;
+        let input = json!({
+            "edits": [edit(
+                anchor_link.join("a.rs").to_str().unwrap(),
+                "fn outside()",
+                "fn replaced()"
+            )]
+        });
+        let err = tool.call(input, &ctx).await.unwrap_err();
+        assert!(
+            err.to_string().contains("escaped"),
+            "the post-swap location must be rejected: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(real.path().join("a.rs")).unwrap(),
+            "fn one() {}\n",
+            "the pinned workspace's file must be untouched"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("a.rs")).unwrap(),
+            "fn outside() {}\n",
+            "the swapped-in file must be untouched"
         );
     }
 

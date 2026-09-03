@@ -159,7 +159,10 @@ impl ReadInput {
             )));
         }
 
-        let bytes = read_capped(&full_path, &cwd, policy).await?;
+        let anchor = runner_context
+            .as_ref()
+            .map(|rc| rc.workspace_anchor.as_ref());
+        let bytes = read_capped(&full_path, &cwd, policy, anchor).await?;
         if let Some(too_large) = too_large_if_over(bytes.len() as u64) {
             return Ok(too_large);
         }
@@ -262,19 +265,27 @@ fn too_large_if_over(byte_count: u64) -> Option<ToolOutput> {
 /// metadata check and the read cannot OOM. If the returned buffer has more than
 /// `MAX_FILE_SIZE_BYTES` bytes, the caller rejects it via [`too_large_if_over`].
 ///
+/// Under the contained policy the opened handle is verified against the
+/// caller's retained workspace anchor when one is supplied, so a symlink
+/// swapped onto the workspace spelling after the runner context was
+/// constructed cannot turn the read into a byte source outside the pinned
+/// workspace.
+///
 /// # Errors
 ///
-/// Returns [`ToolError::Execution`] if the file cannot be opened or read.
+/// Returns [`ToolError::Execution`] if the file cannot be opened or read,
+/// or when the contained handle check fails.
 async fn read_capped(
     path: &std::path::Path,
     workspace: &std::path::Path,
     policy: ResolvePolicy,
+    anchor: Option<&crate::fs::WorkspaceAnchor>,
 ) -> Result<Vec<u8>, ToolError> {
     let file = tokio::fs::File::open(path)
         .await
         .map_err(|e| ToolError::Execution(format!("Failed to open file: {e}")))?;
     if policy == ResolvePolicy::Contained {
-        crate::util::verify_handle_inside(&file, workspace)?;
+        crate::util::verify_handle_inside(&file, workspace, anchor)?;
     }
     let cap = MAX_FILE_SIZE_BYTES.saturating_add(1);
     let mut buf = Vec::with_capacity(cap.min(8192));
@@ -635,6 +646,7 @@ mod tests {
             &dir.join("secret.txt"),
             workspace.path(),
             ResolvePolicy::Contained,
+            None,
         )
         .await
         .unwrap_err();
@@ -657,10 +669,53 @@ mod tests {
             &dir.join("secret.txt"),
             workspace.path(),
             ResolvePolicy::Unrestricted,
+            None,
         )
         .await
         .unwrap();
         assert_eq!(bytes, b"outside\n");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn contained_read_pins_the_workspace_anchor_against_a_later_swap() {
+        // Reads must be judged against the pinned root, not the current
+        // cwd: the anchor symlink resolved to `real` at context
+        // construction, and a swap to `outside` afterwards cannot make the
+        // read serve the swapped-in directory's bytes.
+        use std::os::unix::fs::symlink;
+
+        let real = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let anchor_link = workspace.path().join("project");
+        symlink(real.path(), &anchor_link).unwrap();
+        std::fs::write(real.path().join("data.txt"), "PINNED\n").unwrap();
+        std::fs::write(outside.path().join("data.txt"), "OUTSIDE\n").unwrap();
+
+        let ctx = ctx_in(anchor_link.to_str().unwrap());
+        std::fs::remove_file(&anchor_link).unwrap();
+        symlink(outside.path(), &anchor_link).unwrap();
+
+        let tool = ReadInput::default();
+        let input = json!({ "file_path": anchor_link.join("data.txt").to_str().unwrap() });
+        let err = tool.call(input, &ctx).await.unwrap_err();
+        assert!(
+            err.to_string().contains("escaped"),
+            "the post-swap location must be rejected: {err}"
+        );
+
+        // The outside file's bytes were never served: the read failed
+        // before any content reached the output, and nothing was recorded.
+        let rc = runner_ctx(&ctx).unwrap();
+        let baselines = rc
+            .file_baselines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            baselines.is_empty(),
+            "a refused read must arm no baseline: {baselines:?}"
+        );
     }
 
     #[tokio::test]
@@ -1008,7 +1063,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("small.txt");
         std::fs::write(&path, b"hello world").unwrap();
-        let bytes = read_capped(&path, tmp.path(), ResolvePolicy::Contained)
+        let bytes = read_capped(&path, tmp.path(), ResolvePolicy::Contained, None)
             .await
             .unwrap();
         assert_eq!(bytes, b"hello world");
@@ -1020,7 +1075,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("exact.bin");
         std::fs::write(&path, vec![b'x'; MAX_FILE_SIZE_BYTES]).unwrap();
-        let bytes = read_capped(&path, tmp.path(), ResolvePolicy::Contained)
+        let bytes = read_capped(&path, tmp.path(), ResolvePolicy::Contained, None)
             .await
             .unwrap();
         assert_eq!(bytes.len(), MAX_FILE_SIZE_BYTES);
@@ -1032,7 +1087,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("over.bin");
         std::fs::write(&path, vec![b'x'; MAX_FILE_SIZE_BYTES + 100]).unwrap();
-        let bytes = read_capped(&path, tmp.path(), ResolvePolicy::Contained)
+        let bytes = read_capped(&path, tmp.path(), ResolvePolicy::Contained, None)
             .await
             .unwrap();
         assert_eq!(bytes.len(), MAX_FILE_SIZE_BYTES + 1);
@@ -1044,7 +1099,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("empty.txt");
         std::fs::write(&path, b"").unwrap();
-        let bytes = read_capped(&path, tmp.path(), ResolvePolicy::Contained)
+        let bytes = read_capped(&path, tmp.path(), ResolvePolicy::Contained, None)
             .await
             .unwrap();
         assert!(bytes.is_empty());
@@ -1055,7 +1110,7 @@ mod tests {
     async fn read_capped_missing_file_is_execution_error() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("nope.txt");
-        let err = read_capped(&path, tmp.path(), ResolvePolicy::Contained)
+        let err = read_capped(&path, tmp.path(), ResolvePolicy::Contained, None)
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Execution(_)));

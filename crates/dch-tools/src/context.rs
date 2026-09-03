@@ -105,8 +105,16 @@ pub struct RunnerContext {
     /// than reopening the anchor path, so a symlink swapped onto the
     /// workspace spelling after construction cannot redirect them: the
     /// starting directory is the one the operator's spelling resolved to
-    /// at construction time. Cloning [`RunnerContext`] shares the same
-    /// descriptor.
+    /// at construction time. Contained reads verify opened handles
+    /// against this descriptor's true location the same way, so a swap
+    /// cannot turn a read into a byte source outside the pinned
+    /// workspace. When the workspace could not be opened at construction
+    /// time the anchor retains no descriptor and contained operations
+    /// fail closed. A swap can still skew *validation*: path resolution
+    /// judges the workspace spelling's current target while walks and
+    /// handle checks judge the pinned root — the divergence is fail-safe,
+    /// costing a refusal, never an escape. Cloning [`RunnerContext`]
+    /// shares the same descriptor.
     pub(crate) workspace_anchor: Arc<WorkspaceAnchor>,
 
     /// Whether file tools confine paths to [`cwd`](Self::cwd).

@@ -3,6 +3,7 @@
 use std::fmt;
 use std::io::Write;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 use loopctl::tool::ToolError;
@@ -159,11 +160,18 @@ fn swap_abort(target: &Path) -> ToolError {
 /// rather than reopening the anchor path, so a symlink swapped onto the
 /// anchor after construction cannot redirect them: the starting directory
 /// is the one the operator's spelling resolved to at construction time.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+/// Contained reads verify opened handles against this descriptor's true
+/// location for the same reason.
 pub(crate) struct WorkspaceAnchor {
     /// The pinned root descriptor, once the workspace root could be
-    /// opened. `None` means the open failed at construction time and
-    /// contained walks fall back to opening the anchor path per call.
+    /// opened.
+    ///
+    /// `None` means the open failed at construction time. The anchor
+    /// never re-opens the spelling lazily — a swap during the gap would
+    /// pin whatever it then resolved to, a directory the operator's
+    /// configuration never validated — so contained operations fail
+    /// closed until the runner is reconstructed with an openable
+    /// workspace.
     #[cfg(target_os = "linux")]
     resolved: Mutex<Option<AnchorFd>>,
 }
@@ -171,10 +179,13 @@ pub(crate) struct WorkspaceAnchor {
 impl WorkspaceAnchor {
     /// Pin the workspace's resolved root, if it can be opened now.
     ///
-    /// Deliberately un-failing: a context must be constructible even when
-    /// the root cannot be opened yet; contained walks then fall back to
-    /// opening the anchor path per call (and on non-Linux they fail closed
-    /// regardless).
+    /// Deliberately un-failing: a context must stay constructible even
+    /// when the root cannot be opened — the runner context is public API
+    /// and its construction cannot fail. When the open fails the anchor
+    /// retains no descriptor, and contained operations fail closed rather
+    /// than pin whatever the workspace spelling resolves to later;
+    /// reconstructing the runner once the workspace can be opened is the
+    /// recovery.
     pub(crate) fn pin(workspace: &Path) -> Self {
         #[cfg(target_os = "linux")]
         {
@@ -190,51 +201,62 @@ impl WorkspaceAnchor {
         }
     }
 
-    /// A fresh duplicate of the pinned root descriptor, opening the anchor
-    /// path once if the construction-time pin failed.
+    /// A fresh duplicate of the pinned root descriptor.
     ///
     /// The duplicate is owned by the caller's walk and closed with it; the
     /// retained master descriptor stays open for the context's lifetime.
+    /// When the construction-time pin failed there is nothing to duplicate:
+    /// contained operations fail closed rather than pin whatever the
+    /// workspace spelling resolves to once it exists again — a swap during
+    /// the gap would otherwise redirect writes to a directory the
+    /// operator's configuration never validated.
     ///
     /// # Errors
     ///
-    /// Returns [`ToolError::Execution`] when the anchor cannot be opened
-    /// or duplicated. On non-Linux platforms this always fails closed,
-    /// consistent with the platform's other contained checks.
+    /// Returns [`ToolError::Execution`] when no descriptor was pinned at
+    /// construction time, or when the duplicate cannot be created.
+    #[cfg(target_os = "linux")]
     pub(crate) fn dup_fd(&self, workspace: &Path) -> Result<i32, ToolError> {
-        #[cfg(target_os = "linux")]
-        {
-            let mut slot = self
-                .resolved
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let master = if let Some(master) = slot.as_ref() {
-                master.raw()
-            } else {
-                let anchor = AnchorFd::open(workspace)?;
-                // The insert fills the vacant slot; copying the fd number
-                // out ends this borrow before the lock is released.
-                let inserted = slot.insert(anchor);
-                inserted.raw()
-            };
-            // SAFETY: `master` is a valid open descriptor for the duration
-            // of the call; the duplicate is owned by the caller.
-            let duplicate = unsafe { libc::dup(master) };
-            if duplicate < 0 {
-                return Err(ToolError::Execution(format!(
-                    "cannot duplicate the workspace anchor: {}",
-                    std::io::Error::last_os_error()
-                )));
-            }
-            Ok(duplicate)
+        let slot = self
+            .resolved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(master) = slot.as_ref() else {
+            return Err(ToolError::Execution(format!(
+                "the workspace {} could not be opened when this session \
+                 started; contained writes are refused until the runner is \
+                 reconstructed",
+                workspace.display()
+            )));
+        };
+        // SAFETY: `master` is a valid open descriptor for the duration of
+        // the call; the duplicate is owned by the caller.
+        let duplicate = unsafe { libc::dup(master.raw()) };
+        if duplicate < 0 {
+            return Err(ToolError::Execution(format!(
+                "cannot duplicate the workspace anchor: {}",
+                std::io::Error::last_os_error()
+            )));
         }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = workspace;
-            Err(ToolError::Execution(
-                "path containment cannot be verified on this platform".to_string(),
-            ))
-        }
+        Ok(duplicate)
+    }
+
+    /// The true filesystem location of the pinned root, if one is
+    /// retained.
+    ///
+    /// Read from the descriptor itself (`/proc/self/fd`), so the answer is
+    /// where the workspace resolved at pin time — not wherever the
+    /// spelling points now. `None` covers the un-pinned anchor (fail
+    /// closed at the caller) and the unreadable descriptor, so a caller
+    /// can never mistake an unverifiable root for a verified one.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn pinned_location(&self) -> Option<PathBuf> {
+        let slot = self
+            .resolved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let master = slot.as_ref()?;
+        std::fs::read_link(format!("/proc/self/fd/{}", master.raw())).ok()
     }
 }
 
@@ -1072,6 +1094,19 @@ mod tests {
         let parent = tmp.path().join("a").join("b");
         open_contained_dir(&parent, tmp.path(), true, None).unwrap();
         assert!(parent.is_dir());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dup_fd_fails_closed_when_the_construction_time_pin_failed() {
+        // Reopening the workspace spelling lazily would pin whatever it
+        // resolves to once it exists again — a directory the operator's
+        // configuration never validated. The empty slot must refuse.
+        let base = tempfile::TempDir::new().unwrap();
+        let workspace = base.path().join("vanished");
+        let anchor = WorkspaceAnchor::pin(&workspace);
+        let err = anchor.dup_fd(&workspace).unwrap_err();
+        assert!(err.to_string().contains("could not be opened"), "{err}");
     }
 
     #[cfg(target_os = "linux")]

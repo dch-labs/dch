@@ -132,10 +132,11 @@ impl WriteInput {
             }
         }
 
+        let anchor = rc.as_ref().map(|rc| rc.workspace_anchor.as_ref());
         let old_content = match tokio::fs::File::open(&full_path).await.ok() {
             Some(mut file) => {
                 if policy == ResolvePolicy::Contained {
-                    crate::util::verify_handle_inside(&file, &cwd)?;
+                    crate::util::verify_handle_inside(&file, &cwd, anchor)?;
                 }
                 let mut buffer = String::new();
                 match file.read_to_string(&mut buffer).await {
@@ -170,7 +171,6 @@ impl WriteInput {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        let anchor = rc.as_ref().map(|rc| rc.workspace_anchor.as_ref());
         crate::fs::atomic_write(&full_path, content, &cwd, policy, expected.as_ref(), anchor)?;
 
         if let Some(rc) = &rc {
@@ -527,6 +527,102 @@ mod tests {
             "fn sec() {}\n"
         );
         assert!(!outside.path().join("again.rs").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn contained_write_refuses_an_anchor_swap_during_the_old_content_read() {
+        // The write's old-content read is judged against the pinned root:
+        // after the anchor symlink is swapped, opening the target resolves
+        // outside the pinned workspace and the write must refuse — the
+        // model addressed a file the configuration never validated.
+        use std::os::unix::fs::symlink;
+
+        let real = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let anchor_link = workspace.path().join("project");
+        symlink(real.path(), &anchor_link).unwrap();
+        std::fs::write(real.path().join("data.txt"), "PINNED\n").unwrap();
+        std::fs::write(outside.path().join("data.txt"), "OUTSIDE\n").unwrap();
+
+        let ctx = ctx_in(anchor_link.to_str().unwrap());
+        std::fs::remove_file(&anchor_link).unwrap();
+        symlink(outside.path(), &anchor_link).unwrap();
+
+        let tool = WriteInput::default();
+        let input = json!({
+            "file_path": anchor_link.join("data.txt").to_str().unwrap(),
+            "content": "REPLACED\n"
+        });
+        let err = tool.call(input, &ctx).await.unwrap_err();
+        assert!(
+            err.to_string().contains("escaped"),
+            "the post-swap location must be rejected: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(real.path().join("data.txt")).unwrap(),
+            "PINNED\n",
+            "the pinned workspace's file must be untouched"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("data.txt")).unwrap(),
+            "OUTSIDE\n",
+            "the swapped-in file must be untouched"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_unpinnable_workspace_fails_contained_operations_after_a_later_swap() {
+        // The construction-time fail-open, pinned shut: a workspace that
+        // cannot be opened when the context is constructed leaves the
+        // anchor empty, and contained operations must refuse — not lazily
+        // pin whatever the workspace spelling resolves to once it exists
+        // again, which here is the attacker's directory.
+        use std::os::unix::fs::symlink;
+
+        let base = tempfile::TempDir::new().unwrap();
+        let attacker = tempfile::TempDir::new().unwrap();
+        std::fs::write(attacker.path().join("t.txt"), "ATTACKER\n").unwrap();
+        let workspace = base.path().join("vanished");
+
+        let ctx = ctx_in(workspace.to_str().unwrap());
+        symlink(attacker.path(), &workspace).unwrap();
+
+        let tool = WriteInput::default();
+        let err = tool
+            .call(
+                json!({
+                    "file_path": workspace.join("t.txt").to_str().unwrap(),
+                    "content": "REPLACED\n"
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("could not be opened"),
+            "the unpinned anchor must fail the write closed: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(attacker.path().join("t.txt")).unwrap(),
+            "ATTACKER\n",
+            "nothing may be written into the swapped-in directory"
+        );
+
+        let reader = crate::read::ReadInput::default();
+        let err = reader
+            .call(
+                json!({ "file_path": workspace.join("t.txt").to_str().unwrap() }),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("could not be opened"),
+            "the unpinned anchor must fail the read closed: {err}"
+        );
     }
 
     #[cfg(unix)]

@@ -147,9 +147,11 @@ pub enum ResolvePolicy {
 /// drift apart. The symlink check closes the traversal vector where an
 /// in-workspace link points outside it. A TOCTOU window remains between
 /// this check and the caller's open: on Linux, file tools close it by
-/// verifying the opened handle via `/proc/self/fd` before the write's bytes
-/// move, and on other platforms contained file tools fail closed rather
-/// than proceed unverified; only the directory-walk tools keep the window,
+/// verifying the opened handle via `/proc/self/fd` — against the run's
+/// pinned workspace anchor, so a swap of the anchor spelling itself
+/// cannot redirect the comparison — before the write's bytes move, and on
+/// other platforms contained file tools fail closed rather than proceed
+/// unverified; only the directory-walk tools keep the window,
 /// which needs descriptor-relative, `O_NOFOLLOW` opens to close. One
 /// accepted exception: the staleness re-read inside the conflict check
 /// opens the target by path to compare bytes, without a handle check. A
@@ -250,33 +252,55 @@ fn dangling_link_error(path: &Path) -> ToolError {
     }
 }
 
-/// Verify an opened handle actually resolved inside `workspace` (Linux).
+/// Verify an opened handle actually resolved inside the workspace (Linux).
 ///
 /// Closes the check-to-use race the symlink walk cannot: a concurrent
 /// process may swap a path component between validation and the open, and
 /// the open follows the swap. The kernel pins whatever the swap produced
 /// into the handle, and `/proc/self/fd` reveals its true location — a
-/// handle resolving outside the canonicalized workspace is rejected before
-/// any bytes move. Unrestricted dispatches skip this check: outside paths
-/// are permitted there by policy.
+/// handle resolving outside the workspace is rejected before any bytes
+/// move. Unrestricted dispatches skip this check: outside paths are
+/// permitted there by policy.
+///
+/// The comparison anchors at the caller's retained `WorkspaceAnchor`
+/// (see [`crate::fs`]) when one is supplied:
+/// the check reads the pinned root's true location from the descriptor
+/// itself, so a symlink swapped onto the workspace spelling after the
+/// context was constructed cannot make the post-swap location pass — the
+/// read is judged against the directory the operator's spelling resolved
+/// to at construction time. Without an anchor the workspace path is
+/// canonicalized at check time (direct, context-free callers). When the
+/// anchor retained no descriptor — the construction-time open failed —
+/// the check refuses: there is no verified root to compare against.
 ///
 /// # Errors
 ///
 /// Returns [`ToolError::Execution`] when the handle's real location is
-/// outside the workspace, or when the check cannot be performed (fail
-/// closed).
+/// outside the workspace, when the anchor retained no pinned root, or
+/// when the check cannot be performed (fail closed).
 #[cfg(target_os = "linux")]
 pub(crate) fn verify_handle_inside<F: std::os::unix::io::AsRawFd>(
     handle: &F,
     workspace: &Path,
+    anchor: Option<&crate::fs::WorkspaceAnchor>,
 ) -> Result<(), ToolError> {
     let actual =
         std::fs::read_link(format!("/proc/self/fd/{}", handle.as_raw_fd())).map_err(|error| {
             ToolError::Execution(format!("cannot verify path containment: {error}"))
         })?;
-    let workspace = std::fs::canonicalize(workspace).map_err(|error| {
-        ToolError::Execution(format!("cannot verify path containment: {error}"))
-    })?;
+    let workspace = match anchor {
+        Some(anchor) => anchor.pinned_location().ok_or_else(|| {
+            ToolError::Execution(format!(
+                "cannot verify path containment: the workspace {} could not \
+                 be opened when this session started; contained reads are \
+                 refused until the runner is reconstructed",
+                workspace.display()
+            ))
+        })?,
+        None => std::fs::canonicalize(workspace).map_err(|error| {
+            ToolError::Execution(format!("cannot verify path containment: {error}"))
+        })?,
+    };
     if actual.starts_with(&workspace) {
         Ok(())
     } else {
@@ -297,7 +321,11 @@ pub(crate) fn verify_handle_inside<F: std::os::unix::io::AsRawFd>(
 ///
 /// Always returns [`ToolError::Execution`].
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn verify_handle_inside<F>(_handle: &F, _workspace: &Path) -> Result<(), ToolError> {
+pub(crate) fn verify_handle_inside<F>(
+    _handle: &F,
+    _workspace: &Path,
+    _anchor: Option<&crate::fs::WorkspaceAnchor>,
+) -> Result<(), ToolError> {
     Err(ToolError::Execution(
         "path containment cannot be verified on this platform".to_string(),
     ))
@@ -447,7 +475,7 @@ mod verify_tests {
         let inside = workspace.path().join("inside.txt");
         std::fs::write(&inside, "x").unwrap();
         let handle = std::fs::File::open(&inside).unwrap();
-        assert!(verify_handle_inside(&handle, workspace.path()).is_ok());
+        assert!(verify_handle_inside(&handle, workspace.path(), None).is_ok());
     }
 
     #[test]
@@ -457,7 +485,7 @@ mod verify_tests {
         let file = outside.path().join("outside.txt");
         std::fs::write(&file, "x").unwrap();
         let handle = std::fs::File::open(&file).unwrap();
-        let err = verify_handle_inside(&handle, workspace.path()).unwrap_err();
+        let err = verify_handle_inside(&handle, workspace.path(), None).unwrap_err();
         assert!(
             matches!(err, ToolError::Execution(ref s) if s.contains("escaped")),
             "{err:?}"
@@ -479,7 +507,7 @@ mod verify_tests {
         symlink(&secret, &link).unwrap();
 
         let handle = std::fs::File::open(&link).unwrap();
-        let err = verify_handle_inside(&handle, workspace.path()).unwrap_err();
+        let err = verify_handle_inside(&handle, workspace.path(), None).unwrap_err();
         assert!(err.to_string().contains("escaped"), "{err}");
     }
 }

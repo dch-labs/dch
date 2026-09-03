@@ -119,7 +119,8 @@ impl EditInput {
         if policy == ResolvePolicy::Unrestricted {
             full_path = canonicalize_existing(&full_path)?;
         }
-        let old_content = read_existing(&full_path, parsed.file_path, &cwd, policy).await?;
+        let anchor = rc.as_ref().map(|rc| rc.workspace_anchor.as_ref());
+        let old_content = read_existing(&full_path, parsed.file_path, &cwd, policy, anchor).await?;
         let new_content = match apply_edit(&old_content, parsed.old_text, parsed.new_text) {
             Ok(c) => c,
             Err(reason) => return Ok(reason.into_output()),
@@ -145,7 +146,6 @@ impl EditInput {
             }
         };
 
-        let anchor = rc.as_ref().map(|rc| rc.workspace_anchor.as_ref());
         crate::fs::atomic_write(
             &full_path,
             &new_content,
@@ -328,17 +328,23 @@ fn parse_input(input: &Value) -> Result<EditArgs<'_>, ToolError> {
 ///
 /// Distinguishes a missing file ([`ToolError::FileNotFound`]) from a genuine
 /// I/O fault ([`ToolError::Execution`]). The `display_path` is used verbatim in
-/// the not-found error so the caller sees the path it supplied.
+/// the not-found error so the caller sees the path it supplied. Under the
+/// contained policy the opened handle is verified against the caller's
+/// retained workspace anchor when one is supplied, so a symlink swapped
+/// onto the workspace spelling after the runner context was constructed
+/// cannot serve an edit's old content from outside the pinned workspace.
 ///
 /// # Errors
 ///
-/// Returns [`ToolError::FileNotFound`] when the file does not exist, and
-/// [`ToolError::Execution`] on any other I/O error (including non-UTF-8 reads).
+/// Returns [`ToolError::FileNotFound`] when the file does not exist,
+/// [`ToolError::Execution`] on any other I/O error (including non-UTF-8
+/// reads), and when the contained handle check fails.
 async fn read_existing(
     full_path: &Path,
     display_path: &str,
     workspace: &Path,
     policy: ResolvePolicy,
+    anchor: Option<&crate::fs::WorkspaceAnchor>,
 ) -> Result<String, ToolError> {
     if !tokio::fs::try_exists(full_path)
         .await
@@ -350,7 +356,7 @@ async fn read_existing(
         .await
         .map_err(|e| ToolError::Execution(e.to_string()))?;
     if policy == ResolvePolicy::Contained {
-        crate::util::verify_handle_inside(&file, workspace)?;
+        crate::util::verify_handle_inside(&file, workspace, anchor)?;
     }
     let mut content = String::new();
     file.read_to_string(&mut content)
@@ -858,9 +864,15 @@ mod tests {
     async fn read_existing_missing_file_is_file_not_found() {
         let tmp = tempfile::TempDir::new().unwrap();
         let missing = tmp.path().join("nope.txt");
-        let err = read_existing(&missing, "nope.txt", tmp.path(), ResolvePolicy::Contained)
-            .await
-            .unwrap_err();
+        let err = read_existing(
+            &missing,
+            "nope.txt",
+            tmp.path(),
+            ResolvePolicy::Contained,
+            None,
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(err, ToolError::FileNotFound(ref s) if s == "nope.txt"),
             "{err:?}"
@@ -873,9 +885,15 @@ mod tests {
         let target = tmp.path().join("bin.dat");
         // Invalid UTF-8 (lone continuation byte) — read_to_string rejects it.
         std::fs::write(&target, b"\xFF\xFE\x00").unwrap();
-        let err = read_existing(&target, "bin.dat", tmp.path(), ResolvePolicy::Contained)
-            .await
-            .unwrap_err();
+        let err = read_existing(
+            &target,
+            "bin.dat",
+            tmp.path(),
+            ResolvePolicy::Contained,
+            None,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, ToolError::Execution(_)), "{err:?}");
     }
 
@@ -884,9 +902,15 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let target = tmp.path().join("ok.txt");
         std::fs::write(&target, "hello\n").unwrap();
-        let content = read_existing(&target, "ok.txt", tmp.path(), ResolvePolicy::Contained)
-            .await
-            .unwrap();
+        let content = read_existing(
+            &target,
+            "ok.txt",
+            tmp.path(),
+            ResolvePolicy::Contained,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(content, "hello\n");
     }
 
@@ -1023,5 +1047,49 @@ mod tests {
             "the link must survive the edit"
         );
         assert_eq!(std::fs::read_to_string(&real).unwrap(), "fn uno() {}\n");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn contained_edit_pins_the_workspace_anchor_against_a_later_swap() {
+        // The edit's old-content read is judged against the pinned root:
+        // after the anchor symlink is swapped, the read phase must refuse
+        // rather than merge content sourced from the swapped-in directory,
+        // and nothing may be written anywhere.
+        use std::os::unix::fs::symlink;
+
+        let real = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let anchor_link = workspace.path().join("project");
+        symlink(real.path(), &anchor_link).unwrap();
+        std::fs::write(real.path().join("src.rs"), "fn one() {}\n").unwrap();
+        std::fs::write(outside.path().join("src.rs"), "fn outside() {}\n").unwrap();
+
+        let ctx = ctx_in(anchor_link.to_str().unwrap());
+        std::fs::remove_file(&anchor_link).unwrap();
+        symlink(outside.path(), &anchor_link).unwrap();
+
+        let tool = EditInput::default();
+        let input = json!({
+            "file_path": anchor_link.join("src.rs").to_str().unwrap(),
+            "old_text": "fn outside()",
+            "new_text": "fn replaced()"
+        });
+        let err = tool.call(input, &ctx).await.unwrap_err();
+        assert!(
+            err.to_string().contains("escaped"),
+            "the post-swap location must be rejected: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(real.path().join("src.rs")).unwrap(),
+            "fn one() {}\n",
+            "the pinned workspace's file must be untouched"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("src.rs")).unwrap(),
+            "fn outside() {}\n",
+            "the swapped-in file must be untouched"
+        );
     }
 }
