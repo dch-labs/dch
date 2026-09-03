@@ -47,24 +47,24 @@ impl Theme {
                     .fg(Color::Rgb(86, 182, 194))
                     .add_modifier(Modifier::BOLD),
                 header2: Style::default()
-                    .fg(Color::Rgb(174, 129, 255))
+                    .fg(Color::Rgb(189, 147, 249))
                     .add_modifier(Modifier::BOLD),
                 header3: Style::default()
-                    .fg(Color::Rgb(235, 137, 88))
+                    .fg(Color::Rgb(255, 184, 108))
                     .add_modifier(Modifier::BOLD),
                 header4: Style::default()
-                    .fg(Color::Rgb(235, 203, 139))
+                    .fg(Color::Rgb(241, 250, 140))
                     .add_modifier(Modifier::BOLD),
                 header5: Style::default()
                     .fg(Color::Rgb(139, 233, 253))
                     .add_modifier(Modifier::BOLD),
                 header6: Style::default()
-                    .fg(Color::Rgb(163, 190, 140))
+                    .fg(Color::Rgb(110, 210, 220))
                     .add_modifier(Modifier::BOLD),
                 bold: Style::default().add_modifier(Modifier::BOLD),
                 italic: Style::default().add_modifier(Modifier::ITALIC),
                 code_inline: Style::default()
-                    .fg(Color::Rgb(235, 203, 139))
+                    .fg(Color::Rgb(255, 184, 108))
                     .bg(Color::Rgb(68, 71, 90)),
                 code_block: Style::default().fg(Color::Rgb(248, 248, 242)),
                 link: Style::default()
@@ -150,16 +150,16 @@ impl Theme {
                 italic: Style::default().add_modifier(Modifier::ITALIC),
                 code_inline: Style::default()
                     .fg(Color::Rgb(235, 203, 139))
-                    .bg(Color::Rgb(68, 71, 90)),
-                code_block: Style::default().fg(Color::Rgb(248, 248, 242)),
+                    .bg(Color::Rgb(59, 66, 82)),
+                code_block: Style::default().fg(Color::Rgb(236, 239, 244)),
                 link: Style::default()
-                    .fg(Color::Rgb(98, 114, 164))
+                    .fg(Color::Rgb(163, 190, 140))
                     .add_modifier(Modifier::UNDERLINED),
                 quote: Style::default()
-                    .fg(Color::Rgb(98, 114, 164))
+                    .fg(Color::Rgb(94, 129, 172))
                     .add_modifier(Modifier::ITALIC),
-                list_item: Style::default().fg(Color::Rgb(248, 248, 242)),
-                horizontal_rule: Style::default().fg(Color::Rgb(98, 114, 164)),
+                list_item: Style::default().fg(Color::Rgb(236, 239, 244)),
+                horizontal_rule: Style::default().fg(Color::Rgb(94, 129, 172)),
             },
             ui: UIStyle {
                 background: Color::Rgb(46, 52, 64),
@@ -234,17 +234,17 @@ impl Theme {
                 bold: Style::default().add_modifier(Modifier::BOLD),
                 italic: Style::default().add_modifier(Modifier::ITALIC),
                 code_inline: Style::default()
-                    .fg(Color::Rgb(235, 203, 139))
-                    .bg(Color::Rgb(68, 71, 90)),
-                code_block: Style::default().fg(Color::Rgb(248, 248, 242)),
+                    .fg(Color::Rgb(235, 137, 88))
+                    .bg(Color::Rgb(42, 44, 60)),
+                code_block: Style::default().fg(Color::Rgb(200, 208, 255)),
                 link: Style::default()
-                    .fg(Color::Rgb(98, 114, 164))
+                    .fg(Color::Rgb(151, 206, 238))
                     .add_modifier(Modifier::UNDERLINED),
                 quote: Style::default()
-                    .fg(Color::Rgb(98, 114, 164))
+                    .fg(Color::Rgb(92, 106, 152))
                     .add_modifier(Modifier::ITALIC),
-                list_item: Style::default().fg(Color::Rgb(248, 248, 242)),
-                horizontal_rule: Style::default().fg(Color::Rgb(98, 114, 164)),
+                list_item: Style::default().fg(Color::Rgb(200, 208, 255)),
+                horizontal_rule: Style::default().fg(Color::Rgb(92, 106, 152)),
             },
             ui: UIStyle {
                 background: Color::Rgb(26, 27, 38),
@@ -260,7 +260,7 @@ impl Theme {
                 input_text: Color::Rgb(200, 208, 255),
                 status_bar_bg: Color::Rgb(26, 27, 38),
                 status_bar_fg: Color::Rgb(200, 208, 255),
-                status_success: Color::Rgb(163, 190, 140),
+                status_success: Color::Rgb(169, 177, 214),
                 status_warning: Color::Rgb(235, 203, 139),
                 status_error: Color::Rgb(224, 108, 117),
                 scrollbar_thumb: Color::Rgb(92, 106, 152),
@@ -1126,7 +1126,7 @@ impl Theme {
     #[must_use]
     pub fn github_dark() -> Self {
         Self {
-            name: "Github Dark".to_string(),
+            name: "GitHub Dark".to_string(),
             syntax: SyntaxTheme {
                 attribute: Color::Rgb(33, 136, 255),
                 comment: Color::Rgb(149, 157, 165),
@@ -1211,7 +1211,7 @@ impl Theme {
     #[must_use]
     pub fn github_light() -> Self {
         Self {
-            name: "Github Light".to_string(),
+            name: "GitHub Light".to_string(),
             syntax: SyntaxTheme {
                 attribute: Color::Rgb(3, 102, 214),
                 comment: Color::Rgb(149, 157, 165),
@@ -1299,9 +1299,10 @@ type ThemeConstructor = fn() -> Theme;
 /// The named themes: lookup key → constructor, in registry order.
 ///
 /// `"default"` aliases [`Theme::default`] so config authors can name the
-/// fallback explicitly. Adding a theme means adding the constructor and one
-/// row here — the tests iterate this table, so the two cannot drift apart
-/// silently.
+/// fallback explicitly. Adding a theme means adding the constructor and
+/// one row here: `by_name` resolves only through this table, so a
+/// constructor without a row is unreachable from configuration. The tests
+/// pin that every row resolves and every key is distinct.
 pub(crate) const THEME_CONSTRUCTORS: &[(&str, ThemeConstructor)] = &[
     ("default", Theme::default),
     ("dracula", Theme::dracula),

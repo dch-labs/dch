@@ -122,8 +122,8 @@ pub struct SyntaxTheme {
     /// rather than alternating tones.
     pub property: Color,
 
-    /// Color for punctuation and brackets (`punctuation`,
-    /// Color for punctuation and bracket captures.
+    /// Color for punctuation and bracket captures, both `punctuation` and
+    /// `punctuation.bracket`.
     ///
     /// It carries the structural rhythm of code, so themes keep it quiet —
     /// noticeably dimmer than the token colors it frames.
@@ -187,7 +187,9 @@ impl SyntaxTheme {
     /// together share a field (`function.builtin` renders as `function`);
     /// four palette entries (`comment`, `constructor`, `embedded`, `number`)
     /// are not indexed today and remain as palette entries for richer custom
-    /// rendering.
+    /// rendering. This array is the definition of the order: when the
+    /// highlighter lands, its capture-name list must match these slots slot
+    /// for slot, pinned by a names-versus-array test at that point.
     #[must_use]
     pub fn syntax_colors(&self) -> [Color; 18] {
         [
@@ -204,8 +206,8 @@ impl SyntaxTheme {
             self.string,
             self.escape,
             self.tag,
-            self.r#type, // type
-            self.r#type, // type.builtin
+            self.r#type,
+            self.r#type,
             self.variable,
             self.variable_builtin,
             self.variable,
@@ -360,8 +362,10 @@ pub struct UIStyle {
 
     /// Foreground of assistant messages in the conversation.
     ///
-    /// Set apart from [`user_message_fg`](Self::user_message_fg) so the
-    /// transcript's two voices never blur.
+    /// Paired with [`user_message_fg`](Self::user_message_fg) so the
+    /// transcript's two voices can be told apart. Palettes that keep one
+    /// voice color set the two equal; themes that separate them step this
+    /// a tone away from the user's color.
     pub assistant_message_fg: Color,
 
     /// Border color of the input box.
@@ -463,6 +467,19 @@ mod tests {
     use ratatui::style::Modifier;
 
     #[test]
+    fn registry_keys_are_unique() {
+        // `by_name` resolves with `find`, so a duplicated key would
+        // silently shadow: only the first row would ever resolve. The keys
+        // must be pairwise distinct for every row to be reachable.
+        let keys: Vec<&str> = theme_data::THEME_CONSTRUCTORS
+            .iter()
+            .map(|(key, _)| *key)
+            .collect();
+        let unique: std::collections::HashSet<&str> = keys.iter().copied().collect();
+        assert_eq!(unique.len(), keys.len(), "duplicate registry key: {keys:?}");
+    }
+
+    #[test]
     fn every_known_name_resolves() {
         // The lookup table is the single registry: every entry must resolve,
         // or `by_name` silently degraded for that key.
@@ -475,7 +492,14 @@ mod tests {
     #[test]
     fn the_v1_theme_set_is_registered() {
         // The v1 first cut: exactly this registry scope; the remaining
-        // themes land in a follow-up expansion.
+        // themes land in a follow-up expansion. The length assert makes the
+        // census exact, so a row added or removed without updating this
+        // test fails here first.
+        assert_eq!(
+            theme_data::THEME_CONSTRUCTORS.len(),
+            16,
+            "the registry scope moved; update this census with it"
+        );
         for key in [
             "default",
             "dracula",
