@@ -170,7 +170,8 @@ impl WriteInput {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        crate::fs::atomic_write(&full_path, content, &cwd, policy, expected.as_ref())?;
+        let anchor = rc.as_ref().map(|rc| rc.workspace_anchor.as_ref());
+        crate::fs::atomic_write(&full_path, content, &cwd, policy, expected.as_ref(), anchor)?;
 
         if let Some(rc) = &rc {
             rc.record_baseline(&full_path, crate::state::observe_bytes(content.as_bytes()));
@@ -472,6 +473,60 @@ mod tests {
             .as_array()
             .unwrap();
         assert_eq!(required.len(), 2);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn contained_write_pins_the_workspace_anchor_against_a_later_swap() {
+        // The workspace anchor descriptor is pinned when the context is
+        // constructed — the anchor symlink resolved to `real` at that
+        // moment. Swapping the symlink to `outside` afterwards cannot
+        // redirect the pinned walk: the write lands in the workspace the
+        // anchor resolved to, and the swapped-in directory stays untouched.
+        use std::os::unix::fs::symlink;
+
+        let real = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let workspace = tempfile::TempDir::new().unwrap();
+        let anchor_link = workspace.path().join("project");
+        symlink(real.path(), &anchor_link).unwrap();
+
+        let ctx = ctx_in(anchor_link.to_str().unwrap());
+        std::fs::remove_file(&anchor_link).unwrap();
+        symlink(outside.path(), &anchor_link).unwrap();
+
+        let tool = WriteInput::default();
+        let input = json!({
+            "file_path": anchor_link.join("landed.rs").to_str().unwrap(),
+            "content": "fn main() {}\n"
+        });
+        let out = tool.call(input, &ctx).await.unwrap();
+        assert!(!out.is_error, "{}", out.text_content());
+        assert_eq!(
+            std::fs::read_to_string(real.path().join("landed.rs")).unwrap(),
+            "fn main() {}\n",
+            "the write must land where the anchor resolved at pin time"
+        );
+        assert!(
+            !outside.path().join("landed.rs").exists(),
+            "the swapped-in directory must stay untouched"
+        );
+
+        // A second write reuses the same pinned descriptor — it must not
+        // have been consumed by the first walk.
+        let out = tool
+            .call(
+                json!({ "file_path": anchor_link.join("again.rs"), "content": "fn sec() {}\n" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.text_content());
+        assert_eq!(
+            std::fs::read_to_string(real.path().join("again.rs")).unwrap(),
+            "fn sec() {}\n"
+        );
+        assert!(!outside.path().join("again.rs").exists());
     }
 
     #[cfg(unix)]

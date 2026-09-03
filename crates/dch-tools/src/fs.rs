@@ -1,7 +1,9 @@
 //! Filesystem helpers shared by the write/edit tools.
 
+use std::fmt;
 use std::io::Write;
 use std::path::Path;
+use std::sync::Mutex;
 
 use loopctl::tool::ToolError;
 
@@ -39,6 +41,12 @@ use crate::util::ResolvePolicy;
 /// universal rename-semantics window: an entry swapped in between that
 /// stat and the rename (two adjacent syscalls) is replaced by the rename.
 ///
+/// The walk starts from `anchor` when the caller can supply one: the
+/// context's retained descriptor for the workspace's resolved root, so a
+/// symlink swapped onto the anchor after the context was constructed
+/// cannot redirect the descent. `None` (direct callers, no runner
+/// context) opens the anchor spelling per call, as before.
+///
 /// # Errors
 ///
 /// Returns [`ToolError::InvalidInput`] when a contained target or parent
@@ -52,17 +60,18 @@ pub(crate) fn atomic_write(
     workspace: &Path,
     policy: ResolvePolicy,
     expected: Option<&TargetIdentity>,
+    anchor: Option<&WorkspaceAnchor>,
 ) -> Result<(), ToolError> {
     match policy {
         ResolvePolicy::Unrestricted => path_write(target, content, expected),
         ResolvePolicy::Contained => {
             #[cfg(target_os = "linux")]
             {
-                pinned_write(target, content, workspace, expected)
+                pinned_write(target, content, workspace, expected, anchor)
             }
             #[cfg(not(target_os = "linux"))]
             {
-                let _ = (target, content, workspace, expected);
+                let _ = (target, content, workspace, expected, anchor);
                 Err(ToolError::Execution(
                     "path containment cannot be verified on this platform".to_string(),
                 ))
@@ -140,6 +149,131 @@ fn swap_abort(target: &Path) -> ToolError {
          the write.",
         target.display()
     ))
+}
+
+/// A retained descriptor for the workspace's resolved root.
+///
+/// Opened once when the runner context is constructed — following the
+/// anchor spelling's links at that moment — and held until the context is
+/// dropped. Contained walks start from a duplicate of this descriptor
+/// rather than reopening the anchor path, so a symlink swapped onto the
+/// anchor after construction cannot redirect them: the starting directory
+/// is the one the operator's spelling resolved to at construction time.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) struct WorkspaceAnchor {
+    /// The pinned root descriptor, once the workspace root could be
+    /// opened. `None` means the open failed at construction time and
+    /// contained walks fall back to opening the anchor path per call.
+    #[cfg(target_os = "linux")]
+    resolved: Mutex<Option<AnchorFd>>,
+}
+
+impl WorkspaceAnchor {
+    /// Pin the workspace's resolved root, if it can be opened now.
+    ///
+    /// Deliberately un-failing: a context must be constructible even when
+    /// the root cannot be opened yet; contained walks then fall back to
+    /// opening the anchor path per call (and on non-Linux they fail closed
+    /// regardless).
+    pub(crate) fn pin(workspace: &Path) -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            let resolved = AnchorFd::open(workspace).ok();
+            Self {
+                resolved: Mutex::new(resolved),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = workspace;
+            Self {}
+        }
+    }
+
+    /// A fresh duplicate of the pinned root descriptor, opening the anchor
+    /// path once if the construction-time pin failed.
+    ///
+    /// The duplicate is owned by the caller's walk and closed with it; the
+    /// retained master descriptor stays open for the context's lifetime.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::Execution`] when the anchor cannot be opened
+    /// or duplicated. On non-Linux platforms this always fails closed,
+    /// consistent with the platform's other contained checks.
+    pub(crate) fn dup_fd(&self, workspace: &Path) -> Result<i32, ToolError> {
+        #[cfg(target_os = "linux")]
+        {
+            let mut slot = self
+                .resolved
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let master = if let Some(master) = slot.as_ref() {
+                master.raw()
+            } else {
+                let anchor = AnchorFd::open(workspace)?;
+                // The insert fills the vacant slot; copying the fd number
+                // out ends this borrow before the lock is released.
+                let inserted = slot.insert(anchor);
+                inserted.raw()
+            };
+            // SAFETY: `master` is a valid open descriptor for the duration
+            // of the call; the duplicate is owned by the caller.
+            let duplicate = unsafe { libc::dup(master) };
+            if duplicate < 0 {
+                return Err(ToolError::Execution(format!(
+                    "cannot duplicate the workspace anchor: {}",
+                    std::io::Error::last_os_error()
+                )));
+            }
+            Ok(duplicate)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = workspace;
+            Err(ToolError::Execution(
+                "path containment cannot be verified on this platform".to_string(),
+            ))
+        }
+    }
+}
+
+impl fmt::Debug for WorkspaceAnchor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("WorkspaceAnchor")
+    }
+}
+
+/// An owned directory descriptor, closed on drop.
+#[cfg(target_os = "linux")]
+struct AnchorFd(i32);
+
+#[cfg(target_os = "linux")]
+impl AnchorFd {
+    /// Open `workspace` as a directory descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::Execution`] when the path cannot be opened as
+    /// a directory, carrying the OS error.
+    fn open(workspace: &Path) -> Result<Self, ToolError> {
+        Ok(Self(open_dir_fd(
+            workspace,
+            libc::O_RDONLY | libc::O_DIRECTORY,
+        )?))
+    }
+
+    fn raw(&self) -> i32 {
+        self.0
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for AnchorFd {
+    fn drop(&mut self) {
+        // SAFETY: the descriptor is closed exactly once, here.
+        let _ = unsafe { libc::close(self.0) };
+    }
 }
 
 /// Unique-name counter for contained temp files, alongside the creating
@@ -243,17 +377,21 @@ fn open_contained_dir(
     parent: &Path,
     workspace: &Path,
     create_missing: bool,
+    anchor: Option<&WorkspaceAnchor>,
 ) -> Result<PinnedDir, ToolError> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
     // The parent may be spelled through the operator's anchor or through
     // the workspace's resolved form — `resolve_path` accepts both. Match
-    // whichever spelling the parent uses and anchor the walk there; the
-    // no-follow descent below the anchor is identical either way.
+    // whichever spelling the parent uses and start the descent from there;
+    // the no-follow steps below the anchor are identical either way. The
+    // starting descriptor comes from the retained anchor when one is
+    // supplied: it was resolved when the context was constructed, so a
+    // symlink swapped onto the anchor afterwards cannot redirect the walk.
     let canonical_workspace =
         std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
-    let (anchor, relative) = match parent.strip_prefix(workspace) {
+    let (anchor_spelling, relative) = match parent.strip_prefix(workspace) {
         Ok(relative) => (workspace, relative),
         Err(_) => match parent.strip_prefix(&canonical_workspace) {
             Ok(relative) => (canonical_workspace.as_path(), relative),
@@ -266,6 +404,10 @@ fn open_contained_dir(
             }
         },
     };
+    let root = match anchor {
+        Some(anchor) => anchor.dup_fd(anchor_spelling)?,
+        None => open_dir_fd(anchor_spelling, libc::O_RDONLY | libc::O_DIRECTORY)?,
+    };
 
     let mut pinned = PinnedDir {
         dir_fd: -1,
@@ -273,7 +415,6 @@ fn open_contained_dir(
         created: Vec::new(),
     };
     let failure = (|| {
-        let root = open_dir_fd(anchor, libc::O_RDONLY | libc::O_DIRECTORY)?;
         pinned.walked.push(root);
         let mut current = root;
         for component in relative.components() {
@@ -360,6 +501,7 @@ fn pinned_write(
     content: &str,
     workspace: &Path,
     expected: Option<&TargetIdentity>,
+    anchor: Option<&WorkspaceAnchor>,
 ) -> Result<(), ToolError> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
@@ -379,7 +521,7 @@ fn pinned_write(
     let name = CString::new(name.as_bytes())
         .map_err(|_| ToolError::Execution("path contains a NUL byte".to_string()))?;
 
-    let pinned = open_contained_dir(parent, workspace, true)?;
+    let pinned = open_contained_dir(parent, workspace, true, anchor)?;
     // One no-follow stat decides both the link refusal and the permission
     // copy: a separate stat for the mode would open a window where a racer
     // swaps in a symlink and the copy takes the link's 0o777 onto the new
@@ -650,6 +792,7 @@ mod tests {
             tmp.path(),
             ResolvePolicy::Unrestricted,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
@@ -664,6 +807,7 @@ mod tests {
             "fn main() {}\n",
             tmp.path(),
             ResolvePolicy::Unrestricted,
+            None,
             None,
         )
         .unwrap();
@@ -687,6 +831,7 @@ mod tests {
             "#!/bin/bash\necho new\n",
             tmp.path(),
             ResolvePolicy::Contained,
+            None,
             None,
         )
         .unwrap();
@@ -714,6 +859,7 @@ mod tests {
             "new content\n",
             tmp.path(),
             ResolvePolicy::Contained,
+            None,
             None,
         )
         .unwrap_err();
@@ -754,6 +900,7 @@ mod tests {
             tmp.path(),
             ResolvePolicy::Unrestricted,
             None,
+            None,
         )
         .unwrap();
 
@@ -792,6 +939,7 @@ mod tests {
             workspace.path(),
             ResolvePolicy::Contained,
             None,
+            None,
         )
         .unwrap_err();
         assert!(
@@ -820,6 +968,7 @@ mod tests {
             "x",
             workspace.path(),
             ResolvePolicy::Unrestricted,
+            None,
             None,
         )
         .unwrap();
@@ -850,6 +999,7 @@ mod tests {
             tmp.path(),
             ResolvePolicy::Unrestricted,
             Some(&identity),
+            None,
         )
         .unwrap_err();
         assert!(
@@ -877,6 +1027,7 @@ mod tests {
             tmp.path(),
             ResolvePolicy::Unrestricted,
             Some(&identity),
+            None,
         )
         .unwrap();
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
@@ -898,6 +1049,7 @@ mod tests {
             tmp.path(),
             ResolvePolicy::Unrestricted,
             Some(&identity),
+            None,
         )
         .unwrap_err();
         assert!(
@@ -918,7 +1070,7 @@ mod tests {
     fn open_contained_dir_builds_a_missing_chain() {
         let tmp = tempfile::TempDir::new().unwrap();
         let parent = tmp.path().join("a").join("b");
-        open_contained_dir(&parent, tmp.path(), true).unwrap();
+        open_contained_dir(&parent, tmp.path(), true, None).unwrap();
         assert!(parent.is_dir());
     }
 
@@ -928,7 +1080,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let parent = tmp.path().join("a");
         std::fs::create_dir(&parent).unwrap();
-        open_contained_dir(&parent, tmp.path(), false).unwrap();
+        open_contained_dir(&parent, tmp.path(), false, None).unwrap();
         assert!(parent.is_dir());
     }
 
@@ -937,7 +1089,7 @@ mod tests {
     fn open_contained_dir_requires_an_existing_parent_when_creation_is_off() {
         let tmp = tempfile::TempDir::new().unwrap();
         let parent = tmp.path().join("absent");
-        let err = open_contained_dir(&parent, tmp.path(), false).unwrap_err();
+        let err = open_contained_dir(&parent, tmp.path(), false, None).unwrap_err();
         assert!(err.to_string().contains("cannot descend"), "{err}");
         assert!(!parent.exists(), "nothing may be created without the flag");
     }
@@ -961,7 +1113,7 @@ mod tests {
                 let before = count_open_fds();
                 for i in 0..calls_per_window {
                     let parent = tmp.path().join(format!("w{window}a{i}")).join("b");
-                    open_contained_dir(&parent, tmp.path(), true).unwrap();
+                    open_contained_dir(&parent, tmp.path(), true, None).unwrap();
                     assert!(parent.is_dir());
                 }
                 count_open_fds().saturating_sub(before)
@@ -993,7 +1145,7 @@ mod tests {
         symlink(outside.path(), workspace.path().join("dir")).unwrap();
         let parent = workspace.path().join("dir").join("nested");
 
-        let err = open_contained_dir(&parent, workspace.path(), true).unwrap_err();
+        let err = open_contained_dir(&parent, workspace.path(), true, None).unwrap_err();
         assert!(err.to_string().contains("symbolic link"), "{err}");
         assert!(
             !outside.path().join("nested").exists(),
@@ -1015,7 +1167,7 @@ mod tests {
         symlink(&real, workspace.path().join("link")).unwrap();
         let parent = workspace.path().join("link").join("new");
 
-        let err = open_contained_dir(&parent, workspace.path(), true).unwrap_err();
+        let err = open_contained_dir(&parent, workspace.path(), true, None).unwrap_err();
         assert!(err.to_string().contains("symbolic link"), "{err}");
         assert!(!real.join("new").exists());
     }
@@ -1033,7 +1185,7 @@ mod tests {
         let long = "n".repeat(300);
         let parent = workspace.path().join("a").join(&long);
 
-        let err = open_contained_dir(&parent, workspace.path(), true).unwrap_err();
+        let err = open_contained_dir(&parent, workspace.path(), true, None).unwrap_err();
         assert!(err.to_string().contains("cannot"), "{err}");
         assert!(
             !workspace.path().join("a").exists(),
@@ -1067,6 +1219,7 @@ mod tests {
                         "fn main() {}\n",
                         workspace.path(),
                         ResolvePolicy::Contained,
+                        None,
                         None,
                     )
                     .unwrap();
@@ -1109,6 +1262,7 @@ mod tests {
             tmp.path(),
             ResolvePolicy::Contained,
             Some(&identity),
+            None,
         )
         .unwrap_err();
         assert!(
@@ -1145,6 +1299,7 @@ mod tests {
             tmp.path(),
             ResolvePolicy::Contained,
             Some(&identity),
+            None,
         )
         .unwrap_err();
         assert!(

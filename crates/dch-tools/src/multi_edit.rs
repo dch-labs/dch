@@ -263,6 +263,7 @@ async fn write_finals(
     workspace: &Path,
     policy: ResolvePolicy,
 ) -> Result<Option<BatchConflict>, ToolError> {
+    let anchor = history.map(|rc| rc.workspace_anchor.as_ref());
     let mut written: std::collections::HashSet<&Path> = std::collections::HashSet::new();
     let mut applied: Vec<String> = Vec::new();
     for op in operations {
@@ -289,6 +290,7 @@ async fn write_finals(
                 workspace,
                 policy,
                 expected.as_ref(),
+                anchor,
             )
             .map_err(|e| fault_with_applied(e, &applied))?;
             applied.push(op.file_path.clone());
@@ -1345,9 +1347,16 @@ mod tests {
         std::fs::write(real.path().join("src").join("a.rs"), "fn one() {}\n").unwrap();
 
         let tool = MultiEditTool;
-        let ctx = ctx_in(real.path().to_str().unwrap());
+        // The context is anchored at the symlink; the edit addresses the
+        // file through the canonical spelling, exercising the walk's
+        // resolved-form branch with a symlinked workspace anchor.
+        let ctx = ctx_in(anchor_link.to_str().unwrap());
         let input = json!({
-            "edits": [edit("src/a.rs", "fn one() {}", "fn one(x: i32) {}")]
+            "edits": [edit(
+                real.path().join("src").join("a.rs").to_str().unwrap(),
+                "fn one() {}",
+                "fn one(x: i32) {}",
+            )]
         });
         let out = tool.call(input, &ctx).await.unwrap();
         assert!(!out.is_error, "{}", out.text_content());

@@ -15,6 +15,7 @@ use std::sync::mpsc;
 
 use loopctl::tool::ToolError;
 
+use crate::fs::WorkspaceAnchor;
 use crate::question::QuestionRequest;
 use crate::state::FileBaselines;
 use crate::todo::TodoEntry;
@@ -97,6 +98,17 @@ pub struct RunnerContext {
     /// consulted only after a path-key miss.
     pub file_identities: Arc<Mutex<crate::state::FileIdentities>>,
 
+    /// A retained descriptor for the workspace's resolved root, opened
+    /// when this context was constructed.
+    ///
+    /// Contained walks start from a duplicate of this descriptor rather
+    /// than reopening the anchor path, so a symlink swapped onto the
+    /// workspace spelling after construction cannot redirect them: the
+    /// starting directory is the one the operator's spelling resolved to
+    /// at construction time. Cloning [`RunnerContext`] shares the same
+    /// descriptor.
+    pub(crate) workspace_anchor: Arc<WorkspaceAnchor>,
+
     /// Whether file tools confine paths to [`cwd`](Self::cwd).
     ///
     /// [`ResolvePolicy::Contained`] (the default) rejects paths that escape
@@ -123,12 +135,14 @@ impl RunnerContext {
     pub fn new(cwd: PathBuf) -> Self {
         let cwd = std::path::absolute(&cwd).unwrap_or(cwd);
         let cwd = crate::util::normalize_lexical(&cwd);
+        let workspace_anchor = Arc::new(WorkspaceAnchor::pin(&cwd));
         Self {
             cwd,
             todos: Arc::new(Mutex::new(Vec::new())),
             question_tx: Arc::new(Mutex::new(None)),
             file_baselines: Arc::new(Mutex::new(FileBaselines::default())),
             file_identities: Arc::new(Mutex::new(crate::state::FileIdentities::default())),
+            workspace_anchor,
             resolve_policy: ResolvePolicy::default(),
         }
     }
@@ -275,6 +289,7 @@ impl fmt::Debug for RunnerContext {
             .field("question_tx", &has_channel)
             .field("file_baselines", &baselines)
             .field("file_identities", &identities)
+            .field("workspace_anchor", &self.workspace_anchor)
             .field("resolve_policy", &self.resolve_policy)
             .finish()
     }

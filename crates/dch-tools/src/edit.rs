@@ -145,7 +145,15 @@ impl EditInput {
             }
         };
 
-        crate::fs::atomic_write(&full_path, &new_content, &cwd, policy, expected.as_ref())?;
+        let anchor = rc.as_ref().map(|rc| rc.workspace_anchor.as_ref());
+        crate::fs::atomic_write(
+            &full_path,
+            &new_content,
+            &cwd,
+            policy,
+            expected.as_ref(),
+            anchor,
+        )?;
 
         if let Some(rc) = &rc {
             rc.record_baseline(
