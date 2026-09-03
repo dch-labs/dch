@@ -992,6 +992,102 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_refuses_when_the_newest_alias_observation_differs_from_disk() {
+        // The integrity direction: the model's newest knowledge arrived
+        // through a hard-link alias (canonicalization unifies symlinks,
+        // not links, so the alias recorded a distinct path key). An
+        // external in-place revert then changed the file behind both
+        // spellings — the stale path entry of the write's own spelling
+        // must not downgrade the guard to a pass.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut ctx = ToolContext::default();
+        ctx.cwd = tmp.path().to_string_lossy().into_owned();
+        ctx.set_extension(
+            RunnerContext::new(tmp.path().to_path_buf())
+                .with_resolve_policy(ResolvePolicy::Unrestricted),
+        );
+
+        std::fs::write(tmp.path().join("real.txt"), "v1\n").unwrap();
+        let reader = crate::read::ReadInput::default();
+        reader
+            .call(json!({ "file_path": "real.txt" }), &ctx)
+            .await
+            .unwrap();
+
+        std::fs::hard_link(tmp.path().join("real.txt"), tmp.path().join("hard.txt")).unwrap();
+        std::fs::write(tmp.path().join("real.txt"), "EXT\n").unwrap();
+        reader
+            .call(json!({ "file_path": "hard.txt" }), &ctx)
+            .await
+            .unwrap();
+
+        std::fs::write(tmp.path().join("real.txt"), "v1\n").unwrap();
+
+        let tool = WriteInput::default();
+        let out = tool
+            .call(json!({ "file_path": "real.txt", "content": "NEW\n" }), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            out.is_error,
+            "the unobserved revert must be caught: {}",
+            out.text_content()
+        );
+        assert!(
+            out.text_content().contains("changed on disk"),
+            "{}",
+            out.text_content()
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("real.txt")).unwrap(),
+            "v1\n",
+            "the refused write must leave the reverted content standing"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_proceeds_when_the_alias_observation_matches_the_current_content() {
+        // The false-conflict direction: the same alias divergence without
+        // the revert — the model has seen the current content through the
+        // alias, and the write must not be blamed on an external change.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut ctx = ToolContext::default();
+        ctx.cwd = tmp.path().to_string_lossy().into_owned();
+        ctx.set_extension(
+            RunnerContext::new(tmp.path().to_path_buf())
+                .with_resolve_policy(ResolvePolicy::Unrestricted),
+        );
+
+        std::fs::write(tmp.path().join("real.txt"), "v1\n").unwrap();
+        let reader = crate::read::ReadInput::default();
+        reader
+            .call(json!({ "file_path": "real.txt" }), &ctx)
+            .await
+            .unwrap();
+
+        std::fs::hard_link(tmp.path().join("real.txt"), tmp.path().join("hard.txt")).unwrap();
+        std::fs::write(tmp.path().join("real.txt"), "EXT\n").unwrap();
+        reader
+            .call(json!({ "file_path": "hard.txt" }), &ctx)
+            .await
+            .unwrap();
+
+        let tool = WriteInput::default();
+        let out = tool
+            .call(json!({ "file_path": "real.txt", "content": "NEW\n" }), &ctx)
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.text_content());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("real.txt")).unwrap(),
+            "NEW\n",
+            "the alias's current observation must not block the write"
+        );
+    }
+
     #[tokio::test]
     async fn unrestricted_write_reaches_outside_the_workspace() {
         // The headline promise of the opt-out: an unrestricted write lands

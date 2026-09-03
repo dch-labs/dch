@@ -532,12 +532,13 @@ enum AbortReason {
     /// any file is written: resolve the link and pass the real path.
     Symlink(String),
 
-    /// Two edits' caller-supplied paths are physically the same file (all
-    /// three named in the message, including the shared inode).
+    /// Two edits' caller-supplied paths are physically the same file.
     ///
-    /// Produced by [`physical_alias_check`] under both policies: each
-    /// alias would merge independently against the same original, and the
-    /// second write would silently clobber the first.
+    /// Both spellings are named in the message, plus the shared stat
+    /// identity where the platform prints one. Produced by
+    /// [`physical_alias_check`] under both policies: each alias would
+    /// merge independently against the same original, and the second
+    /// write would silently clobber the first.
     Alias(String),
 
     /// Two edits resolve to the same physical file under different path aliases.
@@ -680,43 +681,37 @@ fn honor_symlink_targets(operations: &mut [EditOperation]) -> Result<(), ToolErr
 /// would merge independently against the same original and the writes
 /// would clobber one another — and the staleness re-read would then blame
 /// an external change the batch itself produced. Every distinct target is
-/// stated once and compared by stat identity; entries that cannot be
+/// stated once and compared by physical identity; entries that cannot be
 /// stated do not exist yet and are left to the read phase to refuse. Runs
 /// under both policies: it protects the batch's own merge semantics, it is
 /// not containment.
 ///
-/// Degradation: on platforms without a stable stat identity the check
-/// cannot fire — under Contained those platforms fail closed at the write
-/// anyway, while unrestricted multi-edit there keeps the alias hole. Two
-/// residuals are accepted and shared with the rest of the guard stack:
-/// separate (non-batch) calls to two hard-link spellings can still split a
-/// shared file — each call is internally consistent and no batch contract
-/// is at stake — and the universal stat-to-rename swap window applies here
-/// as everywhere else.
+/// Identity is per-platform (see [`physical_identity`]). Degradation: on
+/// platforms that expose no identity the check cannot fire — under
+/// Contained those platforms fail closed at the write anyway, while
+/// unrestricted multi-edit there keeps the alias hole. Two residuals are
+/// accepted and shared with the rest of the guard stack: separate
+/// (non-batch) calls to two hard-link spellings can still split a shared
+/// file — each call is internally consistent and no batch contract is at
+/// stake — and the universal stat-to-rename swap window applies here as
+/// everywhere else.
 fn physical_alias_check(operations: &[EditOperation]) -> Option<AbortReason> {
     let mut seen = std::collections::HashSet::new();
-    let mut identities: std::collections::HashMap<(u64, u64), String> =
+    let mut identities: std::collections::HashMap<PhysicalIdentity, String> =
         std::collections::HashMap::new();
     for op in operations {
         if !seen.insert(op.full_path.as_path()) {
             continue;
         }
-        #[cfg(unix)]
-        let identity = std::fs::metadata(&op.full_path).ok().map(|meta| {
-            use std::os::unix::fs::MetadataExt;
-            (meta.dev(), meta.ino())
-        });
-        #[cfg(not(unix))]
-        let identity: Option<(u64, u64)> = None;
-        let Some(identity) = identity else {
+        let Some(identity) = physical_identity(&op.full_path) else {
             continue;
         };
         if let Some(existing) = identities.get(&identity) {
             if *existing != op.file_path.as_str() {
-                return Some(AbortReason::Alias(format!(
-                    "Refusing to write: '{}' and '{}' are the same file (same inode: \
-                     {}:{}). Combine them into one set of edits.",
-                    existing, op.file_path, identity.0, identity.1
+                return Some(AbortReason::Alias(alias_refusal(
+                    existing,
+                    &op.file_path,
+                    identity,
                 )));
             }
             continue;
@@ -724,6 +719,97 @@ fn physical_alias_check(operations: &[EditOperation]) -> Option<AbortReason> {
         identities.insert(identity, op.file_path.clone());
     }
     None
+}
+
+/// The physical identity of one filesystem entry, for alias comparison.
+///
+/// Unix keys by the stat pair (device, inode); platforms served by
+/// `same-file` key by its handle, whose equality and hash compare the
+/// underlying file rather than its name. A platform with neither has no
+/// identity and [`physical_alias_check`] degrades to no detection.
+#[cfg(unix)]
+type PhysicalIdentity = (u64, u64);
+
+/// The physical identity of one filesystem entry, for alias comparison.
+///
+/// Windows counterpart: the `same-file` handle (volume serial plus file
+/// index), hashable and comparable by what the entry points at.
+#[cfg(windows)]
+type PhysicalIdentity = same_file::Handle;
+
+/// The physical identity of one filesystem entry, for alias comparison.
+///
+/// Platforms with neither a stat identity nor a `same-file` handle have
+/// nothing to key on; the placeholder always resolves to `None`, so the
+/// alias check degrades to no detection there.
+#[cfg(not(any(unix, windows)))]
+type PhysicalIdentity = ();
+
+/// The identity of the file `path` reaches, or `None` when it cannot be
+/// determined.
+///
+/// `None` covers a not-yet-existing target — the read phase refuses that
+/// instead — and a platform or entry that exposes no identity.
+#[cfg(unix)]
+fn physical_identity(path: &Path) -> Option<PhysicalIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path)
+        .ok()
+        .map(|meta| (meta.dev(), meta.ino()))
+}
+
+/// The identity of the file `path` reaches, or `None` when it cannot be
+/// determined.
+///
+/// Windows counterpart: opening the entry through `same-file` and keying
+/// on its handle.
+#[cfg(windows)]
+fn physical_identity(path: &Path) -> Option<PhysicalIdentity> {
+    same_file::Handle::from_path(path).ok()
+}
+
+/// The identity of the file `path` reaches, or `None` when it cannot be
+/// determined.
+///
+/// Platform without an identity mechanism: always `None`.
+#[cfg(not(any(unix, windows)))]
+fn physical_identity(_path: &Path) -> Option<PhysicalIdentity> {
+    None
+}
+
+/// Format the refusal for two spellings of one physical file.
+///
+/// Unix names the shared stat pair so the caller can see the aliases
+/// collided at the inode level; platforms without a printable identity
+/// name the fact alone.
+#[cfg(unix)]
+fn alias_refusal(first: &str, second: &str, identity: PhysicalIdentity) -> String {
+    format!(
+        "Refusing to write: '{first}' and '{second}' are the same file (same \
+         inode: {}:{}). Combine them into one set of edits.",
+        identity.0, identity.1
+    )
+}
+
+/// Format the refusal for two spellings of one physical file.
+///
+/// Windows counterpart: no printable identity, so the message names the
+/// collision alone.
+#[cfg(windows)]
+fn alias_refusal(first: &str, second: &str, _identity: PhysicalIdentity) -> String {
+    format!(
+        "Refusing to write: '{first}' and '{second}' are the same file. \
+         Combine them into one set of edits."
+    )
+}
+
+/// Format the refusal for two spellings of one physical file.
+///
+/// Platform without an identity mechanism: the branch is unreachable (no
+/// identity, no collision), but the compilation unit needs the binding.
+#[cfg(not(any(unix, windows)))]
+fn alias_refusal(first: &str, second: &str, _identity: PhysicalIdentity) -> String {
+    format!("Refusing to write: '{first}' and '{second}' are the same file.")
 }
 
 /// A pair of edits whose `old_text` byte-ranges overlap in the same file.
@@ -1449,6 +1535,38 @@ mod tests {
             ),
             other => panic!("the physical-identity refusal fires: {other:?}"),
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn physical_alias_check_refuses_distinct_paths_to_one_file_on_windows() {
+        // The non-unix half of the alias guard: hard links are detected
+        // through `same-file`'s handle equality (volume serial plus file
+        // index) rather than a stat pair.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let real = tmp.path().join("real.rs");
+        let hard = tmp.path().join("hard.rs");
+        std::fs::write(&real, "x").unwrap();
+        std::fs::hard_link(&real, &hard).unwrap();
+        let ops = vec![
+            EditOperation {
+                file_path: "real.rs".to_string(),
+                full_path: real,
+                old_text: "x".to_string(),
+                new_text: "y".to_string(),
+            },
+            EditOperation {
+                file_path: "hard.rs".to_string(),
+                full_path: hard,
+                old_text: "x".to_string(),
+                new_text: "y".to_string(),
+            },
+        ];
+        let reason = physical_alias_check(&ops).expect("physical alias aborts");
+        assert!(
+            matches!(reason, AbortReason::Alias(_)),
+            "the hard-link pair must abort the batch: {reason:?}"
+        );
     }
 
     #[cfg(unix)]

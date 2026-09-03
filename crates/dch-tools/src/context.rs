@@ -91,11 +91,15 @@ pub struct RunnerContext {
     /// staleness guard holds whichever spelling of a file arrives. Only
     /// populated and consulted under [`ResolvePolicy::Unrestricted`];
     /// contained keys are the lexical resolution output by design. Cloning
-    /// [`RunnerContext`] shares the same map. Residual, mirroring the
-    /// `TargetIdentity` field docs: a delete-and-recreate that reclaims the
-    /// recorded device-inode pair arms a guard for a file the model never
-    /// touched — a false refusal, never a false pass, since the index is
-    /// consulted only after a path-key miss.
+    /// [`RunnerContext`] shares the same map. Lookups hold whichever of
+    /// the two indexes' entries is the newer observation, so a hard-link
+    /// alias's newer record is never shadowed by the stale path entry of
+    /// the spelling that happens to be asked. Residual, mirroring the
+    /// `TargetIdentity` field docs: a delete-and-recreate that reclaims
+    /// the recorded device-inode pair arms a guard for a file the model
+    /// never touched — a false refusal, never a false pass, since the
+    /// guard passes only on a hash match with content the model actually
+    /// observed.
     pub file_identities: Arc<Mutex<crate::state::FileIdentities>>,
 
     /// A retained descriptor for the workspace's resolved root, opened
@@ -198,25 +202,42 @@ impl RunnerContext {
     ///
     /// `path` is normalized with the same rule [`record_baseline`](Self::record_baseline)
     /// applies, so a lookup through any spelling of a file finds the
-    /// baseline regardless of which spelling recorded it. Thin locking
-    /// wrapper over [`baseline`](crate::state::baseline).
+    /// baseline regardless of which spelling recorded it. Under
+    /// [`ResolvePolicy::Unrestricted`] the lookup consults both indexes —
+    /// the path key and the file's stat identity, since hard-link aliases
+    /// are distinct path keys over one physical file — and holds whichever
+    /// entry carries the newer observation, mirroring the record rule.
+    /// Thin locking wrapper over the accessors in [`crate::state`].
     pub(crate) fn baseline_for(&self, path: &Path) -> Option<u64> {
         let key = self.baseline_map_key(path);
-        let baselines = self
-            .file_baselines
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let by_path = crate::state::baseline(&baselines, &key);
-        drop(baselines);
-        if by_path.is_some() || self.resolve_policy != ResolvePolicy::Unrestricted {
-            return by_path;
+        let by_path = {
+            let baselines = self
+                .file_baselines
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            crate::state::entry(&baselines, &key)
+        };
+        if self.resolve_policy != ResolvePolicy::Unrestricted {
+            return by_path.map(|baseline| baseline.hash);
         }
-        let identity = identity_of(path)?;
-        let identities = self
-            .file_identities
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        crate::state::baseline_identity(&identities, identity)
+        let by_identity = identity_of(path).and_then(|identity| {
+            let identities = self
+                .file_identities
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            crate::state::entry_identity(&identities, identity)
+        });
+        let newest = match (by_path, by_identity) {
+            (Some(path_entry), Some(identity_entry)) => Some({
+                if identity_entry.observed > path_entry.observed {
+                    identity_entry
+                } else {
+                    path_entry
+                }
+            }),
+            (only, None) | (None, only) => only,
+        };
+        newest.map(|baseline| baseline.hash)
     }
 
     /// The baseline map key for `path`, per the run's resolve policy.
@@ -623,6 +644,71 @@ mod tests {
             rc.baseline_for(&realdir.join("a.rs")),
             None,
             "the physical spelling is a distinct key under Contained"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn baseline_lookup_holds_the_newest_observation_across_hard_link_aliases() {
+        // Hard-link aliases are two distinct path keys over one physical
+        // file: canonicalization unifies symlinks, not links. The lookup
+        // must hold the newest observation of the file, whichever spelling
+        // recorded it — not the entry of the spelling that was asked.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let real = tmp.path().join("real.txt");
+        let hard = tmp.path().join("hard.txt");
+        std::fs::write(&real, b"v1").unwrap();
+        std::fs::hard_link(&real, &hard).unwrap();
+
+        let rc = RunnerContext::new(tmp.path().to_path_buf())
+            .with_resolve_policy(ResolvePolicy::Unrestricted);
+        rc.record_baseline(&real, crate::state::observe_bytes(b"v1"));
+        rc.record_baseline(&hard, crate::state::observe_bytes(b"EXT"));
+
+        assert_eq!(
+            rc.baseline_for(&real),
+            Some(crate::state::content_hash(b"EXT")),
+            "the alias's newer observation must supersede the stale path entry"
+        );
+        assert_eq!(
+            rc.baseline_for(&hard),
+            Some(crate::state::content_hash(b"EXT"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn baseline_lookup_takes_the_newest_across_aliases_in_both_insert_orders() {
+        // Mirror of the map's out-of-order pins: whichever spelling records
+        // the older observation first, the newer one wins for every
+        // spelling of the file.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let real = tmp.path().join("real.txt");
+        let hard = tmp.path().join("hard.txt");
+        std::fs::write(&real, b"v1").unwrap();
+        std::fs::hard_link(&real, &hard).unwrap();
+
+        let older = crate::state::observe_bytes(b"v1");
+        let newer = crate::state::observe_bytes(b"EXT");
+
+        let rc = RunnerContext::new(tmp.path().to_path_buf())
+            .with_resolve_policy(ResolvePolicy::Unrestricted);
+        rc.record_baseline(&hard, older);
+        rc.record_baseline(&real, newer);
+        assert_eq!(
+            rc.baseline_for(&hard),
+            Some(newer.hash),
+            "newer through the physical spelling must win on the alias"
+        );
+
+        let rc = RunnerContext::new(tmp.path().to_path_buf())
+            .with_resolve_policy(ResolvePolicy::Unrestricted);
+        rc.record_baseline(&real, older);
+        rc.record_baseline(&hard, newer);
+        assert_eq!(
+            rc.baseline_for(&real),
+            Some(newer.hash),
+            "newer through the alias must win on the physical spelling"
         );
     }
 }

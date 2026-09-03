@@ -1162,7 +1162,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(baselines.len(), 1, "one successful read, one baseline");
         assert_eq!(
-            crate::state::baseline(&baselines, path.as_path()),
+            crate::state::entry(&baselines, path.as_path()).map(|obs| obs.hash),
             Some(crate::state::content_hash("hello world\n".as_bytes()))
         );
     }
@@ -1211,7 +1211,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(
-            crate::state::baseline(&baselines, path.as_path()),
+            crate::state::entry(&baselines, path.as_path()).map(|obs| obs.hash),
             Some(crate::state::content_hash("hello world\n".as_bytes()))
         );
     }
@@ -1238,7 +1238,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(
-            crate::state::baseline(&baselines, path.as_path()),
+            crate::state::entry(&baselines, path.as_path()).map(|obs| obs.hash),
             Some(crate::state::content_hash(&bytes)),
             "the model was told this file is binary — that notice arms the guard"
         );
@@ -1267,7 +1267,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(baselines.len(), 1, "an image the model saw is a baseline");
         assert_eq!(
-            crate::state::baseline(&baselines, path.as_path()),
+            crate::state::entry(&baselines, path.as_path()).map(|obs| obs.hash),
             Some(crate::state::content_hash(&bytes))
         );
     }
