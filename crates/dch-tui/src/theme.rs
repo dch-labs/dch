@@ -491,7 +491,8 @@ impl Default for Theme {
     clippy::expect_used,
     clippy::unwrap_used,
     clippy::panic,
-    clippy::missing_panics_doc
+    clippy::missing_panics_doc,
+    clippy::arithmetic_side_effects
 )]
 mod tests {
     use super::*;
@@ -746,6 +747,40 @@ mod tests {
                     "{key}: markdown style without a real foreground"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn inline_code_contrasts_with_its_chip() {
+        // WCAG relative luminance: a foreground that blends into its chip
+        // background makes inline code unreadable, so every theme's pair
+        // must clear the 3:1 large-text minimum.
+        fn channel(v: u8) -> f32 {
+            let c = f32::from(v) / 255.0;
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        fn luminance(color: Color) -> f32 {
+            let (r, g, b) = match color {
+                Color::Rgb(r, g, b) => (r, g, b),
+                other => panic!("chip colors must be RGB, got {other:?}"),
+            };
+            0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+        }
+        for (key, _) in theme_data::THEME_CONSTRUCTORS {
+            let style = Theme::by_name(key).unwrap().markdown.code_inline;
+            let fg = style.fg.unwrap();
+            let bg = style.bg.unwrap();
+            let (lf, lb) = (luminance(fg), luminance(bg));
+            let (lighter, darker) = if lf > lb { (lf, lb) } else { (lb, lf) };
+            let ratio = (lighter + 0.05) / (darker + 0.05);
+            assert!(
+                ratio >= 3.0,
+                "{key}: inline-code contrast {ratio:.2} is below 3:1"
+            );
         }
     }
 
