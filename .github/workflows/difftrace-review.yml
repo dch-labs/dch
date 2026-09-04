@@ -110,11 +110,14 @@ jobs:
           AUTHOR: ${{ github.event.comment.user.login }}
         run: |
           case "$AUTHOR" in *"[bot]") echo "skip=bot" >> "$GITHUB_OUTPUT"; exit 0;; esac
-          if ! printf '%s' "$BODY" | grep -qiE '^(@difftrace(\[bot\])?|/difftrace)[[:space:]]'; then
+          # A comment triggers difftrace only when its first line addresses
+          # the bot: "re-review" runs a fresh review, any other mention
+          # replies in the thread.
+          if ! printf '%s' "$BODY" | head -n 1 | grep -qiE '^(@difftrace(\[bot\])?|/difftrace)[[:space:]]'; then
             echo "skip=mention" >> "$GITHUB_OUTPUT"; exit 0
           fi
           echo "skip=" >> "$GITHUB_OUTPUT"
-          if printf '%s' "$BODY" | grep -qiE '^(@difftrace(\[bot\])?|/difftrace)[[:space:]]+re-review([[:space:]]|$)'; then
+          if printf '%s' "$BODY" | head -n 1 | grep -qiE '^(@difftrace(\[bot\])?|/difftrace)[[:space:]]+re-review([[:space:]]|$)'; then
             echo "verb=review" >> "$GITHUB_OUTPUT"
           else
             echo "verb=reply" >> "$GITHUB_OUTPUT"
@@ -129,10 +132,22 @@ jobs:
           case "$PR" in ''|*[!0-9]*) echo "invalid PR number: $PR" >&2; exit 1;; esac
           echo "pr=$PR" >> "$GITHUB_OUTPUT"
 
+      - name: Skip fork pull requests
+        if: steps.cmd.outputs.skip == ''
+        id: fork
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ steps.pr.outputs.pr }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [ "$(gh api "repos/$REPO/pulls/$PR" --jq '.head.repo.fork')" = "true" ]; then
+            echo "skip=fork" >> "$GITHUB_OUTPUT"
+          fi
+
       # The binary is pinned to the tagged v0.2.1 release; bump version and
       # checksum together on every difftrace release.
       - name: Install difftrace v0.2.1
-        if: steps.cmd.outputs.skip == ''
+        if: steps.cmd.outputs.skip == '' && steps.fork.outputs.skip == ''
         run: |
           curl -fsSL -o /tmp/difftrace.tar.gz \
             https://github.com/dch-labs/difftrace/releases/download/v0.2.1/difftrace-0.2.1-x86_64-unknown-linux-gnu.tar.gz
@@ -141,7 +156,7 @@ jobs:
           tar -xzf /tmp/difftrace.tar.gz -C "$HOME/.local/bin"
 
       - name: Check the required secrets are present
-        if: steps.cmd.outputs.skip == ''
+        if: steps.cmd.outputs.skip == '' && steps.fork.outputs.skip == ''
         env:
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
           DIFFTRACE_APP_ID: ${{ secrets.DIFFTRACE_APP_ID }}
@@ -152,7 +167,7 @@ jobs:
           : "${DIFFTRACE_APP_PRIVATE_KEY:?DIFFTRACE_APP_PRIVATE_KEY is not set - the reply step would fail opaquely}"
 
       - name: Mint the difftrace app token
-        if: steps.cmd.outputs.skip == ''
+        if: steps.cmd.outputs.skip == '' && steps.fork.outputs.skip == ''
         uses: actions/create-github-app-token@v2
         id: app-token
         with:
@@ -162,7 +177,7 @@ jobs:
           permission-contents: read
 
       - name: Run the command
-        if: steps.cmd.outputs.skip == ''
+        if: steps.cmd.outputs.skip == '' && steps.fork.outputs.skip == ''
         run: |
           if [ "$VERB" = "review" ]; then
             difftrace review --repo "$REPO" --pr "$PR"
@@ -184,7 +199,7 @@ jobs:
           RUST_LOG: info
 
       - name: Upload trajectory
-        if: always() && steps.cmd.outputs.skip == ''
+        if: always() && steps.cmd.outputs.skip == '' && steps.fork.outputs.skip == ''
         uses: actions/upload-artifact@v4
         with:
           name: difftrace-trajectory-pr${{ steps.pr.outputs.pr }}-chat

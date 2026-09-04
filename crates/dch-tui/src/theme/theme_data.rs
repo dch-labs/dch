@@ -46,7 +46,7 @@ impl Theme {
     /// contrast — readable at small sizes, and the fallback for unknown
     /// theme names.
     #[must_use]
-    pub fn dracula() -> Self {
+    pub(crate) fn dracula() -> Self {
         Self {
             name: "Dracula",
             syntax: SyntaxTheme {
@@ -113,7 +113,7 @@ impl Theme {
     /// Muted blue-gray arctic palette with frost-blue accents; deliberately
     /// low-saturation, built for long sessions rather than punch.
     #[must_use]
-    pub fn nord() -> Self {
+    pub(crate) fn nord() -> Self {
         Self {
             name: "Nord",
             syntax: SyntaxTheme {
@@ -137,10 +137,10 @@ impl Theme {
                 escape: Color::Rgb(191, 97, 106),
             },
             markdown: MarkdownTheme {
-                header1: heading(Color::Rgb(94, 129, 172)),
-                header2: heading(Color::Rgb(129, 161, 193)),
-                header3: heading(Color::Rgb(143, 188, 187)),
-                header4: heading(Color::Rgb(136, 192, 208)),
+                header1: heading(Color::Rgb(136, 192, 208)),
+                header2: heading(Color::Rgb(143, 188, 187)),
+                header3: heading(Color::Rgb(129, 161, 193)),
+                header4: heading(Color::Rgb(94, 129, 172)),
                 header5: heading(Color::Rgb(163, 190, 140)),
                 header6: heading(Color::Rgb(208, 135, 112)),
                 bold: Style::default().add_modifier(Modifier::BOLD),
@@ -180,7 +180,7 @@ impl Theme {
     /// Dark indigo surfaces with neon pink, blue, and cyan accents; a cool,
     /// high-contrast cast for night work.
     #[must_use]
-    pub fn tokyo_night() -> Self {
+    pub(crate) fn tokyo_night() -> Self {
         Self {
             name: "Tokyo Night",
             syntax: SyntaxTheme {
@@ -247,7 +247,7 @@ impl Theme {
     /// Warm retro earth tones on a dark brown-gray base; orange and yellow
     /// accents keep long code sessions gentle on the eyes.
     #[must_use]
-    pub fn gruvbox_dark() -> Self {
+    pub(crate) fn gruvbox_dark() -> Self {
         Self {
             name: "Gruvbox Dark",
             syntax: SyntaxTheme {
@@ -304,7 +304,7 @@ impl Theme {
                 status_warning: Color::Rgb(215, 153, 33),
                 status_error: Color::Rgb(204, 36, 29),
                 scrollbar_thumb: Color::Rgb(146, 131, 116),
-                scrollbar_track: Color::Rgb(146, 131, 116),
+                scrollbar_track: Color::Rgb(60, 56, 54),
             },
         }
     }
@@ -314,7 +314,7 @@ impl Theme {
     /// The same warm hues on paper-white; suited to bright rooms and
     /// print-like reading.
     #[must_use]
-    pub fn gruvbox_light() -> Self {
+    pub(crate) fn gruvbox_light() -> Self {
         Self {
             name: "Gruvbox Light",
             syntax: SyntaxTheme {
@@ -371,7 +371,7 @@ impl Theme {
                 status_warning: Color::Rgb(215, 153, 33),
                 status_error: Color::Rgb(204, 36, 29),
                 scrollbar_thumb: Color::Rgb(146, 131, 116),
-                scrollbar_track: Color::Rgb(146, 131, 116),
+                scrollbar_track: Color::Rgb(235, 219, 178),
             },
         }
     }
@@ -381,7 +381,7 @@ impl Theme {
     /// The classic precision palette on a deep blue-green base; a
     /// deliberately limited hue range with carefully tuned contrast.
     #[must_use]
-    pub fn solarized_dark() -> Self {
+    pub(crate) fn solarized_dark() -> Self {
         Self {
             name: "Solarized Dark",
             syntax: SyntaxTheme {
@@ -438,7 +438,7 @@ impl Theme {
                 status_warning: Color::Rgb(181, 137, 0),
                 status_error: Color::Rgb(220, 50, 47),
                 scrollbar_thumb: Color::Rgb(45, 79, 87),
-                scrollbar_track: Color::Rgb(45, 79, 87),
+                scrollbar_track: Color::Rgb(7, 54, 66),
             },
         }
     }
@@ -448,7 +448,7 @@ impl Theme {
     /// The Solarized precision palette on a warm cream base; the same hue
     /// discipline as its dark sibling, in daylight.
     #[must_use]
-    pub fn solarized_light() -> Self {
+    pub(crate) fn solarized_light() -> Self {
         Self {
             name: "Solarized Light",
             syntax: SyntaxTheme {
@@ -505,7 +505,7 @@ impl Theme {
                 status_warning: Color::Rgb(181, 137, 0),
                 status_error: Color::Rgb(220, 50, 47),
                 scrollbar_thumb: Color::Rgb(0, 43, 54),
-                scrollbar_track: Color::Rgb(0, 43, 54),
+                scrollbar_track: Color::Rgb(238, 232, 213),
             },
         }
     }
@@ -515,7 +515,7 @@ impl Theme {
     /// The light flavor of the Catppuccin family: pastel accents on warm
     /// white, soothing rather than stark.
     #[must_use]
-    pub fn catppuccin_latte() -> Self {
+    pub(crate) fn catppuccin_latte() -> Self {
         Self {
             name: "Catppuccin Latte",
             syntax: SyntaxTheme {
@@ -572,7 +572,7 @@ impl Theme {
                 status_warning: Color::Rgb(223, 142, 29),
                 status_error: Color::Rgb(210, 15, 57),
                 scrollbar_thumb: Color::Rgb(108, 111, 133),
-                scrollbar_track: Color::Rgb(108, 111, 133),
+                scrollbar_track: Color::Rgb(220, 224, 228),
             },
         }
     }
@@ -582,7 +582,7 @@ impl Theme {
     /// Pastel accents on a medium-dark base — the lightest of the family's
     /// dark flavors.
     #[must_use]
-    pub fn catppuccin_frappe() -> Self {
+    pub(crate) fn catppuccin_frappe() -> Self {
         Self {
             name: "Catppuccin Frappe",
             syntax: SyntaxTheme {
@@ -639,7 +639,7 @@ impl Theme {
                 status_warning: Color::Rgb(229, 200, 144),
                 status_error: Color::Rgb(231, 130, 132),
                 scrollbar_thumb: Color::Rgb(98, 104, 128),
-                scrollbar_track: Color::Rgb(98, 104, 128),
+                scrollbar_track: Color::Rgb(64, 69, 89),
             },
         }
     }
@@ -649,7 +649,7 @@ impl Theme {
     /// Pastel accents a step darker than Frappe; a middle stop for those
     /// who find the darker flavors too deep.
     #[must_use]
-    pub fn catppuccin_macchiato() -> Self {
+    pub(crate) fn catppuccin_macchiato() -> Self {
         Self {
             name: "Catppuccin Macchiato",
             syntax: SyntaxTheme {
@@ -706,7 +706,7 @@ impl Theme {
                 status_warning: Color::Rgb(238, 212, 159),
                 status_error: Color::Rgb(237, 135, 150),
                 scrollbar_thumb: Color::Rgb(91, 96, 120),
-                scrollbar_track: Color::Rgb(91, 96, 120),
+                scrollbar_track: Color::Rgb(54, 58, 79),
             },
         }
     }
@@ -716,7 +716,7 @@ impl Theme {
     /// The darkest Catppuccin flavor: pastel accents on deep cocoa
     /// surfaces, gentle on the eyes without going pure black.
     #[must_use]
-    pub fn catppuccin_mocha() -> Self {
+    pub(crate) fn catppuccin_mocha() -> Self {
         Self {
             name: "Catppuccin Mocha",
             syntax: SyntaxTheme {
@@ -773,7 +773,7 @@ impl Theme {
                 status_warning: Color::Rgb(249, 226, 175),
                 status_error: Color::Rgb(243, 139, 168),
                 scrollbar_thumb: Color::Rgb(88, 91, 112),
-                scrollbar_track: Color::Rgb(88, 91, 112),
+                scrollbar_track: Color::Rgb(49, 50, 68),
             },
         }
     }
@@ -783,7 +783,7 @@ impl Theme {
     /// Atom's classic dark palette: cool grays with blue, green, and coral
     /// accents, tuned for editor readability.
     #[must_use]
-    pub fn one_dark() -> Self {
+    pub(crate) fn one_dark() -> Self {
         Self {
             name: "One Dark",
             syntax: SyntaxTheme {
@@ -840,7 +840,7 @@ impl Theme {
                 status_warning: Color::Rgb(209, 154, 102),
                 status_error: Color::Rgb(224, 108, 117),
                 scrollbar_thumb: Color::Rgb(92, 99, 112),
-                scrollbar_track: Color::Rgb(92, 99, 112),
+                scrollbar_track: Color::Rgb(52, 57, 66),
             },
         }
     }
@@ -850,7 +850,7 @@ impl Theme {
     /// The vintage high-contrast dark palette: yellow, green, and magenta on
     /// near-black, for those who like their syntax loud.
     #[must_use]
-    pub fn monokai() -> Self {
+    pub(crate) fn monokai() -> Self {
         Self {
             name: "Monokai",
             syntax: SyntaxTheme {
@@ -907,7 +907,7 @@ impl Theme {
                 status_warning: Color::Rgb(244, 191, 117),
                 status_error: Color::Rgb(249, 38, 114),
                 scrollbar_thumb: Color::Rgb(117, 113, 94),
-                scrollbar_track: Color::Rgb(117, 113, 94),
+                scrollbar_track: Color::Rgb(62, 61, 50),
             },
         }
     }
@@ -917,7 +917,7 @@ impl Theme {
     /// `GitHub`'s own dark-mode code palette: restrained blues and greens on
     /// near-black, optimized for reading diffs and prose alike.
     #[must_use]
-    pub fn github_dark() -> Self {
+    pub(crate) fn github_dark() -> Self {
         Self {
             name: "GitHub Dark",
             syntax: SyntaxTheme {
@@ -969,12 +969,12 @@ impl Theme {
                 input_border: Color::Rgb(149, 157, 165),
                 input_text: Color::Rgb(209, 213, 218),
                 status_bar_bg: Color::Rgb(36, 41, 46),
-                status_bar_fg: Color::Rgb(209, 213, 218),
-                status_success: Color::Rgb(52, 208, 88),
-                status_warning: Color::Rgb(255, 234, 127),
-                status_error: Color::Rgb(234, 74, 90),
+                status_bar_fg: Color::Rgb(201, 209, 217),
+                status_success: Color::Rgb(63, 185, 80),
+                status_warning: Color::Rgb(187, 128, 9),
+                status_error: Color::Rgb(248, 81, 73),
                 scrollbar_thumb: Color::Rgb(149, 157, 165),
-                scrollbar_track: Color::Rgb(149, 157, 165),
+                scrollbar_track: Color::Rgb(45, 51, 59),
             },
         }
     }
@@ -984,7 +984,7 @@ impl Theme {
     /// `GitHub`'s light-mode palette on white; the most conservative light
     /// theme in the set.
     #[must_use]
-    pub fn github_light() -> Self {
+    pub(crate) fn github_light() -> Self {
         Self {
             name: "GitHub Light",
             syntax: SyntaxTheme {
@@ -1041,7 +1041,7 @@ impl Theme {
                 status_warning: Color::Rgb(219, 171, 9),
                 status_error: Color::Rgb(215, 58, 73),
                 scrollbar_thumb: Color::Rgb(149, 157, 165),
-                scrollbar_track: Color::Rgb(149, 157, 165),
+                scrollbar_track: Color::Rgb(225, 228, 232),
             },
         }
     }

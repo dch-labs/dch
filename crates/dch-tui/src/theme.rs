@@ -2,9 +2,9 @@
 //!
 //! A [`Theme`] bundles the three palettes the TUI consumes: tree-sitter
 //! syntax colors, markdown element styles, and application-chrome colors.
-//! Themes are compiled-in data selected by name — from `[display] theme` or
-//! the `--theme` flag — through [`Theme::by_name`]. A theme is pure data:
-//! it carries color only, and components decide how to render it.
+//! Themes are compiled-in data selected by name through [`Theme::by_name`],
+//! which resolves however the name is spelled or cased. A theme is pure
+//! data: it carries color only, and components decide how to render it.
 
 use ratatui::style::{Color, Style};
 
@@ -42,10 +42,11 @@ pub const HIGHLIGHT_NAMES: [&str; 18] = [
 /// A complete color theme: syntax highlighting, markdown rendering, and UI
 /// chrome.
 ///
-/// Construct via [`Theme::by_name`] or one of the named constructors
-/// (`Theme::dracula`, `Theme::nord`, …). Themes are value types with no
-/// behavior beyond [`SyntaxTheme::syntax_colors`]; rendering logic lives with
-/// the components that draw.
+/// Construct via [`Theme::by_name`] or [`Theme::default`]; every field is
+/// public, so a custom palette can also be assembled as a plain struct
+/// literal. Themes are value types with no behavior beyond
+/// [`SyntaxTheme::syntax_colors`]; rendering logic lives with the
+/// components that draw.
 #[derive(Debug, Clone)]
 pub struct Theme {
     /// The theme's display name, as rendered in UI and diagnostics.
@@ -461,10 +462,10 @@ impl Theme {
     /// The `"default"` key aliases [`Theme::default`]. Every constructor is
     /// reachable through this table.
     ///
-    /// An unknown name is the caller's problem to report: the TUI boot path
-    /// is expected to log a warning naming the unknown theme and fall back
-    /// to [`Theme::default`], so a config typo degrades visibly but never
-    /// fails the launch.
+    /// An unknown name is the caller's problem to report: callers should
+    /// log a warning naming the unknown theme and fall back to
+    /// [`Theme::default`], so a bad name degrades visibly without failing
+    /// the session.
     #[must_use]
     pub fn by_name(name: &str) -> Option<Self> {
         let key = name
@@ -520,11 +521,9 @@ mod tests {
     }
 
     #[test]
-    fn the_v1_theme_set_is_registered() {
-        // The v1 first cut: exactly this registry scope; the remaining
-        // themes land in a follow-up expansion. The length assert makes the
-        // census exact, so a row added or removed without updating this
-        // test fails here first.
+    fn the_theme_registry_is_exact() {
+        // The length assert makes the census exact, so a row added or
+        // removed without updating this test fails here first.
         assert_eq!(
             theme_data::THEME_CONSTRUCTORS.len(),
             16,
@@ -649,14 +648,73 @@ mod tests {
     }
 
     #[test]
+    fn scrollbar_thumb_contrasts_with_track() {
+        // A thumb painted the track's own color is invisible; the pair must
+        // differ in every theme or scrolling stops reading as motion.
+        for (key, _) in theme_data::THEME_CONSTRUCTORS {
+            let ui = Theme::by_name(key).unwrap().ui;
+            assert_ne!(
+                ui.scrollbar_thumb, ui.scrollbar_track,
+                "{key}: scrollbar thumb matches its track"
+            );
+        }
+    }
+
+    #[test]
     fn no_theme_palette_contains_reset_colors() {
         // `Reset` in a palette is a gap, not a color choice: every theme
-        // must fully specify its syntax palette.
+        // must fully specify every field of its syntax and chrome palettes.
         for (key, _) in theme_data::THEME_CONSTRUCTORS {
             let theme = Theme::by_name(key).unwrap();
+            let syntax = theme.syntax;
+            let syntax_fields = [
+                syntax.attribute,
+                syntax.comment,
+                syntax.constant,
+                syntax.constructor,
+                syntax.embedded,
+                syntax.function,
+                syntax.keyword,
+                syntax.number,
+                syntax.operator,
+                syntax.property,
+                syntax.punctuation,
+                syntax.string,
+                syntax.r#type,
+                syntax.variable,
+                syntax.variable_builtin,
+                syntax.tag,
+                syntax.delimiter,
+                syntax.escape,
+            ];
             assert!(
-                !theme.syntax.syntax_colors().contains(&Color::Reset),
+                !syntax_fields.contains(&Color::Reset),
                 "{key}: Reset leaked into the syntax palette"
+            );
+            let ui = theme.ui;
+            let ui_fields = [
+                ui.background,
+                ui.foreground,
+                ui.primary,
+                ui.secondary,
+                ui.dim,
+                ui.border_color,
+                ui.focused_border_color,
+                ui.user_message_fg,
+                ui.assistant_message_fg,
+                ui.input_border,
+                ui.input_text,
+                ui.status_bar_bg,
+                ui.status_bar_fg,
+                ui.status_success,
+                ui.status_warning,
+                ui.status_error,
+                ui.scrollbar_thumb,
+                ui.scrollbar_track,
+            ];
+            assert!(
+                !ui_fields.contains(&Color::Reset),
+                "{key}: Reset leaked into the chrome palette"
             );
         }
     }
@@ -684,8 +742,8 @@ mod tests {
             ];
             for style in styled {
                 assert!(
-                    style.fg.is_some(),
-                    "{key}: markdown style without a foreground"
+                    style.fg.is_some_and(|fg| fg != Color::Reset),
+                    "{key}: markdown style without a real foreground"
                 );
             }
         }
@@ -693,21 +751,33 @@ mod tests {
 
     #[test]
     fn markdown_styles_keep_the_semantic_modifiers() {
-        // The markdown contract the renderer relies on: headings are
-        // bold, emphasis is italic, links are underlined.
-
-        let markdown = Theme::dracula().markdown;
-        assert!(
-            markdown.header1.add_modifier.contains(Modifier::BOLD),
-            "header1 must stay bold"
-        );
-        assert!(
-            markdown.italic.add_modifier.contains(Modifier::ITALIC),
-            "italic must stay italic"
-        );
-        assert!(
-            markdown.link.add_modifier.contains(Modifier::UNDERLINED),
-            "link must stay underlined"
-        );
+        // The markdown contract the renderer relies on, in every shipped
+        // palette: headings are bold, emphasis is italic, links are
+        // underlined.
+        for (key, _) in theme_data::THEME_CONSTRUCTORS {
+            let markdown = Theme::by_name(key).unwrap().markdown;
+            let headings = [
+                markdown.header1,
+                markdown.header2,
+                markdown.header3,
+                markdown.header4,
+                markdown.header5,
+                markdown.header6,
+            ];
+            for heading in headings {
+                assert!(
+                    heading.add_modifier.contains(Modifier::BOLD),
+                    "{key}: a heading lost its bold"
+                );
+            }
+            assert!(
+                markdown.italic.add_modifier.contains(Modifier::ITALIC),
+                "{key}: italic lost its italics"
+            );
+            assert!(
+                markdown.link.add_modifier.contains(Modifier::UNDERLINED),
+                "{key}: link lost its underline"
+            );
+        }
     }
 }
