@@ -10,6 +10,35 @@ use ratatui::style::{Color, Style};
 
 pub(crate) mod theme_data;
 
+/// The tree-sitter capture names, in [`SyntaxTheme::syntax_colors`] slot
+/// order.
+///
+/// This list is the contract between the palette and any syntax
+/// highlighter: the highlighter's capture-name list must match it slot for
+/// slot, and `syntax_colors` indexes the palette by exactly this order —
+/// a name list that drifts from it miscolors every theme silently, which
+/// is why the two live together here.
+pub const HIGHLIGHT_NAMES: [&str; 18] = [
+    "attribute",
+    "constant",
+    "function.builtin",
+    "function",
+    "keyword",
+    "operator",
+    "property",
+    "punctuation",
+    "punctuation.bracket",
+    "punctuation.delimiter",
+    "string",
+    "string.special",
+    "tag",
+    "type",
+    "type.builtin",
+    "variable",
+    "variable.builtin",
+    "variable.parameter",
+];
+
 /// A complete color theme: syntax highlighting, markdown rendering, and UI
 /// chrome.
 ///
@@ -23,8 +52,9 @@ pub struct Theme {
     ///
     /// Matches the constructor's conventional spelling ("Dracula", "Gruvbox
     /// Dark") and is independent of the lowercase lookup key used by
-    /// [`Theme::by_name`].
-    pub name: String,
+    /// [`Theme::by_name`]. Static because every theme is compiled-in data —
+    /// a theme cannot be built with a name its constructor does not carry.
+    pub name: &'static str,
 
     /// Colors for the tree-sitter captures highlighted inside code blocks.
     ///
@@ -187,9 +217,9 @@ impl SyntaxTheme {
     /// together share a field (`function.builtin` renders as `function`);
     /// four palette entries (`comment`, `constructor`, `embedded`, `number`)
     /// are not indexed today and remain as palette entries for richer custom
-    /// rendering. This array is the definition of the order: when the
-    /// highlighter lands, its capture-name list must match these slots slot
-    /// for slot, pinned by a names-versus-array test at that point.
+    /// rendering. The order is [`HIGHLIGHT_NAMES`]: the list a syntax
+    /// highlighter must adopt verbatim as its capture-name order, so the
+    /// palette and the highlighter cannot drift apart silently.
     #[must_use]
     pub fn syntax_colors(&self) -> [Color; 18] {
         [
@@ -546,18 +576,18 @@ mod tests {
         for spelling in ["Dracula", "DRACULA", "  dracula  "] {
             assert_eq!(
                 Theme::by_name(spelling).map(|t| t.name),
-                Some("Dracula".to_string()),
+                Some("Dracula"),
                 "{spelling:?} must resolve to Dracula"
             );
         }
         assert_eq!(
             Theme::by_name("  Gruvbox Dark  ").map(|t| t.name),
-            Some("Gruvbox Dark".to_string()),
+            Some("Gruvbox Dark"),
             "multi-word keys normalize too"
         );
         assert_eq!(
             Theme::by_name("GRUVBOX  DARK").map(|t| t.name),
-            Some("Gruvbox Dark".to_string()),
+            Some("Gruvbox Dark"),
             "whitespace runs fold like single spaces"
         );
     }
@@ -582,29 +612,40 @@ mod tests {
 
     #[test]
     fn the_default_key_aliases_the_default_theme() {
-        assert_eq!(
-            Theme::by_name("default").map(|t| t.name),
-            Some("Dracula".into())
-        );
+        assert_eq!(Theme::by_name("default").map(|t| t.name), Some("Dracula"));
     }
 
     #[test]
-    fn syntax_colors_follow_the_highlighter_order() {
-        // Pins the [Color; 18] contract with the highlighter's
-        // HIGHLIGHT_NAMES order — including the structural fix: the
-        // punctuation slot reads the dedicated `punctuation` field rather
-        // than reusing `comment`. For palettes where the two share a
-        // source color they may coincide; the structural read is the
-        // contract.
-        let syntax = Theme::dracula().syntax;
-        let colors = syntax.syntax_colors();
-        assert_eq!(colors.len(), 18);
-        assert_eq!(colors[4], syntax.keyword);
-        assert_eq!(colors[10], syntax.string);
-        assert_eq!(colors[3], syntax.function);
-        assert_eq!(colors[7], syntax.punctuation);
-        assert_eq!(colors[9], syntax.delimiter);
-        assert_eq!(colors[13], syntax.r#type);
+    fn syntax_colors_match_the_highlighter_names() {
+        // The names-versus-array pin: walking HIGHLIGHT_NAMES beside the
+        // projected array, every slot must hold the color of the field its
+        // capture name maps to — the documented folds included — so a
+        // reordered array or a drifted name list fails here instead of
+        // miscoloring every theme.
+        for (key, _) in theme_data::THEME_CONSTRUCTORS {
+            let syntax = Theme::by_name(key).unwrap().syntax;
+            let colors = syntax.syntax_colors();
+            for (name, color) in HIGHLIGHT_NAMES.iter().zip(colors.iter()) {
+                let expected = match *name {
+                    "attribute" => syntax.attribute,
+                    "constant" => syntax.constant,
+                    "function.builtin" | "function" => syntax.function,
+                    "keyword" => syntax.keyword,
+                    "operator" => syntax.operator,
+                    "property" => syntax.property,
+                    "punctuation" | "punctuation.bracket" => syntax.punctuation,
+                    "punctuation.delimiter" => syntax.delimiter,
+                    "string" => syntax.string,
+                    "string.special" => syntax.escape,
+                    "tag" => syntax.tag,
+                    "type" | "type.builtin" => syntax.r#type,
+                    "variable.builtin" => syntax.variable_builtin,
+                    "variable.parameter" | "variable" => syntax.variable,
+                    other => panic!("capture name without a mapped field: {other}"),
+                };
+                assert_eq!(*color, expected, "{key}: {name} slot drifted");
+            }
+        }
     }
 
     #[test]

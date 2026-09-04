@@ -12,6 +12,33 @@ use ratatui::style::{Color, Modifier, Style};
 
 use super::{MarkdownTheme, SyntaxTheme, Theme, UIStyle};
 
+/// A bold style for a heading: `color` at bold weight.
+fn heading(color: Color) -> Style {
+    Style::default().fg(color).add_modifier(Modifier::BOLD)
+}
+
+/// An underlined style for a link.
+fn link(color: Color) -> Style {
+    Style::default()
+        .fg(color)
+        .add_modifier(Modifier::UNDERLINED)
+}
+
+/// An italic style for quoted material.
+fn quote(color: Color) -> Style {
+    Style::default().fg(color).add_modifier(Modifier::ITALIC)
+}
+
+/// Inline code: an accent foreground on a tinted background.
+fn inline_code(fg: Color, bg: Color) -> Style {
+    Style::default().fg(fg).bg(bg)
+}
+
+/// A plain foreground for an element without modifiers.
+fn plain(color: Color) -> Style {
+    Style::default().fg(color)
+}
+
 impl Theme {
     /// The default dch theme.
     ///
@@ -21,7 +48,7 @@ impl Theme {
     #[must_use]
     pub fn dracula() -> Self {
         Self {
-            name: "Dracula".to_string(),
+            name: "Dracula",
             syntax: SyntaxTheme {
                 attribute: Color::Rgb(86, 182, 194),
                 comment: Color::Rgb(98, 114, 164),
@@ -43,38 +70,20 @@ impl Theme {
                 escape: Color::Rgb(255, 85, 85),
             },
             markdown: MarkdownTheme {
-                header1: Style::default()
-                    .fg(Color::Rgb(86, 182, 194))
-                    .add_modifier(Modifier::BOLD),
-                header2: Style::default()
-                    .fg(Color::Rgb(189, 147, 249))
-                    .add_modifier(Modifier::BOLD),
-                header3: Style::default()
-                    .fg(Color::Rgb(255, 184, 108))
-                    .add_modifier(Modifier::BOLD),
-                header4: Style::default()
-                    .fg(Color::Rgb(241, 250, 140))
-                    .add_modifier(Modifier::BOLD),
-                header5: Style::default()
-                    .fg(Color::Rgb(139, 233, 253))
-                    .add_modifier(Modifier::BOLD),
-                header6: Style::default()
-                    .fg(Color::Rgb(110, 210, 220))
-                    .add_modifier(Modifier::BOLD),
+                header1: heading(Color::Rgb(86, 182, 194)),
+                header2: heading(Color::Rgb(189, 147, 249)),
+                header3: heading(Color::Rgb(255, 184, 108)),
+                header4: heading(Color::Rgb(241, 250, 140)),
+                header5: heading(Color::Rgb(139, 233, 253)),
+                header6: heading(Color::Rgb(110, 210, 220)),
                 bold: Style::default().add_modifier(Modifier::BOLD),
                 italic: Style::default().add_modifier(Modifier::ITALIC),
-                code_inline: Style::default()
-                    .fg(Color::Rgb(255, 184, 108))
-                    .bg(Color::Rgb(68, 71, 90)),
-                code_block: Style::default().fg(Color::Rgb(248, 248, 242)),
-                link: Style::default()
-                    .fg(Color::Rgb(98, 114, 164))
-                    .add_modifier(Modifier::UNDERLINED),
-                quote: Style::default()
-                    .fg(Color::Rgb(98, 114, 164))
-                    .add_modifier(Modifier::ITALIC),
-                list_item: Style::default().fg(Color::Rgb(248, 248, 242)),
-                horizontal_rule: Style::default().fg(Color::Rgb(98, 114, 164)),
+                code_inline: inline_code(Color::Rgb(255, 184, 108), Color::Rgb(68, 71, 90)),
+                code_block: plain(Color::Rgb(248, 248, 242)),
+                link: link(Color::Rgb(98, 114, 164)),
+                quote: quote(Color::Rgb(98, 114, 164)),
+                list_item: plain(Color::Rgb(248, 248, 242)),
+                horizontal_rule: plain(Color::Rgb(98, 114, 164)),
             },
             ui: UIStyle {
                 background: Color::Rgb(40, 42, 54),
@@ -106,7 +115,7 @@ impl Theme {
     #[must_use]
     pub fn nord() -> Self {
         Self {
-            name: "Nord".to_string(),
+            name: "Nord",
             syntax: SyntaxTheme {
                 attribute: Color::Rgb(163, 190, 140),
                 comment: Color::Rgb(94, 129, 172),
@@ -128,38 +137,20 @@ impl Theme {
                 escape: Color::Rgb(191, 97, 106),
             },
             markdown: MarkdownTheme {
-                header1: Style::default()
-                    .fg(Color::Rgb(94, 129, 172))
-                    .add_modifier(Modifier::BOLD),
-                header2: Style::default()
-                    .fg(Color::Rgb(129, 161, 193))
-                    .add_modifier(Modifier::BOLD),
-                header3: Style::default()
-                    .fg(Color::Rgb(143, 188, 187))
-                    .add_modifier(Modifier::BOLD),
-                header4: Style::default()
-                    .fg(Color::Rgb(136, 192, 208))
-                    .add_modifier(Modifier::BOLD),
-                header5: Style::default()
-                    .fg(Color::Rgb(163, 190, 140))
-                    .add_modifier(Modifier::BOLD),
-                header6: Style::default()
-                    .fg(Color::Rgb(208, 135, 112))
-                    .add_modifier(Modifier::BOLD),
+                header1: heading(Color::Rgb(94, 129, 172)),
+                header2: heading(Color::Rgb(129, 161, 193)),
+                header3: heading(Color::Rgb(143, 188, 187)),
+                header4: heading(Color::Rgb(136, 192, 208)),
+                header5: heading(Color::Rgb(163, 190, 140)),
+                header6: heading(Color::Rgb(208, 135, 112)),
                 bold: Style::default().add_modifier(Modifier::BOLD),
                 italic: Style::default().add_modifier(Modifier::ITALIC),
-                code_inline: Style::default()
-                    .fg(Color::Rgb(235, 203, 139))
-                    .bg(Color::Rgb(59, 66, 82)),
-                code_block: Style::default().fg(Color::Rgb(236, 239, 244)),
-                link: Style::default()
-                    .fg(Color::Rgb(163, 190, 140))
-                    .add_modifier(Modifier::UNDERLINED),
-                quote: Style::default()
-                    .fg(Color::Rgb(94, 129, 172))
-                    .add_modifier(Modifier::ITALIC),
-                list_item: Style::default().fg(Color::Rgb(236, 239, 244)),
-                horizontal_rule: Style::default().fg(Color::Rgb(94, 129, 172)),
+                code_inline: inline_code(Color::Rgb(235, 203, 139), Color::Rgb(59, 66, 82)),
+                code_block: plain(Color::Rgb(236, 239, 244)),
+                link: link(Color::Rgb(163, 190, 140)),
+                quote: quote(Color::Rgb(94, 129, 172)),
+                list_item: plain(Color::Rgb(236, 239, 244)),
+                horizontal_rule: plain(Color::Rgb(94, 129, 172)),
             },
             ui: UIStyle {
                 background: Color::Rgb(46, 52, 64),
@@ -191,7 +182,7 @@ impl Theme {
     #[must_use]
     pub fn tokyo_night() -> Self {
         Self {
-            name: "Tokyo Night".to_string(),
+            name: "Tokyo Night",
             syntax: SyntaxTheme {
                 attribute: Color::Rgb(122, 162, 247),
                 comment: Color::Rgb(92, 106, 152),
@@ -213,38 +204,20 @@ impl Theme {
                 escape: Color::Rgb(187, 154, 247),
             },
             markdown: MarkdownTheme {
-                header1: Style::default()
-                    .fg(Color::Rgb(224, 108, 117))
-                    .add_modifier(Modifier::BOLD),
-                header2: Style::default()
-                    .fg(Color::Rgb(122, 162, 247))
-                    .add_modifier(Modifier::BOLD),
-                header3: Style::default()
-                    .fg(Color::Rgb(187, 154, 247))
-                    .add_modifier(Modifier::BOLD),
-                header4: Style::default()
-                    .fg(Color::Rgb(235, 137, 88))
-                    .add_modifier(Modifier::BOLD),
-                header5: Style::default()
-                    .fg(Color::Rgb(151, 206, 238))
-                    .add_modifier(Modifier::BOLD),
-                header6: Style::default()
-                    .fg(Color::Rgb(169, 177, 214))
-                    .add_modifier(Modifier::BOLD),
+                header1: heading(Color::Rgb(224, 108, 117)),
+                header2: heading(Color::Rgb(122, 162, 247)),
+                header3: heading(Color::Rgb(187, 154, 247)),
+                header4: heading(Color::Rgb(235, 137, 88)),
+                header5: heading(Color::Rgb(151, 206, 238)),
+                header6: heading(Color::Rgb(169, 177, 214)),
                 bold: Style::default().add_modifier(Modifier::BOLD),
                 italic: Style::default().add_modifier(Modifier::ITALIC),
-                code_inline: Style::default()
-                    .fg(Color::Rgb(235, 137, 88))
-                    .bg(Color::Rgb(42, 44, 60)),
-                code_block: Style::default().fg(Color::Rgb(200, 208, 255)),
-                link: Style::default()
-                    .fg(Color::Rgb(151, 206, 238))
-                    .add_modifier(Modifier::UNDERLINED),
-                quote: Style::default()
-                    .fg(Color::Rgb(92, 106, 152))
-                    .add_modifier(Modifier::ITALIC),
-                list_item: Style::default().fg(Color::Rgb(200, 208, 255)),
-                horizontal_rule: Style::default().fg(Color::Rgb(92, 106, 152)),
+                code_inline: inline_code(Color::Rgb(235, 137, 88), Color::Rgb(42, 44, 60)),
+                code_block: plain(Color::Rgb(200, 208, 255)),
+                link: link(Color::Rgb(151, 206, 238)),
+                quote: quote(Color::Rgb(92, 106, 152)),
+                list_item: plain(Color::Rgb(200, 208, 255)),
+                horizontal_rule: plain(Color::Rgb(92, 106, 152)),
             },
             ui: UIStyle {
                 background: Color::Rgb(26, 27, 38),
@@ -261,7 +234,7 @@ impl Theme {
                 status_bar_bg: Color::Rgb(26, 27, 38),
                 status_bar_fg: Color::Rgb(200, 208, 255),
                 status_success: Color::Rgb(169, 177, 214),
-                status_warning: Color::Rgb(235, 203, 139),
+                status_warning: Color::Rgb(235, 137, 88),
                 status_error: Color::Rgb(224, 108, 117),
                 scrollbar_thumb: Color::Rgb(92, 106, 152),
                 scrollbar_track: Color::Rgb(42, 44, 60),
@@ -276,7 +249,7 @@ impl Theme {
     #[must_use]
     pub fn gruvbox_dark() -> Self {
         Self {
-            name: "Gruvbox Dark".to_string(),
+            name: "Gruvbox Dark",
             syntax: SyntaxTheme {
                 attribute: Color::Rgb(69, 133, 136),
                 comment: Color::Rgb(146, 131, 116),
@@ -298,38 +271,20 @@ impl Theme {
                 escape: Color::Rgb(251, 73, 52),
             },
             markdown: MarkdownTheme {
-                header1: Style::default()
-                    .fg(Color::Rgb(69, 133, 136))
-                    .add_modifier(Modifier::BOLD),
-                header2: Style::default()
-                    .fg(Color::Rgb(177, 98, 134))
-                    .add_modifier(Modifier::BOLD),
-                header3: Style::default()
-                    .fg(Color::Rgb(215, 153, 33))
-                    .add_modifier(Modifier::BOLD),
-                header4: Style::default()
-                    .fg(Color::Rgb(152, 151, 26))
-                    .add_modifier(Modifier::BOLD),
-                header5: Style::default()
-                    .fg(Color::Rgb(104, 157, 106))
-                    .add_modifier(Modifier::BOLD),
-                header6: Style::default()
-                    .fg(Color::Rgb(235, 219, 178))
-                    .add_modifier(Modifier::BOLD),
+                header1: heading(Color::Rgb(69, 133, 136)),
+                header2: heading(Color::Rgb(177, 98, 134)),
+                header3: heading(Color::Rgb(215, 153, 33)),
+                header4: heading(Color::Rgb(152, 151, 26)),
+                header5: heading(Color::Rgb(104, 157, 106)),
+                header6: heading(Color::Rgb(235, 219, 178)),
                 bold: Style::default().add_modifier(Modifier::BOLD),
                 italic: Style::default().add_modifier(Modifier::ITALIC),
-                code_inline: Style::default()
-                    .fg(Color::Rgb(215, 153, 33))
-                    .bg(Color::Rgb(146, 131, 116)),
-                code_block: Style::default().fg(Color::Rgb(235, 219, 178)),
-                link: Style::default()
-                    .fg(Color::Rgb(104, 157, 106))
-                    .add_modifier(Modifier::UNDERLINED),
-                quote: Style::default()
-                    .fg(Color::Rgb(146, 131, 116))
-                    .add_modifier(Modifier::ITALIC),
-                list_item: Style::default().fg(Color::Rgb(235, 219, 178)),
-                horizontal_rule: Style::default().fg(Color::Rgb(146, 131, 116)),
+                code_inline: inline_code(Color::Rgb(215, 153, 33), Color::Rgb(60, 56, 54)),
+                code_block: plain(Color::Rgb(235, 219, 178)),
+                link: link(Color::Rgb(104, 157, 106)),
+                quote: quote(Color::Rgb(146, 131, 116)),
+                list_item: plain(Color::Rgb(235, 219, 178)),
+                horizontal_rule: plain(Color::Rgb(146, 131, 116)),
             },
             ui: UIStyle {
                 background: Color::Rgb(40, 40, 40),
@@ -361,7 +316,7 @@ impl Theme {
     #[must_use]
     pub fn gruvbox_light() -> Self {
         Self {
-            name: "Gruvbox Light".to_string(),
+            name: "Gruvbox Light",
             syntax: SyntaxTheme {
                 attribute: Color::Rgb(69, 133, 136),
                 comment: Color::Rgb(146, 131, 116),
@@ -383,38 +338,20 @@ impl Theme {
                 escape: Color::Rgb(157, 0, 6),
             },
             markdown: MarkdownTheme {
-                header1: Style::default()
-                    .fg(Color::Rgb(69, 133, 136))
-                    .add_modifier(Modifier::BOLD),
-                header2: Style::default()
-                    .fg(Color::Rgb(177, 98, 134))
-                    .add_modifier(Modifier::BOLD),
-                header3: Style::default()
-                    .fg(Color::Rgb(215, 153, 33))
-                    .add_modifier(Modifier::BOLD),
-                header4: Style::default()
-                    .fg(Color::Rgb(152, 151, 26))
-                    .add_modifier(Modifier::BOLD),
-                header5: Style::default()
-                    .fg(Color::Rgb(104, 157, 106))
-                    .add_modifier(Modifier::BOLD),
-                header6: Style::default()
-                    .fg(Color::Rgb(60, 56, 54))
-                    .add_modifier(Modifier::BOLD),
+                header1: heading(Color::Rgb(69, 133, 136)),
+                header2: heading(Color::Rgb(177, 98, 134)),
+                header3: heading(Color::Rgb(215, 153, 33)),
+                header4: heading(Color::Rgb(152, 151, 26)),
+                header5: heading(Color::Rgb(104, 157, 106)),
+                header6: heading(Color::Rgb(60, 56, 54)),
                 bold: Style::default().add_modifier(Modifier::BOLD),
                 italic: Style::default().add_modifier(Modifier::ITALIC),
-                code_inline: Style::default()
-                    .fg(Color::Rgb(215, 153, 33))
-                    .bg(Color::Rgb(146, 131, 116)),
-                code_block: Style::default().fg(Color::Rgb(60, 56, 54)),
-                link: Style::default()
-                    .fg(Color::Rgb(104, 157, 106))
-                    .add_modifier(Modifier::UNDERLINED),
-                quote: Style::default()
-                    .fg(Color::Rgb(146, 131, 116))
-                    .add_modifier(Modifier::ITALIC),
-                list_item: Style::default().fg(Color::Rgb(60, 56, 54)),
-                horizontal_rule: Style::default().fg(Color::Rgb(146, 131, 116)),
+                code_inline: inline_code(Color::Rgb(215, 153, 33), Color::Rgb(146, 131, 116)),
+                code_block: plain(Color::Rgb(60, 56, 54)),
+                link: link(Color::Rgb(104, 157, 106)),
+                quote: quote(Color::Rgb(146, 131, 116)),
+                list_item: plain(Color::Rgb(60, 56, 54)),
+                horizontal_rule: plain(Color::Rgb(146, 131, 116)),
             },
             ui: UIStyle {
                 background: Color::Rgb(251, 241, 199),
@@ -446,7 +383,7 @@ impl Theme {
     #[must_use]
     pub fn solarized_dark() -> Self {
         Self {
-            name: "Solarized Dark".to_string(),
+            name: "Solarized Dark",
             syntax: SyntaxTheme {
                 attribute: Color::Rgb(38, 139, 210),
                 comment: Color::Rgb(45, 79, 87),
@@ -468,38 +405,20 @@ impl Theme {
                 escape: Color::Rgb(203, 75, 22),
             },
             markdown: MarkdownTheme {
-                header1: Style::default()
-                    .fg(Color::Rgb(38, 139, 210))
-                    .add_modifier(Modifier::BOLD),
-                header2: Style::default()
-                    .fg(Color::Rgb(211, 54, 130))
-                    .add_modifier(Modifier::BOLD),
-                header3: Style::default()
-                    .fg(Color::Rgb(181, 137, 0))
-                    .add_modifier(Modifier::BOLD),
-                header4: Style::default()
-                    .fg(Color::Rgb(133, 153, 0))
-                    .add_modifier(Modifier::BOLD),
-                header5: Style::default()
-                    .fg(Color::Rgb(42, 161, 152))
-                    .add_modifier(Modifier::BOLD),
-                header6: Style::default()
-                    .fg(Color::Rgb(253, 246, 227))
-                    .add_modifier(Modifier::BOLD),
+                header1: heading(Color::Rgb(38, 139, 210)),
+                header2: heading(Color::Rgb(211, 54, 130)),
+                header3: heading(Color::Rgb(181, 137, 0)),
+                header4: heading(Color::Rgb(133, 153, 0)),
+                header5: heading(Color::Rgb(42, 161, 152)),
+                header6: heading(Color::Rgb(253, 246, 227)),
                 bold: Style::default().add_modifier(Modifier::BOLD),
                 italic: Style::default().add_modifier(Modifier::ITALIC),
-                code_inline: Style::default()
-                    .fg(Color::Rgb(181, 137, 0))
-                    .bg(Color::Rgb(0, 43, 54)),
-                code_block: Style::default().fg(Color::Rgb(131, 148, 150)),
-                link: Style::default()
-                    .fg(Color::Rgb(42, 161, 152))
-                    .add_modifier(Modifier::UNDERLINED),
-                quote: Style::default()
-                    .fg(Color::Rgb(45, 79, 87))
-                    .add_modifier(Modifier::ITALIC),
-                list_item: Style::default().fg(Color::Rgb(131, 148, 150)),
-                horizontal_rule: Style::default().fg(Color::Rgb(45, 79, 87)),
+                code_inline: inline_code(Color::Rgb(181, 137, 0), Color::Rgb(0, 43, 54)),
+                code_block: plain(Color::Rgb(131, 148, 150)),
+                link: link(Color::Rgb(42, 161, 152)),
+                quote: quote(Color::Rgb(45, 79, 87)),
+                list_item: plain(Color::Rgb(131, 148, 150)),
+                horizontal_rule: plain(Color::Rgb(45, 79, 87)),
             },
             ui: UIStyle {
                 background: Color::Rgb(0, 43, 54),
@@ -531,7 +450,7 @@ impl Theme {
     #[must_use]
     pub fn solarized_light() -> Self {
         Self {
-            name: "Solarized Light".to_string(),
+            name: "Solarized Light",
             syntax: SyntaxTheme {
                 attribute: Color::Rgb(38, 139, 210),
                 comment: Color::Rgb(0, 43, 54),
@@ -553,38 +472,20 @@ impl Theme {
                 escape: Color::Rgb(203, 75, 22),
             },
             markdown: MarkdownTheme {
-                header1: Style::default()
-                    .fg(Color::Rgb(38, 139, 210))
-                    .add_modifier(Modifier::BOLD),
-                header2: Style::default()
-                    .fg(Color::Rgb(211, 54, 130))
-                    .add_modifier(Modifier::BOLD),
-                header3: Style::default()
-                    .fg(Color::Rgb(181, 137, 0))
-                    .add_modifier(Modifier::BOLD),
-                header4: Style::default()
-                    .fg(Color::Rgb(133, 153, 0))
-                    .add_modifier(Modifier::BOLD),
-                header5: Style::default()
-                    .fg(Color::Rgb(42, 161, 152))
-                    .add_modifier(Modifier::BOLD),
-                header6: Style::default()
-                    .fg(Color::Rgb(253, 246, 227))
-                    .add_modifier(Modifier::BOLD),
+                header1: heading(Color::Rgb(38, 139, 210)),
+                header2: heading(Color::Rgb(211, 54, 130)),
+                header3: heading(Color::Rgb(181, 137, 0)),
+                header4: heading(Color::Rgb(133, 153, 0)),
+                header5: heading(Color::Rgb(42, 161, 152)),
+                header6: heading(Color::Rgb(88, 110, 117)),
                 bold: Style::default().add_modifier(Modifier::BOLD),
                 italic: Style::default().add_modifier(Modifier::ITALIC),
-                code_inline: Style::default()
-                    .fg(Color::Rgb(181, 137, 0))
-                    .bg(Color::Rgb(0, 43, 54)),
-                code_block: Style::default().fg(Color::Rgb(88, 110, 117)),
-                link: Style::default()
-                    .fg(Color::Rgb(42, 161, 152))
-                    .add_modifier(Modifier::UNDERLINED),
-                quote: Style::default()
-                    .fg(Color::Rgb(0, 43, 54))
-                    .add_modifier(Modifier::ITALIC),
-                list_item: Style::default().fg(Color::Rgb(88, 110, 117)),
-                horizontal_rule: Style::default().fg(Color::Rgb(0, 43, 54)),
+                code_inline: inline_code(Color::Rgb(181, 137, 0), Color::Rgb(0, 43, 54)),
+                code_block: plain(Color::Rgb(88, 110, 117)),
+                link: link(Color::Rgb(42, 161, 152)),
+                quote: quote(Color::Rgb(0, 43, 54)),
+                list_item: plain(Color::Rgb(88, 110, 117)),
+                horizontal_rule: plain(Color::Rgb(0, 43, 54)),
             },
             ui: UIStyle {
                 background: Color::Rgb(253, 246, 227),
@@ -616,7 +517,7 @@ impl Theme {
     #[must_use]
     pub fn catppuccin_latte() -> Self {
         Self {
-            name: "Catppuccin Latte".to_string(),
+            name: "Catppuccin Latte",
             syntax: SyntaxTheme {
                 attribute: Color::Rgb(30, 102, 245),
                 comment: Color::Rgb(108, 111, 133),
@@ -638,38 +539,20 @@ impl Theme {
                 escape: Color::Rgb(210, 15, 57),
             },
             markdown: MarkdownTheme {
-                header1: Style::default()
-                    .fg(Color::Rgb(30, 102, 245))
-                    .add_modifier(Modifier::BOLD),
-                header2: Style::default()
-                    .fg(Color::Rgb(234, 118, 203))
-                    .add_modifier(Modifier::BOLD),
-                header3: Style::default()
-                    .fg(Color::Rgb(223, 142, 29))
-                    .add_modifier(Modifier::BOLD),
-                header4: Style::default()
-                    .fg(Color::Rgb(64, 160, 43))
-                    .add_modifier(Modifier::BOLD),
-                header5: Style::default()
-                    .fg(Color::Rgb(23, 146, 153))
-                    .add_modifier(Modifier::BOLD),
-                header6: Style::default()
-                    .fg(Color::Rgb(188, 192, 204))
-                    .add_modifier(Modifier::BOLD),
+                header1: heading(Color::Rgb(30, 102, 245)),
+                header2: heading(Color::Rgb(234, 118, 203)),
+                header3: heading(Color::Rgb(223, 142, 29)),
+                header4: heading(Color::Rgb(64, 160, 43)),
+                header5: heading(Color::Rgb(23, 146, 153)),
+                header6: heading(Color::Rgb(188, 192, 204)),
                 bold: Style::default().add_modifier(Modifier::BOLD),
                 italic: Style::default().add_modifier(Modifier::ITALIC),
-                code_inline: Style::default()
-                    .fg(Color::Rgb(223, 142, 29))
-                    .bg(Color::Rgb(108, 111, 133)),
-                code_block: Style::default().fg(Color::Rgb(76, 79, 105)),
-                link: Style::default()
-                    .fg(Color::Rgb(23, 146, 153))
-                    .add_modifier(Modifier::UNDERLINED),
-                quote: Style::default()
-                    .fg(Color::Rgb(108, 111, 133))
-                    .add_modifier(Modifier::ITALIC),
-                list_item: Style::default().fg(Color::Rgb(76, 79, 105)),
-                horizontal_rule: Style::default().fg(Color::Rgb(108, 111, 133)),
+                code_inline: inline_code(Color::Rgb(223, 142, 29), Color::Rgb(108, 111, 133)),
+                code_block: plain(Color::Rgb(76, 79, 105)),
+                link: link(Color::Rgb(23, 146, 153)),
+                quote: quote(Color::Rgb(108, 111, 133)),
+                list_item: plain(Color::Rgb(76, 79, 105)),
+                horizontal_rule: plain(Color::Rgb(108, 111, 133)),
             },
             ui: UIStyle {
                 background: Color::Rgb(239, 241, 245),
@@ -701,7 +584,7 @@ impl Theme {
     #[must_use]
     pub fn catppuccin_frappe() -> Self {
         Self {
-            name: "Catppuccin Frappe".to_string(),
+            name: "Catppuccin Frappe",
             syntax: SyntaxTheme {
                 attribute: Color::Rgb(140, 170, 238),
                 comment: Color::Rgb(98, 104, 128),
@@ -723,38 +606,20 @@ impl Theme {
                 escape: Color::Rgb(231, 130, 132),
             },
             markdown: MarkdownTheme {
-                header1: Style::default()
-                    .fg(Color::Rgb(140, 170, 238))
-                    .add_modifier(Modifier::BOLD),
-                header2: Style::default()
-                    .fg(Color::Rgb(244, 184, 228))
-                    .add_modifier(Modifier::BOLD),
-                header3: Style::default()
-                    .fg(Color::Rgb(229, 200, 144))
-                    .add_modifier(Modifier::BOLD),
-                header4: Style::default()
-                    .fg(Color::Rgb(166, 209, 137))
-                    .add_modifier(Modifier::BOLD),
-                header5: Style::default()
-                    .fg(Color::Rgb(129, 200, 190))
-                    .add_modifier(Modifier::BOLD),
-                header6: Style::default()
-                    .fg(Color::Rgb(165, 173, 206))
-                    .add_modifier(Modifier::BOLD),
+                header1: heading(Color::Rgb(140, 170, 238)),
+                header2: heading(Color::Rgb(244, 184, 228)),
+                header3: heading(Color::Rgb(229, 200, 144)),
+                header4: heading(Color::Rgb(166, 209, 137)),
+                header5: heading(Color::Rgb(129, 200, 190)),
+                header6: heading(Color::Rgb(165, 173, 206)),
                 bold: Style::default().add_modifier(Modifier::BOLD),
                 italic: Style::default().add_modifier(Modifier::ITALIC),
-                code_inline: Style::default()
-                    .fg(Color::Rgb(229, 200, 144))
-                    .bg(Color::Rgb(98, 104, 128)),
-                code_block: Style::default().fg(Color::Rgb(198, 208, 245)),
-                link: Style::default()
-                    .fg(Color::Rgb(129, 200, 190))
-                    .add_modifier(Modifier::UNDERLINED),
-                quote: Style::default()
-                    .fg(Color::Rgb(98, 104, 128))
-                    .add_modifier(Modifier::ITALIC),
-                list_item: Style::default().fg(Color::Rgb(198, 208, 245)),
-                horizontal_rule: Style::default().fg(Color::Rgb(98, 104, 128)),
+                code_inline: inline_code(Color::Rgb(229, 200, 144), Color::Rgb(98, 104, 128)),
+                code_block: plain(Color::Rgb(198, 208, 245)),
+                link: link(Color::Rgb(129, 200, 190)),
+                quote: quote(Color::Rgb(98, 104, 128)),
+                list_item: plain(Color::Rgb(198, 208, 245)),
+                horizontal_rule: plain(Color::Rgb(98, 104, 128)),
             },
             ui: UIStyle {
                 background: Color::Rgb(48, 52, 70),
@@ -786,7 +651,7 @@ impl Theme {
     #[must_use]
     pub fn catppuccin_macchiato() -> Self {
         Self {
-            name: "Catppuccin Macchiato".to_string(),
+            name: "Catppuccin Macchiato",
             syntax: SyntaxTheme {
                 attribute: Color::Rgb(138, 173, 244),
                 comment: Color::Rgb(91, 96, 120),
@@ -808,38 +673,20 @@ impl Theme {
                 escape: Color::Rgb(237, 135, 150),
             },
             markdown: MarkdownTheme {
-                header1: Style::default()
-                    .fg(Color::Rgb(138, 173, 244))
-                    .add_modifier(Modifier::BOLD),
-                header2: Style::default()
-                    .fg(Color::Rgb(245, 189, 230))
-                    .add_modifier(Modifier::BOLD),
-                header3: Style::default()
-                    .fg(Color::Rgb(238, 212, 159))
-                    .add_modifier(Modifier::BOLD),
-                header4: Style::default()
-                    .fg(Color::Rgb(166, 218, 149))
-                    .add_modifier(Modifier::BOLD),
-                header5: Style::default()
-                    .fg(Color::Rgb(139, 213, 202))
-                    .add_modifier(Modifier::BOLD),
-                header6: Style::default()
-                    .fg(Color::Rgb(165, 173, 203))
-                    .add_modifier(Modifier::BOLD),
+                header1: heading(Color::Rgb(138, 173, 244)),
+                header2: heading(Color::Rgb(245, 189, 230)),
+                header3: heading(Color::Rgb(238, 212, 159)),
+                header4: heading(Color::Rgb(166, 218, 149)),
+                header5: heading(Color::Rgb(139, 213, 202)),
+                header6: heading(Color::Rgb(165, 173, 203)),
                 bold: Style::default().add_modifier(Modifier::BOLD),
                 italic: Style::default().add_modifier(Modifier::ITALIC),
-                code_inline: Style::default()
-                    .fg(Color::Rgb(238, 212, 159))
-                    .bg(Color::Rgb(91, 96, 120)),
-                code_block: Style::default().fg(Color::Rgb(202, 211, 245)),
-                link: Style::default()
-                    .fg(Color::Rgb(139, 213, 202))
-                    .add_modifier(Modifier::UNDERLINED),
-                quote: Style::default()
-                    .fg(Color::Rgb(91, 96, 120))
-                    .add_modifier(Modifier::ITALIC),
-                list_item: Style::default().fg(Color::Rgb(202, 211, 245)),
-                horizontal_rule: Style::default().fg(Color::Rgb(91, 96, 120)),
+                code_inline: inline_code(Color::Rgb(238, 212, 159), Color::Rgb(91, 96, 120)),
+                code_block: plain(Color::Rgb(202, 211, 245)),
+                link: link(Color::Rgb(139, 213, 202)),
+                quote: quote(Color::Rgb(91, 96, 120)),
+                list_item: plain(Color::Rgb(202, 211, 245)),
+                horizontal_rule: plain(Color::Rgb(91, 96, 120)),
             },
             ui: UIStyle {
                 background: Color::Rgb(36, 39, 58),
@@ -871,7 +718,7 @@ impl Theme {
     #[must_use]
     pub fn catppuccin_mocha() -> Self {
         Self {
-            name: "Catppuccin Mocha".to_string(),
+            name: "Catppuccin Mocha",
             syntax: SyntaxTheme {
                 attribute: Color::Rgb(137, 180, 250),
                 comment: Color::Rgb(88, 91, 112),
@@ -893,38 +740,20 @@ impl Theme {
                 escape: Color::Rgb(243, 139, 168),
             },
             markdown: MarkdownTheme {
-                header1: Style::default()
-                    .fg(Color::Rgb(137, 180, 250))
-                    .add_modifier(Modifier::BOLD),
-                header2: Style::default()
-                    .fg(Color::Rgb(245, 194, 231))
-                    .add_modifier(Modifier::BOLD),
-                header3: Style::default()
-                    .fg(Color::Rgb(249, 226, 175))
-                    .add_modifier(Modifier::BOLD),
-                header4: Style::default()
-                    .fg(Color::Rgb(166, 227, 161))
-                    .add_modifier(Modifier::BOLD),
-                header5: Style::default()
-                    .fg(Color::Rgb(148, 226, 213))
-                    .add_modifier(Modifier::BOLD),
-                header6: Style::default()
-                    .fg(Color::Rgb(166, 173, 200))
-                    .add_modifier(Modifier::BOLD),
+                header1: heading(Color::Rgb(137, 180, 250)),
+                header2: heading(Color::Rgb(245, 194, 231)),
+                header3: heading(Color::Rgb(249, 226, 175)),
+                header4: heading(Color::Rgb(166, 227, 161)),
+                header5: heading(Color::Rgb(148, 226, 213)),
+                header6: heading(Color::Rgb(166, 173, 200)),
                 bold: Style::default().add_modifier(Modifier::BOLD),
                 italic: Style::default().add_modifier(Modifier::ITALIC),
-                code_inline: Style::default()
-                    .fg(Color::Rgb(249, 226, 175))
-                    .bg(Color::Rgb(88, 91, 112)),
-                code_block: Style::default().fg(Color::Rgb(205, 214, 244)),
-                link: Style::default()
-                    .fg(Color::Rgb(148, 226, 213))
-                    .add_modifier(Modifier::UNDERLINED),
-                quote: Style::default()
-                    .fg(Color::Rgb(88, 91, 112))
-                    .add_modifier(Modifier::ITALIC),
-                list_item: Style::default().fg(Color::Rgb(205, 214, 244)),
-                horizontal_rule: Style::default().fg(Color::Rgb(88, 91, 112)),
+                code_inline: inline_code(Color::Rgb(249, 226, 175), Color::Rgb(88, 91, 112)),
+                code_block: plain(Color::Rgb(205, 214, 244)),
+                link: link(Color::Rgb(148, 226, 213)),
+                quote: quote(Color::Rgb(88, 91, 112)),
+                list_item: plain(Color::Rgb(205, 214, 244)),
+                horizontal_rule: plain(Color::Rgb(88, 91, 112)),
             },
             ui: UIStyle {
                 background: Color::Rgb(30, 30, 46),
@@ -956,7 +785,7 @@ impl Theme {
     #[must_use]
     pub fn one_dark() -> Self {
         Self {
-            name: "One Dark".to_string(),
+            name: "One Dark",
             syntax: SyntaxTheme {
                 attribute: Color::Rgb(97, 175, 239),
                 comment: Color::Rgb(92, 99, 112),
@@ -978,38 +807,20 @@ impl Theme {
                 escape: Color::Rgb(224, 108, 117),
             },
             markdown: MarkdownTheme {
-                header1: Style::default()
-                    .fg(Color::Rgb(97, 175, 239))
-                    .add_modifier(Modifier::BOLD),
-                header2: Style::default()
-                    .fg(Color::Rgb(198, 120, 221))
-                    .add_modifier(Modifier::BOLD),
-                header3: Style::default()
-                    .fg(Color::Rgb(209, 154, 102))
-                    .add_modifier(Modifier::BOLD),
-                header4: Style::default()
-                    .fg(Color::Rgb(152, 195, 121))
-                    .add_modifier(Modifier::BOLD),
-                header5: Style::default()
-                    .fg(Color::Rgb(86, 182, 194))
-                    .add_modifier(Modifier::BOLD),
-                header6: Style::default()
-                    .fg(Color::Rgb(255, 255, 255))
-                    .add_modifier(Modifier::BOLD),
+                header1: heading(Color::Rgb(97, 175, 239)),
+                header2: heading(Color::Rgb(198, 120, 221)),
+                header3: heading(Color::Rgb(209, 154, 102)),
+                header4: heading(Color::Rgb(152, 195, 121)),
+                header5: heading(Color::Rgb(171, 178, 191)),
+                header6: heading(Color::Rgb(255, 255, 255)),
                 bold: Style::default().add_modifier(Modifier::BOLD),
                 italic: Style::default().add_modifier(Modifier::ITALIC),
-                code_inline: Style::default()
-                    .fg(Color::Rgb(209, 154, 102))
-                    .bg(Color::Rgb(92, 99, 112)),
-                code_block: Style::default().fg(Color::Rgb(171, 178, 191)),
-                link: Style::default()
-                    .fg(Color::Rgb(86, 182, 194))
-                    .add_modifier(Modifier::UNDERLINED),
-                quote: Style::default()
-                    .fg(Color::Rgb(92, 99, 112))
-                    .add_modifier(Modifier::ITALIC),
-                list_item: Style::default().fg(Color::Rgb(171, 178, 191)),
-                horizontal_rule: Style::default().fg(Color::Rgb(92, 99, 112)),
+                code_inline: inline_code(Color::Rgb(209, 154, 102), Color::Rgb(92, 99, 112)),
+                code_block: plain(Color::Rgb(171, 178, 191)),
+                link: link(Color::Rgb(97, 175, 239)),
+                quote: quote(Color::Rgb(92, 99, 112)),
+                list_item: plain(Color::Rgb(171, 178, 191)),
+                horizontal_rule: plain(Color::Rgb(92, 99, 112)),
             },
             ui: UIStyle {
                 background: Color::Rgb(40, 44, 52),
@@ -1041,7 +852,7 @@ impl Theme {
     #[must_use]
     pub fn monokai() -> Self {
         Self {
-            name: "Monokai".to_string(),
+            name: "Monokai",
             syntax: SyntaxTheme {
                 attribute: Color::Rgb(102, 217, 239),
                 comment: Color::Rgb(117, 113, 94),
@@ -1063,38 +874,20 @@ impl Theme {
                 escape: Color::Rgb(249, 38, 114),
             },
             markdown: MarkdownTheme {
-                header1: Style::default()
-                    .fg(Color::Rgb(102, 217, 239))
-                    .add_modifier(Modifier::BOLD),
-                header2: Style::default()
-                    .fg(Color::Rgb(174, 129, 255))
-                    .add_modifier(Modifier::BOLD),
-                header3: Style::default()
-                    .fg(Color::Rgb(244, 191, 117))
-                    .add_modifier(Modifier::BOLD),
-                header4: Style::default()
-                    .fg(Color::Rgb(166, 226, 46))
-                    .add_modifier(Modifier::BOLD),
-                header5: Style::default()
-                    .fg(Color::Rgb(161, 239, 228))
-                    .add_modifier(Modifier::BOLD),
-                header6: Style::default()
-                    .fg(Color::Rgb(249, 248, 245))
-                    .add_modifier(Modifier::BOLD),
+                header1: heading(Color::Rgb(102, 217, 239)),
+                header2: heading(Color::Rgb(174, 129, 255)),
+                header3: heading(Color::Rgb(244, 191, 117)),
+                header4: heading(Color::Rgb(166, 226, 46)),
+                header5: heading(Color::Rgb(161, 239, 228)),
+                header6: heading(Color::Rgb(249, 248, 245)),
                 bold: Style::default().add_modifier(Modifier::BOLD),
                 italic: Style::default().add_modifier(Modifier::ITALIC),
-                code_inline: Style::default()
-                    .fg(Color::Rgb(244, 191, 117))
-                    .bg(Color::Rgb(117, 113, 94)),
-                code_block: Style::default().fg(Color::Rgb(248, 248, 242)),
-                link: Style::default()
-                    .fg(Color::Rgb(161, 239, 228))
-                    .add_modifier(Modifier::UNDERLINED),
-                quote: Style::default()
-                    .fg(Color::Rgb(117, 113, 94))
-                    .add_modifier(Modifier::ITALIC),
-                list_item: Style::default().fg(Color::Rgb(248, 248, 242)),
-                horizontal_rule: Style::default().fg(Color::Rgb(117, 113, 94)),
+                code_inline: inline_code(Color::Rgb(244, 191, 117), Color::Rgb(117, 113, 94)),
+                code_block: plain(Color::Rgb(248, 248, 242)),
+                link: link(Color::Rgb(161, 239, 228)),
+                quote: quote(Color::Rgb(117, 113, 94)),
+                list_item: plain(Color::Rgb(248, 248, 242)),
+                horizontal_rule: plain(Color::Rgb(117, 113, 94)),
             },
             ui: UIStyle {
                 background: Color::Rgb(39, 40, 34),
@@ -1126,7 +919,7 @@ impl Theme {
     #[must_use]
     pub fn github_dark() -> Self {
         Self {
-            name: "GitHub Dark".to_string(),
+            name: "GitHub Dark",
             syntax: SyntaxTheme {
                 attribute: Color::Rgb(33, 136, 255),
                 comment: Color::Rgb(149, 157, 165),
@@ -1148,38 +941,20 @@ impl Theme {
                 escape: Color::Rgb(249, 117, 131),
             },
             markdown: MarkdownTheme {
-                header1: Style::default()
-                    .fg(Color::Rgb(33, 136, 255))
-                    .add_modifier(Modifier::BOLD),
-                header2: Style::default()
-                    .fg(Color::Rgb(179, 146, 240))
-                    .add_modifier(Modifier::BOLD),
-                header3: Style::default()
-                    .fg(Color::Rgb(255, 234, 127))
-                    .add_modifier(Modifier::BOLD),
-                header4: Style::default()
-                    .fg(Color::Rgb(52, 208, 88))
-                    .add_modifier(Modifier::BOLD),
-                header5: Style::default()
-                    .fg(Color::Rgb(57, 197, 207))
-                    .add_modifier(Modifier::BOLD),
-                header6: Style::default()
-                    .fg(Color::Rgb(250, 251, 252))
-                    .add_modifier(Modifier::BOLD),
+                header1: heading(Color::Rgb(33, 136, 255)),
+                header2: heading(Color::Rgb(179, 146, 240)),
+                header3: heading(Color::Rgb(255, 234, 127)),
+                header4: heading(Color::Rgb(52, 208, 88)),
+                header5: heading(Color::Rgb(57, 197, 207)),
+                header6: heading(Color::Rgb(250, 251, 252)),
                 bold: Style::default().add_modifier(Modifier::BOLD),
                 italic: Style::default().add_modifier(Modifier::ITALIC),
-                code_inline: Style::default()
-                    .fg(Color::Rgb(255, 234, 127))
-                    .bg(Color::Rgb(149, 157, 165)),
-                code_block: Style::default().fg(Color::Rgb(209, 213, 218)),
-                link: Style::default()
-                    .fg(Color::Rgb(57, 197, 207))
-                    .add_modifier(Modifier::UNDERLINED),
-                quote: Style::default()
-                    .fg(Color::Rgb(149, 157, 165))
-                    .add_modifier(Modifier::ITALIC),
-                list_item: Style::default().fg(Color::Rgb(209, 213, 218)),
-                horizontal_rule: Style::default().fg(Color::Rgb(149, 157, 165)),
+                code_inline: inline_code(Color::Rgb(255, 234, 127), Color::Rgb(149, 157, 165)),
+                code_block: plain(Color::Rgb(209, 213, 218)),
+                link: link(Color::Rgb(57, 197, 207)),
+                quote: quote(Color::Rgb(149, 157, 165)),
+                list_item: plain(Color::Rgb(209, 213, 218)),
+                horizontal_rule: plain(Color::Rgb(149, 157, 165)),
             },
             ui: UIStyle {
                 background: Color::Rgb(36, 41, 46),
@@ -1211,7 +986,7 @@ impl Theme {
     #[must_use]
     pub fn github_light() -> Self {
         Self {
-            name: "GitHub Light".to_string(),
+            name: "GitHub Light",
             syntax: SyntaxTheme {
                 attribute: Color::Rgb(3, 102, 214),
                 comment: Color::Rgb(149, 157, 165),
@@ -1233,38 +1008,20 @@ impl Theme {
                 escape: Color::Rgb(203, 36, 49),
             },
             markdown: MarkdownTheme {
-                header1: Style::default()
-                    .fg(Color::Rgb(3, 102, 214))
-                    .add_modifier(Modifier::BOLD),
-                header2: Style::default()
-                    .fg(Color::Rgb(90, 50, 163))
-                    .add_modifier(Modifier::BOLD),
-                header3: Style::default()
-                    .fg(Color::Rgb(219, 171, 9))
-                    .add_modifier(Modifier::BOLD),
-                header4: Style::default()
-                    .fg(Color::Rgb(40, 167, 69))
-                    .add_modifier(Modifier::BOLD),
-                header5: Style::default()
-                    .fg(Color::Rgb(5, 152, 188))
-                    .add_modifier(Modifier::BOLD),
-                header6: Style::default()
-                    .fg(Color::Rgb(209, 213, 218))
-                    .add_modifier(Modifier::BOLD),
+                header1: heading(Color::Rgb(3, 102, 214)),
+                header2: heading(Color::Rgb(90, 50, 163)),
+                header3: heading(Color::Rgb(219, 171, 9)),
+                header4: heading(Color::Rgb(40, 167, 69)),
+                header5: heading(Color::Rgb(5, 152, 188)),
+                header6: heading(Color::Rgb(36, 41, 47)),
                 bold: Style::default().add_modifier(Modifier::BOLD),
                 italic: Style::default().add_modifier(Modifier::ITALIC),
-                code_inline: Style::default()
-                    .fg(Color::Rgb(219, 171, 9))
-                    .bg(Color::Rgb(149, 157, 165)),
-                code_block: Style::default().fg(Color::Rgb(36, 41, 47)),
-                link: Style::default()
-                    .fg(Color::Rgb(5, 152, 188))
-                    .add_modifier(Modifier::UNDERLINED),
-                quote: Style::default()
-                    .fg(Color::Rgb(149, 157, 165))
-                    .add_modifier(Modifier::ITALIC),
-                list_item: Style::default().fg(Color::Rgb(36, 41, 47)),
-                horizontal_rule: Style::default().fg(Color::Rgb(149, 157, 165)),
+                code_inline: inline_code(Color::Rgb(219, 171, 9), Color::Rgb(149, 157, 165)),
+                code_block: plain(Color::Rgb(36, 41, 47)),
+                link: link(Color::Rgb(5, 152, 188)),
+                quote: quote(Color::Rgb(149, 157, 165)),
+                list_item: plain(Color::Rgb(36, 41, 47)),
+                horizontal_rule: plain(Color::Rgb(149, 157, 165)),
             },
             ui: UIStyle {
                 background: Color::Rgb(255, 255, 255),
