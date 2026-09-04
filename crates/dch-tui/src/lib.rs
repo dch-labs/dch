@@ -2,8 +2,4 @@
 
 #![warn(missing_docs)]
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn dch_tui_compiles() {}
-}
+pub mod theme;
