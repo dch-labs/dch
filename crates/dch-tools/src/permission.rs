@@ -3,9 +3,9 @@
 //!
 //! The permission system classifies every tool into a [`ToolCategory`], and
 //! resolves a [`PermissionMode`] × category pair into a [`PermissionOutcome`]
-//! through [`decide`]. Both halves are pure and synchronous: the runner's
-//! permission hook (which owns the prompting I/O) calls [`decide`] and turns
-//! `Ask` into a question for the user.
+//! through [`decide`]. Both halves are pure and synchronous; the prompting
+//! I/O belongs to the enforcement hook that will consume them, which turns
+//! [`Ask`](PermissionOutcome::Ask) into a question for the user.
 
 use tracing::warn;
 
@@ -13,10 +13,10 @@ use tracing::warn;
 ///
 /// dch-config owns the serde-bearing canonical definition (selected by the
 /// `[runner] permission_mode` config key); this copy exists so dch-tools can
-/// express mode-aware classification without depending on dch-config. The
-/// hook that consumes it converts the config-side mode into this mirror at
-/// dispatch time — one conversion point, and the variants stay ordered and
-/// named identically.
+/// express mode-aware classification without depending on dch-config.
+/// Whatever consumes this mirror converts the config-side mode into it at
+/// dispatch time — one conversion point — and the variants stay ordered and
+/// named identically, keeping that conversion a pure relabeling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermissionMode {
     /// Never prompts.
@@ -38,7 +38,7 @@ pub enum PermissionMode {
 
     /// Prompts before every side-effecting action.
     ///
-    /// Only genuinely read-only work runs without confirmation.
+    /// The most conservative mode, confirming each action individually.
     Interactive,
 }
 
@@ -61,9 +61,9 @@ pub enum ToolCategory {
 
     /// Creates, overwrites, or edits files.
     ///
-    /// `Write`, `Edit`, and `MultiEdit` land here; shipped palettes pair the
-    /// category with a linter gate at the tool layer, but the permission
-    /// system treats the write itself as the side-effect.
+    /// `Write`, `Edit`, and `MultiEdit` land here; the shipped tools pair
+    /// this category with a linter gate at the tool layer, but the
+    /// permission system treats the write itself as the side-effect.
     FileWrite,
 
     /// Executes shell commands, which can touch anything the shell can.
@@ -109,11 +109,12 @@ impl ToolCategory {
 ///
 /// Matching is exact and case-sensitive: the names are the registered tool
 /// names, in their `PascalCase` registry form. Unknown names — a misconfigured
-/// registry, a typo, a future tool added before its entry — default to
-/// [`ToolCategory::FileWrite`], the most restrictive write category, and
-/// emit a warning so the gap is observable in logs: an unclassified tool is
-/// over-gated (it prompts where it might not need to) rather than silently
-/// under-gated.
+/// registry, a typo, a tool added before its entry — default to
+/// [`ToolCategory::FileWrite`] and emit a warning so the gap is observable
+/// in logs. The default is gated under Plan (blocked) and Interactive
+/// (asked), but under `AcceptEdits` it is allowed like any edit: a tool whose
+/// true category is `ShellExecute`, `Network`, or `Meta` would run
+/// unconfirmed there, so the warning is the only signal.
 #[must_use]
 pub fn tool_category(name: &str) -> ToolCategory {
     match name {
@@ -131,30 +132,29 @@ pub fn tool_category(name: &str) -> ToolCategory {
     }
 }
 
-/// The synchronous decision the permission hook reaches for a given
-/// (mode, category) pair, before any user prompting.
+/// The synchronous decision for a given (mode, category) pair, reached
+/// before any user prompting.
 ///
-/// [`Ask`](PermissionOutcome::Ask) means the hook must route through the
-/// question channel; a headless host has no channel, so its hook turns `Ask`
-/// into a block rather than hanging on a prompt that will never come.
+/// [`Ask`](PermissionOutcome::Ask) routes through the question channel; a
+/// headless host has no channel, so it becomes a block rather than a prompt
+/// that will never come.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermissionOutcome {
     /// Run the tool without confirmation.
     ///
-    /// The hook lets the dispatch proceed as if no permission system
-    /// existed.
+    /// The dispatch proceeds as if no permission system existed.
     Allow,
 
     /// Refuse the tool call.
     ///
-    /// The hook turns the call into a soft error addressed to the model,
-    /// naming the mode that blocked it.
+    /// The consumer is expected to turn the call into a soft error
+    /// addressed to the model, naming the mode that blocked it.
     Block,
 
     /// Ask the user before running the tool.
     ///
-    /// The hook routes through the question channel; a host that cannot
-    /// ask (headless) converts this outcome into a block.
+    /// The consumer is expected to route through the question channel; a
+    /// host that cannot ask (headless) converts this outcome into a block.
     Ask,
 }
 
@@ -194,8 +194,9 @@ pub fn decide(mode: PermissionMode, category: ToolCategory) -> PermissionOutcome
 )]
 mod tests {
     use super::*;
+    use crate::registry::builtin_registry;
 
-    /// Every v1 tool with the category the reference table prescribes.
+    /// Every v1 tool with the category this table prescribes.
     ///
     /// One row per tool: adding a tool means adding a row here and an arm in
     /// [`tool_category`], and the tests iterate this table so the two cannot
@@ -230,6 +231,26 @@ mod tests {
     }
 
     #[test]
+    fn every_registered_tool_has_a_category_row() {
+        // The registry and the category table are linked only by convention;
+        // this pins that a registered tool never silently falls to the
+        // unknown-name default.
+        let registry = builtin_registry();
+        let registered: Vec<&str> = registry
+            .all_tools()
+            .into_iter()
+            .map(loopctl::Tool::name)
+            .collect();
+        assert!(!registered.is_empty(), "the registry must not be empty");
+        for name in registered {
+            assert!(
+                TOOL_TABLE.iter().any(|(row_name, _)| *row_name == name),
+                "{name} is registered but has no category row"
+            );
+        }
+    }
+
+    #[test]
     fn is_read_only_is_true_for_file_read_only() {
         // The regression guard: Meta tools carry session-level side-effects
         // (submission produces a patch, TodoWrite mutates state, questions
@@ -242,7 +263,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_names_default_to_the_restrictive_write_category() {
+    fn unknown_names_default_to_file_write() {
         for name in ["DefinitelyNotATool", "", "read", "Bash ", "TODO_WRITE"] {
             assert_eq!(
                 tool_category(name),
