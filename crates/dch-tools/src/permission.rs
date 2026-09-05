@@ -183,12 +183,12 @@ pub enum PermissionOutcome {
 pub fn decide(mode: PermissionMode, category: ToolCategory) -> PermissionOutcome {
     use PermissionMode::{AcceptEdits, Auto, Interactive, Plan};
     use PermissionOutcome::{Allow, Ask, Block};
+    use ToolCategory::{FileRead, FileWrite, Meta, Network, ShellExecute, Unclassified};
     match (mode, category) {
-        (Auto, _)
-        | (Plan, ToolCategory::FileRead)
-        | (AcceptEdits, ToolCategory::FileRead | ToolCategory::FileWrite) => Allow,
-        (Plan, _) => Block,
-        (AcceptEdits | Interactive, _) => Ask,
+        (Auto, _) | (Plan, FileRead) | (AcceptEdits, FileRead | FileWrite) => Allow,
+        (Plan, FileWrite | ShellExecute | Network | Meta | Unclassified) => Block,
+        (Interactive, FileRead | FileWrite)
+        | (AcceptEdits | Interactive, ShellExecute | Network | Meta | Unclassified) => Ask,
     }
 }
 
