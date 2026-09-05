@@ -126,9 +126,10 @@ struct TodoListInput {
 
 /// One todo entry as the model submits it.
 ///
-/// Carries three fields the stored [`TodoEntry`] does not keep (`owner`,
-/// `blocked_by`, `blocks`); they are validated, rendered in the summary, and
-/// dropped when the list is stored.
+/// Carries two wire-only fields the stored [`TodoEntry`] does not keep:
+/// `blocked_by` is validated against the submission's ids and `blocks` is
+/// rendered in the summary; neither is stored. The schema additionally
+/// advertises `owner`, which is accepted for compatibility and ignored.
 #[derive(Debug, Clone, Deserialize)]
 struct TodoEntryInput {
     /// Stable identifier for the entry.
@@ -175,8 +176,8 @@ struct TodoEntryInput {
 
     /// Ids waiting on this entry.
     ///
-    /// Same lifecycle as `blocked_by`: rendered from the submission, not
-    /// stored.
+    /// Rendered from the submission like `blocked_by`, but not validated:
+    /// references to absent ids pass through unflagged.
     #[serde(default)]
     blocks: Vec<String>,
 }
@@ -211,14 +212,14 @@ where
 
 /// Derive a subject from a description, falling back to the entry id.
 ///
-/// Takes the first line of the description, truncated to roughly fifty
-/// characters when longer; entries without a description become
+/// Takes the first line of the description, trimmed, truncated to roughly
+/// fifty characters when longer; a missing or blank first line yields
 /// `"Task {id}"`.
 fn derive_subject(description: &str, id: &str) -> String {
-    if description.is_empty() {
+    let first_line = description.lines().next().map_or("", str::trim);
+    if first_line.is_empty() {
         return format!("Task {id}");
     }
-    let first_line = description.lines().next().unwrap_or(description);
     if first_line.chars().count() > 50 {
         format!("{}...", first_line.chars().take(47).collect::<String>())
     } else {
@@ -304,6 +305,234 @@ fn status_name(status: TodoStatus) -> &'static str {
     }
 }
 
+/// The repair hint matching a parse failure.
+///
+/// Selects on the parse error's wording so the model can repair its call
+/// in one round trip; empty when no hint applies.
+fn parse_hint(error: &serde_json::Error) -> &'static str {
+    let error_msg = error.to_string();
+    if error_msg.contains("subject") {
+        "\n\nHint: Each todo must have a non-empty 'subject' field. \
+         Example: {\"id\": \"1\", \"subject\": \"Fix the bug\"}"
+    } else if error_msg.contains("missing field `todos`") {
+        "\n\nHint: Provide the whole list under the 'todos' key. \
+         Example: {\"todos\": [{\"id\": \"1\", \"subject\": \"Fix the bug\"}]}"
+    } else if error_msg.contains("missing field") {
+        "\n\nHint: Missing required field. Required fields: 'id', 'subject'."
+    } else if error_msg.contains("invalid type") {
+        "\n\nHint: Check that 'todos' is an array of objects, not a string."
+    } else {
+        ""
+    }
+}
+
+/// Parse the preprocessed input into the typed list.
+///
+/// # Errors
+///
+/// Returns [`ToolError::InvalidInput`] carrying the underlying parse error
+/// and the matching repair hint.
+fn parse_todo_input(input: Value) -> Result<TodoListInput, ToolError> {
+    serde_json::from_value(input).map_err(|error| {
+        ToolError::InvalidInput(format!(
+            "Failed to parse todo input: {error}{}",
+            parse_hint(&error)
+        ))
+    })
+}
+
+/// Reject submissions that reuse an entry id.
+///
+/// Ids are the join key for status transitions across calls, so a
+/// duplicate would make the transition check ambiguous.
+///
+/// # Errors
+///
+/// Returns [`ToolError::InvalidInput`] naming the duplicated id.
+fn reject_duplicate_ids(todos: &[TodoEntryInput]) -> Result<(), ToolError> {
+    let mut seen_ids: Vec<&str> = Vec::new();
+    for todo in todos {
+        if seen_ids.contains(&todo.id.as_str()) {
+            return Err(ToolError::InvalidInput(format!(
+                "Duplicate todo ID '{}'. Every entry needs a unique id.",
+                todo.id
+            )));
+        }
+        seen_ids.push(&todo.id);
+    }
+    Ok(())
+}
+
+/// Reject `blocked_by` references to ids absent from the submission.
+///
+/// A whole-list replacement cannot depend on an entry it does not carry,
+/// so dangling references are rejected rather than silently resolved.
+///
+/// # Errors
+///
+/// Returns [`ToolError::InvalidInput`] naming the referencing entry and
+/// the missing id.
+fn reject_unknown_blocked_by(todos: &[TodoEntryInput]) -> Result<(), ToolError> {
+    for todo in todos {
+        for blocked_id in &todo.blocked_by {
+            if !todos.iter().any(|other| &other.id == blocked_id) {
+                return Err(ToolError::InvalidInput(format!(
+                    "Todo '{}' is blocked by non-existent todo ID '{}'. \
+                     Ensure all referenced todos exist in the same call.",
+                    todo.id, blocked_id
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Project the submission onto the stored entry shape.
+///
+/// Drops the wire-only fields (`blocked_by`, `blocks`) so the store keeps
+/// exactly what the entry type carries.
+fn stored_entries(todos: &[TodoEntryInput]) -> Vec<TodoEntry> {
+    todos
+        .iter()
+        .map(|todo| TodoEntry {
+            id: todo.id.clone(),
+            subject: todo.subject.clone(),
+            description: todo.description.clone(),
+            status: todo.status,
+            active_form: todo.active_form.clone(),
+        })
+        .collect()
+}
+
+/// The rejection for a status change outside the allowed set, carrying the
+/// remedy that fits the rejected pair.
+fn illegal_transition_error(entry: &TodoEntry, previous: TodoStatus) -> ToolError {
+    let remedy = if (previous, entry.status) == (TodoStatus::Completed, TodoStatus::Pending) {
+        "restart a completed task via in progress"
+    } else {
+        "move it through in progress"
+    };
+    ToolError::InvalidInput(format!(
+        "Todo '{}' cannot move from {} to {} ({}).",
+        entry.id,
+        status_name(previous),
+        status_name(entry.status),
+        remedy
+    ))
+}
+
+/// Validate every status change and replace the stored list.
+///
+/// Validation and replacement share one lock section: no other writer can
+/// observe a half-validated store, and a rejected call leaves the previous
+/// list byte-identical.
+///
+/// # Errors
+///
+/// Returns [`ToolError::InvalidInput`] when an entry's status change is
+/// not in the allowed transition set.
+fn store_validated(
+    todos: &Arc<std::sync::Mutex<Vec<TodoEntry>>>,
+    entries: Vec<TodoEntry>,
+) -> Result<(), ToolError> {
+    let mut store = todos
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for entry in &entries {
+        if let Some(existing) = store.iter().find(|existing| existing.id == entry.id) {
+            let previous = existing.status;
+            if !transition_allowed(previous, entry.status) {
+                return Err(illegal_transition_error(entry, previous));
+            }
+        }
+    }
+    *store = entries;
+    Ok(())
+}
+
+/// The summary-line indicator for a status.
+///
+/// Open circle for pending, half circle for in progress, filled circle for
+/// completed — the render contract the status line prints.
+fn status_icon(status: TodoStatus) -> &'static str {
+    match status {
+        TodoStatus::Pending => "○",
+        TodoStatus::InProgress => "◐",
+        TodoStatus::Completed => "●",
+    }
+}
+
+/// Sort position of a status: in-progress work leads, completed trails.
+fn display_order(status: TodoStatus) -> u8 {
+    match status {
+        TodoStatus::InProgress => 0,
+        TodoStatus::Pending => 1,
+        TodoStatus::Completed => 2,
+    }
+}
+
+/// How many entries in the submission carry the given status.
+fn count_in_status(todos: &[TodoEntryInput], status: TodoStatus) -> usize {
+    todos.iter().filter(|todo| todo.status == status).count()
+}
+
+/// Append one entry block: the status line, then the optional description
+/// and dependency lines, each only when the entry carries it.
+fn push_entry(todo: &TodoEntryInput, output: &mut String) {
+    writeln!(
+        output,
+        "{} [{}] {}",
+        status_icon(todo.status),
+        todo.id,
+        todo.subject
+    )
+    .ok();
+    if !todo.description.is_empty() {
+        writeln!(output, "  {}", todo.description).ok();
+    }
+    if !todo.blocked_by.is_empty() {
+        writeln!(output, "  Blocked by: {}", todo.blocked_by.join(", ")).ok();
+    }
+    if !todo.blocks.is_empty() {
+        writeln!(output, "  Blocks: {}", todo.blocks.join(", ")).ok();
+    }
+    output.push('\n');
+}
+
+/// Render the summary the model reads back.
+///
+/// Emits the subject-recovery notice when one is due, a status-count line,
+/// then the entries sorted in progress → pending → completed so current
+/// work leads the list.
+fn render_task_list(parsed: TodoListInput, recovered: bool) -> String {
+    let mut output = String::new();
+
+    if recovered {
+        writeln!(
+            output,
+            "Auto-recovered: Some todo subjects were derived from their descriptions or ids.\n"
+        )
+        .ok();
+    }
+
+    writeln!(output, "# Task List\n").ok();
+    write!(
+        output,
+        "Summary: {} pending, {} in progress, {} completed\n\n",
+        count_in_status(&parsed.todos, TodoStatus::Pending),
+        count_in_status(&parsed.todos, TodoStatus::InProgress),
+        count_in_status(&parsed.todos, TodoStatus::Completed),
+    )
+    .ok();
+
+    let mut sorted = parsed.todos;
+    sorted.sort_by_key(|todo| display_order(todo.status));
+    for todo in &sorted {
+        push_entry(todo, &mut output);
+    }
+    output
+}
+
 impl TodoTool {
     /// Body of [`Tool::call`], separated so the trait method stays a
     /// one-liner.
@@ -311,10 +540,11 @@ impl TodoTool {
     /// # Errors
     ///
     /// Returns [`ToolError::Execution`] when no runner context is installed,
-    /// and [`ToolError::InvalidInput`] when the input cannot be parsed, a
-    /// `blocked_by` reference names an absent id, or an entry's status
-    /// change is not in the allowed transition set. The stored list is only
-    /// mutated when every validation has passed.
+    /// and [`ToolError::InvalidInput`] when the input cannot be parsed, an
+    /// id is duplicated within the submission, a `blocked_by` reference
+    /// names an absent id, or an entry's status change is not in the
+    /// allowed transition set. The stored list is only mutated when every
+    /// validation has passed.
     fn todo_write_inner(
         mut input: Value,
         todos: Option<Arc<std::sync::Mutex<Vec<TodoEntry>>>>,
@@ -326,158 +556,21 @@ impl TodoTool {
         };
 
         let recovered = preprocess_todo_input(&mut input);
-
-        let parsed: TodoListInput = serde_json::from_value(input).map_err(|error| {
-            let error_msg = error.to_string();
-            let hint = if error_msg.contains("subject") {
-                "\n\nHint: Each todo must have a non-empty 'subject' field. \
-                 Example: {\"id\": \"1\", \"subject\": \"Fix the bug\"}"
-            } else if error_msg.contains("missing field `todos`") {
-                "\n\nHint: Provide the whole list under the 'todos' key. \
-                 Example: {\"todos\": [{\"id\": \"1\", \"subject\": \"Fix the bug\"}]}"
-            } else if error_msg.contains("missing field") {
-                "\n\nHint: Missing required field. Required fields: 'id', 'subject'."
-            } else if error_msg.contains("invalid type") {
-                "\n\nHint: Check that 'todos' is an array of objects, not a string."
-            } else {
-                ""
-            };
-            ToolError::InvalidInput(format!("Failed to parse todo input: {error}{hint}"))
-        })?;
+        let parsed = parse_todo_input(input)?;
 
         if parsed.todos.is_empty() {
-            let mut store = todos
+            todos
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            store.clear();
-            drop(store);
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
             return Ok(ToolOutput::text("Todo list cleared."));
         }
 
-        let mut seen_ids: Vec<&str> = Vec::new();
-        for todo in &parsed.todos {
-            if seen_ids.contains(&todo.id.as_str()) {
-                return Err(ToolError::InvalidInput(format!(
-                    "Duplicate todo ID '{}'. Every entry needs a unique id.",
-                    todo.id
-                )));
-            }
-            seen_ids.push(&todo.id);
-        }
+        reject_duplicate_ids(&parsed.todos)?;
+        reject_unknown_blocked_by(&parsed.todos)?;
+        store_validated(&todos, stored_entries(&parsed.todos))?;
 
-        for todo in &parsed.todos {
-            for blocked_id in &todo.blocked_by {
-                if !parsed.todos.iter().any(|other| &other.id == blocked_id) {
-                    return Err(ToolError::InvalidInput(format!(
-                        "Todo '{}' is blocked by non-existent todo ID '{}'. \
-                         Ensure all referenced todos exist in the same call.",
-                        todo.id, blocked_id
-                    )));
-                }
-            }
-        }
-
-        let entries: Vec<TodoEntry> = parsed
-            .todos
-            .iter()
-            .map(|todo| TodoEntry {
-                id: todo.id.clone(),
-                subject: todo.subject.clone(),
-                description: todo.description.clone(),
-                status: todo.status,
-                active_form: todo.active_form.clone(),
-            })
-            .collect();
-
-        {
-            let mut store = todos
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for entry in &entries {
-                if let Some(existing) = store.iter().find(|existing| existing.id == entry.id) {
-                    let previous = existing.status;
-                    if !transition_allowed(previous, entry.status) {
-                        return Err(ToolError::InvalidInput(format!(
-                            "Todo '{}' cannot move from {} to {} (restart a completed \
-                             task via in progress).",
-                            entry.id,
-                            status_name(previous),
-                            status_name(entry.status)
-                        )));
-                    }
-                }
-            }
-            *store = entries;
-        }
-
-        let mut output = String::new();
-
-        if recovered {
-            writeln!(
-                output,
-                "Auto-recovered: Some todo subjects were derived from their descriptions or ids.\n"
-            )
-            .ok();
-        }
-
-        writeln!(output, "# Task List\n").ok();
-
-        let pending_count = parsed
-            .todos
-            .iter()
-            .filter(|todo| todo.status == TodoStatus::Pending)
-            .count();
-        let in_progress_count = parsed
-            .todos
-            .iter()
-            .filter(|todo| todo.status == TodoStatus::InProgress)
-            .count();
-        let completed_count = parsed
-            .todos
-            .iter()
-            .filter(|todo| todo.status == TodoStatus::Completed)
-            .count();
-
-        write!(
-            output,
-            "Summary: {pending_count} pending, {in_progress_count} in progress, {completed_count} completed\n\n"
-        )
-        .ok();
-
-        let mut sorted_todos = parsed.todos;
-        sorted_todos.sort_by(|a, b| {
-            let order = |status: &TodoStatus| match status {
-                TodoStatus::InProgress => 0,
-                TodoStatus::Pending => 1,
-                TodoStatus::Completed => 2,
-            };
-            order(&a.status).cmp(&order(&b.status))
-        });
-
-        for todo in &sorted_todos {
-            let status_icon = match todo.status {
-                TodoStatus::Pending => "○",
-                TodoStatus::InProgress => "◐",
-                TodoStatus::Completed => "●",
-            };
-            writeln!(output, "{} [{}] {}", status_icon, todo.id, todo.subject).ok();
-
-            if !todo.description.is_empty() {
-                writeln!(output, "  {}", todo.description).ok();
-            }
-
-            if !todo.blocked_by.is_empty() {
-                writeln!(output, "  Blocked by: {}", todo.blocked_by.join(", ")).ok();
-            }
-
-            if !todo.blocks.is_empty() {
-                writeln!(output, "  Blocks: {}", todo.blocks.join(", ")).ok();
-            }
-
-            output.push('\n');
-        }
-
-        Ok(ToolOutput::text(output))
+        Ok(ToolOutput::text(render_task_list(parsed, recovered)))
     }
 }
 
@@ -544,6 +637,14 @@ impl Tool for TodoTool {
 
     fn is_concurrency_safe(&self) -> bool {
         false
+    }
+
+    fn system_prompt(&self) -> Option<String> {
+        Some(
+            "For multi-step tasks, maintain a todo list and mark items \
+             in_progress one at a time."
+                .to_string(),
+        )
     }
 }
 
@@ -643,6 +744,13 @@ mod tests {
             builtin_registry().get("TodoWrite").is_some(),
             "TodoWrite must ship in the builtin registry"
         );
+    }
+
+    #[test]
+    fn system_prompt_present() {
+        let prompt = TodoTool.system_prompt();
+        assert!(prompt.is_some());
+        assert!(prompt.unwrap().contains("todo list"));
     }
 
     #[test]
@@ -746,7 +854,7 @@ mod tests {
         assert_eq!(store.len(), 2);
         assert!(
             store.iter().all(|entry| entry.description.is_empty()),
-            "the wire-only fields must not leak into the stored entries"
+            "descriptions omitted on the wire are stored empty"
         );
     }
 
@@ -760,22 +868,30 @@ mod tests {
     #[tokio::test]
     async fn allowed_status_transitions_are_accepted() {
         let (ctx, todos) = todo_context();
-        seed(&todos, "1", TodoStatus::Completed);
-        seed(&todos, "2", TodoStatus::Pending);
+        seed(&todos, "c", TodoStatus::Completed);
+        seed(&todos, "p", TodoStatus::Pending);
+        seed(&todos, "f", TodoStatus::InProgress);
+        seed(&todos, "b", TodoStatus::InProgress);
+        seed(&todos, "s", TodoStatus::InProgress);
         let out = TodoTool
             .call(
                 json!({"todos": [
-                    {"id": "1", "subject": "Seed 1", "status": "in_progress"},
-                    {"id": "2", "subject": "Seed 2", "status": "in_progress"},
-                    {"id": "3", "subject": "Seed 3", "status": "completed"}
+                    {"id": "c", "subject": "Seed c", "status": "in_progress"},
+                    {"id": "p", "subject": "Seed p", "status": "in_progress"},
+                    {"id": "f", "subject": "Seed f", "status": "completed"},
+                    {"id": "b", "subject": "Seed b", "status": "pending"},
+                    {"id": "s", "subject": "Seed s", "status": "in_progress"},
+                    {"id": "n", "subject": "Seed n", "status": "completed"}
                 ]}),
                 &ctx,
             )
             .await
             .unwrap();
         assert!(!out.is_error, "{}", out.text_content());
-        // New entry "3" may start at any status; the resends of "1" and "2"
-        // exercise the revisit and forward edges.
+        // The five accepted edges: completed → in progress, pending → in
+        // progress, in progress → completed, in progress → pending, and the
+        // same-status resend that is the model's every-turn case. New ids
+        // ("n") may start at any status.
     }
 
     #[tokio::test]
@@ -794,6 +910,7 @@ mod tests {
             message.contains("cannot move from completed to pending"),
             "{message}"
         );
+        assert!(message.contains("restart a completed task"), "{message}");
         assert!(message.contains('1'), "{message}");
         assert_eq!(
             todos.lock().unwrap().first().unwrap().status,
@@ -813,11 +930,12 @@ mod tests {
             )
             .await
             .unwrap_err();
+        let message = err.to_string();
         assert!(
-            err.to_string()
-                .contains("cannot move from pending to completed"),
-            "{err:?}"
+            message.contains("cannot move from pending to completed"),
+            "{message}"
         );
+        assert!(message.contains("move it through in progress"), "{message}");
     }
 
     #[tokio::test]
@@ -966,6 +1084,210 @@ mod tests {
             todos.lock().unwrap().first().unwrap().subject,
             "Trimmed task"
         );
+    }
+
+    #[test]
+    fn derived_subjects_truncate_long_first_lines() {
+        let long = "x".repeat(60);
+        let subject = derive_subject(&long, "1");
+        assert_eq!(subject.chars().count(), 50, "{subject}");
+        assert!(subject.ends_with("..."), "{subject}");
+
+        let exact = "y".repeat(50);
+        assert_eq!(derive_subject(&exact, "1"), exact);
+    }
+
+    #[test]
+    fn blank_first_description_line_falls_back_to_the_id() {
+        assert_eq!(derive_subject("\nActual plan here", "7"), "Task 7");
+    }
+
+    #[test]
+    fn whitespace_only_description_falls_back_to_the_id() {
+        assert_eq!(derive_subject("   ", "7"), "Task 7");
+    }
+
+    /// A parse failure for the given JSON, for feeding [`parse_hint`]
+    /// directly.
+    fn parse_error(json: &str) -> serde_json::Error {
+        serde_json::from_str::<TodoListInput>(json).unwrap_err()
+    }
+
+    /// A typed submission parsed from the wire shape, for driving the
+    /// validation and projection helpers as units.
+    fn parse_input(json: Value) -> TodoListInput {
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn parse_hint_names_the_missing_subject() {
+        let hint = parse_hint(&parse_error(r#"{"todos": [{"id": "1"}]}"#));
+        assert!(hint.contains("'subject' field"), "{hint}");
+    }
+
+    #[test]
+    fn parse_hint_names_the_missing_todos_key() {
+        let hint = parse_hint(&parse_error("{}"));
+        assert!(hint.contains("'todos' key"), "{hint}");
+    }
+
+    #[test]
+    fn parse_hint_names_any_other_missing_field() {
+        let hint = parse_hint(&parse_error(r#"{"todos": [{"subject": "x"}]}"#));
+        assert!(hint.contains("Required fields"), "{hint}");
+    }
+
+    #[test]
+    fn parse_hint_names_the_wrong_container_type() {
+        let hint = parse_hint(&parse_error(r#"{"todos": "nope"}"#));
+        assert!(hint.contains("array of objects"), "{hint}");
+    }
+
+    #[test]
+    fn parse_hint_stays_silent_for_value_rejections() {
+        // The blank-id rejection carries none of the keywords the hint
+        // selection matches on, so no hint is better than a wrong one.
+        let hint = parse_hint(&parse_error(r#"{"todos": [{"id": " ", "subject": "x"}]}"#));
+        assert_eq!(hint, "");
+    }
+
+    #[test]
+    fn duplicate_id_check_passes_distinct_ids() {
+        let parsed = parse_input(json!({"todos": [
+            {"id": "1", "subject": "First"},
+            {"id": "2", "subject": "Second"}
+        ]}));
+        assert!(reject_duplicate_ids(&parsed.todos).is_ok());
+    }
+
+    #[test]
+    fn blocked_by_check_passes_declared_ids() {
+        let parsed = parse_input(json!({"todos": [
+            {"id": "1", "subject": "First", "blocked_by": ["2"]},
+            {"id": "2", "subject": "Second"}
+        ]}));
+        assert!(reject_unknown_blocked_by(&parsed.todos).is_ok());
+    }
+
+    #[test]
+    fn stored_entries_copy_every_stored_field() {
+        let parsed = parse_input(json!({"todos": [
+            {"id": "1", "subject": "Ship", "description": "Wire it",
+             "status": "in_progress", "active_form": "Shipping"}
+        ]}));
+        let entries = stored_entries(&parsed.todos);
+        let entry = entries.first().unwrap();
+        assert_eq!(entry.id, "1");
+        assert_eq!(entry.subject, "Ship");
+        assert_eq!(entry.description, "Wire it");
+        assert_eq!(entry.status, TodoStatus::InProgress);
+        assert_eq!(entry.active_form.as_deref(), Some("Shipping"));
+    }
+
+    #[test]
+    fn illegal_transition_errors_carry_the_pair_matching_remedy() {
+        let restarted = entry(TodoStatus::Pending, None);
+        assert!(
+            illegal_transition_error(&restarted, TodoStatus::Completed)
+                .to_string()
+                .contains("restart a completed task")
+        );
+        let skipped = entry(TodoStatus::Completed, None);
+        assert!(
+            illegal_transition_error(&skipped, TodoStatus::Pending)
+                .to_string()
+                .contains("move it through in progress")
+        );
+    }
+
+    #[test]
+    fn store_validated_replaces_the_list_when_transitions_pass() {
+        let todos: Arc<std::sync::Mutex<Vec<TodoEntry>>> = Arc::default();
+        seed(&todos, "1", TodoStatus::Pending);
+        store_validated(&todos, vec![entry(TodoStatus::InProgress, None)]).unwrap();
+        let store = todos.lock().unwrap();
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.first().unwrap().status, TodoStatus::InProgress);
+    }
+
+    #[test]
+    fn status_icon_marks_each_status() {
+        assert_eq!(status_icon(TodoStatus::Pending), "○");
+        assert_eq!(status_icon(TodoStatus::InProgress), "◐");
+        assert_eq!(status_icon(TodoStatus::Completed), "●");
+    }
+
+    #[test]
+    fn display_order_puts_active_work_first_and_done_last() {
+        assert!(display_order(TodoStatus::InProgress) < display_order(TodoStatus::Pending));
+        assert!(display_order(TodoStatus::Pending) < display_order(TodoStatus::Completed));
+    }
+
+    #[test]
+    fn count_in_status_counts_only_the_matching_status() {
+        let parsed = parse_input(json!({"todos": [
+            {"id": "1", "subject": "First", "status": "pending"},
+            {"id": "2", "subject": "Second", "status": "pending"},
+            {"id": "3", "subject": "Third", "status": "completed"}
+        ]}));
+        assert_eq!(count_in_status(&parsed.todos, TodoStatus::Pending), 2);
+        assert_eq!(count_in_status(&parsed.todos, TodoStatus::InProgress), 0);
+    }
+
+    #[test]
+    fn push_entry_prints_only_the_lines_the_entry_carries() {
+        let full = parse_input(json!({"todos": [
+            {"id": "2", "subject": "Current", "status": "in_progress",
+             "description": "Details", "blocked_by": ["1"], "blocks": ["3"]}
+        ]}));
+        let mut out = String::new();
+        push_entry(full.todos.first().unwrap(), &mut out);
+        assert!(out.contains("◐ [2] Current\n"), "{out}");
+        assert!(out.contains("  Details\n"), "{out}");
+        assert!(out.contains("  Blocked by: 1\n"), "{out}");
+        assert!(out.contains("  Blocks: 3\n"), "{out}");
+
+        let bare = parse_input(json!({"todos": [{"id": "1", "subject": "Bare"}]}));
+        let mut out = String::new();
+        push_entry(bare.todos.first().unwrap(), &mut out);
+        assert_eq!(out, "○ [1] Bare\n\n", "{out}");
+    }
+
+    #[test]
+    fn render_task_list_assembles_notice_counts_and_sorted_entries() {
+        let parsed = parse_input(json!({"todos": [
+            {"id": "1", "subject": "Done", "status": "completed"},
+            {"id": "2", "subject": "Now", "status": "in_progress"}
+        ]}));
+        let rendered = render_task_list(parsed, true);
+        assert!(
+            rendered.find("Auto-recovered:").unwrap() < rendered.find("# Task List").unwrap(),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Summary: 0 pending, 1 in progress, 1 completed"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.find('◐').unwrap() < rendered.find('●').unwrap(),
+            "{rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_survives_a_blank_first_description_line() {
+        let (ctx, todos) = todo_context();
+        let out = TodoTool
+            .call(
+                json!({"todos": [
+                    {"id": "1", "subject": null, "description": "\nActual plan"}
+                ]}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.text_content());
+        assert_eq!(todos.lock().unwrap().first().unwrap().subject, "Task 1");
     }
 
     #[tokio::test]
