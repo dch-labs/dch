@@ -87,6 +87,15 @@ pub enum ToolCategory {
     /// read-only: the side-effects are at the session level, not the
     /// filesystem, which is exactly why they evade file-based checks.
     Meta,
+
+    /// The fail-closed default for names the classification table does not
+    /// know.
+    ///
+    /// Not a behavioral class of tool: it exists so an unclassified name —
+    /// an MCP tool under an arbitrary name, a typo, a tool registered
+    /// before its entry — can never run unconfirmed. Only `Auto` allows
+    /// it; every other mode asks or blocks.
+    Unclassified,
 }
 
 impl ToolCategory {
@@ -108,13 +117,11 @@ impl ToolCategory {
 /// Map a tool's registered name to its [`ToolCategory`].
 ///
 /// Matching is exact and case-sensitive: the names are the registered tool
-/// names, in their `PascalCase` registry form. Unknown names — a misconfigured
-/// registry, a typo, a tool added before its entry — default to
-/// [`ToolCategory::FileWrite`] and emit a warning so the gap is observable
-/// in logs. The default is gated under Plan (blocked) and Interactive
-/// (asked), but under `AcceptEdits` it is allowed like any edit: a tool whose
-/// true category is `ShellExecute`, `Network`, or `Meta` would run
-/// unconfirmed there, so the warning is the only signal.
+/// names, in their `PascalCase` registry form. Unknown names — a
+/// misconfigured registry, a typo, a tool added before its entry —
+/// classify as [`ToolCategory::Unclassified`] and emit a warning so the gap
+/// is observable in logs. `Unclassified` fails closed: only `Auto` runs
+/// it, every other mode asks or blocks.
 #[must_use]
 pub fn tool_category(name: &str) -> ToolCategory {
     match name {
@@ -126,8 +133,8 @@ pub fn tool_category(name: &str) -> ToolCategory {
         "WebFetch" => ToolCategory::Network,
         "TodoWrite" | "Submit" | "AskUserQuestion" => ToolCategory::Meta,
         _ => {
-            warn!(tool = %name, "unclassified tool — defaulting to FileWrite");
-            ToolCategory::FileWrite
+            warn!(tool = %name, "unclassified tool — failing closed");
+            ToolCategory::Unclassified
         }
     }
 }
@@ -162,12 +169,12 @@ pub enum PermissionOutcome {
 ///
 /// The matrix is the behavioral contract of the whole permission system:
 ///
-/// | Mode ＼ Category   | `FileRead` | `FileWrite` | `ShellExecute` | `Network` | `Meta` |
-/// |-------------------|------------|-------------|----------------|-----------|--------|
-/// | `Auto`            | allow      | allow       | allow          | allow     | allow  |
-/// | `Plan`            | allow      | block       | block          | block     | block  |
-/// | `AcceptEdits`     | allow      | allow       | ask            | ask       | ask    |
-/// | `Interactive`     | ask        | ask         | ask            | ask       | ask    |
+/// | Mode ＼ Category   | `FileRead` | `FileWrite` | `ShellExecute` | `Network` | `Meta` | `Unclassified` |
+/// |-------------------|------------|-------------|----------------|-----------|--------|----------------|
+/// | `Auto`            | allow      | allow       | allow          | allow     | allow  | allow          |
+/// | `Plan`            | allow      | block       | block          | block     | block  | block          |
+/// | `AcceptEdits`     | allow      | allow       | ask            | ask       | ask    | ask            |
+/// | `Interactive`     | ask        | ask         | ask            | ask       | ask    | ask            |
 ///
 /// [`PermissionOutcome::Allow`] runs the tool; [`PermissionOutcome::Block`]
 /// refuses it; [`PermissionOutcome::Ask`] prompts the user (or blocks, in a
@@ -260,17 +267,38 @@ mod tests {
         assert!(!ToolCategory::ShellExecute.is_read_only());
         assert!(!ToolCategory::Network.is_read_only());
         assert!(!ToolCategory::Meta.is_read_only());
+        assert!(!ToolCategory::Unclassified.is_read_only());
     }
 
     #[test]
-    fn unknown_names_default_to_file_write() {
+    fn unknown_names_fail_closed_as_unclassified() {
         for name in ["DefinitelyNotATool", "", "read", "Bash ", "TODO_WRITE"] {
             assert_eq!(
                 tool_category(name),
-                ToolCategory::FileWrite,
-                "{name:?} must fall through to FileWrite"
+                ToolCategory::Unclassified,
+                "{name:?} must fail closed as Unclassified"
             );
         }
+    }
+
+    #[test]
+    fn unclassified_never_allows_outside_auto() {
+        // The fail-closed guarantee: only Auto runs an unclassified tool.
+        for mode in [
+            PermissionMode::Plan,
+            PermissionMode::AcceptEdits,
+            PermissionMode::Interactive,
+        ] {
+            assert_ne!(
+                decide(mode, ToolCategory::Unclassified),
+                PermissionOutcome::Allow,
+                "{mode:?} × Unclassified must not allow"
+            );
+        }
+        assert_eq!(
+            decide(PermissionMode::Auto, ToolCategory::Unclassified),
+            PermissionOutcome::Allow
+        );
     }
 
     #[test]
@@ -279,7 +307,7 @@ mod tests {
         // regression names its (mode, category) pair in the failure.
         use PermissionMode::{AcceptEdits, Auto, Interactive, Plan};
         use PermissionOutcome::{Allow, Ask, Block};
-        use ToolCategory::{FileRead, FileWrite, Meta, Network, ShellExecute};
+        use ToolCategory::{FileRead, FileWrite, Meta, Network, ShellExecute, Unclassified};
 
         const MATRIX: &[(&str, PermissionMode, ToolCategory, PermissionOutcome)] = &[
             ("auto × file_read", Auto, FileRead, Allow),
@@ -312,8 +340,17 @@ mod tests {
             ),
             ("interactive × network", Interactive, Network, Ask),
             ("interactive × meta", Interactive, Meta, Ask),
+            ("auto × unclassified", Auto, Unclassified, Allow),
+            ("plan × unclassified", Plan, Unclassified, Block),
+            (
+                "accept_edits × unclassified",
+                AcceptEdits,
+                Unclassified,
+                Ask,
+            ),
+            ("interactive × unclassified", Interactive, Unclassified, Ask),
         ];
-        assert_eq!(MATRIX.len(), 20, "the matrix is 4 modes × 5 categories");
+        assert_eq!(MATRIX.len(), 24, "the matrix is 4 modes × 6 categories");
         for (cell, mode, category, expected) in MATRIX {
             assert_eq!(decide(*mode, *category), *expected, "{cell}");
         }
@@ -330,6 +367,7 @@ mod tests {
             ToolCategory::ShellExecute,
             ToolCategory::Network,
             ToolCategory::Meta,
+            ToolCategory::Unclassified,
         ] {
             assert_eq!(
                 decide(PermissionMode::Plan, category) == PermissionOutcome::Allow,
