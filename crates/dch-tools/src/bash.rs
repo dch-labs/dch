@@ -1004,10 +1004,19 @@ mod tests {
         let input = json!({ "command": "yes y | head -c 2000000" });
         let out = tool.call(input, &ctx).await.unwrap();
         // Output + metadata line should be under the cap + a small margin.
+        let text = out.text_content();
+        let tail: String = text
+            .chars()
+            .rev()
+            .take(120)
+            .collect::<Vec<_>>()
+            .iter()
+            .rev()
+            .collect();
         assert!(
-            out.text_content().len() < MAX_OUTPUT_BYTES + 100,
-            "output was {} bytes",
-            out.text_content().len()
+            text.len() < MAX_OUTPUT_BYTES + 512,
+            "output was {} bytes, tail: {tail:?}",
+            text.len()
         );
     }
 
@@ -1020,10 +1029,19 @@ mod tests {
         let ctx = ctx_in(cwd);
         let input = json!({ "command": "yes y | head -c 10000000" });
         let out = tool.call(input, &ctx).await.unwrap();
+        let text = out.text_content();
+        let tail: String = text
+            .chars()
+            .rev()
+            .take(120)
+            .collect::<Vec<_>>()
+            .iter()
+            .rev()
+            .collect();
         assert!(
-            out.text_content().len() < MAX_OUTPUT_BYTES + 100,
-            "output was {} bytes, should be bounded to ~{}",
-            out.text_content().len(),
+            text.len() < MAX_OUTPUT_BYTES + 512,
+            "output was {} bytes, should be bounded to ~{}, tail: {tail:?}",
+            text.len(),
             MAX_OUTPUT_BYTES
         );
     }

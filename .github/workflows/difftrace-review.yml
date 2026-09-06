@@ -131,6 +131,8 @@ jobs:
           echo "skip=" >> "$GITHUB_OUTPUT"
           if printf '%s' "$BODY" | head -n 1 | grep -qiE '^(@difftrace(\[bot\])?|/difftrace)[[:space:]]+review([[:space:]]|$)'; then
             echo "verb=review" >> "$GITHUB_OUTPUT"
+          elif printf '%s' "$BODY" | head -n 1 | grep -qiE '^(@difftrace(\[bot\])?|/difftrace)[[:space:]]+plan([[:space:]]|$)'; then
+            echo "verb=plan" >> "$GITHUB_OUTPUT"
           else
             echo "verb=reply" >> "$GITHUB_OUTPUT"
           fi
@@ -201,6 +203,8 @@ jobs:
         run: |
           if [ "$VERB" = "review" ]; then
             difftrace review --repo "$REPO" --pr "$PR"
+          elif [ "$VERB" = "plan" ] && [ "$COMMENT_KIND" = "review" ]; then
+            difftrace plan --repo "$REPO" --pr "$PR" --review-comment "$COMMENT_ID"
           elif [ "$COMMENT_KIND" = "issue" ]; then
             difftrace reply --repo "$REPO" --pr "$PR" --issue-comment "$COMMENT_ID"
           else

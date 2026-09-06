@@ -7,6 +7,7 @@
 mod args;
 mod done;
 mod headless;
+mod signals;
 
 fn main() -> std::process::ExitCode {
     let args = args::parse_args();

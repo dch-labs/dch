@@ -160,6 +160,14 @@ async fn run_headless_inner(args: &Args) -> Result<HeadlessOutcome, HeadlessOutc
         .await
         .map_err(|err| construction_failure(args, format!("agent construction: {err}")))?;
 
+    let force_args = args.clone();
+    crate::signals::install_cancel_handler(runner.cancel_signal(), move || {
+        write_done_file_if_requested(
+            &force_args,
+            &HeadlessOutcome::failure(130, "cancelled by a repeated interrupt"),
+        );
+    });
+
     let run = runner.run(&prompt).await.map_err(|err| {
         let outcome = HeadlessOutcome::from_loop_error(&err);
         write_done_file_if_requested(args, &outcome);
@@ -340,6 +348,7 @@ mod tests {
     use super::*;
     use clap::Parser as _;
     use loopctl::engine::RunConfig;
+    use tokio::io::AsyncWriteExt as _;
 
     /// Parse a flag list into [`Args`], prefixing the program name.
     fn parse(args: &[&str]) -> Args {
@@ -577,5 +586,123 @@ mod tests {
     async fn a_live_headless_run_succeeds() {
         let args = parse(&["--headless", "Reply with exactly: ok"]);
         assert_eq!(run_headless(&args).await, 0);
+    }
+
+    /// Serializes tests that deliver real process signals: every installed
+    /// handler hears every signal, so concurrent signal tests would cancel
+    /// each other's runs.
+    static SIGNAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A local server that answers the agent's request with one streamed
+    /// text delta and then holds the connection open, so the run is still
+    /// mid-stream when the test delivers its signal.
+    struct HoldServer {
+        /// Whether the delta has been written and the run is mid-stream.
+        streaming: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        /// The ephemeral port the agent's requests arrive on.
+        port: u16,
+    }
+
+    impl HoldServer {
+        async fn start() -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("ephemeral bind");
+            let port = listener.local_addr().expect("bound address").port();
+            let streaming = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let task_streaming = std::sync::Arc::clone(&streaming);
+            tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("agent connects");
+                let delta = serde_json::json!({
+                    "id": "c1", "model": "test-model",
+                    "choices": [{"delta": {"content": "partial"}, "finish_reason": null}]
+                });
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\ndata: {delta}\n\n"
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("delta written");
+                task_streaming.store(true, std::sync::atomic::Ordering::SeqCst);
+                std::future::pending::<()>().await;
+            });
+            Self { streaming, port }
+        }
+
+        /// A config pointing the agent at this server.
+        fn config_toml(&self) -> String {
+            format!(
+                "[api]\napi_type = \"openai\"\nbase_url = \"http://127.0.0.1:{}\"\
+                 \napi_key = \"dummy\"\nmodel = \"test-model\"\nrequest_timeout_secs = 10\n",
+                self.port
+            )
+        }
+
+        /// A task that waits until the run is mid-stream, then delivers the
+        /// given signal to this process.
+        fn signal_when_streaming(&self, signal: i32) {
+            let streaming = std::sync::Arc::clone(&self.streaming);
+            tokio::spawn(async move {
+                for _ in 0..200 {
+                    if streaming.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                unsafe { libc::kill(libc::getpid(), signal) };
+            });
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn sigint_mid_run_resolves_cancelled_with_exit_130() {
+        let _signal_lock = SIGNAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let server = HoldServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, server.config_toml()).unwrap();
+        let args = parse(&[
+            "--headless",
+            "hello",
+            "--config",
+            config_path.to_str().unwrap(),
+        ]);
+
+        server.signal_when_streaming(libc::SIGINT);
+
+        let code = run_headless(&args).await;
+        assert_eq!(code, 130, "SIGINT must cancel the run and map to exit 130");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn sigterm_mid_run_resolves_cancelled_with_exit_130_like_sigint() {
+        let _signal_lock = SIGNAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let server = HoldServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, server.config_toml()).unwrap();
+        let args = parse(&[
+            "--headless",
+            "hello",
+            "--config",
+            config_path.to_str().unwrap(),
+        ]);
+
+        server.signal_when_streaming(libc::SIGTERM);
+
+        let code = run_headless(&args).await;
+        assert_eq!(
+            code, 130,
+            "SIGTERM must take the same cooperative path as SIGINT, not a default kill"
+        );
     }
 }

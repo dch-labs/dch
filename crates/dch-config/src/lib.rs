@@ -43,20 +43,20 @@ pub enum ApiType {
 
     /// `DeepSeek` API.
     ///
-    /// A standalone variant so the default [`ApiType::default_base_url`] resolves
-    /// to the correct `DeepSeek` host.
+    /// A standalone variant selecting its provider profile, whose endpoint,
+    /// credential variable, and default model the profile supplies.
     DeepSeek,
 
     /// xAI `Grok`.
     ///
-    /// A standalone variant so the default [`ApiType::default_base_url`] resolves
-    /// to the correct xAI host.
+    /// A standalone variant selecting its provider profile, whose endpoint,
+    /// credential variable, and default model the profile supplies.
     Grok,
 
     /// `Z.AI` API.
     ///
-    /// A standalone variant so the default [`ApiType::default_base_url`] resolves
-    /// to the correct Z.AI host.
+    /// A standalone variant selecting its provider profile, whose endpoint,
+    /// credential variable, and default model the profile supplies.
     Zai,
 
     /// Azure OpenAI.
@@ -84,23 +84,25 @@ pub enum ApiType {
 impl ApiType {
     /// The default `base_url` for this provider.
     ///
-    /// Returns a sensible public or local endpoint for each variant,
-    /// consulted as the effective endpoint when [`ApiConfig::base_url`] is
-    /// unset. These are
-    /// the canonical host roots; provider clients may append their own path
-    /// suffixes on top.
+    /// Consulted as the effective endpoint when [`ApiConfig::base_url`] is
+    /// unset, for the stock providers (`OpenAi`, `Anthropic`, `Gemini`).
+    /// The profiled providers (`Ollama`, `DeepSeek`, `Grok`, `Azure`,
+    /// `Moonshot`, `Zai`) take their default endpoint from their provider
+    /// profile instead, so this returns an empty string for them; provider
+    /// clients may append their own path suffixes on top of a host root.
     #[must_use]
     pub fn default_base_url(self) -> &'static str {
         match self {
             Self::OpenAi => "https://api.openai.com/v1",
             Self::Anthropic => "https://api.anthropic.com",
             Self::Gemini => "https://generativelanguage.googleapis.com",
-            Self::Ollama => "http://localhost:11434/v1",
-            Self::DeepSeek => "https://api.deepseek.com",
-            Self::Grok => "https://api.x.ai/v1",
-            Self::Zai => "https://api.z.ai/api",
-            Self::Azure | Self::Bedrock => "",
-            Self::Moonshot => "https://api.moonshot.ai/v1",
+            Self::Ollama
+            | Self::DeepSeek
+            | Self::Grok
+            | Self::Zai
+            | Self::Azure
+            | Self::Bedrock
+            | Self::Moonshot => "",
         }
     }
 }
@@ -1222,10 +1224,7 @@ redact_secrets = false
         let zai: ApiConfig = toml::from_str("api_type = \"zai\"\n").unwrap();
         assert_eq!(zai.api_type, ApiType::Zai);
 
-        assert_eq!(
-            ApiType::Ollama.default_base_url(),
-            "http://localhost:11434/v1"
-        );
+        assert_eq!(ApiType::Ollama.default_base_url(), "");
         assert_eq!(
             ApiType::OpenAi.default_base_url(),
             "https://api.openai.com/v1"
