@@ -88,7 +88,8 @@ impl ApiType {
     /// unset, for the stock providers (`OpenAi`, `Anthropic`, `Gemini`).
     /// The profiled providers (`Ollama`, `DeepSeek`, `Grok`, `Azure`,
     /// `Moonshot`, `Zai`) take their default endpoint from their provider
-    /// profile instead, so this returns an empty string for them; provider
+    /// profile instead, and `Bedrock` derives its endpoint from the AWS
+    /// region, so this returns an empty string for all of them; provider
     /// clients may append their own path suffixes on top of a host root.
     #[must_use]
     pub fn default_base_url(self) -> &'static str {

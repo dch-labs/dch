@@ -20,7 +20,7 @@
 
 use std::io::Read as _;
 use std::net::TcpListener;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -46,12 +46,15 @@ fn holding_server() -> (u16, Arc<AtomicBool>) {
     (port, connected)
 }
 
-fn wait_for(flag: &AtomicBool, what: &str) {
+fn wait_for(child: &mut Child, flag: &AtomicBool, what: &str) {
     let deadline = Instant::now()
         .checked_add(Duration::from_secs(10))
         .expect("deadline computable");
     while !flag.load(Ordering::SeqCst) {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        if let Some(status) = child.try_wait().expect("child is waitable") {
+            panic!("the child exited before {what}: {status}");
+        }
         std::thread::sleep(Duration::from_millis(25));
     }
 }
@@ -83,17 +86,29 @@ fn interrupts_exit_130_and_leave_a_done_file() {
         .spawn()
         .expect("child spawned");
 
-    wait_for(&connected, "the child to reach the server");
+    wait_for(&mut child, &connected, "the child to reach the server");
 
     let pid = child.id().cast_signed();
     unsafe { libc::kill(pid, libc::SIGINT) };
-    std::thread::sleep(Duration::from_millis(10));
-    unsafe { libc::kill(pid, libc::SIGINT) };
-
     let deadline = Instant::now()
         .checked_add(Duration::from_secs(15))
         .expect("deadline computable");
     loop {
+        // Repeat the interrupt while the child lives: a kill landing after
+        // the bridge stopped is swallowed (no listener), so the earliest
+        // still-armed delivery decides between the force and cooperative
+        // paths — both must end in 130 with a done-file.
+        assert!(
+            Instant::now() < deadline,
+            "the child never exited after the repeated interrupts"
+        );
+        unsafe { libc::kill(pid, libc::SIGINT) };
+        for _ in 0..10 {
+            if child.try_wait().expect("child is waitable").is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
         if let Some(status) = child.try_wait().expect("child is waitable") {
             assert_eq!(
                 status.code(),
@@ -106,10 +121,5 @@ fn interrupts_exit_130_and_leave_a_done_file() {
             );
             return;
         }
-        assert!(
-            Instant::now() < deadline,
-            "the child never exited after two interrupts"
-        );
-        std::thread::sleep(Duration::from_millis(50));
     }
 }

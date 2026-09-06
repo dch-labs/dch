@@ -31,11 +31,12 @@ jobs:
     name: Review the pull request
     runs-on: ubuntu-latest
     concurrency:
-      # One lane per pull request, shared with the chat job: reviews and
-      # comment commands serialize instead of racing the registry,
-      # threads, and memory. Queued runs pick up the head at start time.
-      group: difftrace-${{ inputs.pr || github.event.pull_request.number || github.event.issue.number || github.run_id }}
-      cancel-in-progress: false
+      # One review lane per pull request: a push or dispatch supersedes any
+      # review still in flight or queued for the same PR — the superseded
+      # run would only re-review the same final head. Comment commands have
+      # their own serialized queue in the chat job.
+      group: difftrace-review-${{ inputs.pr || github.event.pull_request.number || github.run_id }}
+      cancel-in-progress: true
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request' &&
@@ -179,10 +180,13 @@ jobs:
     needs: gate
     runs-on: ubuntu-latest
     concurrency:
-      # Shared with the review job's lane: a re-review command waits for
-      # any in-flight review instead of racing it.
-      group: difftrace-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}
+      # One command lane per pull request, queued: every pending command
+      # eventually runs instead of a newer one replacing it. Reviews run
+      # in their own lane and may interleave with a command, but a command
+      # never silently disappears.
+      group: difftrace-chat-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}
       cancel-in-progress: false
+      queue: max
     if: needs.gate.outputs.skip == ''
     steps:
 
@@ -229,6 +233,9 @@ jobs:
             difftrace review --repo "$REPO" --pr "$PR"
           elif [ "$VERB" = "plan" ] && [ "$COMMENT_KIND" = "review" ]; then
             difftrace plan --repo "$REPO" --pr "$PR" --review-comment "$COMMENT_ID"
+          elif [ "$VERB" = "plan" ]; then
+            hint='`plan` applies to a review thread — post it as a comment on one of the review threads, or use `re-review` for a fresh full review.'
+            gh pr comment "$PR" --repo "$REPO" --body "$hint"
           elif [ "$COMMENT_KIND" = "issue" ]; then
             difftrace reply --repo "$REPO" --pr "$PR" --issue-comment "$COMMENT_ID"
           else
