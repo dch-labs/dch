@@ -166,7 +166,12 @@ struct ChannelSource {
 /// the listener still attached, the window's expiry re-arms a fresh
 /// first-interrupt, and a repeat inside the window runs `on_force` and
 /// returns.
-async fn bridge_loop(source: &mut InterruptSource, cancel: Arc<CancelSignal>, on_force: impl Fn()) {
+async fn bridge_loop(
+    source: &mut InterruptSource,
+    stop: &mut tokio::sync::watch::Receiver<bool>,
+    cancel: Arc<CancelSignal>,
+    on_force: impl Fn(),
+) {
     let mut previous: Option<Instant> = None;
     loop {
         if let Some(then) = previous {
@@ -182,9 +187,13 @@ async fn bridge_loop(source: &mut InterruptSource, cancel: Arc<CancelSignal>, on
                     continue;
                 }
                 () = source.wait() => {}
+                _ = stop.changed() => return,
             }
         } else {
-            source.wait().await;
+            tokio::select! {
+                () = source.wait() => {}
+                _ = stop.changed() => return,
+            }
         }
         let now = Instant::now();
         match classify_interrupt(previous, now) {
@@ -219,19 +228,44 @@ async fn bridge_loop(source: &mut InterruptSource, cancel: Arc<CancelSignal>, on
 /// interrupt starts a new cooperative cancellation.
 ///
 /// Call once, after constructing the runner and before awaiting its run,
-/// so an early interrupt cannot be missed. The signature carries only the
-/// signal and a hook — not the runner — so any mode can install the same
-/// bridge against its own runner's signal.
-pub fn install_cancel_handler(cancel: Arc<CancelSignal>, on_force: impl Fn() + Send + 'static) {
+/// so an early interrupt cannot be missed, and stop the returned bridge
+/// when the run ends — a stopped bridge stops listening, so a later run
+/// in the same process never inherits an older bridge's window state.
+/// The signature carries only the signal and a hook — not the runner — so
+/// any mode can install the same bridge against its own runner's signal.
+pub fn install_cancel_handler(
+    cancel: Arc<CancelSignal>,
+    on_force: impl Fn() + Send + 'static,
+) -> CancelBridge {
+    let (stop, stop_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
-        bridge_loop(
-            &mut InterruptSource::Listeners(InterruptListeners::install()),
-            cancel,
-            on_force,
-        )
-        .await;
+        let mut stop_rx = stop_rx;
+        let mut source = InterruptSource::Listeners(InterruptListeners::install());
+        bridge_loop(&mut source, &mut stop_rx, cancel, on_force).await;
         std::process::exit(130);
     });
+    CancelBridge { stop }
+}
+
+/// A handle that stops the interrupt bridge installed for one run.
+///
+/// Stopping ends the bridge task: its listeners unsubscribe, its window
+/// state dies with it, and signals after the stop are no longer its to
+/// classify.
+#[derive(Debug)]
+pub struct CancelBridge {
+    stop: tokio::sync::watch::Sender<bool>,
+}
+
+impl CancelBridge {
+    /// Stop the bridge.
+    ///
+    /// Idempotent; a bridge whose task already ended (for example after a
+    /// force exit) cannot be revived, and a failed send just means that
+    /// receiver is already gone.
+    pub fn stop(self) {
+        self.stop.send(true).ok();
+    }
 }
 
 #[cfg(test)]
@@ -293,8 +327,9 @@ mod tests {
         let hook_fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let hook_flag = Arc::clone(&hook_fired);
         let mut source = InterruptSource::Channel(ChannelSource { rx: received });
+        let (_keep_open, mut stop_rx) = tokio::sync::watch::channel(false);
         let bridge = tokio::spawn(async move {
-            bridge_loop(&mut source, hook_cancel, move || {
+            bridge_loop(&mut source, &mut stop_rx, hook_cancel, move || {
                 hook_flag.store(true, std::sync::atomic::Ordering::SeqCst);
             })
             .await;

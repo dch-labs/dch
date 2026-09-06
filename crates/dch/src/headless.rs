@@ -161,14 +161,16 @@ async fn run_headless_inner(args: &Args) -> Result<HeadlessOutcome, HeadlessOutc
         .map_err(|err| construction_failure(args, format!("agent construction: {err}")))?;
 
     let force_args = args.clone();
-    crate::signals::install_cancel_handler(runner.cancel_signal(), move || {
+    let bridge = crate::signals::install_cancel_handler(runner.cancel_signal(), move || {
         write_done_file_if_requested(
             &force_args,
             &HeadlessOutcome::failure(130, "cancelled by a repeated interrupt"),
         );
     });
 
-    let run = runner.run(&prompt).await.map_err(|err| {
+    let run_result = runner.run(&prompt).await;
+    bridge.stop();
+    let run = run_result.map_err(|err| {
         let outcome = HeadlessOutcome::from_loop_error(&err);
         write_done_file_if_requested(args, &outcome);
         outcome
@@ -636,19 +638,25 @@ mod tests {
             )
         }
 
-        /// A task that waits until the run is mid-stream, then delivers the
-        /// given signal to this process.
-        fn signal_when_streaming(&self, signal: i32) {
+        /// Arm a signal to fire once the run is mid-stream.
+        ///
+        /// The returned task resolves to whether the run reached mid-stream;
+        /// the signal is delivered only then, and a run that ends first —
+        /// or a readiness window that elapses — is never signaled. The
+        /// caller awaits the handle before returning so no stray task
+        /// outlives the test.
+        fn signal_when_streaming(&self, signal: i32) -> tokio::task::JoinHandle<bool> {
             let streaming = std::sync::Arc::clone(&self.streaming);
             tokio::spawn(async move {
                 for _ in 0..200 {
                     if streaming.load(std::sync::atomic::Ordering::SeqCst) {
-                        break;
+                        unsafe { libc::kill(libc::getpid(), signal) };
+                        return true;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(25)).await;
                 }
-                unsafe { libc::kill(libc::getpid(), signal) };
-            });
+                false
+            })
         }
     }
 
@@ -670,9 +678,13 @@ mod tests {
             config_path.to_str().unwrap(),
         ]);
 
-        server.signal_when_streaming(libc::SIGINT);
+        let armed = server.signal_when_streaming(libc::SIGINT);
 
         let code = run_headless(&args).await;
+        assert!(
+            armed.await.unwrap(),
+            "the run must reach mid-stream for the signal to fire"
+        );
         assert_eq!(code, 130, "SIGINT must cancel the run and map to exit 130");
     }
 
@@ -694,9 +706,13 @@ mod tests {
             config_path.to_str().unwrap(),
         ]);
 
-        server.signal_when_streaming(libc::SIGTERM);
+        let armed = server.signal_when_streaming(libc::SIGTERM);
 
         let code = run_headless(&args).await;
+        assert!(
+            armed.await.unwrap(),
+            "the run must reach mid-stream for the signal to fire"
+        );
         assert_eq!(
             code, 130,
             "SIGTERM must take the same cooperative path as SIGINT, not a default kill"
