@@ -54,13 +54,13 @@ jobs:
           fork=$(gh api "repos/$REPO/pulls/$PR" --jq .head.repo.fork)
           case "$fork" in false) ;; *) echo "difftrace does not run on fork pull requests" >&2; exit 1;; esac
 
-      # The binary is pinned to the tagged v0.4.1 release; bump version and
+      # The binary is pinned to the tagged v0.5.0 release; bump version and
       # checksum together on every difftrace release.
-      - name: Install difftrace v0.4.1
+      - name: Install difftrace v0.5.0
         run: |
           curl -fsSL -o /tmp/difftrace.tar.gz \
-            https://github.com/dch-labs/difftrace/releases/download/v0.4.1/difftrace-0.4.1-x86_64-unknown-linux-gnu.tar.gz
-          echo "a92adaa9e816de63dbd0c31fef87027f2485ab5c11411c8d93ae4117125b95c9  /tmp/difftrace.tar.gz" | sha256sum -c -
+            https://github.com/dch-labs/difftrace/releases/download/v0.5.0/difftrace-0.5.0-x86_64-unknown-linux-gnu.tar.gz
+          echo "5253f8daef15bba174ac890edcb386ad550610eb8d13c02bc4ae4d930902bac6  /tmp/difftrace.tar.gz" | sha256sum -c -
           mkdir -p "$HOME/.local/bin"
           tar -xzf /tmp/difftrace.tar.gz -C "$HOME/.local/bin"
 
@@ -170,13 +170,13 @@ jobs:
           case "$PR" in ''|*[!0-9]*) echo "invalid PR number: $PR" >&2; exit 1;; esac
           echo "pr=$PR" >> "$GITHUB_OUTPUT"
 
-      # The binary is pinned to the tagged v0.4.1 release; bump version and
+      # The binary is pinned to the tagged v0.5.0 release; bump version and
       # checksum together on every difftrace release.
-      - name: Install difftrace v0.4.1
+      - name: Install difftrace v0.5.0
         run: |
           curl -fsSL -o /tmp/difftrace.tar.gz \
-            https://github.com/dch-labs/difftrace/releases/download/v0.4.1/difftrace-0.4.1-x86_64-unknown-linux-gnu.tar.gz
-          echo "a92adaa9e816de63dbd0c31fef87027f2485ab5c11411c8d93ae4117125b95c9  /tmp/difftrace.tar.gz" | sha256sum -c -
+            https://github.com/dch-labs/difftrace/releases/download/v0.5.0/difftrace-0.5.0-x86_64-unknown-linux-gnu.tar.gz
+          echo "5253f8daef15bba174ac890edcb386ad550610eb8d13c02bc4ae4d930902bac6  /tmp/difftrace.tar.gz" | sha256sum -c -
           mkdir -p "$HOME/.local/bin"
           tar -xzf /tmp/difftrace.tar.gz -C "$HOME/.local/bin"
 
@@ -203,9 +203,7 @@ jobs:
         run: |
           if [ "$VERB" = "review" ]; then
             difftrace review --repo "$REPO" --pr "$PR"
-          elif [ "$VERB" = "plan" ] && [ "$COMMENT_KIND" = "issue" ]; then
-            difftrace plan --repo "$REPO" --pr "$PR" --issue-comment "$COMMENT_ID"
-          elif [ "$VERB" = "plan" ]; then
+          elif [ "$VERB" = "plan" ] && [ "$COMMENT_KIND" = "review" ]; then
             difftrace plan --repo "$REPO" --pr "$PR" --review-comment "$COMMENT_ID"
           elif [ "$COMMENT_KIND" = "issue" ]; then
             difftrace reply --repo "$REPO" --pr "$PR" --issue-comment "$COMMENT_ID"
