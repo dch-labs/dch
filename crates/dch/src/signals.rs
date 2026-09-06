@@ -30,11 +30,18 @@ const DOUBLE_CTRL_C_WINDOW: Duration = Duration::from_secs(2);
 /// delivering a real signal.
 #[derive(Debug, PartialEq, Eq)]
 enum InterruptDecision {
-    /// A first interrupt: cancel the in-flight turn cooperatively.
+    /// A first interrupt, asking the loop for a cooperative stop.
+    ///
+    /// The bridge trips the agent's cancel signal and arms the repeat
+    /// window; the loop itself stops at its next check point and reports
+    /// the run as cancelled rather than failed.
     Cancel,
 
-    /// A repeat interrupt: the user has declined to wait for the
-    /// cooperative check points; run the force hook and exit now.
+    /// A repeat interrupt inside the window, declining further waiting.
+    ///
+    /// The force hook runs first — flushing whatever durable state the
+    /// host attached — and the process then exits with the interrupt
+    /// status instead of waiting out a possibly-stuck turn.
     Force,
 }
 
@@ -63,14 +70,31 @@ fn classify_interrupt(previous: Option<Instant>, now: Instant) -> InterruptDecis
 /// platform refuses to install becomes `None`, which never fires — the
 /// bridge stays alive on the signals it does have.
 struct InterruptListeners {
+    /// The Ctrl-C stream, `None` when the platform refused the
+    /// registration.
+    ///
+    /// A persistent stream rather than a per-wait future: a signal
+    /// delivered between waits lands on this same registration and is
+    /// observed by the next [`wait`](Self::wait).
     #[cfg(unix)]
     interrupt: Option<signal::unix::Signal>,
+
+    /// The SIGTERM stream, `None` when the platform refused the
+    /// registration.
+    ///
+    /// Present so a supervisor's graceful-shutdown request takes the same
+    /// cooperative path as Ctrl-C instead of the default disposition.
     #[cfg(unix)]
     terminate: Option<signal::unix::Signal>,
 }
 
 impl InterruptListeners {
-    /// Install the listeners, reporting any registration failure.
+    /// Install the listeners for the bridge's whole lifetime.
+    ///
+    /// Registration happens here, before the bridge handle is handed to
+    /// the caller, so a signal arriving immediately after installation is
+    /// already captured. A platform refusal is reported to stderr and
+    /// leaves that listener absent rather than failing the install.
     fn install() -> Self {
         #[cfg(unix)]
         {
@@ -115,8 +139,11 @@ impl InterruptListeners {
         }
     }
 
-    /// The non-Unix bridge has no persistent SIGTERM source: Ctrl-C alone
-    /// drives it, re-armed per wait by the platform's console handler.
+    /// The non-Unix bridge has no persistent SIGTERM source.
+    ///
+    /// Ctrl-C alone drives it, re-armed per wait by the platform's console
+    /// handler; the tests that pin listener persistence are Unix-gated,
+    /// where the persistent listener pair exists.
     #[cfg(not(unix))]
     async fn wait(&mut self) {
         match signal::ctrl_c().await {
@@ -129,18 +156,32 @@ impl InterruptListeners {
     }
 }
 
-/// The bridge's interrupt source: the process's real signal listeners in
-/// production, or a channel-driven stand-in in tests.
+/// The bridge's interrupt source.
+///
+/// Production waits on the process's real signal listeners; tests drive
+/// the loop through a channel, one item per simulated interrupt, so the
+/// decision sequence is deterministic without real signals.
 enum InterruptSource {
-    /// The real signal listeners.
+    /// The process's real listeners, installed once at bridge start.
+    ///
+    /// Every wait reads the same registration, so interrupts delivered at
+    /// any point in the bridge's life are observed in order.
     Listeners(InterruptListeners),
 
     /// The test stand-in, one channel item per simulated interrupt.
+    ///
+    /// Present only in test builds; it lets the decision loop be driven
+    /// deterministically without delivering real signals to the process.
     #[cfg(test)]
     Channel(ChannelSource),
 }
 
 impl InterruptSource {
+    /// Block until this source's next interrupt.
+    ///
+    /// Dispatches to the variant's concrete wait, which for the real
+    /// listeners selects across both registered signals. The returned
+    /// future is `Send` because the bridge runs on a spawned task.
     async fn wait(&mut self) {
         match self {
             Self::Listeners(listeners) => listeners.wait().await,
@@ -153,25 +194,54 @@ impl InterruptSource {
 }
 
 /// The test interrupt source: a channel receiving one item per interrupt.
+///
+/// Driving the bridge through the channel makes the decision loop's
+/// first-cancel-then-force sequence deterministic without delivering real
+/// signals to the test process.
 #[cfg(test)]
 struct ChannelSource {
+    /// One item is received per simulated interrupt.
+    ///
+    /// The loop's wait resolves each time the test sends across the
+    /// paired sender, standing in for the OS signal stream.
     rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+}
+
+/// How a bridge task ended.
+///
+/// Distinguished so the caller treats an ordered shutdown differently from
+/// a forced exit: only a forced exit terminates the process.
+#[derive(Debug, PartialEq, Eq)]
+enum BridgeOutcome {
+    /// The run's owner stopped the bridge.
+    ///
+    /// An ordered shutdown: the force hook never ran, and the process
+    /// carries on — the caller finalizes the run's own outcome.
+    Stopped,
+
+    /// A repeat interrupt landed inside the window and the hook ran.
+    ///
+    /// The caller must terminate the process with the interrupt status;
+    /// everything up to the last cooperative check point is already
+    /// durable at this point.
+    Forced,
 }
 
 /// The interrupt-bridge decision loop, parameterized over the interrupt
 /// source so tests can drive it without OS signals.
 ///
-/// Runs until a repeat interrupt lands inside the window: the first
+/// Runs until a repeat interrupt lands inside the window — the first
 /// interrupt cooperatively cancels via `cancel` and arms the window with
 /// the listener still attached, the window's expiry re-arms a fresh
 /// first-interrupt, and a repeat inside the window runs `on_force` and
-/// returns.
+/// yields [`BridgeOutcome::Forced`] — or until the stop signal fires,
+/// which yields [`BridgeOutcome::Stopped`].
 async fn bridge_loop(
     source: &mut InterruptSource,
     stop: &mut tokio::sync::watch::Receiver<bool>,
     cancel: Arc<CancelSignal>,
     on_force: impl Fn(),
-) {
+) -> BridgeOutcome {
     let mut previous: Option<Instant> = None;
     loop {
         if let Some(then) = previous {
@@ -187,12 +257,12 @@ async fn bridge_loop(
                     continue;
                 }
                 () = source.wait() => {}
-                _ = stop.changed() => return,
+                _ = stop.changed() => return BridgeOutcome::Stopped,
             }
         } else {
             tokio::select! {
                 () = source.wait() => {}
-                _ = stop.changed() => return,
+                _ = stop.changed() => return BridgeOutcome::Stopped,
             }
         }
         let now = Instant::now();
@@ -208,7 +278,7 @@ async fn bridge_loop(
             InterruptDecision::Force => {
                 eprintln!("dch: second interrupt received — forcing exit (130)");
                 on_force();
-                return;
+                return BridgeOutcome::Forced;
             }
         }
     }
@@ -223,7 +293,7 @@ async fn bridge_loop(
 /// returns `LoopError::Cancelled`, which the host maps to exit code 130. A
 /// second interrupt within [`DOUBLE_CTRL_C_WINDOW`] runs `on_force` — a
 /// host hook for durable state, such as the done-file marker — and exits
-/// with 130 directly. The listener stays armed across the window, so the
+/// the process with 130. The listener stays armed across the window, so the
 /// repeat interrupt is never lost; once the window elapses, a fresh
 /// interrupt starts a new cooperative cancellation.
 ///
@@ -237,34 +307,49 @@ pub fn install_cancel_handler(
     cancel: Arc<CancelSignal>,
     on_force: impl Fn() + Send + 'static,
 ) -> CancelBridge {
-    let (stop, stop_rx) = tokio::sync::watch::channel(false);
-    tokio::spawn(async move {
-        let mut stop_rx = stop_rx;
-        let mut source = InterruptSource::Listeners(InterruptListeners::install());
-        bridge_loop(&mut source, &mut stop_rx, cancel, on_force).await;
-        std::process::exit(130);
+    let (stop, mut stop_rx) = tokio::sync::watch::channel(false);
+    let mut source = InterruptSource::Listeners(InterruptListeners::install());
+    let task = tokio::spawn(async move {
+        let outcome = bridge_loop(&mut source, &mut stop_rx, cancel, on_force).await;
+        if outcome == BridgeOutcome::Forced {
+            std::process::exit(130);
+        }
     });
-    CancelBridge { stop }
+    CancelBridge { stop, task }
 }
 
-/// A handle that stops the interrupt bridge installed for one run.
+/// A handle over the interrupt bridge installed for one run.
 ///
-/// Stopping ends the bridge task: its listeners unsubscribe, its window
-/// state dies with it, and signals after the stop are no longer its to
-/// classify.
+/// Stopping the bridge ends its task: the listeners unsubscribe, the
+/// window state dies with it, and signals after the stop are no longer
+/// its to classify. Awaiting [`stop`](Self::stop) waits out the task so a
+/// late forced exit can never race the run's own finalization.
 #[derive(Debug)]
 pub struct CancelBridge {
+    /// Signals the bridge task to stop.
+    ///
+    /// The task selects on this channel beside its interrupt waits; when
+    /// this handle drops the channel closes, ending any still-pending
+    /// wait the same way.
     stop: tokio::sync::watch::Sender<bool>,
+
+    /// The bridge task itself.
+    ///
+    /// Awaited by [`stop`](Self::stop) so the run's finalization happens
+    /// only after the bridge is quiescent — a forced exit skips the wait
+    /// because the process is already terminating.
+    task: tokio::task::JoinHandle<()>,
 }
 
 impl CancelBridge {
-    /// Stop the bridge.
+    /// Stop the bridge and wait for its task to finish.
     ///
-    /// Idempotent; a bridge whose task already ended (for example after a
-    /// force exit) cannot be revived, and a failed send just means that
-    /// receiver is already gone.
-    pub fn stop(self) {
+    /// Only a forced exit skips the wait — by definition the process is
+    /// already terminating. A failed send just means the task is already
+    /// gone.
+    pub async fn stop(self) {
         self.stop.send(true).ok();
+        let _ended = self.task.await;
     }
 }
 
@@ -332,7 +417,7 @@ mod tests {
             bridge_loop(&mut source, &mut stop_rx, hook_cancel, move || {
                 hook_flag.store(true, std::sync::atomic::Ordering::SeqCst);
             })
-            .await;
+            .await
         });
 
         let _sent = interrupts.send(());
@@ -343,10 +428,44 @@ mod tests {
         );
 
         let _sent = interrupts.send(());
-        bridge.await.unwrap();
+        let outcome = bridge.await.unwrap();
+        assert_eq!(
+            outcome,
+            BridgeOutcome::Forced,
+            "a repeat inside the window forces"
+        );
         assert!(
             hook_fired.load(std::sync::atomic::Ordering::SeqCst),
             "the repeat inside the window must run the force hook before returning"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_signal_during_startup_is_captured_by_the_installed_bridge() {
+        let _signal_lock = SIGNAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cancel = Arc::new(CancelSignal::new());
+        let hook_cancel = Arc::clone(&cancel);
+        let hook_fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook_flag = Arc::clone(&hook_fired);
+        let bridge = install_cancel_handler(Arc::clone(&cancel), move || {
+            hook_cancel.cancel();
+            hook_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        unsafe { libc::kill(libc::getpid(), libc::SIGINT) };
+        let cancelled = tokio::time::timeout(Duration::from_secs(5), cancel.notified()).await;
+        assert!(
+            cancelled.is_ok(),
+            "a signal arriving immediately after installation must be captured"
+        );
+        bridge.stop().await;
+        assert!(
+            !hook_fired.load(std::sync::atomic::Ordering::SeqCst),
+            "a single interrupt cooperatively cancels and must not force"
         );
     }
 

@@ -26,7 +26,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// Bind a server that accepts one connection, swallows the request, and
-/// never responds — the child stays mid-run until interrupted.
+/// never responds.
+///
+/// The child's request therefore hangs mid-run until interrupted, which
+/// is the state both interrupt paths are exercised from; the park keeps
+/// the socket open for the child's whole short life.
 fn holding_server() -> (u16, Arc<AtomicBool>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("ephemeral bind");
     let port = listener.local_addr().expect("bound address").port();

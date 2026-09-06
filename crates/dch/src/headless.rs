@@ -169,7 +169,7 @@ async fn run_headless_inner(args: &Args) -> Result<HeadlessOutcome, HeadlessOutc
     });
 
     let run_result = runner.run(&prompt).await;
-    bridge.stop();
+    bridge.stop().await;
     let run = run_result.map_err(|err| {
         let outcome = HeadlessOutcome::from_loop_error(&err);
         write_done_file_if_requested(args, &outcome);
@@ -348,11 +348,16 @@ fn write_done_file_if_requested(args: &Args, outcome: &HeadlessOutcome) {
 )]
 mod tests {
     use super::*;
+    use crate::signals::SIGNAL_TEST_LOCK;
     use clap::Parser as _;
     use loopctl::engine::RunConfig;
     use tokio::io::AsyncWriteExt as _;
 
     /// Parse a flag list into [`Args`], prefixing the program name.
+    ///
+    /// Clap requires the program name as the first argument, so tests pass
+    /// flag lists exactly as `main` would receive them after the binary
+    /// name.
     fn parse(args: &[&str]) -> Args {
         Args::try_parse_from(std::iter::once("dch").chain(args.iter().copied())).unwrap()
     }
@@ -590,19 +595,29 @@ mod tests {
         assert_eq!(run_headless(&args).await, 0);
     }
 
-    use crate::signals::SIGNAL_TEST_LOCK;
-
     /// A local server that answers the agent's request with one streamed
     /// text delta and then holds the connection open, so the run is still
     /// mid-stream when the test delivers its signal.
     struct HoldServer {
         /// Whether the delta has been written and the run is mid-stream.
+        ///
+        /// Flips to true only after the delta bytes reach the wire, so a
+        /// signal armed on this flag is guaranteed to land during the run
+        /// rather than before the agent request is made.
         streaming: std::sync::Arc<std::sync::atomic::AtomicBool>,
         /// The ephemeral port the agent's requests arrive on.
+        ///
+        /// Rendered into the temp config's `base_url`, so pointing the
+        /// run at the server needs no name resolution or fixed port.
         port: u16,
     }
 
     impl HoldServer {
+        /// Bind the server and spawn its connection task.
+        ///
+        /// The port is bound before returning so the temp config can name
+        /// it; the task parks forever after answering, dying with the test
+        /// process.
         async fn start() -> Self {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
@@ -630,6 +645,10 @@ mod tests {
         }
 
         /// A config pointing the agent at this server.
+        ///
+        /// OpenAI-compatible against the bound port, with a placeholder
+        /// key and a generous timeout so the only thing that can end the
+        /// run early is the signal under test.
         fn config_toml(&self) -> String {
             format!(
                 "[api]\napi_type = \"openai\"\nbase_url = \"http://127.0.0.1:{}\"\
