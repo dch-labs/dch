@@ -588,10 +588,7 @@ mod tests {
         assert_eq!(run_headless(&args).await, 0);
     }
 
-    /// Serializes tests that deliver real process signals: every installed
-    /// handler hears every signal, so concurrent signal tests would cancel
-    /// each other's runs.
-    static SIGNAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use crate::signals::SIGNAL_TEST_LOCK;
 
     /// A local server that answers the agent's request with one streamed
     /// text delta and then holds the connection open, so the run is still

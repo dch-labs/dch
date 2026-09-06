@@ -203,7 +203,9 @@ jobs:
         run: |
           if [ "$VERB" = "review" ]; then
             difftrace review --repo "$REPO" --pr "$PR"
-          elif [ "$VERB" = "plan" ] && [ "$COMMENT_KIND" = "review" ]; then
+          elif [ "$VERB" = "plan" ] && [ "$COMMENT_KIND" = "issue" ]; then
+            difftrace plan --repo "$REPO" --pr "$PR" --issue-comment "$COMMENT_ID"
+          elif [ "$VERB" = "plan" ]; then
             difftrace plan --repo "$REPO" --pr "$PR" --review-comment "$COMMENT_ID"
           elif [ "$COMMENT_KIND" = "issue" ]; then
             difftrace reply --repo "$REPO" --pr "$PR" --issue-comment "$COMMENT_ID"

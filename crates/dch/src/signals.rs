@@ -5,12 +5,17 @@
 //! its next cooperative check point, and a second interrupt within the
 //! coalescing window runs the force hook and exits immediately.
 
-use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use loopctl::cancel::CancelSignal;
 use tokio::signal;
+
+/// Serializes tests that deliver real process signals: every installed
+/// handler hears every signal, so concurrent signal tests would cancel
+/// each other's runs.
+#[cfg(test)]
+pub(crate) static SIGNAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// The window after a first interrupt inside which a repeat interrupt
 /// forces an immediate exit.
@@ -48,38 +53,72 @@ fn classify_interrupt(previous: Option<Instant>, now: Instant) -> InterruptDecis
     }
 }
 
-/// Block until the process receives an interrupt.
+/// Persistent interrupt listeners, installed once for the bridge's whole
+/// lifetime.
 ///
-/// Waits on Ctrl-C, and additionally on SIGTERM on Unix so a supervisor's
-/// graceful-shutdown request takes the same cooperative path. A failure to
-/// install a listener is reported and parks forever rather than returning,
-/// which would spin the caller's loop.
-async fn wait_for_interrupt() {
+/// A signal that arrives while the bridge is between waits must not be
+/// lost, so the listeners are not recreated per wait: on Unix both are
+/// long-lived signal streams, and a signal delivered at any instant is
+/// delivered to the same registration the next wait reads. A listener the
+/// platform refuses to install becomes `None`, which never fires — the
+/// bridge stays alive on the signals it does have.
+struct InterruptListeners {
     #[cfg(unix)]
-    {
-        let sigterm = async {
-            match signal::unix::signal(signal::unix::SignalKind::terminate()) {
-                Ok(mut stream) => {
-                    let _ = stream.recv().await;
-                }
+    interrupt: Option<signal::unix::Signal>,
+    #[cfg(unix)]
+    terminate: Option<signal::unix::Signal>,
+}
+
+impl InterruptListeners {
+    /// Install the listeners, reporting any registration failure.
+    fn install() -> Self {
+        #[cfg(unix)]
+        {
+            let install = |kind| match signal::unix::signal(kind) {
+                Ok(stream) => Some(stream),
                 Err(error) => {
-                    eprintln!("dch: cannot install the SIGTERM listener: {error}");
-                    std::future::pending::<()>().await;
+                    eprintln!("dch: cannot install a signal listener: {error}");
+                    None
+                }
+            };
+            Self {
+                interrupt: install(signal::unix::SignalKind::interrupt()),
+                terminate: install(signal::unix::SignalKind::terminate()),
+            }
+        }
+        #[cfg(not(unix))]
+        Self {}
+    }
+
+    /// Block until the process receives an interrupt.
+    ///
+    /// Waits on Ctrl-C, and additionally on SIGTERM on Unix so a
+    /// supervisor's graceful-shutdown request takes the same cooperative
+    /// path. The listeners persist across calls, so no interrupt is lost
+    /// to a re-registration gap.
+    #[cfg(unix)]
+    async fn wait(&mut self) {
+        match (self.interrupt.as_mut(), self.terminate.as_mut()) {
+            (Some(interrupt), Some(terminate)) => {
+                tokio::select! {
+                    _ = interrupt.recv() => {}
+                    _ = terminate.recv() => {}
                 }
             }
-        };
-        tokio::select! {
-            result = signal::ctrl_c() => {
-                if let Err(error) = result {
-                    eprintln!("dch: cannot install the Ctrl-C listener: {error}");
-                    std::future::pending::<()>().await;
-                }
+            (Some(interrupt), None) => {
+                interrupt.recv().await;
             }
-            () = sigterm => {}
+            (None, Some(terminate)) => {
+                terminate.recv().await;
+            }
+            (None, None) => std::future::pending::<()>().await,
         }
     }
+
+    /// The non-Unix bridge has no persistent SIGTERM source: Ctrl-C alone
+    /// drives it, re-armed per wait by the platform's console handler.
     #[cfg(not(unix))]
-    {
+    async fn wait(&mut self) {
         match signal::ctrl_c().await {
             Ok(()) => {}
             Err(error) => {
@@ -90,6 +129,35 @@ async fn wait_for_interrupt() {
     }
 }
 
+/// The bridge's interrupt source: the process's real signal listeners in
+/// production, or a channel-driven stand-in in tests.
+enum InterruptSource {
+    /// The real signal listeners.
+    Listeners(InterruptListeners),
+
+    /// The test stand-in, one channel item per simulated interrupt.
+    #[cfg(test)]
+    Channel(ChannelSource),
+}
+
+impl InterruptSource {
+    async fn wait(&mut self) {
+        match self {
+            Self::Listeners(listeners) => listeners.wait().await,
+            #[cfg(test)]
+            Self::Channel(channel) => {
+                let _ = channel.rx.recv().await;
+            }
+        }
+    }
+}
+
+/// The test interrupt source: a channel receiving one item per interrupt.
+#[cfg(test)]
+struct ChannelSource {
+    rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+}
+
 /// The interrupt-bridge decision loop, parameterized over the interrupt
 /// source so tests can drive it without OS signals.
 ///
@@ -98,11 +166,7 @@ async fn wait_for_interrupt() {
 /// the listener still attached, the window's expiry re-arms a fresh
 /// first-interrupt, and a repeat inside the window runs `on_force` and
 /// returns.
-async fn bridge_loop<W, F>(mut wait: F, cancel: Arc<CancelSignal>, on_force: impl Fn())
-where
-    F: FnMut() -> W,
-    W: Future<Output = ()>,
-{
+async fn bridge_loop(source: &mut InterruptSource, cancel: Arc<CancelSignal>, on_force: impl Fn()) {
     let mut previous: Option<Instant> = None;
     loop {
         if let Some(then) = previous {
@@ -117,10 +181,10 @@ where
                     previous = None;
                     continue;
                 }
-                () = wait() => {}
+                () = source.wait() => {}
             }
         } else {
-            wait().await;
+            source.wait().await;
         }
         let now = Instant::now();
         match classify_interrupt(previous, now) {
@@ -160,7 +224,12 @@ where
 /// bridge against its own runner's signal.
 pub fn install_cancel_handler(cancel: Arc<CancelSignal>, on_force: impl Fn() + Send + 'static) {
     tokio::spawn(async move {
-        bridge_loop(wait_for_interrupt, cancel, on_force).await;
+        bridge_loop(
+            &mut InterruptSource::Listeners(InterruptListeners::install()),
+            cancel,
+            on_force,
+        )
+        .await;
         std::process::exit(130);
     });
 }
@@ -223,15 +292,9 @@ mod tests {
         let hook_cancel = Arc::clone(&cancel);
         let hook_fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let hook_flag = Arc::clone(&hook_fired);
-        let received = Arc::new(tokio::sync::Mutex::new(received));
+        let mut source = InterruptSource::Channel(ChannelSource { rx: received });
         let bridge = tokio::spawn(async move {
-            let wait = || {
-                let received = Arc::clone(&received);
-                async move {
-                    received.lock().await.recv().await;
-                }
-            };
-            bridge_loop(wait, hook_cancel, move || {
+            bridge_loop(&mut source, hook_cancel, move || {
                 hook_flag.store(true, std::sync::atomic::Ordering::SeqCst);
             })
             .await;
@@ -249,6 +312,29 @@ mod tests {
         assert!(
             hook_fired.load(std::sync::atomic::Ordering::SeqCst),
             "the repeat inside the window must run the force hook before returning"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn consecutive_signals_are_all_delivered_by_the_persistent_listener() {
+        let _signal_lock = SIGNAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut listeners = InterruptListeners::install();
+
+        unsafe { libc::kill(libc::getpid(), libc::SIGINT) };
+        let first = tokio::time::timeout(Duration::from_secs(5), listeners.wait()).await;
+        assert!(first.is_ok(), "the first signal must arrive");
+
+        // A repeat delivered immediately after the first wait returns: with
+        // per-wait listeners this was the lost-signal window.
+        unsafe { libc::kill(libc::getpid(), libc::SIGINT) };
+        let second = tokio::time::timeout(Duration::from_secs(5), listeners.wait()).await;
+        assert!(
+            second.is_ok(),
+            "a signal arriving right after a wait returns must not be lost"
         );
     }
 }
