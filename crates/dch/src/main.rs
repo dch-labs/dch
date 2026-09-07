@@ -20,7 +20,13 @@ fn main() -> std::process::ExitCode {
                 eprintln!("dch: failed to start tokio runtime: {err}");
                 std::process::exit(1);
             });
-        let code = runtime.block_on(headless::run_headless(&args));
+        let code = runtime.block_on(async {
+            let startup_args = args.clone();
+            let startup_bridge = signals::install_construction_handler(move || {
+                headless::write_startup_done_file(&startup_args);
+            });
+            headless::run_headless(&args, startup_bridge).await
+        });
         std::process::ExitCode::from(code)
     } else {
         eprintln!("interactive mode not yet implemented; use --headless");

@@ -70,6 +70,14 @@ fn classify_interrupt(previous: Option<Instant>, now: Instant) -> InterruptDecis
 /// platform refuses to install becomes `None`, which never fires — the
 /// bridge stays alive on the signals it does have.
 struct InterruptListeners {
+    /// The Windows Ctrl-C stream, `None` when registration failed.
+    ///
+    /// Created during [`install`](Self::install) — the platform's console
+    /// handler registers on creation, not on first poll — so a Ctrl-C
+    /// before the first wait is captured, mirroring the Unix fix.
+    #[cfg(windows)]
+    interrupt: Option<signal::windows::CtrlC>,
+
     /// The Ctrl-C stream, `None` when the platform refused the
     /// registration.
     ///
@@ -110,7 +118,15 @@ impl InterruptListeners {
                 terminate: install(signal::unix::SignalKind::terminate()),
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            Self {
+                // Registered synchronously so a Ctrl-C before the first
+                // poll is captured, mirroring the Unix fix.
+                interrupt: signal::windows::ctrl_c().ok(),
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
         Self {}
     }
 
@@ -139,12 +155,20 @@ impl InterruptListeners {
         }
     }
 
-    /// The non-Unix bridge has no persistent SIGTERM source.
-    ///
-    /// Ctrl-C alone drives it, re-armed per wait by the platform's console
-    /// handler; the tests that pin listener persistence are Unix-gated,
-    /// where the persistent listener pair exists.
-    #[cfg(not(unix))]
+    /// Windows waits on the persistently registered Ctrl-C stream.
+    #[cfg(windows)]
+    async fn wait(&mut self) {
+        match self.interrupt.as_mut() {
+            Some(interrupt) => {
+                interrupt.recv().await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    }
+
+    /// Platforms with neither persistent pair nor console stream cannot
+    /// listen; the wait parks forever and says so.
+    #[cfg(not(any(unix, windows)))]
     async fn wait(&mut self) {
         match signal::ctrl_c().await {
             Ok(()) => {}

@@ -921,6 +921,19 @@ mod tests {
         text.chars().skip(skip).collect()
     }
 
+    /// Assert the output stayed under the cap plus the failure-message
+    /// margin, showing the tail when it did not.
+    fn assert_bounded(text: &str, margin: usize) {
+        assert!(
+            text.len() < MAX_OUTPUT_BYTES + margin,
+            "output was {} bytes (cap ~{} + margin {}), tail: {:?}",
+            text.len(),
+            MAX_OUTPUT_BYTES,
+            margin,
+            tail_of(text, 120)
+        );
+    }
+
     fn ctx_in(cwd: &str) -> ToolContext {
         let mut ctx = ToolContext::default();
         ctx.cwd = cwd.to_string();
@@ -1009,13 +1022,7 @@ mod tests {
         let input = json!({ "command": "yes y | head -c 2000000" });
         let out = tool.call(input, &ctx).await.unwrap();
         // Output + metadata line should be under the cap + a small margin.
-        let text = out.text_content();
-        assert!(
-            text.len() < MAX_OUTPUT_BYTES + 512,
-            "output was {} bytes, tail: {:?}",
-            text.len(),
-            tail_of(&text, 120)
-        );
+        assert_bounded(&out.text_content(), 512);
     }
 
     #[tokio::test]
@@ -1027,14 +1034,7 @@ mod tests {
         let ctx = ctx_in(cwd);
         let input = json!({ "command": "yes y | head -c 10000000" });
         let out = tool.call(input, &ctx).await.unwrap();
-        let text = out.text_content();
-        assert!(
-            text.len() < MAX_OUTPUT_BYTES + 512,
-            "output was {} bytes, should be bounded to ~{}, tail: {:?}",
-            text.len(),
-            MAX_OUTPUT_BYTES,
-            tail_of(&text, 120)
-        );
+        assert_bounded(&out.text_content(), 512);
     }
 
     #[tokio::test]

@@ -119,14 +119,16 @@ impl HeadlessOutcome {
 /// Loads config, builds a non-interactive runner with a `ConsoleObserver`,
 /// resolves the prompt (from `--headless` or stdin), runs one full session,
 /// writes the `--done-file` (if requested), and returns the exit code. The
-/// caller (`main`) turns the code into the process exit status.
+/// caller (`main`) turns the code into the process exit status. The
+/// startup bridge armed before this call is stopped once the run bridge
+/// takes over.
 ///
 /// # Errors
 ///
 /// Returns the exit code for any failure: 1 for construction-phase errors,
 /// 2 for run-level failures, 130 for cancellation.
-pub async fn run_headless(args: &Args) -> u8 {
-    match run_headless_inner(args).await {
+pub async fn run_headless(args: &Args, startup_bridge: crate::signals::CancelBridge) -> u8 {
+    match run_headless_inner(args, startup_bridge).await {
         Ok(outcome) | Err(outcome) => outcome.exit_code,
     }
 }
@@ -142,15 +144,10 @@ pub async fn run_headless(args: &Args) -> u8 {
 ///
 /// Returns the construction-phase failure outcome when the config, agent,
 /// or prompt cannot be resolved.
-async fn run_headless_inner(args: &Args) -> Result<HeadlessOutcome, HeadlessOutcome> {
-    let startup_args = args.clone();
-    let startup_bridge = crate::signals::install_construction_handler(move || {
-        write_done_file_if_requested(
-            &startup_args,
-            &HeadlessOutcome::failure(130, "cancelled during startup"),
-        );
-    });
-
+async fn run_headless_inner(
+    args: &Args,
+    startup_bridge: crate::signals::CancelBridge,
+) -> Result<HeadlessOutcome, HeadlessOutcome> {
     let prompt = resolve_prompt_nonblocking(args)
         .await
         .map_err(|message| construction_failure(args, message))?;
@@ -196,6 +193,18 @@ async fn run_headless_inner(args: &Args) -> Result<HeadlessOutcome, HeadlessOutc
     Ok(outcome)
 }
 
+/// Write the done-file for an interrupt that lands before the runner
+/// exists — the startup bridge's hook.
+///
+/// Public to `main` so the handler can be armed the moment the runtime is
+/// up, ahead of prompt resolution and agent construction.
+pub(crate) fn write_startup_done_file(args: &Args) {
+    write_done_file_if_requested(
+        args,
+        &HeadlessOutcome::failure(130, "cancelled during startup"),
+    );
+}
+
 /// Build a construction-phase failure outcome and write the done-file.
 ///
 /// Every terminal path writes the marker when `--done-file` is supplied —
@@ -219,12 +228,7 @@ fn construction_failure(args: &Args, message: impl Into<String>) -> HeadlessOutc
 ///
 /// Returns an error message when no usable prompt exists.
 async fn resolve_prompt_nonblocking(args: &Args) -> Result<String, String> {
-    if args
-        .headless
-        .as_deref()
-        .is_some_and(|text| !text.trim().is_empty())
-        || std::io::stdin().is_terminal()
-    {
+    if has_explicit_prompt(args) || std::io::stdin().is_terminal() {
         return resolve_prompt(args);
     }
     let read = tokio::task::spawn_blocking(read_stdin_prompt);
@@ -232,6 +236,22 @@ async fn resolve_prompt_nonblocking(args: &Args) -> Result<String, String> {
         .await
         .unwrap_or_else(|err| Err(format!("stdin read task failed: {err}")));
     resolve_prompt_with(args.headless.as_deref(), move || piped, || false)
+}
+
+/// Whether the `--headless` flag carries a usable task text.
+///
+/// Shared by the fast paths so the definition of "explicit prompt" cannot
+/// drift between them.
+fn has_explicit_prompt(args: &Args) -> bool {
+    args.headless.as_deref().is_some_and(presentable)
+}
+
+/// Whether a prompt candidate can be used verbatim.
+///
+/// Leading and trailing whitespace is not content: a flag or stream that
+/// trims to nothing falls through to the next source instead.
+fn presentable(text: &str) -> bool {
+    !text.trim().is_empty()
 }
 
 /// Resolve the prompt from the parsed arguments.
@@ -265,7 +285,7 @@ fn resolve_prompt_with(
     read_stdin: impl FnOnce() -> Result<String, String>,
     stdin_is_terminal: impl FnOnce() -> bool,
 ) -> Result<String, String> {
-    if let Some(text) = explicit.filter(|text| !text.trim().is_empty()) {
+    if let Some(text) = explicit.filter(|text| presentable(text)) {
         return Ok(text.to_string());
     }
     if stdin_is_terminal() {
@@ -648,7 +668,10 @@ mod tests {
     #[ignore = "needs a configured provider; run manually to prove the pipeline"]
     async fn a_live_headless_run_succeeds() {
         let args = parse(&["--headless", "Reply with exactly: ok"]);
-        assert_eq!(run_headless(&args).await, 0);
+        assert_eq!(
+            run_headless(&args, crate::signals::install_construction_handler(|| {}),).await,
+            0
+        );
     }
 
     /// A local server that answers the agent's request with one streamed
@@ -755,7 +778,7 @@ mod tests {
 
         let armed = server.signal_when_streaming(libc::SIGINT);
 
-        let code = run_headless(&args).await;
+        let code = run_headless(&args, crate::signals::install_construction_handler(|| {})).await;
         assert!(
             armed.await.unwrap(),
             "the run must reach mid-stream for the signal to fire"
@@ -783,7 +806,7 @@ mod tests {
 
         let armed = server.signal_when_streaming(libc::SIGTERM);
 
-        let code = run_headless(&args).await;
+        let code = run_headless(&args, crate::signals::install_construction_handler(|| {})).await;
         assert!(
             armed.await.unwrap(),
             "the run must reach mid-stream for the signal to fire"
