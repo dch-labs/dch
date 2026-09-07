@@ -498,6 +498,45 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_stop_request_stops_the_bridge_without_forcing() {
+        let (interrupts, received) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let cancel = Arc::new(CancelSignal::new());
+        let hook_cancel = Arc::clone(&cancel);
+        let hook_fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook_flag = Arc::clone(&hook_fired);
+        let mut source = InterruptSource::Channel(ChannelSource { rx: received });
+        let (stop, mut stop_rx) = tokio::sync::watch::channel(false);
+        let bridge = tokio::spawn(async move {
+            bridge_loop(&mut source, &mut stop_rx, hook_cancel, move || {
+                hook_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+            .await
+        });
+
+        let _sent = interrupts.send(());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            cancel.is_cancelled(),
+            "the first interrupt must cooperatively cancel"
+        );
+
+        stop.send(true).ok();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), bridge)
+            .await
+            .expect("the bridge must stop within the test timeout")
+            .unwrap();
+        assert_eq!(
+            outcome,
+            BridgeOutcome::Stopped,
+            "a stop request must end the loop as an orderly stop"
+        );
+        assert!(
+            !hook_fired.load(std::sync::atomic::Ordering::SeqCst),
+            "an orderly stop must not fire the force hook"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
