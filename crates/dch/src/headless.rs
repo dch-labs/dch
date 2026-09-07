@@ -120,10 +120,9 @@ impl HeadlessOutcome {
 /// resolves the prompt (from `--headless` or stdin), runs one full session,
 /// writes the `--done-file` (if requested), and returns the exit code. The
 /// caller (`main`) turns the code into the process exit status. The
-/// startup bridge armed before this call is stopped before the run bridge
-/// is installed, so the two never decide a signal together; the
-/// synchronous stretch between them is covered by the process-lifetime
-/// signal registration, which captures without acting.
+/// startup bridge armed before this call is stopped once the run bridge is
+/// installed; the two briefly overlap, where an interrupt fails closed
+/// through the construction hook.
 ///
 /// # Errors
 ///
@@ -173,8 +172,6 @@ async fn run_headless_inner(
         .await
         .map_err(|err| construction_failure(args, format!("agent construction: {err}")))?;
 
-    startup_bridge.stop().await;
-
     let force_args = args.clone();
     let bridge = crate::signals::install_cancel_handler(runner.cancel_signal(), move || {
         write_done_file_if_requested(
@@ -182,6 +179,7 @@ async fn run_headless_inner(
             &HeadlessOutcome::failure(130, FORCE_CANCEL_MESSAGE),
         );
     });
+    startup_bridge.stop().await;
 
     let run_result = runner.run(&prompt).await;
     bridge.stop().await;

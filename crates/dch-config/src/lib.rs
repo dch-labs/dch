@@ -539,9 +539,10 @@ pub struct ApiConfig {
 
     /// Base URL of the provider endpoint.
     ///
-    /// The host root the API client builds request URLs against. Defaults to an
-    /// empty string; callers typically fill it from
-    /// [`ApiType::default_base_url`].
+    /// The host root the API client builds request URLs against. Defaults to
+    /// an empty string; the stock providers fall back to
+    /// [`ApiType::default_base_url`], while the profiled providers fall back
+    /// to their loopctl provider-profile endpoint.
     pub base_url: String,
 
     /// Which provider to speak to.

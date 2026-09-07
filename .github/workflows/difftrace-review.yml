@@ -1,16 +1,17 @@
 # Caller template for the difftrace review workflow
 # (dch-labs/difftrace/.github/workflows/review.yml). Copy verbatim; on
-# every difftrace release, bump the ref in the uses: line below —
-# release.sh in the difftrace repo prints the exact line: a fixed commit
-# carrying the release's binary version+checksum pins, alongside the
-# callee's authorization steps to re-verify (fork and dependabot
-# rejection, collaborator-only commands, secrets preflight).
+# every difftrace release, bump the ref in the uses: line below — the
+# `release.sh pins` command in the difftrace repo prints the exact
+# line to copy, a fixed commit carrying the release's binary
+# version+checksum pins.
 #
 # What the pinned callee enforces on its side — the jobs are not in this
 # file: fork and dependabot pull requests are rejected; command authors
 # must be collaborators with write; required secrets fail fast with
 # named messages; the binary is checksum-pinned; all writes go through
-# a least-privilege app token.
+# a least-privilege app token; concurrency lanes are callee-side too
+# — pushes supersede in-flight reviews and commands queue FIFO without
+# dropping (up to 100 pending; beyond that, arrivals are canceled).
 name: difftrace review
 
 on:
@@ -35,33 +36,10 @@ permissions:
 
 jobs:
   review:
-    concurrency:
-      # Split caller gates mirroring the callee's lanes, with distinct
-      # prefixes so they never merge with the callee's own groups: a
-      # review trigger supersedes an older review run of the same PR,
-      # while an admitted command never cancels anything. Caller-level
-      # groups apply to this calling run even though the jobs live in
-      # the callee; a callee-side change to its own groups does not
-      # affect this guarantee.
-      group: >-
-        ${{ (github.event_name == 'issue_comment' || github.event_name == 'pull_request_review_comment') &&
-        format('difftrace-caller-chat-{0}', inputs.pr || github.event.pull_request.number || github.event.issue.number || github.run_id) ||
-        format('difftrace-caller-review-{0}', inputs.pr || github.event.pull_request.number || github.event.issue.number || github.run_id) }}
-      cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' }}
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'pull_request' &&
-      github.event.pull_request.user.login != 'dependabot[bot]' &&
-      github.event.pull_request.head.repo.fork != true) ||
-      ((github.event_name == 'issue_comment' &&
-      github.event.issue.pull_request != null) ||
-      github.event_name == 'pull_request_review_comment') &&
-      (github.event.comment.author_association == 'OWNER' ||
-      github.event.comment.author_association == 'MEMBER' ||
-      github.event.comment.author_association == 'COLLABORATOR')
-    uses: dch-labs/difftrace/.github/workflows/review.yml@ed800d58b310ea3041f57521c15ce989b0bc932d # v0.11.0
+    if: github.event_name != 'issue_comment' || github.event.issue.pull_request != null
+    uses: dch-labs/difftrace/.github/workflows/review.yml@ea6c910f22707185e025b6c7bb2cc1c25a07ade6 # v0.11.2
     with:
-      pr: ${{ inputs.pr }}
+      pr: ${{ github.event.pull_request.number || (github.event.issue.pull_request != null && github.event.issue.number) || inputs.pr }}
       model: ${{ inputs.model }}
     secrets:
       ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}

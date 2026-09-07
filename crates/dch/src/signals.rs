@@ -483,7 +483,10 @@ mod tests {
         );
 
         let _sent = interrupts.send(());
-        let outcome = bridge.await.unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), bridge)
+            .await
+            .expect("the bridge must decide within the test timeout")
+            .unwrap();
         assert_eq!(
             outcome,
             BridgeOutcome::Forced,

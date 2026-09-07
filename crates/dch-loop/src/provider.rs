@@ -592,11 +592,31 @@ mod tests {
 
     #[test]
     fn ollama_empty_base_url_uses_default() {
-        let env = loopctl::testing::EnvGuard::acquire(&["OLLAMA_API_KEY"]);
+        let env = loopctl::testing::EnvGuard::acquire(&["OLLAMA_API_KEY", "OLLAMA_BASE_URL"]);
         env.remove("OLLAMA_API_KEY");
+        env.remove("OLLAMA_BASE_URL");
         let c = cfg(ApiType::Ollama, "", None);
         let client = create_client(&c).expect("ollama builds via default base_url");
         assert_eq!(client.model(), "test-model");
+        assert_eq!(
+            client.base_url(),
+            "http://localhost:11434/v1",
+            "an empty base_url must fall back to the seeded local Ollama endpoint"
+        );
+    }
+
+    #[test]
+    fn ollama_env_base_url_overrides_the_seed() {
+        let env = loopctl::testing::EnvGuard::acquire(&["OLLAMA_BASE_URL"]);
+        env.set("OLLAMA_BASE_URL", "http://env-host:11434/v1");
+        let c = cfg(ApiType::Ollama, "", None);
+        let client = create_client(&c).expect("ollama builds from the env endpoint");
+        assert_eq!(
+            client.base_url(),
+            "http://env-host:11434/v1",
+            "an empty base_url must honor the profile's OLLAMA_BASE_URL variable"
+        );
+        env.remove("OLLAMA_BASE_URL");
     }
 
     #[test]
@@ -723,6 +743,23 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_missing_key_names_the_expected_env_var() {
+        let env = loopctl::testing::EnvGuard::acquire(&["DEEPSEEK_API_KEY"]);
+        env.remove("DEEPSEEK_API_KEY");
+        let c = cfg(ApiType::DeepSeek, "", None);
+        let err = create_client(&c)
+            .err()
+            .expect("deepseek without key should error");
+        let RunnerError::Client(msg) = &err else {
+            panic!("expected Client error, got {err:?}");
+        };
+        assert!(
+            msg.contains("DEEPSEEK_API_KEY"),
+            "the profiled missing-key error should name the env var: {msg}"
+        );
+    }
+
+    #[test]
     fn zai_key_from_zai_env() {
         let env = loopctl::testing::EnvGuard::acquire(&["ZAI_API_KEY", "ZHIPUAI_API_KEY"]);
         env.set("ZAI_API_KEY", "env-key");
@@ -788,10 +825,17 @@ mod tests {
     #[test]
     fn default_api_config_builds() {
         // ApiConfig::default() is api_type=Ollama, empty base_url, no key.
+        let env = loopctl::testing::EnvGuard::acquire(&["OLLAMA_BASE_URL"]);
+        env.remove("OLLAMA_BASE_URL");
         let mut c = ApiConfig::default();
         c.model = "default-model".to_string();
         let client = create_client(&c).expect("default ApiConfig should build");
         assert_eq!(client.model(), "default-model");
+        assert_eq!(
+            client.base_url(),
+            "http://localhost:11434/v1",
+            "the out-of-box configuration must land on the seeded local Ollama endpoint"
+        );
     }
 
     #[test]
@@ -919,6 +963,25 @@ mod tests {
         assert!(
             msg.contains("AZURE_OPENAI_RESOURCE") && msg.contains("azure_resource"),
             "error must name both sources: {msg}"
+        );
+    }
+
+    #[test]
+    fn azure_missing_model_names_the_deployment_variable() {
+        let env = loopctl::testing::EnvGuard::acquire(&["AZURE_OPENAI_MODEL"]);
+        env.remove("AZURE_OPENAI_MODEL");
+        let mut c = cfg(ApiType::Azure, "", Some("k"));
+        c.model = String::new();
+        c.azure_resource = Some("configured-resource".to_string());
+        let err = create_client(&c)
+            .err()
+            .expect("azure without a model should error");
+        let RunnerError::Client(msg) = &err else {
+            panic!("expected Client error, got {err:?}");
+        };
+        assert!(
+            msg.contains("AZURE_OPENAI_MODEL"),
+            "the missing-model error should name the env var: {msg}"
         );
     }
 
