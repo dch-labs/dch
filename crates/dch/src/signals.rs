@@ -120,11 +120,14 @@ impl InterruptListeners {
         }
         #[cfg(windows)]
         {
-            Self {
-                // Registered synchronously so a Ctrl-C before the first
-                // poll is captured, mirroring the Unix fix.
-                interrupt: signal::windows::ctrl_c().ok(),
-            }
+            let interrupt = match signal::windows::ctrl_c() {
+                Ok(stream) => Some(stream),
+                Err(error) => {
+                    eprintln!("dch: cannot install the Ctrl-C listener: {error}");
+                    None
+                }
+            };
+            Self { interrupt }
         }
         #[cfg(not(any(unix, windows)))]
         Self {}

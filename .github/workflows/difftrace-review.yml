@@ -1,8 +1,10 @@
 # Caller template for the difftrace review workflow
 # (dch-labs/difftrace/.github/workflows/review.yml). Copy verbatim; on
 # every difftrace release, bump the ref in the uses: line below —
-# release.sh pins in the difftrace repo prints the exact line: a fixed
-# commit carrying the release's binary version+checksum pins.
+# release.sh in the difftrace repo prints the exact line: a fixed commit
+# carrying the release's binary version+checksum pins, alongside the
+# callee's authorization steps to re-verify (fork and dependabot
+# rejection, collaborator-only commands, secrets preflight).
 #
 # What the pinned callee enforces on its side — the jobs are not in this
 # file: fork and dependabot pull requests are rejected; command authors
@@ -33,7 +35,26 @@ permissions:
 
 jobs:
   review:
-    uses: dch-labs/difftrace/.github/workflows/review.yml@d73e50dc2f6511b4a0012847992e222846423107 # v0.10.0
+    concurrency:
+      # One lane per pull request: a newer trigger supersedes an older run
+      # of the same PR instead of queueing a duplicate full review of the
+      # same final head. Caller-level groups apply to this calling run even
+      # though the jobs live in the callee; a callee-side change to its own
+      # groups does not affect this guarantee.
+      group: difftrace-${{ inputs.pr || github.event.pull_request.number || github.event.issue.number || github.run_id }}
+      cancel-in-progress: true
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+      github.event.pull_request.user.login != 'dependabot[bot]' &&
+      github.event.pull_request.head.repo.fork != true) ||
+      ((github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request != null) ||
+      github.event_name == 'pull_request_review_comment') &&
+      (github.event.comment.author_association == 'OWNER' ||
+      github.event.comment.author_association == 'MEMBER' ||
+      github.event.comment.author_association == 'COLLABORATOR')
+    uses: dch-labs/difftrace/.github/workflows/review.yml@ed800d58b310ea3041f57521c15ce989b0bc932d # v0.11.0
     with:
       pr: ${{ inputs.pr }}
       model: ${{ inputs.model }}

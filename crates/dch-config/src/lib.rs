@@ -1225,7 +1225,24 @@ redact_secrets = false
         let zai: ApiConfig = toml::from_str("api_type = \"zai\"\n").unwrap();
         assert_eq!(zai.api_type, ApiType::Zai);
 
-        assert_eq!(ApiType::Ollama.default_base_url(), "");
+        // Every profiled variant must keep its empty default: a
+        // reintroduced hard-coded host here would silently shadow the
+        // endpoint its provider profile owns.
+        for api_type in [
+            ApiType::Ollama,
+            ApiType::DeepSeek,
+            ApiType::Grok,
+            ApiType::Zai,
+            ApiType::Azure,
+            ApiType::Bedrock,
+            ApiType::Moonshot,
+        ] {
+            assert_eq!(
+                api_type.default_base_url(),
+                "",
+                "{api_type:?} must defer to its provider profile"
+            );
+        }
         assert_eq!(
             ApiType::OpenAi.default_base_url(),
             "https://api.openai.com/v1"

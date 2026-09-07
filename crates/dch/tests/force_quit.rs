@@ -46,6 +46,30 @@ fn holding_server() -> (u16, Arc<AtomicBool>) {
     (port, connected)
 }
 
+/// Kills the child on drop so a failed assert cannot leak a live
+/// `dch` process hanging on its server until the request timeout.
+struct KillOnDrop<'a>(&'a mut Child);
+
+impl Drop for KillOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.kill().ok();
+    }
+}
+
+impl std::ops::Deref for KillOnDrop<'_> {
+    type Target = Child;
+
+    fn deref(&self) -> &Child {
+        self.0
+    }
+}
+
+impl std::ops::DerefMut for KillOnDrop<'_> {
+    fn deref_mut(&mut self) -> &mut Child {
+        self.0
+    }
+}
+
 fn wait_for(child: &mut Child, flag: &AtomicBool, what: &str) {
     let deadline = Instant::now()
         .checked_add(Duration::from_secs(10))
@@ -85,6 +109,7 @@ fn interrupts_exit_130_and_leave_a_done_file() {
         .stderr(Stdio::null())
         .spawn()
         .expect("child spawned");
+    let mut child = KillOnDrop(&mut child);
 
     wait_for(&mut child, &connected, "the child to reach the server");
 
@@ -142,10 +167,16 @@ fn signal_during_startup_writes_the_done_file_and_exits_130() {
         .stderr(Stdio::null())
         .spawn()
         .expect("child spawned");
+    let mut child = KillOnDrop(&mut child);
 
     // No config file: prompt resolution reads the held-open stdin pipe and
     // blocks, keeping the child in its construction phase.
-    std::thread::sleep(Duration::from_millis(400));
+    //
+    // The generous grace covers process start to listener registration;
+    // a signal landing inside the (millisecond-scale) pre-registration
+    // window would still kill by default disposition, which is the
+    // residual flake this test cannot remove from outside.
+    std::thread::sleep(Duration::from_millis(1500));
     let pid = child.id().cast_signed();
     unsafe { libc::kill(pid, libc::SIGTERM) };
 

@@ -10,26 +10,26 @@ mod headless;
 mod signals;
 
 fn main() -> std::process::ExitCode {
-    let args = args::parse_args();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|err| {
+            eprintln!("dch: failed to start tokio runtime: {err}");
+            std::process::exit(1);
+        });
+    runtime.block_on(async {
+        let args = args::parse_args();
 
-    if args.headless.is_some() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap_or_else(|err| {
-                eprintln!("dch: failed to start tokio runtime: {err}");
-                std::process::exit(1);
-            });
-        let code = runtime.block_on(async {
+        if args.headless.is_some() {
             let startup_args = args.clone();
             let startup_bridge = signals::install_construction_handler(move || {
                 headless::write_startup_done_file(&startup_args);
             });
-            headless::run_headless(&args, startup_bridge).await
-        });
-        std::process::ExitCode::from(code)
-    } else {
-        eprintln!("interactive mode not yet implemented; use --headless");
-        std::process::ExitCode::from(1)
-    }
+            let code = headless::run_headless(&args, startup_bridge).await;
+            std::process::ExitCode::from(code)
+        } else {
+            eprintln!("interactive mode not yet implemented; use --headless");
+            std::process::ExitCode::from(1)
+        }
+    })
 }

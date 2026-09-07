@@ -234,7 +234,7 @@ pub fn create_client(config: &ApiConfig) -> Result<DchClient, RunnerError> {
             )
         }
         ApiType::Ollama => DchClient::OpenAi(
-            profiled_openai(
+            profiled(
                 loopctl::provider::ollama_builder(config.model.as_str()),
                 config,
             )
@@ -242,27 +242,27 @@ pub fn create_client(config: &ApiConfig) -> Result<DchClient, RunnerError> {
             .map_err(client_error)?,
         ),
         ApiType::DeepSeek => DchClient::OpenAi(
-            profiled_openai(loopctl::provider::deepseek_builder(), config)
+            profiled(loopctl::provider::deepseek_builder(), config)
                 .build()
                 .map_err(client_error)?,
         ),
         ApiType::Grok => DchClient::OpenAi(
-            profiled_openai(loopctl::provider::grok_builder(), config)
+            profiled(loopctl::provider::grok_builder(), config)
                 .build()
                 .map_err(client_error)?,
         ),
         ApiType::Azure => DchClient::OpenAi(
-            profiled_openai(azure_seeded_builder(config)?, config)
+            profiled(azure_seeded_builder(config)?, config)
                 .build()
                 .map_err(client_error)?,
         ),
         ApiType::Moonshot => DchClient::OpenAi(
-            profiled_openai(loopctl::provider::moonshot_builder(), config)
+            profiled(loopctl::provider::moonshot_builder(), config)
                 .build()
                 .map_err(client_error)?,
         ),
         ApiType::Zai => DchClient::Anthropic(
-            profiled_anthropic(loopctl::provider::zai_builder(), config)
+            profiled(loopctl::provider::zai_builder(), config)
                 .build()
                 .map_err(client_error)?,
         ),
@@ -332,60 +332,99 @@ fn azure_resource(config: &ApiConfig) -> Result<String, RunnerError> {
         })
 }
 
-/// Apply dch's config precedence onto a pre-seeded OpenAI-family profile
-/// builder.
+/// The config precedence both profile families apply on top of their
+/// seeded builder.
 ///
-/// The seeds are defaults-in-waiting: `base_url` and `model` replace the
-/// seeded values only when the config carries them, and `api_key` only when
-/// configured — so config-beats-environment falls out of the ordering.
-/// `request_timeout_secs` bounds every request the built client makes.
-fn profiled_openai(
-    builder: loopctl::provider::OpenAiClientBuilder,
-    config: &ApiConfig,
-) -> loopctl::provider::OpenAiClientBuilder {
-    let builder = if config.base_url.is_empty() {
-        builder
-    } else {
-        builder.with_base_url(config.base_url.clone())
-    };
-    let builder = if config.model.is_empty() {
-        builder
-    } else {
-        builder.with_model(config.model.as_str())
-    };
-    let builder = match &config.api_key {
-        Some(key) => builder.with_api_key(key.clone()),
-        None => builder,
-    };
-    builder.with_timeout(Duration::from_secs(config.request_timeout_secs))
+/// One implementation per family keeps dch's defaults-in-waiting contract
+/// in a single place: config values replace the seeds only when the
+/// config carries them, and the read timeout always applies.
+trait Profiled {
+    /// Replace the seeded endpoint with the configured `base_url`.
+    fn apply_base_url(self, url: &str) -> Self;
+
+    /// Replace the seeded model with the configured `model`.
+    fn apply_model(self, model: &str) -> Self;
+
+    /// Replace the seeded credential with the configured `api_key`.
+    fn apply_api_key(self, key: &str) -> Self;
+
+    /// Cap each request's read gap at the configured timeout.
+    fn apply_timeout(self, timeout: Duration) -> Self;
+
+    /// Bound each reply at the configured completion budget. Families
+    /// without a completion knob ignore it.
+    fn apply_max_tokens(self, tokens: u32) -> Self;
 }
 
-/// Apply dch's config precedence onto a pre-seeded Anthropic-family profile
-/// builder.
+impl Profiled for loopctl::provider::OpenAiClientBuilder {
+    fn apply_base_url(self, url: &str) -> Self {
+        loopctl::provider::OpenAiClientBuilder::with_base_url(self, url)
+    }
+
+    fn apply_model(self, model: &str) -> Self {
+        loopctl::provider::OpenAiClientBuilder::with_model(self, model)
+    }
+
+    fn apply_api_key(self, key: &str) -> Self {
+        loopctl::provider::OpenAiClientBuilder::with_api_key(self, key)
+    }
+
+    fn apply_timeout(self, timeout: Duration) -> Self {
+        loopctl::provider::OpenAiClientBuilder::with_timeout(self, timeout)
+    }
+
+    fn apply_max_tokens(self, _tokens: u32) -> Self {
+        self
+    }
+}
+
+impl Profiled for loopctl::provider::AnthropicClientBuilder {
+    fn apply_base_url(self, url: &str) -> Self {
+        loopctl::provider::AnthropicClientBuilder::with_base_url(self, url)
+    }
+
+    fn apply_model(self, model: &str) -> Self {
+        loopctl::provider::AnthropicClientBuilder::with_model(self, model)
+    }
+
+    fn apply_api_key(self, key: &str) -> Self {
+        loopctl::provider::AnthropicClientBuilder::with_api_key(self, key)
+    }
+
+    fn apply_timeout(self, timeout: Duration) -> Self {
+        loopctl::provider::AnthropicClientBuilder::with_timeout(self, timeout)
+    }
+
+    fn apply_max_tokens(self, tokens: u32) -> Self {
+        loopctl::provider::AnthropicClientBuilder::with_max_tokens(self, tokens)
+    }
+}
+
+/// Apply dch's config precedence onto a pre-seeded profile builder.
 ///
-/// The same defaults-in-waiting contract as [`profiled_openai`], plus the
-/// configured [`ApiConfig::max_tokens`].
-fn profiled_anthropic(
-    builder: loopctl::provider::AnthropicClientBuilder,
-    config: &ApiConfig,
-) -> loopctl::provider::AnthropicClientBuilder {
+/// The seeds are defaults-in-waiting: `base_url` and `model` replace the
+/// seeded values only when the config carries them, and `api_key` only
+/// when configured — so config-beats-environment falls out of the
+/// ordering. `request_timeout_secs` and `max_tokens` are family settings
+/// that always apply.
+fn profiled<B: Profiled>(builder: B, config: &ApiConfig) -> B {
     let builder = if config.base_url.is_empty() {
         builder
     } else {
-        builder.with_base_url(config.base_url.clone())
+        builder.apply_base_url(&config.base_url)
     };
     let builder = if config.model.is_empty() {
         builder
     } else {
-        builder.with_model(config.model.as_str())
+        builder.apply_model(&config.model)
     };
     let builder = match &config.api_key {
-        Some(key) => builder.with_api_key(key.clone()),
+        Some(key) => builder.apply_api_key(key),
         None => builder,
     };
     builder
-        .with_max_tokens(config.max_tokens)
-        .with_timeout(Duration::from_secs(config.request_timeout_secs))
+        .apply_max_tokens(config.max_tokens)
+        .apply_timeout(Duration::from_secs(config.request_timeout_secs))
 }
 
 /// Build the Bedrock client for `config`.
