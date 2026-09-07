@@ -36,13 +36,18 @@ permissions:
 jobs:
   review:
     concurrency:
-      # One lane per pull request: a newer trigger supersedes an older run
-      # of the same PR instead of queueing a duplicate full review of the
-      # same final head. Caller-level groups apply to this calling run even
-      # though the jobs live in the callee; a callee-side change to its own
-      # groups does not affect this guarantee.
-      group: difftrace-${{ inputs.pr || github.event.pull_request.number || github.event.issue.number || github.run_id }}
-      cancel-in-progress: true
+      # Split caller gates mirroring the callee's lanes, with distinct
+      # prefixes so they never merge with the callee's own groups: a
+      # review trigger supersedes an older review run of the same PR,
+      # while an admitted command never cancels anything. Caller-level
+      # groups apply to this calling run even though the jobs live in
+      # the callee; a callee-side change to its own groups does not
+      # affect this guarantee.
+      group: >-
+        ${{ (github.event_name == 'issue_comment' || github.event_name == 'pull_request_review_comment') &&
+        format('difftrace-caller-chat-{0}', inputs.pr || github.event.pull_request.number || github.event.issue.number || github.run_id) ||
+        format('difftrace-caller-review-{0}', inputs.pr || github.event.pull_request.number || github.event.issue.number || github.run_id) }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' }}
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request' &&

@@ -119,15 +119,18 @@ fn interrupts_exit_130_and_leave_a_done_file() {
         .checked_add(Duration::from_secs(15))
         .expect("deadline computable");
     loop {
-        // Repeat the interrupt while the child lives: a kill landing after
-        // the bridge stopped is swallowed (no listener), so the earliest
-        // still-armed delivery decides between the force and cooperative
-        // paths — both must end in 130 with a done-file.
         assert!(
             Instant::now() < deadline,
             "the child never exited after the repeated interrupts"
         );
-        unsafe { libc::kill(pid, libc::SIGINT) };
+        // Repeat while the outcome is undecided — the repeat is what makes
+        // the force path reachable. Both terminal paths write the done-file
+        // immediately before exiting, so once it exists the run is decided
+        // and signaling stops: a kill past that point could only land on
+        // teardown, where delivery is no longer guaranteed.
+        if !done_path.exists() {
+            unsafe { libc::kill(pid, libc::SIGINT) };
+        }
         for _ in 0..10 {
             if child.try_wait().expect("child is waitable").is_some() {
                 break;
