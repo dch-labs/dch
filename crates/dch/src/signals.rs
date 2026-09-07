@@ -318,6 +318,34 @@ pub fn install_cancel_handler(
     CancelBridge { stop, task }
 }
 
+/// Install a construction-phase interrupt handler.
+///
+/// Before the runner exists there is nothing to cancel cooperatively, so
+/// any SIGINT or SIGTERM during construction runs `on_interrupt` — a host
+/// hook for durable state, such as the done-file marker — and exits the
+/// process with 130. Listeners are registered before this function
+/// returns, closing the default-disposition window an unaided spawn would
+/// have.
+///
+/// Stop the returned bridge once the full bridge is installed; the two
+/// may briefly overlap, where an interrupt fails closed through the
+/// construction hook.
+pub fn install_construction_handler(on_interrupt: impl Fn() + Send + 'static) -> CancelBridge {
+    let (stop, mut stop_rx) = tokio::sync::watch::channel(false);
+    let mut source = InterruptSource::Listeners(InterruptListeners::install());
+    let task = tokio::spawn(async move {
+        tokio::select! {
+            _ = stop_rx.changed() => {}
+            () = source.wait() => {
+                eprintln!("dch: interrupt received during startup — exiting (130)");
+                on_interrupt();
+                std::process::exit(130);
+            }
+        }
+    });
+    CancelBridge { stop, task }
+}
+
 /// A handle over the interrupt bridge installed for one run.
 ///
 /// Stopping the bridge ends its task: the listeners unsubscribe, the

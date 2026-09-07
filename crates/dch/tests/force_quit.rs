@@ -123,3 +123,52 @@ fn interrupts_exit_130_and_leave_a_done_file() {
         }
     }
 }
+
+/// A signal during the construction phase — here a stdin prompt that never
+/// completes — must take the startup handler's path: the done-file hook
+/// runs and the process exits 130, instead of dying on the default
+/// disposition with no marker for a polling orchestrator.
+#[test]
+fn signal_during_startup_writes_the_done_file_and_exits_130() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let done_path = dir.path().join("done.json");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dch"))
+        .arg("--headless")
+        .arg("--done-file")
+        .arg(&done_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("child spawned");
+
+    // No config file: prompt resolution reads the held-open stdin pipe and
+    // blocks, keeping the child in its construction phase.
+    std::thread::sleep(Duration::from_millis(400));
+    let pid = child.id().cast_signed();
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(15))
+        .expect("deadline computable");
+    loop {
+        if let Some(status) = child.try_wait().expect("child is waitable") {
+            assert_eq!(
+                status.code(),
+                Some(130),
+                "a startup signal must exit 130, not {status}"
+            );
+            assert!(
+                done_path.exists(),
+                "the startup handler writes the done-file before exiting"
+            );
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the child never exited after the startup signal"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}

@@ -18,6 +18,10 @@ use loopctl::error::LoopError;
 use crate::args::Args;
 use crate::done::{DoneStatus, write_done_file};
 
+/// The done-file message the force path writes, distinguishing a repeated
+/// interrupt from the cooperative cancellation a single one produces.
+const FORCE_CANCEL_MESSAGE: &str = "cancelled by a repeated interrupt";
+
 /// The outcome of a headless run: the process exit code and any status
 /// message for the done-file.
 ///
@@ -139,7 +143,17 @@ pub async fn run_headless(args: &Args) -> u8 {
 /// Returns the construction-phase failure outcome when the config, agent,
 /// or prompt cannot be resolved.
 async fn run_headless_inner(args: &Args) -> Result<HeadlessOutcome, HeadlessOutcome> {
-    let prompt = resolve_prompt(args).map_err(|message| construction_failure(args, message))?;
+    let startup_args = args.clone();
+    let startup_bridge = crate::signals::install_construction_handler(move || {
+        write_done_file_if_requested(
+            &startup_args,
+            &HeadlessOutcome::failure(130, "cancelled during startup"),
+        );
+    });
+
+    let prompt = resolve_prompt_nonblocking(args)
+        .await
+        .map_err(|message| construction_failure(args, message))?;
 
     let mut config = load_config(args.config.config_path.as_deref())
         .map_err(|message| construction_failure(args, message))?;
@@ -164,9 +178,10 @@ async fn run_headless_inner(args: &Args) -> Result<HeadlessOutcome, HeadlessOutc
     let bridge = crate::signals::install_cancel_handler(runner.cancel_signal(), move || {
         write_done_file_if_requested(
             &force_args,
-            &HeadlessOutcome::failure(130, "cancelled by a repeated interrupt"),
+            &HeadlessOutcome::failure(130, FORCE_CANCEL_MESSAGE),
         );
     });
+    startup_bridge.stop().await;
 
     let run_result = runner.run(&prompt).await;
     bridge.stop().await;
@@ -190,6 +205,33 @@ fn construction_failure(args: &Args, message: impl Into<String>) -> HeadlessOutc
     let outcome = HeadlessOutcome::failure(1, message);
     write_done_file_if_requested(args, &outcome);
     outcome
+}
+
+/// Resolve the prompt from the parsed arguments without blocking the
+/// runtime thread.
+///
+/// The fast paths — explicit text, terminal-stdin usage errors — resolve
+/// synchronously; a piped-stdin read, potentially unbounded, runs on the
+/// blocking pool so the startup interrupt bridge stays live while it
+/// waits. See [`resolve_prompt_with`] for the full rules.
+///
+/// # Errors
+///
+/// Returns an error message when no usable prompt exists.
+async fn resolve_prompt_nonblocking(args: &Args) -> Result<String, String> {
+    if args
+        .headless
+        .as_deref()
+        .is_some_and(|text| !text.trim().is_empty())
+        || std::io::stdin().is_terminal()
+    {
+        return resolve_prompt(args);
+    }
+    let read = tokio::task::spawn_blocking(read_stdin_prompt);
+    let piped = read
+        .await
+        .unwrap_or_else(|err| Err(format!("stdin read task failed: {err}")));
+    resolve_prompt_with(args.headless.as_deref(), move || piped, || false)
 }
 
 /// Resolve the prompt from the parsed arguments.
@@ -441,6 +483,20 @@ mod tests {
         assert!(!outcome.success);
         assert_eq!(outcome.turns, Some(0), "counts survive for the done-file");
         assert_eq!(outcome.tools_used, Some(0));
+    }
+
+    #[test]
+    fn the_force_path_writes_its_distinguishing_done_file_message() {
+        // The e2e accepts either terminal path; this pins the content that
+        // distinguishes the force hook's write from a cooperative cancel.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("done.json");
+        let args = parse(&["--headless", "x", "--done-file", path.to_str().unwrap()]);
+        write_done_file_if_requested(&args, &HeadlessOutcome::failure(130, FORCE_CANCEL_MESSAGE));
+        let written: DoneStatus =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written.message.as_deref(), Some(FORCE_CANCEL_MESSAGE));
+        assert_eq!(written.turns, None);
     }
 
     #[test]

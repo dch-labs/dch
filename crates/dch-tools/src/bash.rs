@@ -916,6 +916,11 @@ mod tests {
         assert!(prompt.unwrap().contains("Bash"));
     }
 
+    fn tail_of(text: &str, n: usize) -> String {
+        let skip = text.chars().count().saturating_sub(n);
+        text.chars().skip(skip).collect()
+    }
+
     fn ctx_in(cwd: &str) -> ToolContext {
         let mut ctx = ToolContext::default();
         ctx.cwd = cwd.to_string();
@@ -1005,18 +1010,11 @@ mod tests {
         let out = tool.call(input, &ctx).await.unwrap();
         // Output + metadata line should be under the cap + a small margin.
         let text = out.text_content();
-        let tail: String = text
-            .chars()
-            .rev()
-            .take(120)
-            .collect::<Vec<_>>()
-            .iter()
-            .rev()
-            .collect();
         assert!(
             text.len() < MAX_OUTPUT_BYTES + 512,
-            "output was {} bytes, tail: {tail:?}",
-            text.len()
+            "output was {} bytes, tail: {:?}",
+            text.len(),
+            tail_of(&text, 120)
         );
     }
 
@@ -1030,19 +1028,12 @@ mod tests {
         let input = json!({ "command": "yes y | head -c 10000000" });
         let out = tool.call(input, &ctx).await.unwrap();
         let text = out.text_content();
-        let tail: String = text
-            .chars()
-            .rev()
-            .take(120)
-            .collect::<Vec<_>>()
-            .iter()
-            .rev()
-            .collect();
         assert!(
             text.len() < MAX_OUTPUT_BYTES + 512,
-            "output was {} bytes, should be bounded to ~{}, tail: {tail:?}",
+            "output was {} bytes, should be bounded to ~{}, tail: {:?}",
             text.len(),
-            MAX_OUTPUT_BYTES
+            MAX_OUTPUT_BYTES,
+            tail_of(&text, 120)
         );
     }
 
