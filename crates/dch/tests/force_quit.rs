@@ -249,78 +249,144 @@ fn interrupts_exit_130_and_leave_a_done_file() {
     );
 }
 
-/// A signal during the construction phase — here a stdin prompt that never
-/// completes — must take the startup handler's path: the done-file hook
-/// runs and the process exits 130, instead of dying on the default
-/// disposition with no marker for a polling orchestrator.
 #[test]
 fn signal_during_startup_writes_the_done_file_and_exits_130() {
     let dir = tempfile::tempdir().expect("temp dir");
     let done_path = dir.path().join("done.json");
+    let (status, stderr, _) = startup_signal_outcome(&done_path, dir.path(), false);
+    assert_eq!(
+        status.code(),
+        Some(130),
+        "a startup signal must exit 130, not {status}\nchild stderr:\n{}",
+        stderr.so_far()
+    );
+    assert!(
+        done_path.exists(),
+        "the startup handler writes the done-file before exiting"
+    );
+}
 
-    // No config file and an isolated HOME (the default lookup is
-    // `~/.dch`): prompt resolution reads the held-open stdin pipe and
-    // blocks, keeping the child in its construction phase.
-    //
-    // The generous grace covers process start to listener registration.
-    // A signal landing inside that (millisecond-scale) window still kills
-    // by default disposition — the one flake this test can only tolerate
-    // from outside — so exactly one such death is retried on a fresh
-    // child rather than misread as a product regression.
-    let (mut child, stderr) = {
-        let mut attempts_left = 1;
+#[test]
+fn an_immediate_startup_signal_exits_130_with_the_done_file() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let done_path = dir.path().join("done.json");
+    let (status, stderr, early_exercised) = startup_signal_outcome(&done_path, dir.path(), true);
+    assert!(
+        early_exercised,
+        "the immediate signal must be exercised — a provoked death observed or \
+         an early send handled — not silently degraded to the delayed scenario"
+    );
+    assert_eq!(
+        status.code(),
+        Some(130),
+        "an immediate signal must still exit 130, not {status}\nchild stderr:\n{}",
+        stderr.so_far()
+    );
+    assert!(
+        done_path.exists(),
+        "every arm of the retry leaves the done-file behind"
+    );
+}
+
+/// Drive the startup-signal scenario through its retry loop and return
+/// the terminal status with the captured stderr of the deciding attempt.
+///
+/// Each attempt runs with no config file and an isolated HOME, so prompt
+/// resolution reads the held-open stdin pipe and blocks, keeping the
+/// child in its construction phase. The grace covers process start to
+/// listener registration; a signal landing inside that
+/// (millisecond-scale) window still kills by default disposition — the
+/// flake this harness can only tolerate from outside. Two distinct
+/// races are budgeted separately so a loaded runner cannot spend them
+/// on one another: the provoked pre-registration race (signaled at
+/// spawn on every attempt while its budget lasts; a death there retries
+/// from the same budget) and the slow-start race (registration
+/// outlasting the fixed grace, one retry). The returned flag states
+/// whether the early path was exercised — a provoked death observed or
+/// an early send handled — so the immediate-signal test fails loudly
+/// instead of passing on a silently delayed scenario.
+fn startup_signal_outcome(
+    done_path: &Path,
+    home: &Path,
+    early_signal: bool,
+) -> (std::process::ExitStatus, StderrCapture, bool) {
+    let mut provoked_retries_left: usize = 3;
+    let mut slow_start_retries_left: usize = 1;
+    let mut provoked_death_seen = false;
+    'attempt: loop {
+        let mut spawned = Command::new(env!("CARGO_BIN_EXE_dch"))
+            .arg("--headless")
+            .arg("--done-file")
+            .arg(done_path)
+            .env("HOME", home)
+            .env("XDG_CONFIG_HOME", home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("child spawned");
+        let stderr = StderrCapture::spawn(&mut spawned);
+        let mut child = KillOnDrop(&mut spawned);
+        let sent_early = early_signal && provoked_retries_left > 0;
+        if sent_early {
+            let pid = child.id().cast_signed();
+            unsafe { libc::kill(pid, libc::SIGTERM) };
+        }
+        std::thread::sleep(Duration::from_millis(1500));
+        match child.try_wait().expect("child is waitable") {
+            Some(status)
+                if unix_signal(status) == Some(libc::SIGTERM)
+                    && sent_early
+                    && provoked_retries_left > 0 =>
+            {
+                provoked_retries_left = provoked_retries_left.saturating_sub(1);
+                provoked_death_seen = true;
+                continue;
+            }
+            Some(status)
+                if unix_signal(status) == Some(libc::SIGTERM)
+                    && !sent_early
+                    && slow_start_retries_left > 0 =>
+            {
+                slow_start_retries_left = slow_start_retries_left.saturating_sub(1);
+                continue;
+            }
+            // An early signal the child had time to register for is a
+            // handled exit, not a broken premise — the deciding status.
+            Some(status) if early_signal && status.code() == Some(130) => {
+                break 'attempt (status, stderr, sent_early || provoked_death_seen);
+            }
+            Some(status) => panic!(
+                "the child exited before the startup signal — the prompt no \
+                 longer blocks: {status}\nchild stderr:\n{}",
+                stderr.so_far()
+            ),
+            None => {}
+        }
+        let pid = child.id().cast_signed();
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(15))
+            .expect("deadline computable");
         loop {
-            let mut spawned = Command::new(env!("CARGO_BIN_EXE_dch"))
-                .arg("--headless")
-                .arg("--done-file")
-                .arg(&done_path)
-                .env("HOME", dir.path())
-                .stdin(Stdio::piped())
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("child spawned");
-            let stderr = StderrCapture::spawn(&mut spawned);
-            std::thread::sleep(Duration::from_millis(1500));
-            match spawned.try_wait().expect("child is waitable") {
-                None => break (spawned, stderr),
-                Some(status) if unix_signal(status) == Some(libc::SIGTERM) && attempts_left > 0 => {
-                    attempts_left -= 1;
+            match child.try_wait().expect("child is waitable") {
+                Some(status)
+                    if unix_signal(status) == Some(libc::SIGTERM)
+                        && slow_start_retries_left > 0 =>
+                {
+                    slow_start_retries_left = slow_start_retries_left.saturating_sub(1);
+                    break;
                 }
-                Some(status) => panic!(
-                    "the child exited before the startup signal — the prompt no \
-                     longer blocks: {status}\nchild stderr:\n{}",
+                Some(status) => {
+                    break 'attempt (status, stderr, sent_early || provoked_death_seen);
+                }
+                None => assert!(
+                    Instant::now() < deadline,
+                    "the child never exited after the startup signal\nchild stderr:\n{}",
                     stderr.so_far()
                 ),
             }
+            std::thread::sleep(Duration::from_millis(50));
         }
-    };
-    let mut child = KillOnDrop(&mut child);
-    let pid = child.id().cast_signed();
-    unsafe { libc::kill(pid, libc::SIGTERM) };
-
-    let deadline = Instant::now()
-        .checked_add(Duration::from_secs(15))
-        .expect("deadline computable");
-    loop {
-        if let Some(status) = child.try_wait().expect("child is waitable") {
-            assert_eq!(
-                status.code(),
-                Some(130),
-                "a startup signal must exit 130, not {status}\nchild stderr:\n{}",
-                stderr.so_far()
-            );
-            assert!(
-                done_path.exists(),
-                "the startup handler writes the done-file before exiting"
-            );
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the child never exited after the startup signal\nchild stderr:\n{}",
-            stderr.so_far()
-        );
-        std::thread::sleep(Duration::from_millis(50));
     }
 }

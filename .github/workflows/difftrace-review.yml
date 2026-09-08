@@ -16,8 +16,13 @@
 # FIFO without dropping (up to 100 pending; beyond that, arrivals are
 # canceled); every job uploads its review trajectory as an always-on
 # 7-day artifact. Fork and dependabot pull requests are rejected there
-# too, but this caller skips them up front so its terminal state never
-# depends on callee step ordering.
+# too, and this caller skips them up front where the event payload
+# carries the fact: fork status only on the PR and review-comment
+# events, the author on every path — an issue comment on a fork PR is
+# left to the callee's rejection. Comment-triggered runs additionally
+# start only for owners, members, and collaborators, so the secrets this
+# job carries never enter an unauthorized comment's environment; the
+# callee's gate re-checks with write on its side.
 name: difftrace review
 
 on:
@@ -43,9 +48,13 @@ permissions:
 jobs:
   review:
     if: >-
+      (github.event_name != 'issue_comment' && github.event_name != 'pull_request_review_comment' ||
+       contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)) &&
       (github.event_name != 'issue_comment' || github.event.issue.pull_request != null) &&
       github.event.pull_request.user.login != 'dependabot[bot]' &&
-      github.event.pull_request.head.repo.fork != true
+      github.event.issue.user.login != 'dependabot[bot]' &&
+      github.event.pull_request.head.repo.fork != true &&
+      !endsWith(github.event.comment.user.login, '[bot]')
     uses: dch-labs/difftrace/.github/workflows/review.yml@a272e47e1826be342d360227c60ba598b1d4f201 # v0.11.3
     with:
       pr: ${{ github.event.pull_request.number || (github.event.issue.pull_request != null && github.event.issue.number) || inputs.pr }}

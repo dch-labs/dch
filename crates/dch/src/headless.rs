@@ -9,6 +9,7 @@
 use std::io::{IsTerminal, Read};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use dch_config::Verbosity;
 use dch_loop::ConsoleObserver;
@@ -153,7 +154,9 @@ pub async fn run_headless(args: &Args, startup_bridge: crate::signals::CancelBri
 /// done-file status info. Finalization — the done-file write — runs
 /// before the run bridge is stopped, so an interrupt landing during the
 /// write fails closed through the force hook rather than killing the
-/// process with no marker.
+/// process with no marker. Once the run's own marker is written the
+/// force hook stands down: a repeat interrupt still exits 130, but the
+/// recorded outcome survives in the done-file.
 ///
 /// # Errors
 ///
@@ -170,15 +173,13 @@ async fn run_headless_inner(
             return Err(outcome);
         }
     };
-    let ConstructedRun { prompt, runner } = built;
-    let mut runner = runner;
+    let ConstructedRun { prompt, mut runner } = built;
 
     let force_args = args.clone();
+    let outcome_recorded = Arc::new(AtomicBool::new(false));
+    let hook_recorded = Arc::clone(&outcome_recorded);
     let bridge = crate::signals::install_cancel_handler(runner.cancel_signal(), move || {
-        write_done_file_if_requested(
-            &force_args,
-            &HeadlessOutcome::failure(130, FORCE_CANCEL_MESSAGE),
-        );
+        write_force_marker_unless_recorded(&force_args, &hook_recorded);
     });
     startup_bridge.stop().await;
 
@@ -187,6 +188,7 @@ async fn run_headless_inner(
         Err(err) => {
             let outcome = HeadlessOutcome::from_loop_error(&err);
             write_done_file_if_requested(args, &outcome);
+            outcome_recorded.store(true, Ordering::SeqCst);
             bridge.stop().await;
             return Err(outcome);
         }
@@ -194,8 +196,23 @@ async fn run_headless_inner(
 
     let outcome = HeadlessOutcome::from_run(&run);
     write_done_file_if_requested(args, &outcome);
+    outcome_recorded.store(true, Ordering::SeqCst);
     bridge.stop().await;
     Ok(outcome)
+}
+
+/// The force hook's marker write, stood down once a run outcome exists.
+///
+/// The bridge stays armed through the run's own finalization so an
+/// interrupt during the write fails closed; after that write completes,
+/// the recorded outcome is authoritative — a repeat interrupt still
+/// exits 130 through the force path, but no longer replaces the
+/// done-file's real outcome with the fixed cancel message.
+fn write_force_marker_unless_recorded(args: &Args, recorded: &AtomicBool) {
+    if recorded.load(Ordering::SeqCst) {
+        return;
+    }
+    write_done_file_if_requested(args, &HeadlessOutcome::failure(130, FORCE_CANCEL_MESSAGE));
 }
 
 /// The product of a successful construction phase.
@@ -574,6 +591,30 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(written.message.as_deref(), Some(FORCE_CANCEL_MESSAGE));
         assert_eq!(written.turns, None);
+    }
+
+    #[test]
+    fn the_force_hook_stands_down_once_an_outcome_is_recorded() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("done.json");
+        let args = parse(&["--headless", "x", "--done-file", path.to_str().unwrap()]);
+
+        let recorded = AtomicBool::new(false);
+        write_force_marker_unless_recorded(&args, &recorded);
+        let first: DoneStatus =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(first.message.as_deref(), Some(FORCE_CANCEL_MESSAGE));
+
+        write_done_file_if_requested(&args, &HeadlessOutcome::failure(2, "engine error text"));
+        recorded.store(true, Ordering::SeqCst);
+        write_force_marker_unless_recorded(&args, &recorded);
+        let final_status: DoneStatus =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            final_status.message.as_deref(),
+            Some("engine error text"),
+            "a recorded outcome is authoritative — the hook must not replace it"
+        );
     }
 
     #[test]

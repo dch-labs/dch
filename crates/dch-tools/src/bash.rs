@@ -45,6 +45,22 @@ const MAX_TIMEOUT_SECS: u64 = 600;
 /// plus the join and metadata line.
 const MAX_OUTPUT_BYTES: usize = 1_000_000;
 
+/// The marker appended wherever captured output was capped.
+///
+/// One wording across every path — the live command's streams, a
+/// render-time over-cap join, a stored job payload's middle cut — so a
+/// consumer keying on the marker finds all of them.
+const TRUNCATION_MARKER: &str = "...[output truncated]";
+
+/// Display bound for a command rendered in job output, in bytes.
+///
+/// The `jobs` listing and the `job_status` header interpolate the
+/// command verbatim, and nothing bounds the model's input — a huge
+/// command would re-open the unbounded listing hole the payload work
+/// closed, and would outgrow the header room [`cap_job_payload`]
+/// reserves. Renderings show at most this many bytes of it.
+const MAX_COMMAND_SUMMARY_BYTES: usize = 256;
+
 /// Commands that are safe to run concurrently (read-only).
 ///
 /// Matched as boundary-aware prefixes of the trimmed command — `cargo
@@ -225,7 +241,7 @@ fn spawn_background_job(command: &str, cwd: &str, timeout_secs: u64) -> u64 {
 
     tokio::spawn(async move {
         let exec = Box::pin(execute_command(&owned_command, &owned_cwd));
-        let (text, is_error) = match tokio::time::timeout(timeout, exec).await {
+        let (mut text, is_error) = match tokio::time::timeout(timeout, exec).await {
             Ok(result) => result.map_or_else(
                 |e| (e.to_string(), true),
                 |o| (o.text_content(), o.is_error),
@@ -235,6 +251,7 @@ fn spawn_background_job(command: &str, cwd: &str, timeout_secs: u64) -> u64 {
                 true,
             ),
         };
+        cap_job_payload(&mut text);
         let status = if is_error {
             JobStatus::Failed(text)
         } else {
@@ -310,6 +327,18 @@ fn prune_terminal_jobs(table: &mut BTreeMap<u64, BackgroundJob>) {
     for id in evict {
         table.remove(&id);
     }
+}
+
+/// A display-bounded rendering of a job's command.
+///
+/// The stored command stays verbatim; only renderings pass through
+/// here, so a pathological command cannot outgrow the job output's
+/// caps. Uses [`truncate_string`], so an elided command carries
+/// [`TRUNCATION_MARKER`] like any other cut.
+fn command_summary(command: &str) -> String {
+    let mut summary = command.to_string();
+    truncate_string(&mut summary, MAX_COMMAND_SUMMARY_BYTES);
+    summary
 }
 
 /// A payload-free status rendering for the `jobs` listing.
@@ -530,7 +559,14 @@ fn dispatch_operation(operation: &str, input: &Value) -> Result<ToolOutput, Tool
                 "No background jobs.".to_string()
             } else {
                 jobs.iter()
-                    .map(|j| format!("  [{}] {} — {}", j.id, j.command, job_summary(&j.status)))
+                    .map(|j| {
+                        format!(
+                            "  [{}] {} — {}",
+                            j.id,
+                            command_summary(&j.command),
+                            job_summary(&j.status)
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join("\n")
             };
@@ -543,7 +579,12 @@ fn dispatch_operation(operation: &str, input: &Value) -> Result<ToolOutput, Tool
                 .ok_or_else(|| ToolError::InvalidInput("job_status requires job_id".to_string()))?;
             match get_job(id) {
                 Some(job) => {
-                    let mut text = format!("[{}] {}: {}", job.id, job.command, job.status);
+                    let mut text = format!(
+                        "[{}] {}: {}",
+                        job.id,
+                        command_summary(&job.command),
+                        job.status
+                    );
                     truncate_string(&mut text, MAX_OUTPUT_BYTES);
                     Ok(ToolOutput::text(text))
                 }
@@ -628,7 +669,8 @@ async fn execute_command(command: &str, cwd: &str) -> Result<ToolOutput, ToolErr
         format!("{stdout}\n{stderr}")
     };
     if stdout_cut || stderr_cut {
-        body.push_str("\n...[output truncated]");
+        body.push('\n');
+        body.push_str(TRUNCATION_MARKER);
     }
 
     let output_text = format!("{body}\n[exit {exit_code}, {duration_ms}ms]");
@@ -643,9 +685,12 @@ async fn execute_command(command: &str, cwd: &str) -> Result<ToolOutput, ToolErr
 ///
 /// Once the cap is reached, the remaining output is drained to EOF (so the
 /// pipe doesn't block the child) but not stored, preventing unbounded memory
-/// growth from commands that produce gigabytes of output. The returned flag
-/// reports whether that happened, so the caller can mark the truncation for
-/// the model instead of cutting silently.
+/// growth from commands that produce gigabytes of output. The lossy
+/// UTF-8 conversion can itself overshoot the cap — invalid bytes expand
+/// up to three-to-one under replacement — so the converted text is
+/// re-cut to the cap here. The returned flag reports either overflow, so
+/// the caller can mark the truncation for the model instead of cutting
+/// silently.
 async fn read_bounded<R>(stream: &mut R, max_bytes: usize) -> (String, bool)
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -671,18 +716,28 @@ where
             }
         }
     }
-    (String::from_utf8_lossy(&buf).into_owned(), truncated)
+    let mut text = String::from_utf8_lossy(&buf).into_owned();
+    if text.len() > max_bytes {
+        truncated = true;
+        let mut cut = max_bytes;
+        while !text.is_char_boundary(cut) && cut > 0 {
+            cut = cut.saturating_sub(1);
+        }
+        text.truncate(cut);
+    }
+    (text, truncated)
 }
 
 /// Truncate `s` in place to at most `max_bytes`, landing on a UTF-8 char boundary.
 ///
 /// If `s` already fits, it is left untouched. Otherwise the cut point walks
 /// back from `max_bytes` to the preceding char boundary so the result stays
-/// valid UTF-8, the tail is dropped, and a `...[truncated]` marker is appended
+/// valid UTF-8, the tail is dropped, and a [`TRUNCATION_MARKER`] is appended
 /// so the model can see the output was capped. Used on renderings that
 /// combine independently capped streams — a job payload joining capped
 /// stdout and stderr can exceed the cap by construction; the live command
-/// path marks its own truncation at the source instead.
+/// path marks its own truncation at the source instead, and a stored job
+/// payload is capped by [`cap_job_payload`] before it ever reaches here.
 fn truncate_string(s: &mut String, max_bytes: usize) {
     if s.len() <= max_bytes {
         return;
@@ -692,7 +747,46 @@ fn truncate_string(s: &mut String, max_bytes: usize) {
         cut = cut.saturating_sub(1);
     }
     s.truncate(cut);
-    s.push_str("...[truncated]");
+    s.push_str(TRUNCATION_MARKER);
+}
+
+/// Cap a stored job payload, cutting from the middle so both ends
+/// survive.
+///
+/// A completed job's text joins two independently capped streams, so it
+/// can reach twice the render cap; a head-only cut would drop the
+/// stderr tail and the `[exit …]` line — the parts a failed
+/// high-output job is polled for. The middle cut keeps the head of the
+/// stdout and the tail (the stderr end, any stream markers, the exit
+/// metadata) with [`TRUNCATION_MARKER`] naming the elided span. The
+/// halves are sized to leave room for the header `job_status` prepends
+/// at render time — the id, the [`command_summary`]-bounded command,
+/// and the status prefix stay under the reservation by construction —
+/// so the render-time cut is a last-resort guard, not the plan. The
+/// threshold carries the reservation too: a payload that lands just
+/// under the cap but leaves no header room is cut like any other.
+fn cap_job_payload(text: &mut String) {
+    let reserved = 512usize
+        .saturating_add(TRUNCATION_MARKER.len())
+        .saturating_add(2);
+    if text.len().saturating_add(reserved) <= MAX_OUTPUT_BYTES {
+        return;
+    }
+    let keep = MAX_OUTPUT_BYTES.saturating_sub(reserved) / 2;
+    let mut head_end = keep;
+    while !text.is_char_boundary(head_end) && head_end > 0 {
+        head_end = head_end.saturating_sub(1);
+    }
+    let mut tail_start = text.len().saturating_sub(keep);
+    while !text.is_char_boundary(tail_start) && tail_start < text.len() {
+        tail_start = tail_start.saturating_add(1);
+    }
+    let tail = text.split_off(tail_start);
+    text.truncate(head_end);
+    text.push('\n');
+    text.push_str(TRUNCATION_MARKER);
+    text.push('\n');
+    text.push_str(&tail);
 }
 
 /// Check whether a command is read-only (safe to run concurrently).
@@ -949,8 +1043,9 @@ mod tests {
     fn truncate_string_cuts_at_boundary() {
         let mut s = "hello".repeat(300_000); // 1.5 MB
         truncate_string(&mut s, MAX_OUTPUT_BYTES);
-        assert!(s.len() <= MAX_OUTPUT_BYTES + 20); // +20 for truncation suffix
-        assert!(s.ends_with("[truncated]"));
+        // +24 covers the truncation suffix.
+        assert!(s.len() <= MAX_OUTPUT_BYTES + 24);
+        assert!(s.ends_with(TRUNCATION_MARKER));
     }
 
     #[test]
@@ -958,7 +1053,64 @@ mod tests {
         let mut s = "€".repeat(400_000); // 1.2 MB, multibyte
         truncate_string(&mut s, MAX_OUTPUT_BYTES);
         // Must land on a char boundary — no panic from String::truncate.
-        assert!(s.len() <= MAX_OUTPUT_BYTES + 20);
+        assert!(s.len() <= MAX_OUTPUT_BYTES + 24);
+    }
+
+    #[test]
+    fn cap_job_payload_cuts_payloads_that_leave_no_header_room() {
+        let mut s = "x".repeat(MAX_OUTPUT_BYTES - 100);
+        cap_job_payload(&mut s);
+        assert!(
+            s.len() < MAX_OUTPUT_BYTES - 300,
+            "the render header must fit after the cut, retained {}",
+            s.len()
+        );
+        assert!(s.contains(TRUNCATION_MARKER));
+    }
+
+    #[test]
+    fn cap_job_payload_leaves_small_payloads_untouched() {
+        let mut s = "out\n[exit 0, 12ms]".to_string();
+        cap_job_payload(&mut s);
+        assert_eq!(s, "out\n[exit 0, 12ms]");
+    }
+
+    #[test]
+    fn cap_job_payload_keeps_both_ends_and_the_exit_line() {
+        // 1 MB of stdout head plus a stderr tail and exit line: together
+        // past the cap, so the middle is elided.
+        let mut s = format!(
+            "{}\nboom: real failure text\n[exit 3, 45ms]",
+            "x".repeat(MAX_OUTPUT_BYTES)
+        );
+        let original_head = s.get(..32).map(str::to_string).unwrap_or_default();
+        cap_job_payload(&mut s);
+        assert!(
+            s.len() <= MAX_OUTPUT_BYTES - 512 + 16,
+            "the capped payload leaves header room under the render cap: {}",
+            s.len()
+        );
+        assert!(
+            s.starts_with(&original_head),
+            "the stdout head survives the middle cut"
+        );
+        assert!(
+            s.ends_with("boom: real failure text\n[exit 3, 45ms]"),
+            "the stderr tail and exit line must survive the middle cut"
+        );
+        assert!(
+            s.contains(TRUNCATION_MARKER),
+            "the elided middle is named by the shared marker"
+        );
+    }
+
+    #[test]
+    fn cap_job_payload_lands_on_char_boundaries() {
+        let mut s = format!("€{}", "y".repeat(MAX_OUTPUT_BYTES));
+        cap_job_payload(&mut s);
+        // No panic from split_off/truncate on a multibyte head — both
+        // cut points walked to boundaries first.
+        assert!(s.contains(TRUNCATION_MARKER));
     }
 
     #[tokio::test]
@@ -996,6 +1148,24 @@ mod tests {
         let (result, truncated) = read_bounded(&mut cursor, MAX_OUTPUT_BYTES).await;
         assert_eq!(result, data);
         assert!(!truncated);
+    }
+
+    #[tokio::test]
+    async fn read_bounded_caps_the_lossy_expansion_of_invalid_utf8() {
+        use std::io::Cursor;
+        // 5k invalid bytes sit under a 10k raw cap but expand to ~15k of
+        // replacement characters — the conversion itself must be re-cut.
+        let mut cursor = Cursor::new(vec![0xFFu8; 5_000]);
+        let (text, truncated) = read_bounded(&mut cursor, 10_000).await;
+        assert!(
+            truncated,
+            "lossy expansion past the cap must report overflow"
+        );
+        assert!(
+            text.len() <= 10_000,
+            "retained {} bytes after conversion, cap is 10000",
+            text.len()
+        );
     }
 
     #[tokio::test]
@@ -1318,6 +1488,109 @@ mod tests {
         assert_bounded(&text, 512);
     }
 
+    #[test]
+    fn command_summary_bounds_a_pathological_command() {
+        let long = "x".repeat(10_000);
+        let summary = command_summary(&long);
+        assert!(
+            summary.len() <= MAX_COMMAND_SUMMARY_BYTES + TRUNCATION_MARKER.len(),
+            "an elided command stays within the display bound plus marker"
+        );
+        assert!(summary.contains(TRUNCATION_MARKER));
+        assert_eq!(command_summary("echo hi"), "echo hi");
+    }
+
+    #[tokio::test]
+    async fn a_long_command_job_keeps_its_exit_line_in_job_status() {
+        let _guard = JOB_TEST_GUARD.lock().await;
+        reset_job_table();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let tool = BashTool;
+        let ctx = ctx_in(cwd);
+
+        // Past the header reservation even after the display bound's
+        // marker: the exit line must still survive the rendering.
+        let command = format!("echo {} && echo marker-done", "x".repeat(600));
+        let out = tool
+            .call(json!({ "command": command, "background": true }), &ctx)
+            .await
+            .unwrap();
+        let id: u64 = out
+            .text_content()
+            .split("job ")
+            .nth(1)
+            .and_then(|s| s.split(':').next())
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+
+        let mut text = String::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let out = tool
+                .call(
+                    json!({ "command": "", "operation": "job_status", "job_id": id }),
+                    &ctx,
+                )
+                .await
+                .unwrap();
+            text = out.text_content();
+            if text.contains("Completed") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(text.contains("Completed"), "job must finish: {text}");
+        assert!(
+            text.contains("marker-done"),
+            "the payload survives the rendering: {text}"
+        );
+        assert!(
+            text.contains("[exit 0"),
+            "a long command must not push the render into a tail cut: {text}"
+        );
+        assert_bounded(&text, 600);
+    }
+
+    #[tokio::test]
+    async fn jobs_listing_bounds_a_long_command() {
+        let _guard = JOB_TEST_GUARD.lock().await;
+        reset_job_table();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let tool = BashTool;
+        let ctx = ctx_in(cwd);
+
+        let command = format!("echo {}", "y".repeat(600));
+        tool.call(json!({ "command": command, "background": true }), &ctx)
+            .await
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while list_jobs()
+            .iter()
+            .any(|job| job.status == JobStatus::Running)
+            && Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let out = tool
+            .call(json!({ "command": "", "operation": "jobs" }), &ctx)
+            .await
+            .unwrap();
+        let text = out.text_content();
+        assert!(
+            text.contains(TRUNCATION_MARKER),
+            "an over-bound command is elided in the listing: {text}"
+        );
+        assert!(
+            !text
+                .lines()
+                .any(|line| line.len() > MAX_COMMAND_SUMMARY_BYTES + 200),
+            "every listing line stays within the display bound's reach"
+        );
+    }
+
     #[tokio::test]
     async fn terminal_jobs_are_evicted_beyond_the_retention_cap() {
         let _guard = JOB_TEST_GUARD.lock().await;
@@ -1419,6 +1692,59 @@ mod tests {
         assert!(
             text.contains("timed out"),
             "failure message should mention timeout: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_high_output_job_keeps_its_exit_line_in_job_status() {
+        let _guard = JOB_TEST_GUARD.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let tool = BashTool;
+        let ctx = ctx_in(cwd);
+
+        // Both streams past the per-stream cap: the joined payload
+        // reaches twice the render cap, so an uncapped store would push
+        // the exit line out of any head-only cut.
+        let spawn_input = json!({
+            "command": "head -c 1200000 /dev/zero | tr '\\0' 'x'; \
+                        head -c 1200000 /dev/zero | tr '\\0' 'e' >&2; exit 3",
+            "background": true
+        });
+        let out = tool.call(spawn_input, &ctx).await.unwrap();
+        let id: u64 = out
+            .text_content()
+            .split("job ")
+            .nth(1)
+            .and_then(|s| s.split(':').next())
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let text = loop {
+            let status_input = json!({ "command": "", "operation": "job_status", "job_id": id });
+            let out = tool.call(status_input, &ctx).await.unwrap();
+            let text = out.text_content();
+            if !text.contains("Running") || Instant::now() > deadline {
+                break text;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+
+        assert!(
+            text.contains("[exit 3,"),
+            "the exit line must survive the payload cap: {}",
+            tail_of(&text, 200)
+        );
+        assert!(
+            text.contains(TRUNCATION_MARKER),
+            "the elided middle must be named: {}",
+            tail_of(&text, 200)
+        );
+        assert!(
+            text.len() <= MAX_OUTPUT_BYTES + 16,
+            "the rendered status stays within the cap: {}",
+            text.len()
         );
     }
 

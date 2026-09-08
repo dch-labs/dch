@@ -3,12 +3,13 @@
 //! [`install_cancel_handler`] connects SIGINT and SIGTERM to the agent's
 //! shared [`CancelSignal`]: the first interrupt asks the loop to stop at
 //! its next cooperative check point, and a second interrupt within the
-//! coalescing window runs the force hook and exits immediately.
+//! repeat window runs the force hook and exits immediately.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use loopctl::cancel::CancelSignal;
+#[cfg(any(unix, windows))]
 use tokio::signal;
 
 /// Serializes tests that deliver real process signals: every installed
@@ -66,16 +67,20 @@ fn classify_interrupt(previous: Option<Instant>, now: Instant) -> InterruptDecis
 /// Persistent interrupt listeners, installed once for the bridge's whole
 /// lifetime.
 ///
-/// A signal that arrives while the bridge is between waits must not be
-/// lost, so the listeners are not recreated per wait: on Unix both are
-/// long-lived signal streams, and a signal delivered at any instant is
-/// delivered to the same registration the next wait reads. On Windows the
-/// single console-handler registration is at least as durable, but its
-/// stream makes no one-event-per-press guarantee — a rapid repeat can
-/// coalesce, so the double-press force hatch may need an extra press
-/// there. A listener the platform refuses to install becomes `None`,
-/// which never fires — the bridge stays alive on the signals it does
-/// have.
+/// A signal that arrives while the bridge is between waits is captured
+/// by the same registration the next wait reads — the listeners are
+/// never recreated per wait, so no interrupt is lost to a
+/// re-registration gap (the loss mode this structure exists to close).
+/// One-event-per-signal is a different guarantee, and tokio's streams
+/// provide it on neither platform: notifications arriving before the
+/// stream is polled again coalesce into one, so a repeat landing inside
+/// that gap merges with its predecessor. A human's double press is
+/// spaced far beyond the gap; a script firing two kills back-to-back
+/// can surface a single cooperative cancel instead of the forced exit,
+/// so a reliable orchestrator force-quit belongs to SIGKILL, not to the
+/// double-press hatch. A listener the platform refuses to install
+/// becomes `None`, which never fires — the bridge stays alive on the
+/// signals it does have.
 struct InterruptListeners {
     /// The Windows Ctrl-C stream, `None` when registration failed.
     ///
@@ -337,7 +342,9 @@ async fn bridge_loop(
 /// second interrupt within [`DOUBLE_CTRL_C_WINDOW`] runs `on_force` — a
 /// host hook for durable state, such as the done-file marker — and exits
 /// the process with 130. The listener stays armed across the window, so the
-/// repeat interrupt is never lost; once the window elapses, a fresh
+/// repeat is never lost to a re-registration gap — though a repeat
+/// arriving before the previous interrupt is consumed can coalesce with
+/// it (see `InterruptListeners`); once the window elapses, a fresh
 /// interrupt starts a new cooperative cancellation.
 ///
 /// Call once, after constructing the runner and before awaiting its run,
@@ -435,10 +442,15 @@ impl CancelBridge {
     ///
     /// Only a forced exit skips the wait — by definition the process is
     /// already terminating. A failed send just means the task is already
-    /// gone.
+    /// gone. An abnormal task end — a panic inside the force hook is the
+    /// realistic case, leaving the process alive with the force path
+    /// dead — is logged to stderr rather than propagated, so a failed
+    /// forced shutdown is at least observable during teardown.
     pub async fn stop(self) {
         self.stop.send(true).ok();
-        let _ended = self.task.await;
+        if let Err(err) = self.task.await {
+            eprintln!("dch: the signal bridge task ended abnormally: {err}");
+        }
     }
 }
 
@@ -715,6 +727,24 @@ mod tests {
             !hook_fired.load(std::sync::atomic::Ordering::SeqCst),
             "a single interrupt cooperatively cancels and must not force"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_stray_interrupt_after_the_bridge_stops_cannot_default_kill() {
+        let _signal_lock = SIGNAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let bridge = install_cancel_handler(Arc::new(CancelSignal::new()), || {});
+        bridge.stop().await;
+        // The registration outlives the bridge: the platform handler is
+        // never uninstalled once installed, so a signal arriving after
+        // the listeners are gone is captured and discarded rather than
+        // reverting to the default disposition. This test's survival —
+        // and the harness's — is the assertion.
+        unsafe { libc::kill(libc::getpid(), libc::SIGINT) };
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
     #[cfg(unix)]

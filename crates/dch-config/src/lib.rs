@@ -119,8 +119,8 @@ impl ApiType {
     /// [`Self::default_base_url`]'s match — the real enforcement point —
     /// but not into this list, whose per-variant pins would then silently
     /// skip it. `api_type_all_lists_each_variant_once` catches duplicates
-    /// and typos only; extend this list in the same change that adds a
-    /// variant.
+    /// only — a mistyped variant path is a compile error; extend this
+    /// list in the same change that adds a variant.
     pub const ALL: [ApiType; 10] = [
         ApiType::OpenAi,
         ApiType::Anthropic,
@@ -1232,22 +1232,41 @@ redact_secrets = false
 
     #[test]
     fn every_variant_round_trips_through_its_lowercase_name() {
-        for api_type in ApiType::ALL {
-            let name = format!("{api_type:?}").to_lowercase();
+        // The literals are the guard on the persisted on-disk format: a
+        // variant rename or a rename_all change breaks a literal here,
+        // not just the derived-name comparison in the same loop.
+        let wire_names = [
+            (ApiType::OpenAi, "openai"),
+            (ApiType::Anthropic, "anthropic"),
+            (ApiType::Gemini, "gemini"),
+            (ApiType::Ollama, "ollama"),
+            (ApiType::DeepSeek, "deepseek"),
+            (ApiType::Grok, "grok"),
+            (ApiType::Zai, "zai"),
+            (ApiType::Azure, "azure"),
+            (ApiType::Moonshot, "moonshot"),
+            (ApiType::Bedrock, "bedrock"),
+        ];
+        for (variant, name) in wire_names {
             let parsed: ApiConfig = toml::from_str(&format!("api_type = \"{name}\"\n")).unwrap();
             assert_eq!(
-                parsed.api_type, api_type,
-                "the serde name for {api_type:?} must be {name}"
+                parsed.api_type, variant,
+                "wire name {name} must keep mapping to {variant:?}"
+            );
+            assert_eq!(
+                format!("{variant:?}").to_lowercase(),
+                name,
+                "{variant:?} must derive its literal wire name"
             );
             let source = ApiConfig {
-                api_type,
+                api_type: variant,
                 ..ApiConfig::default()
             };
             let written = toml::to_string(&source).unwrap();
             let reparsed: ApiConfig = toml::from_str(&written).unwrap();
             assert_eq!(
-                reparsed.api_type, api_type,
-                "{api_type:?} must survive a serialize/deserialize round trip"
+                reparsed.api_type, variant,
+                "{variant:?} must survive a serialize/deserialize round trip"
             );
         }
     }
