@@ -180,13 +180,11 @@ impl InterruptListeners {
     /// listen; the wait parks forever and says so.
     #[cfg(not(any(unix, windows)))]
     async fn wait(&mut self) {
-        match signal::ctrl_c().await {
-            Ok(()) => {}
-            Err(error) => {
-                eprintln!("dch: cannot install the Ctrl-C listener: {error}");
-                std::future::pending::<()>().await;
-            }
-        }
+        eprintln!(
+            "dch: this platform cannot listen for interrupts — the current \
+             run cannot be cancelled"
+        );
+        std::future::pending::<()>().await;
     }
 }
 
@@ -221,7 +219,9 @@ impl InterruptSource {
             Self::Listeners(listeners) => listeners.wait().await,
             #[cfg(test)]
             Self::Channel(channel) => {
-                let _ = channel.rx.recv().await;
+                if channel.rx.recv().await.is_none() {
+                    std::future::pending::<()>().await;
+                }
             }
         }
     }
@@ -231,7 +231,11 @@ impl InterruptSource {
 ///
 /// Driving the bridge through the channel makes the decision loop's
 /// first-cancel-then-force sequence deterministic without delivering real
-/// signals to the test process.
+/// signals to the test process. Items classify at dequeue time, mirroring
+/// OS signals processed after a busy stretch: a burst queued in advance
+/// classifies back-to-back — and forces — regardless of when it was sent,
+/// so a test exercising window expiry must space its sends in real time
+/// or pin the classification through [`classify_interrupt`] directly.
 #[cfg(test)]
 struct ChannelSource {
     /// One item is received per simulated interrupt.
@@ -269,7 +273,10 @@ enum BridgeOutcome {
 /// the listener still attached, the window's expiry re-arms a fresh
 /// first-interrupt, and a repeat inside the window runs `on_force` and
 /// yields [`BridgeOutcome::Forced`] — or until the stop signal fires,
-/// which yields [`BridgeOutcome::Stopped`].
+/// which yields [`BridgeOutcome::Stopped`]. At the window's edge a
+/// ready interrupt outranks the expiry (the select is biased), so a
+/// repeat landing as the window closes still forces instead of being
+/// downgraded to a fresh cancellation.
 async fn bridge_loop(
     source: &mut InterruptSource,
     stop: &mut tokio::sync::watch::Receiver<bool>,
@@ -286,11 +293,13 @@ async fn bridge_loop(
                     }),
             );
             tokio::select! {
+                biased;
+
+                () = source.wait() => {}
                 () = window => {
                     previous = None;
                     continue;
                 }
-                () = source.wait() => {}
                 _ = stop.changed() => return BridgeOutcome::Stopped,
             }
         } else {
@@ -304,7 +313,7 @@ async fn bridge_loop(
             InterruptDecision::Cancel => {
                 eprintln!(
                     "dch: interrupt received — cancelling the current turn \
-                     (press Ctrl-C again to quit immediately)"
+                     (repeat the interrupt to quit immediately)"
                 );
                 cancel.cancel();
                 previous = Some(now);
@@ -485,18 +494,35 @@ mod tests {
     }
 
     /// The plumbing a channel-driven `bridge_loop` test exercises.
+    ///
+    /// Assembled by [`spawn_bridge_loop`]; each field is one handle the
+    /// tests drive or observe, so a test body holds only its
+    /// distinguishing steps.
     struct BridgeHarness {
-        /// Sender standing in for the OS signal stream, one item per
-        /// simulated interrupt.
+        /// Sender standing in for the OS signal stream.
+        ///
+        /// One queued item models one delivered interrupt; sending is
+        /// the test's only way to advance the loop.
         interrupts: tokio::sync::mpsc::UnboundedSender<()>,
         /// The shared cancel signal the first interrupt trips.
+        ///
+        /// Observed through [`until_cancelled`] to confirm the
+        /// cooperative leg before a test exercises the repeat.
         cancel: Arc<CancelSignal>,
         /// Whether the force hook has run.
+        ///
+        /// Set inside the hook closure itself, so an assertion on it
+        /// proves the loop ran the hook before returning.
         hook_fired: Arc<std::sync::atomic::AtomicBool>,
-        /// Stop sender; dropping it ends the loop, so a test that never
-        /// stops keeps the harness alive.
+        /// Stop sender for the loop's watch channel.
+        ///
+        /// Dropping it ends the loop the same way a stop request does,
+        /// so a test that never stops must keep the harness alive.
         stop: tokio::sync::watch::Sender<bool>,
-        /// Handle to the spawned loop, resolving to its outcome.
+        /// Handle to the spawned loop.
+        ///
+        /// Awaiting it yields the loop's [`BridgeOutcome`], which every
+        /// test asserts on.
         bridge: tokio::task::JoinHandle<BridgeOutcome>,
     }
 
@@ -541,6 +567,18 @@ mod tests {
         })
         .await
         .expect("the first interrupt must cooperatively cancel");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_channel_sender_parks_the_source_instead_of_interrupting() {
+        let (interrupts, received) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let mut source = InterruptSource::Channel(ChannelSource { rx: received });
+        drop(interrupts);
+        let decided = tokio::time::timeout(Duration::from_millis(150), source.wait()).await;
+        assert!(
+            decided.is_err(),
+            "a closed source must park like a never-firing listener, not resolve"
+        );
     }
 
     #[tokio::test]

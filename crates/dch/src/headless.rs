@@ -31,8 +31,9 @@ const STARTUP_CANCEL_MESSAGE: &str = "cancelled during startup";
 /// message for the done-file.
 ///
 /// Both variants carry the same fields so the done-file writer can treat
-/// them uniformly: construction failures have no turn or tool counts, and
-/// run-level failures carry whatever the runner produced before the error.
+/// them uniformly: counts appear only when a run completed — the engine's
+/// error path carries no partial-run totals, so construction and run-level
+/// failures alike report none.
 struct HeadlessOutcome {
     /// The process exit code for `main` to hand to the shell.
     ///
@@ -54,14 +55,16 @@ struct HeadlessOutcome {
 
     /// Turns completed during the run.
     ///
-    /// `None` only on construction-phase failures, where no run existed to
-    /// count; the done-file writer turns `None` into a countless failure.
+    /// `Some` only when a run completed — the engine's error values carry
+    /// no partial-run totals, so failures (construction and run-level
+    /// alike) report none. The done-file writer turns `None` into a
+    /// countless failure.
     turns: Option<usize>,
 
     /// Tool calls made during the run.
     ///
-    /// Same lifecycle as `turns`: always `Some` once a run started, `None`
-    /// before one could.
+    /// Same lifecycle as `turns`: `Some` when a run completed, `None` on
+    /// every failure path.
     tools_used: Option<usize>,
 }
 
@@ -106,7 +109,9 @@ impl HeadlessOutcome {
 
     /// Map a `LoopError` to an outcome, honouring the cancel exit code.
     ///
-    /// Cancelled runs exit 130; all other loop errors exit 2.
+    /// Cancelled runs exit 130; all other loop errors exit 2. The error
+    /// value carries no partial-run totals, so the counts stay `None` —
+    /// how far a failed run got is not recoverable from it.
     fn from_loop_error(error: &LoopError) -> Self {
         let code = if error.is_cancelled() { 130 } else { 2 };
         Self {
@@ -127,7 +132,8 @@ impl HeadlessOutcome {
 /// caller (`main`) turns the code into the process exit status. The
 /// startup bridge armed before this call is stopped once the run bridge is
 /// installed; the two briefly overlap, where an interrupt fails closed
-/// through the construction hook.
+/// through the construction hook. A construction-phase failure stops the
+/// startup bridge directly, after its marker is written.
 ///
 /// # Errors
 ///
@@ -157,28 +163,15 @@ async fn run_headless_inner(
     args: &Args,
     startup_bridge: crate::signals::CancelBridge,
 ) -> Result<HeadlessOutcome, HeadlessOutcome> {
-    let prompt = resolve_prompt_nonblocking(args)
-        .await
-        .map_err(|message| construction_failure(args, message))?;
-
-    let mut config = load_config(args.config.config_path.as_deref())
-        .map_err(|message| construction_failure(args, message))?;
-    apply_cli_overrides(&mut config, args);
-
-    let verbosity = resolve_verbosity(&config, args);
-    let observer = Arc::new(ConsoleObserver::new(
-        verbosity,
-        ConsoleObserver::detect_color(),
-    ));
-
-    let workdir = std::env::current_dir()
-        .map_err(|err| construction_failure(args, format!("cannot determine cwd: {err}")))?;
-
-    let mut runner = dch_loop::Runner::builder(&config, &workdir)
-        .with_observer(Arc::clone(&observer) as Arc<dyn loopctl::observer::LoopObserver>)
-        .build()
-        .await
-        .map_err(|err| construction_failure(args, format!("agent construction: {err}")))?;
+    let built = match construct_run(args).await {
+        Ok(built) => built,
+        Err(outcome) => {
+            startup_bridge.stop().await;
+            return Err(outcome);
+        }
+    };
+    let ConstructedRun { prompt, runner } = built;
+    let mut runner = runner;
 
     let force_args = args.clone();
     let bridge = crate::signals::install_cancel_handler(runner.cancel_signal(), move || {
@@ -203,6 +196,61 @@ async fn run_headless_inner(
     write_done_file_if_requested(args, &outcome);
     bridge.stop().await;
     Ok(outcome)
+}
+
+/// The product of a successful construction phase.
+///
+/// Bundles everything the run needs so the phase reads as one fallible
+/// unit the caller guards.
+struct ConstructedRun {
+    /// The resolved task text for the run.
+    ///
+    /// Fixed before any config or agent work begins, and handed to the
+    /// runner unchanged once construction has succeeded.
+    prompt: String,
+
+    /// The built agent.
+    ///
+    /// Fully configured from the loaded config and the process working
+    /// directory, observer attached, with its shared cancel signal ready
+    /// for the run bridge to install.
+    runner: dch_loop::Runner,
+}
+
+/// Resolve the prompt, load the config, and build the runner.
+///
+/// Every step before the run bridge exists; each failure maps through
+/// [`construction_failure`], which writes the done-file marker before
+/// the outcome leaves this function.
+///
+/// # Errors
+///
+/// Returns the construction-phase failure outcome when the prompt,
+/// config, working directory, or agent construction fails.
+async fn construct_run(args: &Args) -> Result<ConstructedRun, HeadlessOutcome> {
+    let prompt = resolve_prompt_nonblocking(args)
+        .await
+        .map_err(|message| construction_failure(args, message))?;
+
+    let mut config = load_config(args.config.config_path.as_deref())
+        .map_err(|message| construction_failure(args, message))?;
+    apply_cli_overrides(&mut config, args);
+
+    let verbosity = resolve_verbosity(&config, args);
+    let observer = Arc::new(ConsoleObserver::new(
+        verbosity,
+        ConsoleObserver::detect_color(),
+    ));
+
+    let workdir = std::env::current_dir()
+        .map_err(|err| construction_failure(args, format!("cannot determine cwd: {err}")))?;
+
+    let runner = dch_loop::Runner::builder(&config, &workdir)
+        .with_observer(Arc::clone(&observer) as Arc<dyn loopctl::observer::LoopObserver>)
+        .build()
+        .await
+        .map_err(|err| construction_failure(args, format!("agent construction: {err}")))?;
+    Ok(ConstructedRun { prompt, runner })
 }
 
 /// Write the done-file for an interrupt that lands before the runner

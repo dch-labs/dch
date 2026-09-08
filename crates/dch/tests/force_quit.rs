@@ -56,11 +56,16 @@ fn holding_server() -> (u16, Arc<AtomicBool>) {
 
 /// Kills the child on drop so a failed assert cannot leak a live
 /// `dch` process hanging on its server until the request timeout.
+///
+/// The kill is followed by a wait: the reaped child neither zombies for
+/// the rest of the harness run nor holds the stderr pipe open for the
+/// capture thread.
 struct KillOnDrop<'a>(&'a mut Child);
 
 impl Drop for KillOnDrop<'_> {
     fn drop(&mut self) {
         self.0.kill().ok();
+        self.0.wait().ok();
     }
 }
 
@@ -85,12 +90,20 @@ impl std::ops::DerefMut for KillOnDrop<'_> {
 /// keeps the pipe empty and the capture snapshots whatever has arrived
 /// whenever a failure wants to report it.
 struct StderrCapture {
-    /// Text read so far; the reader thread appends as bytes arrive.
+    /// Text read so far.
+    ///
+    /// Appended by the reader thread as chunks arrive, and snapshotted
+    /// under the same lock by [`so_far`](Self::so_far).
     text: Arc<std::sync::Mutex<String>>,
 }
 
 impl StderrCapture {
     /// Take the child's piped stderr and drain it on a background thread.
+    ///
+    /// The reader keeps the pipe empty for the child's whole life, so a
+    /// chatty child can never fill it and block; whatever has arrived is
+    /// available to a failure report at any moment through
+    /// [`so_far`](Self::so_far).
     fn spawn(child: &mut Child) -> Self {
         let text = Arc::new(std::sync::Mutex::new(String::new()));
         let Some(mut stderr) = child.stderr.take() else {
@@ -116,12 +129,25 @@ impl StderrCapture {
     }
 
     /// The stderr text captured so far.
+    ///
+    /// A snapshot taken under the capture's lock — the reader thread may
+    /// append more the moment this returns.
     fn so_far(&self) -> String {
         self.text
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
+}
+
+/// The terminating signal of an exited child, if it died by one.
+///
+/// A signal death carries no exit code, only the signal — the startup
+/// test uses that distinction to recognize the one pre-registration
+/// death it tolerates and retries on a fresh child.
+fn unix_signal(status: std::process::ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt as _;
+    status.signal()
 }
 
 fn wait_until(child: &mut Child, stderr: &StderrCapture, what: &str, ready: impl Fn() -> bool) {
@@ -147,7 +173,11 @@ fn wait_until(child: &mut Child, stderr: &StderrCapture, what: &str, ready: impl
 /// paths write the done-file immediately before exiting, so once it
 /// exists the run is decided and signaling stops: a kill past that point
 /// could only land on teardown, where delivery is no longer guaranteed.
-fn force_until_exit(child: &mut Child, done_path: &Path) -> std::process::ExitStatus {
+fn force_until_exit(
+    child: &mut Child,
+    done_path: &Path,
+    stderr: &StderrCapture,
+) -> std::process::ExitStatus {
     let pid = child.id().cast_signed();
     let deadline = Instant::now()
         .checked_add(Duration::from_secs(15))
@@ -155,7 +185,8 @@ fn force_until_exit(child: &mut Child, done_path: &Path) -> std::process::ExitSt
     loop {
         assert!(
             Instant::now() < deadline,
-            "the child never exited after the repeated interrupts"
+            "the child never exited after the repeated interrupts\nchild stderr:\n{}",
+            stderr.so_far()
         );
         if !done_path.exists() {
             unsafe { libc::kill(pid, libc::SIGINT) };
@@ -205,7 +236,7 @@ fn interrupts_exit_130_and_leave_a_done_file() {
         connected.load(Ordering::SeqCst)
     });
 
-    let status = force_until_exit(&mut child, &done_path);
+    let status = force_until_exit(&mut child, &done_path, &stderr);
     assert_eq!(
         status.code(),
         Some(130),
@@ -227,33 +258,44 @@ fn signal_during_startup_writes_the_done_file_and_exits_130() {
     let dir = tempfile::tempdir().expect("temp dir");
     let done_path = dir.path().join("done.json");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_dch"))
-        .arg("--headless")
-        .arg("--done-file")
-        .arg(&done_path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("child spawned");
-    let stderr = StderrCapture::spawn(&mut child);
-    let mut child = KillOnDrop(&mut child);
-
-    // No config file: prompt resolution reads the held-open stdin pipe and
+    // No config file and an isolated HOME (the default lookup is
+    // `~/.dch`): prompt resolution reads the held-open stdin pipe and
     // blocks, keeping the child in its construction phase.
     //
-    // The generous grace covers process start to listener registration;
-    // a signal landing inside the (millisecond-scale) pre-registration
-    // window would still kill by default disposition, which is the
-    // residual flake this test cannot remove from outside.
-    std::thread::sleep(Duration::from_millis(1500));
-    if let Some(status) = child.try_wait().expect("child is waitable") {
-        panic!(
-            "the child exited before the startup signal — the prompt no \
-             longer blocks: {status}\nchild stderr:\n{}",
-            stderr.so_far()
-        );
-    }
+    // The generous grace covers process start to listener registration.
+    // A signal landing inside that (millisecond-scale) window still kills
+    // by default disposition — the one flake this test can only tolerate
+    // from outside — so exactly one such death is retried on a fresh
+    // child rather than misread as a product regression.
+    let (mut child, stderr) = {
+        let mut attempts_left = 1;
+        loop {
+            let mut spawned = Command::new(env!("CARGO_BIN_EXE_dch"))
+                .arg("--headless")
+                .arg("--done-file")
+                .arg(&done_path)
+                .env("HOME", dir.path())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("child spawned");
+            let stderr = StderrCapture::spawn(&mut spawned);
+            std::thread::sleep(Duration::from_millis(1500));
+            match spawned.try_wait().expect("child is waitable") {
+                None => break (spawned, stderr),
+                Some(status) if unix_signal(status) == Some(libc::SIGTERM) && attempts_left > 0 => {
+                    attempts_left -= 1;
+                }
+                Some(status) => panic!(
+                    "the child exited before the startup signal — the prompt no \
+                     longer blocks: {status}\nchild stderr:\n{}",
+                    stderr.so_far()
+                ),
+            }
+        }
+    };
+    let mut child = KillOnDrop(&mut child);
     let pid = child.id().cast_signed();
     unsafe { libc::kill(pid, libc::SIGTERM) };
 
@@ -276,7 +318,8 @@ fn signal_during_startup_writes_the_done_file_and_exits_130() {
         }
         assert!(
             Instant::now() < deadline,
-            "the child never exited after the startup signal"
+            "the child never exited after the startup signal\nchild stderr:\n{}",
+            stderr.so_far()
         );
         std::thread::sleep(Duration::from_millis(50));
     }

@@ -184,7 +184,8 @@ impl ApiClient for DchClient {
 /// (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY` or
 /// `GOOGLE_API_KEY`); the profiled providers inherit their profile's
 /// seeded variable (for example `DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY`)
-/// from the builder, and Ollama tolerates a missing key. If a required
+/// from the builder; a keyless Ollama configuration carries its
+/// profile's seeded dummy credential. If a required
 /// key is missing, returns [`RunnerError::Client`] naming the expected
 /// environment variable.
 ///
@@ -199,7 +200,7 @@ pub fn create_client(config: &ApiConfig) -> Result<DchClient, RunnerError> {
 
     let client = match config.api_type {
         ApiType::OpenAi => {
-            let base_url = effective_base_url(config);
+            let base_url = effective_base_url(config)?;
             let api_key = resolve_api_key(config)?;
             DchClient::OpenAi(
                 OpenAiClient::builder()
@@ -212,7 +213,7 @@ pub fn create_client(config: &ApiConfig) -> Result<DchClient, RunnerError> {
             )
         }
         ApiType::Anthropic => {
-            let base_url = effective_base_url(config);
+            let base_url = effective_base_url(config)?;
             let api_key = resolve_api_key(config)?;
             DchClient::Anthropic(
                 AnthropicClient::builder()
@@ -226,7 +227,7 @@ pub fn create_client(config: &ApiConfig) -> Result<DchClient, RunnerError> {
             )
         }
         ApiType::Gemini => {
-            let base_url = effective_base_url(config);
+            let base_url = effective_base_url(config)?;
             let api_key = resolve_api_key(config)?;
             DchClient::Gemini(
                 GeminiClient::builder()
@@ -345,15 +346,27 @@ fn azure_resource(config: &ApiConfig) -> Result<String, RunnerError> {
 /// config carries them, and the read timeout always applies.
 trait Profiled {
     /// Replace the seeded endpoint with the configured `base_url`.
+    ///
+    /// Applied by [`profiled`] only when the config carries one; until
+    /// then the profile's seeded endpoint stands.
     fn apply_base_url(self, url: &str) -> Self;
 
     /// Replace the seeded model with the configured `model`.
+    ///
+    /// Applied by [`profiled`] only when the config names one; until
+    /// then the profile's seeded default stands.
     fn apply_model(self, model: &str) -> Self;
 
     /// Replace the seeded credential with the configured `api_key`.
+    ///
+    /// Applied by [`profiled`] only when the config carries one, so
+    /// config-beats-environment falls out of the ordering.
     fn apply_api_key(self, key: &str) -> Self;
 
     /// Cap each request's read gap at the configured timeout.
+    ///
+    /// A family setting rather than a default-in-waiting: [`profiled`]
+    /// applies it unconditionally.
     fn apply_timeout(self, timeout: Duration) -> Self;
 
     /// Bound each reply at the configured completion budget. Families
@@ -478,14 +491,24 @@ fn build_bedrock(config: &ApiConfig) -> Result<BedrockClient, RunnerError> {
 /// lets a config omit `base_url` entirely (the common case for stock
 /// OpenAI/Anthropic/Gemini) while still allowing an override for self-hosted
 /// or proxy deployments. Only the stock arms call this helper — the profiled
-/// providers seed their endpoint from their builder — and every stock
-/// provider has a default, so the `None` arm of
-/// [`ApiType::default_base_url`] cannot be reached from here.
-fn effective_base_url(config: &ApiConfig) -> String {
+/// providers seed their endpoint from their builder — so a provider with no
+/// stock default reaching this helper is a wiring bug, reported loudly here
+/// rather than surfacing later as a request against an empty host.
+///
+/// # Errors
+///
+/// Returns [`RunnerError::Client`] when the provider defers its endpoint to
+/// a profile — a call only a stock arm should ever make.
+fn effective_base_url(config: &ApiConfig) -> Result<String, RunnerError> {
     if config.base_url.is_empty() {
-        config.api_type.default_base_url().unwrap_or("").to_owned()
+        config.api_type.default_base_url().map(str::to_owned).ok_or_else(|| {
+            RunnerError::Client(format!(
+                "{:?} has no stock default base_url; its endpoint comes from its provider profile",
+                config.api_type
+            ))
+        })
     } else {
-        config.base_url.clone()
+        Ok(config.base_url.clone())
     }
 }
 
@@ -859,6 +882,20 @@ mod tests {
             client.model(),
             "",
             "no config model and no profile default means an empty model"
+        );
+    }
+
+    #[test]
+    fn a_profiled_provider_reaching_the_stock_fallback_fails_loudly() {
+        let c = cfg(ApiType::Ollama, "", None);
+        let err = effective_base_url(&c)
+            .expect_err("a profiled fallback must not resolve to an empty host");
+        let RunnerError::Client(msg) = &err else {
+            panic!("expected Client error, got {err:?}");
+        };
+        assert!(
+            msg.contains("provider profile"),
+            "the error must name where the endpoint lives: {msg}"
         );
     }
 

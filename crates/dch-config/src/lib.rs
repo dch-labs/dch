@@ -20,8 +20,8 @@ pub enum ApiType {
     ///
     /// The Chat Completions schema that several other providers (including
     /// vLLM servers) speak, so they map to this variant's client family;
-    /// `DeepSeek` and `Grok` carry their own variants for host-specific
-    /// defaults while reusing the same wire protocol.
+    /// `DeepSeek` and `Grok` carry their own variants selecting their
+    /// provider profiles while reusing the same wire protocol.
     OpenAi,
 
     /// `Anthropic` Messages API (also used by Z.AI).
@@ -71,9 +71,9 @@ pub enum ApiType {
 
     /// Moonshot AI.
     ///
-    /// An OpenAI-compatible API served by Moonshot; the default base URL and
-    /// model resolve to Moonshot's host, with the key taken from the
-    /// `MOONSHOT_API_KEY` provider profile.
+    /// An OpenAI-compatible API served by Moonshot; its endpoint,
+    /// credentials, and default model come from its provider profile
+    /// (`MOONSHOT_API_KEY`).
     Moonshot,
 
     /// AWS Bedrock.
@@ -111,16 +111,16 @@ impl ApiType {
         }
     }
 
-    /// Every provider variant, the exhaustive set for guards that must
-    /// not miss one.
+    /// Every provider variant, the enumeration tests iterate.
     ///
-    /// Single source of truth for enumerating providers where a stale
-    /// hand-written list would silently skip a variant: the
-    /// `default_base_url` stock-versus-deferred guard iterates it, so a
-    /// variant added to [`ApiType`] must join this list for its
-    /// classification to be pinned. The
-    /// `api_type_all_covers_every_variant` test holds the list to one
-    /// entry per variant.
+    /// A manually maintained list, not a derived one: Rust has no
+    /// exhaustive-enumeration reflection, so a variant added to
+    /// [`ApiType`] is compiler-forced into
+    /// [`Self::default_base_url`]'s match — the real enforcement point —
+    /// but not into this list, whose per-variant pins would then silently
+    /// skip it. `api_type_all_lists_each_variant_once` catches duplicates
+    /// and typos only; extend this list in the same change that adds a
+    /// variant.
     pub const ALL: [ApiType; 10] = [
         ApiType::OpenAi,
         ApiType::Anthropic,
@@ -1231,27 +1231,25 @@ redact_secrets = false
     }
 
     #[test]
-    fn test_api_type_serde_roundtrip() {
-        let openai: ApiConfig = toml::from_str("api_type = \"openai\"\n").unwrap();
-        assert_eq!(openai.api_type, ApiType::OpenAi);
-
-        let anthropic: ApiConfig = toml::from_str("api_type = \"anthropic\"\n").unwrap();
-        assert_eq!(anthropic.api_type, ApiType::Anthropic);
-
-        let gemini: ApiConfig = toml::from_str("api_type = \"gemini\"\n").unwrap();
-        assert_eq!(gemini.api_type, ApiType::Gemini);
-
-        let ollama: ApiConfig = toml::from_str("api_type = \"ollama\"\n").unwrap();
-        assert_eq!(ollama.api_type, ApiType::Ollama);
-
-        let deepseek: ApiConfig = toml::from_str("api_type = \"deepseek\"\n").unwrap();
-        assert_eq!(deepseek.api_type, ApiType::DeepSeek);
-
-        let grok: ApiConfig = toml::from_str("api_type = \"grok\"\n").unwrap();
-        assert_eq!(grok.api_type, ApiType::Grok);
-
-        let zai: ApiConfig = toml::from_str("api_type = \"zai\"\n").unwrap();
-        assert_eq!(zai.api_type, ApiType::Zai);
+    fn every_variant_round_trips_through_its_lowercase_name() {
+        for api_type in ApiType::ALL {
+            let name = format!("{api_type:?}").to_lowercase();
+            let parsed: ApiConfig = toml::from_str(&format!("api_type = \"{name}\"\n")).unwrap();
+            assert_eq!(
+                parsed.api_type, api_type,
+                "the serde name for {api_type:?} must be {name}"
+            );
+            let source = ApiConfig {
+                api_type,
+                ..ApiConfig::default()
+            };
+            let written = toml::to_string(&source).unwrap();
+            let reparsed: ApiConfig = toml::from_str(&written).unwrap();
+            assert_eq!(
+                reparsed.api_type, api_type,
+                "{api_type:?} must survive a serialize/deserialize round trip"
+            );
+        }
     }
 
     #[test]
@@ -1287,7 +1285,10 @@ redact_secrets = false
     }
 
     #[test]
-    fn api_type_all_covers_every_variant() {
+    fn api_type_all_lists_each_variant_once() {
+        // Only the duplicate half is checkable from here: a variant
+        // missing from ALL must be caught by the change that adds it —
+        // the enum's exhaustive matches are the enforcement point.
         let mut seen = std::collections::HashSet::new();
         for api_type in ApiType::ALL {
             assert!(
@@ -1295,11 +1296,6 @@ redact_secrets = false
                 "duplicate variant in ALL: {api_type:?}"
             );
         }
-        assert_eq!(
-            seen.len(),
-            10,
-            "ALL must contain all 10 variants — add new ones here"
-        );
     }
 
     #[test]

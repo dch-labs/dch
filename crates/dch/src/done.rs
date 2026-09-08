@@ -28,8 +28,8 @@ pub struct DoneStatus {
 
     /// Turns completed during the run.
     ///
-    /// `None` when the run failed before producing a result — there was
-    /// nothing to count.
+    /// `Some` when the run completed; the engine's error values carry no
+    /// partial-run totals, so every failure path reports `None`.
     pub turns: Option<usize>,
 
     /// Tool calls made during the run.

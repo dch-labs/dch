@@ -27,15 +27,30 @@ use crate::context::runner_ctx;
 use crate::input::get_u64;
 
 /// Default command timeout in seconds.
+///
+/// Used when the model's input omits `timeout`; the same default bounds
+/// background jobs spawned without one.
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 
 /// Hard ceiling on a command timeout.
+///
+/// Larger input values are clamped rather than rejected, so an
+/// over-ambitious request still runs with the maximum allowed wait.
 const MAX_TIMEOUT_SECS: u64 = 600;
 
 /// Per-stream cap on captured stdout or stderr, in bytes.
+///
+/// Each stream is read independently under this cap and drained past
+/// it, so a command's total retained output is bounded by twice this
+/// plus the join and metadata line.
 const MAX_OUTPUT_BYTES: usize = 1_000_000;
 
 /// Commands that are safe to run concurrently (read-only).
+///
+/// Matched as boundary-aware prefixes of the trimmed command — `cargo
+/// check` qualifies, `cargo checkout` does not. A command matching
+/// here, with no shell operator or unsafe substring, dispatches in
+/// parallel with other reads.
 const READ_ONLY_PREFIXES: &[&str] = &[
     "cat",
     "ls",
@@ -63,9 +78,16 @@ const READ_ONLY_PREFIXES: &[&str] = &[
 ];
 
 /// Shell operators that indicate a compound command (always unsafe).
+///
+/// Any one of these disqualifies a command from concurrent execution
+/// regardless of the words around it — a pipeline or redirection can
+/// have side effects even when every word looks read-only.
 const SHELL_OPERATORS: &[&str] = &["&&", "||", ";", "|", "`", "$(", ">", ">>", "<"];
 
 /// Substrings that make an otherwise-allowlisted command unsafe.
+///
+/// Guard against mutating flags and subcommands hiding inside an
+/// allowlisted prefix, such as `find -delete` or `git branch -D`.
 const UNSAFE_SUBSTRINGS: &[&str] = &[
     " -delete",
     " -exec",
@@ -152,11 +174,27 @@ struct BackgroundJob {
 }
 
 /// Global background job table.
+///
+/// Keyed by the monotonic job ID and shared by every Bash call in the
+/// process: spawns insert here, detached completion tasks update their
+/// entries in place under the mutex, and the job operations read
+/// clones. A poisoned lock is tolerated — accessors return empty
+/// rather than failing the tool call.
 static JOB_TABLE: LazyLock<Mutex<BTreeMap<u64, BackgroundJob>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
 /// Monotonic counter for job IDs.
+///
+/// Relaxed increments at spawn time hand out IDs that are never
+/// reused, so a stale ID from a finished, cleaned-up, or evicted job
+/// can never resolve to a different job later.
 static JOB_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// How many terminal jobs the table retains before the oldest are evicted.
+///
+/// Completed payloads are the table's memory cost; a session that never
+/// calls `cleanup_jobs` would otherwise retain every job forever.
+const MAX_TERMINAL_JOBS: usize = 20;
 
 /// Spawn `command` as a background job and return its ID immediately.
 ///
@@ -203,10 +241,11 @@ fn spawn_background_job(command: &str, cwd: &str, timeout_secs: u64) -> u64 {
             JobStatus::Completed(text)
         };
 
-        if let Ok(mut table) = JOB_TABLE.lock()
-            && let Some(job) = table.get_mut(&id)
-        {
-            job.status = status;
+        if let Ok(mut table) = JOB_TABLE.lock() {
+            if let Some(job) = table.get_mut(&id) {
+                job.status = status;
+            }
+            prune_terminal_jobs(&mut table);
         }
     });
 
@@ -247,7 +286,43 @@ fn cleanup_jobs() -> usize {
     };
     let before = table.len();
     table.retain(|_, job| matches!(job.status, JobStatus::Running));
+
     before.saturating_sub(table.len())
+}
+
+/// Evict the oldest terminal jobs beyond [`MAX_TERMINAL_JOBS`].
+///
+/// Keys are monotonic job IDs, so ascending order is spawn order: the
+/// oldest completed or failed payloads go first, and running jobs are
+/// never evicted.
+fn prune_terminal_jobs(table: &mut BTreeMap<u64, BackgroundJob>) {
+    let excess = table
+        .values()
+        .filter(|job| !matches!(job.status, JobStatus::Running))
+        .count()
+        .saturating_sub(MAX_TERMINAL_JOBS);
+    let evict: Vec<u64> = table
+        .iter()
+        .filter(|(_, job)| !matches!(job.status, JobStatus::Running))
+        .map(|(id, _)| *id)
+        .take(excess)
+        .collect();
+    for id in evict {
+        table.remove(&id);
+    }
+}
+
+/// A payload-free status rendering for the `jobs` listing.
+///
+/// The listing concatenates one line per job; inlining each terminal
+/// payload would multiply the per-job cap into an unbounded listing, so
+/// the listing reports sizes and leaves payloads to `job_status`.
+fn job_summary(status: &JobStatus) -> String {
+    match status {
+        JobStatus::Running => "Running".to_string(),
+        JobStatus::Completed(payload) => format!("Completed ({} bytes)", payload.len()),
+        JobStatus::Failed(payload) => format!("Failed ({} bytes)", payload.len()),
+    }
 }
 
 /// RAII guard that kills a child's process group on drop.
@@ -255,7 +330,9 @@ fn cleanup_jobs() -> usize {
 /// On timeout cancellation, `tokio::time::timeout` drops the future, dropping
 /// the `Child` (SIGKILL to the direct child) and this guard (SIGKILL to the
 /// whole process group). This ensures sub-shells, pipelines, and `sleep`
-/// grandchildren die too — not just the `bash` child.
+/// grandchildren die too — not just the `bash` child. A reaped child
+/// disarms the guard, so a command that deliberately backgrounded a helper
+/// leaves it running past the tool's return.
 #[cfg(unix)]
 struct ChildGuard {
     /// Process-group ID of the child, when it was successfully spawned into its own group.
@@ -265,6 +342,20 @@ struct ChildGuard {
     /// because killing the negated PGID reaches the whole group (sub-shells,
     /// pipelines, and grandchildren), not just the direct `bash` child.
     pgid: Option<libc::pid_t>,
+}
+
+#[cfg(unix)]
+impl ChildGuard {
+    /// Disarm the drop-kill.
+    ///
+    /// Called once the child has been reaped. From that point the
+    /// process group belongs to whatever the command left running in it,
+    /// so the guard must not signal it — neither to kill a deliberately
+    /// backgrounded helper nor a group whose ID a new process may
+    /// already have recycled.
+    fn disarm(&mut self) {
+        self.pgid = None;
+    }
 }
 
 #[cfg(unix)]
@@ -439,7 +530,7 @@ fn dispatch_operation(operation: &str, input: &Value) -> Result<ToolOutput, Tool
                 "No background jobs.".to_string()
             } else {
                 jobs.iter()
-                    .map(|j| format!("  [{}] {} — {}", j.id, j.command, j.status))
+                    .map(|j| format!("  [{}] {} — {}", j.id, j.command, job_summary(&j.status)))
                     .collect::<Vec<_>>()
                     .join("\n")
             };
@@ -452,7 +543,8 @@ fn dispatch_operation(operation: &str, input: &Value) -> Result<ToolOutput, Tool
                 .ok_or_else(|| ToolError::InvalidInput("job_status requires job_id".to_string()))?;
             match get_job(id) {
                 Some(job) => {
-                    let text = format!("[{}] {}: {}", job.id, job.command, job.status);
+                    let mut text = format!("[{}] {}: {}", job.id, job.command, job.status);
+                    truncate_string(&mut text, MAX_OUTPUT_BYTES);
                     Ok(ToolOutput::text(text))
                 }
                 None => Ok(ToolOutput::error_text(format!("Job {id} not found"))),
@@ -502,42 +594,42 @@ async fn execute_command(command: &str, cwd: &str) -> Result<ToolOutput, ToolErr
         .map_err(|e| ToolError::Execution(format!("Failed to spawn command: {e}")))?;
 
     #[cfg(unix)]
-    let _guard = ChildGuard {
+    let mut guard = ChildGuard {
         pgid: child.id().and_then(|id| libc::pid_t::try_from(id).ok()),
     };
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let stdout_fut = async {
-        match stdout {
-            Some(mut s) => read_bounded(&mut s, MAX_OUTPUT_BYTES).await,
-            None => String::new(),
+    let ((stdout, stdout_cut), (stderr, stderr_cut)) = tokio::join!(
+        async {
+            match stdout {
+                Some(mut s) => read_bounded(&mut s, MAX_OUTPUT_BYTES).await,
+                None => (String::new(), false),
+            }
+        },
+        async {
+            match stderr {
+                Some(mut s) => read_bounded(&mut s, MAX_OUTPUT_BYTES).await,
+                None => (String::new(), false),
+            }
         }
-    };
-    let stderr_fut = async {
-        match stderr {
-            Some(mut s) => read_bounded(&mut s, MAX_OUTPUT_BYTES).await,
-            None => String::new(),
-        }
-    };
-    let (stdout_res, stderr_res) = tokio::join!(stdout_fut, stderr_fut);
+    );
     let status = child
         .wait()
         .await
         .map_err(|e| ToolError::Execution(format!("Failed to wait for command: {e}")))?;
+    #[cfg(unix)]
+    guard.disarm();
     let duration_ms = start.elapsed().as_millis();
     let exit_code = status.code().unwrap_or(-1);
-    let mut stdout = stdout_res;
-    let mut stderr = stderr_res;
-
-    truncate_string(&mut stdout, MAX_OUTPUT_BYTES);
-    truncate_string(&mut stderr, MAX_OUTPUT_BYTES);
-
-    let body = if stderr.is_empty() {
+    let mut body = if stderr.is_empty() {
         stdout
     } else {
         format!("{stdout}\n{stderr}")
     };
+    if stdout_cut || stderr_cut {
+        body.push_str("\n...[output truncated]");
+    }
 
     let output_text = format!("{body}\n[exit {exit_code}, {duration_ms}ms]");
     if status.success() {
@@ -551,12 +643,15 @@ async fn execute_command(command: &str, cwd: &str) -> Result<ToolOutput, ToolErr
 ///
 /// Once the cap is reached, the remaining output is drained to EOF (so the
 /// pipe doesn't block the child) but not stored, preventing unbounded memory
-/// growth from commands that produce gigabytes of output.
-async fn read_bounded<R>(stream: &mut R, max_bytes: usize) -> String
+/// growth from commands that produce gigabytes of output. The returned flag
+/// reports whether that happened, so the caller can mark the truncation for
+/// the model instead of cutting silently.
+async fn read_bounded<R>(stream: &mut R, max_bytes: usize) -> (String, bool)
 where
     R: tokio::io::AsyncRead + Unpin,
 {
     let mut buf = Vec::with_capacity(8192);
+    let mut truncated = false;
     let mut tmp = [0u8; 8192];
     loop {
         match stream.read(&mut tmp).await {
@@ -567,11 +662,16 @@ where
                     if let Some(chunk) = tmp.get(..n.min(room)) {
                         buf.extend_from_slice(chunk);
                     }
+                    if n > room {
+                        truncated = true;
+                    }
+                } else {
+                    truncated = true;
                 }
             }
         }
     }
-    String::from_utf8_lossy(&buf).into_owned()
+    (String::from_utf8_lossy(&buf).into_owned(), truncated)
 }
 
 /// Truncate `s` in place to at most `max_bytes`, landing on a UTF-8 char boundary.
@@ -579,10 +679,10 @@ where
 /// If `s` already fits, it is left untouched. Otherwise the cut point walks
 /// back from `max_bytes` to the preceding char boundary so the result stays
 /// valid UTF-8, the tail is dropped, and a `...[truncated]` marker is appended
-/// so the model can see the output was capped. Used to keep captured
-/// command output under [`MAX_OUTPUT_BYTES`] after [`read_bounded`] has
-/// already sized the buffer — see the [`read_bounded`] docs for why both
-/// exist.
+/// so the model can see the output was capped. Used on renderings that
+/// combine independently capped streams — a job payload joining capped
+/// stdout and stderr can exceed the cap by construction; the live command
+/// path marks its own truncation at the source instead.
 fn truncate_string(s: &mut String, max_bytes: usize) {
     if s.len() <= max_bytes {
         return;
@@ -646,6 +746,17 @@ mod tests {
     /// Serializes tests that touch the global job table, preventing cross-test
     /// interference from the shared `JOB_TABLE` / `JOB_ID_COUNTER`.
     static JOB_TEST_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Empty the global job table.
+    ///
+    /// A background job's completion task dies with its test's runtime, so
+    /// an entry from an earlier test can linger as `Running` forever; tests
+    /// that count table state start from a clean slate.
+    fn reset_job_table() {
+        if let Ok(mut table) = JOB_TABLE.lock() {
+            table.clear();
+        }
+    }
 
     #[test]
     fn concurrency_check_allowlist_hits() {
@@ -857,8 +968,9 @@ mod tests {
         use std::io::Cursor;
         let data = "x".repeat(50_000); // well past 8192, well under MAX_OUTPUT_BYTES
         let mut cursor = Cursor::new(data.clone().into_bytes());
-        let result = read_bounded(&mut cursor, MAX_OUTPUT_BYTES).await;
+        let (result, truncated) = read_bounded(&mut cursor, MAX_OUTPUT_BYTES).await;
         assert_eq!(result, data, "all data should be retained");
+        assert!(!truncated, "under-cap data must not report overflow");
     }
 
     #[tokio::test]
@@ -866,13 +978,14 @@ mod tests {
         use std::io::Cursor;
         let data = "y".repeat(100_000);
         let mut cursor = Cursor::new(data.into_bytes());
-        let result = read_bounded(&mut cursor, 10_000).await;
+        let (result, truncated) = read_bounded(&mut cursor, 10_000).await;
         assert!(
             result.len() <= 10_000,
             "retained {} bytes, should be <= 10000",
             result.len()
         );
         assert!(result.chars().all(|c| c == 'y'));
+        assert!(truncated, "100k bytes into a 10k cap must report overflow");
     }
 
     #[tokio::test]
@@ -880,8 +993,9 @@ mod tests {
         use std::io::Cursor;
         let data = "hello world".to_string();
         let mut cursor = Cursor::new(data.clone().into_bytes());
-        let result = read_bounded(&mut cursor, MAX_OUTPUT_BYTES).await;
+        let (result, truncated) = read_bounded(&mut cursor, MAX_OUTPUT_BYTES).await;
         assert_eq!(result, data);
+        assert!(!truncated);
     }
 
     #[tokio::test]
@@ -893,8 +1007,9 @@ mod tests {
         use std::io::Cursor;
         let raw = vec![b'a'; 50_000];
         let mut cursor = Cursor::new(raw.clone());
-        let result = read_bounded(&mut cursor, 1_000).await;
+        let (result, truncated) = read_bounded(&mut cursor, 1_000).await;
         assert!(result.len() <= 1_000);
+        assert!(truncated, "50k bytes into a 1k cap must report overflow");
         // Cursor position should be at EOF — the reader drained the rest.
         assert_eq!(cursor.position(), 50_000);
     }
@@ -1057,9 +1172,46 @@ mod tests {
         let cwd = tmp.path().to_str().unwrap();
         let tool = BashTool;
         let ctx = ctx_in(cwd);
-        let input = json!({ "command": "echo ok && dd if=/dev/zero bs=2000 count=1000 2>&1 | tr '\\0' 'e'" });
+        let input = json!({ "command": "echo ok && dd if=/dev/zero bs=2000 count=1000 1>&2" });
         let out = tool.call(input, &ctx).await.unwrap();
         assert_bounded(&out.text_content(), 200);
+    }
+
+    #[tokio::test]
+    async fn capped_output_carries_a_truncation_marker() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let tool = BashTool;
+        let ctx = ctx_in(cwd);
+        let input = json!({ "command": "yes y | head -c 2000000" });
+        let out = tool.call(input, &ctx).await.unwrap();
+        assert!(
+            out.text_content().contains("...[output truncated]"),
+            "a capped stream must say so, tail: {:?}",
+            tail_of(&out.text_content(), 200)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_detached_helper_survives_a_successful_command() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let marker = tmp.path().join("late-marker");
+        let tool = BashTool;
+        let ctx = ctx_in(cwd);
+        let input = json!({
+            "command": format!("(sleep 0.4 && touch {}) & echo started", marker.display())
+        });
+        let out = tool.call(input, &ctx).await.unwrap();
+        assert!(!out.is_error);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !marker.exists() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            marker.exists(),
+            "a helper detached before the tool returned must not be group-killed"
+        );
     }
 
     #[tokio::test]
@@ -1122,9 +1274,78 @@ mod tests {
         let out = tool.call(status_input, &ctx).await.unwrap();
         let text = out.text_content();
         assert!(
-            text.contains("bgdone") || text.contains("Completed"),
-            "job status text: {text}"
+            text.contains("Completed") && text.contains("bgdone"),
+            "the job must reach the terminal status with its payload: {text}"
         );
+    }
+
+    #[tokio::test]
+    async fn job_status_caps_the_stored_payload() {
+        let _guard = JOB_TEST_GUARD.lock().await;
+        reset_job_table();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let tool = BashTool;
+        let ctx = ctx_in(cwd);
+
+        let spawn_input = json!({ "command": "yes y | head -c 2000000", "background": true });
+        let out = tool.call(spawn_input, &ctx).await.unwrap();
+        let id: u64 = out
+            .text_content()
+            .split("job ")
+            .nth(1)
+            .and_then(|s| s.split(':').next())
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+
+        let mut text = String::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let out = tool
+                .call(
+                    json!({ "command": "", "operation": "job_status", "job_id": id }),
+                    &ctx,
+                )
+                .await
+                .unwrap();
+            text = out.text_content();
+            if text.contains("Completed") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(text.contains("Completed"), "job must finish: {text}");
+        assert_bounded(&text, 512);
+    }
+
+    #[tokio::test]
+    async fn terminal_jobs_are_evicted_beyond_the_retention_cap() {
+        let _guard = JOB_TEST_GUARD.lock().await;
+        reset_job_table();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let tool = BashTool;
+        let ctx = ctx_in(cwd);
+
+        for _ in 0..(MAX_TERMINAL_JOBS + 5) {
+            tool.call(json!({ "command": "true", "background": true }), &ctx)
+                .await
+                .unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while list_jobs()
+            .iter()
+            .any(|job| job.status == JobStatus::Running)
+            && Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let retained = list_jobs().len();
+        assert!(
+            retained <= MAX_TERMINAL_JOBS,
+            "the table must cap terminal retention, retained {retained}"
+        );
+        assert!(retained > 0, "recent terminal jobs stay queryable");
     }
 
     #[tokio::test]
@@ -1152,6 +1373,10 @@ mod tests {
             .await
             .unwrap();
         assert!(!list_out.is_error);
+        assert!(
+            !list_out.text_content().contains("[exit"),
+            "the listing must summarize, not inline payloads"
+        );
 
         // Cleanup.
         let clean_out = tool
@@ -1222,8 +1447,8 @@ mod tests {
         let out = tool.call(status_input, &ctx).await.unwrap();
         let text = out.text_content();
         assert!(
-            text.contains("bgok") || text.contains("Completed"),
-            "job should complete: {text}"
+            text.contains("Completed") && text.contains("bgok"),
+            "the job must reach the terminal status with its payload: {text}"
         );
     }
 

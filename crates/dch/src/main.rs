@@ -10,6 +10,7 @@ mod headless;
 mod signals;
 
 fn main() -> std::process::ExitCode {
+    let args = args::parse_args();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -17,9 +18,7 @@ fn main() -> std::process::ExitCode {
             eprintln!("dch: failed to start tokio runtime: {err}");
             std::process::exit(1);
         });
-    runtime.block_on(async {
-        let args = args::parse_args();
-
+    runtime.block_on(async move {
         if args.headless.is_some() {
             let startup_args = args.clone();
             let startup_bridge = signals::install_construction_handler(move || {

@@ -6,13 +6,18 @@
 # version+checksum pins.
 #
 # What the pinned callee enforces on its side — the jobs are not in this
-# file: fork and dependabot pull requests are rejected; command authors
-# must be collaborators with write; required secrets fail fast with
-# named messages; the binary is checksum-pinned; all writes go through
-# a least-privilege app token; concurrency lanes are callee-side too
-# — pushes supersede in-flight reviews and commands queue FIFO without
-# dropping (up to 100 pending; beyond that, arrivals are canceled); every
-# job uploads its review trajectory as an always-on 7-day artifact.
+# file: command authors must be collaborators with write; required
+# secrets fail fast with named messages; a malformed or empty dispatch
+# `pr` fails fast with a named message; an empty `model` forward falls
+# through the callee's own DIFFTRACE_MODEL/'glm-4.7' resolution; the
+# binary is checksum-pinned; all writes go through a least-privilege app
+# token; concurrency lanes are callee-side too — pushes supersede
+# in-flight reviews (the difftrace-review-<pr> lane) and commands queue
+# FIFO without dropping (up to 100 pending; beyond that, arrivals are
+# canceled); every job uploads its review trajectory as an always-on
+# 7-day artifact. Fork and dependabot pull requests are rejected there
+# too, but this caller skips them up front so its terminal state never
+# depends on callee step ordering.
 name: difftrace review
 
 on:
@@ -37,7 +42,10 @@ permissions:
 
 jobs:
   review:
-    if: github.event_name != 'issue_comment' || github.event.issue.pull_request != null
+    if: >-
+      (github.event_name != 'issue_comment' || github.event.issue.pull_request != null) &&
+      github.event.pull_request.user.login != 'dependabot[bot]' &&
+      github.event.pull_request.head.repo.fork != true
     uses: dch-labs/difftrace/.github/workflows/review.yml@a272e47e1826be342d360227c60ba598b1d4f201 # v0.11.3
     with:
       pr: ${{ github.event.pull_request.number || (github.event.issue.pull_request != null && github.event.issue.number) || inputs.pr }}
