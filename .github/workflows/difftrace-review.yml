@@ -11,7 +11,8 @@
 # named messages; the binary is checksum-pinned; all writes go through
 # a least-privilege app token; concurrency lanes are callee-side too
 # — pushes supersede in-flight reviews and commands queue FIFO without
-# dropping (up to 100 pending; beyond that, arrivals are canceled).
+# dropping (up to 100 pending; beyond that, arrivals are canceled); every
+# job uploads its review trajectory as an always-on 7-day artifact.
 name: difftrace review
 
 on:
@@ -40,7 +41,7 @@ jobs:
     uses: dch-labs/difftrace/.github/workflows/review.yml@a272e47e1826be342d360227c60ba598b1d4f201 # v0.11.3
     with:
       pr: ${{ github.event.pull_request.number || (github.event.issue.pull_request != null && github.event.issue.number) || inputs.pr }}
-      model: ${{ inputs.model }}
+      model: ${{ inputs.model || vars.DIFFTRACE_MODEL }}
     secrets:
       ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
       DIFFTRACE_APP_ID: ${{ secrets.DIFFTRACE_APP_ID }}

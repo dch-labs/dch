@@ -11,7 +11,9 @@ use std::path::PathBuf;
 /// talking to a model. The variant also gates provider-specific request shaping
 /// elsewhere in the application. Serde (de)serializes values as their lowercase
 /// name (e.g. `ollama`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Deserialize, serde::Serialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum ApiType {
     /// `OpenAI`-compatible API.
@@ -82,30 +84,55 @@ pub enum ApiType {
 }
 
 impl ApiType {
-    /// The default `base_url` for this provider.
+    /// The stock default `base_url` for this provider, when it has one.
     ///
     /// Consulted as the effective endpoint when [`ApiConfig::base_url`] is
     /// unset, for the stock providers (`OpenAi`, `Anthropic`, `Gemini`).
     /// The profiled providers (`Ollama`, `DeepSeek`, `Grok`, `Azure`,
     /// `Moonshot`, `Zai`) take their default endpoint from their provider
     /// profile instead, and `Bedrock` derives its endpoint from the AWS
-    /// region, so this returns an empty string for all of them; provider
-    /// clients may append their own path suffixes on top of a host root.
+    /// region, so this returns `None` for all of them — the type itself
+    /// keeps "defer to the profile" distinct from a configured host.
+    /// Provider clients may append their own path suffixes on top of a
+    /// host root.
     #[must_use]
-    pub fn default_base_url(self) -> &'static str {
+    pub fn default_base_url(self) -> Option<&'static str> {
         match self {
-            Self::OpenAi => "https://api.openai.com/v1",
-            Self::Anthropic => "https://api.anthropic.com",
-            Self::Gemini => "https://generativelanguage.googleapis.com",
+            Self::OpenAi => Some("https://api.openai.com/v1"),
+            Self::Anthropic => Some("https://api.anthropic.com"),
+            Self::Gemini => Some("https://generativelanguage.googleapis.com"),
             Self::Ollama
             | Self::DeepSeek
             | Self::Grok
             | Self::Zai
             | Self::Azure
             | Self::Bedrock
-            | Self::Moonshot => "",
+            | Self::Moonshot => None,
         }
     }
+
+    /// Every provider variant, the exhaustive set for guards that must
+    /// not miss one.
+    ///
+    /// Single source of truth for enumerating providers where a stale
+    /// hand-written list would silently skip a variant: the
+    /// `default_base_url` stock-versus-deferred guard iterates it, so a
+    /// variant added to [`ApiType`] must join this list for its
+    /// classification to be pinned. The
+    /// `api_type_all_covers_every_variant` test holds the list to one
+    /// entry per variant.
+    pub const ALL: [ApiType; 10] = [
+        ApiType::OpenAi,
+        ApiType::Anthropic,
+        ApiType::Gemini,
+        ApiType::Ollama,
+        ApiType::DeepSeek,
+        ApiType::Grok,
+        ApiType::Zai,
+        ApiType::Azure,
+        ApiType::Moonshot,
+        ApiType::Bedrock,
+    ];
 }
 
 /// Console output verbosity.
@@ -1225,32 +1252,53 @@ redact_secrets = false
 
         let zai: ApiConfig = toml::from_str("api_type = \"zai\"\n").unwrap();
         assert_eq!(zai.api_type, ApiType::Zai);
+    }
 
-        // Every profiled variant must keep its empty default: a
-        // reintroduced hard-coded host here would silently shadow the
-        // endpoint its provider profile owns.
-        for api_type in [
-            ApiType::Ollama,
-            ApiType::DeepSeek,
-            ApiType::Grok,
-            ApiType::Zai,
-            ApiType::Azure,
-            ApiType::Bedrock,
-            ApiType::Moonshot,
-        ] {
-            assert_eq!(
-                api_type.default_base_url(),
-                "",
-                "{api_type:?} must defer to its provider profile"
+    #[test]
+    fn default_base_url_pins_stock_hosts_and_defers_every_other_variant() {
+        // A reintroduced hard-coded host here would silently shadow the
+        // endpoint its provider profile or AWS region derives; iterating
+        // ALL keeps a future variant from escaping the guard.
+        let stock = [
+            (ApiType::OpenAi, "https://api.openai.com/v1"),
+            (ApiType::Anthropic, "https://api.anthropic.com"),
+            (ApiType::Gemini, "https://generativelanguage.googleapis.com"),
+        ];
+        for api_type in ApiType::ALL {
+            match stock.iter().find(|(variant, _)| *variant == api_type) {
+                Some((_, host)) => assert_eq!(
+                    api_type.default_base_url(),
+                    Some(*host),
+                    "{api_type:?} must keep its stock host pinned"
+                ),
+                None => assert_eq!(
+                    api_type.default_base_url(),
+                    None,
+                    "{api_type:?} must defer to its profile- or region-derived endpoint"
+                ),
+            }
+        }
+        for (variant, _) in stock {
+            assert!(
+                ApiType::ALL.contains(&variant),
+                "{variant:?} must stay in ALL for its host pin to run"
+            );
+        }
+    }
+
+    #[test]
+    fn api_type_all_covers_every_variant() {
+        let mut seen = std::collections::HashSet::new();
+        for api_type in ApiType::ALL {
+            assert!(
+                seen.insert(api_type),
+                "duplicate variant in ALL: {api_type:?}"
             );
         }
         assert_eq!(
-            ApiType::OpenAi.default_base_url(),
-            "https://api.openai.com/v1"
-        );
-        assert_eq!(
-            ApiType::Gemini.default_base_url(),
-            "https://generativelanguage.googleapis.com"
+            seen.len(),
+            10,
+            "ALL must contain all 10 variants — add new ones here"
         );
     }
 

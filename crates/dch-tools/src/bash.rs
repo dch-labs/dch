@@ -921,8 +921,9 @@ mod tests {
         text.chars().skip(skip).collect()
     }
 
-    /// Assert the output stayed under the cap plus the failure-message
-    /// margin, showing the tail when it did not.
+    /// Assert combined output stayed under the per-stream cap plus a
+    /// small margin for the stdout/stderr join and the trailing `[exit …]`
+    /// metadata line, showing the tail when it did not.
     fn assert_bounded(text: &str, margin: usize) {
         assert!(
             text.len() < MAX_OUTPUT_BYTES + margin,
@@ -1058,11 +1059,7 @@ mod tests {
         let ctx = ctx_in(cwd);
         let input = json!({ "command": "echo ok && dd if=/dev/zero bs=2000 count=1000 2>&1 | tr '\\0' 'e'" });
         let out = tool.call(input, &ctx).await.unwrap();
-        assert!(
-            out.text_content().len() < MAX_OUTPUT_BYTES + 200,
-            "combined output was {} bytes, stderr should be independently capped",
-            out.text_content().len()
-        );
+        assert_bounded(&out.text_content(), 200);
     }
 
     #[tokio::test]

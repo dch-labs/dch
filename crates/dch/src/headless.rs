@@ -22,6 +22,11 @@ use crate::done::{DoneStatus, write_done_file};
 /// interrupt from the cooperative cancellation a single one produces.
 const FORCE_CANCEL_MESSAGE: &str = "cancelled by a repeated interrupt";
 
+/// The done-file message the startup path writes, distinguishing an
+/// interrupt that landed before the runner existed from the run-phase
+/// cancellations above.
+const STARTUP_CANCEL_MESSAGE: &str = "cancelled during startup";
+
 /// The outcome of a headless run: the process exit code and any status
 /// message for the done-file.
 ///
@@ -139,7 +144,10 @@ pub async fn run_headless(args: &Args, startup_bridge: crate::signals::CancelBri
 /// Returns `Ok(HeadlessOutcome)` on any terminal outcome (success or
 /// run-level failure); `Err(HeadlessOutcome)` on construction-phase failure
 /// (config, agent, or prompt resolution). Both variants carry the
-/// done-file status info.
+/// done-file status info. Finalization — the done-file write — runs
+/// before the run bridge is stopped, so an interrupt landing during the
+/// write fails closed through the force hook rather than killing the
+/// process with no marker.
 ///
 /// # Errors
 ///
@@ -181,16 +189,19 @@ async fn run_headless_inner(
     });
     startup_bridge.stop().await;
 
-    let run_result = runner.run(&prompt).await;
-    bridge.stop().await;
-    let run = run_result.map_err(|err| {
-        let outcome = HeadlessOutcome::from_loop_error(&err);
-        write_done_file_if_requested(args, &outcome);
-        outcome
-    })?;
+    let run = match runner.run(&prompt).await {
+        Ok(run) => run,
+        Err(err) => {
+            let outcome = HeadlessOutcome::from_loop_error(&err);
+            write_done_file_if_requested(args, &outcome);
+            bridge.stop().await;
+            return Err(outcome);
+        }
+    };
 
     let outcome = HeadlessOutcome::from_run(&run);
     write_done_file_if_requested(args, &outcome);
+    bridge.stop().await;
     Ok(outcome)
 }
 
@@ -200,10 +211,7 @@ async fn run_headless_inner(
 /// Public to `main` so the handler can be armed the moment the runtime is
 /// up, ahead of prompt resolution and agent construction.
 pub(crate) fn write_startup_done_file(args: &Args) {
-    write_done_file_if_requested(
-        args,
-        &HeadlessOutcome::failure(130, "cancelled during startup"),
-    );
+    write_done_file_if_requested(args, &HeadlessOutcome::failure(130, STARTUP_CANCEL_MESSAGE));
 }
 
 /// Build a construction-phase failure outcome and write the done-file.
@@ -521,6 +529,23 @@ mod tests {
     }
 
     #[test]
+    fn the_startup_path_writes_its_distinguishing_done_file_message() {
+        // Same pin for the startup hook: the message is what separates an
+        // interrupt before the runner existed from the run-phase paths.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("done.json");
+        let args = parse(&["--headless", "x", "--done-file", path.to_str().unwrap()]);
+        write_done_file_if_requested(
+            &args,
+            &HeadlessOutcome::failure(130, STARTUP_CANCEL_MESSAGE),
+        );
+        let written: DoneStatus =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written.message.as_deref(), Some(STARTUP_CANCEL_MESSAGE));
+        assert_eq!(written.turns, None);
+    }
+
+    #[test]
     fn the_cancel_split_uses_is_cancelled() {
         assert!(LoopError::Cancelled.is_cancelled());
         assert!(!LoopError::InvalidInput("bad".into()).is_cancelled());
@@ -678,6 +703,11 @@ mod tests {
     /// A local server that answers the agent's request with one streamed
     /// text delta and then holds the connection open, so the run is still
     /// mid-stream when the test delivers its signal.
+    ///
+    /// Unix-only like the mid-run signal tests it serves: the armed
+    /// signal is delivered with `libc::kill`, which does not exist on
+    /// other targets.
+    #[cfg(unix)]
     struct HoldServer {
         /// Whether the delta has been written and the run is mid-stream.
         ///
@@ -685,6 +715,7 @@ mod tests {
         /// signal armed on this flag is guaranteed to land during the run
         /// rather than before the agent request is made.
         streaming: std::sync::Arc<std::sync::atomic::AtomicBool>,
+
         /// The ephemeral port the agent's requests arrive on.
         ///
         /// Rendered into the temp config's `base_url`, so pointing the
@@ -692,6 +723,7 @@ mod tests {
         port: u16,
     }
 
+    #[cfg(unix)]
     impl HoldServer {
         /// Bind the server and spawn its connection task.
         ///
@@ -759,10 +791,17 @@ mod tests {
         }
     }
 
+    /// Drive one full headless run that receives `signal` mid-stream.
+    ///
+    /// The harness owns the scaffolding shared by the mid-run signal
+    /// tests — signal serialization, the held server, the temp config, the
+    /// argument plumbing — leaving each test its signal and done-file
+    /// path. Returns the process exit code, asserting along the way that
+    /// the run reached mid-stream: a signal fired earlier would exercise
+    /// the startup path instead of the mid-run one under test.
     #[cfg(unix)]
-    #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn sigint_mid_run_resolves_cancelled_with_exit_130() {
+    async fn run_signaled_mid_stream(signal: i32, done_file: Option<&std::path::Path>) -> u8 {
         let _signal_lock = SIGNAL_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -770,48 +809,54 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
         std::fs::write(&config_path, server.config_toml()).unwrap();
-        let args = parse(&[
+        let mut flags = vec![
             "--headless",
             "hello",
             "--config",
             config_path.to_str().unwrap(),
-        ]);
+        ];
+        if let Some(path) = done_file {
+            flags.push("--done-file");
+            flags.push(path.to_str().unwrap());
+        }
+        let args = parse(&flags);
 
-        let armed = server.signal_when_streaming(libc::SIGINT);
+        let armed = server.signal_when_streaming(signal);
 
         let code = run_headless(&args, crate::signals::install_construction_handler(|| {})).await;
         assert!(
             armed.await.unwrap(),
             "the run must reach mid-stream for the signal to fire"
         );
-        assert_eq!(code, 130, "SIGINT must cancel the run and map to exit 130");
+        code
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
-    async fn sigterm_mid_run_resolves_cancelled_with_exit_130_like_sigint() {
-        let _signal_lock = SIGNAL_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let server = HoldServer::start().await;
-        let dir = tempfile::tempdir().unwrap();
-        let config_path = dir.path().join("config.toml");
-        std::fs::write(&config_path, server.config_toml()).unwrap();
-        let args = parse(&[
-            "--headless",
-            "hello",
-            "--config",
-            config_path.to_str().unwrap(),
-        ]);
-
-        let armed = server.signal_when_streaming(libc::SIGTERM);
-
-        let code = run_headless(&args, crate::signals::install_construction_handler(|| {})).await;
-        assert!(
-            armed.await.unwrap(),
-            "the run must reach mid-stream for the signal to fire"
+    async fn sigint_mid_run_resolves_cancelled_with_exit_130_and_cooperative_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let done_path = tmp.path().join("done.json");
+        let code = run_signaled_mid_stream(libc::SIGINT, Some(&done_path)).await;
+        assert_eq!(code, 130, "SIGINT must cancel the run and map to exit 130");
+        let written: DoneStatus =
+            serde_json::from_str(&std::fs::read_to_string(&done_path).unwrap()).unwrap();
+        assert!(!written.success, "a cancelled run is not a success");
+        assert_eq!(
+            written.message,
+            Some(LoopError::Cancelled.to_string()),
+            "the cooperative path writes the engine's cancel message, not the force hook's"
         );
+        assert_eq!(
+            written.turns, None,
+            "a cancelled run reports no turn count for the marker"
+        );
+        assert_eq!(written.tools_used, None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sigterm_mid_run_resolves_cancelled_with_exit_130_like_sigint() {
+        let code = run_signaled_mid_stream(libc::SIGTERM, None).await;
         assert_eq!(
             code, 130,
             "SIGTERM must take the same cooperative path as SIGINT, not a default kill"

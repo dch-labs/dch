@@ -40,8 +40,11 @@ enum InterruptDecision {
     /// A repeat interrupt inside the window, declining further waiting.
     ///
     /// The force hook runs first — flushing whatever durable state the
-    /// host attached — and the process then exits with the interrupt
-    /// status instead of waiting out a possibly-stuck turn.
+    /// host attached — and the process then exits with 130 instead of
+    /// waiting out a possibly-stuck turn. The status is fixed rather
+    /// than signal-derived: a forced SIGTERM reports the same 130 as a
+    /// forced Ctrl-C, matching the module's one-code-per-meaning exit
+    /// contract.
     Force,
 }
 
@@ -66,9 +69,13 @@ fn classify_interrupt(previous: Option<Instant>, now: Instant) -> InterruptDecis
 /// A signal that arrives while the bridge is between waits must not be
 /// lost, so the listeners are not recreated per wait: on Unix both are
 /// long-lived signal streams, and a signal delivered at any instant is
-/// delivered to the same registration the next wait reads. A listener the
-/// platform refuses to install becomes `None`, which never fires — the
-/// bridge stays alive on the signals it does have.
+/// delivered to the same registration the next wait reads. On Windows the
+/// single console-handler registration is at least as durable, but its
+/// stream makes no one-event-per-press guarantee — a rapid repeat can
+/// coalesce, so the double-press force hatch may need an extra press
+/// there. A listener the platform refuses to install becomes `None`,
+/// which never fires — the bridge stays alive on the signals it does
+/// have.
 struct InterruptListeners {
     /// The Windows Ctrl-C stream, `None` when registration failed.
     ///
@@ -106,16 +113,16 @@ impl InterruptListeners {
     fn install() -> Self {
         #[cfg(unix)]
         {
-            let install = |kind| match signal::unix::signal(kind) {
+            let install = |kind, name| match signal::unix::signal(kind) {
                 Ok(stream) => Some(stream),
                 Err(error) => {
-                    eprintln!("dch: cannot install a signal listener: {error}");
+                    eprintln!("dch: cannot install the {name} listener: {error}");
                     None
                 }
             };
             Self {
-                interrupt: install(signal::unix::SignalKind::interrupt()),
-                terminate: install(signal::unix::SignalKind::terminate()),
+                interrupt: install(signal::unix::SignalKind::interrupt(), "SIGINT"),
+                terminate: install(signal::unix::SignalKind::terminate(), "SIGTERM"),
             }
         }
         #[cfg(windows)]
@@ -361,16 +368,34 @@ pub fn install_construction_handler(on_interrupt: impl Fn() + Send + 'static) ->
     let (stop, mut stop_rx) = tokio::sync::watch::channel(false);
     let mut source = InterruptSource::Listeners(InterruptListeners::install());
     let task = tokio::spawn(async move {
-        tokio::select! {
-            _ = stop_rx.changed() => {}
-            () = source.wait() => {
-                eprintln!("dch: interrupt received during startup — exiting (130)");
-                on_interrupt();
-                std::process::exit(130);
-            }
+        if construction_loop(&mut source, &mut stop_rx, on_interrupt).await {
+            std::process::exit(130);
         }
     });
     CancelBridge { stop, task }
+}
+
+/// The construction bridge's single decision step, parameterized over the
+/// interrupt source so tests can drive it without OS signals.
+///
+/// One wait, two exits: an interrupt runs `on_interrupt` and reports that
+/// the caller must exit with the interrupt status; a stop request ends
+/// the wait and reports an orderly shutdown instead.
+/// [`install_construction_handler`] keeps the process exit out of this
+/// loop, so the test stand-in never terminates the test process.
+async fn construction_loop(
+    source: &mut InterruptSource,
+    stop: &mut tokio::sync::watch::Receiver<bool>,
+    on_interrupt: impl Fn(),
+) -> bool {
+    tokio::select! {
+        _ = stop.changed() => false,
+        () = source.wait() => {
+            eprintln!("dch: interrupt received during startup — exiting (130)");
+            on_interrupt();
+            true
+        }
+    }
 }
 
 /// A handle over the interrupt bridge installed for one run.
@@ -459,47 +484,28 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_repeat_interrupt_inside_the_window_runs_the_force_hook() {
-        let (interrupts, received) = tokio::sync::mpsc::unbounded_channel::<()>();
-        let cancel = Arc::new(CancelSignal::new());
-        let hook_cancel = Arc::clone(&cancel);
-        let hook_fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let hook_flag = Arc::clone(&hook_fired);
-        let mut source = InterruptSource::Channel(ChannelSource { rx: received });
-        let (_keep_open, mut stop_rx) = tokio::sync::watch::channel(false);
-        let bridge = tokio::spawn(async move {
-            bridge_loop(&mut source, &mut stop_rx, hook_cancel, move || {
-                hook_flag.store(true, std::sync::atomic::Ordering::SeqCst);
-            })
-            .await
-        });
-
-        let _sent = interrupts.send(());
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(
-            cancel.is_cancelled(),
-            "the first interrupt must cooperatively cancel"
-        );
-
-        let _sent = interrupts.send(());
-        let outcome = tokio::time::timeout(Duration::from_secs(5), bridge)
-            .await
-            .expect("the bridge must decide within the test timeout")
-            .unwrap();
-        assert_eq!(
-            outcome,
-            BridgeOutcome::Forced,
-            "a repeat inside the window forces"
-        );
-        assert!(
-            hook_fired.load(std::sync::atomic::Ordering::SeqCst),
-            "the repeat inside the window must run the force hook before returning"
-        );
+    /// The plumbing a channel-driven `bridge_loop` test exercises.
+    struct BridgeHarness {
+        /// Sender standing in for the OS signal stream, one item per
+        /// simulated interrupt.
+        interrupts: tokio::sync::mpsc::UnboundedSender<()>,
+        /// The shared cancel signal the first interrupt trips.
+        cancel: Arc<CancelSignal>,
+        /// Whether the force hook has run.
+        hook_fired: Arc<std::sync::atomic::AtomicBool>,
+        /// Stop sender; dropping it ends the loop, so a test that never
+        /// stops keeps the harness alive.
+        stop: tokio::sync::watch::Sender<bool>,
+        /// Handle to the spawned loop, resolving to its outcome.
+        bridge: tokio::task::JoinHandle<BridgeOutcome>,
     }
 
-    #[tokio::test]
-    async fn a_stop_request_stops_the_bridge_without_forcing() {
+    /// Spawn a `bridge_loop` driven by a channel interrupt source.
+    ///
+    /// Each test body is left with only its distinguishing steps — the
+    /// channel pair, cancel signal, hook-flag plumbing, watch channel, and
+    /// task spawn live here.
+    fn spawn_bridge_loop() -> BridgeHarness {
         let (interrupts, received) = tokio::sync::mpsc::unbounded_channel::<()>();
         let cancel = Arc::new(CancelSignal::new());
         let hook_cancel = Arc::clone(&cancel);
@@ -513,16 +519,65 @@ mod tests {
             })
             .await
         });
+        BridgeHarness {
+            interrupts,
+            cancel,
+            hook_fired,
+            stop,
+            bridge,
+        }
+    }
 
-        let _sent = interrupts.send(());
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(
-            cancel.is_cancelled(),
-            "the first interrupt must cooperatively cancel"
+    /// Wait, bounded, for the first interrupt's cooperative cancel.
+    ///
+    /// Yielding lets the bridge task process the sent interrupt on the
+    /// same runtime; the timeout keeps a stalled schedule from failing the
+    /// test where a fixed sleep would have to guess the task's pace.
+    async fn until_cancelled(cancel: &Arc<CancelSignal>) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !cancel.is_cancelled() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first interrupt must cooperatively cancel");
+    }
+
+    #[tokio::test]
+    async fn a_repeat_interrupt_inside_the_window_runs_the_force_hook() {
+        let harness = spawn_bridge_loop();
+
+        // Both interrupts are queued before any waiting: the bridge
+        // classifies them back-to-back, so the repeat lands inside the
+        // window no matter how the scheduler interleaves the tasks.
+        let _sent = harness.interrupts.send(());
+        let _sent = harness.interrupts.send(());
+        until_cancelled(&harness.cancel).await;
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), harness.bridge)
+            .await
+            .expect("the bridge must decide within the test timeout")
+            .unwrap();
+        assert_eq!(
+            outcome,
+            BridgeOutcome::Forced,
+            "a repeat inside the window forces"
         );
+        assert!(
+            harness.hook_fired.load(std::sync::atomic::Ordering::SeqCst),
+            "the repeat inside the window must run the force hook before returning"
+        );
+    }
 
-        stop.send(true).ok();
-        let outcome = tokio::time::timeout(Duration::from_secs(5), bridge)
+    #[tokio::test]
+    async fn a_stop_request_stops_the_bridge_without_forcing() {
+        let harness = spawn_bridge_loop();
+
+        let _sent = harness.interrupts.send(());
+        until_cancelled(&harness.cancel).await;
+
+        harness.stop.send(true).ok();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), harness.bridge)
             .await
             .expect("the bridge must stop within the test timeout")
             .unwrap();
@@ -532,8 +587,66 @@ mod tests {
             "a stop request must end the loop as an orderly stop"
         );
         assert!(
-            !hook_fired.load(std::sync::atomic::Ordering::SeqCst),
+            !harness.hook_fired.load(std::sync::atomic::Ordering::SeqCst),
             "an orderly stop must not fire the force hook"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stop_request_ends_the_construction_loop_without_running_the_hook() {
+        let (_interrupts, received) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let mut source = InterruptSource::Channel(ChannelSource { rx: received });
+        let (stop, mut stop_rx) = tokio::sync::watch::channel(false);
+        let hook_fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook_flag = Arc::clone(&hook_fired);
+        let run = tokio::spawn(async move {
+            construction_loop(&mut source, &mut stop_rx, move || {
+                hook_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+            .await
+        });
+
+        stop.send(true).ok();
+        let interrupted = tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("the loop must end within the test timeout")
+            .unwrap();
+        assert!(
+            !interrupted,
+            "a stop request is an orderly end, not an interrupt"
+        );
+        assert!(
+            !hook_fired.load(std::sync::atomic::Ordering::SeqCst),
+            "an orderly stop must not run the interrupt hook"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_interrupt_runs_the_construction_hook_and_reports_the_exit() {
+        let (interrupts, received) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let mut source = InterruptSource::Channel(ChannelSource { rx: received });
+        let (_stop, mut stop_rx) = tokio::sync::watch::channel(false);
+        let hook_fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook_flag = Arc::clone(&hook_fired);
+        let run = tokio::spawn(async move {
+            construction_loop(&mut source, &mut stop_rx, move || {
+                hook_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+            .await
+        });
+
+        let _sent = interrupts.send(());
+        let interrupted = tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("the loop must end within the test timeout")
+            .unwrap();
+        assert!(
+            interrupted,
+            "an interrupt must be reported so the caller exits with the interrupt status"
+        );
+        assert!(
+            hook_fired.load(std::sync::atomic::Ordering::SeqCst),
+            "the hook must run before the caller exits"
         );
     }
 

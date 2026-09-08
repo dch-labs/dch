@@ -169,11 +169,17 @@ impl ApiClient for DchClient {
 /// dch layers its config precedence on top (config values replace the
 /// seeds; `request_timeout_secs` always applies). An empty `base_url`
 /// falls back to [`ApiType::default_base_url`] for the stock providers and
-/// to the seeded profile endpoint for the profiled ones.
+/// to the seeded profile endpoint for the profiled ones. Ollama's profile
+/// carries no default model, so the raw `config.model` seeds its builder:
+/// the out-of-box configuration (empty model) builds a client whose model
+/// is empty — a model must be named in the config or on the command line
+/// before a request can succeed.
 ///
 /// # API-key resolution
 ///
-/// `config.api_key` wins for every provider. When `None`, the stock
+/// `config.api_key` wins for every provider that accepts a key; Bedrock
+/// is the exception — it rejects a configured `api_key` (authentication
+/// is `SigV4` via the `AWS_*` environment variables). When `None`, the stock
 /// providers fall back to their conventional environment variables
 /// (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY` or
 /// `GOOGLE_API_KEY`); the profiled providers inherit their profile's
@@ -189,8 +195,7 @@ impl ApiClient for DchClient {
 ///   name), or the underlying HTTP client cannot be constructed.
 pub fn create_client(config: &ApiConfig) -> Result<DchClient, RunnerError> {
     let timeout = Duration::from_secs(config.request_timeout_secs);
-    let client_error =
-        |error: loopctl::api::error::ApiError| RunnerError::Client(error.to_string());
+    let client_error = |error: ApiError| RunnerError::Client(error.to_string());
 
     let client = match config.api_type {
         ApiType::OpenAi => {
@@ -469,13 +474,16 @@ fn build_bedrock(config: &ApiConfig) -> Result<BedrockClient, RunnerError> {
 /// Resolve the effective API base URL for `config`.
 ///
 /// Returns the configured [`ApiConfig::base_url`] verbatim when the user set
-/// one; otherwise falls back to [`ApiType::default_base_url`] for the
-/// configured provider. This is what lets a config omit `base_url` entirely
-/// (the common case for stock OpenAI/Anthropic/Gemini) while still allowing an
-/// override for self-hosted or proxy deployments.
+/// one; otherwise falls back to the provider's stock default. This is what
+/// lets a config omit `base_url` entirely (the common case for stock
+/// OpenAI/Anthropic/Gemini) while still allowing an override for self-hosted
+/// or proxy deployments. Only the stock arms call this helper — the profiled
+/// providers seed their endpoint from their builder — and every stock
+/// provider has a default, so the `None` arm of
+/// [`ApiType::default_base_url`] cannot be reached from here.
 fn effective_base_url(config: &ApiConfig) -> String {
     if config.base_url.is_empty() {
-        config.api_type.default_base_url().to_owned()
+        config.api_type.default_base_url().unwrap_or("").to_owned()
     } else {
         config.base_url.clone()
     }
@@ -835,6 +843,22 @@ mod tests {
             client.base_url(),
             "http://localhost:11434/v1",
             "the out-of-box configuration must land on the seeded local Ollama endpoint"
+        );
+    }
+
+    #[test]
+    fn default_api_config_without_a_model_builds_an_empty_model_client() {
+        // Ollama's profile has no default model to fall back on, so the
+        // out-of-box client builds with an empty one — the documented
+        // boundary, distinct from a seeded default like deepseek-chat.
+        let env = loopctl::testing::EnvGuard::acquire(&["OLLAMA_BASE_URL"]);
+        env.remove("OLLAMA_BASE_URL");
+        let client = create_client(&ApiConfig::default())
+            .expect("the out-of-box configuration builds without a model");
+        assert_eq!(
+            client.model(),
+            "",
+            "no config model and no profile default means an empty model"
         );
     }
 
