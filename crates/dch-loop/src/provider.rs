@@ -423,8 +423,11 @@ impl Profiled for loopctl::provider::AnthropicClientBuilder {
 /// The seeds are defaults-in-waiting: `base_url` and `model` replace the
 /// seeded values only when the config carries them, and `api_key` only
 /// when configured — so config-beats-environment falls out of the
-/// ordering. `request_timeout_secs` and `max_tokens` are family settings
-/// that always apply.
+/// ordering. `request_timeout_secs` always applies; `max_tokens` is
+/// forwarded to every family and honored where the family's client has
+/// a completion knob — the Anthropic family does, the OpenAI family's
+/// builder has none, so there it is dropped by documented design and
+/// the provider's own default completion budget governs.
 fn profiled<B: Profiled>(builder: B, config: &ApiConfig) -> B {
     let builder = if config.base_url.is_empty() {
         builder

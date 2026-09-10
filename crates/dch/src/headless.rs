@@ -141,8 +141,33 @@ impl HeadlessOutcome {
 /// Returns the exit code for any failure: 1 for construction-phase errors,
 /// 2 for run-level failures, 130 for cancellation.
 pub async fn run_headless(args: &Args, startup_bridge: crate::signals::CancelBridge) -> u8 {
-    match run_headless_inner(args, startup_bridge).await {
+    let inherited_mode = capture_marker_mode(args.done_file.as_ref());
+    let code = match run_headless_inner(args, startup_bridge, inherited_mode.clone()).await {
         Ok(outcome) | Err(outcome) => outcome.exit_code,
+    };
+    reapply_mode(inherited_mode.as_ref(), args.done_file.as_ref());
+    code
+}
+
+/// An existing marker's permissions, captured before the run clears it.
+///
+/// The clear deletes the file the writer's mode preservation would
+/// otherwise read, so the run carries the mode itself and reapplies it
+/// after its terminal write — a restrictive marker stays restrictive
+/// across runs.
+pub(crate) fn capture_marker_mode(
+    done_file: Option<&std::path::PathBuf>,
+) -> Option<std::fs::Permissions> {
+    done_file
+        .and_then(|path| std::fs::metadata(path).ok())
+        .map(|metadata| metadata.permissions())
+}
+
+/// Best-effort mode restoration; a failed chmod leaves the platform
+/// default in place.
+fn reapply_mode(mode: Option<&std::fs::Permissions>, done_file: Option<&std::path::PathBuf>) {
+    if let (Some(mode), Some(path)) = (mode, done_file) {
+        drop(std::fs::set_permissions(path, mode.clone()));
     }
 }
 
@@ -165,15 +190,23 @@ pub async fn run_headless(args: &Args, startup_bridge: crate::signals::CancelBri
 async fn run_headless_inner(
     args: &Args,
     startup_bridge: crate::signals::CancelBridge,
+    inherited_mode: Option<std::fs::Permissions>,
 ) -> Result<HeadlessOutcome, HeadlessOutcome> {
     if let Some(path) = &args.done_file {
         match std::fs::remove_file(path) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => eprintln!(
-                "dch: cannot clear the stale done-file at {}: {err}",
-                path.display()
-            ),
+            Err(err) => {
+                let outcome = construction_failure(
+                    args,
+                    format!(
+                        "cannot clear the stale done-file at {}: {err}",
+                        path.display()
+                    ),
+                );
+                startup_bridge.stop().await;
+                return Err(outcome);
+            }
         }
     }
     let built = match construct_run(args).await {
@@ -186,10 +219,12 @@ async fn run_headless_inner(
     let ConstructedRun { prompt, mut runner } = built;
 
     let force_args = args.clone();
+    let hook_mode = inherited_mode;
     let outcome_recorded = Arc::new(AtomicBool::new(false));
     let hook_recorded = Arc::clone(&outcome_recorded);
     let bridge = crate::signals::install_cancel_handler(runner.cancel_signal(), move || {
         write_force_marker_unless_recorded(&force_args, &hook_recorded);
+        reapply_mode(hook_mode.as_ref(), force_args.done_file.as_ref());
     });
     startup_bridge.stop().await;
 
@@ -284,9 +319,13 @@ async fn construct_run(args: &Args) -> Result<ConstructedRun, HeadlessOutcome> {
 /// exists — the startup bridge's hook.
 ///
 /// Public to `main` so the handler can be armed the moment the runtime is
-/// up, ahead of prompt resolution and agent construction.
-pub(crate) fn write_startup_done_file(args: &Args) {
+/// up, ahead of prompt resolution and agent construction. The mode
+/// captured before the bridge was armed is restored after the write,
+/// mirroring the run-phase force hook: the stale marker this hook's write
+/// replaces was cleared while the hook waited.
+pub(crate) fn write_startup_done_file(args: &Args, inherited_mode: Option<&std::fs::Permissions>) {
     write_done_file_if_requested(args, &HeadlessOutcome::failure(130, STARTUP_CANCEL_MESSAGE));
+    reapply_mode(inherited_mode, args.done_file.as_ref());
 }
 
 /// Build a construction-phase failure outcome and write the done-file.
@@ -791,7 +830,11 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "needs a configured provider; run manually to prove the pipeline"]
+    #[allow(clippy::await_holding_lock)]
     async fn a_live_headless_run_succeeds() {
+        let _signal_lock = SIGNAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let args = parse(&["--headless", "Reply with exactly: ok"]);
         assert_eq!(
             run_headless(&args, crate::signals::install_construction_handler(|| {}),).await,
@@ -904,6 +947,7 @@ mod tests {
         let _signal_lock = SIGNAL_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::signals::assert_listeners_install();
         let server = HoldServer::start().await;
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
@@ -962,8 +1006,14 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn a_stale_done_file_is_cleared_before_the_run_proceeds() {
+        let _signal_lock = SIGNAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::signals::assert_listeners_install();
         let server = HoldServer::start().await;
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
@@ -984,8 +1034,6 @@ mod tests {
         ];
         let args = parse(&flags);
         let run_args = args.clone();
-        // The held server parks the run mid-stream, so the only way the
-        // marker can vanish while the run is live is the startup clear.
         let run = tokio::spawn(async move {
             run_headless(
                 &run_args,
@@ -1003,5 +1051,97 @@ mod tests {
              outcome for this one"
         );
         run.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn an_unclearable_stale_done_file_fails_the_run() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _signal_lock = SIGNAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::signals::assert_listeners_install();
+        if unsafe { libc::getuid() } == 0 {
+            // Root ignores directory permissions, so the removal this
+            // test forces would succeed and the assert would misfire.
+            return;
+        }
+        let server = HoldServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, server.config_toml()).unwrap();
+        let done_path = dir.path().join("done.json");
+        std::fs::write(
+            &done_path,
+            serde_json::to_string(&DoneStatus::success("a previous run", 3, 7)).unwrap(),
+        )
+        .unwrap();
+        let mut locked = std::fs::metadata(dir.path()).unwrap().permissions();
+        locked.set_mode(0o555);
+        std::fs::set_permissions(dir.path(), locked).unwrap();
+        let flags = [
+            "--headless",
+            "hello",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--done-file",
+            done_path.to_str().unwrap(),
+        ];
+        let code = run_headless(
+            &parse(&flags),
+            crate::signals::install_construction_handler(|| {}),
+        )
+        .await;
+        let mut writable = std::fs::metadata(dir.path()).unwrap().permissions();
+        writable.set_mode(0o755);
+        std::fs::set_permissions(dir.path(), writable).ok();
+        assert_eq!(
+            code, 1,
+            "a stale marker this run cannot clear must fail the run, not \
+             proceed under the previous run's outcome"
+        );
+        assert!(
+            done_path.exists(),
+            "the unreadable-marker failure path leaves the stale file — it \
+             could not be replaced"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_restrictive_marker_mode_survives_the_stale_clear() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _signal_lock = SIGNAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "not a valid [[toml document").unwrap();
+        let done_path = dir.path().join("done.json");
+        std::fs::write(&done_path, "stale").unwrap();
+        std::fs::set_permissions(&done_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let flags = [
+            "--headless",
+            "hello",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--done-file",
+            done_path.to_str().unwrap(),
+        ];
+        let code = run_headless(
+            &parse(&flags),
+            crate::signals::install_construction_handler(|| {}),
+        )
+        .await;
+        assert_eq!(code, 1, "the malformed config must fail construction");
+        let mode = std::fs::metadata(&done_path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "the restrictive mode of a cleared marker must survive the \
+             run that replaced it"
+        );
     }
 }

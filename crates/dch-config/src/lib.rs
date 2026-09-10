@@ -555,7 +555,7 @@ pub struct DchConfig {
 /// Everything needed to point the agent at a model endpoint: which model, where
 /// it lives, how to authenticate, and the token/timeout limits to enforce. All
 /// fields default via the manual [`Default`] impl below.
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct ApiConfig {
     /// Primary model identifier.
@@ -1265,8 +1265,10 @@ redact_secrets = false
             let written = toml::to_string(&source).unwrap();
             let reparsed: ApiConfig = toml::from_str(&written).unwrap();
             assert_eq!(
-                reparsed.api_type, variant,
-                "{variant:?} must survive a serialize/deserialize round trip"
+                reparsed, source,
+                "{variant:?} must survive a serialize/deserialize round trip \
+                 whole — an unset Option coming back as an empty string would \
+                 turn a missing key into a present-but-empty credential"
             );
         }
     }

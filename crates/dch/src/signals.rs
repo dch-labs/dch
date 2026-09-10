@@ -121,7 +121,7 @@ impl InterruptListeners {
             let install = |kind, name| match signal::unix::signal(kind) {
                 Ok(stream) => Some(stream),
                 Err(error) => {
-                    eprintln!("dch: cannot install the {name} listener: {error}");
+                    report(&format!("dch: cannot install the {name} listener: {error}"));
                     None
                 }
             };
@@ -135,7 +135,7 @@ impl InterruptListeners {
             let interrupt = match signal::windows::ctrl_c() {
                 Ok(stream) => Some(stream),
                 Err(error) => {
-                    eprintln!("dch: cannot install the Ctrl-C listener: {error}");
+                    report(&format!("dch: cannot install the Ctrl-C listener: {error}"));
                     None
                 }
             };
@@ -185,9 +185,9 @@ impl InterruptListeners {
     /// listen; the wait parks forever and says so.
     #[cfg(not(any(unix, windows)))]
     async fn wait(&mut self) {
-        eprintln!(
+        report(
             "dch: this platform cannot listen for interrupts — the current \
-             run cannot be cancelled"
+             run cannot be cancelled",
         );
         std::future::pending::<()>().await;
     }
@@ -270,6 +270,25 @@ enum BridgeOutcome {
     Forced,
 }
 
+/// Report a bridge message without letting a broken stderr take the
+/// bridge down.
+///
+/// `eprintln!` panics when the write itself fails — a closed or piped
+/// fd 2 being ordinary in CI — and a panic inside the bridge task
+/// strands the run with neither cancellation nor the forced exit.
+fn report(message: &str) {
+    use std::io::Write as _;
+    drop(writeln!(std::io::stderr(), "{message}"));
+}
+
+/// Run a host hook so its panic cannot void the terminal action.
+///
+/// The hook writes durable state on the way out; whatever it leaves
+/// undone, the caller still performs the exit the interrupt promised.
+fn run_hook_guarded(hook: impl Fn()) {
+    drop(std::panic::catch_unwind(std::panic::AssertUnwindSafe(hook)));
+}
+
 /// The interrupt-bridge decision loop, parameterized over the interrupt
 /// source so tests can drive it without OS signals.
 ///
@@ -281,7 +300,10 @@ enum BridgeOutcome {
 /// which yields [`BridgeOutcome::Stopped`]. At the window's edge a
 /// ready interrupt outranks the expiry (the select is biased), so a
 /// repeat landing as the window closes still forces instead of being
-/// downgraded to a fresh cancellation.
+/// downgraded to a fresh cancellation. The cancel trips before its
+/// notice is written, and a panicking hook is contained — a broken
+/// stderr or a failing hook cannot strand the run without either
+/// exit path.
 async fn bridge_loop(
     source: &mut InterruptSource,
     stop: &mut tokio::sync::watch::Receiver<bool>,
@@ -316,16 +338,16 @@ async fn bridge_loop(
         let now = Instant::now();
         match classify_interrupt(previous, now) {
             InterruptDecision::Cancel => {
-                eprintln!(
-                    "dch: interrupt received — cancelling the current turn \
-                     (repeat the interrupt to quit immediately)"
-                );
                 cancel.cancel();
+                report(
+                    "dch: interrupt received — cancelling the current turn \
+                     (repeat the interrupt to quit immediately)",
+                );
                 previous = Some(now);
             }
             InterruptDecision::Force => {
-                eprintln!("dch: second interrupt received — forcing exit (130)");
-                on_force();
+                report("dch: second interrupt received — forcing exit (130)");
+                run_hook_guarded(on_force);
                 return BridgeOutcome::Forced;
             }
         }
@@ -341,7 +363,8 @@ async fn bridge_loop(
 /// returns `LoopError::Cancelled`, which the host maps to exit code 130. A
 /// second interrupt within [`DOUBLE_CTRL_C_WINDOW`] runs `on_force` — a
 /// host hook for durable state, such as the done-file marker — and exits
-/// the process with 130. The listener stays armed across the window, so the
+/// the process with 130; the hook runs contained, so its panic cannot
+/// void the exit. The listener stays armed across the window, so the
 /// repeat is never lost to a re-registration gap — though a repeat
 /// arriving before the previous interrupt is consumed can coalesce with
 /// it (see `InterruptListeners`); once the window elapses, a fresh
@@ -349,10 +372,16 @@ async fn bridge_loop(
 ///
 /// Call once, after constructing the runner and before awaiting its run,
 /// so an early interrupt cannot be missed, and stop the returned bridge
-/// when the run ends — a stopped bridge stops listening, so a later run
-/// in the same process never inherits an older bridge's window state.
-/// The signature carries only the signal and a hook — not the runner — so
-/// any mode can install the same bridge against its own runner's signal.
+/// when the run ends — its window state dies with it, so a later run in
+/// the same process never inherits an older bridge's state. Install the
+/// successor bridge before stopping this one to stay interruptible
+/// across the handoff on every platform; on Unix the OS handler
+/// additionally stays registered for the runtime's lifetime (the
+/// stray-signal test pins the gap's capture-and-discard), while on
+/// Windows persistence across a dropped Ctrl-C stream is unverified.
+/// The signature carries only the signal
+/// and a hook — not the runner — so any mode can install the same
+/// bridge against its own runner's signal.
 pub fn install_cancel_handler(
     cancel: Arc<CancelSignal>,
     on_force: impl Fn() + Send + 'static,
@@ -373,7 +402,8 @@ pub fn install_cancel_handler(
 /// Before the runner exists there is nothing to cancel cooperatively, so
 /// any SIGINT or SIGTERM during construction runs `on_interrupt` — a host
 /// hook for durable state, such as the done-file marker — and exits the
-/// process with 130. Listeners are registered before this function
+/// process with 130; the hook runs contained, so its panic cannot void
+/// the exit. Listeners are registered before this function
 /// returns, closing the default-disposition window an unaided spawn would
 /// have.
 ///
@@ -407,8 +437,8 @@ async fn construction_loop(
     tokio::select! {
         _ = stop.changed() => false,
         () = source.wait() => {
-            eprintln!("dch: interrupt received during startup — exiting (130)");
-            on_interrupt();
+            report("dch: interrupt received during startup — exiting (130)");
+            run_hook_guarded(on_interrupt);
             true
         }
     }
@@ -416,10 +446,18 @@ async fn construction_loop(
 
 /// A handle over the interrupt bridge installed for one run.
 ///
-/// Stopping the bridge ends its task: the listeners unsubscribe, the
-/// window state dies with it, and signals after the stop are no longer
-/// its to classify. Awaiting [`stop`](Self::stop) waits out the task so a
-/// late forced exit can never race the run's own finalization.
+/// Stopping the bridge ends its task and drops its listener streams,
+/// and the window state dies with it. On Unix, the OS-level handler
+/// installed on first registration stays installed for the
+/// signal-enabled runtime's lifetime, so a signal arriving in a
+/// stop→reinstall gap is captured and discarded rather than allowed to
+/// kill by the default disposition — pinned by the stray-signal test;
+/// on Windows the console handler's persistence across a dropped
+/// Ctrl-C stream is not verified here. A host that must stay
+/// interruptible across the gap installs the next bridge before
+/// stopping this one — the one handoff that holds on every platform.
+/// Awaiting [`stop`](Self::stop) waits out the task so a late forced
+/// exit can never race the run's own finalization.
 #[derive(Debug)]
 pub struct CancelBridge {
     /// Signals the bridge task to stop.
@@ -449,9 +487,34 @@ impl CancelBridge {
     pub async fn stop(self) {
         self.stop.send(true).ok();
         if let Err(err) = self.task.await {
-            eprintln!("dch: the signal bridge task ended abnormally: {err}");
+            report(&format!(
+                "dch: the signal bridge task ended abnormally: {err}"
+            ));
         }
     }
+}
+
+/// Refuse to run a real-signal test without a verified listener.
+///
+/// `InterruptListeners::install` tolerates a refused registration; a
+/// kill with no listener installed takes the default disposition and
+/// terminates the whole test binary, so each real-signal test first
+/// proves this environment registers listeners at all — a registration
+/// that succeeds here succeeds for the test's own install
+/// microseconds later.
+///
+/// # Panics
+///
+/// When either listener fails to register — the calling test refuses
+/// to run rather than default-kill the whole binary.
+#[cfg(all(test, unix))]
+pub(crate) fn assert_listeners_install() {
+    let listeners = InterruptListeners::install();
+    assert!(
+        listeners.interrupt.is_some() && listeners.terminate.is_some(),
+        "signal listeners refused to install — a real-signal kill would \
+         terminate the whole test binary"
+    );
 }
 
 #[cfg(test)]
@@ -463,24 +526,6 @@ impl CancelBridge {
 )]
 mod tests {
     use super::*;
-
-    /// Refuse to run a real-signal test without a verified listener.
-    ///
-    /// `InterruptListeners::install` tolerates a refused registration;
-    /// a kill with no listener installed takes the default disposition
-    /// and terminates the whole test binary, so each real-signal test
-    /// first proves this environment registers listeners at all — a
-    /// registration that succeeds here succeeds for the test's own
-    /// install microseconds later.
-    #[cfg(unix)]
-    fn assert_listeners_install() {
-        let listeners = InterruptListeners::install();
-        assert!(
-            listeners.interrupt.is_some() && listeners.terminate.is_some(),
-            "signal listeners refused to install — a real-signal kill would \
-             terminate the whole test binary"
-        );
-    }
 
     #[test]
     fn a_first_interrupt_classifies_as_cancel() {
@@ -634,6 +679,45 @@ mod tests {
         assert!(
             harness.hook_fired.load(std::sync::atomic::Ordering::SeqCst),
             "the repeat inside the window must run the force hook before returning"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_panicking_force_hook_still_yields_the_forced_outcome() {
+        let (interrupts, received) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let cancel = Arc::new(CancelSignal::new());
+        let mut source = InterruptSource::Channel(ChannelSource { rx: received });
+        let (_keep_open, mut stop_rx) = tokio::sync::watch::channel(false);
+        let bridge = tokio::spawn(async move {
+            bridge_loop(&mut source, &mut stop_rx, cancel, || {
+                panic!("the durable-state hook failed");
+            })
+            .await
+        });
+        let _sent = interrupts.send(());
+        let _sent = interrupts.send(());
+        let outcome = tokio::time::timeout(Duration::from_secs(5), bridge)
+            .await
+            .expect("the bridge must decide within the test timeout")
+            .unwrap();
+        assert_eq!(
+            outcome,
+            BridgeOutcome::Forced,
+            "a panicking hook must not void the forced exit"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_panicking_construction_hook_still_reports_the_interrupt() {
+        let (interrupts, received) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let mut source = InterruptSource::Channel(ChannelSource { rx: received });
+        let (_keep_open, mut stop_rx) = tokio::sync::watch::channel(false);
+        let _sent = interrupts.send(());
+        let interrupted =
+            construction_loop(&mut source, &mut stop_rx, || panic!("the hook failed")).await;
+        assert!(
+            interrupted,
+            "a panicking hook must not void the startup exit"
         );
     }
 

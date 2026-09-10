@@ -16,7 +16,7 @@ dch-tui = { workspace = true }
 dch-config = { workspace = true }
 loopctl    = { workspace = true }
 clap       = { workspace = true }
-tokio      = { workspace = true, features = ["signal"] }
+tokio      = { workspace = true, features = ["signal", "net", "io-util"] }
 serde       = { workspace = true }
 serde_json = { workspace = true }
 uuid       = { workspace = true }

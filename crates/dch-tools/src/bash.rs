@@ -536,8 +536,9 @@ impl BashTool {
             .unwrap_or(false)
         {
             let id = spawn_background_job(command, &cwd, timeout_secs);
+            let summary = command_summary(command);
             return Ok(ToolOutput::text(format!(
-                "Started background job {id}: {command}"
+                "Started background job {id}: {summary}"
             )));
         }
 
@@ -1477,6 +1478,33 @@ mod tests {
         let out = tool.call(input, &ctx).await.unwrap();
         assert!(!out.is_error);
         assert!(out.text_content().contains("Started background job"));
+    }
+
+    #[tokio::test]
+    async fn a_background_acknowledgement_is_bounded() {
+        let _guard = JOB_TEST_GUARD.lock().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let tool = BashTool;
+        let ctx = ctx_in(cwd);
+        let long = "x".repeat(MAX_COMMAND_SUMMARY_BYTES * 3);
+        let input = json!({ "command": format!("echo {long}"), "background": true });
+        let out = tool.call(input, &ctx).await.unwrap();
+        let text = out.text_content();
+        assert!(
+            text.contains("Started background job"),
+            "the acknowledgement still names the job: {text}"
+        );
+        assert!(
+            text.len() < MAX_COMMAND_SUMMARY_BYTES * 2,
+            "the acknowledgement must not echo a pathological command back \
+             into the model's context: {} bytes",
+            text.len()
+        );
+        assert!(
+            text.contains(TRUNCATION_MARKER),
+            "the elided command carries the shared marker: {text}"
+        );
     }
 
     #[tokio::test]

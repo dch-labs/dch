@@ -17,7 +17,8 @@ fn main() -> std::process::ExitCode {
         .unwrap_or_else(|err| {
             let message = format!("failed to start tokio runtime: {err}");
             eprintln!("dch: {message}");
-            if let Some(path) = &args.done_file
+            if args.headless.is_some()
+                && let Some(path) = &args.done_file
                 && let Err(write_err) =
                     done::write_done_file(path, &done::DoneStatus::failure(message))
             {
@@ -31,8 +32,9 @@ fn main() -> std::process::ExitCode {
     runtime.block_on(async move {
         if args.headless.is_some() {
             let startup_args = args.clone();
+            let startup_mode = headless::capture_marker_mode(args.done_file.as_ref());
             let startup_bridge = signals::install_construction_handler(move || {
-                headless::write_startup_done_file(&startup_args);
+                headless::write_startup_done_file(&startup_args, startup_mode.as_ref());
             });
             let code = headless::run_headless(&args, startup_bridge).await;
             std::process::ExitCode::from(code)
