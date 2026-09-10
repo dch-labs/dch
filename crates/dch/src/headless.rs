@@ -166,6 +166,16 @@ async fn run_headless_inner(
     args: &Args,
     startup_bridge: crate::signals::CancelBridge,
 ) -> Result<HeadlessOutcome, HeadlessOutcome> {
+    if let Some(path) = &args.done_file {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => eprintln!(
+                "dch: cannot clear the stale done-file at {}: {err}",
+                path.display()
+            ),
+        }
+    }
     let built = match construct_run(args).await {
         Ok(built) => built,
         Err(outcome) => {
@@ -950,5 +960,48 @@ mod tests {
             code, 130,
             "SIGTERM must take the same cooperative path as SIGINT, not a default kill"
         );
+    }
+
+    #[tokio::test]
+    async fn a_stale_done_file_is_cleared_before_the_run_proceeds() {
+        let server = HoldServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, server.config_toml()).unwrap();
+        let done_path = dir.path().join("done.json");
+        std::fs::write(
+            &done_path,
+            serde_json::to_string(&DoneStatus::success("a previous run", 3, 7)).unwrap(),
+        )
+        .unwrap();
+        let flags = [
+            "--headless",
+            "hello",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--done-file",
+            done_path.to_str().unwrap(),
+        ];
+        let args = parse(&flags);
+        let run_args = args.clone();
+        // The held server parks the run mid-stream, so the only way the
+        // marker can vanish while the run is live is the startup clear.
+        let run = tokio::spawn(async move {
+            run_headless(
+                &run_args,
+                crate::signals::install_construction_handler(|| {}),
+            )
+            .await
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while done_path.exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            !done_path.exists(),
+            "a marker left by a previous run must not report that run's \
+             outcome for this one"
+        );
+        run.abort();
     }
 }

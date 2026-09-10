@@ -20,9 +20,11 @@
 # carries the fact: fork status only on the PR and review-comment
 # events, the author on every path — an issue comment on a fork PR is
 # left to the callee's rejection. Comment-triggered runs additionally
-# start only for owners, members, and collaborators, so the secrets this
-# job carries never enter an unauthorized comment's environment; the
-# callee's gate re-checks with write on its side.
+# start only for owners, members, and collaborators — an advisory
+# filter, since those associations do not prove write permission: the
+# secrets this job carries are contained by the callee's write gate,
+# which is the actual authorization boundary and must be re-verified
+# at every pin bump.
 name: difftrace review
 
 on:

@@ -103,10 +103,15 @@ const SHELL_OPERATORS: &[&str] = &["&&", "||", ";", "|", "`", "$(", ">", ">>", "
 /// Substrings that make an otherwise-allowlisted command unsafe.
 ///
 /// Guard against mutating flags and subcommands hiding inside an
-/// allowlisted prefix, such as `find -delete` or `git branch -D`.
+/// allowlisted prefix, such as `find -delete`, find's file-writing
+/// `-fls`/`-fprint*` flags, `git diff --output=` writing its output to a
+/// file, or `git branch -D`.
 const UNSAFE_SUBSTRINGS: &[&str] = &[
     " -delete",
     " -exec",
+    " -fls",
+    " -fprint",
+    " --output=",
     "git branch -D",
     "git branch -d",
     "git branch --delete",
@@ -360,8 +365,11 @@ fn job_summary(status: &JobStatus) -> String {
 /// the `Child` (SIGKILL to the direct child) and this guard (SIGKILL to the
 /// whole process group). This ensures sub-shells, pipelines, and `sleep`
 /// grandchildren die too — not just the `bash` child. A reaped child
-/// disarms the guard, so a command that deliberately backgrounded a helper
-/// leaves it running past the tool's return.
+/// disarms the guard, so a helper the command backgrounded **with its
+/// output redirected away from the pipes** survives the tool's return.
+/// A bare `cmd &` does not: the helper inherits the pipe write ends,
+/// so the tool blocks on EOF until the helper exits — and on timeout
+/// the still-armed guard kills it with the group.
 #[cfg(unix)]
 struct ChildGuard {
     /// Process-group ID of the child, when it was successfully spawned into its own group.
@@ -949,12 +957,28 @@ mod tests {
             "find . -delete",
             "find / -exec rm {} \\;",
             "find . -name '*.tmp' -delete",
+            "find . -fls /tmp/out",
+            "find . -fprint /tmp/names",
+            "find . -fprint0 /tmp/names0",
+            "find . -fprintf /tmp/report '\\n'",
         ] {
             assert!(
                 !is_read_only_command(&json!({ "command": cmd })),
                 "'{cmd}' should NOT be read-only (mutating find)"
             );
         }
+    }
+
+    #[test]
+    fn concurrency_check_git_output_flag_unsafe() {
+        assert!(
+            !is_read_only_command(&json!({ "command": "git diff --output=/tmp/patch" })),
+            "git diff --output writes a file and must not be read-only"
+        );
+        assert!(
+            !is_read_only_command(&json!({ "command": "git log --output=/tmp/log" })),
+            "git log --output writes a file and must not be read-only"
+        );
     }
 
     #[test]
@@ -1381,6 +1405,44 @@ mod tests {
         assert!(
             marker.exists(),
             "a helper detached before the tool returned must not be group-killed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_redirected_helper_outlives_the_tool_call_without_blocking_it() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let marker = tmp.path().join("late-marker");
+        let tool = BashTool;
+        let ctx = ctx_in(cwd);
+        // The subshell's stdio is redirected to /dev/null, so it holds
+        // none of the tool's pipes: the tool must return at the shell's
+        // exit, long before the helper's 3 s sleep ends.
+        let input = json!({
+            "command": format!(
+                "(sleep 3 && touch {}) >/dev/null 2>&1 &",
+                marker.display()
+            )
+        });
+        let started = Instant::now();
+        let out = tool.call(input, &ctx).await.unwrap();
+        let elapsed = started.elapsed();
+        assert!(!out.is_error);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the tool must not block on a redirected helper's lifetime: {elapsed:?}"
+        );
+        assert!(
+            !marker.exists(),
+            "the helper is still asleep when the tool returns"
+        );
+        let deadline = Instant::now() + Duration::from_secs(6);
+        while !marker.exists() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            marker.exists(),
+            "the redirected helper survives the tool's return"
         );
     }
 

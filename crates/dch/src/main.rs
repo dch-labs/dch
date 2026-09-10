@@ -15,7 +15,17 @@ fn main() -> std::process::ExitCode {
         .enable_all()
         .build()
         .unwrap_or_else(|err| {
-            eprintln!("dch: failed to start tokio runtime: {err}");
+            let message = format!("failed to start tokio runtime: {err}");
+            eprintln!("dch: {message}");
+            if let Some(path) = &args.done_file
+                && let Err(write_err) =
+                    done::write_done_file(path, &done::DoneStatus::failure(message))
+            {
+                eprintln!(
+                    "dch: cannot write the done-file at {}: {write_err}",
+                    path.display()
+                );
+            }
             std::process::exit(1);
         });
     runtime.block_on(async move {

@@ -464,6 +464,24 @@ impl CancelBridge {
 mod tests {
     use super::*;
 
+    /// Refuse to run a real-signal test without a verified listener.
+    ///
+    /// `InterruptListeners::install` tolerates a refused registration;
+    /// a kill with no listener installed takes the default disposition
+    /// and terminates the whole test binary, so each real-signal test
+    /// first proves this environment registers listeners at all — a
+    /// registration that succeeds here succeeds for the test's own
+    /// install microseconds later.
+    #[cfg(unix)]
+    fn assert_listeners_install() {
+        let listeners = InterruptListeners::install();
+        assert!(
+            listeners.interrupt.is_some() && listeners.terminate.is_some(),
+            "signal listeners refused to install — a real-signal kill would \
+             terminate the whole test binary"
+        );
+    }
+
     #[test]
     fn a_first_interrupt_classifies_as_cancel() {
         let now = Instant::now();
@@ -707,6 +725,7 @@ mod tests {
         let _signal_lock = SIGNAL_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_listeners_install();
         let cancel = Arc::new(CancelSignal::new());
         let hook_cancel = Arc::clone(&cancel);
         let hook_fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -736,6 +755,7 @@ mod tests {
         let _signal_lock = SIGNAL_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_listeners_install();
         let bridge = install_cancel_handler(Arc::new(CancelSignal::new()), || {});
         bridge.stop().await;
         // The registration outlives the bridge: the platform handler is
@@ -754,6 +774,7 @@ mod tests {
         let _signal_lock = SIGNAL_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_listeners_install();
         let mut listeners = InterruptListeners::install();
 
         unsafe { libc::kill(libc::getpid(), libc::SIGINT) };
