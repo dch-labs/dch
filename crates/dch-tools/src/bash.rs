@@ -808,7 +808,7 @@ fn is_read_only_command(input: &Value) -> bool {
     let Some(command) = input.get("command").and_then(Value::as_str) else {
         return false;
     };
-    let normalized = command.trim();
+    let normalized = shell_normalized(command);
     if normalized.is_empty() {
         return false;
     }
@@ -828,6 +828,21 @@ fn is_read_only_command(input: &Value) -> bool {
         }
         false
     })
+}
+
+/// Collapse a command the way the shell would tokenize it for matching.
+///
+/// Whitespace runs become single spaces and quote characters are
+/// dropped, so a tab-separated or quoted argument cannot slip an unsafe
+/// flag past checks that match space-separated text — `find\t.\t-delete`
+/// and `find . "-delete"` normalize to the same `find . -delete` the
+/// denylist guards.
+fn shell_normalized(command: &str) -> String {
+    command
+        .replace(['"', '\''], "")
+        .split_whitespace()
+        .collect::<Vec<&str>>()
+        .join(" ")
 }
 
 #[cfg(test)]
@@ -962,12 +977,33 @@ mod tests {
             "find . -fprint /tmp/names",
             "find . -fprint0 /tmp/names0",
             "find . -fprintf /tmp/report '\\n'",
+            "find\t.\t-delete",
+            "find . \"-delete\"",
         ] {
             assert!(
                 !is_read_only_command(&json!({ "command": cmd })),
                 "'{cmd}' should NOT be read-only (mutating find)"
             );
         }
+    }
+
+    #[test]
+    fn concurrency_check_whitespace_and_quotes_normalized() {
+        for cmd in [
+            "git branch\t-D\tmain",
+            "git remote\tadd\torigin\turl",
+            "git diff\t--output=/tmp/patch",
+            "git branch \"-D\" main",
+        ] {
+            assert!(
+                !is_read_only_command(&json!({ "command": cmd })),
+                "'{cmd}' should NOT be read-only (separator/quote-normalized)"
+            );
+        }
+        assert!(
+            is_read_only_command(&json!({ "command": "git\tstatus" })),
+            "a tab-separated safe command stays read-only once normalized"
+        );
     }
 
     #[test]

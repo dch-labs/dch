@@ -270,13 +270,13 @@ enum BridgeOutcome {
     Forced,
 }
 
-/// Report a bridge message without letting a broken stderr take the
-/// bridge down.
+/// Report a message to stderr without letting a broken stream take the
+/// caller down.
 ///
 /// `eprintln!` panics when the write itself fails — a closed or piped
-/// fd 2 being ordinary in CI — and a panic inside the bridge task
-/// strands the run with neither cancellation nor the forced exit.
-fn report(message: &str) {
+/// fd 2 being ordinary in CI — and such a panic on a terminal path
+/// strands the run without its marker or exit code.
+pub(crate) fn report(message: &str) {
     use std::io::Write as _;
     drop(writeln!(std::io::stderr(), "{message}"));
 }
@@ -297,10 +297,13 @@ fn run_hook_guarded(hook: impl Fn()) {
 /// the listener still attached, the window's expiry re-arms a fresh
 /// first-interrupt, and a repeat inside the window runs `on_force` and
 /// yields [`BridgeOutcome::Forced`] — or until the stop signal fires,
-/// which yields [`BridgeOutcome::Stopped`]. At the window's edge a
-/// ready interrupt outranks the expiry (the select is biased), so a
-/// repeat landing as the window closes still forces instead of being
-/// downgraded to a fresh cancellation. The cancel trips before its
+/// which yields [`BridgeOutcome::Stopped`]. The selects are biased with
+/// the stop request first, so a buffered interrupt — even a repeat that
+/// would force — cannot preempt an ordered shutdown and override the
+/// outcome the host has already finalized; among the rest, a ready
+/// interrupt outranks the window's expiry, so a repeat landing as the
+/// window closes still forces instead of being downgraded to a fresh
+/// cancellation. The cancel trips before its
 /// notice is written, and a panicking hook is contained — a broken
 /// stderr or a failing hook cannot strand the run without either
 /// exit path.
@@ -322,17 +325,19 @@ async fn bridge_loop(
             tokio::select! {
                 biased;
 
+                _ = stop.changed() => return BridgeOutcome::Stopped,
                 () = source.wait() => {}
                 () = window => {
                     previous = None;
                     continue;
                 }
-                _ = stop.changed() => return BridgeOutcome::Stopped,
             }
         } else {
             tokio::select! {
-                () = source.wait() => {}
+                biased;
+
                 _ = stop.changed() => return BridgeOutcome::Stopped,
+                () = source.wait() => {}
             }
         }
         let now = Instant::now();
@@ -741,6 +746,35 @@ mod tests {
         assert!(
             !harness.hook_fired.load(std::sync::atomic::Ordering::SeqCst),
             "an orderly stop must not fire the force hook"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pending_stop_outranks_a_buffered_repeat_interrupt() {
+        let harness = spawn_bridge_loop();
+
+        // Both interrupts are queued before the stop, so when the task is
+        // first polled the repeat is ready to force and the stop is ready
+        // to end the loop — the stop must win, or an interrupt landing
+        // during the host's finalization would exit(130) over the outcome
+        // the host just recorded.
+        let _sent = harness.interrupts.send(());
+        let _sent = harness.interrupts.send(());
+        harness.stop.send(true).ok();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), harness.bridge)
+            .await
+            .expect("the bridge must decide within the test timeout")
+            .unwrap();
+        assert_eq!(
+            outcome,
+            BridgeOutcome::Stopped,
+            "a pending stop outranks a buffered repeat that would force"
+        );
+        assert!(
+            !harness.hook_fired.load(std::sync::atomic::Ordering::SeqCst),
+            "the buffered repeat must not run the force hook once the stop \
+             is pending"
         );
     }
 

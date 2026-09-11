@@ -16,17 +16,19 @@ fn main() -> std::process::ExitCode {
         .build()
         .unwrap_or_else(|err| {
             let message = format!("failed to start tokio runtime: {err}");
-            eprintln!("dch: {message}");
+            // The marker precedes any stderr output: a broken stderr
+            // panics `eprintln!`, and this path exists to guarantee both.
             if args.headless.is_some()
                 && let Some(path) = &args.done_file
                 && let Err(write_err) =
-                    done::write_done_file(path, &done::DoneStatus::failure(message))
+                    done::write_done_file(path, &done::DoneStatus::failure(message.clone()), None)
             {
-                eprintln!(
+                signals::report(&format!(
                     "dch: cannot write the done-file at {}: {write_err}",
                     path.display()
-                );
+                ));
             }
+            signals::report(&format!("dch: {message}"));
             std::process::exit(1);
         });
     runtime.block_on(async move {
@@ -38,6 +40,12 @@ fn main() -> std::process::ExitCode {
             });
             let code = headless::run_headless(&args, startup_bridge).await;
             std::process::ExitCode::from(code)
+        } else if args.list_sessions {
+            eprintln!("--list-sessions is not yet available");
+            std::process::ExitCode::from(1)
+        } else if args.resume.is_some() {
+            eprintln!("--resume is not yet available");
+            std::process::ExitCode::from(1)
         } else {
             eprintln!("interactive mode not yet implemented; use --headless");
             std::process::ExitCode::from(1)

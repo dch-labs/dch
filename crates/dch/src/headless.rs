@@ -17,7 +17,7 @@ use loopctl::engine::Run;
 use loopctl::error::LoopError;
 
 use crate::args::Args;
-use crate::done::{DoneStatus, write_done_file};
+use crate::done::{DoneStatus, overwrite_done_file, write_done_file};
 
 /// The done-file message the force path writes, distinguishing a repeated
 /// interrupt from the cooperative cancellation a single one produces.
@@ -142,33 +142,24 @@ impl HeadlessOutcome {
 /// 2 for run-level failures, 130 for cancellation.
 pub async fn run_headless(args: &Args, startup_bridge: crate::signals::CancelBridge) -> u8 {
     let inherited_mode = capture_marker_mode(args.done_file.as_ref());
-    let code = match run_headless_inner(args, startup_bridge, inherited_mode.clone()).await {
+    match run_headless_inner(args, startup_bridge, inherited_mode).await {
         Ok(outcome) | Err(outcome) => outcome.exit_code,
-    };
-    reapply_mode(inherited_mode.as_ref(), args.done_file.as_ref());
-    code
+    }
 }
 
 /// An existing marker's permissions, captured before the run clears it.
 ///
 /// The clear deletes the file the writer's mode preservation would
-/// otherwise read, so the run carries the mode itself and reapplies it
-/// after its terminal write — a restrictive marker stays restrictive
-/// across runs.
+/// otherwise read, so the run carries the mode itself and every terminal
+/// write applies it to the replacement's temporary file before the
+/// rename — a restrictive marker stays restrictive with no post-write
+/// window.
 pub(crate) fn capture_marker_mode(
     done_file: Option<&std::path::PathBuf>,
 ) -> Option<std::fs::Permissions> {
     done_file
         .and_then(|path| std::fs::metadata(path).ok())
         .map(|metadata| metadata.permissions())
-}
-
-/// Best-effort mode restoration; a failed chmod leaves the platform
-/// default in place.
-fn reapply_mode(mode: Option<&std::fs::Permissions>, done_file: Option<&std::path::PathBuf>) {
-    if let (Some(mode), Some(path)) = (mode, done_file) {
-        drop(std::fs::set_permissions(path, mode.clone()));
-    }
 }
 
 /// Run the headless pipeline and produce a structured outcome.
@@ -197,19 +188,22 @@ async fn run_headless_inner(
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => {
-                let outcome = construction_failure(
-                    args,
-                    format!(
-                        "cannot clear the stale done-file at {}: {err}",
-                        path.display()
-                    ),
+                let message = format!(
+                    "cannot clear the stale done-file at {}: {err}",
+                    path.display()
                 );
+                // The rename-based write needs directory permission the
+                // removal just proved absent; an in-place overwrite needs
+                // only file permission and at minimum invalidates the
+                // previous run's outcome.
+                drop(overwrite_done_file(path, &DoneStatus::failure(&message)));
+                let outcome = construction_failure(args, message, inherited_mode.as_ref());
                 startup_bridge.stop().await;
                 return Err(outcome);
             }
         }
     }
-    let built = match construct_run(args).await {
+    let built = match construct_run(args, inherited_mode.as_ref()).await {
         Ok(built) => built,
         Err(outcome) => {
             startup_bridge.stop().await;
@@ -219,12 +213,11 @@ async fn run_headless_inner(
     let ConstructedRun { prompt, mut runner } = built;
 
     let force_args = args.clone();
-    let hook_mode = inherited_mode;
+    let hook_mode = inherited_mode.clone();
     let outcome_recorded = Arc::new(AtomicBool::new(false));
     let hook_recorded = Arc::clone(&outcome_recorded);
     let bridge = crate::signals::install_cancel_handler(runner.cancel_signal(), move || {
-        write_force_marker_unless_recorded(&force_args, &hook_recorded);
-        reapply_mode(hook_mode.as_ref(), force_args.done_file.as_ref());
+        write_force_marker_unless_recorded(&force_args, &hook_recorded, hook_mode.as_ref());
     });
     startup_bridge.stop().await;
 
@@ -232,7 +225,7 @@ async fn run_headless_inner(
         Ok(run) => run,
         Err(err) => {
             let outcome = HeadlessOutcome::from_loop_error(&err);
-            write_done_file_if_requested(args, &outcome);
+            write_done_file_if_requested(args, &outcome, inherited_mode.as_ref());
             outcome_recorded.store(true, Ordering::SeqCst);
             bridge.stop().await;
             return Err(outcome);
@@ -240,7 +233,7 @@ async fn run_headless_inner(
     };
 
     let outcome = HeadlessOutcome::from_run(&run);
-    write_done_file_if_requested(args, &outcome);
+    write_done_file_if_requested(args, &outcome, inherited_mode.as_ref());
     outcome_recorded.store(true, Ordering::SeqCst);
     bridge.stop().await;
     Ok(outcome)
@@ -253,11 +246,19 @@ async fn run_headless_inner(
 /// the recorded outcome is authoritative — a repeat interrupt still
 /// exits 130 through the force path, but no longer replaces the
 /// done-file's real outcome with the fixed cancel message.
-fn write_force_marker_unless_recorded(args: &Args, recorded: &AtomicBool) {
+fn write_force_marker_unless_recorded(
+    args: &Args,
+    recorded: &AtomicBool,
+    inherited_mode: Option<&std::fs::Permissions>,
+) {
     if recorded.load(Ordering::SeqCst) {
         return;
     }
-    write_done_file_if_requested(args, &HeadlessOutcome::failure(130, FORCE_CANCEL_MESSAGE));
+    write_done_file_if_requested(
+        args,
+        &HeadlessOutcome::failure(130, FORCE_CANCEL_MESSAGE),
+        inherited_mode,
+    );
 }
 
 /// The product of a successful construction phase.
@@ -289,13 +290,16 @@ struct ConstructedRun {
 ///
 /// Returns the construction-phase failure outcome when the prompt,
 /// config, working directory, or agent construction fails.
-async fn construct_run(args: &Args) -> Result<ConstructedRun, HeadlessOutcome> {
+async fn construct_run(
+    args: &Args,
+    inherited_mode: Option<&std::fs::Permissions>,
+) -> Result<ConstructedRun, HeadlessOutcome> {
     let prompt = resolve_prompt_nonblocking(args)
         .await
-        .map_err(|message| construction_failure(args, message))?;
+        .map_err(|message| construction_failure(args, message, inherited_mode))?;
 
     let mut config = load_config(args.config.config_path.as_deref())
-        .map_err(|message| construction_failure(args, message))?;
+        .map_err(|message| construction_failure(args, message, inherited_mode))?;
     apply_cli_overrides(&mut config, args);
 
     let verbosity = resolve_verbosity(&config, args);
@@ -304,14 +308,17 @@ async fn construct_run(args: &Args) -> Result<ConstructedRun, HeadlessOutcome> {
         ConsoleObserver::detect_color(),
     ));
 
-    let workdir = std::env::current_dir()
-        .map_err(|err| construction_failure(args, format!("cannot determine cwd: {err}")))?;
+    let workdir = std::env::current_dir().map_err(|err| {
+        construction_failure(args, format!("cannot determine cwd: {err}"), inherited_mode)
+    })?;
 
     let runner = dch_loop::Runner::builder(&config, &workdir)
         .with_observer(Arc::clone(&observer) as Arc<dyn loopctl::observer::LoopObserver>)
         .build()
         .await
-        .map_err(|err| construction_failure(args, format!("agent construction: {err}")))?;
+        .map_err(|err| {
+            construction_failure(args, format!("agent construction: {err}"), inherited_mode)
+        })?;
     Ok(ConstructedRun { prompt, runner })
 }
 
@@ -320,12 +327,15 @@ async fn construct_run(args: &Args) -> Result<ConstructedRun, HeadlessOutcome> {
 ///
 /// Public to `main` so the handler can be armed the moment the runtime is
 /// up, ahead of prompt resolution and agent construction. The mode
-/// captured before the bridge was armed is restored after the write,
-/// mirroring the run-phase force hook: the stale marker this hook's write
-/// replaces was cleared while the hook waited.
+/// captured before the bridge was armed is applied to the replacement
+/// atomically: the stale marker this write replaces was cleared while the
+/// hook waited.
 pub(crate) fn write_startup_done_file(args: &Args, inherited_mode: Option<&std::fs::Permissions>) {
-    write_done_file_if_requested(args, &HeadlessOutcome::failure(130, STARTUP_CANCEL_MESSAGE));
-    reapply_mode(inherited_mode, args.done_file.as_ref());
+    write_done_file_if_requested(
+        args,
+        &HeadlessOutcome::failure(130, STARTUP_CANCEL_MESSAGE),
+        inherited_mode,
+    );
 }
 
 /// Build a construction-phase failure outcome and write the done-file.
@@ -333,9 +343,13 @@ pub(crate) fn write_startup_done_file(args: &Args, inherited_mode: Option<&std::
 /// Every terminal path writes the marker when `--done-file` is supplied —
 /// including these before-the-run failures — so an orchestrator polling for
 /// the file's existence never hangs.
-fn construction_failure(args: &Args, message: impl Into<String>) -> HeadlessOutcome {
+fn construction_failure(
+    args: &Args,
+    message: impl Into<String>,
+    inherited_mode: Option<&std::fs::Permissions>,
+) -> HeadlessOutcome {
     let outcome = HeadlessOutcome::failure(1, message);
-    write_done_file_if_requested(args, &outcome);
+    write_done_file_if_requested(args, &outcome, inherited_mode);
     outcome
 }
 
@@ -498,9 +512,15 @@ fn resolve_verbosity(config: &dch_config::DchConfig, args: &Args) -> Verbosity {
 /// Write the done-file when `--done-file` is supplied.
 ///
 /// Called on every terminal path. Successful runs and answerless runs carry
-/// their turn/tool counts; other failures carry the message alone. Write
+/// their turn/tool counts; other failures carry the message alone. The
+/// inherited mode — captured before the stale marker was cleared — is
+/// applied to the replacement atomically, before the rename. Write
 /// failures are logged to stderr but do not change the exit code.
-fn write_done_file_if_requested(args: &Args, outcome: &HeadlessOutcome) {
+fn write_done_file_if_requested(
+    args: &Args,
+    outcome: &HeadlessOutcome,
+    inherited_mode: Option<&std::fs::Permissions>,
+) {
     let Some(path) = &args.done_file else {
         return;
     };
@@ -515,11 +535,11 @@ fn write_done_file_if_requested(args: &Args, outcome: &HeadlessOutcome) {
     } else {
         DoneStatus::failure(outcome.message.clone())
     };
-    if let Err(err) = write_done_file(path, &status) {
-        eprintln!(
+    if let Err(err) = write_done_file(path, &status, inherited_mode) {
+        crate::signals::report(&format!(
             "warning: failed to write done-file {}: {err}",
             path.display()
-        );
+        ));
     }
 }
 
@@ -635,7 +655,11 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("done.json");
         let args = parse(&["--headless", "x", "--done-file", path.to_str().unwrap()]);
-        write_done_file_if_requested(&args, &HeadlessOutcome::failure(130, FORCE_CANCEL_MESSAGE));
+        write_done_file_if_requested(
+            &args,
+            &HeadlessOutcome::failure(130, FORCE_CANCEL_MESSAGE),
+            None,
+        );
         let written: DoneStatus =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(written.message.as_deref(), Some(FORCE_CANCEL_MESSAGE));
@@ -649,14 +673,18 @@ mod tests {
         let args = parse(&["--headless", "x", "--done-file", path.to_str().unwrap()]);
 
         let recorded = AtomicBool::new(false);
-        write_force_marker_unless_recorded(&args, &recorded);
+        write_force_marker_unless_recorded(&args, &recorded, None);
         let first: DoneStatus =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(first.message.as_deref(), Some(FORCE_CANCEL_MESSAGE));
 
-        write_done_file_if_requested(&args, &HeadlessOutcome::failure(2, "engine error text"));
+        write_done_file_if_requested(
+            &args,
+            &HeadlessOutcome::failure(2, "engine error text"),
+            None,
+        );
         recorded.store(true, Ordering::SeqCst);
-        write_force_marker_unless_recorded(&args, &recorded);
+        write_force_marker_unless_recorded(&args, &recorded, None);
         let final_status: DoneStatus =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(
@@ -676,6 +704,7 @@ mod tests {
         write_done_file_if_requested(
             &args,
             &HeadlessOutcome::failure(130, STARTUP_CANCEL_MESSAGE),
+            None,
         );
         let written: DoneStatus =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -702,7 +731,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("done.json");
         let args = parse(&["--headless", "x", "--done-file", path.to_str().unwrap()]);
-        let outcome = construction_failure(&args, "config unreadable");
+        let outcome = construction_failure(&args, "config unreadable", None);
         assert_eq!(outcome.exit_code, 1);
         let written: DoneStatus =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -719,7 +748,7 @@ mod tests {
         let args = parse(&["--headless", "x", "--done-file", path.to_str().unwrap()]);
         let mut run = Run::new("task", &RunConfig::default());
         run.output = Some("done".into());
-        write_done_file_if_requested(&args, &HeadlessOutcome::from_run(&run));
+        write_done_file_if_requested(&args, &HeadlessOutcome::from_run(&run), None);
         let written: DoneStatus =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert!(written.success);
@@ -733,7 +762,7 @@ mod tests {
         let path = tmp.path().join("done.json");
         let args = parse(&["--headless", "x", "--done-file", path.to_str().unwrap()]);
         let run = Run::new("task", &RunConfig::default());
-        write_done_file_if_requested(&args, &HeadlessOutcome::from_run(&run));
+        write_done_file_if_requested(&args, &HeadlessOutcome::from_run(&run), None);
         let written: DoneStatus =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert!(!written.success);
@@ -745,7 +774,7 @@ mod tests {
     fn no_done_file_flag_writes_nothing() {
         let tmp = tempfile::TempDir::new().unwrap();
         let args = parse(&["--headless", "x"]);
-        write_done_file_if_requested(&args, &HeadlessOutcome::failure(1, "boom"));
+        write_done_file_if_requested(&args, &HeadlessOutcome::failure(1, "boom"), None);
         assert_eq!(
             std::fs::read_dir(tmp.path()).unwrap().count(),
             0,
@@ -776,6 +805,7 @@ mod tests {
         write_done_file_if_requested(
             &args,
             &HeadlessOutcome::from_loop_error(&LoopError::Cancelled),
+            None,
         );
         lock(0o700);
         assert!(!path.exists(), "the failed write leaves no marker");
@@ -1103,8 +1133,13 @@ mod tests {
         );
         assert!(
             done_path.exists(),
-            "the unreadable-marker failure path leaves the stale file — it \
-             could not be replaced"
+            "the unreadable-marker failure path leaves a file behind"
+        );
+        let written = std::fs::read_to_string(&done_path).unwrap_or_default();
+        assert!(
+            written.contains("cannot clear the stale done-file"),
+            "a writable-but-unremovable marker is invalidated in place, not \
+             left carrying the previous run's outcome: {written}"
         );
     }
 
