@@ -11,15 +11,17 @@ use std::path::PathBuf;
 /// talking to a model. The variant also gates provider-specific request shaping
 /// elsewhere in the application. Serde (de)serializes values as their lowercase
 /// name (e.g. `ollama`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Deserialize, serde::Serialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum ApiType {
     /// `OpenAI`-compatible API.
     ///
     /// The Chat Completions schema that several other providers (including
     /// vLLM servers) speak, so they map to this variant's client family;
-    /// `DeepSeek` and `Grok` carry their own variants for host-specific
-    /// defaults while reusing the same wire protocol.
+    /// `DeepSeek` and `Grok` carry their own variants selecting their
+    /// provider profiles while reusing the same wire protocol.
     OpenAi,
 
     /// `Anthropic` Messages API (also used by Z.AI).
@@ -43,20 +45,20 @@ pub enum ApiType {
 
     /// `DeepSeek` API.
     ///
-    /// A standalone variant so the default [`ApiType::default_base_url`] resolves
-    /// to the correct `DeepSeek` host.
+    /// A standalone variant selecting its provider profile, whose endpoint,
+    /// credential variable, and default model the profile supplies.
     DeepSeek,
 
     /// xAI `Grok`.
     ///
-    /// A standalone variant so the default [`ApiType::default_base_url`] resolves
-    /// to the correct xAI host.
+    /// A standalone variant selecting its provider profile, whose endpoint,
+    /// credential variable, and default model the profile supplies.
     Grok,
 
     /// `Z.AI` API.
     ///
-    /// A standalone variant so the default [`ApiType::default_base_url`] resolves
-    /// to the correct Z.AI host.
+    /// A standalone variant selecting its provider profile, whose endpoint,
+    /// credential variable, and default model the profile supplies.
     Zai,
 
     /// Azure OpenAI.
@@ -69,9 +71,9 @@ pub enum ApiType {
 
     /// Moonshot AI.
     ///
-    /// An OpenAI-compatible API served by Moonshot; the default base URL and
-    /// model resolve to Moonshot's host, with the key taken from the
-    /// `MOONSHOT_API_KEY` provider profile.
+    /// An OpenAI-compatible API served by Moonshot; its endpoint,
+    /// credentials, and default model come from its provider profile
+    /// (`MOONSHOT_API_KEY`).
     Moonshot,
 
     /// AWS Bedrock.
@@ -82,27 +84,55 @@ pub enum ApiType {
 }
 
 impl ApiType {
-    /// The default `base_url` for this provider.
+    /// The stock default `base_url` for this provider, when it has one.
     ///
-    /// Returns a sensible public or local endpoint for each variant,
-    /// consulted as the effective endpoint when [`ApiConfig::base_url`] is
-    /// unset. These are
-    /// the canonical host roots; provider clients may append their own path
-    /// suffixes on top.
+    /// Consulted as the effective endpoint when [`ApiConfig::base_url`] is
+    /// unset, for the stock providers (`OpenAi`, `Anthropic`, `Gemini`).
+    /// The profiled providers (`Ollama`, `DeepSeek`, `Grok`, `Azure`,
+    /// `Moonshot`, `Zai`) take their default endpoint from their provider
+    /// profile instead, and `Bedrock` derives its endpoint from the AWS
+    /// region, so this returns `None` for all of them — the type itself
+    /// keeps "defer to the profile" distinct from a configured host.
+    /// Provider clients may append their own path suffixes on top of a
+    /// host root.
     #[must_use]
-    pub fn default_base_url(self) -> &'static str {
+    pub fn default_base_url(self) -> Option<&'static str> {
         match self {
-            Self::OpenAi => "https://api.openai.com/v1",
-            Self::Anthropic => "https://api.anthropic.com",
-            Self::Gemini => "https://generativelanguage.googleapis.com",
-            Self::Ollama => "http://localhost:11434/v1",
-            Self::DeepSeek => "https://api.deepseek.com",
-            Self::Grok => "https://api.x.ai/v1",
-            Self::Zai => "https://api.z.ai/api",
-            Self::Azure | Self::Bedrock => "",
-            Self::Moonshot => "https://api.moonshot.ai/v1",
+            Self::OpenAi => Some("https://api.openai.com/v1"),
+            Self::Anthropic => Some("https://api.anthropic.com"),
+            Self::Gemini => Some("https://generativelanguage.googleapis.com"),
+            Self::Ollama
+            | Self::DeepSeek
+            | Self::Grok
+            | Self::Zai
+            | Self::Azure
+            | Self::Bedrock
+            | Self::Moonshot => None,
         }
     }
+
+    /// Every provider variant, the enumeration tests iterate.
+    ///
+    /// A manually maintained list, not a derived one: Rust has no
+    /// exhaustive-enumeration reflection, so a variant added to
+    /// [`ApiType`] is compiler-forced into
+    /// [`Self::default_base_url`]'s match — the real enforcement point —
+    /// but not into this list, whose per-variant pins would then silently
+    /// skip it. `api_type_all_lists_each_variant_once` catches duplicates
+    /// only — a mistyped variant path is a compile error; extend this
+    /// list in the same change that adds a variant.
+    pub const ALL: [ApiType; 10] = [
+        ApiType::OpenAi,
+        ApiType::Anthropic,
+        ApiType::Gemini,
+        ApiType::Ollama,
+        ApiType::DeepSeek,
+        ApiType::Grok,
+        ApiType::Zai,
+        ApiType::Azure,
+        ApiType::Moonshot,
+        ApiType::Bedrock,
+    ];
 }
 
 /// Console output verbosity.
@@ -525,7 +555,7 @@ pub struct DchConfig {
 /// Everything needed to point the agent at a model endpoint: which model, where
 /// it lives, how to authenticate, and the token/timeout limits to enforce. All
 /// fields default via the manual [`Default`] impl below.
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct ApiConfig {
     /// Primary model identifier.
@@ -536,9 +566,10 @@ pub struct ApiConfig {
 
     /// Base URL of the provider endpoint.
     ///
-    /// The host root the API client builds request URLs against. Defaults to an
-    /// empty string; callers typically fill it from
-    /// [`ApiType::default_base_url`].
+    /// The host root the API client builds request URLs against. Defaults to
+    /// an empty string; the stock providers fall back to
+    /// [`ApiType::default_base_url`], while the profiled providers fall back
+    /// to their loopctl provider-profile endpoint.
     pub base_url: String,
 
     /// Which provider to speak to.
@@ -1200,40 +1231,92 @@ redact_secrets = false
     }
 
     #[test]
-    fn test_api_type_serde_roundtrip() {
-        let openai: ApiConfig = toml::from_str("api_type = \"openai\"\n").unwrap();
-        assert_eq!(openai.api_type, ApiType::OpenAi);
+    fn every_variant_round_trips_through_its_lowercase_name() {
+        // The literals are the guard on the persisted on-disk format: a
+        // variant rename or a rename_all change breaks a literal here,
+        // not just the derived-name comparison in the same loop.
+        let wire_names = [
+            (ApiType::OpenAi, "openai"),
+            (ApiType::Anthropic, "anthropic"),
+            (ApiType::Gemini, "gemini"),
+            (ApiType::Ollama, "ollama"),
+            (ApiType::DeepSeek, "deepseek"),
+            (ApiType::Grok, "grok"),
+            (ApiType::Zai, "zai"),
+            (ApiType::Azure, "azure"),
+            (ApiType::Moonshot, "moonshot"),
+            (ApiType::Bedrock, "bedrock"),
+        ];
+        for (variant, name) in wire_names {
+            let parsed: ApiConfig = toml::from_str(&format!("api_type = \"{name}\"\n")).unwrap();
+            assert_eq!(
+                parsed.api_type, variant,
+                "wire name {name} must keep mapping to {variant:?}"
+            );
+            assert_eq!(
+                format!("{variant:?}").to_lowercase(),
+                name,
+                "{variant:?} must derive its literal wire name"
+            );
+            let source = ApiConfig {
+                api_type: variant,
+                ..ApiConfig::default()
+            };
+            let written = toml::to_string(&source).unwrap();
+            let reparsed: ApiConfig = toml::from_str(&written).unwrap();
+            assert_eq!(
+                reparsed, source,
+                "{variant:?} must survive a serialize/deserialize round trip \
+                 whole — an unset Option coming back as an empty string would \
+                 turn a missing key into a present-but-empty credential"
+            );
+        }
+    }
 
-        let anthropic: ApiConfig = toml::from_str("api_type = \"anthropic\"\n").unwrap();
-        assert_eq!(anthropic.api_type, ApiType::Anthropic);
+    #[test]
+    fn default_base_url_pins_stock_hosts_and_defers_every_other_variant() {
+        // A reintroduced hard-coded host here would silently shadow the
+        // endpoint its provider profile or AWS region derives; iterating
+        // ALL keeps a future variant from escaping the guard.
+        let stock = [
+            (ApiType::OpenAi, "https://api.openai.com/v1"),
+            (ApiType::Anthropic, "https://api.anthropic.com"),
+            (ApiType::Gemini, "https://generativelanguage.googleapis.com"),
+        ];
+        for api_type in ApiType::ALL {
+            match stock.iter().find(|(variant, _)| *variant == api_type) {
+                Some((_, host)) => assert_eq!(
+                    api_type.default_base_url(),
+                    Some(*host),
+                    "{api_type:?} must keep its stock host pinned"
+                ),
+                None => assert_eq!(
+                    api_type.default_base_url(),
+                    None,
+                    "{api_type:?} must defer to its profile- or region-derived endpoint"
+                ),
+            }
+        }
+        for (variant, _) in stock {
+            assert!(
+                ApiType::ALL.contains(&variant),
+                "{variant:?} must stay in ALL for its host pin to run"
+            );
+        }
+    }
 
-        let gemini: ApiConfig = toml::from_str("api_type = \"gemini\"\n").unwrap();
-        assert_eq!(gemini.api_type, ApiType::Gemini);
-
-        let ollama: ApiConfig = toml::from_str("api_type = \"ollama\"\n").unwrap();
-        assert_eq!(ollama.api_type, ApiType::Ollama);
-
-        let deepseek: ApiConfig = toml::from_str("api_type = \"deepseek\"\n").unwrap();
-        assert_eq!(deepseek.api_type, ApiType::DeepSeek);
-
-        let grok: ApiConfig = toml::from_str("api_type = \"grok\"\n").unwrap();
-        assert_eq!(grok.api_type, ApiType::Grok);
-
-        let zai: ApiConfig = toml::from_str("api_type = \"zai\"\n").unwrap();
-        assert_eq!(zai.api_type, ApiType::Zai);
-
-        assert_eq!(
-            ApiType::Ollama.default_base_url(),
-            "http://localhost:11434/v1"
-        );
-        assert_eq!(
-            ApiType::OpenAi.default_base_url(),
-            "https://api.openai.com/v1"
-        );
-        assert_eq!(
-            ApiType::Gemini.default_base_url(),
-            "https://generativelanguage.googleapis.com"
-        );
+    #[test]
+    fn api_type_all_lists_each_variant_once() {
+        // Only the duplicate half is checkable from here: a variant
+        // missing from ALL must be caught by the change that adds it —
+        // the enum's exhaustive matches are the enforcement point.
+        let mut seen = std::collections::HashSet::new();
+        for api_type in ApiType::ALL {
+            assert!(
+                seen.insert(api_type),
+                "duplicate variant in ALL: {api_type:?}"
+            );
+        }
     }
 
     #[test]

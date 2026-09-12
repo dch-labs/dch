@@ -24,14 +24,6 @@ use loopctl::stream::StreamEvent;
 
 use crate::error::RunnerError;
 
-/// Sentinel API key used for providers that require no authentication.
-///
-/// A local Ollama server accepts any credential, so when no key is configured
-/// this dummy is sent rather than erroring — the request succeeds and the
-/// user is not forced to invent a placeholder key. Cloud-hosted deployments
-/// with real authentication override it via `api_key` or `OLLAMA_API_KEY`.
-const NO_AUTH_KEY: &str = "ollama";
-
 /// The concrete provider client dch monomorphizes the agent loop over.
 ///
 /// A runtime-selected enum over loopctl's four provider client families, so
@@ -170,30 +162,45 @@ impl ApiClient for DchClient {
 ///
 /// Variants are mapped by wire-protocol family: OpenAI-compatible providers
 /// (`OpenAi`, `Ollama`, `DeepSeek`, `Grok`, `Azure`, `Moonshot`) wrap an
-/// [`OpenAiClient`]; Anthropic-compatible providers (`Anthropic`, `Zai`) wrap
-/// an [`AnthropicClient`]; `Gemini` wraps a [`GeminiClient`]. An empty
-/// `base_url` falls back to [`ApiType::default_base_url`].
+/// [`OpenAiClient`]; Anthropic-compatible providers (`Anthropic`, `Zai`)
+/// wrap an [`AnthropicClient`]; `Gemini` wraps a [`GeminiClient`]. The
+/// profiled providers start from loopctl's pre-seeded profile builders,
+/// which own their endpoints, credential variables, and default models;
+/// dch layers its config precedence on top (config values replace the
+/// seeds; `request_timeout_secs` always applies). An empty `base_url`
+/// falls back to [`ApiType::default_base_url`] for the stock providers and
+/// to the seeded profile endpoint for the profiled ones. Ollama's profile
+/// carries no default model, so the raw `config.model` seeds its builder:
+/// the out-of-box configuration (empty model) builds a client whose model
+/// is empty — a model must be named in the config or on the command line
+/// before a request can succeed.
 ///
 /// # API-key resolution
 ///
-/// `config.api_key` wins. When `None`, the factory falls back to the family's
-/// conventional environment variable (`OPENAI_API_KEY` for the OpenAI family,
-/// `ANTHROPIC_API_KEY` for the Anthropic family, `GEMINI_API_KEY` or
-/// `GOOGLE_API_KEY` for Gemini, `AZURE_OPENAI_API_KEY` for Azure, and
-/// `MOONSHOT_API_KEY` for Moonshot). `Ollama` needs no key and is given a
-/// dummy. If a required key is missing, returns [`RunnerError::Client`]
-/// naming the expected environment variable.
+/// `config.api_key` wins for every provider that accepts a key; Bedrock
+/// is the exception — it rejects a configured `api_key` (authentication
+/// is `SigV4` via the `AWS_*` environment variables). When `None`, the stock
+/// providers fall back to their conventional environment variables
+/// (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY` or
+/// `GOOGLE_API_KEY`); the profiled providers inherit their profile's
+/// seeded variable (for example `DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY`)
+/// from the builder; a keyless Ollama configuration carries its
+/// profile's seeded dummy credential. If a required
+/// key is missing, returns [`RunnerError::Client`] naming the expected
+/// environment variable.
 ///
 /// # Errors
 ///
-/// - [`RunnerError::Client`] if a required API key is missing or if the
-///   underlying HTTP client cannot be constructed.
+/// - [`RunnerError::Client`] if a required API key or model is missing, a
+///   profiled fact is invalid (for example a malformed Azure resource
+///   name), or the underlying HTTP client cannot be constructed.
 pub fn create_client(config: &ApiConfig) -> Result<DchClient, RunnerError> {
     let timeout = Duration::from_secs(config.request_timeout_secs);
+    let client_error = |error: ApiError| RunnerError::Client(error.to_string());
 
     let client = match config.api_type {
-        ApiType::OpenAi | ApiType::Ollama | ApiType::DeepSeek | ApiType::Grok => {
-            let base_url = effective_base_url(config);
+        ApiType::OpenAi => {
+            let base_url = effective_base_url(config)?;
             let api_key = resolve_api_key(config)?;
             DchClient::OpenAi(
                 OpenAiClient::builder()
@@ -202,11 +209,11 @@ pub fn create_client(config: &ApiConfig) -> Result<DchClient, RunnerError> {
                     .with_model(config.model.as_str())
                     .with_timeout(timeout)
                     .build()
-                    .map_err(|e| RunnerError::Client(e.to_string()))?,
+                    .map_err(client_error)?,
             )
         }
-        ApiType::Anthropic | ApiType::Zai => {
-            let base_url = effective_base_url(config);
+        ApiType::Anthropic => {
+            let base_url = effective_base_url(config)?;
             let api_key = resolve_api_key(config)?;
             DchClient::Anthropic(
                 AnthropicClient::builder()
@@ -216,11 +223,11 @@ pub fn create_client(config: &ApiConfig) -> Result<DchClient, RunnerError> {
                     .with_max_tokens(config.max_tokens)
                     .with_timeout(timeout)
                     .build()
-                    .map_err(|e| RunnerError::Client(e.to_string()))?,
+                    .map_err(client_error)?,
             )
         }
         ApiType::Gemini => {
-            let base_url = effective_base_url(config);
+            let base_url = effective_base_url(config)?;
             let api_key = resolve_api_key(config)?;
             DchClient::Gemini(
                 GeminiClient::builder()
@@ -229,148 +236,216 @@ pub fn create_client(config: &ApiConfig) -> Result<DchClient, RunnerError> {
                     .with_model(config.model.as_str())
                     .with_timeout(timeout)
                     .build()
-                    .map_err(|e| RunnerError::Client(e.to_string()))?,
+                    .map_err(client_error)?,
             )
         }
-        ApiType::Azure => DchClient::OpenAi(build_azure(config)?),
-        ApiType::Moonshot => DchClient::OpenAi(build_moonshot(config)?),
+        ApiType::Ollama => DchClient::OpenAi(
+            profiled(
+                loopctl::provider::ollama_builder(config.model.as_str()),
+                config,
+            )
+            .build()
+            .map_err(client_error)?,
+        ),
+        ApiType::DeepSeek => DchClient::OpenAi(
+            profiled(loopctl::provider::deepseek_builder(), config)
+                .build()
+                .map_err(client_error)?,
+        ),
+        ApiType::Grok => DchClient::OpenAi(
+            profiled(loopctl::provider::grok_builder(), config)
+                .build()
+                .map_err(client_error)?,
+        ),
+        ApiType::Azure => DchClient::OpenAi(
+            profiled(azure_seeded_builder(config)?, config)
+                .build()
+                .map_err(client_error)?,
+        ),
+        ApiType::Moonshot => DchClient::OpenAi(
+            profiled(loopctl::provider::moonshot_builder(), config)
+                .build()
+                .map_err(client_error)?,
+        ),
+        ApiType::Zai => DchClient::Anthropic(
+            profiled(loopctl::provider::zai_builder(), config)
+                .build()
+                .map_err(client_error)?,
+        ),
         ApiType::Bedrock => DchClient::Bedrock(build_bedrock(config)?),
     };
     Ok(client)
 }
 
-/// Build the Azure OpenAI client for `config`.
+/// Resource-name seed for gateway deployments that set `base_url` explicitly.
 ///
-/// The endpoint is [`ApiConfig::base_url`] when explicitly set (a gateway or
-/// proxy deployment); otherwise it is derived from the resource name, which
-/// comes from [`ApiConfig::azure_resource`] or, when that is unset or empty,
-/// the `AZURE_OPENAI_RESOURCE` environment variable. Credential and model
-/// resolve like every other provider: [`ApiConfig::api_key`] wins, otherwise
-/// `AZURE_OPENAI_API_KEY`; [`ApiConfig::model`] wins, otherwise the
-/// `AZURE_OPENAI_MODEL` environment variable. `request_timeout_secs` bounds
-/// each request's read gap.
-///
-/// # Errors
-///
-/// Returns [`RunnerError::Client`] when the endpoint must be derived but the
-/// resource name is unset or malformed, the model is unresolvable, the API
-/// key is missing, or the HTTP client cannot be constructed.
-fn build_azure(config: &ApiConfig) -> Result<OpenAiClient, RunnerError> {
-    let base_url = if config.base_url.is_empty() {
-        let resource = config
-            .azure_resource
-            .clone()
-            .filter(|value| !value.is_empty())
-            .or_else(|| {
-                std::env::var("AZURE_OPENAI_RESOURCE")
-                    .ok()
-                    .filter(|value| !value.is_empty())
-            });
-        let resource = resource.ok_or_else(|| {
-            RunnerError::Client(
-                "azure: no resource name: set api.azure_resource or AZURE_OPENAI_RESOURCE"
-                    .to_string(),
-            )
-        })?;
-        validate_azure_resource(&resource)?;
-        format!("https://{resource}.openai.azure.com/openai/v1")
-    } else {
-        config.base_url.clone()
-    };
-    let model = model_or_env(config, "azure", "AZURE_OPENAI_MODEL")?;
-    profile_openai_client(config, base_url, model)
-}
+/// The profile builder derives its endpoint from a syntactically valid
+/// resource name, so a gateway configuration seeds this placeholder
+/// whenever `base_url` is set — the configured resource, valid or not, is
+/// irrelevant behind an overridden endpoint; the configured `base_url`
+/// replaces the derived endpoint immediately and the seed never reaches a
+/// request.
+const GATEWAY_RESOURCE_SEED: &str = "gateway";
 
-/// Build the Moonshot client for `config`.
+/// Start the Azure profile builder for `config`.
 ///
-/// An OpenAI-protocol client pointed at [`ApiConfig::base_url`] when set, or
-/// Moonshot's default endpoint otherwise. Credential and model resolve like
-/// every other provider: [`ApiConfig::api_key`] wins, otherwise
-/// `MOONSHOT_API_KEY`; [`ApiConfig::model`] wins, otherwise the
-/// `MOONSHOT_MODEL` environment variable. `request_timeout_secs` bounds each
-/// request's read gap.
-///
-/// # Errors
-///
-/// Returns [`RunnerError::Client`] when the model or API key is unresolvable
-/// or the HTTP client cannot be constructed.
-fn build_moonshot(config: &ApiConfig) -> Result<OpenAiClient, RunnerError> {
-    let model = model_or_env(config, "moonshot", "MOONSHOT_MODEL")?;
-    profile_openai_client(config, effective_base_url(config), model)
-}
-
-/// Construct the OpenAI-protocol client shared by the profile providers.
-///
-/// Applies the uniform resolution order — [`resolve_api_key`] for the
-/// credential, the provider's `request_timeout_secs` for the read gap — on
-/// top of the caller's resolved `base_url` and `model`.
+/// The endpoint is derived from the resource name, which comes from
+/// [`ApiConfig::azure_resource`] or, when that is unset or empty, the
+/// `AZURE_OPENAI_RESOURCE` environment variable. An explicitly configured
+/// `base_url` (a gateway or proxy deployment) replaces the derived
+/// endpoint, so the resource is irrelevant there and the placeholder seed
+/// stands in for it.
 ///
 /// # Errors
 ///
-/// Returns [`RunnerError::Client`] when the API key is missing or the HTTP
-/// client cannot be constructed.
-fn profile_openai_client(
+/// Returns [`RunnerError::Client`] when the endpoint must be derived but no
+/// resource name resolves.
+fn azure_seeded_builder(
     config: &ApiConfig,
-    base_url: String,
-    model: String,
-) -> Result<OpenAiClient, RunnerError> {
-    OpenAiClient::builder()
-        .with_api_key(resolve_api_key(config)?)
-        .with_base_url(base_url)
-        .with_model(model)
-        .with_timeout(Duration::from_secs(config.request_timeout_secs))
-        .build()
-        .map_err(|e| RunnerError::Client(e.to_string()))
+) -> Result<loopctl::provider::OpenAiClientBuilder, RunnerError> {
+    if config.base_url.is_empty() {
+        Ok(loopctl::provider::azure_builder(azure_resource(config)?))
+    } else {
+        Ok(loopctl::provider::azure_builder(GATEWAY_RESOURCE_SEED))
+    }
 }
 
-/// Resolve the deployment model for a profile provider.
+/// Resolve the Azure resource name for `config`.
 ///
-/// [`ApiConfig::model`] wins when non-empty; otherwise the provider profile's
-/// environment variable supplies the model.
+/// [`ApiConfig::azure_resource`] wins when non-empty; otherwise the
+/// `AZURE_OPENAI_RESOURCE` environment variable supplies it. The name forms
+/// the deployment endpoint, and loopctl's builder validates its shape at
+/// build time.
 ///
 /// # Errors
 ///
 /// Returns [`RunnerError::Client`] naming both sources when neither is set.
-fn model_or_env(config: &ApiConfig, provider: &str, env_var: &str) -> Result<String, RunnerError> {
-    if !config.model.is_empty() {
-        return Ok(config.model.clone());
-    }
-    std::env::var(env_var)
-        .ok()
+fn azure_resource(config: &ApiConfig) -> Result<String, RunnerError> {
+    config
+        .azure_resource
+        .clone()
         .filter(|value| !value.is_empty())
+        .or_else(|| {
+            std::env::var("AZURE_OPENAI_RESOURCE")
+                .ok()
+                .filter(|value| !value.is_empty())
+        })
         .ok_or_else(|| {
-            RunnerError::Client(format!("{provider}: no model: set api.model or {env_var}"))
+            RunnerError::Client(
+                "azure: no resource name: set api.azure_resource or AZURE_OPENAI_RESOURCE"
+                    .to_string(),
+            )
         })
 }
 
-/// Reject a resource name that cannot form a valid deployment endpoint.
+/// The config precedence both profile families apply on top of their
+/// seeded builder.
 ///
-/// Azure resource names are 2–64 characters of alphanumerics and hyphens,
-/// starting and ending with an alphanumeric; anything else would fail later
-/// with a confusing request error instead of a clear configuration one.
-///
-/// # Errors
-///
-/// Returns [`RunnerError::Client`] naming the malformed resource.
-fn validate_azure_resource(resource: &str) -> Result<(), RunnerError> {
-    let chars_ok = resource
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-');
-    let edges_ok = resource
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_alphanumeric())
-        && resource
-            .chars()
-            .next_back()
-            .is_some_and(|c| c.is_ascii_alphanumeric());
-    if (2..=64).contains(&resource.chars().count()) && chars_ok && edges_ok {
-        return Ok(());
+/// One implementation per family keeps dch's defaults-in-waiting contract
+/// in a single place: config values replace the seeds only when the
+/// config carries them, and the read timeout always applies.
+trait Profiled {
+    /// Replace the seeded endpoint with the configured `base_url`.
+    ///
+    /// Applied by [`profiled`] only when the config carries one; until
+    /// then the profile's seeded endpoint stands.
+    fn apply_base_url(self, url: &str) -> Self;
+
+    /// Replace the seeded model with the configured `model`.
+    ///
+    /// Applied by [`profiled`] only when the config names one; until
+    /// then the profile's seeded default stands.
+    fn apply_model(self, model: &str) -> Self;
+
+    /// Replace the seeded credential with the configured `api_key`.
+    ///
+    /// Applied by [`profiled`] only when the config carries one, so
+    /// config-beats-environment falls out of the ordering.
+    fn apply_api_key(self, key: &str) -> Self;
+
+    /// Cap each request's read gap at the configured timeout.
+    ///
+    /// A family setting rather than a default-in-waiting: [`profiled`]
+    /// applies it unconditionally.
+    fn apply_timeout(self, timeout: Duration) -> Self;
+
+    /// Bound each reply at the configured completion budget. Families
+    /// without a completion knob ignore it.
+    fn apply_max_tokens(self, tokens: u32) -> Self;
+}
+
+impl Profiled for loopctl::provider::OpenAiClientBuilder {
+    fn apply_base_url(self, url: &str) -> Self {
+        loopctl::provider::OpenAiClientBuilder::with_base_url(self, url)
     }
-    Err(RunnerError::Client(format!(
-        "azure: resource name {resource:?} must be 2-64 characters of alphanumerics \
-         and hyphens, starting and ending with an alphanumeric"
-    )))
+
+    fn apply_model(self, model: &str) -> Self {
+        loopctl::provider::OpenAiClientBuilder::with_model(self, model)
+    }
+
+    fn apply_api_key(self, key: &str) -> Self {
+        loopctl::provider::OpenAiClientBuilder::with_api_key(self, key)
+    }
+
+    fn apply_timeout(self, timeout: Duration) -> Self {
+        loopctl::provider::OpenAiClientBuilder::with_timeout(self, timeout)
+    }
+
+    fn apply_max_tokens(self, _tokens: u32) -> Self {
+        self
+    }
+}
+
+impl Profiled for loopctl::provider::AnthropicClientBuilder {
+    fn apply_base_url(self, url: &str) -> Self {
+        loopctl::provider::AnthropicClientBuilder::with_base_url(self, url)
+    }
+
+    fn apply_model(self, model: &str) -> Self {
+        loopctl::provider::AnthropicClientBuilder::with_model(self, model)
+    }
+
+    fn apply_api_key(self, key: &str) -> Self {
+        loopctl::provider::AnthropicClientBuilder::with_api_key(self, key)
+    }
+
+    fn apply_timeout(self, timeout: Duration) -> Self {
+        loopctl::provider::AnthropicClientBuilder::with_timeout(self, timeout)
+    }
+
+    fn apply_max_tokens(self, tokens: u32) -> Self {
+        loopctl::provider::AnthropicClientBuilder::with_max_tokens(self, tokens)
+    }
+}
+
+/// Apply dch's config precedence onto a pre-seeded profile builder.
+///
+/// The seeds are defaults-in-waiting: `base_url` and `model` replace the
+/// seeded values only when the config carries them, and `api_key` only
+/// when configured — so config-beats-environment falls out of the
+/// ordering. `request_timeout_secs` always applies; `max_tokens` is
+/// forwarded to every family and honored where the family's client has
+/// a completion knob — the Anthropic family does, the OpenAI family's
+/// builder has none, so there it is dropped by documented design and
+/// the provider's own default completion budget governs.
+fn profiled<B: Profiled>(builder: B, config: &ApiConfig) -> B {
+    let builder = if config.base_url.is_empty() {
+        builder
+    } else {
+        builder.apply_base_url(&config.base_url)
+    };
+    let builder = if config.model.is_empty() {
+        builder
+    } else {
+        builder.apply_model(&config.model)
+    };
+    let builder = match &config.api_key {
+        Some(key) => builder.apply_api_key(key),
+        None => builder,
+    };
+    builder
+        .apply_max_tokens(config.max_tokens)
+        .apply_timeout(Duration::from_secs(config.request_timeout_secs))
 }
 
 /// Build the Bedrock client for `config`.
@@ -415,34 +490,44 @@ fn build_bedrock(config: &ApiConfig) -> Result<BedrockClient, RunnerError> {
 /// Resolve the effective API base URL for `config`.
 ///
 /// Returns the configured [`ApiConfig::base_url`] verbatim when the user set
-/// one; otherwise falls back to [`ApiType::default_base_url`] for the
-/// configured provider. This is what lets a config omit `base_url` entirely
-/// (the common case for stock OpenAI/Anthropic/Gemini) while still allowing an
-/// override for self-hosted or proxy deployments.
-fn effective_base_url(config: &ApiConfig) -> String {
+/// one; otherwise falls back to the provider's stock default. This is what
+/// lets a config omit `base_url` entirely (the common case for stock
+/// OpenAI/Anthropic/Gemini) while still allowing an override for self-hosted
+/// or proxy deployments. Only the stock arms call this helper — the profiled
+/// providers seed their endpoint from their builder — so a provider with no
+/// stock default reaching this helper is a wiring bug, reported loudly here
+/// rather than surfacing later as a request against an empty host.
+///
+/// # Errors
+///
+/// Returns [`RunnerError::Client`] when the provider defers its endpoint to
+/// a profile — a call only a stock arm should ever make.
+fn effective_base_url(config: &ApiConfig) -> Result<String, RunnerError> {
     if config.base_url.is_empty() {
-        config.api_type.default_base_url().to_owned()
+        config.api_type.default_base_url().map(str::to_owned).ok_or_else(|| {
+            RunnerError::Client(format!(
+                "{:?} has no stock default base_url; its endpoint comes from its provider profile",
+                config.api_type
+            ))
+        })
     } else {
-        config.base_url.clone()
+        Ok(config.base_url.clone())
     }
 }
 
 /// Resolve the API key for `config`.
 ///
-/// Resolution is uniform across providers: `config.api_key` wins; otherwise
-/// each provider's candidate environment variables are tried in order. A miss
-/// yields a [`RunnerError::Client`] naming the variables that were tried.
-///
-/// Ollama is the one exception: a local Ollama server needs no authentication,
-/// so when no key is configured it falls back to a fixed dummy rather than
-/// erroring. A cloud-hosted Ollama with authentication works like any other
-/// provider via `api_key` or `OLLAMA_API_KEY`.
+/// Resolution is uniform across the stock providers: `config.api_key` wins;
+/// otherwise each provider's candidate environment variables are tried in
+/// order. A miss yields a [`RunnerError::Client`] naming the variables that
+/// were tried. The profiled providers (`Ollama`, `DeepSeek`, `Grok`, `Azure`,
+/// Moonshot, Zai) resolve theirs through the seeded profile builders and do
+/// not pass through here.
 ///
 /// # Errors
 ///
 /// Returns [`RunnerError::Client`] when the key is neither configured nor
-/// available in any of the provider's environment variables (except for
-/// Ollama, which falls back to a dummy).
+/// available in any of the provider's environment variables.
 fn resolve_api_key(config: &ApiConfig) -> Result<String, RunnerError> {
     if let Some(key) = &config.api_key {
         return Ok(key.clone());
@@ -452,9 +537,6 @@ fn resolve_api_key(config: &ApiConfig) -> Result<String, RunnerError> {
         if let Ok(key) = std::env::var(var) {
             return Ok(key);
         }
-    }
-    if config.api_type == ApiType::Ollama {
-        return Ok(NO_AUTH_KEY.to_owned());
     }
     match candidates.as_slice() {
         [] => Err(RunnerError::Client(
@@ -470,24 +552,26 @@ fn resolve_api_key(config: &ApiConfig) -> Result<String, RunnerError> {
     }
 }
 
-/// Candidate API-key environment variables for `api_type`, in fallback order.
+/// Candidate API-key environment variables for the stock providers, in
+/// fallback order.
 ///
-/// Consulted by [`resolve_api_key`] when [`ApiConfig::api_key`] is unset, so a
-/// user can avoid putting the key in the config file by exporting it. Each
-/// provider maps to the env var its official client reads; `OpenAI`-compatible
-/// providers (`DeepSeek`, `Grok`) share `OPENAI_API_KEY` since they speak the
-/// same protocol, and `Gemini` tries both `GEMINI_API_KEY` and the older
-/// `GOOGLE_API_KEY`. [`ApiType::Ollama`] is included for uniformity even though
-/// a local Ollama needs no key.
+/// Consulted by [`resolve_api_key`] when [`ApiConfig::api_key`] is unset, so
+/// a user can avoid putting the key in the config file by exporting it. Each
+/// stock provider maps to the env var its official client reads, and `Gemini`
+/// tries both `GEMINI_API_KEY` and the older `GOOGLE_API_KEY`. The profiled
+/// providers' variables are owned by their loopctl profile builders.
 fn candidate_env_vars(api_type: ApiType) -> Vec<&'static str> {
     match api_type {
-        ApiType::OpenAi | ApiType::DeepSeek | ApiType::Grok => vec!["OPENAI_API_KEY"],
-        ApiType::Anthropic | ApiType::Zai => vec!["ANTHROPIC_API_KEY"],
+        ApiType::OpenAi => vec!["OPENAI_API_KEY"],
+        ApiType::Anthropic => vec!["ANTHROPIC_API_KEY"],
         ApiType::Gemini => vec!["GEMINI_API_KEY", "GOOGLE_API_KEY"],
-        ApiType::Ollama => vec!["OLLAMA_API_KEY"],
-        ApiType::Azure => vec!["AZURE_OPENAI_API_KEY"],
-        ApiType::Moonshot => vec!["MOONSHOT_API_KEY"],
-        ApiType::Bedrock => Vec::new(),
+        ApiType::Ollama
+        | ApiType::DeepSeek
+        | ApiType::Grok
+        | ApiType::Azure
+        | ApiType::Moonshot
+        | ApiType::Zai
+        | ApiType::Bedrock => Vec::new(),
     }
 }
 
@@ -542,11 +626,31 @@ mod tests {
 
     #[test]
     fn ollama_empty_base_url_uses_default() {
-        let env = loopctl::testing::EnvGuard::acquire(&["OLLAMA_API_KEY"]);
+        let env = loopctl::testing::EnvGuard::acquire(&["OLLAMA_API_KEY", "OLLAMA_BASE_URL"]);
         env.remove("OLLAMA_API_KEY");
+        env.remove("OLLAMA_BASE_URL");
         let c = cfg(ApiType::Ollama, "", None);
         let client = create_client(&c).expect("ollama builds via default base_url");
         assert_eq!(client.model(), "test-model");
+        assert_eq!(
+            client.base_url(),
+            "http://localhost:11434/v1",
+            "an empty base_url must fall back to the seeded local Ollama endpoint"
+        );
+    }
+
+    #[test]
+    fn ollama_env_base_url_overrides_the_seed() {
+        let env = loopctl::testing::EnvGuard::acquire(&["OLLAMA_BASE_URL"]);
+        env.set("OLLAMA_BASE_URL", "http://env-host:11434/v1");
+        let c = cfg(ApiType::Ollama, "", None);
+        let client = create_client(&c).expect("ollama builds from the env endpoint");
+        assert_eq!(
+            client.base_url(),
+            "http://env-host:11434/v1",
+            "an empty base_url must honor the profile's OLLAMA_BASE_URL variable"
+        );
+        env.remove("OLLAMA_BASE_URL");
     }
 
     #[test]
@@ -602,23 +706,47 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_key_via_openai_env() {
-        let env = loopctl::testing::EnvGuard::acquire(&["OPENAI_API_KEY"]);
-        env.set("OPENAI_API_KEY", "env-key");
-        let c = cfg(ApiType::DeepSeek, "https://api.deepseek.com", None);
-        let client = create_client(&c).expect("deepseek builds with OPENAI_API_KEY");
+    fn deepseek_key_from_deepseek_env() {
+        let env = loopctl::testing::EnvGuard::acquire(&["DEEPSEEK_API_KEY"]);
+        env.set("DEEPSEEK_API_KEY", "env-key");
+        let c = cfg(ApiType::DeepSeek, "", None);
+        let client = create_client(&c).expect("deepseek builds with DEEPSEEK_API_KEY");
         assert_eq!(client.model(), "test-model");
-        env.remove("OPENAI_API_KEY");
+        env.remove("DEEPSEEK_API_KEY");
     }
 
     #[test]
-    fn grok_key_via_openai_env() {
-        let env = loopctl::testing::EnvGuard::acquire(&["OPENAI_API_KEY"]);
-        env.set("OPENAI_API_KEY", "env-key");
-        let c = cfg(ApiType::Grok, "https://api.x.ai/v1", None);
-        let client = create_client(&c).expect("grok builds with OPENAI_API_KEY");
+    fn deepseek_empty_model_seeds_the_profile_default() {
+        let env = loopctl::testing::EnvGuard::acquire(&["DEEPSEEK_API_KEY", "DEEPSEEK_MODEL"]);
+        env.set("DEEPSEEK_API_KEY", "env-key");
+        env.remove("DEEPSEEK_MODEL");
+        let mut c = cfg(ApiType::DeepSeek, "", None);
+        c.model = String::new();
+        let client = create_client(&c).expect("the profile default model applies");
+        assert_eq!(client.model(), "deepseek-chat");
+        env.remove("DEEPSEEK_API_KEY");
+    }
+
+    #[test]
+    fn grok_key_from_xai_env() {
+        let env = loopctl::testing::EnvGuard::acquire(&["XAI_API_KEY", "GROK_API_KEY"]);
+        env.set("XAI_API_KEY", "env-key");
+        env.remove("GROK_API_KEY");
+        let c = cfg(ApiType::Grok, "", None);
+        let client = create_client(&c).expect("grok builds with XAI_API_KEY");
         assert_eq!(client.model(), "test-model");
-        env.remove("OPENAI_API_KEY");
+        env.remove("XAI_API_KEY");
+    }
+
+    #[test]
+    fn grok_key_falls_back_to_the_grok_alias() {
+        let env = loopctl::testing::EnvGuard::acquire(&["XAI_API_KEY", "GROK_API_KEY"]);
+        env.remove("XAI_API_KEY");
+        env.set("GROK_API_KEY", "env-key");
+        let c = cfg(ApiType::Grok, "", None);
+        let client = create_client(&c).expect("grok builds with the GROK_API_KEY alias");
+        assert_eq!(client.model(), "test-model");
+        env.remove("GROK_API_KEY");
     }
 
     #[test]
@@ -649,13 +777,31 @@ mod tests {
     }
 
     #[test]
-    fn zai_key_via_anthropic_env() {
-        let env = loopctl::testing::EnvGuard::acquire(&["ANTHROPIC_API_KEY"]);
-        env.set("ANTHROPIC_API_KEY", "env-key");
-        let c = cfg(ApiType::Zai, "https://api.z.ai/api", None);
-        let client = create_client(&c).expect("zai builds with ANTHROPIC_API_KEY");
+    fn deepseek_missing_key_names_the_expected_env_var() {
+        let env = loopctl::testing::EnvGuard::acquire(&["DEEPSEEK_API_KEY"]);
+        env.remove("DEEPSEEK_API_KEY");
+        let c = cfg(ApiType::DeepSeek, "", None);
+        let err = create_client(&c)
+            .err()
+            .expect("deepseek without key should error");
+        let RunnerError::Client(msg) = &err else {
+            panic!("expected Client error, got {err:?}");
+        };
+        assert!(
+            msg.contains("DEEPSEEK_API_KEY"),
+            "the profiled missing-key error should name the env var: {msg}"
+        );
+    }
+
+    #[test]
+    fn zai_key_from_zai_env() {
+        let env = loopctl::testing::EnvGuard::acquire(&["ZAI_API_KEY", "ZHIPUAI_API_KEY"]);
+        env.set("ZAI_API_KEY", "env-key");
+        env.remove("ZHIPUAI_API_KEY");
+        let c = cfg(ApiType::Zai, "", None);
+        let client = create_client(&c).expect("zai builds with ZAI_API_KEY");
         assert_eq!(client.model(), "test-model");
-        env.remove("ANTHROPIC_API_KEY");
+        env.remove("ZAI_API_KEY");
     }
 
     #[test]
@@ -713,10 +859,47 @@ mod tests {
     #[test]
     fn default_api_config_builds() {
         // ApiConfig::default() is api_type=Ollama, empty base_url, no key.
+        let env = loopctl::testing::EnvGuard::acquire(&["OLLAMA_BASE_URL"]);
+        env.remove("OLLAMA_BASE_URL");
         let mut c = ApiConfig::default();
         c.model = "default-model".to_string();
         let client = create_client(&c).expect("default ApiConfig should build");
         assert_eq!(client.model(), "default-model");
+        assert_eq!(
+            client.base_url(),
+            "http://localhost:11434/v1",
+            "the out-of-box configuration must land on the seeded local Ollama endpoint"
+        );
+    }
+
+    #[test]
+    fn default_api_config_without_a_model_builds_an_empty_model_client() {
+        // Ollama's profile has no default model to fall back on, so the
+        // out-of-box client builds with an empty one — the documented
+        // boundary, distinct from a seeded default like deepseek-chat.
+        let env = loopctl::testing::EnvGuard::acquire(&["OLLAMA_BASE_URL"]);
+        env.remove("OLLAMA_BASE_URL");
+        let client = create_client(&ApiConfig::default())
+            .expect("the out-of-box configuration builds without a model");
+        assert_eq!(
+            client.model(),
+            "",
+            "no config model and no profile default means an empty model"
+        );
+    }
+
+    #[test]
+    fn a_profiled_provider_reaching_the_stock_fallback_fails_loudly() {
+        let c = cfg(ApiType::Ollama, "", None);
+        let err = effective_base_url(&c)
+            .expect_err("a profiled fallback must not resolve to an empty host");
+        let RunnerError::Client(msg) = &err else {
+            panic!("expected Client error, got {err:?}");
+        };
+        assert!(
+            msg.contains("provider profile"),
+            "the error must name where the endpoint lives: {msg}"
+        );
     }
 
     #[test]
@@ -848,6 +1031,25 @@ mod tests {
     }
 
     #[test]
+    fn azure_missing_model_names_the_deployment_variable() {
+        let env = loopctl::testing::EnvGuard::acquire(&["AZURE_OPENAI_MODEL"]);
+        env.remove("AZURE_OPENAI_MODEL");
+        let mut c = cfg(ApiType::Azure, "", Some("k"));
+        c.model = String::new();
+        c.azure_resource = Some("configured-resource".to_string());
+        let err = create_client(&c)
+            .err()
+            .expect("azure without a model should error");
+        let RunnerError::Client(msg) = &err else {
+            panic!("expected Client error, got {err:?}");
+        };
+        assert!(
+            msg.contains("AZURE_OPENAI_MODEL"),
+            "the missing-model error should name the env var: {msg}"
+        );
+    }
+
+    #[test]
     fn moonshot_builds_from_env_profile() {
         let env = loopctl::testing::EnvGuard::acquire(&["MOONSHOT_API_KEY", "MOONSHOT_MODEL"]);
         env.set("MOONSHOT_API_KEY", "env-key");
@@ -924,6 +1126,23 @@ mod tests {
     }
 
     #[test]
+    fn azure_gateway_ignores_a_malformed_configured_resource() {
+        // Behind a gateway the resource name is irrelevant: it must not be
+        // validated into a hard failure the direct path would report.
+        let env = loopctl::testing::EnvGuard::acquire(&[
+            "AZURE_OPENAI_RESOURCE",
+            "AZURE_OPENAI_API_KEY",
+            "AZURE_OPENAI_MODEL",
+        ]);
+        env.remove("AZURE_OPENAI_RESOURCE");
+        env.remove("AZURE_OPENAI_MODEL");
+        let mut c = cfg(ApiType::Azure, "https://gateway.example/v1", Some("k"));
+        c.azure_resource = Some("bad resource!".to_string());
+        let client = create_client(&c).expect("a gateway config must not validate the resource");
+        assert_eq!(client.base_url(), "https://gateway.example/v1");
+    }
+
+    #[test]
     fn azure_model_from_config_needs_no_env_model() {
         let env = loopctl::testing::EnvGuard::acquire(&[
             "AZURE_OPENAI_RESOURCE",
@@ -974,22 +1193,15 @@ mod tests {
     }
 
     #[test]
-    fn moonshot_missing_model_and_env_names_both_sources() {
+    fn moonshot_without_a_model_uses_the_profile_default() {
         let env = loopctl::testing::EnvGuard::acquire(&["MOONSHOT_API_KEY", "MOONSHOT_MODEL"]);
         env.set("MOONSHOT_API_KEY", "env-key");
         env.remove("MOONSHOT_MODEL");
         let mut c = cfg(ApiType::Moonshot, "", None);
         c.model = String::new();
-        let err = create_client(&c)
-            .err()
-            .expect("no model anywhere must error");
-        let RunnerError::Client(msg) = &err else {
-            panic!("expected Client error, got {err:?}");
-        };
-        assert!(
-            msg.contains("api.model") && msg.contains("MOONSHOT_MODEL"),
-            "error must name both model sources: {msg}"
-        );
+        let client = create_client(&c).expect("moonshot builds on the profile default");
+        assert_eq!(client.model(), "kimi-k3");
+        env.remove("MOONSHOT_API_KEY");
     }
 
     #[test]

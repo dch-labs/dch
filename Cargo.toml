@@ -13,7 +13,7 @@ readme = "README.md"
 authors = ["dch"]
 
 [workspace.dependencies]
-loopctl = { version = "0.3", features = ["openai", "anthropic", "hooks", "testing"] }
+loopctl = { version = "0.3", features = ["openai", "anthropic", "hooks", "testing", "ollama", "deepseek", "grok", "azure", "moonshot", "zai"] }
 
 tokio       = { version = "1.52.3", features = ["sync", "macros", "time", "rt-multi-thread"] }
 serde       = { version = "1", features = ["derive"] }
@@ -34,6 +34,7 @@ chrono         = { version = "0.4", features = ["serde"] }
 
 clap       = { version = "4", features = ["derive"] }
 dirs       = "6"
+libc       = "0.2"
 tempfile   = "3"
 base64     = "0.22"
 ignore     = "0.4"

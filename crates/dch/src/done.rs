@@ -28,8 +28,10 @@ pub struct DoneStatus {
 
     /// Turns completed during the run.
     ///
-    /// `None` when the run failed before producing a result — there was
-    /// nothing to count.
+    /// `Some` when the engine produced run totals — including a run
+    /// that ended without a final answer (`failure_with_counts`); `None`
+    /// when the run failed with an error, since the engine's error
+    /// values carry no partial-run totals.
     pub turns: Option<usize>,
 
     /// Tool calls made during the run.
@@ -89,10 +91,15 @@ impl DoneStatus {
 /// Serialize `status` as pretty JSON to `path` with a trailing newline.
 ///
 /// Uses temp-then-rename so a reader never sees a half-written JSON file,
-/// and preserves an existing marker's permissions across the replacement
-/// (a rename swaps the file, not its metadata, so the marker's mode would
-/// otherwise reset to the platform default — silently widening a
-/// restrictive marker). A first-time marker keeps the platform default.
+/// and applies `inherited_mode` to the temporary file before the rename
+/// when given — the mode a run captured before clearing the stale marker,
+/// so the replacement never exists at the platform default and a
+/// restrictive marker stays restrictive without a post-write window.
+/// Without an inherited mode, an existing marker's own permissions are
+/// carried over instead (a rename swaps the file, not its metadata, so
+/// the mode would otherwise reset to the platform default — silently
+/// widening a restrictive marker); a first-time marker with neither
+/// available keeps the platform default.
 ///
 /// # Errors
 ///
@@ -100,30 +107,80 @@ impl DoneStatus {
 /// be written. Callers should log and continue — the done-file is a status
 /// marker, not the source of truth. A failed write leaves no marker behind
 /// and removes the temporary file.
-pub fn write_done_file(path: &Path, status: &DoneStatus) -> Result<(), Box<dyn std::error::Error>> {
+pub fn write_done_file(
+    path: &Path,
+    status: &DoneStatus,
+    inherited_mode: Option<&std::fs::Permissions>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let json = serde_json::to_string_pretty(status)?;
     let tmp = unique_sibling(path);
-    let result = write_marker(&tmp, path, &json);
+    let result = write_marker(&tmp, path, &json, inherited_mode);
     if result.is_err() {
         drop(std::fs::remove_file(&tmp));
     }
     result
 }
 
-/// Write `json` to `tmp`, carry over `target`'s permissions, then rename
-/// it into place.
+/// Overwrite the marker in place, without the temp-file rename.
+///
+/// The fallback for a path whose directory cannot host the rename —
+/// typically right after a failed stale-marker removal: an in-place write
+/// needs write permission on the file alone, and at minimum invalidates
+/// the previous run's outcome instead of leaving it authoritative while
+/// the process exits in error.
+///
+/// # Errors
+///
+/// Returns the underlying I/O or serialization error; unlike
+/// [`write_done_file`] a concurrent reader may observe a partial line.
+pub fn overwrite_done_file(
+    path: &Path,
+    status: &DoneStatus,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let json = serde_json::to_string_pretty(status)?;
+    std::fs::write(path, format!("{json}\n"))?;
+    Ok(())
+}
+
+/// Write `json` to `tmp`, apply the marker's mode, then rename it into
+/// place.
 ///
 /// # Errors
 ///
 /// Returns any error from creating or writing the temporary file, from
-/// applying the target's permissions, or from the final rename.
-fn write_marker(tmp: &Path, target: &Path, json: &str) -> Result<(), Box<dyn std::error::Error>> {
+/// applying the mode, or from the final rename.
+fn write_marker(
+    tmp: &Path,
+    target: &Path,
+    json: &str,
+    inherited_mode: Option<&std::fs::Permissions>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut handle = std::fs::File::create(tmp)?;
     handle.write_all(format!("{json}\n").as_bytes())?;
     drop(handle);
-    preserve_target_mode(target, tmp)?;
+    apply_marker_mode(tmp, target, inherited_mode)?;
     std::fs::rename(tmp, target)?;
     Ok(())
+}
+
+/// Give `tmp` the marker's permissions before it becomes the marker.
+///
+/// The inherited mode wins when present; otherwise an existing target's
+/// own mode carries over.
+///
+/// # Errors
+///
+/// Returns the underlying I/O error when the permissions cannot be read
+/// or applied.
+fn apply_marker_mode(
+    tmp: &Path,
+    target: &Path,
+    inherited_mode: Option<&std::fs::Permissions>,
+) -> std::io::Result<()> {
+    match inherited_mode {
+        Some(mode) => std::fs::set_permissions(tmp, mode.clone()),
+        None => preserve_target_mode(target, tmp),
+    }
 }
 
 /// Apply `target`'s existing permissions to `tmp` before the rename.
@@ -213,7 +270,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("done.json");
         let status = DoneStatus::success("ok", 2, 4);
-        write_done_file(&path, &status).unwrap();
+        write_done_file(&path, &status, None).unwrap();
         assert!(path.exists());
         let residue: Vec<String> = std::fs::read_dir(tmp.path())
             .unwrap()
@@ -238,7 +295,7 @@ mod tests {
         permissions.set_mode(0o600);
         std::fs::set_permissions(&path, permissions).unwrap();
 
-        write_done_file(&path, &DoneStatus::success("new", 1, 1)).unwrap();
+        write_done_file(&path, &DoneStatus::success("new", 1, 1), None).unwrap();
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(
@@ -255,7 +312,7 @@ mod tests {
         let path = tmp.path().join("done.json");
         std::fs::write(&path, "old").unwrap();
         let status = DoneStatus::success("new", 1, 1);
-        write_done_file(&path, &status).unwrap();
+        write_done_file(&path, &status, None).unwrap();
         assert!(std::fs::read_to_string(&path).unwrap().contains("new"));
     }
 }
