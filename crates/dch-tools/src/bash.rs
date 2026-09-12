@@ -104,14 +104,15 @@ const SHELL_OPERATORS: &[&str] = &["&&", "||", ";", "|", "`", "$(", ">", ">>", "
 ///
 /// Guard against mutating flags and subcommands hiding inside an
 /// allowlisted prefix, such as `find -delete`, find's file-writing
-/// `-fls`/`-fprint*` flags, `git diff --output=` writing its output to a
-/// file, or `git branch -D`.
+/// `-fls`/`-fprint*` flags, `git diff --output` writing its output to a
+/// file in either the `=`-joined or space-separated form, or
+/// `git branch -D`.
 const UNSAFE_SUBSTRINGS: &[&str] = &[
     " -delete",
     " -exec",
     " -fls",
     " -fprint",
-    " --output=",
+    " --output",
     "git branch -D",
     "git branch -d",
     "git branch --delete",
@@ -832,14 +833,15 @@ fn is_read_only_command(input: &Value) -> bool {
 
 /// Collapse a command the way the shell would tokenize it for matching.
 ///
-/// Whitespace runs become single spaces and quote characters are
-/// dropped, so a tab-separated or quoted argument cannot slip an unsafe
-/// flag past checks that match space-separated text — `find\t.\t-delete`
-/// and `find . "-delete"` normalize to the same `find . -delete` the
-/// denylist guards.
+/// Whitespace runs become single spaces and quote characters and
+/// backslash escapes are dropped, so a tab-separated, quoted, or
+/// escaped argument cannot slip an unsafe flag past checks that match
+/// space-separated text — `find\t.\t-delete`, `find . "-delete"`, and
+/// `git branch \-D` normalize to the same literal forms the denylist
+/// guards.
 fn shell_normalized(command: &str) -> String {
     command
-        .replace(['"', '\''], "")
+        .replace(['"', '\'', '\\'], "")
         .split_whitespace()
         .collect::<Vec<&str>>()
         .join(" ")
@@ -994,6 +996,8 @@ mod tests {
             "git remote\tadd\torigin\turl",
             "git diff\t--output=/tmp/patch",
             "git branch \"-D\" main",
+            "git branch \\-D main",
+            "find . \\-delete",
         ] {
             assert!(
                 !is_read_only_command(&json!({ "command": cmd })),
@@ -1016,6 +1020,12 @@ mod tests {
             !is_read_only_command(&json!({ "command": "git log --output=/tmp/log" })),
             "git log --output writes a file and must not be read-only"
         );
+        for cmd in ["git diff --output /tmp/patch", "git log --output /tmp/log"] {
+            assert!(
+                !is_read_only_command(&json!({ "command": cmd })),
+                "'{cmd}' writes a file in its space-separated form and must not be read-only"
+            );
+        }
     }
 
     #[test]

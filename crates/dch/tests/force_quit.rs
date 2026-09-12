@@ -205,6 +205,7 @@ fn force_until_exit(
         if let Some(status) = child.try_wait().expect("child is waitable") {
             return status;
         }
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -272,6 +273,21 @@ fn signal_during_startup_writes_the_done_file_and_exits_130() {
     assert!(
         done_path.exists(),
         "the startup handler writes the done-file before exiting"
+    );
+    let written = std::fs::read_to_string(&done_path).expect("the replaced marker is readable");
+    let record: serde_json::Value = serde_json::from_str(&written).expect(
+        "the startup handler wrote a fresh done record — the stale marker of a \
+        previous run would leave exists() and the mode check passing vacuously",
+    );
+    assert_eq!(
+        record.get("success"),
+        Some(&serde_json::json!(false)),
+        "a startup cancel records a failure"
+    );
+    assert_eq!(
+        record.get("message"),
+        Some(&serde_json::json!("cancelled during startup")),
+        "the fresh record carries the startup-cancel message"
     );
     let mode = std::fs::metadata(&done_path)
         .expect("the replaced marker exists")
