@@ -486,6 +486,57 @@ impl Default for Theme {
     }
 }
 
+impl From<&Theme> for crate::markdown::MarkdownTheme {
+    fn from(value: &Theme) -> Self {
+        Self {
+            header: [
+                value.markdown.header1,
+                value.markdown.header2,
+                value.markdown.header3,
+                value.markdown.header4,
+                value.markdown.header5,
+                value.markdown.header6,
+            ],
+            bold: value.markdown.bold,
+            italic: value.markdown.italic,
+            code_inline: value.markdown.code_inline,
+            code_block: value.markdown.code_block.bg.unwrap_or(value.ui.background),
+            link: value.markdown.link,
+            quote: value.markdown.quote,
+            list_item: value.markdown.list_item,
+            horizontal_rule: value.markdown.horizontal_rule,
+            border: value.ui.border_color,
+            dim: value.ui.dim,
+        }
+    }
+}
+
+impl From<&Theme> for crate::markdown::SyntaxTheme {
+    fn from(value: &Theme) -> Self {
+        Self {
+            plain: value.ui.foreground,
+            attribute: value.syntax.attribute,
+            comment: value.syntax.comment,
+            constant: value.syntax.constant,
+            constructor: value.syntax.constructor,
+            embedded: value.syntax.embedded,
+            function: value.syntax.function,
+            keyword: value.syntax.keyword,
+            number: value.syntax.number,
+            operator: value.syntax.operator,
+            property: value.syntax.property,
+            punctuation: value.syntax.punctuation,
+            string: value.syntax.string,
+            r#type: value.syntax.r#type,
+            variable: value.syntax.variable,
+            variable_builtin: value.syntax.variable_builtin,
+            tag: value.syntax.tag,
+            delimiter: value.syntax.delimiter,
+            escape: value.syntax.escape,
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -814,5 +865,25 @@ mod tests {
                 "{key}: link lost its underline"
             );
         }
+    }
+
+    #[test]
+    fn host_theme_maps_into_the_module_themes() {
+        let theme = Theme::default();
+        let markdown: crate::markdown::MarkdownTheme = (&theme).into();
+        let syntax: crate::markdown::SyntaxTheme = (&theme).into();
+
+        assert_eq!(markdown.header[0], theme.markdown.header1);
+        assert_eq!(markdown.border, theme.ui.border_color);
+        assert_eq!(markdown.dim, theme.ui.dim);
+        assert_eq!(
+            markdown.code_block,
+            theme.markdown.code_block.bg.unwrap_or(theme.ui.background)
+        );
+
+        assert_eq!(syntax.plain, theme.ui.foreground);
+        assert_eq!(syntax.keyword, theme.syntax.keyword);
+        assert_eq!(syntax.escape, theme.syntax.escape);
+        assert_eq!(syntax.emit_order_colors(), theme.syntax.syntax_colors());
     }
 }
