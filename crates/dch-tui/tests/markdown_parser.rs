@@ -379,6 +379,16 @@ fn table_cells_carry_their_wide_glyphs() {
             !widths.is_empty(),
             "Table should have non-empty column widths"
         );
+        let cell_words: Vec<&str> = tc
+            .content()
+            .iter()
+            .flatten()
+            .map(dch_tui::markdown::Word::content)
+            .collect();
+        assert!(
+            cell_words.iter().any(|w| w.contains('→')),
+            "the arrow glyph must survive into cell words, got: {cell_words:?}"
+        );
     }
 }
 
@@ -396,17 +406,27 @@ fn a_table_without_a_trailing_newline_still_parses() {
 
     let table_comp = comps
         .iter()
-        .find(|c| matches!(c.kind(), TextNode::Table(_, _)));
-    assert!(
-        table_comp.is_some(),
-        "Expected a Table component, got component kinds: {:?}",
-        comps
-            .iter()
-            .map(|c| format!("{:?}", c.kind()))
-            .collect::<Vec<_>>()
+        .find(|c| matches!(c.kind(), TextNode::Table(_, _)))
+        .expect("should have a Table component");
+    let column_count = table_comp
+        .meta_info()
+        .iter()
+        .filter(|w| matches!(w.kind(), WordType::MetaInfo(MetaData::ColumnsCount)))
+        .count();
+    assert_eq!(
+        column_count, 5,
+        "the separator row declares five columns, got {column_count}"
+    );
+    assert_eq!(
+        table_comp.content().len(),
+        15,
+        "header plus two body rows × five columns = fifteen cells, got {}",
+        table_comp.content().len()
     );
 
-    if let Some(tc) = table_comp
+    if let Some(tc) = comps
+        .iter()
+        .find(|c| matches!(c.kind(), TextNode::Table(_, _)))
         && let TextNode::Table(widths, _heights) = tc.kind()
     {
         assert!(
@@ -439,4 +459,148 @@ fn a_table_among_paragraphs_parses_in_place() {
             .map(|c| format!("{:?}", c.kind()))
             .collect::<Vec<_>>()
     );
+    assert!(
+        matches!(comps.first(), Some(c) if matches!(c.kind(), TextNode::Paragraph)),
+        "the leading component must stay a paragraph, got: {:?}",
+        comps.first().map(|c| c.kind())
+    );
+    assert!(
+        matches!(comps.last(), Some(c) if matches!(c.kind(), TextNode::Paragraph)),
+        "the trailing component must stay a paragraph, got: {:?}",
+        comps.last().map(|c| c.kind())
+    );
+    if let Some(table) = table_comp {
+        let table_idx = comps
+            .iter()
+            .position(|c| std::ptr::eq(c, table))
+            .expect("the table component is in the list");
+        assert!(
+            table_idx > 0 && table_idx < comps.len().saturating_sub(1),
+            "the table must sit between the paragraphs, at index {table_idx} of {}",
+            comps.len()
+        );
+    }
+}
+
+/// A dash run with trailing text on the same line is a paragraph, not a
+/// horizontal rule — the rule requires the dashes to end their line.
+#[test]
+fn a_dash_run_with_trailing_text_is_not_a_separator() {
+    for md in ["---title", "----text"] {
+        let root = parse_markdown(md, 80);
+        let comps = root.components();
+        assert!(
+            !comps
+                .iter()
+                .any(|c| matches!(c.kind(), TextNode::HorizontalSeparator)),
+            "`{md}` must not produce a separator, got kinds: {:?}",
+            comps.iter().map(|c| c.kind()).collect::<Vec<_>>()
+        );
+        assert!(
+            matches!(comps.first(), Some(c) if matches!(c.kind(), TextNode::Paragraph)),
+            "`{md}` should stay a paragraph"
+        );
+    }
+}
+
+/// A dash run alone on its line — with or without trailing text after a
+/// newline — remains a horizontal rule.
+#[test]
+fn a_dash_run_ending_its_line_stays_a_separator() {
+    for md in ["---", "-----", "---\ntext"] {
+        let root = parse_markdown(md, 80);
+        assert!(
+            root.components()
+                .iter()
+                .any(|c| matches!(c.kind(), TextNode::HorizontalSeparator)),
+            "`{md}` should produce a separator, got kinds: {:?}",
+            root.components()
+                .iter()
+                .map(|c| c.kind())
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+/// The fence's language tag is metadata, never a content row — a
+/// language row would surface as a phantom empty first line.
+#[test]
+fn the_fence_language_never_becomes_a_content_row() {
+    let root = parse_markdown("```rust\nfn main() {}\n```", 80);
+    let code_block = root
+        .components()
+        .into_iter()
+        .find(|c| matches!(c.kind(), TextNode::CodeBlock))
+        .expect("should have a CodeBlock component");
+
+    assert!(
+        code_block
+            .content()
+            .first()
+            .is_some_and(|row| !row.is_empty()),
+        "the first content row should be source code, not the language tag"
+    );
+    let language_words = code_block
+        .meta_info()
+        .iter()
+        .filter(|w| matches!(w.kind(), WordType::MetaInfo(MetaData::PLanguage)))
+        .count();
+    assert_eq!(
+        language_words, 1,
+        "the language should appear exactly once in metadata"
+    );
+}
+
+/// Nested list items keep their indentation: the nested pair sits two
+/// columns in, the surrounding top-level items at the margin.
+#[test]
+fn nested_list_items_keep_their_indentation() {
+    let md = "- a\n  - b\n  - c\n- d";
+    let root = parse_markdown(md, 80);
+    let list_comp = root
+        .components()
+        .into_iter()
+        .find(|c| matches!(c.kind(), TextNode::List))
+        .expect("should have a list");
+
+    let rows = list_comp.content();
+    assert_eq!(rows.len(), 4, "four items, four rows");
+    let indent_widths: Vec<usize> = rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .take_while(|w| {
+                    w.kind() == WordType::Normal
+                        && !w.content().is_empty()
+                        && w.content().trim().is_empty()
+                })
+                .map(|w| unicode_width::UnicodeWidthStr::width(w.content()))
+                .sum()
+        })
+        .collect();
+    assert_eq!(
+        indent_widths,
+        vec![0, 2, 2, 0],
+        "nested items indent two columns, top-level items none"
+    );
+}
+
+/// A table whose width budget cannot give every column one column
+/// degenerates instead of rendering past the terminal.
+#[test]
+fn a_table_too_narrow_for_its_columns_degenerates() {
+    let md = "| a | b | c | d | e | f |\n|---|---|---|---|---|---|\n| 1 | 2 | 3 | 4 | 5 | 6 |";
+    let root = parse_markdown(md, 12);
+    let table = root
+        .components()
+        .into_iter()
+        .find(|c| matches!(c.kind(), TextNode::Table(_, _)))
+        .expect("should have a Table component");
+
+    if let TextNode::Table(widths, _) = table.kind() {
+        assert!(
+            widths.is_empty(),
+            "an unfixable table degenerates to empty widths, got {widths:?}"
+        );
+    }
 }

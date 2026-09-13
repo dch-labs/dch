@@ -409,7 +409,7 @@ fn transform_list(component: &mut TextComponent, width: u16) {
     let indent_iter = component
         .meta_info
         .iter()
-        .filter(|w| w.content().trim().is_empty());
+        .filter(|w| w.content().trim().is_empty() && !matches!(w.kind(), WordType::MetaInfo(_)));
     let list_type_iter = component.meta_info.iter().filter(|w| {
         matches!(
             w.kind(),
@@ -529,6 +529,14 @@ fn transform_table(component: &mut TextComponent, width: u16) {
             .saturating_mul(TABLE_CELL_PADDING.saturating_mul(2).saturating_add(1)),
     );
     let available_for_content: u16 = width.saturating_sub(styling_overhead);
+
+    // A budget that cannot give every column a single column degenerates:
+    // honoring the one-column minimum would push the table past the width.
+    if usize::from(available_for_content) < column_count {
+        component.height = 1;
+        component.kind = TextNode::Table(vec![], vec![]);
+        return;
+    }
 
     let total_natural: u64 = natural_widths.iter().copied().map(u64::from).sum();
     let final_widths = if total_natural <= u64::from(available_for_content) {

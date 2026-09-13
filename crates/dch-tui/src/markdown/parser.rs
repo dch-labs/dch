@@ -539,6 +539,7 @@ fn build_code_block(node: &ParseNode) -> TextComponent {
     for ln in &leaf_nodes {
         if ln.kind() == MdParseEnum::PLanguage {
             language = Some(ln.content().to_owned());
+            continue;
         }
         let word_type = WordType::from(ln.kind());
         let content = ln.content().to_owned();

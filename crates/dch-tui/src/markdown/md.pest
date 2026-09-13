@@ -141,7 +141,7 @@ quote          = { (NEWLINE? ~ WHITESPACE_S* ~ ">" ~ ((quote_marking | sentence 
 task           = { NEWLINE? ~ task_prefix ~ sentence }
 footnote       = { NEWLINE? ~ "[^" ~ footnote_ref ~ "]" ~ footnote_sentence+ }
 block_sep      = { NEWLINE }
-horizontal_sep = { NEWLINE? ~ "---" ~ "-"* }
+horizontal_sep = { NEWLINE? ~ "---" ~ "-"* ~ WHITESPACE_S* ~ (NEWLINE | EOI) }
 image          = { NEWLINE? ~ "![" ~ alt_text ~ "](" ~ link_data+ ~ ")" }
 
 txt = {

@@ -88,26 +88,31 @@ fn code_block_words_carry_captures_not_colors() {
 /// behind the syntax-highlight feature.
 ///
 /// Reads the manifest and enforces it: the parser's own dependencies
-/// are plain entries, and every tree-sitter entry is optional — the
-/// highlighting backend only builds when the feature is enabled, and
-/// nothing in the module references it until the renderer wires it
-/// up. Ratatui is the module's other legitimate dependency by design —
-/// a manifest cannot scope dependencies to one module, so the test
-/// asserts the surface it can.
+/// are plain entries, every tree-sitter entry is optional, and the
+/// `syntax-highlight` feature maps every tree-sitter dependency so the
+/// one feature toggles the whole backend — an optional entry the
+/// feature forgets would be unreachable dead weight. Ratatui is the
+/// module's other legitimate dependency by design — a manifest cannot
+/// scope dependencies to one module, so the test asserts the surface
+/// it can.
 #[test]
 fn parser_hard_dependencies_are_pest_and_unicode_width() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
     let text = std::fs::read_to_string(&manifest).expect("manifest is readable");
 
-    let mut in_dependencies = false;
+    let mut section = "";
+    let mut in_syntax_highlight = false;
     let mut saw_pest = false;
     let mut saw_unicode_width = false;
+    let mut tree_sitter_deps: Vec<&str> = Vec::new();
+    let mut feature_entries: Vec<&str> = Vec::new();
     for line in text.lines() {
         if line.starts_with('[') {
-            in_dependencies = line.trim() == "[dependencies]";
+            section = line.trim();
+            in_syntax_highlight = false;
             continue;
         }
-        if in_dependencies {
+        if section == "[dependencies]" {
             if line.starts_with("pest ") || line.starts_with("pest=") {
                 saw_pest = true;
             }
@@ -120,11 +125,39 @@ fn parser_hard_dependencies_are_pest_and_unicode_width() {
                     "tree-sitter entries must stay optional, gated behind \
                      the syntax-highlight feature: {line}"
                 );
+                if let Some(name) = line.split('=').next() {
+                    tree_sitter_deps.push(name.trim());
+                }
+            }
+        }
+        if section == "[features]" {
+            if line.trim_start().starts_with(']') {
+                in_syntax_highlight = false;
+            } else if line.starts_with("syntax-highlight") {
+                in_syntax_highlight = true;
+            }
+            if in_syntax_highlight {
+                feature_entries.extend(
+                    line.split('"')
+                        .skip(1)
+                        .step_by(2)
+                        .map(|entry| entry.strip_prefix("dep:").unwrap_or(entry)),
+                );
             }
         }
     }
     assert!(saw_pest, "pest is a plain dependency");
     assert!(saw_unicode_width, "unicode-width is a plain dependency");
+    assert!(
+        !tree_sitter_deps.is_empty(),
+        "the syntax-highlight feature skeleton should exist"
+    );
+    for dep in &tree_sitter_deps {
+        assert!(
+            feature_entries.contains(dep),
+            "the syntax-highlight feature must map `{dep}`"
+        );
+    }
 }
 
 /// The module's theme types are its own, distinct from the host's.
