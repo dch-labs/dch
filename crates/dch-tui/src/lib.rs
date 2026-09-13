@@ -2,4 +2,5 @@
 
 #![warn(missing_docs)]
 
+pub mod markdown;
 pub mod theme;
