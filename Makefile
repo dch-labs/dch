@@ -1,7 +1,7 @@
 CARGO          := cargo
 ALL_FEATURES   := --all-features
 
-.PHONY: build check test clippy fmt run lint docs examples boundary ci help
+.PHONY: build check test clippy fmt run lint docs examples boundary nodefault ci help
 
 ## build: Build the whole workspace (debug, all features)
 build:
@@ -43,8 +43,12 @@ examples:
 boundary:
 	$(CARGO) run -p xtask -- check-boundary
 
-## ci: Run the full local CI gate (fmt, clippy, test, docs, examples, boundary)
-ci: fmt clippy test docs examples boundary
+## nodefault: Prove the workspace compiles without default features
+nodefault:
+	$(CARGO) check --no-default-features
+
+## ci: Run the full local CI gate (fmt, clippy, test, docs, examples, boundary, nodefault)
+ci: fmt clippy test docs examples boundary nodefault
 	@echo "✅ CI passed locally"
 
 ## help: Show this help

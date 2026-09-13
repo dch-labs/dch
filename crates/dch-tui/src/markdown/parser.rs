@@ -652,9 +652,20 @@ fn build_quote(node: &ParseNode) -> TextComponent {
 }
 
 /// Build a task-list-item component from its leaf words.
+///
+/// The checkbox marker's trailing space is trimmed away with its
+/// markers, so a separator word follows it explicitly — without one,
+/// the marker and the item text render glued together.
 fn build_task(node: &ParseNode) -> TextComponent {
     let leaf_nodes = get_leaf_nodes(node);
-    let words = collect_words(&leaf_nodes);
+    let mut words = collect_words(&leaf_nodes);
+    if matches!(
+        leaf_nodes.first().map(ParseNode::kind),
+        Some(MdParseEnum::TaskOpen | MdParseEnum::TaskClosed)
+    ) && words.len() > 1
+    {
+        words.insert(1, Word::new(" ".to_owned(), WordType::Normal));
+    }
     TextComponent::new(TextNode::Task, words)
 }
 
