@@ -14,7 +14,7 @@ use ratatui::Frame;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
@@ -23,7 +23,7 @@ use unicode_width::UnicodeWidthStr;
 use dch_config::DchConfig;
 
 use crate::markdown;
-use crate::message::{ActiveTool, TokenCounts, TuiMessage};
+use crate::message::{ActiveTool, ContentBlock, TokenCounts, TuiMessage};
 use crate::theme::Theme;
 
 /// The main TUI application.
@@ -395,7 +395,10 @@ impl TuiApp {
     ///
     /// Assistant text goes through the markdown pipeline with the
     /// assistant base color; user, system, and error messages render
-    /// as single styled lines.
+    /// as single styled lines; a completed tool block renders as one
+    /// dim summary line between the text blocks around it. A nonempty
+    /// streaming buffer follows the conversation as the reply in
+    /// progress, and the in-flight tool list closes the live region.
     fn conversation_lines(&self, area: Rect) -> Vec<Line<'static>> {
         let width = area.width.max(1);
         let markdown_theme = markdown::MarkdownTheme::from(&self.theme);
@@ -411,15 +414,32 @@ impl TuiApp {
                 }
                 TuiMessage::Assistant { blocks, .. } => {
                     for block in blocks {
-                        if let crate::message::ContentBlock::Text { text } = block {
-                            lines.extend(markdown::render_markdown(
-                                text,
-                                width,
-                                &markdown_theme,
-                                &syntax_theme,
-                                self.theme.ui.assistant_message_fg,
-                                None,
-                            ));
+                        match block {
+                            ContentBlock::Text { text } => {
+                                lines.extend(markdown::render_markdown(
+                                    text,
+                                    width,
+                                    &markdown_theme,
+                                    &syntax_theme,
+                                    self.theme.ui.assistant_message_fg,
+                                    None,
+                                ));
+                            }
+                            ContentBlock::Tool {
+                                name,
+                                input_preview,
+                                success,
+                                elapsed_secs,
+                                ..
+                            } => {
+                                lines.push(completed_tool_line(
+                                    name,
+                                    input_preview,
+                                    *success,
+                                    *elapsed_secs,
+                                    &self.theme,
+                                ));
+                            }
                         }
                     }
                 }
@@ -436,6 +456,27 @@ impl TuiApp {
                     ));
                 }
             }
+        }
+        let streaming = self
+            .streaming_text
+            .lock()
+            .map_or_else(|_| String::new(), |text| text.clone());
+        if !streaming.is_empty() {
+            lines.extend(markdown::render_markdown(
+                &streaming,
+                width,
+                &markdown_theme,
+                &syntax_theme,
+                self.theme.ui.assistant_message_fg,
+                None,
+            ));
+        }
+        let tools = self
+            .active_tools
+            .lock()
+            .map_or_else(|_| Vec::new(), |tools| tools.clone());
+        for tool in &tools {
+            lines.push(running_tool_line(tool, &self.theme));
         }
         lines
     }
@@ -488,6 +529,65 @@ impl TuiApp {
             ),
             area,
         );
+    }
+}
+
+/// Build the conversation line for a completed tool call.
+///
+/// The outcome marker carries the theme's success or error color; the
+/// name, input preview, and elapsed stamp stay dim so tool activity
+/// reads as one glanceable line between the text blocks around it.
+fn completed_tool_line(
+    name: &str,
+    input_preview: &str,
+    success: bool,
+    elapsed_secs: f64,
+    theme: &Theme,
+) -> Line<'static> {
+    let (marker, marker_color) = if success {
+        ("✓", theme.ui.status_success)
+    } else {
+        ("✗", theme.ui.status_error)
+    };
+    Line::from(vec![
+        Span::styled(marker, Style::default().fg(marker_color)),
+        Span::styled(
+            format!(" {name} {input_preview}{}", format_elapsed(elapsed_secs)),
+            Style::default().fg(theme.ui.dim),
+        ),
+    ])
+}
+
+/// Build the conversation line for an in-flight tool call.
+///
+/// The marker and summary stay dim — a quiet cue that the call is
+/// working, replaced by the colored outcome marker once it completes.
+fn running_tool_line(tool: &ActiveTool, theme: &Theme) -> Line<'static> {
+    let elapsed = tool.start.elapsed().as_secs_f64();
+    Line::from(vec![
+        Span::styled("⏳", Style::default().fg(theme.ui.dim)),
+        Span::styled(
+            format!(
+                " {} {}{}",
+                tool.name,
+                tool.input_summary,
+                format_elapsed(elapsed)
+            ),
+            Style::default().fg(theme.ui.dim),
+        ),
+    ])
+}
+
+/// Render a duration as a parenthesized elapsed stamp.
+///
+/// Sub-minute durations keep one decimal (`(0.4s)`); longer ones
+/// switch to minutes and whole seconds (`(1m1s)`), the shape the
+/// tool summary lines carry.
+fn format_elapsed(secs: f64) -> String {
+    if secs >= 60.0 {
+        format!(" ({:.0}m{:.0}s)", secs / 60.0, secs % 60.0)
+    } else {
+        format!(" ({secs:.1}s)")
     }
 }
 
