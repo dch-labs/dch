@@ -1,6 +1,14 @@
-//! Ratatui terminal UI for `dch`: themes, markdown rendering, and streaming display.
+//! Ratatui terminal UI for `dch`: themes, markdown rendering, the
+//! application shell, and streaming display.
 
 #![warn(missing_docs)]
 
+pub mod app;
 pub mod markdown;
+pub mod message;
+pub mod terminal;
 pub mod theme;
+
+pub use app::TuiApp;
+pub use message::{ActiveTool, ContentBlock, TokenCounts, TuiMessage};
+pub use terminal::{TerminalGuard, init_terminal, restore_terminal};
