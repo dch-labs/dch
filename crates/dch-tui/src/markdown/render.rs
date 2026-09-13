@@ -391,10 +391,13 @@ fn render_table(
 
                 row_spans.push(Span::styled(" ", style));
                 if cell_width > target_width {
-                    row_spans.push(Span::styled(
-                        unicode_truncate(&cell_text, target_width),
-                        style,
-                    ));
+                    let mut truncated = unicode_truncate(&cell_text, target_width);
+                    let shortfall =
+                        target_width.saturating_sub(UnicodeWidthStr::width(truncated.as_str()));
+                    if shortfall > 0 {
+                        truncated.push_str(&" ".repeat(shortfall));
+                    }
+                    row_spans.push(Span::styled(truncated, style));
                 } else {
                     for word in cell_words {
                         row_spans.extend(word_to_spans(word, style, theme));

@@ -1,7 +1,7 @@
 CARGO          := cargo
 ALL_FEATURES   := --all-features
 
-.PHONY: build check test clippy fmt run lint docs examples boundary ci help
+.PHONY: build check test clippy fmt run lint docs examples boundary nodefault ci help
 
 ## build: Build the whole workspace (debug, all features)
 build:

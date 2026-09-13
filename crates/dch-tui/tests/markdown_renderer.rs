@@ -412,3 +412,17 @@ fn highlighted_tokens_carry_their_capture_colors() {
         .unwrap();
     assert_eq!(string.style.fg, Some(theme.string));
 }
+
+#[test]
+fn truncated_wide_cells_keep_their_column_alignment() {
+    let lines = render("| 中 | 文 |\n|---|---|", 10);
+    let widths: Vec<usize> = lines.iter().map(line_width).collect();
+    assert!(
+        widths.len() >= 3,
+        "borders plus a header row, got {widths:?}"
+    );
+    assert!(
+        widths.iter().all(|width| *width == widths[0]),
+        "every table line must share one width, got {widths:?}"
+    );
+}
