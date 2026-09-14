@@ -4,11 +4,10 @@
 //! state background producers write through; `run` drives the
 //! render ↔ input ↔ scroll loop until the user quits.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
-use event_listener::Event as WakeEvent;
 use futures::StreamExt;
 use ratatui::Frame;
 use ratatui::backend::CrosstermBackend;
@@ -24,7 +23,15 @@ use dch_config::DchConfig;
 
 use crate::markdown;
 use crate::message::{ActiveTool, ContentBlock, TokenCounts, TuiMessage};
+use crate::observer::{ToolResultDisplay, TuiObserverState};
 use crate::theme::Theme;
+
+/// How many completed tool calls the live region keeps visible.
+///
+/// Oldest entries drop off the drained history once the count passes
+/// this depth, so a long session neither loses recent completions nor
+/// accumulates all of them.
+const TOOL_HISTORY_DEPTH: usize = 20;
 
 /// The main TUI application.
 ///
@@ -44,29 +51,20 @@ pub struct TuiApp {
     /// scroll offset walks it from the bottom.
     conversation: Vec<TuiMessage>,
 
-    /// The streaming-text buffer for the reply in progress.
+    /// The shared state the observer half of the display writes.
     ///
-    /// One allocation shared by whatever produces reply text and the
-    /// renderer; it reads empty while no reply is in progress.
-    streaming_text: Arc<Mutex<String>>,
+    /// Bundled as one value so the split pattern stays in a single
+    /// place: an app built from externally-created state and its
+    /// observer hold clones of these same allocations.
+    state: TuiObserverState,
 
-    /// The list of tools in flight.
+    /// Completed tool calls this display has taken from the shared
+    /// buffer.
     ///
-    /// One entry per dispatched call, removed on completion; empty
-    /// while nothing is running.
-    active_tools: Arc<Mutex<Vec<ActiveTool>>>,
-
-    /// The token-usage counters.
-    ///
-    /// The status bar reads the cumulative totals from this shared
-    /// copy.
-    tokens: Arc<Mutex<TokenCounts>>,
-
-    /// The shared redraw request.
-    ///
-    /// Waking it makes the run loop redraw on its next iteration; a
-    /// listener stays registered across draws and event handling.
-    render_notify: Arc<WakeEvent>,
+    /// Drained from the shared state on every redraw and capped at
+    /// [`TOOL_HISTORY_DEPTH`], so finished calls stay visible while
+    /// nothing accumulates without bound.
+    tool_history: Vec<ToolResultDisplay>,
 
     /// The input line's current text.
     ///
@@ -102,7 +100,18 @@ impl TuiApp {
     ///
     /// The TUI renders and responds to input; the shared buffers stay
     /// empty until a producer writes them.
+    #[must_use]
     pub fn new(config: DchConfig) -> Self {
+        Self::from_observer_state(config, TuiObserverState::new())
+    }
+
+    /// Construct the shell around externally-created shared state.
+    ///
+    /// The retained half of a state split through
+    /// [`TuiObserverState::into_observer`] — the observer half goes
+    /// to the agent — so writes from the running agent reach this
+    /// app's display through the same allocations.
+    pub fn from_observer_state(config: DchConfig, state: TuiObserverState) -> Self {
         let theme = if let Some(theme) = Theme::by_name(&config.display.theme) {
             theme
         } else {
@@ -112,10 +121,8 @@ impl TuiApp {
         Self {
             theme,
             conversation: Vec::new(),
-            streaming_text: Arc::new(Mutex::new(String::new())),
-            active_tools: Arc::new(Mutex::new(Vec::new())),
-            tokens: Arc::new(Mutex::new(TokenCounts::default())),
-            render_notify: Arc::new(WakeEvent::new()),
+            state,
+            tool_history: Vec::new(),
             input: String::new(),
             cursor: 0,
             scroll_offset: 0,
@@ -180,7 +187,7 @@ impl TuiApp {
     /// reads empty until a writer starts.
     #[must_use]
     pub fn streaming_text(&self) -> &Arc<Mutex<String>> {
-        &self.streaming_text
+        &self.state.streaming_text
     }
 
     /// The shared in-flight tool list.
@@ -189,7 +196,7 @@ impl TuiApp {
     /// on completion.
     #[must_use]
     pub fn active_tools(&self) -> &Arc<Mutex<Vec<ActiveTool>>> {
-        &self.active_tools
+        &self.state.active_tools
     }
 
     /// The shared token counters.
@@ -197,15 +204,15 @@ impl TuiApp {
     /// The status bar's totals read through this handle.
     #[must_use]
     pub fn tokens(&self) -> &Arc<Mutex<TokenCounts>> {
-        &self.tokens
+        &self.state.tokens
     }
 
     /// The shared redraw request.
     ///
     /// Waking it triggers a redraw on the loop's next iteration.
     #[must_use]
-    pub fn render_notify(&self) -> &Arc<WakeEvent> {
-        &self.render_notify
+    pub fn render_notify(&self) -> &Arc<event_listener::Event> {
+        &self.state.render_notify
     }
 
     /// Run the UI event loop until the user exits.
@@ -230,7 +237,7 @@ impl TuiApp {
         self.quitting = false;
         let mut events = Box::pin(crossterm::event::EventStream::new());
         let mut tick = tokio::time::interval(Duration::from_millis(250));
-        let notify = Arc::clone(&self.render_notify);
+        let notify = Arc::clone(&self.state.render_notify);
         let mut listener = notify.listen();
 
         terminal.draw(|frame| self.render(frame))?;
@@ -345,7 +352,8 @@ impl TuiApp {
     /// a poisoned lock reads as none, the same policy the render
     /// path applies to the live region.
     fn any_tools_running(&self) -> bool {
-        self.active_tools
+        self.state
+            .active_tools
             .lock()
             .is_ok_and(|tools| !tools.is_empty())
     }
@@ -360,8 +368,12 @@ impl TuiApp {
     /// Render one frame of the three-pane layout.
     ///
     /// Conversation fills the space above the input box; the status
-    /// bar closes the frame at the bottom row.
+    /// bar closes the frame at the bottom row. Each frame first takes
+    /// what the observer finished — finalized replies graduate into
+    /// the conversation, completed tool calls into the bounded
+    /// history.
     pub fn render(&mut self, frame: &mut Frame) {
+        self.drain_shared_state();
         let area = frame.area();
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -406,14 +418,39 @@ impl TuiApp {
         self.render_status_bar(frame, status_area);
     }
 
+    /// Take what the observer finished since the last frame.
+    ///
+    /// Finalized replies move into the conversation as assistant
+    /// messages; completed tool calls move into this display's
+    /// bounded history — so neither shared buffer accumulates across
+    /// frames. A poisoned lock is recovered — the same policy the
+    /// observer writes with — so finalized data still graduates.
+    fn drain_shared_state(&mut self) {
+        let replies = take_locked(&self.state.completed_replies);
+        let now = chrono::Utc::now();
+        for text in replies {
+            self.push_message(TuiMessage::Assistant {
+                blocks: vec![ContentBlock::Text { text }],
+                timestamp: now,
+                duration_ms: None,
+            });
+        }
+        self.tool_history
+            .extend(take_locked(&self.state.tool_results));
+        let drop_count = self.tool_history.len().saturating_sub(TOOL_HISTORY_DEPTH);
+        self.tool_history.drain(..drop_count);
+    }
+
     /// Flatten the conversation into styled lines for the given width.
     ///
     /// Assistant text goes through the markdown pipeline with the
     /// assistant base color; user, system, and error messages render
     /// as single styled lines; a completed tool block renders as one
-    /// dim summary line between the text blocks around it. A nonempty
-    /// streaming buffer follows the conversation as the reply in
-    /// progress, and the in-flight tool list closes the live region.
+    /// dim summary line between the text blocks around it. The
+    /// bounded history of drained tool results follows the
+    /// conversation, a nonempty streaming buffer renders as the reply
+    /// in progress, and the in-flight tool list closes the live
+    /// region.
     fn conversation_lines(&self, area: Rect) -> Vec<Line<'static>> {
         let width = area.width.max(1);
         let markdown_theme = markdown::MarkdownTheme::from(&self.theme);
@@ -472,7 +509,11 @@ impl TuiApp {
                 }
             }
         }
+        for result in &self.tool_history {
+            lines.push(result_line(result, &self.theme));
+        }
         let streaming = self
+            .state
             .streaming_text
             .lock()
             .map_or_else(|_| String::new(), |text| text.clone());
@@ -487,6 +528,7 @@ impl TuiApp {
             ));
         }
         let tools = self
+            .state
             .active_tools
             .lock()
             .map_or_else(|_| Vec::new(), |tools| tools.clone());
@@ -527,7 +569,7 @@ impl TuiApp {
     /// Names the configured model on the left and the cumulative
     /// token totals on the right; both sit on the themed bar colors.
     fn render_status_bar(&self, frame: &mut Frame, area: Rect) {
-        let tokens = self.tokens.lock().map_or_else(
+        let tokens = self.state.tokens.lock().map_or_else(
             |_| 0,
             |counts| {
                 counts
@@ -573,6 +615,30 @@ fn completed_tool_line(
     ])
 }
 
+/// Build the conversation line for a drained tool result.
+///
+/// The result record carries no input preview — the conversation
+/// around it supplies the what — so the line is the outcome marker,
+/// the name, and the elapsed stamp.
+fn result_line(result: &ToolResultDisplay, theme: &Theme) -> Line<'static> {
+    let (marker, marker_color) = if result.is_error {
+        ("✗", theme.ui.status_error)
+    } else {
+        ("✓", theme.ui.status_success)
+    };
+    Line::from(vec![
+        Span::styled(marker, Style::default().fg(marker_color)),
+        Span::styled(
+            format!(
+                " {}{}",
+                result.name,
+                format_elapsed(result.duration.as_secs_f64())
+            ),
+            Style::default().fg(theme.ui.dim),
+        ),
+    ])
+}
+
 /// Build the conversation line for an in-flight tool call.
 ///
 /// The marker and summary stay dim — a quiet cue that the call is
@@ -605,6 +671,15 @@ fn format_elapsed(secs: f64) -> String {
     } else {
         format!(" ({secs:.1}s)")
     }
+}
+
+/// Take a shared buffer's contents, leaving it empty.
+///
+/// Recovers from poisoning — the same policy the observer writes
+/// with — so finalized data still graduates after another thread's
+/// panic left the lock poisoned.
+fn take_locked<T: Default>(mutex: &Mutex<T>) -> T {
+    std::mem::take(&mut *mutex.lock().unwrap_or_else(PoisonError::into_inner))
 }
 
 /// Fetch a layout pane by index with a whole-area fallback.
@@ -640,6 +715,7 @@ mod tests {
             .lock()
             .expect("the tools lock")
             .push(ActiveTool {
+                call_id: String::new(),
                 name: "Grep".to_string(),
                 input_summary: "\"needle\"".to_string(),
                 start: std::time::Instant::now(),

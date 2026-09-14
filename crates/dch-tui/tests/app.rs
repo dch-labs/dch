@@ -19,6 +19,7 @@ use dch_config::DchConfig;
 use dch_tui::TuiApp;
 use dch_tui::message::{ActiveTool, ContentBlock, TuiMessage};
 use dch_tui::theme::Theme;
+use loopctl::observer::LoopObserver as _;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
@@ -415,6 +416,7 @@ fn active_tools_render_as_running_lines() {
         .lock()
         .expect("the tools lock")
         .push(ActiveTool {
+            call_id: String::new(),
             name: "Grep".to_string(),
             input_summary: "\"todo\"".to_string(),
             start: std::time::Instant::now(),
@@ -483,5 +485,167 @@ fn elapsed_stamps_round_once_before_splitting() {
     assert!(
         joined.contains("Bash true (1m0s)"),
         "59.6s crosses the minute boundary once rounded: {joined:?}"
+    );
+}
+
+#[test]
+fn an_app_built_from_observer_state_renders_observer_writes() {
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+
+    observer.on_text_delta(&loopctl::observer::TextDeltaContext {
+        turn: 0,
+        delta: "live text".to_string(),
+    });
+    drop(observer);
+
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    assert!(
+        view_text(&terminal, 80, 30).contains("live text"),
+        "observer writes reach an app built from the kept state"
+    );
+}
+
+#[test]
+fn a_finalized_reply_graduates_into_the_conversation() {
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    let mut streamed = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+
+    observer.on_text_delta(&loopctl::observer::TextDeltaContext {
+        turn: 0,
+        delta: "the streamed".to_string(),
+    });
+    observer.on_response(&loopctl::observer::ResponseContext {
+        turn: 0,
+        text: "the streamed and final reply".to_string(),
+        usage: None,
+    });
+    drop(observer);
+
+    let terminal = render_to_buffer(&mut streamed, 80, 30);
+    assert!(
+        view_text(&terminal, 80, 30).contains("the streamed and final reply"),
+        "the finalized reply renders in the conversation after the live buffer clears"
+    );
+    assert!(
+        streamed.conversation().len() == 1,
+        "graduation appends one assistant message"
+    );
+    assert!(
+        matches!(
+            streamed.conversation().first(),
+            Some(dch_tui::TuiMessage::Assistant { .. })
+        ),
+        "the graduated message is an assistant message"
+    );
+
+    let (observer, kept) = dch_tui::TuiObserverState::new().into_observer();
+    let mut unstreamed = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    observer.on_response(&loopctl::observer::ResponseContext {
+        turn: 0,
+        text: "a reply no delta announced".to_string(),
+        usage: None,
+    });
+    drop(observer);
+    let terminal = render_to_buffer(&mut unstreamed, 80, 30);
+    assert!(
+        view_text(&terminal, 80, 30).contains("a reply no delta announced"),
+        "a non-streaming turn's reply reaches the conversation through its only copy"
+    );
+}
+
+#[test]
+fn completed_tool_results_drain_into_a_bounded_history() {
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept.clone());
+
+    for index in 0..25 {
+        observer.finish_tool(
+            &format!("call-{index}"),
+            &format!("tool-{index}"),
+            false,
+            std::time::Duration::from_millis(u64::try_from(index).unwrap_or(0)),
+        );
+    }
+    drop(observer);
+
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let view = view_text(&terminal, 80, 30);
+    assert!(
+        view.contains("✓ tool-24"),
+        "the newest completed tool renders after its active line retires: {view:?}"
+    );
+    assert!(
+        !view.contains("✓ tool-4"),
+        "history older than the display depth drops off instead of scrolling everything: {view:?}"
+    );
+    assert!(
+        kept.tool_results
+            .lock()
+            .expect("the results lock")
+            .is_empty(),
+        "the shared buffer drains on redraw, so it cannot accumulate across a session"
+    );
+}
+
+#[test]
+fn poisoned_shared_buffers_still_graduate_through_render() {
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+
+    observer.on_response(&loopctl::observer::ResponseContext {
+        turn: 0,
+        text: "reply under poison".to_string(),
+        usage: None,
+    });
+    observer.finish_tool("call-1", "Grep", false, std::time::Duration::from_millis(3));
+
+    let poisoned_replies = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = kept.completed_replies.lock().expect("the replies lock");
+        panic!("poison the replies lock");
+    }));
+    assert!(
+        poisoned_replies.is_err(),
+        "the replies poisoning must unwind"
+    );
+    let poisoned_results = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = kept.tool_results.lock().expect("the results lock");
+        panic!("poison the results lock");
+    }));
+    assert!(
+        poisoned_results.is_err(),
+        "the results poisoning must unwind"
+    );
+
+    observer.on_response(&loopctl::observer::ResponseContext {
+        turn: 1,
+        text: "reply after poison".to_string(),
+        usage: None,
+    });
+    observer.finish_tool("call-2", "Read", false, std::time::Duration::from_millis(4));
+    drop(observer);
+
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let view = view_text(&terminal, 80, 30);
+    assert!(
+        view.contains("reply under poison") && view.contains("reply after poison"),
+        "the drain recovers through poison — both replies graduate: {view:?}"
+    );
+    assert!(
+        view.contains("✓ Grep") && view.contains("✓ Read"),
+        "poisoned tool results still drain into the history: {view:?}"
+    );
+    let assistant_count = app
+        .conversation()
+        .iter()
+        .filter(|message| matches!(message, dch_tui::TuiMessage::Assistant { .. }))
+        .count();
+    assert_eq!(
+        assistant_count, 2,
+        "both replies graduated into the conversation through the poisoned lock"
     );
 }

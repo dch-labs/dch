@@ -139,14 +139,18 @@ pub enum ContentBlock {
 /// it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TokenCounts {
-    /// Input tokens of the current turn.
+    /// Input tokens of the most recent turn.
     ///
-    /// Resets when a new turn starts.
+    /// Overwritten at each stream or turn-end event; no event fires
+    /// at a turn's start, so the value keeps the previous turn's
+    /// counts until the next one reports.
     pub input: u64,
 
-    /// Output tokens of the current turn.
+    /// Output tokens of the most recent turn.
     ///
-    /// Resets when a new turn starts.
+    /// Overwritten at each stream or turn-end event; no event fires
+    /// at a turn's start, so the value keeps the previous turn's
+    /// counts until the next one reports.
     pub output: u64,
 
     /// Input tokens since the session began.
@@ -166,6 +170,13 @@ pub struct TokenCounts {
 /// on completion; the display layer reads the list to show progress.
 #[derive(Debug, Clone)]
 pub struct ActiveTool {
+    /// The model-issued call id.
+    ///
+    /// Pairs the pre and post lifecycle events exactly — including
+    /// same-tool retries and parallel calls, where the name alone is
+    /// ambiguous. Display code ignores it.
+    pub call_id: String,
+
     /// The invoked tool's name.
     ///
     /// As reported by the dispatcher.
@@ -173,7 +184,8 @@ pub struct ActiveTool {
 
     /// A one-line summary of the call's input.
     ///
-    /// Condensed from the full arguments.
+    /// Condensed from the full arguments when the call is received;
+    /// empty when no summary was stashed.
     pub input_summary: String,
 
     /// When the call was dispatched.
