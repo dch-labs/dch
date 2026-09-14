@@ -1,0 +1,310 @@
+//! `TuiObserver` tests — pure state mutation driven with hand-built
+//! contexts; no real loop, no terminal, no network. The completion
+//! path goes through the plain-args helper (the post context is not
+//! constructible outside its crate).
+
+#![allow(
+    clippy::uninlined_format_args,
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc
+)]
+
+use std::time::Duration;
+
+use dch_tui::TokenCounts;
+use dch_tui::observer::{TuiObserver, TuiObserverState};
+use loopctl::observer::{
+    LoopObserver, ResponseContext, StreamContext, TextDeltaContext, ToolCallReceivedContext,
+    ToolPreContext, TurnEndContext,
+};
+use serde_json::json;
+
+fn state_and_observer() -> (TuiObserver, TuiObserverState) {
+    TuiObserverState::new().into_observer()
+}
+
+fn delta(text: &str) -> TextDeltaContext {
+    TextDeltaContext {
+        turn: 0,
+        delta: text.to_string(),
+    }
+}
+
+fn received(call_id: &str, tool: &str, input: serde_json::Value) -> ToolCallReceivedContext {
+    ToolCallReceivedContext {
+        turn: 0,
+        tool: tool.to_string(),
+        call_id: call_id.to_string(),
+        input,
+    }
+}
+
+fn pre(call_id: &str, tool: &str) -> ToolPreContext {
+    ToolPreContext {
+        turn: 0,
+        tool: tool.to_string(),
+        tool_call_id: call_id.to_string(),
+    }
+}
+
+fn stream(turn: usize, input_tokens: u64, output_tokens: u64) -> StreamContext {
+    StreamContext {
+        turn,
+        model: "test-model".to_string(),
+        input_tokens,
+        output_tokens,
+    }
+}
+
+fn turn_end(turn: usize, input_tokens: u64, output_tokens: u64) -> TurnEndContext {
+    TurnEndContext {
+        turn,
+        success: true,
+        error: None,
+        duration_ms: 10,
+        input_tokens,
+        output_tokens,
+    }
+}
+
+fn tokens_of(state: &TuiObserverState) -> TokenCounts {
+    *state.tokens.lock().expect("the tokens lock")
+}
+
+#[test]
+fn the_split_pattern_shares_the_buffers() {
+    let (observer, kept) = state_and_observer();
+    observer.on_text_delta(&delta("hi"));
+    assert_eq!(
+        *kept.streaming_text.lock().expect("the streaming lock"),
+        "hi",
+        "a write through the observer reaches the kept state"
+    );
+}
+
+#[test]
+fn the_notify_arc_is_shared() {
+    let (observer, kept) = state_and_observer();
+    let listener = kept.render_notify.listen();
+    observer.on_text_delta(&delta("wake"));
+    futures::executor::block_on(listener);
+}
+
+#[test]
+fn text_deltas_append_in_arrival_order() {
+    let (observer, kept) = state_and_observer();
+    for part in ["a", "b", "c"] {
+        observer.on_text_delta(&delta(part));
+    }
+    assert_eq!(*kept.streaming_text.lock().unwrap(), "abc");
+}
+
+#[test]
+fn a_response_clears_the_streaming_buffer() {
+    let (observer, kept) = state_and_observer();
+    observer.on_text_delta(&delta("partial"));
+    observer.on_response(&ResponseContext {
+        turn: 0,
+        text: "partial".to_string(),
+        usage: None,
+    });
+    assert!(kept.streaming_text.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_tool_pre_adds_an_active_tool() {
+    let (observer, kept) = state_and_observer();
+    observer.on_tool_call_received(&received("call-1", "Edit", json!({"path": "a.rs"})));
+    observer.on_tool_pre(&pre("call-1", "Edit"));
+    let tools = kept.active_tools.lock().unwrap().clone();
+    let tool = tools.first().expect("one active tool");
+    assert_eq!(tool.name, "Edit");
+    assert_eq!(tool.call_id, "call-1");
+    assert!(
+        tool.input_summary.contains("a.rs"),
+        "the stashed input summary travels with the tool: {}",
+        tool.input_summary
+    );
+}
+
+#[test]
+fn a_tool_post_moves_the_active_tool_to_results() {
+    let (observer, kept) = state_and_observer();
+    observer.on_tool_call_received(&received("call-1", "Edit", json!("x")));
+    observer.on_tool_pre(&pre("call-1", "Edit"));
+    observer.finish_tool("call-1", "Edit", false, Duration::from_millis(5));
+
+    assert!(kept.active_tools.lock().unwrap().is_empty());
+    let results = kept.tool_results.lock().unwrap().clone();
+    let result = results.first().expect("one completed result");
+    assert_eq!(result.name, "Edit");
+    assert!(!result.is_error);
+    assert_eq!(result.duration, Duration::from_millis(5));
+}
+
+#[test]
+fn stream_success_sets_per_turn_and_accumulates_cumulative() {
+    let (observer, kept) = state_and_observer();
+    observer.on_stream_success(&stream(0, 10, 20));
+    observer.on_stream_success(&stream(1, 5, 7));
+    let tokens = tokens_of(&kept);
+    assert_eq!(tokens.input, 5, "per-turn counts are last-wins");
+    assert_eq!(tokens.output, 7);
+    assert_eq!(tokens.cumulative_input, 15, "cumulative counts sum");
+    assert_eq!(tokens.cumulative_output, 27);
+}
+
+#[test]
+fn a_turn_end_without_a_stream_still_accumulates() {
+    let (observer, kept) = state_and_observer();
+    observer.on_turn_end(&turn_end(0, 3, 4));
+    let tokens = tokens_of(&kept);
+    assert_eq!(tokens.cumulative_input, 3);
+    assert_eq!(tokens.cumulative_output, 4);
+}
+
+#[test]
+fn a_turn_end_after_its_stream_does_not_double_count() {
+    let (observer, kept) = state_and_observer();
+    observer.on_stream_success(&stream(0, 10, 20));
+    observer.on_turn_end(&turn_end(0, 10, 20));
+    let tokens = tokens_of(&kept);
+    assert_eq!(
+        tokens.cumulative_input, 10,
+        "the stream already counted this turn"
+    );
+    assert_eq!(tokens.cumulative_output, 20);
+}
+
+#[test]
+fn interleaved_posts_match_by_call_id() {
+    let (observer, kept) = state_and_observer();
+    observer.on_tool_call_received(&received("call-1", "Grep", json!("first")));
+    observer.on_tool_call_received(&received("call-2", "Grep", json!("second")));
+    observer.on_tool_pre(&pre("call-1", "Grep"));
+    observer.on_tool_pre(&pre("call-2", "Grep"));
+    observer.finish_tool("call-1", "Grep", false, Duration::from_millis(1));
+
+    let tools = kept.active_tools.lock().unwrap().clone();
+    assert_eq!(
+        tools.len(),
+        1,
+        "the first completion removes the first call"
+    );
+    assert!(
+        tools.first().unwrap().input_summary.contains("second"),
+        "the surviving entry is the still-running call"
+    );
+}
+
+#[test]
+fn reset_clears_every_buffer_and_the_private_maps() {
+    let (observer, kept) = state_and_observer();
+    observer.on_text_delta(&delta("partial"));
+    observer.on_tool_call_received(&received("call-1", "Edit", json!("x")));
+    observer.on_tool_pre(&pre("call-1", "Edit"));
+    observer.on_stream_success(&stream(0, 10, 20));
+    observer.reset();
+
+    assert!(kept.streaming_text.lock().unwrap().is_empty());
+    assert!(kept.active_tools.lock().unwrap().is_empty());
+    assert!(kept.tool_results.lock().unwrap().is_empty());
+    assert_eq!(tokens_of(&kept), TokenCounts::default());
+    observer.on_tool_pre(&pre("call-1", "Edit"));
+    assert!(
+        kept.active_tools
+            .lock()
+            .unwrap()
+            .first()
+            .unwrap()
+            .input_summary
+            .is_empty(),
+        "the summary stash is cleared with the rest"
+    );
+}
+
+#[test]
+fn every_state_mutation_notifies() {
+    let (observer, kept) = state_and_observer();
+
+    let listener = kept.render_notify.listen();
+    observer.on_text_delta(&delta("a"));
+    futures::executor::block_on(listener);
+
+    let listener = kept.render_notify.listen();
+    observer.on_response(&ResponseContext {
+        turn: 0,
+        text: String::new(),
+        usage: None,
+    });
+    futures::executor::block_on(listener);
+
+    let listener = kept.render_notify.listen();
+    observer.on_tool_pre(&pre("call-1", "Edit"));
+    futures::executor::block_on(listener);
+
+    let listener = kept.render_notify.listen();
+    observer.finish_tool("call-1", "Edit", false, Duration::from_millis(1));
+    futures::executor::block_on(listener);
+
+    let listener = kept.render_notify.listen();
+    observer.on_stream_success(&stream(0, 1, 2));
+    futures::executor::block_on(listener);
+
+    let listener = kept.render_notify.listen();
+    observer.on_turn_end(&turn_end(0, 1, 2));
+    futures::executor::block_on(listener);
+
+    let listener = kept.render_notify.listen();
+    observer.reset();
+    futures::executor::block_on(listener);
+}
+
+#[test]
+fn a_thousand_deltas_without_a_listener_complete_promptly() {
+    let (observer, kept) = state_and_observer();
+    let start = std::time::Instant::now();
+    for i in 0..1000 {
+        observer.on_text_delta(&delta(&i.to_string()));
+    }
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "1000 deltas took {elapsed:?} — the observer must never wait on the display"
+    );
+    let text = kept.streaming_text.lock().unwrap().clone();
+    assert_eq!(text.chars().count(), 2890, "every delta concatenated");
+}
+
+#[test]
+fn send_sync_and_the_observer_names_itself() {
+    fn as_trait(object: &TuiObserver) -> &(dyn LoopObserver + Send + Sync) {
+        object
+    }
+    let (observer, _kept) = state_and_observer();
+    assert_eq!(as_trait(&observer).name(), "tui");
+}
+
+#[test]
+fn a_poisoned_buffer_is_recovered_not_propagated() {
+    let (observer, kept) = state_and_observer();
+    let shared = std::sync::Arc::new(kept);
+    let poisoning = std::sync::Arc::clone(&shared);
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = poisoning.streaming_text.lock().expect("the streaming lock");
+        panic!("poison the streaming buffer");
+    }));
+    assert!(panicked.is_err(), "the poisoning panic must unwind");
+    observer.on_text_delta(&delta("after"));
+    let written = shared
+        .streaming_text
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        written.contains("after"),
+        "the observer keeps writing through a poisoned lock"
+    );
+}

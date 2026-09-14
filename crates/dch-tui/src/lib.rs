@@ -6,9 +6,11 @@
 pub mod app;
 pub mod markdown;
 pub mod message;
+pub mod observer;
 pub mod terminal;
 pub mod theme;
 
 pub use app::TuiApp;
 pub use message::{ActiveTool, ContentBlock, TokenCounts, TuiMessage};
+pub use observer::{ToolResultDisplay, TuiObserver, TuiObserverState};
 pub use terminal::{TerminalGuard, init_terminal, restore_terminal};

@@ -19,6 +19,7 @@ use dch_config::DchConfig;
 use dch_tui::TuiApp;
 use dch_tui::message::{ActiveTool, ContentBlock, TuiMessage};
 use dch_tui::theme::Theme;
+use loopctl::observer::LoopObserver as _;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
@@ -415,6 +416,7 @@ fn active_tools_render_as_running_lines() {
         .lock()
         .expect("the tools lock")
         .push(ActiveTool {
+            call_id: String::new(),
             name: "Grep".to_string(),
             input_summary: "\"todo\"".to_string(),
             start: std::time::Instant::now(),
@@ -483,5 +485,24 @@ fn elapsed_stamps_round_once_before_splitting() {
     assert!(
         joined.contains("Bash true (1m0s)"),
         "59.6s crosses the minute boundary once rounded: {joined:?}"
+    );
+}
+
+#[test]
+fn an_app_built_from_observer_state_renders_observer_writes() {
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+
+    observer.on_text_delta(&loopctl::observer::TextDeltaContext {
+        turn: 0,
+        delta: "live text".to_string(),
+    });
+    drop(observer);
+
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    assert!(
+        view_text(&terminal, 80, 30).contains("live text"),
+        "observer writes reach an app built from the kept state"
     );
 }

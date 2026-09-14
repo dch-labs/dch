@@ -166,6 +166,13 @@ pub struct TokenCounts {
 /// on completion; the display layer reads the list to show progress.
 #[derive(Debug, Clone)]
 pub struct ActiveTool {
+    /// The model-issued call id.
+    ///
+    /// Pairs the pre and post lifecycle events exactly — including
+    /// same-tool retries and parallel calls, where the name alone is
+    /// ambiguous. Display code ignores it.
+    pub call_id: String,
+
     /// The invoked tool's name.
     ///
     /// As reported by the dispatcher.
@@ -173,7 +180,8 @@ pub struct ActiveTool {
 
     /// A one-line summary of the call's input.
     ///
-    /// Condensed from the full arguments.
+    /// Condensed from the full arguments when the call is received;
+    /// empty when no summary was stashed.
     pub input_summary: String,
 
     /// When the call was dispatched.

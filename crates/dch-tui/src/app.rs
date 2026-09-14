@@ -8,7 +8,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
-use event_listener::Event as WakeEvent;
 use futures::StreamExt;
 use ratatui::Frame;
 use ratatui::backend::CrosstermBackend;
@@ -24,6 +23,7 @@ use dch_config::DchConfig;
 
 use crate::markdown;
 use crate::message::{ActiveTool, ContentBlock, TokenCounts, TuiMessage};
+use crate::observer::TuiObserverState;
 use crate::theme::Theme;
 
 /// The main TUI application.
@@ -44,29 +44,12 @@ pub struct TuiApp {
     /// scroll offset walks it from the bottom.
     conversation: Vec<TuiMessage>,
 
-    /// The streaming-text buffer for the reply in progress.
+    /// The shared state the observer half of the display writes.
     ///
-    /// One allocation shared by whatever produces reply text and the
-    /// renderer; it reads empty while no reply is in progress.
-    streaming_text: Arc<Mutex<String>>,
-
-    /// The list of tools in flight.
-    ///
-    /// One entry per dispatched call, removed on completion; empty
-    /// while nothing is running.
-    active_tools: Arc<Mutex<Vec<ActiveTool>>>,
-
-    /// The token-usage counters.
-    ///
-    /// The status bar reads the cumulative totals from this shared
-    /// copy.
-    tokens: Arc<Mutex<TokenCounts>>,
-
-    /// The shared redraw request.
-    ///
-    /// Waking it makes the run loop redraw on its next iteration; a
-    /// listener stays registered across draws and event handling.
-    render_notify: Arc<WakeEvent>,
+    /// Bundled as one value so the split pattern stays in a single
+    /// place: an app built from externally-created state and its
+    /// observer hold clones of these same allocations.
+    state: TuiObserverState,
 
     /// The input line's current text.
     ///
@@ -102,7 +85,18 @@ impl TuiApp {
     ///
     /// The TUI renders and responds to input; the shared buffers stay
     /// empty until a producer writes them.
+    #[must_use]
     pub fn new(config: DchConfig) -> Self {
+        Self::from_observer_state(config, TuiObserverState::new())
+    }
+
+    /// Construct the shell around externally-created shared state.
+    ///
+    /// The retained half of a state split through
+    /// [`TuiObserverState::into_observer`] — the observer half goes
+    /// to the agent — so writes from the running agent reach this
+    /// app's display through the same allocations.
+    pub fn from_observer_state(config: DchConfig, state: TuiObserverState) -> Self {
         let theme = if let Some(theme) = Theme::by_name(&config.display.theme) {
             theme
         } else {
@@ -112,10 +106,7 @@ impl TuiApp {
         Self {
             theme,
             conversation: Vec::new(),
-            streaming_text: Arc::new(Mutex::new(String::new())),
-            active_tools: Arc::new(Mutex::new(Vec::new())),
-            tokens: Arc::new(Mutex::new(TokenCounts::default())),
-            render_notify: Arc::new(WakeEvent::new()),
+            state,
             input: String::new(),
             cursor: 0,
             scroll_offset: 0,
@@ -180,7 +171,7 @@ impl TuiApp {
     /// reads empty until a writer starts.
     #[must_use]
     pub fn streaming_text(&self) -> &Arc<Mutex<String>> {
-        &self.streaming_text
+        &self.state.streaming_text
     }
 
     /// The shared in-flight tool list.
@@ -189,7 +180,7 @@ impl TuiApp {
     /// on completion.
     #[must_use]
     pub fn active_tools(&self) -> &Arc<Mutex<Vec<ActiveTool>>> {
-        &self.active_tools
+        &self.state.active_tools
     }
 
     /// The shared token counters.
@@ -197,15 +188,15 @@ impl TuiApp {
     /// The status bar's totals read through this handle.
     #[must_use]
     pub fn tokens(&self) -> &Arc<Mutex<TokenCounts>> {
-        &self.tokens
+        &self.state.tokens
     }
 
     /// The shared redraw request.
     ///
     /// Waking it triggers a redraw on the loop's next iteration.
     #[must_use]
-    pub fn render_notify(&self) -> &Arc<WakeEvent> {
-        &self.render_notify
+    pub fn render_notify(&self) -> &Arc<event_listener::Event> {
+        &self.state.render_notify
     }
 
     /// Run the UI event loop until the user exits.
@@ -230,7 +221,7 @@ impl TuiApp {
         self.quitting = false;
         let mut events = Box::pin(crossterm::event::EventStream::new());
         let mut tick = tokio::time::interval(Duration::from_millis(250));
-        let notify = Arc::clone(&self.render_notify);
+        let notify = Arc::clone(&self.state.render_notify);
         let mut listener = notify.listen();
 
         terminal.draw(|frame| self.render(frame))?;
@@ -345,7 +336,8 @@ impl TuiApp {
     /// a poisoned lock reads as none, the same policy the render
     /// path applies to the live region.
     fn any_tools_running(&self) -> bool {
-        self.active_tools
+        self.state
+            .active_tools
             .lock()
             .is_ok_and(|tools| !tools.is_empty())
     }
@@ -473,6 +465,7 @@ impl TuiApp {
             }
         }
         let streaming = self
+            .state
             .streaming_text
             .lock()
             .map_or_else(|_| String::new(), |text| text.clone());
@@ -487,6 +480,7 @@ impl TuiApp {
             ));
         }
         let tools = self
+            .state
             .active_tools
             .lock()
             .map_or_else(|_| Vec::new(), |tools| tools.clone());
@@ -527,7 +521,7 @@ impl TuiApp {
     /// Names the configured model on the left and the cumulative
     /// token totals on the right; both sit on the themed bar colors.
     fn render_status_bar(&self, frame: &mut Frame, area: Rect) {
-        let tokens = self.tokens.lock().map_or_else(
+        let tokens = self.state.tokens.lock().map_or_else(
             |_| 0,
             |counts| {
                 counts
@@ -640,6 +634,7 @@ mod tests {
             .lock()
             .expect("the tools lock")
             .push(ActiveTool {
+                call_id: String::new(),
                 name: "Grep".to_string(),
                 input_summary: "\"needle\"".to_string(),
                 start: std::time::Instant::now(),
