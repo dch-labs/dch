@@ -212,11 +212,13 @@ impl TuiApp {
     ///
     /// Selects over terminal events, the shared notify (the path
     /// background state uses to request a redraw), and a periodic
-    /// tick held in reserve for animated chrome. A notify listener
-    /// stays registered across draws and event handling, so a
-    /// notification sent while the loop is busy is delivered on the
-    /// next iteration rather than lost. Redraws happen only when an
-    /// arm asks for one. The caller owns terminal setup and teardown.
+    /// tick. A notify listener stays registered across draws and
+    /// event handling, so a notification sent while the loop is busy
+    /// is delivered on the next iteration rather than lost. The tick
+    /// redraws only while tool calls are in flight, keeping their
+    /// elapsed stamps live; idle ticks draw nothing. Otherwise,
+    /// redraws happen only when an arm asks for one. The caller owns
+    /// terminal setup and teardown.
     ///
     /// # Errors
     /// Propagates terminal draw failures; the caller's guard still
@@ -249,7 +251,9 @@ impl TuiApp {
                     needs_redraw = true;
                     listener = notify.listen();
                 }
-                _instant = tick.tick() => {}
+                _instant = tick.tick() => {
+                    needs_redraw = self.any_tools_running();
+                }
             }
             if needs_redraw {
                 terminal.draw(|frame| self.render(frame))?;
@@ -333,6 +337,17 @@ impl TuiApp {
             self.input.drain(new_cursor..);
             self.cursor = new_cursor;
         }
+    }
+
+    /// Whether any tool call is in flight.
+    ///
+    /// The tick consults this to keep in-flight elapsed stamps live;
+    /// a poisoned lock reads as none, the same policy the render
+    /// path applies to the live region.
+    fn any_tools_running(&self) -> bool {
+        self.active_tools
+            .lock()
+            .is_ok_and(|tools| !tools.is_empty())
     }
 
     /// Jump the view back to the bottom of the conversation.
@@ -580,12 +595,13 @@ fn running_tool_line(tool: &ActiveTool, theme: &Theme) -> Line<'static> {
 
 /// Render a duration as a parenthesized elapsed stamp.
 ///
-/// Sub-minute durations keep one decimal (`(0.4s)`); longer ones
-/// switch to minutes and whole seconds (`(1m1s)`), the shape the
-/// tool summary lines carry.
+/// Sub-minute durations keep one decimal (`(0.4s)`); at a minute the
+/// total is rounded once, then split into minutes and whole seconds
+/// (`(1m30s)`), so the components never round past the true value.
 fn format_elapsed(secs: f64) -> String {
-    if secs >= 60.0 {
-        format!(" ({:.0}m{:.0}s)", secs / 60.0, secs % 60.0)
+    let total = secs.round();
+    if total >= 60.0 {
+        format!(" ({:.0}m{:.0}s)", (total / 60.0).floor(), total % 60.0)
     } else {
         format!(" ({secs:.1}s)")
     }
@@ -597,4 +613,47 @@ fn format_elapsed(secs: f64) -> String {
 /// fallback keeps rendering total if a shorter split ever appears.
 fn pane(chunks: &[Rect], index: usize, fallback: Rect) -> Rect {
     chunks.get(index).copied().unwrap_or(fallback)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::expect_used,
+        clippy::unwrap_used,
+        clippy::panic,
+        clippy::missing_panics_doc,
+        clippy::missing_errors_doc
+    )]
+
+    use super::*;
+
+    fn app() -> TuiApp {
+        TuiApp::new(dch_config::DchConfig::default())
+    }
+
+    #[test]
+    fn the_tick_redraws_only_while_tools_run() {
+        let app = app();
+        assert!(!app.any_tools_running(), "no tools in flight yet");
+
+        app.active_tools()
+            .lock()
+            .expect("the tools lock")
+            .push(ActiveTool {
+                name: "Grep".to_string(),
+                input_summary: "\"needle\"".to_string(),
+                start: std::time::Instant::now(),
+            });
+        assert!(app.any_tools_running(), "a running tool asks for redraws");
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = app.active_tools().lock().expect("the tools lock");
+            panic!("poison the tools lock");
+        }));
+        assert!(panicked.is_err(), "the poisoning panic must unwind");
+        assert!(
+            !app.any_tools_running(),
+            "a poisoned lock reads as no tools in flight"
+        );
+    }
 }

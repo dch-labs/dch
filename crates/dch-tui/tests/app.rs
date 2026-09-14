@@ -438,3 +438,50 @@ fn row_texts(terminal: &Terminal<TestBackend>) -> Vec<String> {
         })
         .collect()
 }
+
+#[test]
+fn elapsed_stamps_round_once_before_splitting() {
+    let mut app = app();
+    app.push_message(TuiMessage::Assistant {
+        blocks: vec![
+            ContentBlock::Tool {
+                name: "Read".to_string(),
+                input_preview: "a.rs".to_string(),
+                success: true,
+                elapsed_secs: 90.0,
+                output_preview: String::new(),
+            },
+            ContentBlock::Tool {
+                name: "Grep".to_string(),
+                input_preview: "\"x\"".to_string(),
+                success: true,
+                elapsed_secs: 119.6,
+                output_preview: String::new(),
+            },
+            ContentBlock::Tool {
+                name: "Bash".to_string(),
+                input_preview: "true".to_string(),
+                success: true,
+                elapsed_secs: 59.6,
+                output_preview: String::new(),
+            },
+        ],
+        timestamp: chrono::Utc::now(),
+        duration_ms: None,
+    });
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&terminal);
+    let joined = rows.join("\n");
+    assert!(
+        joined.contains("Read a.rs (1m30s)"),
+        "90s rounds to 1m30s, not 2m30s: {joined:?}"
+    );
+    assert!(
+        joined.contains("Grep \"x\" (2m0s)"),
+        "119.6s rounds once to 2m0s, not 1m60s or 2m60s: {joined:?}"
+    );
+    assert!(
+        joined.contains("Bash true (1m0s)"),
+        "59.6s crosses the minute boundary once rounded: {joined:?}"
+    );
+}
