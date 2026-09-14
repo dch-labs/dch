@@ -139,14 +139,18 @@ pub enum ContentBlock {
 /// it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TokenCounts {
-    /// Input tokens of the current turn.
+    /// Input tokens of the most recent turn.
     ///
-    /// Resets when a new turn starts.
+    /// Overwritten at each stream or turn-end event; no event fires
+    /// at a turn's start, so the value keeps the previous turn's
+    /// counts until the next one reports.
     pub input: u64,
 
-    /// Output tokens of the current turn.
+    /// Output tokens of the most recent turn.
     ///
-    /// Resets when a new turn starts.
+    /// Overwritten at each stream or turn-end event; no event fires
+    /// at a turn's start, so the value keeps the previous turn's
+    /// counts until the next one reports.
     pub output: u64,
 
     /// Input tokens since the session began.

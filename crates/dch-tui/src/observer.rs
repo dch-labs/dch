@@ -23,6 +23,13 @@ use crate::message::{ActiveTool, TokenCounts};
 /// needs a glanceable fragment, not the document.
 const SUMMARY_LIMIT: usize = 60;
 
+/// How many stashed input summaries accumulate before the stash drops.
+///
+/// Summaries are useful only until their call dispatches or the turn
+/// moves on; a wholesale drop at this depth bounds entries for calls
+/// that never dispatch (unknown tools) without ordering machinery.
+const PENDING_SUMMARY_CAP: usize = 64;
+
 /// A completed tool call, formatted for display.
 ///
 /// Carries what a glanceable result line needs — name, outcome,
@@ -67,9 +74,21 @@ pub struct ToolResultDisplay {
 pub struct TuiObserverState {
     /// The in-flight assistant text, accumulated delta by delta.
     ///
-    /// Cleared once the turn's message is finalized, so the buffer
-    /// never outlives the reply it was accumulating.
+    /// The response event records the turn's committed text in
+    /// [`completed_replies`](Self::completed_replies) and clears this
+    /// buffer — the buffer's own accumulation, which a retried stream
+    /// can leave duplicated or truncated, is not what graduates. A
+    /// failed turn discards the partial text at its turn-end event,
+    /// so the buffer never outlives its reply.
     pub streaming_text: Arc<Mutex<String>>,
+
+    /// Finalized assistant replies the display has not taken yet.
+    ///
+    /// The response event pushes the turn's complete text here — for a
+    /// non-streaming turn this is the only copy — and the display
+    /// drains the buffer on redraw, graduating each text into its
+    /// conversation.
+    pub completed_replies: Arc<Mutex<Vec<String>>>,
 
     /// Tools currently executing.
     ///
@@ -78,8 +97,9 @@ pub struct TuiObserverState {
 
     /// Completed tool calls, newest appended.
     ///
-    /// The display trims this to its depth; the observer appends
-    /// without bound.
+    /// The display drains this on redraw into its own bounded
+    /// history, so completed calls stay visible without the buffer
+    /// accumulating across a session.
     pub tool_results: Arc<Mutex<Vec<ToolResultDisplay>>>,
 
     /// Token usage counters, per-turn and cumulative.
@@ -104,6 +124,7 @@ impl TuiObserverState {
     pub fn new() -> Self {
         Self {
             streaming_text: Arc::new(Mutex::new(String::new())),
+            completed_replies: Arc::new(Mutex::new(Vec::new())),
             active_tools: Arc::new(Mutex::new(Vec::new())),
             tool_results: Arc::new(Mutex::new(Vec::new())),
             tokens: Arc::new(Mutex::new(TokenCounts::default())),
@@ -115,7 +136,7 @@ impl TuiObserverState {
     ///
     /// The two are produced together and share the same underlying
     /// allocations, so they can never drift. Cheap — cloning the
-    /// state bumps five reference counts and copies no data.
+    /// state bumps six reference counts and copies no data.
     #[must_use]
     pub fn into_observer(self) -> (TuiObserver, Self) {
         let observer = TuiObserver {
@@ -151,8 +172,12 @@ pub struct TuiObserver {
     /// Input summaries keyed by call id, stashed when calls are
     /// received.
     ///
-    /// Consumed by the dispatch event so the pending indicator can
-    /// show what a running call was asked to do; observer-private.
+    /// Peeked by the dispatch event, never consumed — retries re-fire
+    /// the dispatch, and every attempt renders its summary. Calls the
+    /// model emits that are never dispatched (unknown tools appear
+    /// only here) would otherwise linger: the stash is dropped
+    /// wholesale once [`PENDING_SUMMARY_CAP`] entries accumulate, and
+    /// `reset` clears it with the rest.
     pending_summaries: Mutex<HashMap<String, String>>,
 
     /// The turn whose stream tokens were already accumulated.
@@ -238,19 +263,27 @@ impl LoopObserver for TuiObserver {
         self.notify();
     }
 
-    fn on_response(&self, _ctx: &ResponseContext) {
+    fn on_response(&self, ctx: &ResponseContext) {
+        if !ctx.text.is_empty() {
+            recover(&self.state.completed_replies).push(ctx.text.clone());
+        }
         recover(&self.state.streaming_text).clear();
         self.notify();
     }
 
     fn on_tool_call_received(&self, ctx: &ToolCallReceivedContext) {
         let summary = summarize_input(&ctx.input);
-        recover(&self.pending_summaries).insert(ctx.call_id.clone(), summary);
+        let mut stash = recover(&self.pending_summaries);
+        if stash.len() >= PENDING_SUMMARY_CAP {
+            stash.clear();
+        }
+        stash.insert(ctx.call_id.clone(), summary);
     }
 
     fn on_tool_pre(&self, ctx: &ToolPreContext) {
         let input_summary = recover(&self.pending_summaries)
-            .remove(&ctx.tool_call_id)
+            .get(&ctx.tool_call_id)
+            .cloned()
             .unwrap_or_default();
         recover(&self.state.active_tools).push(ActiveTool {
             call_id: ctx.tool_call_id.clone(),
@@ -278,9 +311,14 @@ impl LoopObserver for TuiObserver {
     }
 
     fn on_turn_end(&self, ctx: &TurnEndContext) {
+        if !ctx.success {
+            recover(&self.state.streaming_text).clear();
+        }
         let already_counted = recover(&self.last_counted_turn).is_some_and(|turn| turn == ctx.turn);
+        let mut tokens = recover(&self.state.tokens);
+        tokens.input = ctx.input_tokens;
+        tokens.output = ctx.output_tokens;
         if !already_counted {
-            let mut tokens = recover(&self.state.tokens);
             tokens.cumulative_input = tokens.cumulative_input.saturating_add(ctx.input_tokens);
             tokens.cumulative_output = tokens.cumulative_output.saturating_add(ctx.output_tokens);
         }
@@ -289,6 +327,7 @@ impl LoopObserver for TuiObserver {
 
     fn reset(&self) {
         recover(&self.state.streaming_text).clear();
+        recover(&self.state.completed_replies).clear();
         recover(&self.state.active_tools).clear();
         recover(&self.state.tool_results).clear();
         *recover(&self.state.tokens) = TokenCounts::default();

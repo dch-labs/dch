@@ -4,7 +4,7 @@
 //! state background producers write through; `run` drives the
 //! render ↔ input ↔ scroll loop until the user quits.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -23,8 +23,15 @@ use dch_config::DchConfig;
 
 use crate::markdown;
 use crate::message::{ActiveTool, ContentBlock, TokenCounts, TuiMessage};
-use crate::observer::TuiObserverState;
+use crate::observer::{ToolResultDisplay, TuiObserverState};
 use crate::theme::Theme;
+
+/// How many completed tool calls the live region keeps visible.
+///
+/// Oldest entries drop off the drained history once the count passes
+/// this depth, so a long session neither loses recent completions nor
+/// accumulates all of them.
+const TOOL_HISTORY_DEPTH: usize = 20;
 
 /// The main TUI application.
 ///
@@ -50,6 +57,14 @@ pub struct TuiApp {
     /// place: an app built from externally-created state and its
     /// observer hold clones of these same allocations.
     state: TuiObserverState,
+
+    /// Completed tool calls this display has taken from the shared
+    /// buffer.
+    ///
+    /// Drained from the shared state on every redraw and capped at
+    /// [`TOOL_HISTORY_DEPTH`], so finished calls stay visible while
+    /// nothing accumulates without bound.
+    tool_history: Vec<ToolResultDisplay>,
 
     /// The input line's current text.
     ///
@@ -107,6 +122,7 @@ impl TuiApp {
             theme,
             conversation: Vec::new(),
             state,
+            tool_history: Vec::new(),
             input: String::new(),
             cursor: 0,
             scroll_offset: 0,
@@ -352,8 +368,12 @@ impl TuiApp {
     /// Render one frame of the three-pane layout.
     ///
     /// Conversation fills the space above the input box; the status
-    /// bar closes the frame at the bottom row.
+    /// bar closes the frame at the bottom row. Each frame first takes
+    /// what the observer finished — finalized replies graduate into
+    /// the conversation, completed tool calls into the bounded
+    /// history.
     pub fn render(&mut self, frame: &mut Frame) {
+        self.drain_shared_state();
         let area = frame.area();
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -398,14 +418,39 @@ impl TuiApp {
         self.render_status_bar(frame, status_area);
     }
 
+    /// Take what the observer finished since the last frame.
+    ///
+    /// Finalized replies move into the conversation as assistant
+    /// messages; completed tool calls move into this display's
+    /// bounded history — so neither shared buffer accumulates across
+    /// frames. A poisoned lock is recovered — the same policy the
+    /// observer writes with — so finalized data still graduates.
+    fn drain_shared_state(&mut self) {
+        let replies = take_locked(&self.state.completed_replies);
+        let now = chrono::Utc::now();
+        for text in replies {
+            self.push_message(TuiMessage::Assistant {
+                blocks: vec![ContentBlock::Text { text }],
+                timestamp: now,
+                duration_ms: None,
+            });
+        }
+        self.tool_history
+            .extend(take_locked(&self.state.tool_results));
+        let drop_count = self.tool_history.len().saturating_sub(TOOL_HISTORY_DEPTH);
+        self.tool_history.drain(..drop_count);
+    }
+
     /// Flatten the conversation into styled lines for the given width.
     ///
     /// Assistant text goes through the markdown pipeline with the
     /// assistant base color; user, system, and error messages render
     /// as single styled lines; a completed tool block renders as one
-    /// dim summary line between the text blocks around it. A nonempty
-    /// streaming buffer follows the conversation as the reply in
-    /// progress, and the in-flight tool list closes the live region.
+    /// dim summary line between the text blocks around it. The
+    /// bounded history of drained tool results follows the
+    /// conversation, a nonempty streaming buffer renders as the reply
+    /// in progress, and the in-flight tool list closes the live
+    /// region.
     fn conversation_lines(&self, area: Rect) -> Vec<Line<'static>> {
         let width = area.width.max(1);
         let markdown_theme = markdown::MarkdownTheme::from(&self.theme);
@@ -463,6 +508,9 @@ impl TuiApp {
                     ));
                 }
             }
+        }
+        for result in &self.tool_history {
+            lines.push(result_line(result, &self.theme));
         }
         let streaming = self
             .state
@@ -567,6 +615,30 @@ fn completed_tool_line(
     ])
 }
 
+/// Build the conversation line for a drained tool result.
+///
+/// The result record carries no input preview — the conversation
+/// around it supplies the what — so the line is the outcome marker,
+/// the name, and the elapsed stamp.
+fn result_line(result: &ToolResultDisplay, theme: &Theme) -> Line<'static> {
+    let (marker, marker_color) = if result.is_error {
+        ("✗", theme.ui.status_error)
+    } else {
+        ("✓", theme.ui.status_success)
+    };
+    Line::from(vec![
+        Span::styled(marker, Style::default().fg(marker_color)),
+        Span::styled(
+            format!(
+                " {}{}",
+                result.name,
+                format_elapsed(result.duration.as_secs_f64())
+            ),
+            Style::default().fg(theme.ui.dim),
+        ),
+    ])
+}
+
 /// Build the conversation line for an in-flight tool call.
 ///
 /// The marker and summary stay dim — a quiet cue that the call is
@@ -599,6 +671,15 @@ fn format_elapsed(secs: f64) -> String {
     } else {
         format!(" ({secs:.1}s)")
     }
+}
+
+/// Take a shared buffer's contents, leaving it empty.
+///
+/// Recovers from poisoning — the same policy the observer writes
+/// with — so finalized data still graduates after another thread's
+/// panic left the lock poisoned.
+fn take_locked<T: Default>(mutex: &Mutex<T>) -> T {
+    std::mem::take(&mut *mutex.lock().unwrap_or_else(PoisonError::into_inner))
 }
 
 /// Fetch a layout pane by index with a whole-area fallback.

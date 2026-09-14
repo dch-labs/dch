@@ -70,6 +70,17 @@ fn turn_end(turn: usize, input_tokens: u64, output_tokens: u64) -> TurnEndContex
     }
 }
 
+fn failed_turn_end(turn: usize, input_tokens: u64, output_tokens: u64) -> TurnEndContext {
+    TurnEndContext {
+        turn,
+        success: false,
+        error: Some("the stream died mid-reply".to_string()),
+        duration_ms: 10,
+        input_tokens,
+        output_tokens,
+    }
+}
+
 fn tokens_of(state: &TuiObserverState) -> TokenCounts {
     *state.tokens.lock().expect("the tokens lock")
 }
@@ -112,6 +123,42 @@ fn a_response_clears_the_streaming_buffer() {
         usage: None,
     });
     assert!(kept.streaming_text.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_response_hands_the_finalized_reply_to_the_display_buffer() {
+    let (observer, kept) = state_and_observer();
+    observer.on_text_delta(&delta("partial "));
+    observer.on_response(&ResponseContext {
+        turn: 0,
+        text: "partial reply".to_string(),
+        usage: None,
+    });
+    let replies = kept.completed_replies.lock().unwrap().clone();
+    assert_eq!(
+        replies,
+        vec!["partial reply".to_string()],
+        "the response text survives finalization for the display to graduate"
+    );
+    assert!(
+        kept.streaming_text.lock().unwrap().is_empty(),
+        "the live buffer clears once its reply is handed over"
+    );
+}
+
+#[test]
+fn a_response_without_deltas_keeps_the_only_reply_copy() {
+    let (observer, kept) = state_and_observer();
+    observer.on_response(&ResponseContext {
+        turn: 0,
+        text: "the whole reply".to_string(),
+        usage: None,
+    });
+    assert_eq!(
+        kept.completed_replies.lock().unwrap().clone(),
+        vec!["the whole reply".to_string()],
+        "a non-streaming turn's response text is the reply's only copy — it must not be dropped"
+    );
 }
 
 #[test]
@@ -162,6 +209,11 @@ fn a_turn_end_without_a_stream_still_accumulates() {
     let (observer, kept) = state_and_observer();
     observer.on_turn_end(&turn_end(0, 3, 4));
     let tokens = tokens_of(&kept);
+    assert_eq!(
+        tokens.input, 3,
+        "a turn-end-only turn sets the per-turn counts"
+    );
+    assert_eq!(tokens.output, 4);
     assert_eq!(tokens.cumulative_input, 3);
     assert_eq!(tokens.cumulative_output, 4);
 }
@@ -204,12 +256,18 @@ fn interleaved_posts_match_by_call_id() {
 fn reset_clears_every_buffer_and_the_private_maps() {
     let (observer, kept) = state_and_observer();
     observer.on_text_delta(&delta("partial"));
+    observer.on_response(&ResponseContext {
+        turn: 0,
+        text: "partial".to_string(),
+        usage: None,
+    });
     observer.on_tool_call_received(&received("call-1", "Edit", json!("x")));
     observer.on_tool_pre(&pre("call-1", "Edit"));
     observer.on_stream_success(&stream(0, 10, 20));
     observer.reset();
 
     assert!(kept.streaming_text.lock().unwrap().is_empty());
+    assert!(kept.completed_replies.lock().unwrap().is_empty());
     assert!(kept.active_tools.lock().unwrap().is_empty());
     assert!(kept.tool_results.lock().unwrap().is_empty());
     assert_eq!(tokens_of(&kept), TokenCounts::default());
@@ -223,6 +281,70 @@ fn reset_clears_every_buffer_and_the_private_maps() {
             .input_summary
             .is_empty(),
         "the summary stash is cleared with the rest"
+    );
+    observer.on_turn_end(&turn_end(0, 5, 7));
+    assert_eq!(
+        tokens_of(&kept).cumulative_input,
+        5,
+        "the double-count note is cleared with the rest — a repeated turn id accumulates again"
+    );
+}
+
+#[test]
+fn a_failed_turn_discards_its_partial_streaming_text() {
+    let (observer, kept) = state_and_observer();
+    observer.on_text_delta(&delta("Hel"));
+    observer.on_turn_end(&failed_turn_end(0, 4, 1));
+    assert!(
+        kept.streaming_text.lock().unwrap().is_empty(),
+        "a failed turn's uncommitted text is discarded, not left to merge into the next turn's reply"
+    );
+}
+
+#[test]
+fn every_retry_attempt_renders_the_stashed_summary() {
+    let (observer, kept) = state_and_observer();
+    observer.on_tool_call_received(&received("call-1", "Edit", json!({"path": "a.rs"})));
+    observer.on_tool_pre(&pre("call-1", "Edit"));
+    observer.finish_tool("call-1", "Edit", true, Duration::from_millis(1));
+    observer.on_tool_pre(&pre("call-1", "Edit"));
+    let tools = kept.active_tools.lock().unwrap().clone();
+    let retried = tools
+        .iter()
+        .find(|tool| tool.call_id == "call-1")
+        .expect("the retry attempt is in flight");
+    assert!(
+        retried.input_summary.contains("a.rs"),
+        "the stash survives the first attempt so the retry renders the same summary: {}",
+        retried.input_summary
+    );
+}
+
+#[test]
+fn undispatched_summaries_are_bounded_by_a_wholesale_drop() {
+    let (observer, kept) = state_and_observer();
+    for index in 0..64 {
+        observer.on_tool_call_received(&received(&format!("call-{index}"), "Bash", json!(index)));
+    }
+    observer.on_tool_call_received(&received("call-64", "Bash", json!("newest")));
+    observer.on_tool_pre(&pre("call-0", "Bash"));
+    observer.on_tool_pre(&pre("call-64", "Bash"));
+    let tools = kept.active_tools.lock().unwrap().clone();
+    let stale = tools
+        .iter()
+        .find(|tool| tool.call_id == "call-0")
+        .expect("the pre-cap call dispatched");
+    assert!(
+        stale.input_summary.is_empty(),
+        "the stash dropped wholesale once past the cap, so pre-cap entries render no summary"
+    );
+    let newest = tools
+        .iter()
+        .find(|tool| tool.call_id == "call-64")
+        .expect("the post-cap call dispatched");
+    assert!(
+        newest.input_summary.contains("newest"),
+        "entries stashed after the drop render their summary"
     );
 }
 
