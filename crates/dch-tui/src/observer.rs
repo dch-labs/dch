@@ -66,7 +66,8 @@ pub struct ToolResultDisplay {
 /// [`into_observer`](Self::into_observer): the returned observer goes
 /// to the agent as one of its observers; the retained state goes to
 /// the app. Both halves hold clones of the same `Arc`s, so a write
-/// on the observer side is visible to the app side. The event is the
+/// on the observer side — or by the mode driver, the third holder —
+/// is visible to the app side. The event is the
 /// wake-up signal: the observer notifies after every mutation; the
 /// app awaits a listener to know when to redraw. The mutexes guard
 /// plain data and are never held across an await.
@@ -102,6 +103,13 @@ pub struct TuiObserverState {
     /// accumulating across a session.
     pub tool_results: Arc<Mutex<Vec<ToolResultDisplay>>>,
 
+    /// Run-level failures the display has not taken yet.
+    ///
+    /// Written by the mode driver when a submitted task's run fails;
+    /// the display drains the buffer on redraw, surfacing each
+    /// failure as an error row in the conversation.
+    pub errors: Arc<Mutex<Vec<String>>>,
+
     /// Token usage counters, per-turn and cumulative.
     ///
     /// Updated from stream and turn events.
@@ -127,6 +135,7 @@ impl TuiObserverState {
             completed_replies: Arc::new(Mutex::new(Vec::new())),
             active_tools: Arc::new(Mutex::new(Vec::new())),
             tool_results: Arc::new(Mutex::new(Vec::new())),
+            errors: Arc::new(Mutex::new(Vec::new())),
             tokens: Arc::new(Mutex::new(TokenCounts::default())),
             render_notify: Arc::new(event_listener::Event::new()),
         }
@@ -136,7 +145,7 @@ impl TuiObserverState {
     ///
     /// The two are produced together and share the same underlying
     /// allocations, so they can never drift. Cheap — cloning the
-    /// state bumps six reference counts and copies no data.
+    /// state bumps seven reference counts and copies no data.
     #[must_use]
     pub fn into_observer(self) -> (TuiObserver, Self) {
         let observer = TuiObserver {
@@ -330,6 +339,7 @@ impl LoopObserver for TuiObserver {
         recover(&self.state.completed_replies).clear();
         recover(&self.state.active_tools).clear();
         recover(&self.state.tool_results).clear();
+        recover(&self.state.errors).clear();
         *recover(&self.state.tokens) = TokenCounts::default();
         recover(&self.pending_summaries).clear();
         *recover(&self.last_counted_turn) = None;

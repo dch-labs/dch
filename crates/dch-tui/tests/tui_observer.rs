@@ -264,12 +264,17 @@ fn reset_clears_every_buffer_and_the_private_maps() {
     observer.on_tool_call_received(&received("call-1", "Edit", json!("x")));
     observer.on_tool_pre(&pre("call-1", "Edit"));
     observer.on_stream_success(&stream(0, 10, 20));
+    kept.errors.lock().unwrap().push("run failed".to_string());
     observer.reset();
 
     assert!(kept.streaming_text.lock().unwrap().is_empty());
     assert!(kept.completed_replies.lock().unwrap().is_empty());
     assert!(kept.active_tools.lock().unwrap().is_empty());
     assert!(kept.tool_results.lock().unwrap().is_empty());
+    assert!(
+        kept.errors.lock().unwrap().is_empty(),
+        "the driver's error buffer clears with the rest"
+    );
     assert_eq!(tokens_of(&kept), TokenCounts::default());
     observer.on_tool_pre(&pre("call-1", "Edit"));
     assert!(

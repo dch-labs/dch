@@ -1,13 +1,15 @@
 //! `dch` — a terminal-based agentic coding assistant built on `loopctl`.
 //!
 //! Run-mode dispatch: `--headless` routes to the headless runner (one task,
-//! non-interactive, exit code to the shell); other modes arrive with later
-//! milestones.
+//! non-interactive, exit code to the shell); any other invocation hosts the
+//! interactive TUI session. `--resume` and `--list-sessions` are not
+//! implemented and exit with an error.
 
 mod args;
 mod done;
 mod headless;
 mod signals;
+mod tui;
 
 fn main() -> std::process::ExitCode {
     let args = args::parse_args();
@@ -47,8 +49,7 @@ fn main() -> std::process::ExitCode {
             eprintln!("--resume is not yet available");
             std::process::ExitCode::from(1)
         } else {
-            eprintln!("interactive mode not yet implemented; use --headless");
-            std::process::ExitCode::from(1)
+            std::process::ExitCode::from(tui::run_tui(&args).await)
         }
     })
 }

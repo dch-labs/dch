@@ -91,6 +91,13 @@ pub struct TuiApp {
     /// observer hold clones of these same allocations.
     state: TuiObserverState,
 
+    /// Where submitted input lines travel to the agent.
+    ///
+    /// Set by the mode driver before the run loop; Enter sends each
+    /// non-empty submit through it alongside the local echo. `None`
+    /// on a bare app — submits render locally and reach no agent.
+    submit_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+
     /// Completed tool calls this display has taken from the shared
     /// buffer.
     ///
@@ -230,6 +237,7 @@ impl TuiApp {
             theme,
             conversation: Vec::new(),
             state,
+            submit_tx: None,
             tool_history: Vec::new(),
             input: String::new(),
             cursor: 0,
@@ -341,6 +349,16 @@ impl TuiApp {
         &self.state.render_notify
     }
 
+    /// Route submitted input lines to the agent driver.
+    ///
+    /// The sender half of the channel the mode driver receives on;
+    /// once set, Enter forwards every non-empty submit through it
+    /// while the local echo stays in the conversation. A send no
+    /// receiver awaits is dropped — the session is ending.
+    pub fn set_submit_tx(&mut self, tx: tokio::sync::mpsc::UnboundedSender<String>) {
+        self.submit_tx = Some(tx);
+    }
+
     /// Run the UI event loop until the user exits.
     ///
     /// Selects over terminal events, the shared notify (the path
@@ -418,6 +436,9 @@ impl TuiApp {
                 let text = std::mem::take(&mut self.input);
                 self.cursor = 0;
                 if !text.trim().is_empty() {
+                    if let Some(tx) = &self.submit_tx {
+                        drop(tx.send(text.clone()));
+                    }
                     self.conversation.push(TuiMessage::User {
                         text,
                         timestamp: chrono::Utc::now(),
@@ -680,9 +701,11 @@ impl TuiApp {
     ///
     /// Finalized replies move into the conversation as assistant
     /// messages; completed tool calls move into this display's
-    /// bounded history — so neither shared buffer accumulates across
-    /// frames. A poisoned lock is recovered — the same policy the
-    /// observer writes with — so finalized data still graduates.
+    /// bounded history; run failures recorded by the mode driver
+    /// surface as error messages — so none of the shared buffers
+    /// accumulates across frames. A poisoned lock is recovered — the
+    /// same policy the observer writes with — so finalized data
+    /// still graduates.
     fn drain_shared_state(&mut self) {
         let replies = take_locked(&self.state.completed_replies);
         let now = chrono::Utc::now();
@@ -697,17 +720,25 @@ impl TuiApp {
             .extend(take_locked(&self.state.tool_results));
         let drop_count = self.tool_history.len().saturating_sub(TOOL_HISTORY_DEPTH);
         self.tool_history.drain(..drop_count);
+        for text in take_locked(&self.state.errors) {
+            self.push_message(TuiMessage::Error {
+                text,
+                timestamp: now,
+            });
+        }
     }
 
     /// Flatten the conversation into styled lines for the given width.
     ///
     /// Assistant text goes through the markdown pipeline with the
-    /// assistant base color; user, system, and error messages render
-    /// as single styled lines; a completed tool block renders as one
-    /// dim summary line between the text blocks around it. The
-    /// bounded history of drained tool results closes the settled
-    /// content; the live region (streaming text, in-flight tools)
-    /// is assembled by the caller.
+    /// assistant base color; user and system messages render as
+    /// single styled lines; error messages wrap as styled plaintext
+    /// at the pane width, so a long failure body stays readable
+    /// instead of clipping at the right edge; a completed tool
+    /// block renders as one dim summary line between the text
+    /// blocks around it. The bounded history of drained tool
+    /// results closes the settled content; the live region
+    /// (streaming text, in-flight tools) is assembled by the caller.
     fn conversation_lines(&self, area: Rect) -> Vec<Line<'static>> {
         let width = area.width.max(1);
         let markdown_theme = markdown::MarkdownTheme::from(&self.theme);
@@ -759,9 +790,10 @@ impl TuiApp {
                     ));
                 }
                 TuiMessage::Error { text, .. } => {
-                    lines.push(Line::styled(
-                        text.clone(),
-                        Style::default().fg(self.theme.ui.status_error),
+                    lines.extend(plain_wrapped_lines(
+                        text,
+                        usize::from(width),
+                        self.theme.ui.status_error,
                     ));
                 }
             }
@@ -1320,13 +1352,13 @@ fn fingerprint(text: &str) -> u64 {
     hasher.finish()
 }
 
-/// Wrap streamed text into styled plaintext lines.
+/// Wrap text into styled plaintext lines at a display width.
 ///
-/// The streaming tail — the line still being typed — renders raw:
-/// split on newlines and greedily wrapped at the pane width on
-/// character boundaries, styled with the assistant foreground. No
-/// parsing, so the cost stays linear in the tail and partial markup
-/// shows exactly as typed.
+/// The input renders raw: split on newlines and greedily wrapped at
+/// the width on character boundaries, styled with the caller's
+/// foreground. No parsing, so the cost stays linear in the input and
+/// partial markup shows exactly as typed — the properties the
+/// streaming tail and the error rows both rely on.
 fn plain_wrapped_lines(text: &str, width: usize, fg: ratatui::style::Color) -> Vec<Line<'static>> {
     let cap = width.max(1);
     let mut lines = Vec::new();
