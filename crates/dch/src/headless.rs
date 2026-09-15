@@ -463,12 +463,12 @@ fn read_stdin_prompt() -> Result<String, String> {
 ///
 /// An explicit path is read and parsed verbatim, relative paths resolving
 /// against the process's current directory; with no path, the default
-/// config lookup applies.
+/// config lookup applies. Both mode runners resolve their config here.
 ///
 /// # Errors
 ///
 /// Returns an error message when the file cannot be read or parsed.
-fn load_config(path: Option<&Path>) -> Result<dch_config::DchConfig, String> {
+pub(crate) fn load_config(path: Option<&Path>) -> Result<dch_config::DchConfig, String> {
     match path {
         Some(path) => {
             let content = std::fs::read_to_string(path)
@@ -485,8 +485,8 @@ fn load_config(path: Option<&Path>) -> Result<dch_config::DchConfig, String> {
 /// Deliberately small: `--model` is the only per-run provider override and
 /// `--unsafe-paths` the only per-run access switch. Verbosity resolves
 /// separately when the observer is built, and display preferences remain
-/// config-file concerns.
-fn apply_cli_overrides(config: &mut dch_config::DchConfig, args: &Args) {
+/// config-file concerns. Both mode runners apply the same overrides.
+pub(crate) fn apply_cli_overrides(config: &mut dch_config::DchConfig, args: &Args) {
     if let Some(model) = &args.model {
         config.api.model.clone_from(model);
     }

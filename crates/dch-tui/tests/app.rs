@@ -177,6 +177,56 @@ fn enter_submits_appends_and_clears() {
 }
 
 #[test]
+fn enter_sends_the_submitted_text_through_the_channel() {
+    let mut app = app();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    app.set_submit_tx(tx);
+    for c in ['h', 'i'] {
+        app.handle_event(&plain(KeyCode::Char(c)));
+    }
+    assert!(app.handle_event(&plain(KeyCode::Enter)));
+    assert_eq!(
+        rx.try_recv().unwrap(),
+        "hi",
+        "Enter forwards the submitted text to the agent driver"
+    );
+
+    for c in [' ', '\t'] {
+        app.handle_event(&plain(KeyCode::Char(c)));
+    }
+    assert!(app.handle_event(&plain(KeyCode::Enter)));
+    assert!(
+        rx.try_recv().is_err(),
+        "a whitespace-only submit sends nothing"
+    );
+}
+
+#[test]
+fn submissions_queue_in_order_while_the_driver_is_busy() {
+    let mut app = app();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    app.set_submit_tx(tx);
+    for text in ["first task", "second task"] {
+        for c in text.chars() {
+            app.handle_event(&plain(KeyCode::Char(c)));
+        }
+        app.handle_event(&plain(KeyCode::Enter));
+    }
+
+    assert_eq!(
+        rx.try_recv().unwrap(),
+        "first task",
+        "submits buffer while nothing drains the channel"
+    );
+    assert_eq!(
+        rx.try_recv().unwrap(),
+        "second task",
+        "queued submits keep their arrival order"
+    );
+    assert!(rx.try_recv().is_err(), "two submits yield two messages");
+}
+
+#[test]
 fn scroll_keys_adjust_without_underflow() {
     let mut app = app();
     assert!(app.handle_event(&plain(KeyCode::PageDown)));
@@ -672,5 +722,68 @@ fn poisoned_shared_buffers_still_graduate_through_render() {
     assert_eq!(
         assistant_count, 2,
         "both replies graduated into the conversation through the poisoned lock"
+    );
+}
+
+#[test]
+fn run_failures_drain_into_the_conversation_as_errors() {
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    kept.errors
+        .lock()
+        .expect("the errors lock")
+        .push("provider unreachable".to_string());
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept.clone());
+
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let view = view_text(&terminal, 80, 30);
+    assert!(
+        view.contains("provider unreachable"),
+        "the failure surfaces as a conversation row: {view:?}"
+    );
+    assert!(
+        app.conversation().len() == 1,
+        "the drained failure becomes one message"
+    );
+    assert!(
+        kept.errors.lock().expect("the errors lock").is_empty(),
+        "the display drains the error buffer on redraw"
+    );
+
+    let theme = Theme::default();
+    let buffer = terminal.backend().buffer();
+    let mut error_styled = false;
+    for y in 0..buffer.area.height {
+        for x in 0..buffer.area.width {
+            let cell = &buffer[(x, y)];
+            if cell.symbol() == "p" && cell.fg == theme.ui.status_error {
+                error_styled = true;
+            }
+        }
+    }
+    assert!(error_styled, "the error row carries status_error");
+}
+
+#[test]
+fn long_error_messages_wrap_at_the_pane_width() {
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    let mut text = String::from("API error: ");
+    for i in 0..40 {
+        text.push_str("chunk");
+        text.push_str(&i.to_string());
+        text.push(' ');
+    }
+    text.push_str("ENDMARK");
+    kept.errors.lock().expect("the errors lock").push(text);
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+
+    let terminal = render_to_buffer(&mut app, 40, 24);
+    let view = view_text(&terminal, 40, 24);
+    assert!(
+        view.contains("ENDMARK"),
+        "the wrapped tail of a long error stays visible instead of clipping: {view:?}"
     );
 }
