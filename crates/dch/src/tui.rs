@@ -105,14 +105,18 @@ async fn run_tui_session(args: &Args) -> Result<(), String> {
 /// the shutdown flag is set: the engine clears its cancel signal at
 /// the end of every run, so the flag — raised before the cancel — is
 /// what keeps submissions queued behind a quitting user from ever
-/// starting.
+/// starting. The flag gates the loop condition, so it is checked
+/// before a queued submission is admitted, not only after a run
+/// returns.
 async fn drive_submissions(
     mut runner: dch_loop::Runner,
     mut receiver: mpsc::UnboundedReceiver<String>,
     state: TuiObserverState,
     shutting_down: Arc<AtomicBool>,
 ) {
-    while let Some(text) = receiver.recv().await {
+    while !shutting_down.load(Ordering::SeqCst)
+        && let Some(text) = receiver.recv().await
+    {
         if let Err(err) = runner.run(&text).await {
             state
                 .errors
@@ -120,9 +124,6 @@ async fn drive_submissions(
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(err.to_string());
             state.render_notify.notify(1);
-        }
-        if shutting_down.load(Ordering::SeqCst) {
-            break;
         }
     }
 }
@@ -232,10 +233,9 @@ mod tests {
         .expect("the driver leaves the queue behind instead of draining it");
 
         let errors = state.errors.lock().unwrap();
-        assert_eq!(
-            errors.len(),
-            1,
-            "only the in-flight run executed; the submission queued behind shutdown never started"
+        assert!(
+            errors.is_empty(),
+            "no submission is admitted once shutdown has begun — neither queued task ran"
         );
     }
 }

@@ -482,13 +482,16 @@ pub(crate) fn load_config(path: Option<&Path>) -> Result<dch_config::DchConfig, 
 
 /// Apply CLI overrides to the config before agent construction.
 ///
-/// Deliberately small: `--model` is the only per-run provider override and
-/// `--unsafe-paths` the only per-run access switch. Verbosity resolves
-/// separately when the observer is built, and display preferences remain
-/// config-file concerns. Both mode runners apply the same overrides.
+/// Deliberately small: `--model` is the only per-run provider override,
+/// `--theme` the only per-run display switch, and `--unsafe-paths` the
+/// only per-run access switch. Verbosity resolves separately when the
+/// observer is built. Both mode runners apply the same overrides.
 pub(crate) fn apply_cli_overrides(config: &mut dch_config::DchConfig, args: &Args) {
     if let Some(model) = &args.model {
         config.api.model.clone_from(model);
+    }
+    if let Some(theme) = &args.theme {
+        config.display.theme.clone_from(theme);
     }
     if args.config.unsafe_paths {
         config.runner.unsafe_paths = true;
@@ -821,6 +824,21 @@ mod tests {
         let original = config.api.model.clone();
         apply_cli_overrides(&mut config, &parse(&[]));
         assert_eq!(config.api.model, original);
+    }
+
+    #[test]
+    fn the_theme_flag_overrides_the_configured_theme() {
+        let mut config = dch_config::DchConfig::default();
+        let original = config.display.theme.clone();
+        apply_cli_overrides(&mut config, &parse(&["--theme", "nord"]));
+        assert_eq!(config.display.theme, "nord");
+
+        let mut config = dch_config::DchConfig::default();
+        apply_cli_overrides(&mut config, &parse(&[]));
+        assert_eq!(
+            config.display.theme, original,
+            "with no flag the configured theme stands"
+        );
     }
 
     #[test]
