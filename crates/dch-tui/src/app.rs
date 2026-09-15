@@ -13,7 +13,6 @@ use std::time::{Duration, Instant};
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
 };
-use futures::StreamExt;
 use ratatui::Frame;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -26,6 +25,7 @@ use unicode_width::UnicodeWidthChar;
 
 use dch_config::DchConfig;
 
+use crate::events::TerminalEvents;
 use crate::input::{InputAction, InputEditor};
 use crate::markdown;
 use crate::message::{ActiveTool, ContentBlock, TokenCounts, TuiMessage};
@@ -204,6 +204,53 @@ pub struct TuiApp {
     /// same content at the new width.
     stream_cache_width: u16,
 
+    /// Rendered lines of the streaming buffer's live segment.
+    ///
+    /// The live segment — the unfrozen complete lines plus the
+    /// unterminated tail — only changes when a delta arrives, the
+    /// freeze advances, or the pane resizes; input keystrokes and
+    /// idle ticks re-render it identically. Frames re-use these
+    /// lines until the segment's stamp moves, so a keystroke never
+    /// pays the markdown re-parse (a live open code fence
+    /// re-highlighted per frame costs frame-budget-breaking time).
+    live_lines: Vec<Line<'static>>,
+
+    /// Stamp of the live segment the cached lines were built from.
+    ///
+    /// A fingerprint of the unfrozen buffer suffix — content, not
+    /// just length, so a cleared-and-refilled turn invalidates.
+    live_stamp: u64,
+
+    /// The freeze offset the live cache was built at.
+    live_frozen_upto: usize,
+
+    /// The pane width the live cache was built at.
+    live_width: u16,
+
+    /// Rendered lines of the settled conversation.
+    ///
+    /// The conversation changes only when a message graduates, a
+    /// submit echoes, a tool result drains, or an error lands —
+    /// everything else a frame does to it is re-rendering identical
+    /// markdown. The cache rebuilds on those mutations and on a width
+    /// change; frames clone it, the same per-frame linear trait the
+    /// streaming freeze cache has.
+    conversation_cache: Vec<Line<'static>>,
+
+    /// The pane width the conversation cache was built for.
+    conversation_cache_width: u16,
+
+    /// Monotonic count of settled-conversation mutations.
+    ///
+    /// Every message push, drained tool result, and echoed submit
+    /// bumps it; the render cache detects staleness by falling
+    /// behind, which keeps the comparison against the width key
+    /// uniform.
+    conversation_generation: u64,
+
+    /// The generation the conversation cache was built at.
+    conversation_cache_generation: u64,
+
     /// Whether the run loop should exit.
     ///
     /// Set by the quit keys; the loop leaves at the top of its next
@@ -256,6 +303,14 @@ impl TuiApp {
             frozen_separators: 0,
             frozen_fingerprint: 0,
             stream_cache_width: 0,
+            live_lines: Vec::new(),
+            live_stamp: 0,
+            live_frozen_upto: 0,
+            live_width: 0,
+            conversation_cache: Vec::new(),
+            conversation_cache_width: 0,
+            conversation_generation: 1,
+            conversation_cache_generation: 0,
             quitting: false,
             config,
         }
@@ -276,6 +331,7 @@ impl TuiApp {
     /// path internally.
     pub fn push_message(&mut self, message: TuiMessage) {
         self.conversation.push(message);
+        self.conversation_generation = self.conversation_generation.saturating_add(1);
     }
 
     /// The input buffer's current text.
@@ -380,7 +436,7 @@ impl TuiApp {
         terminal: &mut ratatui::Terminal<CrosstermBackend<std::io::Stdout>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.quitting = false;
-        let mut events = Box::pin(crossterm::event::EventStream::new());
+        let mut events = TerminalEvents::spawn();
         let mut tick = tokio::time::interval(Duration::from_millis(250));
         let notify = Arc::clone(&self.state.render_notify);
         let mut listener = notify.listen();
@@ -388,24 +444,22 @@ impl TuiApp {
         terminal.draw(|frame| self.render(frame))?;
 
         while !self.quitting {
-            let mut needs_redraw = false;
-            tokio::select! {
-                maybe_event = events.next() => {
+            let needs_redraw = tokio::select! {
+                maybe_event = events.recv() => {
                     match maybe_event {
-                        Some(Ok(event)) => needs_redraw = self.handle_event(&event),
-                        Some(Err(err)) => {
-                            tracing::warn!("terminal event stream error: {err}");
+                        Some(event) => {
+                            let mut handled = self.handle_event(&event);
+                            while let Some(extra) = events.poll() {
+                                handled |= self.handle_event(&extra);
+                            }
+                            handled
                         }
-                        None => break,
+                        None => return Ok(()),
                     }
                 }
-                () = &mut listener => {
-                    needs_redraw = self.notify_wake(&notify, &mut listener);
-                }
-                _instant = tick.tick() => {
-                    needs_redraw = self.tick_wake(Instant::now());
-                }
-            }
+                () = &mut listener => self.notify_wake(&notify, &mut listener),
+                _instant = tick.tick() => self.tick_wake(Instant::now()),
+            };
             if needs_redraw {
                 terminal.draw(|frame| self.render(frame))?;
             }
@@ -526,12 +580,15 @@ impl TuiApp {
     fn submit_text(&mut self, text: String) {
         if let Some(tx) = &self.submit_tx {
             self.state.queued.fetch_add(1, Ordering::SeqCst);
-            drop(tx.send(text.clone()));
+            if tx.send(text.clone()).is_err() {
+                self.state.queued.fetch_sub(1, Ordering::SeqCst);
+            }
         }
         self.conversation.push(TuiMessage::User {
             text,
             timestamp: chrono::Utc::now(),
         });
+        self.conversation_generation = self.conversation_generation.saturating_add(1);
         self.scroll_to_bottom();
     }
 
@@ -690,10 +747,21 @@ impl TuiApp {
 
         let conversation_height = conversation_area.height as usize;
         let width = conversation_area.width.max(1);
-        let mut lines = self.conversation_lines(conversation_area);
-        lines.extend(self.streaming_region_lines(width));
-        lines.extend(self.active_tool_lines());
-        let total_lines = lines.len();
+        if self.conversation_cache_generation != self.conversation_generation
+            || self.conversation_cache_width != width
+        {
+            self.conversation_cache = self.conversation_lines(conversation_area);
+            self.conversation_cache_width = width;
+            self.conversation_cache_generation = self.conversation_generation;
+        }
+        self.refresh_streaming_region(width);
+        let tools = self.active_tool_lines();
+        let total_lines = self
+            .conversation_cache
+            .len()
+            .saturating_add(self.frozen_lines.len())
+            .saturating_add(self.live_lines.len())
+            .saturating_add(tools.len());
         if self.auto_scroll {
             self.scroll_offset = 0;
         } else {
@@ -711,11 +779,16 @@ impl TuiApp {
         let skip = total_lines
             .saturating_sub(conversation_height)
             .saturating_sub(self.scroll_offset);
-        let visible: Vec<Line<'_>> = lines
-            .into_iter()
-            .skip(skip)
-            .take(conversation_height)
-            .collect();
+        let visible = visible_window(
+            [
+                &self.conversation_cache,
+                &self.frozen_lines,
+                &self.live_lines,
+                &tools,
+            ],
+            skip,
+            conversation_height,
+        );
         let visible_len = visible.len();
 
         frame.render_widget(Paragraph::new(visible), conversation_area);
@@ -753,8 +826,11 @@ impl TuiApp {
                 duration_ms: None,
             });
         }
-        self.tool_history
-            .extend(take_locked(&self.state.tool_results));
+        let drained_tools = take_locked(&self.state.tool_results);
+        if !drained_tools.is_empty() {
+            self.conversation_generation = self.conversation_generation.saturating_add(1);
+        }
+        self.tool_history.extend(drained_tools);
         let drop_count = self.tool_history.len().saturating_sub(TOOL_HISTORY_DEPTH);
         self.tool_history.drain(..drop_count);
         for text in take_locked(&self.state.errors) {
@@ -841,7 +917,8 @@ impl TuiApp {
         lines
     }
 
-    /// The streaming region: what the in-flight reply looks like.
+    /// The streaming region's live rows: everything after the
+    /// frozen prefix.
     ///
     /// Three parts, assembled in order: the cached lines of frozen
     /// blocks (settled content, rendered once when its terminating
@@ -859,7 +936,7 @@ impl TuiApp {
     /// empty buffer renders nothing; a poisoned lock is recovered —
     /// the same policy the drain applies — so the live view keeps
     /// rendering after another thread's panic.
-    fn streaming_region_lines(&mut self, width: u16) -> Vec<Line<'static>> {
+    fn refresh_streaming_region(&mut self, width: u16) {
         let buffer = self
             .state
             .streaming_text
@@ -868,7 +945,7 @@ impl TuiApp {
             .clone();
         if buffer.is_empty() {
             self.reset_stream_cache();
-            return Vec::new();
+            return;
         }
         if self.stream_cache_width != width {
             self.reset_stream_cache();
@@ -883,9 +960,6 @@ impl TuiApp {
         }
         self.advance_freeze(&buffer, width);
 
-        let markdown_theme = markdown::MarkdownTheme::from(&self.theme);
-        let syntax_theme = markdown::SyntaxTheme::from(&self.theme);
-        let base = self.theme.ui.assistant_message_fg;
         let live = buffer
             .rsplit_once('\n')
             .map_or(buffer.as_str(), |(_, tail)| tail);
@@ -893,9 +967,26 @@ impl TuiApp {
         let live_md = buffer
             .get(self.frozen_upto..live_md_len)
             .filter(|segment| !segment.is_empty());
-        let mut lines = self.frozen_lines.clone();
+        let stamp = live_md.map_or(0, fingerprint) ^ {
+            let mut seed = live.len() as u64;
+            for ch in live.chars().rev().take(64) {
+                seed = seed.wrapping_mul(31).wrapping_add(u64::from(u32::from(ch)));
+            }
+            seed
+        };
+        if self.live_stamp == stamp
+            && self.live_frozen_upto == self.frozen_upto
+            && self.live_width == width
+        {
+            return;
+        }
+
+        let markdown_theme = markdown::MarkdownTheme::from(&self.theme);
+        let syntax_theme = markdown::SyntaxTheme::from(&self.theme);
+        let base = self.theme.ui.assistant_message_fg;
+        let mut lines: Vec<Line<'static>> = Vec::new();
         let leading = live_md.map_or(0, |segment| split_blank_prefix(segment).0);
-        if !lines.is_empty() && (live_md.is_some() || !live.is_empty()) {
+        if !self.frozen_lines.is_empty() && (live_md.is_some() || !live.is_empty()) {
             let gap = self.frozen_separators.max(leading);
             for _ in 0..gap {
                 lines.push(Line::from(""));
@@ -938,7 +1029,10 @@ impl TuiApp {
         if !live.is_empty() {
             lines.extend(plain_wrapped_lines(live, usize::from(width), base));
         }
-        lines
+        self.live_stamp = stamp;
+        self.live_frozen_upto = self.frozen_upto;
+        self.live_width = width;
+        self.live_lines = lines;
     }
 
     /// Reset the streaming cache.
@@ -952,6 +1046,10 @@ impl TuiApp {
         self.frozen_upto = 0;
         self.frozen_separators = 0;
         self.frozen_fingerprint = 0;
+        self.live_stamp = 0;
+        self.live_frozen_upto = 0;
+        self.live_width = 0;
+        self.live_lines.clear();
     }
 
     /// Freeze every newly settled block into the cache.
@@ -1182,6 +1280,36 @@ fn format_elapsed(secs: f64) -> String {
 /// panic left the lock poisoned.
 fn take_locked<T: Default>(mutex: &Mutex<T>) -> T {
     std::mem::take(&mut *mutex.lock().unwrap_or_else(PoisonError::into_inner))
+}
+
+/// Collect the viewport window across concatenated line segments.
+///
+/// The settled conversation renders from a cache that must survive
+/// the frame, so instead of concatenating and cloning every segment
+/// this walks them with the skip offset and clones only the lines
+/// the viewport actually shows — per-frame cost tracks the pane
+/// height, not the session length.
+fn visible_window<'a>(segments: [&'a [Line<'a>]; 4], skip: usize, height: usize) -> Vec<Line<'a>> {
+    let mut visible = Vec::with_capacity(height.min(64));
+    let mut skip = skip;
+    for segment in segments {
+        if skip >= segment.len() {
+            skip = skip.saturating_sub(segment.len());
+            continue;
+        }
+        let take = segment
+            .len()
+            .saturating_sub(skip)
+            .min(height.saturating_sub(visible.len()));
+        if let Some(window) = segment.get(skip..skip.saturating_add(take)) {
+            visible.extend(window.iter().cloned());
+        }
+        skip = 0;
+        if visible.len() >= height {
+            break;
+        }
+    }
+    visible
 }
 
 /// Fetch a layout pane by index with a whole-area fallback.

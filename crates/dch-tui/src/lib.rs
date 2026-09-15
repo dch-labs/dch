@@ -4,6 +4,7 @@
 #![warn(missing_docs)]
 
 pub mod app;
+pub mod events;
 pub mod input;
 pub mod markdown;
 pub mod message;
@@ -12,6 +13,7 @@ pub mod terminal;
 pub mod theme;
 
 pub use app::TuiApp;
+pub use events::TerminalEvents;
 pub use input::{InputAction, InputEditor, InputHistory};
 pub use message::{ActiveTool, ContentBlock, TokenCounts, TuiMessage};
 pub use observer::{ToolResultDisplay, TuiObserver, TuiObserverState};

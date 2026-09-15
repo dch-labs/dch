@@ -23,6 +23,19 @@ fn wants_headless(args: &args::Args) -> bool {
     selects_single_run(args.task.as_deref(), std::io::stdin().is_terminal())
 }
 
+/// Whether the runtime-failure path may write the done-file marker.
+///
+/// The normal dispatch serves the session verbs before the
+/// single-run mode and never writes a marker for them; this
+/// bootstrap-time mirror of that ordering keeps `--done-file`'s
+/// "ignored outside headless mode" promise true even when the
+/// runtime itself fails to construct.
+fn bootstrap_marker_applies(args: &args::Args, stdin_is_terminal: bool) -> bool {
+    !args.list_sessions
+        && args.resume.is_none()
+        && selects_single_run(args.task.as_deref(), stdin_is_terminal)
+}
+
 /// The mode decision over the task argument and the stdin kind.
 ///
 /// A present task selects the single-run mode whatever stdin is; with
@@ -41,7 +54,7 @@ fn main() -> std::process::ExitCode {
             let message = format!("failed to start tokio runtime: {err}");
             // The marker precedes any stderr output: a broken stderr
             // panics `eprintln!`, and this path exists to guarantee both.
-            if wants_headless(&args)
+            if bootstrap_marker_applies(&args, std::io::stdin().is_terminal())
                 && let Some(path) = &args.done_file
                 && let Err(write_err) =
                     done::write_done_file(path, &done::DoneStatus::failure(message.clone()), None)
@@ -85,6 +98,7 @@ fn main() -> std::process::ExitCode {
 )]
 mod tests {
     use super::*;
+    use clap::Parser as _;
 
     #[test]
     fn a_task_argument_selects_the_single_run_mode_on_any_stdin() {
@@ -100,5 +114,22 @@ mod tests {
     #[test]
     fn only_a_terminal_stdin_without_a_task_launches_the_tui() {
         assert!(!selects_single_run(None, true));
+    }
+
+    #[test]
+    fn session_verbs_never_take_the_bootstrap_marker() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let list = args::Args::try_parse_from(["dch", "--list-sessions"]).unwrap();
+        assert!(!bootstrap_marker_applies(&list, false));
+        let resume = args::Args::try_parse_from(["dch", "--resume", id.as_str()]).unwrap();
+        assert!(!bootstrap_marker_applies(&resume, false));
+    }
+
+    #[test]
+    fn single_run_invocations_take_the_bootstrap_marker() {
+        let task = args::Args::try_parse_from(["dch", "probe"]).unwrap();
+        assert!(bootstrap_marker_applies(&task, true));
+        let piped = args::Args::try_parse_from(["dch"]).unwrap();
+        assert!(bootstrap_marker_applies(&piped, false));
     }
 }

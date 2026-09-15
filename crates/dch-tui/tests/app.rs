@@ -899,3 +899,134 @@ fn ctrl_p_recalls_history_from_a_multiline_buffer() {
         "Ctrl-P reaches history even while editing multiple lines"
     );
 }
+
+#[test]
+fn late_pushed_messages_appear_in_the_next_render() {
+    let mut app = app();
+    let _ = render_to_buffer(&mut app, 40, 12);
+    app.push_message(TuiMessage::User {
+        text: "arrived between frames".to_string(),
+        timestamp: chrono::Utc::now(),
+    });
+    let terminal = render_to_buffer(&mut app, 40, 12);
+    assert!(
+        view_text(&terminal, 40, 12).contains("arrived between frames"),
+        "a message pushed after a cached render must still show up"
+    );
+}
+
+#[test]
+fn a_width_change_reflows_the_cached_conversation() {
+    let mut app = app();
+    app.push_message(TuiMessage::Assistant {
+        blocks: vec![ContentBlock::Text {
+            text: "aaaaaaaaaa bbbbbbbbbb cccccccccc dddddddddd".to_string(),
+        }],
+        timestamp: chrono::Utc::now(),
+        duration_ms: None,
+    });
+    let wide = render_to_buffer(&mut app, 60, 12);
+    assert!(
+        row_texts(&wide)[0].contains("dddddddddd"),
+        "at width 60 the message fits one row"
+    );
+
+    let narrow = render_to_buffer(&mut app, 20, 12);
+    let narrow_rows = row_texts(&narrow);
+    assert!(
+        !narrow_rows[0].contains("dddddddddd")
+            && narrow_rows.iter().any(|row| row.contains("dddddddddd")),
+        "a resize rebuilds the cache and the message reflows onto later rows"
+    );
+}
+
+#[test]
+fn a_large_session_typing_redraw_stays_inside_the_frame_budget() {
+    // Per the render cache and the windowed viewport assembly, a
+    // keystroke's cost tracks the pane height, not the session
+    // length. A regression to per-frame O(session) work (the whole-
+    // conversation clone this replaces) pushes the mean past this
+    // budget by an order of magnitude at this session size.
+    let mut app = app();
+    for i in 0..150 {
+        let text = (0..40)
+            .map(|l| format!("message {i} line {l} with some words here"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        app.push_message(TuiMessage::Assistant {
+            blocks: vec![ContentBlock::Text { text }],
+            timestamp: chrono::Utc::now(),
+            duration_ms: None,
+        });
+    }
+    let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+    terminal.draw(|frame| app.render(frame)).unwrap();
+
+    let chars: Vec<char> = "the quick brown fox jumps".chars().collect();
+    let start = std::time::Instant::now();
+    for i in 0..100 {
+        app.handle_event(&plain(KeyCode::Char(chars[i % chars.len()])));
+        terminal.draw(|frame| app.render(frame)).unwrap();
+    }
+    let mean_micros = start.elapsed().as_secs_f64() * 1e4;
+    assert!(
+        mean_micros < 10_000.0,
+        "mean typing redraw {mean_micros:.0} µs exceeds the 10 ms frame-class budget"
+    );
+}
+
+#[test]
+fn typing_during_a_live_code_block_stays_inside_the_frame_budget() {
+    // The live segment re-renders only when a delta moves its stamp;
+    // a keystroke changes nothing about the streamed reply, so its
+    // frame must be a cache hit. Re-parsing per keystroke (the shape
+    // this guards against) measured two orders of magnitude past
+    // this budget with a 300-line open fence in a debug build.
+    let mut app = app();
+    let mut reply = String::from("```rust\n");
+    for i in 0..300 {
+        reply.push_str("let value_");
+        reply.push_str(&i.to_string());
+        reply.push_str(" = compute_something(i) + other(i);\n");
+    }
+    app.streaming_text()
+        .lock()
+        .expect("the streaming lock")
+        .push_str(&reply);
+    let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+    terminal.draw(|frame| app.render(frame)).unwrap();
+
+    let chars: Vec<char> = "the quick brown fox".chars().collect();
+    let start = std::time::Instant::now();
+    for i in 0..50 {
+        app.handle_event(&plain(KeyCode::Char(chars[i % chars.len()])));
+        terminal.draw(|frame| app.render(frame)).unwrap();
+    }
+    let mean_micros = start.elapsed().as_secs_f64() * 2e4;
+    assert!(
+        mean_micros < 10_000.0,
+        "mean typing redraw {mean_micros:.0} µs with a live open fence exceeds the budget"
+    );
+}
+
+#[test]
+fn a_failed_send_rolls_the_queue_increment_back() {
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept.clone());
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    app.set_submit_tx(tx);
+    drop(rx);
+
+    for c in "gone".chars() {
+        app.handle_event(&plain(KeyCode::Char(c)));
+    }
+    assert!(app.handle_event(&plain(KeyCode::Enter)));
+    assert_eq!(
+        kept.queued.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a send no receiver takes must not stay counted as queued"
+    );
+    assert_eq!(app.conversation().len(), 1, "the echo still lands");
+}
