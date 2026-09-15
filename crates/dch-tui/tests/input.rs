@@ -1,0 +1,386 @@
+//! Input-editor tests — pure logic against `InputEditor` and
+//! `InputHistory`, no terminal, no backend.
+
+#![allow(
+    clippy::uninlined_format_args,
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    clippy::indexing_slicing
+)]
+
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use dch_tui::input::{InputAction, InputEditor, InputHistory};
+
+fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+    KeyEvent::new(code, modifiers)
+}
+
+fn plain(code: KeyCode) -> KeyEvent {
+    key(code, KeyModifiers::NONE)
+}
+
+fn char(c: char) -> KeyEvent {
+    plain(KeyCode::Char(c))
+}
+
+fn type_str(editor: &mut InputEditor, text: &str) {
+    for c in text.chars() {
+        editor.handle_key(char(c));
+    }
+}
+
+/// Drive the editor to a submitted entry and return its text.
+fn submit(editor: &mut InputEditor, text: &str) -> String {
+    type_str(editor, text);
+    match editor.handle_key(plain(KeyCode::Enter)) {
+        InputAction::Submit(sent) => sent,
+        other => panic!("expected a submit for {text:?}, got {other:?}"),
+    }
+}
+
+#[test]
+fn push_then_prev_returns_the_entry_and_stops_at_oldest() {
+    let mut history = InputHistory::new(10);
+    history.push("first".to_string());
+    history.push("second".to_string());
+    assert_eq!(
+        history.older(),
+        Some("second"),
+        "prev from live hits the newest"
+    );
+    assert_eq!(history.older(), Some("first"));
+    assert_eq!(history.older(), None, "already at the oldest — stays put");
+    assert_eq!(history.older(), None);
+}
+
+#[test]
+fn next_past_the_oldest_returns_to_live() {
+    let mut history = InputHistory::new(10);
+    history.push("only".to_string());
+    assert_eq!(history.older(), Some("only"));
+    assert_eq!(history.newer(), None, "arriving back at live reports None");
+    assert_eq!(history.newer(), None);
+    assert_eq!(history.older(), Some("only"), "live can browse again");
+}
+
+#[test]
+fn fifo_eviction_caps_the_entries() {
+    let mut history = InputHistory::new(3);
+    for entry in ["one", "two", "three", "four"] {
+        history.push(entry.to_string());
+    }
+    assert_eq!(history.older(), Some("four"));
+    assert_eq!(history.older(), Some("three"));
+    assert_eq!(history.older(), Some("two"));
+    assert_eq!(history.older(), None, "the evicted oldest is gone");
+}
+
+#[test]
+fn consecutive_duplicates_collapse_but_distinct_neighbors_stay() {
+    let mut history = InputHistory::new(10);
+    history.push("hi".to_string());
+    history.push("hi".to_string());
+    history.push("other".to_string());
+    history.push("other".to_string());
+    assert_eq!(history.older(), Some("other"));
+    assert_eq!(history.older(), Some("hi"));
+    assert_eq!(history.older(), None, "two distinct entries total");
+}
+
+#[test]
+fn backspace_mid_buffer_deletes_whole_characters() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "héllo");
+    editor.handle_key(plain(KeyCode::Left));
+    editor.handle_key(plain(KeyCode::Backspace));
+    assert_eq!(editor.text(), "hélo", "one backspace removes one character");
+
+    editor.handle_key(key(KeyCode::Char('a'), KeyModifiers::CONTROL));
+    editor.handle_key(plain(KeyCode::Right));
+    editor.handle_key(plain(KeyCode::Right));
+    editor.handle_key(plain(KeyCode::Backspace));
+    assert_eq!(
+        editor.text(),
+        "hlo",
+        "the multi-byte é leaves as one character"
+    );
+}
+
+#[test]
+fn backslash_enter_inserts_a_newline_and_consumes_the_backslash() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "ab\\");
+    assert_eq!(
+        editor.handle_key(plain(KeyCode::Enter)),
+        InputAction::None,
+        "a trailing backslash turns Enter into a newline, not a submit"
+    );
+    type_str(&mut editor, "cd");
+    assert_eq!(editor.text(), "ab\ncd");
+    assert!(editor.is_multiline());
+    assert_eq!(editor.cursor_cell(40).map(|(row, _)| row), Some(1));
+}
+
+#[test]
+fn shift_enter_inserts_a_newline_where_reported() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "ab");
+    editor.handle_key(key(KeyCode::Enter, KeyModifiers::SHIFT));
+    type_str(&mut editor, "cd");
+    assert_eq!(editor.text(), "ab\ncd");
+    assert!(editor.is_multiline());
+}
+
+#[test]
+fn enter_submits_clears_and_records_history() {
+    let mut editor = InputEditor::new();
+    assert_eq!(submit(&mut editor, "hello"), "hello");
+    assert!(editor.is_empty());
+    assert!(editor.has_history());
+    editor.handle_key(plain(KeyCode::Up));
+    assert_eq!(editor.text(), "hello", "the submit is recallable");
+}
+
+#[test]
+fn enter_on_an_empty_buffer_is_a_noop() {
+    let mut editor = InputEditor::new();
+    assert_eq!(editor.handle_key(plain(KeyCode::Enter)), InputAction::None);
+    assert!(editor.is_empty());
+    assert!(!editor.has_history());
+}
+
+#[test]
+fn whitespace_only_enter_clears_without_submitting() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "  \t ");
+    assert_eq!(editor.handle_key(plain(KeyCode::Enter)), InputAction::None);
+    assert!(editor.is_empty(), "the buffer clears");
+    assert!(!editor.has_history(), "nothing is recorded");
+}
+
+#[test]
+fn alt_enter_behaves_as_plain_enter() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "hi");
+    assert_eq!(
+        editor.handle_key(key(KeyCode::Enter, KeyModifiers::ALT)),
+        InputAction::Submit("hi".to_string()),
+        "Alt+Enter queues like Enter — the interrupt variant is not built"
+    );
+    assert!(editor.is_empty());
+}
+
+#[test]
+fn paste_lands_atomically_and_never_partial_submits() {
+    let mut editor = InputEditor::new();
+    editor.insert_str("line1\nline2\n");
+    assert_eq!(
+        editor.handle_key(plain(KeyCode::Enter)),
+        InputAction::Submit("line1\nline2\n".to_string()),
+        "a pasted block submits whole — the embedded newlines never fire mid-paste"
+    );
+}
+
+#[test]
+fn home_and_end_move_within_the_current_line() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "ab\\");
+    editor.handle_key(plain(KeyCode::Enter));
+    type_str(&mut editor, "cdef");
+    editor.handle_key(key(KeyCode::Char('a'), KeyModifiers::CONTROL));
+    assert_eq!(editor.cursor_cell(40).map(|(_, col)| col), Some(0));
+    editor.handle_key(key(KeyCode::Char('e'), KeyModifiers::CONTROL));
+    assert_eq!(editor.cursor_cell(40).map(|(_, col)| col), Some(4));
+    editor.handle_key(plain(KeyCode::Home));
+    assert_eq!(editor.cursor_cell(40), Some((1, 0)));
+    editor.handle_key(plain(KeyCode::End));
+    assert_eq!(editor.cursor_cell(40), Some((1, 4)));
+}
+
+#[test]
+fn up_navigates_history_when_single_line_and_moves_lines_when_multiline() {
+    let mut editor = InputEditor::new();
+    submit(&mut editor, "recorded");
+    editor.handle_key(plain(KeyCode::Up));
+    assert_eq!(editor.text(), "recorded", "single-line Up recalls history");
+
+    let mut multiline = InputEditor::new();
+    type_str(&mut multiline, "one\\");
+    multiline.handle_key(plain(KeyCode::Enter));
+    type_str(&mut multiline, "two");
+    multiline.handle_key(plain(KeyCode::Up));
+    assert_eq!(multiline.cursor_cell(40).map(|(row, _)| row), Some(0));
+    assert_eq!(
+        multiline.text(),
+        "one\ntwo",
+        "multi-line Up moves the cursor, not history"
+    );
+    multiline.handle_key(plain(KeyCode::Down));
+    assert_eq!(multiline.cursor_cell(40).map(|(row, _)| row), Some(1));
+}
+
+#[test]
+fn history_browsing_restores_the_stashed_draft() {
+    let mut editor = InputEditor::new();
+    submit(&mut editor, "sent");
+    type_str(&mut editor, "draf");
+    editor.handle_key(plain(KeyCode::Up));
+    assert_eq!(editor.text(), "sent");
+    editor.handle_key(plain(KeyCode::Down));
+    assert_eq!(
+        editor.text(),
+        "draf",
+        "returning to live restores the draft"
+    );
+}
+
+#[test]
+fn ctrl_u_and_ctrl_k_kill_within_the_line_and_survive_later_keys() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "hello");
+    editor.handle_key(key(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    assert_eq!(editor.text(), "");
+    editor.handle_key(plain(KeyCode::Char('x')));
+    assert_eq!(
+        editor.text(),
+        "x",
+        "typing after Ctrl-U must not panic — the cursor follows the drain"
+    );
+
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "ab\\");
+    editor.handle_key(plain(KeyCode::Enter));
+    type_str(&mut editor, "cdef");
+    editor.handle_key(key(KeyCode::Char('a'), KeyModifiers::CONTROL));
+    editor.handle_key(key(KeyCode::Char('k'), KeyModifiers::CONTROL));
+    assert_eq!(
+        editor.text(),
+        "ab\n",
+        "kill-to-end stays within the current line"
+    );
+    editor.handle_key(plain(KeyCode::Char('y')));
+    assert_eq!(
+        editor.text(),
+        "ab\ny",
+        "typing after Ctrl-K must not panic either"
+    );
+
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "héllo");
+    editor.handle_key(plain(KeyCode::Right));
+    editor.handle_key(key(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    editor.handle_key(plain(KeyCode::Char('x')));
+    assert_eq!(
+        editor.text(),
+        "x",
+        "a mid-line Ctrl-U before a multi-byte character survives later keys"
+    );
+}
+
+#[test]
+fn ctrl_c_is_not_bound_in_the_editor() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "draft");
+    assert_eq!(
+        editor.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        InputAction::None
+    );
+    assert_eq!(
+        editor.text(),
+        "draft",
+        "quit and cancel own Ctrl-C at the app level"
+    );
+}
+
+#[test]
+fn max_chars_caps_a_pathological_paste() {
+    let mut editor = InputEditor::new();
+    let huge = "x".repeat(200_001);
+    editor.insert_str(&huge);
+    assert_eq!(editor.text().chars().count(), 100_000);
+}
+
+#[test]
+fn cursor_cell_tracks_display_width_not_chars() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "ab😀");
+    assert_eq!(
+        editor.cursor_cell(40).map(|(_, col)| col),
+        Some(4),
+        "the end sits at display column 4 — a char count would say 3"
+    );
+    editor.handle_key(plain(KeyCode::Left));
+    assert_eq!(editor.cursor_cell(40).map(|(_, col)| col), Some(2));
+    editor.handle_key(plain(KeyCode::Right));
+    assert_eq!(editor.cursor_cell(40).map(|(_, col)| col), Some(4));
+}
+
+#[test]
+fn cursor_cell_lands_on_the_wrapped_row() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "alpha beta gamma delta epsilon");
+    assert_eq!(editor.cursor_cell(10).map(|(row, _)| row), Some(3));
+    assert!(editor.cursor_cell(10).is_some_and(|(_, col)| col < 10));
+}
+
+#[test]
+fn tab_indents_with_spaces() {
+    let mut editor = InputEditor::new();
+    editor.handle_key(plain(KeyCode::Tab));
+    assert_eq!(editor.text(), "    ");
+}
+
+#[test]
+fn ctrl_l_asks_for_a_redraw() {
+    let mut editor = InputEditor::new();
+    assert_eq!(
+        editor.handle_key(key(KeyCode::Char('l'), KeyModifiers::CONTROL)),
+        InputAction::Redraw
+    );
+}
+
+#[test]
+fn word_motion_and_deletion_cross_whitespace() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "one two");
+    editor.handle_key(key(KeyCode::Left, KeyModifiers::ALT));
+    assert_eq!(
+        editor.cursor_cell(40).map(|(_, col)| col),
+        Some(4),
+        "word-left lands after the space, before \"two\""
+    );
+    editor.handle_key(key(KeyCode::Char('w'), KeyModifiers::CONTROL));
+    assert_eq!(
+        editor.text(),
+        "two",
+        "delete-word-back kills \"one \" whole"
+    );
+}
+
+#[test]
+fn vertical_moves_never_land_mid_character_and_survive_inserts() {
+    let mut editor = InputEditor::new();
+    editor.set_text("aé\nab".to_string());
+    editor.handle_key(plain(KeyCode::Up));
+    editor.handle_key(plain(KeyCode::Char('x')));
+    assert_eq!(
+        editor.text(),
+        "axé\nab",
+        "typing after an Up that lands inside é must not panic"
+    );
+
+    let mut editor = InputEditor::new();
+    editor.set_text("ab\naé".to_string());
+    editor.handle_key(plain(KeyCode::Home));
+    editor.handle_key(plain(KeyCode::Left));
+    editor.handle_key(plain(KeyCode::Down));
+    editor.handle_key(plain(KeyCode::Char('x')));
+    assert_eq!(
+        editor.text(),
+        "ab\naxé",
+        "typing after a Down that lands inside é must not panic"
+    );
+}

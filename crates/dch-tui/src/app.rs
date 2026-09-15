@@ -6,11 +6,13 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
-use futures::StreamExt;
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+};
 use ratatui::Frame;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -19,10 +21,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthChar;
 
 use dch_config::DchConfig;
 
+use crate::events::TerminalEvents;
+use crate::input::{InputAction, InputEditor};
 use crate::markdown;
 use crate::message::{ActiveTool, ContentBlock, TokenCounts, TuiMessage};
 use crate::observer::{ToolResultDisplay, TuiObserverState};
@@ -49,6 +53,13 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 /// so an exact offset-zero check would detach a view that only fell
 /// behind by growth.
 const STICK_TOLERANCE: usize = 2;
+
+/// Lines one wheel or touchpad scroll event moves.
+///
+/// The terminal convention per notch: enough that touchpad momentum
+/// accumulates into fast travel without overshooting a single
+/// gesture.
+const WHEEL_SCROLL_LINES: usize = 3;
 
 /// The most lines of the live segment parsed as markdown per frame.
 ///
@@ -106,17 +117,12 @@ pub struct TuiApp {
     /// nothing accumulates without bound.
     tool_history: Vec<ToolResultDisplay>,
 
-    /// The input line's current text.
+    /// The input editor: multi-line buffer, cursor, and history.
     ///
-    /// Keystrokes insert at the cursor; Enter submits the text and
-    /// clears the buffer.
-    input: String,
-
-    /// The input cursor's byte index.
-    ///
-    /// Always at a UTF-8 character boundary; it stays at the end of
-    /// the text, since the cursor cannot move within the line.
-    cursor: usize,
+    /// Every non-app key routes here. Submits surface as
+    /// [`InputAction::Submit`], echo into the conversation, and
+    /// travel the submit channel to the agent driver.
+    input: InputEditor,
 
     /// Lines scrolled up from the bottom of the view.
     ///
@@ -198,6 +204,53 @@ pub struct TuiApp {
     /// same content at the new width.
     stream_cache_width: u16,
 
+    /// Rendered lines of the streaming buffer's live segment.
+    ///
+    /// The live segment — the unfrozen complete lines plus the
+    /// unterminated tail — only changes when a delta arrives, the
+    /// freeze advances, or the pane resizes; input keystrokes and
+    /// idle ticks re-render it identically. Frames re-use these
+    /// lines until the segment's stamp moves, so a keystroke never
+    /// pays the markdown re-parse (a live open code fence
+    /// re-highlighted per frame costs frame-budget-breaking time).
+    live_lines: Vec<Line<'static>>,
+
+    /// Stamp of the live segment the cached lines were built from.
+    ///
+    /// A fingerprint of the unfrozen buffer suffix — content, not
+    /// just length, so a cleared-and-refilled turn invalidates.
+    live_stamp: u64,
+
+    /// The freeze offset the live cache was built at.
+    live_frozen_upto: usize,
+
+    /// The pane width the live cache was built at.
+    live_width: u16,
+
+    /// Rendered lines of the settled conversation.
+    ///
+    /// The conversation changes only when a message graduates, a
+    /// submit echoes, a tool result drains, or an error lands —
+    /// everything else a frame does to it is re-rendering identical
+    /// markdown. The cache rebuilds on those mutations and on a width
+    /// change; frames clone it, the same per-frame linear trait the
+    /// streaming freeze cache has.
+    conversation_cache: Vec<Line<'static>>,
+
+    /// The pane width the conversation cache was built for.
+    conversation_cache_width: u16,
+
+    /// Monotonic count of settled-conversation mutations.
+    ///
+    /// Every message push, drained tool result, and echoed submit
+    /// bumps it; the render cache detects staleness by falling
+    /// behind, which keeps the comparison against the width key
+    /// uniform.
+    conversation_generation: u64,
+
+    /// The generation the conversation cache was built at.
+    conversation_cache_generation: u64,
+
     /// Whether the run loop should exit.
     ///
     /// Set by the quit keys; the loop leaves at the top of its next
@@ -239,8 +292,7 @@ impl TuiApp {
             state,
             submit_tx: None,
             tool_history: Vec::new(),
-            input: String::new(),
-            cursor: 0,
+            input: InputEditor::new(),
             scroll_offset: 0,
             auto_scroll: true,
             render_pending: false,
@@ -251,6 +303,14 @@ impl TuiApp {
             frozen_separators: 0,
             frozen_fingerprint: 0,
             stream_cache_width: 0,
+            live_lines: Vec::new(),
+            live_stamp: 0,
+            live_frozen_upto: 0,
+            live_width: 0,
+            conversation_cache: Vec::new(),
+            conversation_cache_width: 0,
+            conversation_generation: 1,
+            conversation_cache_generation: 0,
             quitting: false,
             config,
         }
@@ -271,23 +331,16 @@ impl TuiApp {
     /// path internally.
     pub fn push_message(&mut self, message: TuiMessage) {
         self.conversation.push(message);
+        self.conversation_generation = self.conversation_generation.saturating_add(1);
     }
 
-    /// The current input-line text.
+    /// The input buffer's current text.
     ///
-    /// Empty right after a submit; keystrokes append at the cursor.
+    /// Empty right after a submit; keystrokes and pastes edit it
+    /// through the editor.
     #[must_use]
     pub fn input(&self) -> &str {
-        &self.input
-    }
-
-    /// The input cursor's byte index.
-    ///
-    /// Counts bytes, not characters, and always sits on a UTF-8
-    /// character boundary.
-    #[must_use]
-    pub fn cursor(&self) -> usize {
-        self.cursor
+        self.input.text()
     }
 
     /// The scroll offset in lines above the bottom of the view.
@@ -383,7 +436,7 @@ impl TuiApp {
         terminal: &mut ratatui::Terminal<CrosstermBackend<std::io::Stdout>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.quitting = false;
-        let mut events = Box::pin(crossterm::event::EventStream::new());
+        let mut events = TerminalEvents::spawn();
         let mut tick = tokio::time::interval(Duration::from_millis(250));
         let notify = Arc::clone(&self.state.render_notify);
         let mut listener = notify.listen();
@@ -391,24 +444,22 @@ impl TuiApp {
         terminal.draw(|frame| self.render(frame))?;
 
         while !self.quitting {
-            let mut needs_redraw = false;
-            tokio::select! {
-                maybe_event = events.next() => {
+            let needs_redraw = tokio::select! {
+                maybe_event = events.recv() => {
                     match maybe_event {
-                        Some(Ok(event)) => needs_redraw = self.handle_event(&event),
-                        Some(Err(err)) => {
-                            tracing::warn!("terminal event stream error: {err}");
+                        Some(event) => {
+                            let mut handled = self.handle_event(&event);
+                            while let Some(extra) = events.poll() {
+                                handled |= self.handle_event(&extra);
+                            }
+                            handled
                         }
-                        None => break,
+                        None => return Ok(()),
                     }
                 }
-                () = &mut listener => {
-                    needs_redraw = self.notify_wake(&notify, &mut listener);
-                }
-                _instant = tick.tick() => {
-                    needs_redraw = self.tick_wake(Instant::now());
-                }
-            }
+                () = &mut listener => self.notify_wake(&notify, &mut listener),
+                _instant = tick.tick() => self.tick_wake(Instant::now()),
+            };
             if needs_redraw {
                 terminal.draw(|frame| self.render(frame))?;
             }
@@ -419,53 +470,37 @@ impl TuiApp {
     /// Apply one terminal event to the app state.
     ///
     /// Returns whether the event requires a redraw. Key releases and
-    /// repeats are ignored so a held key fires once per press.
+    /// repeats are ignored so a held key fires once per press. Mouse
+    /// events other than the wheel are ignored.
     pub fn handle_event(&mut self, event: &Event) -> bool {
-        let Event::Key(key) = event else {
-            return matches!(event, Event::Resize(_, _));
-        };
-        if key.kind != KeyEventKind::Press {
-            return false;
+        match event {
+            Event::Key(key) => {
+                if key.kind != KeyEventKind::Press {
+                    return false;
+                }
+                self.handle_key(*key)
+            }
+            Event::Mouse(mouse) => self.handle_mouse(*mouse),
+            Event::Paste(text) => {
+                self.input.insert_str(text);
+                true
+            }
+            Event::Resize(_, _) => true,
+            _ => false,
         }
+    }
+
+    /// Apply one key press: quit and page-scroll keys stay app-level,
+    /// everything else belongs to the input editor.
+    ///
+    /// Up, Down, and End fall back to the transcript while the input
+    /// sits empty with no history to recall — a fresh session's
+    /// arrows still scroll the conversation — and join the editor as
+    /// soon as anything is typed or recallable.
+    fn handle_key(&mut self, key: KeyEvent) -> bool {
         match (key.code, key.modifiers) {
             (KeyCode::Char('c' | 'd'), KeyModifiers::CONTROL) | (KeyCode::Esc, _) => {
                 self.quitting = true;
-                true
-            }
-            (KeyCode::Enter, _) => {
-                let text = std::mem::take(&mut self.input);
-                self.cursor = 0;
-                if !text.trim().is_empty() {
-                    if let Some(tx) = &self.submit_tx {
-                        drop(tx.send(text.clone()));
-                    }
-                    self.conversation.push(TuiMessage::User {
-                        text,
-                        timestamp: chrono::Utc::now(),
-                    });
-                    self.scroll_to_bottom();
-                }
-                true
-            }
-            (KeyCode::Backspace, _) => {
-                self.delete_char_before_cursor();
-                true
-            }
-            (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
-                if self.input.is_char_boundary(self.cursor) {
-                    self.input.insert(self.cursor, c);
-                    self.cursor = self.cursor.saturating_add(c.len_utf8());
-                }
-                true
-            }
-            (KeyCode::Up, KeyModifiers::NONE) => {
-                self.scroll_offset = self.scroll_offset.saturating_add(1);
-                self.auto_scroll = false;
-                true
-            }
-            (KeyCode::Down, KeyModifiers::NONE) => {
-                self.scroll_offset = self.scroll_offset.saturating_sub(1);
-                self.rearm_if_near_bottom();
                 true
             }
             (KeyCode::PageUp, _) => {
@@ -478,30 +513,83 @@ impl TuiApp {
                 self.rearm_if_near_bottom();
                 true
             }
-            (KeyCode::End, _) => {
+            (KeyCode::Up, KeyModifiers::NONE)
+                if self.input.is_empty() && !self.input.has_history() =>
+            {
+                self.scroll_offset = self.scroll_offset.saturating_add(1);
+                self.auto_scroll = false;
+                true
+            }
+            (KeyCode::Down, KeyModifiers::NONE)
+                if self.input.is_empty() && !self.input.has_history() =>
+            {
+                self.scroll_offset = self.scroll_offset.saturating_sub(1);
+                self.rearm_if_near_bottom();
+                true
+            }
+            (KeyCode::End, _) if self.input.is_empty() => {
                 self.scroll_to_bottom();
+                true
+            }
+            _ => {
+                let action = self.input.handle_key(key);
+                self.apply_input_action(action)
+            }
+        }
+    }
+
+    /// Apply one mouse event.
+    ///
+    /// The wheel scrolls by [`WHEEL_SCROLL_LINES`]; anything else is
+    /// ignored.
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                self.scroll_offset = self.scroll_offset.saturating_add(WHEEL_SCROLL_LINES);
+                self.auto_scroll = false;
+                true
+            }
+            MouseEventKind::ScrollDown => {
+                self.scroll_offset = self.scroll_offset.saturating_sub(WHEEL_SCROLL_LINES);
+                self.rearm_if_near_bottom();
                 true
             }
             _ => false,
         }
     }
 
-    /// Delete the character before the cursor.
+    /// Route an editor action.
     ///
-    /// Walks back to the previous char boundary, so multi-byte input
-    /// never sheds a partial character.
-    fn delete_char_before_cursor(&mut self) {
-        if self.cursor == 0 {
-            return;
+    /// A submit echoes, enqueues, and re-anchors; the rest need
+    /// nothing beyond the redraw the caller grants.
+    fn apply_input_action(&mut self, action: InputAction) -> bool {
+        match action {
+            InputAction::Submit(text) => {
+                self.submit_text(text);
+                true
+            }
+            InputAction::Redraw | InputAction::None => true,
         }
-        let Some(prefix) = self.input.get(..self.cursor) else {
-            return;
-        };
-        let new_cursor = prefix.char_indices().last().map_or(0, |(i, _)| i);
-        if self.input.is_char_boundary(new_cursor) {
-            self.input.drain(new_cursor..);
-            self.cursor = new_cursor;
+    }
+
+    /// Send one submitted text to the agent driver and echo it.
+    ///
+    /// The channel send (when a driver is attached) counts toward
+    /// the queued indicator the input title renders; the local echo
+    /// lands immediately and the view re-anchors to the newest line.
+    fn submit_text(&mut self, text: String) {
+        if let Some(tx) = &self.submit_tx {
+            self.state.queued.fetch_add(1, Ordering::SeqCst);
+            if tx.send(text.clone()).is_err() {
+                self.state.queued.fetch_sub(1, Ordering::SeqCst);
+            }
         }
+        self.conversation.push(TuiMessage::User {
+            text,
+            timestamp: chrono::Utc::now(),
+        });
+        self.conversation_generation = self.conversation_generation.saturating_add(1);
+        self.scroll_to_bottom();
     }
 
     /// Whether any tool call is in flight.
@@ -637,11 +725,17 @@ impl TuiApp {
     pub fn render(&mut self, frame: &mut Frame) {
         self.drain_shared_state();
         let area = frame.area();
+        let input_width = area.width.max(1).saturating_sub(2);
+        let input_rows = self.input.wrapped_lines(input_width).len();
+        let input_height = u16::try_from(input_rows.saturating_add(2))
+            .unwrap_or(u16::MAX)
+            .min(area.height.saturating_div(2))
+            .max(3);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(0),
-                Constraint::Length(3),
+                Constraint::Length(input_height),
                 Constraint::Length(1),
             ])
             .split(area);
@@ -653,10 +747,21 @@ impl TuiApp {
 
         let conversation_height = conversation_area.height as usize;
         let width = conversation_area.width.max(1);
-        let mut lines = self.conversation_lines(conversation_area);
-        lines.extend(self.streaming_region_lines(width));
-        lines.extend(self.active_tool_lines());
-        let total_lines = lines.len();
+        if self.conversation_cache_generation != self.conversation_generation
+            || self.conversation_cache_width != width
+        {
+            self.conversation_cache = self.conversation_lines(conversation_area);
+            self.conversation_cache_width = width;
+            self.conversation_cache_generation = self.conversation_generation;
+        }
+        self.refresh_streaming_region(width);
+        let tools = self.active_tool_lines();
+        let total_lines = self
+            .conversation_cache
+            .len()
+            .saturating_add(self.frozen_lines.len())
+            .saturating_add(self.live_lines.len())
+            .saturating_add(tools.len());
         if self.auto_scroll {
             self.scroll_offset = 0;
         } else {
@@ -674,11 +779,16 @@ impl TuiApp {
         let skip = total_lines
             .saturating_sub(conversation_height)
             .saturating_sub(self.scroll_offset);
-        let visible: Vec<Line<'_>> = lines
-            .into_iter()
-            .skip(skip)
-            .take(conversation_height)
-            .collect();
+        let visible = visible_window(
+            [
+                &self.conversation_cache,
+                &self.frozen_lines,
+                &self.live_lines,
+                &tools,
+            ],
+            skip,
+            conversation_height,
+        );
         let visible_len = visible.len();
 
         frame.render_widget(Paragraph::new(visible), conversation_area);
@@ -716,8 +826,11 @@ impl TuiApp {
                 duration_ms: None,
             });
         }
-        self.tool_history
-            .extend(take_locked(&self.state.tool_results));
+        let drained_tools = take_locked(&self.state.tool_results);
+        if !drained_tools.is_empty() {
+            self.conversation_generation = self.conversation_generation.saturating_add(1);
+        }
+        self.tool_history.extend(drained_tools);
         let drop_count = self.tool_history.len().saturating_sub(TOOL_HISTORY_DEPTH);
         self.tool_history.drain(..drop_count);
         for text in take_locked(&self.state.errors) {
@@ -804,7 +917,8 @@ impl TuiApp {
         lines
     }
 
-    /// The streaming region: what the in-flight reply looks like.
+    /// The streaming region's live rows: everything after the
+    /// frozen prefix.
     ///
     /// Three parts, assembled in order: the cached lines of frozen
     /// blocks (settled content, rendered once when its terminating
@@ -822,7 +936,7 @@ impl TuiApp {
     /// empty buffer renders nothing; a poisoned lock is recovered —
     /// the same policy the drain applies — so the live view keeps
     /// rendering after another thread's panic.
-    fn streaming_region_lines(&mut self, width: u16) -> Vec<Line<'static>> {
+    fn refresh_streaming_region(&mut self, width: u16) {
         let buffer = self
             .state
             .streaming_text
@@ -831,7 +945,7 @@ impl TuiApp {
             .clone();
         if buffer.is_empty() {
             self.reset_stream_cache();
-            return Vec::new();
+            return;
         }
         if self.stream_cache_width != width {
             self.reset_stream_cache();
@@ -846,9 +960,6 @@ impl TuiApp {
         }
         self.advance_freeze(&buffer, width);
 
-        let markdown_theme = markdown::MarkdownTheme::from(&self.theme);
-        let syntax_theme = markdown::SyntaxTheme::from(&self.theme);
-        let base = self.theme.ui.assistant_message_fg;
         let live = buffer
             .rsplit_once('\n')
             .map_or(buffer.as_str(), |(_, tail)| tail);
@@ -856,9 +967,26 @@ impl TuiApp {
         let live_md = buffer
             .get(self.frozen_upto..live_md_len)
             .filter(|segment| !segment.is_empty());
-        let mut lines = self.frozen_lines.clone();
+        let stamp = live_md.map_or(0, fingerprint) ^ {
+            let mut seed = live.len() as u64;
+            for ch in live.chars().rev().take(64) {
+                seed = seed.wrapping_mul(31).wrapping_add(u64::from(u32::from(ch)));
+            }
+            seed
+        };
+        if self.live_stamp == stamp
+            && self.live_frozen_upto == self.frozen_upto
+            && self.live_width == width
+        {
+            return;
+        }
+
+        let markdown_theme = markdown::MarkdownTheme::from(&self.theme);
+        let syntax_theme = markdown::SyntaxTheme::from(&self.theme);
+        let base = self.theme.ui.assistant_message_fg;
+        let mut lines: Vec<Line<'static>> = Vec::new();
         let leading = live_md.map_or(0, |segment| split_blank_prefix(segment).0);
-        if !lines.is_empty() && (live_md.is_some() || !live.is_empty()) {
+        if !self.frozen_lines.is_empty() && (live_md.is_some() || !live.is_empty()) {
             let gap = self.frozen_separators.max(leading);
             for _ in 0..gap {
                 lines.push(Line::from(""));
@@ -901,7 +1029,10 @@ impl TuiApp {
         if !live.is_empty() {
             lines.extend(plain_wrapped_lines(live, usize::from(width), base));
         }
-        lines
+        self.live_stamp = stamp;
+        self.live_frozen_upto = self.frozen_upto;
+        self.live_width = width;
+        self.live_lines = lines;
     }
 
     /// Reset the streaming cache.
@@ -915,6 +1046,10 @@ impl TuiApp {
         self.frozen_upto = 0;
         self.frozen_separators = 0;
         self.frozen_fingerprint = 0;
+        self.live_stamp = 0;
+        self.live_frozen_upto = 0;
+        self.live_width = 0;
+        self.live_lines.clear();
     }
 
     /// Freeze every newly settled block into the cache.
@@ -987,29 +1122,45 @@ impl TuiApp {
             .collect()
     }
 
-    /// Render the input box with the caret position.
+    /// Render the input box: wrapped editor rows, the newline hint,
+    /// the queued indicator, and the terminal cursor's cell.
     ///
-    /// The caret sits one column inside the border, offset by the
-    /// display width of the text before the cursor.
+    /// The block title always teaches the two newline gestures — the
+    /// hint is the discovery path on terminals where Shift+Enter
+    /// arrives as a plain Enter — and prefixes the queued-submission
+    /// count while the driver has unclaimed sends. The caret sits
+    /// one cell inside the border, offset by the cursor's display
+    /// column and wrapped row.
     fn render_input(&self, frame: &mut Frame, area: Rect) {
+        let width = area.width.max(1).saturating_sub(2);
+        let rows = self.input.wrapped_lines(width);
+        let queued = self.state.queued.load(Ordering::SeqCst);
+        let title = if queued > 0 {
+            format!(" ⏳ {queued} queued · ⏎ enter · shift+enter or \\+enter for newline ")
+        } else {
+            " ⏎ enter · shift+enter or \\+enter for newline ".to_string()
+        };
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(self.theme.ui.input_border));
+            .border_style(Style::default().fg(self.theme.ui.input_border))
+            .title(title);
         let inner = block.inner(area);
-        frame.render_widget(
-            Paragraph::new(self.input.clone()).style(Style::default().fg(self.theme.ui.input_text)),
-            inner,
-        );
+        let lines: Vec<Line<'_>> = rows
+            .iter()
+            .map(|row| Line::styled(row.as_str(), Style::default().fg(self.theme.ui.input_text)))
+            .collect();
+        frame.render_widget(Paragraph::new(lines), inner);
         frame.render_widget(block, area);
 
-        let prefix_width = self
-            .input
-            .get(..self.cursor)
-            .map_or(0, UnicodeWidthStr::width);
-        let caret_x = u16::try_from(prefix_width)
-            .map_or(inner.x, |width| inner.x.saturating_add(width))
+        let (row, column) = self.input.cursor_cell(width).unwrap_or((0, 0));
+        let caret_x = inner
+            .x
+            .saturating_add(column)
             .min(inner.right().saturating_sub(1));
-        let caret_y = inner.y;
+        let caret_y = inner
+            .y
+            .saturating_add(row)
+            .min(inner.bottom().saturating_sub(1));
         frame.set_cursor_position((caret_x, caret_y));
     }
 
@@ -1129,6 +1280,36 @@ fn format_elapsed(secs: f64) -> String {
 /// panic left the lock poisoned.
 fn take_locked<T: Default>(mutex: &Mutex<T>) -> T {
     std::mem::take(&mut *mutex.lock().unwrap_or_else(PoisonError::into_inner))
+}
+
+/// Collect the viewport window across concatenated line segments.
+///
+/// The settled conversation renders from a cache that must survive
+/// the frame, so instead of concatenating and cloning every segment
+/// this walks them with the skip offset and clones only the lines
+/// the viewport actually shows — per-frame cost tracks the pane
+/// height, not the session length.
+fn visible_window<'a>(segments: [&'a [Line<'a>]; 4], skip: usize, height: usize) -> Vec<Line<'a>> {
+    let mut visible = Vec::with_capacity(height.min(64));
+    let mut skip = skip;
+    for segment in segments {
+        if skip >= segment.len() {
+            skip = skip.saturating_sub(segment.len());
+            continue;
+        }
+        let take = segment
+            .len()
+            .saturating_sub(skip)
+            .min(height.saturating_sub(visible.len()));
+        if let Some(window) = segment.get(skip..skip.saturating_add(take)) {
+            visible.extend(window.iter().cloned());
+        }
+        skip = 0;
+        if visible.len() >= height {
+            break;
+        }
+    }
+    visible
 }
 
 /// Fetch a layout pane by index with a whole-area fallback.

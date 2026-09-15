@@ -1,6 +1,7 @@
 //! Headless runner: load config, build the agent, run one session, exit.
 //!
-//! This is the dispatch target for `dch --headless`. It owns no agent-loop
+//! This is the dispatch target for task-mode invocations — a task
+//! argument or a piped stdin. It owns no agent-loop
 //! logic — everything turn/stream/dispatch lives in loopctl via the runner —
 //! and prints nothing of its own: the model's answer reaches stdout through
 //! the [`ConsoleObserver`] stream. This module resolves the prompt, maps the
@@ -19,13 +20,16 @@ use loopctl::error::LoopError;
 use crate::args::Args;
 use crate::done::{DoneStatus, overwrite_done_file, write_done_file};
 
-/// The done-file message the force path writes, distinguishing a repeated
-/// interrupt from the cooperative cancellation a single one produces.
+/// The done-file message the force path writes.
+///
+/// Distinguishes a repeated interrupt from the cooperative
+/// cancellation a single one produces.
 const FORCE_CANCEL_MESSAGE: &str = "cancelled by a repeated interrupt";
 
-/// The done-file message the startup path writes, distinguishing an
-/// interrupt that landed before the runner existed from the run-phase
-/// cancellations above.
+/// The done-file message the startup path writes.
+///
+/// Distinguishes an interrupt that landed before the runner existed
+/// from the run-phase cancellations.
 const STARTUP_CANCEL_MESSAGE: &str = "cancelled during startup";
 
 /// The outcome of a headless run: the process exit code and any status
@@ -128,9 +132,9 @@ impl HeadlessOutcome {
 /// Run a single headless task and return the process exit code.
 ///
 /// Loads config, builds a non-interactive runner with a `ConsoleObserver`,
-/// resolves the prompt (from `--headless` or stdin), runs one full session,
-/// writes the `--done-file` (if requested), and returns the exit code. The
-/// caller (`main`) turns the code into the process exit status. The
+/// resolves the prompt (from the task argument or stdin), runs one full
+/// session, writes the `--done-file` (if requested), and returns the exit
+/// code. The caller (`main`) turns the code into the process exit status. The
 /// startup bridge armed before this call is stopped once the run bridge is
 /// installed; the two briefly overlap, where an interrupt fails closed
 /// through the construction hook. A construction-phase failure stops the
@@ -372,15 +376,15 @@ async fn resolve_prompt_nonblocking(args: &Args) -> Result<String, String> {
     let piped = read
         .await
         .unwrap_or_else(|err| Err(format!("stdin read task failed: {err}")));
-    resolve_prompt_with(args.headless.as_deref(), move || piped, || false)
+    resolve_prompt_with(args.task.as_deref(), move || piped, || false)
 }
 
-/// Whether the `--headless` flag carries a usable task text.
+/// Whether the task argument carries a usable task text.
 ///
 /// Shared by the fast paths so the definition of "explicit prompt" cannot
 /// drift between them.
 fn has_explicit_prompt(args: &Args) -> bool {
-    args.headless.as_deref().is_some_and(presentable)
+    args.task.as_deref().is_some_and(presentable)
 }
 
 /// Whether a prompt candidate can be used verbatim.
@@ -393,22 +397,22 @@ fn presentable(text: &str) -> bool {
 
 /// Resolve the prompt from the parsed arguments.
 ///
-/// A non-empty `--headless "<text>"` wins and stdin is never touched; an
-/// empty or whitespace-only value falls through to stdin, as does an absent
-/// flag. See [`resolve_prompt_with`] for the full rules.
+/// A non-empty task argument wins and stdin is never touched; an empty
+/// or whitespace-only value falls through to stdin, as does an omitted
+/// argument. See [`resolve_prompt_with`] for the full rules.
 ///
 /// # Errors
 ///
 /// Returns an error message when no usable prompt exists.
 fn resolve_prompt(args: &Args) -> Result<String, String> {
-    resolve_prompt_with(args.headless.as_deref(), read_stdin_prompt, || {
+    resolve_prompt_with(args.task.as_deref(), read_stdin_prompt, || {
         std::io::stdin().is_terminal()
     })
 }
 
 /// The prompt-resolution rules, with the stdin side injected.
 ///
-/// Precedence: non-empty `--headless` text is used verbatim and the stdin
+/// Precedence: a non-empty task argument is used verbatim and the stdin
 /// closures are never called; otherwise stdin is probed and, when it is not
 /// a terminal, read to end as one prompt with trailing line breaks trimmed.
 /// A terminal stdin can never deliver a task, so that is a usage error, as
@@ -427,11 +431,11 @@ fn resolve_prompt_with(
     }
     if stdin_is_terminal() {
         return Err(if explicit.is_some() {
-            "stdin is a terminal and no task was given: use `--headless \"…\"` \
-             or pipe a task on stdin"
+            "stdin is a terminal and no task was given: pass a task \
+             argument or pipe one on stdin"
                 .into()
         } else {
-            "no prompt: use `--headless \"…\"` or pipe a task on stdin".into()
+            "no prompt: pass a task argument or pipe one on stdin".into()
         });
     }
     let raw = read_stdin()?;
@@ -609,7 +613,7 @@ mod tests {
     fn terminal_stdin_with_no_flag_names_the_flag() {
         let err =
             resolve_prompt_with(None, || panic!("a terminal is never read"), || true).unwrap_err();
-        assert!(err.contains("--headless"), "{err}");
+        assert!(err.contains("task argument"), "{err}");
     }
 
     #[test]
@@ -657,7 +661,7 @@ mod tests {
         // distinguishes the force hook's write from a cooperative cancel.
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("done.json");
-        let args = parse(&["--headless", "x", "--done-file", path.to_str().unwrap()]);
+        let args = parse(&["x", "--done-file", path.to_str().unwrap()]);
         write_done_file_if_requested(
             &args,
             &HeadlessOutcome::failure(130, FORCE_CANCEL_MESSAGE),
@@ -673,7 +677,7 @@ mod tests {
     fn the_force_hook_stands_down_once_an_outcome_is_recorded() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("done.json");
-        let args = parse(&["--headless", "x", "--done-file", path.to_str().unwrap()]);
+        let args = parse(&["x", "--done-file", path.to_str().unwrap()]);
 
         let recorded = AtomicBool::new(false);
         write_force_marker_unless_recorded(&args, &recorded, None);
@@ -703,7 +707,7 @@ mod tests {
         // interrupt before the runner existed from the run-phase paths.
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("done.json");
-        let args = parse(&["--headless", "x", "--done-file", path.to_str().unwrap()]);
+        let args = parse(&["x", "--done-file", path.to_str().unwrap()]);
         write_done_file_if_requested(
             &args,
             &HeadlessOutcome::failure(130, STARTUP_CANCEL_MESSAGE),
@@ -733,7 +737,7 @@ mod tests {
     fn the_done_file_is_written_on_the_construction_failure_path() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("done.json");
-        let args = parse(&["--headless", "x", "--done-file", path.to_str().unwrap()]);
+        let args = parse(&["x", "--done-file", path.to_str().unwrap()]);
         let outcome = construction_failure(&args, "config unreadable", None);
         assert_eq!(outcome.exit_code, 1);
         let written: DoneStatus =
@@ -748,7 +752,7 @@ mod tests {
     fn the_done_file_carries_a_successful_run_s_counts() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("done.json");
-        let args = parse(&["--headless", "x", "--done-file", path.to_str().unwrap()]);
+        let args = parse(&["x", "--done-file", path.to_str().unwrap()]);
         let mut run = Run::new("task", &RunConfig::default());
         run.output = Some("done".into());
         write_done_file_if_requested(&args, &HeadlessOutcome::from_run(&run), None);
@@ -763,7 +767,7 @@ mod tests {
     fn the_done_file_keeps_counts_when_the_run_ended_without_an_answer() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("done.json");
-        let args = parse(&["--headless", "x", "--done-file", path.to_str().unwrap()]);
+        let args = parse(&["x", "--done-file", path.to_str().unwrap()]);
         let run = Run::new("task", &RunConfig::default());
         write_done_file_if_requested(&args, &HeadlessOutcome::from_run(&run), None);
         let written: DoneStatus =
@@ -776,7 +780,7 @@ mod tests {
     #[test]
     fn no_done_file_flag_writes_nothing() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let args = parse(&["--headless", "x"]);
+        let args = parse(&["x"]);
         write_done_file_if_requested(&args, &HeadlessOutcome::failure(1, "boom"), None);
         assert_eq!(
             std::fs::read_dir(tmp.path()).unwrap().count(),
@@ -804,7 +808,7 @@ mod tests {
             return; // mode bits are ignored here (e.g. root); nothing to pin
         }
         let path = dir.join("done.json");
-        let args = parse(&["--headless", "x", "--done-file", path.to_str().unwrap()]);
+        let args = parse(&["x", "--done-file", path.to_str().unwrap()]);
         write_done_file_if_requested(
             &args,
             &HeadlessOutcome::from_loop_error(&LoopError::Cancelled),
@@ -883,7 +887,7 @@ mod tests {
         let _signal_lock = SIGNAL_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let args = parse(&["--headless", "Reply with exactly: ok"]);
+        let args = parse(&["Reply with exactly: ok"]);
         assert_eq!(
             run_headless(&args, crate::signals::install_construction_handler(|| {}),).await,
             0
@@ -1000,12 +1004,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
         std::fs::write(&config_path, server.config_toml()).unwrap();
-        let mut flags = vec![
-            "--headless",
-            "hello",
-            "--config",
-            config_path.to_str().unwrap(),
-        ];
+        let mut flags = vec!["hello", "--config", config_path.to_str().unwrap()];
         if let Some(path) = done_file {
             flags.push("--done-file");
             flags.push(path.to_str().unwrap());
@@ -1073,7 +1072,6 @@ mod tests {
         )
         .unwrap();
         let flags = [
-            "--headless",
             "hello",
             "--config",
             config_path.to_str().unwrap(),
@@ -1129,7 +1127,6 @@ mod tests {
         locked.set_mode(0o555);
         std::fs::set_permissions(dir.path(), locked).unwrap();
         let flags = [
-            "--headless",
             "hello",
             "--config",
             config_path.to_str().unwrap(),
@@ -1176,7 +1173,6 @@ mod tests {
         std::fs::write(&done_path, "stale").unwrap();
         std::fs::set_permissions(&done_path, std::fs::Permissions::from_mode(0o600)).unwrap();
         let flags = [
-            "--headless",
             "hello",
             "--config",
             config_path.to_str().unwrap(),

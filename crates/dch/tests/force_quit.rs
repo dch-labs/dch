@@ -225,7 +225,6 @@ fn interrupts_exit_130_and_leave_a_done_file() {
     .expect("config written");
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_dch"))
-        .arg("--headless")
         .arg("hello")
         .arg("--config")
         .arg(&config_path)
@@ -348,7 +347,6 @@ fn startup_signal_outcome(
     let mut slow_start_retries_left: usize = 1;
     'attempt: loop {
         let mut spawned = Command::new(env!("CARGO_BIN_EXE_dch"))
-            .arg("--headless")
             .arg("--done-file")
             .arg(done_path)
             .env("HOME", home)

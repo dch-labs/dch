@@ -7,6 +7,10 @@
 
 use std::io::{self, Stdout};
 
+use crossterm::cursor::SetCursorStyle;
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -16,11 +20,15 @@ use ratatui::backend::CrosstermBackend;
 
 /// Initialize the terminal for a full-screen TUI session.
 ///
-/// Enables raw mode and enters the alternate screen, returning a
-/// terminal bound to stdout. Pair with [`restore_terminal`] — or hold
-/// a [`TerminalGuard`] so the pairing is automatic. A failure after
+/// Enables raw mode and enters the alternate screen with bracketed
+/// paste and mouse capture armed — paste lands as one atomic event
+/// and the wheel scrolls the conversation — and asks the terminal
+/// for a blinking block cursor, which many terminals do not offer
+/// by default; terminals that ignore the style request simply keep
+/// their own. Returns a terminal bound to stdout. Pair with [`restore_terminal`] — or hold a
+/// [`TerminalGuard`] so the pairing is automatic. A failure after
 /// raw mode was enabled undoes the partial setup — raw mode off
-/// first, the alternate screen best-effort — before returning the
+/// first, the escape sequences best-effort — before returning the
 /// error, so an unwritable stdout cannot strand the shell in raw
 /// mode.
 ///
@@ -31,7 +39,13 @@ pub fn init_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     let initialized = (|| {
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableBracketedPaste,
+            EnableMouseCapture,
+            SetCursorStyle::BlinkingBlock
+        )?;
         let backend = CrosstermBackend::new(stdout);
         Terminal::new(backend)
     })();
@@ -45,20 +59,28 @@ pub fn init_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
 
 /// Restore the terminal after a TUI session.
 ///
-/// Disables raw mode first and leaves the alternate screen second:
-/// raw mode is the state that breaks the user's shell, so its undo
-/// never runs behind an escape-sequence write that can fail on an
-/// unwritable stdout. Both attempts always run; the raw-mode error,
-/// when present, is the one returned. Safe to call repeatedly and
-/// safe when the terminal was never initialized — the escape
-/// sequences are ignored by a terminal not in those modes.
+/// Disables raw mode first — the state that breaks the user's shell,
+/// so its undo never runs behind an escape-sequence write that can
+/// fail on an unwritable stdout — then leaves the alternate screen,
+/// returns the cursor to the user's own shape, and stands the paste
+/// and mouse modes down. Both attempts always
+/// run; the raw-mode error, when present, is the one returned. Safe
+/// to call repeatedly and safe when the terminal was never
+/// initialized — the escape sequences are ignored by a terminal not
+/// in those modes.
 ///
 /// # Errors
 /// Fails only when the mode change or the escape-sequence write is
 /// rejected by the underlying terminal.
 pub fn restore_terminal() -> io::Result<()> {
     let raw_result = disable_raw_mode();
-    let alt_result = execute!(io::stdout(), LeaveAlternateScreen);
+    let alt_result = execute!(
+        io::stdout(),
+        SetCursorStyle::DefaultUserShape,
+        DisableMouseCapture,
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    );
     raw_result.and(alt_result)
 }
 

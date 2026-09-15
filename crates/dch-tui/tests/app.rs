@@ -14,7 +14,9 @@
 
 use std::sync::Arc;
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+};
 use dch_config::DchConfig;
 use dch_tui::TuiApp;
 use dch_tui::message::{ActiveTool, ContentBlock, TuiMessage};
@@ -42,6 +44,15 @@ fn plain(code: KeyCode) -> Event {
     key(code, KeyModifiers::NONE)
 }
 
+fn wheel_event(kind: MouseEventKind) -> Event {
+    Event::Mouse(MouseEvent {
+        kind,
+        column: 0,
+        row: 0,
+        modifiers: KeyModifiers::NONE,
+    })
+}
+
 fn render_to_buffer(app: &mut TuiApp, width: u16, height: u16) -> Terminal<TestBackend> {
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
     terminal.draw(|frame| app.render(frame)).unwrap();
@@ -54,7 +65,6 @@ fn new_constructs_with_empty_fresh_state() {
 
     assert!(app.conversation().is_empty());
     assert!(app.input().is_empty());
-    assert_eq!(app.cursor(), 0);
     assert_eq!(app.scroll_offset(), 0);
     assert!(!app.is_quitting());
 
@@ -85,7 +95,6 @@ fn typing_echoes_into_the_input() {
         assert!(app.handle_event(&plain(KeyCode::Char(c))));
     }
     assert_eq!(app.input(), "hello");
-    assert_eq!(app.cursor(), 5);
 
     let terminal = render_to_buffer(&mut app, 80, 30);
     let buffer = terminal.backend().buffer();
@@ -127,7 +136,6 @@ fn backspace_deletes_whole_characters() {
         app.handle_event(&plain(KeyCode::Char(c)));
     }
     assert_eq!(app.input(), "héllo");
-    assert_eq!(app.cursor(), 6, "the cursor is a byte index");
 
     app.handle_event(&plain(KeyCode::Backspace));
     assert_eq!(app.input(), "héll");
@@ -144,7 +152,6 @@ fn backspace_deletes_whole_characters() {
         "h",
         "dropping the multi-byte é removes the whole character"
     );
-    assert_eq!(accent_app.cursor(), 1);
 }
 
 #[test]
@@ -157,7 +164,6 @@ fn enter_submits_appends_and_clears() {
     assert!(app.handle_event(&plain(KeyCode::Enter)));
 
     assert!(app.input().is_empty());
-    assert_eq!(app.cursor(), 0);
     assert_eq!(app.conversation().len(), 1);
     match app.conversation().first() {
         Some(TuiMessage::User { text, .. }) => assert_eq!(text, "hi"),
@@ -786,4 +792,241 @@ fn long_error_messages_wrap_at_the_pane_width() {
         view.contains("ENDMARK"),
         "the wrapped tail of a long error stays visible instead of clipping: {view:?}"
     );
+}
+
+#[test]
+fn the_mouse_wheel_scrolls_three_lines_per_event() {
+    let mut app = app();
+    assert!(app.handle_event(&wheel_event(MouseEventKind::ScrollUp)));
+    assert_eq!(app.scroll_offset(), 3);
+    assert!(!app.auto_scroll(), "wheel up detaches stickiness");
+    assert!(app.handle_event(&wheel_event(MouseEventKind::ScrollDown)));
+    assert_eq!(app.scroll_offset(), 0, "one wheel down clears one wheel up");
+    assert!(app.auto_scroll(), "landing at the bottom re-arms");
+}
+
+#[test]
+fn a_paste_event_lands_atomically_in_the_editor() {
+    let mut app = app();
+    assert!(app.handle_event(&Event::Paste("line one\nline two".to_string())));
+    assert_eq!(app.input(), "line one\nline two");
+}
+
+#[test]
+fn a_submit_increments_the_shared_queue_depth() {
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept.clone());
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    app.set_submit_tx(tx);
+    for c in "hi".chars() {
+        app.handle_event(&plain(KeyCode::Char(c)));
+    }
+    assert!(app.handle_event(&plain(KeyCode::Enter)));
+    assert_eq!(rx.try_recv().unwrap(), "hi");
+    assert_eq!(
+        kept.queued.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the send bumps the depth the driver will decrement"
+    );
+}
+
+#[test]
+fn the_input_box_grows_with_wrapped_lines_and_shows_the_hint() {
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept.clone());
+
+    let single = render_to_buffer(&mut app, 40, 24);
+    let rows = row_texts(&single);
+    assert!(
+        rows[20].contains("shift+enter"),
+        "the hint rides the single-row input box's border: {}",
+        rows[20]
+    );
+
+    app.handle_event(&Event::Paste("one\ntwo".to_string()));
+    let grown = render_to_buffer(&mut app, 40, 24);
+    let rows = row_texts(&grown);
+    assert!(
+        rows[19].contains("shift+enter"),
+        "a second row moves the border and its title up: {}",
+        rows[19]
+    );
+    assert!(rows[20].contains("one"), "the first wrapped row renders");
+
+    kept.queued.store(2, std::sync::atomic::Ordering::SeqCst);
+    let queued = render_to_buffer(&mut app, 40, 24);
+    assert!(
+        row_texts(&queued)[19].contains("2 queued"),
+        "the queued count prefixes the title while the driver has unclaimed sends"
+    );
+}
+
+#[test]
+fn up_recalls_history_instead_of_scrolling_the_transcript() {
+    let mut app = app();
+    for c in "earlier".chars() {
+        app.handle_event(&plain(KeyCode::Char(c)));
+    }
+    assert!(app.handle_event(&plain(KeyCode::Enter)));
+
+    assert!(app.handle_event(&plain(KeyCode::Up)));
+    assert_eq!(app.input(), "earlier", "Up recalls the submitted entry");
+    assert_eq!(app.scroll_offset(), 0, "the transcript does not move");
+    assert!(app.auto_scroll(), "history recall does not detach the view");
+}
+
+#[test]
+fn ctrl_p_recalls_history_from_a_multiline_buffer() {
+    let mut app = app();
+    for c in "earlier".chars() {
+        app.handle_event(&plain(KeyCode::Char(c)));
+    }
+    assert!(app.handle_event(&plain(KeyCode::Enter)));
+    for c in "ab".chars() {
+        app.handle_event(&plain(KeyCode::Char(c)));
+    }
+    assert!(app.handle_event(&key(KeyCode::Enter, KeyModifiers::SHIFT)));
+    app.handle_event(&plain(KeyCode::Char('c')));
+
+    assert!(app.handle_event(&key(KeyCode::Char('p'), KeyModifiers::CONTROL)));
+    assert_eq!(
+        app.input(),
+        "earlier",
+        "Ctrl-P reaches history even while editing multiple lines"
+    );
+}
+
+#[test]
+fn late_pushed_messages_appear_in_the_next_render() {
+    let mut app = app();
+    let _ = render_to_buffer(&mut app, 40, 12);
+    app.push_message(TuiMessage::User {
+        text: "arrived between frames".to_string(),
+        timestamp: chrono::Utc::now(),
+    });
+    let terminal = render_to_buffer(&mut app, 40, 12);
+    assert!(
+        view_text(&terminal, 40, 12).contains("arrived between frames"),
+        "a message pushed after a cached render must still show up"
+    );
+}
+
+#[test]
+fn a_width_change_reflows_the_cached_conversation() {
+    let mut app = app();
+    app.push_message(TuiMessage::Assistant {
+        blocks: vec![ContentBlock::Text {
+            text: "aaaaaaaaaa bbbbbbbbbb cccccccccc dddddddddd".to_string(),
+        }],
+        timestamp: chrono::Utc::now(),
+        duration_ms: None,
+    });
+    let wide = render_to_buffer(&mut app, 60, 12);
+    assert!(
+        row_texts(&wide)[0].contains("dddddddddd"),
+        "at width 60 the message fits one row"
+    );
+
+    let narrow = render_to_buffer(&mut app, 20, 12);
+    let narrow_rows = row_texts(&narrow);
+    assert!(
+        !narrow_rows[0].contains("dddddddddd")
+            && narrow_rows.iter().any(|row| row.contains("dddddddddd")),
+        "a resize rebuilds the cache and the message reflows onto later rows"
+    );
+}
+
+#[test]
+fn a_large_session_typing_redraw_stays_inside_the_frame_budget() {
+    // Per the render cache and the windowed viewport assembly, a
+    // keystroke's cost tracks the pane height, not the session
+    // length. A regression to per-frame O(session) work (the whole-
+    // conversation clone this replaces) pushes the mean past this
+    // budget by an order of magnitude at this session size.
+    let mut app = app();
+    for i in 0..150 {
+        let text = (0..40)
+            .map(|l| format!("message {i} line {l} with some words here"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        app.push_message(TuiMessage::Assistant {
+            blocks: vec![ContentBlock::Text { text }],
+            timestamp: chrono::Utc::now(),
+            duration_ms: None,
+        });
+    }
+    let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+    terminal.draw(|frame| app.render(frame)).unwrap();
+
+    let chars: Vec<char> = "the quick brown fox jumps".chars().collect();
+    let start = std::time::Instant::now();
+    for i in 0..100 {
+        app.handle_event(&plain(KeyCode::Char(chars[i % chars.len()])));
+        terminal.draw(|frame| app.render(frame)).unwrap();
+    }
+    let mean_micros = start.elapsed().as_secs_f64() * 1e4;
+    assert!(
+        mean_micros < 10_000.0,
+        "mean typing redraw {mean_micros:.0} µs exceeds the 10 ms frame-class budget"
+    );
+}
+
+#[test]
+fn typing_during_a_live_code_block_stays_inside_the_frame_budget() {
+    // The live segment re-renders only when a delta moves its stamp;
+    // a keystroke changes nothing about the streamed reply, so its
+    // frame must be a cache hit. Re-parsing per keystroke (the shape
+    // this guards against) measured two orders of magnitude past
+    // this budget with a 300-line open fence in a debug build.
+    let mut app = app();
+    let mut reply = String::from("```rust\n");
+    for i in 0..300 {
+        reply.push_str("let value_");
+        reply.push_str(&i.to_string());
+        reply.push_str(" = compute_something(i) + other(i);\n");
+    }
+    app.streaming_text()
+        .lock()
+        .expect("the streaming lock")
+        .push_str(&reply);
+    let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+    terminal.draw(|frame| app.render(frame)).unwrap();
+
+    let chars: Vec<char> = "the quick brown fox".chars().collect();
+    let start = std::time::Instant::now();
+    for i in 0..50 {
+        app.handle_event(&plain(KeyCode::Char(chars[i % chars.len()])));
+        terminal.draw(|frame| app.render(frame)).unwrap();
+    }
+    let mean_micros = start.elapsed().as_secs_f64() * 2e4;
+    assert!(
+        mean_micros < 10_000.0,
+        "mean typing redraw {mean_micros:.0} µs with a live open fence exceeds the budget"
+    );
+}
+
+#[test]
+fn a_failed_send_rolls_the_queue_increment_back() {
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept.clone());
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    app.set_submit_tx(tx);
+    drop(rx);
+
+    for c in "gone".chars() {
+        app.handle_event(&plain(KeyCode::Char(c)));
+    }
+    assert!(app.handle_event(&plain(KeyCode::Enter)));
+    assert_eq!(
+        kept.queued.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a send no receiver takes must not stay counted as queued"
+    );
+    assert_eq!(app.conversation().len(), 1, "the echo still lands");
 }
