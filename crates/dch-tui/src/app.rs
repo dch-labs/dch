@@ -6,10 +6,13 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+};
 use futures::StreamExt;
 use ratatui::Frame;
 use ratatui::backend::CrosstermBackend;
@@ -19,10 +22,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthChar;
 
 use dch_config::DchConfig;
 
+use crate::input::{InputAction, InputEditor};
 use crate::markdown;
 use crate::message::{ActiveTool, ContentBlock, TokenCounts, TuiMessage};
 use crate::observer::{ToolResultDisplay, TuiObserverState};
@@ -49,6 +53,13 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 /// so an exact offset-zero check would detach a view that only fell
 /// behind by growth.
 const STICK_TOLERANCE: usize = 2;
+
+/// Lines one wheel or touchpad scroll event moves.
+///
+/// The terminal convention per notch: enough that touchpad momentum
+/// accumulates into fast travel without overshooting a single
+/// gesture.
+const WHEEL_SCROLL_LINES: usize = 3;
 
 /// The most lines of the live segment parsed as markdown per frame.
 ///
@@ -106,17 +117,12 @@ pub struct TuiApp {
     /// nothing accumulates without bound.
     tool_history: Vec<ToolResultDisplay>,
 
-    /// The input line's current text.
+    /// The input editor: multi-line buffer, cursor, and history.
     ///
-    /// Keystrokes insert at the cursor; Enter submits the text and
-    /// clears the buffer.
-    input: String,
-
-    /// The input cursor's byte index.
-    ///
-    /// Always at a UTF-8 character boundary; it stays at the end of
-    /// the text, since the cursor cannot move within the line.
-    cursor: usize,
+    /// Every non-app key routes here. Submits surface as
+    /// [`InputAction::Submit`], echo into the conversation, and
+    /// travel the submit channel to the agent driver.
+    input: InputEditor,
 
     /// Lines scrolled up from the bottom of the view.
     ///
@@ -239,8 +245,7 @@ impl TuiApp {
             state,
             submit_tx: None,
             tool_history: Vec::new(),
-            input: String::new(),
-            cursor: 0,
+            input: InputEditor::new(),
             scroll_offset: 0,
             auto_scroll: true,
             render_pending: false,
@@ -273,21 +278,13 @@ impl TuiApp {
         self.conversation.push(message);
     }
 
-    /// The current input-line text.
+    /// The input buffer's current text.
     ///
-    /// Empty right after a submit; keystrokes append at the cursor.
+    /// Empty right after a submit; keystrokes and pastes edit it
+    /// through the editor.
     #[must_use]
     pub fn input(&self) -> &str {
-        &self.input
-    }
-
-    /// The input cursor's byte index.
-    ///
-    /// Counts bytes, not characters, and always sits on a UTF-8
-    /// character boundary.
-    #[must_use]
-    pub fn cursor(&self) -> usize {
-        self.cursor
+        self.input.text()
     }
 
     /// The scroll offset in lines above the bottom of the view.
@@ -419,53 +416,37 @@ impl TuiApp {
     /// Apply one terminal event to the app state.
     ///
     /// Returns whether the event requires a redraw. Key releases and
-    /// repeats are ignored so a held key fires once per press.
+    /// repeats are ignored so a held key fires once per press. Mouse
+    /// events other than the wheel are ignored.
     pub fn handle_event(&mut self, event: &Event) -> bool {
-        let Event::Key(key) = event else {
-            return matches!(event, Event::Resize(_, _));
-        };
-        if key.kind != KeyEventKind::Press {
-            return false;
+        match event {
+            Event::Key(key) => {
+                if key.kind != KeyEventKind::Press {
+                    return false;
+                }
+                self.handle_key(*key)
+            }
+            Event::Mouse(mouse) => self.handle_mouse(*mouse),
+            Event::Paste(text) => {
+                self.input.insert_str(text);
+                true
+            }
+            Event::Resize(_, _) => true,
+            _ => false,
         }
+    }
+
+    /// Apply one key press: quit and page-scroll keys stay app-level,
+    /// everything else belongs to the input editor.
+    ///
+    /// Up, Down, and End fall back to the transcript while the input
+    /// sits empty with no history to recall — a fresh session's
+    /// arrows still scroll the conversation — and join the editor as
+    /// soon as anything is typed or recallable.
+    fn handle_key(&mut self, key: KeyEvent) -> bool {
         match (key.code, key.modifiers) {
             (KeyCode::Char('c' | 'd'), KeyModifiers::CONTROL) | (KeyCode::Esc, _) => {
                 self.quitting = true;
-                true
-            }
-            (KeyCode::Enter, _) => {
-                let text = std::mem::take(&mut self.input);
-                self.cursor = 0;
-                if !text.trim().is_empty() {
-                    if let Some(tx) = &self.submit_tx {
-                        drop(tx.send(text.clone()));
-                    }
-                    self.conversation.push(TuiMessage::User {
-                        text,
-                        timestamp: chrono::Utc::now(),
-                    });
-                    self.scroll_to_bottom();
-                }
-                true
-            }
-            (KeyCode::Backspace, _) => {
-                self.delete_char_before_cursor();
-                true
-            }
-            (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
-                if self.input.is_char_boundary(self.cursor) {
-                    self.input.insert(self.cursor, c);
-                    self.cursor = self.cursor.saturating_add(c.len_utf8());
-                }
-                true
-            }
-            (KeyCode::Up, KeyModifiers::NONE) => {
-                self.scroll_offset = self.scroll_offset.saturating_add(1);
-                self.auto_scroll = false;
-                true
-            }
-            (KeyCode::Down, KeyModifiers::NONE) => {
-                self.scroll_offset = self.scroll_offset.saturating_sub(1);
-                self.rearm_if_near_bottom();
                 true
             }
             (KeyCode::PageUp, _) => {
@@ -478,30 +459,80 @@ impl TuiApp {
                 self.rearm_if_near_bottom();
                 true
             }
-            (KeyCode::End, _) => {
+            (KeyCode::Up, KeyModifiers::NONE)
+                if self.input.is_empty() && !self.input.has_history() =>
+            {
+                self.scroll_offset = self.scroll_offset.saturating_add(1);
+                self.auto_scroll = false;
+                true
+            }
+            (KeyCode::Down, KeyModifiers::NONE)
+                if self.input.is_empty() && !self.input.has_history() =>
+            {
+                self.scroll_offset = self.scroll_offset.saturating_sub(1);
+                self.rearm_if_near_bottom();
+                true
+            }
+            (KeyCode::End, _) if self.input.is_empty() => {
                 self.scroll_to_bottom();
+                true
+            }
+            _ => {
+                let action = self.input.handle_key(key);
+                self.apply_input_action(action)
+            }
+        }
+    }
+
+    /// Apply one mouse event.
+    ///
+    /// The wheel scrolls by [`WHEEL_SCROLL_LINES`]; anything else is
+    /// ignored.
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                self.scroll_offset = self.scroll_offset.saturating_add(WHEEL_SCROLL_LINES);
+                self.auto_scroll = false;
+                true
+            }
+            MouseEventKind::ScrollDown => {
+                self.scroll_offset = self.scroll_offset.saturating_sub(WHEEL_SCROLL_LINES);
+                self.rearm_if_near_bottom();
                 true
             }
             _ => false,
         }
     }
 
-    /// Delete the character before the cursor.
+    /// Route an editor action.
     ///
-    /// Walks back to the previous char boundary, so multi-byte input
-    /// never sheds a partial character.
-    fn delete_char_before_cursor(&mut self) {
-        if self.cursor == 0 {
-            return;
+    /// A submit echoes, enqueues, and re-anchors; the rest need
+    /// nothing beyond the redraw the caller grants.
+    fn apply_input_action(&mut self, action: InputAction) -> bool {
+        match action {
+            InputAction::Submit(text) => {
+                self.submit_text(text);
+                true
+            }
+            InputAction::Redraw | InputAction::None => true,
         }
-        let Some(prefix) = self.input.get(..self.cursor) else {
-            return;
-        };
-        let new_cursor = prefix.char_indices().last().map_or(0, |(i, _)| i);
-        if self.input.is_char_boundary(new_cursor) {
-            self.input.drain(new_cursor..);
-            self.cursor = new_cursor;
+    }
+
+    /// Send one submitted text to the agent driver and echo it.
+    ///
+    /// The channel send (when a driver is attached) counts toward
+    /// the queued indicator the input title renders; the local echo
+    /// lands immediately and the view re-anchors to the newest line.
+    fn submit_text(&mut self, text: String) {
+        if let Some(tx) = &self.submit_tx {
+            self.state.queued.fetch_add(1, Ordering::SeqCst);
+            drop(tx.send(text.clone()));
         }
+        self.conversation.push(TuiMessage::User {
+            text,
+            timestamp: chrono::Utc::now(),
+        });
+        self.scroll_to_bottom();
     }
 
     /// Whether any tool call is in flight.
@@ -637,11 +668,17 @@ impl TuiApp {
     pub fn render(&mut self, frame: &mut Frame) {
         self.drain_shared_state();
         let area = frame.area();
+        let input_width = area.width.max(1).saturating_sub(2);
+        let input_rows = self.input.wrapped_lines(input_width).len();
+        let input_height = u16::try_from(input_rows.saturating_add(2))
+            .unwrap_or(u16::MAX)
+            .min(area.height.saturating_div(2))
+            .max(3);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(0),
-                Constraint::Length(3),
+                Constraint::Length(input_height),
                 Constraint::Length(1),
             ])
             .split(area);
@@ -987,29 +1024,45 @@ impl TuiApp {
             .collect()
     }
 
-    /// Render the input box with the caret position.
+    /// Render the input box: wrapped editor rows, the newline hint,
+    /// the queued indicator, and the terminal cursor's cell.
     ///
-    /// The caret sits one column inside the border, offset by the
-    /// display width of the text before the cursor.
+    /// The block title always teaches the two newline gestures — the
+    /// hint is the discovery path on terminals where Shift+Enter
+    /// arrives as a plain Enter — and prefixes the queued-submission
+    /// count while the driver has unclaimed sends. The caret sits
+    /// one cell inside the border, offset by the cursor's display
+    /// column and wrapped row.
     fn render_input(&self, frame: &mut Frame, area: Rect) {
+        let width = area.width.max(1).saturating_sub(2);
+        let rows = self.input.wrapped_lines(width);
+        let queued = self.state.queued.load(Ordering::SeqCst);
+        let title = if queued > 0 {
+            format!(" ⏳ {queued} queued · ⏎ enter · shift+enter or \\+enter for newline ")
+        } else {
+            " ⏎ enter · shift+enter or \\+enter for newline ".to_string()
+        };
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(self.theme.ui.input_border));
+            .border_style(Style::default().fg(self.theme.ui.input_border))
+            .title(title);
         let inner = block.inner(area);
-        frame.render_widget(
-            Paragraph::new(self.input.clone()).style(Style::default().fg(self.theme.ui.input_text)),
-            inner,
-        );
+        let lines: Vec<Line<'_>> = rows
+            .iter()
+            .map(|row| Line::styled(row.as_str(), Style::default().fg(self.theme.ui.input_text)))
+            .collect();
+        frame.render_widget(Paragraph::new(lines), inner);
         frame.render_widget(block, area);
 
-        let prefix_width = self
-            .input
-            .get(..self.cursor)
-            .map_or(0, UnicodeWidthStr::width);
-        let caret_x = u16::try_from(prefix_width)
-            .map_or(inner.x, |width| inner.x.saturating_add(width))
+        let (row, column) = self.input.cursor_cell(width).unwrap_or((0, 0));
+        let caret_x = inner
+            .x
+            .saturating_add(column)
             .min(inner.right().saturating_sub(1));
-        let caret_y = inner.y;
+        let caret_y = inner
+            .y
+            .saturating_add(row)
+            .min(inner.bottom().saturating_sub(1));
         frame.set_cursor_position((caret_x, caret_y));
     }
 

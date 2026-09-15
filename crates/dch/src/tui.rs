@@ -117,6 +117,7 @@ async fn drive_submissions(
     while !shutting_down.load(Ordering::SeqCst)
         && let Some(text) = receiver.recv().await
     {
+        state.queued.fetch_sub(1, Ordering::SeqCst);
         if let Err(err) = runner.run(&text).await {
             state
                 .errors
@@ -142,8 +143,9 @@ mod tests {
     use dch_config::ApiType;
 
     /// A config whose provider endpoint refuses connections on the
-    /// loopback interface, so a real run fails fast without touching
-    /// the network.
+    /// loopback interface.
+    ///
+    /// A real run then fails fast without touching the network.
     fn unreachable_config() -> dch_config::DchConfig {
         let mut config = dch_config::DchConfig::default();
         config.api.api_type = ApiType::OpenAi;
@@ -181,18 +183,29 @@ mod tests {
         drop(tx);
         let listener = state.render_notify.listen();
 
+        state.queued.store(1, Ordering::SeqCst);
         tokio::time::timeout(
             std::time::Duration::from_secs(30),
             drive_submissions(runner, rx, state.clone(), shutdown_flag(false)),
         )
         .await
         .expect("a refused connection resolves without hanging");
+        assert_eq!(
+            state.queued.load(Ordering::SeqCst),
+            0,
+            "the driver claims the submission, returning the depth to zero"
+        );
 
         {
             let errors = state.errors.lock().unwrap();
             assert_eq!(errors.len(), 1, "exactly one failure is recorded");
             assert!(!errors[0].is_empty(), "the failure carries its message");
         }
+        assert_eq!(
+            state.queued.load(Ordering::SeqCst),
+            0,
+            "the driver claims the send it is running"
+        );
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(100), listener)
                 .await
@@ -222,7 +235,9 @@ mod tests {
         let (_, state) = TuiObserverState::new().into_observer();
         let (tx, rx) = mpsc::unbounded_channel();
         tx.send("first".to_string()).unwrap();
+        state.queued.fetch_add(1, Ordering::SeqCst);
         tx.send("second".to_string()).unwrap();
+        state.queued.fetch_add(1, Ordering::SeqCst);
         drop(tx);
 
         tokio::time::timeout(
@@ -236,6 +251,11 @@ mod tests {
         assert!(
             errors.is_empty(),
             "no submission is admitted once shutdown has begun — neither queued task ran"
+        );
+        assert_eq!(
+            state.queued.load(Ordering::SeqCst),
+            2,
+            "unclaimed submissions stay counted — the queue outlives the driver"
         );
     }
 }

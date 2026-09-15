@@ -14,7 +14,9 @@
 
 use std::sync::Arc;
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+};
 use dch_config::DchConfig;
 use dch_tui::TuiApp;
 use dch_tui::message::{ActiveTool, ContentBlock, TuiMessage};
@@ -42,6 +44,15 @@ fn plain(code: KeyCode) -> Event {
     key(code, KeyModifiers::NONE)
 }
 
+fn wheel_event(kind: MouseEventKind) -> Event {
+    Event::Mouse(MouseEvent {
+        kind,
+        column: 0,
+        row: 0,
+        modifiers: KeyModifiers::NONE,
+    })
+}
+
 fn render_to_buffer(app: &mut TuiApp, width: u16, height: u16) -> Terminal<TestBackend> {
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
     terminal.draw(|frame| app.render(frame)).unwrap();
@@ -54,7 +65,6 @@ fn new_constructs_with_empty_fresh_state() {
 
     assert!(app.conversation().is_empty());
     assert!(app.input().is_empty());
-    assert_eq!(app.cursor(), 0);
     assert_eq!(app.scroll_offset(), 0);
     assert!(!app.is_quitting());
 
@@ -85,7 +95,6 @@ fn typing_echoes_into_the_input() {
         assert!(app.handle_event(&plain(KeyCode::Char(c))));
     }
     assert_eq!(app.input(), "hello");
-    assert_eq!(app.cursor(), 5);
 
     let terminal = render_to_buffer(&mut app, 80, 30);
     let buffer = terminal.backend().buffer();
@@ -127,7 +136,6 @@ fn backspace_deletes_whole_characters() {
         app.handle_event(&plain(KeyCode::Char(c)));
     }
     assert_eq!(app.input(), "héllo");
-    assert_eq!(app.cursor(), 6, "the cursor is a byte index");
 
     app.handle_event(&plain(KeyCode::Backspace));
     assert_eq!(app.input(), "héll");
@@ -144,7 +152,6 @@ fn backspace_deletes_whole_characters() {
         "h",
         "dropping the multi-byte é removes the whole character"
     );
-    assert_eq!(accent_app.cursor(), 1);
 }
 
 #[test]
@@ -157,7 +164,6 @@ fn enter_submits_appends_and_clears() {
     assert!(app.handle_event(&plain(KeyCode::Enter)));
 
     assert!(app.input().is_empty());
-    assert_eq!(app.cursor(), 0);
     assert_eq!(app.conversation().len(), 1);
     match app.conversation().first() {
         Some(TuiMessage::User { text, .. }) => assert_eq!(text, "hi"),
@@ -785,5 +791,111 @@ fn long_error_messages_wrap_at_the_pane_width() {
     assert!(
         view.contains("ENDMARK"),
         "the wrapped tail of a long error stays visible instead of clipping: {view:?}"
+    );
+}
+
+#[test]
+fn the_mouse_wheel_scrolls_three_lines_per_event() {
+    let mut app = app();
+    assert!(app.handle_event(&wheel_event(MouseEventKind::ScrollUp)));
+    assert_eq!(app.scroll_offset(), 3);
+    assert!(!app.auto_scroll(), "wheel up detaches stickiness");
+    assert!(app.handle_event(&wheel_event(MouseEventKind::ScrollDown)));
+    assert_eq!(app.scroll_offset(), 0, "one wheel down clears one wheel up");
+    assert!(app.auto_scroll(), "landing at the bottom re-arms");
+}
+
+#[test]
+fn a_paste_event_lands_atomically_in_the_editor() {
+    let mut app = app();
+    assert!(app.handle_event(&Event::Paste("line one\nline two".to_string())));
+    assert_eq!(app.input(), "line one\nline two");
+}
+
+#[test]
+fn a_submit_increments_the_shared_queue_depth() {
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept.clone());
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    app.set_submit_tx(tx);
+    for c in "hi".chars() {
+        app.handle_event(&plain(KeyCode::Char(c)));
+    }
+    assert!(app.handle_event(&plain(KeyCode::Enter)));
+    assert_eq!(rx.try_recv().unwrap(), "hi");
+    assert_eq!(
+        kept.queued.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the send bumps the depth the driver will decrement"
+    );
+}
+
+#[test]
+fn the_input_box_grows_with_wrapped_lines_and_shows_the_hint() {
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept.clone());
+
+    let single = render_to_buffer(&mut app, 40, 24);
+    let rows = row_texts(&single);
+    assert!(
+        rows[20].contains("shift+enter"),
+        "the hint rides the single-row input box's border: {}",
+        rows[20]
+    );
+
+    app.handle_event(&Event::Paste("one\ntwo".to_string()));
+    let grown = render_to_buffer(&mut app, 40, 24);
+    let rows = row_texts(&grown);
+    assert!(
+        rows[19].contains("shift+enter"),
+        "a second row moves the border and its title up: {}",
+        rows[19]
+    );
+    assert!(rows[20].contains("one"), "the first wrapped row renders");
+
+    kept.queued.store(2, std::sync::atomic::Ordering::SeqCst);
+    let queued = render_to_buffer(&mut app, 40, 24);
+    assert!(
+        row_texts(&queued)[19].contains("2 queued"),
+        "the queued count prefixes the title while the driver has unclaimed sends"
+    );
+}
+
+#[test]
+fn up_recalls_history_instead_of_scrolling_the_transcript() {
+    let mut app = app();
+    for c in "earlier".chars() {
+        app.handle_event(&plain(KeyCode::Char(c)));
+    }
+    assert!(app.handle_event(&plain(KeyCode::Enter)));
+
+    assert!(app.handle_event(&plain(KeyCode::Up)));
+    assert_eq!(app.input(), "earlier", "Up recalls the submitted entry");
+    assert_eq!(app.scroll_offset(), 0, "the transcript does not move");
+    assert!(app.auto_scroll(), "history recall does not detach the view");
+}
+
+#[test]
+fn ctrl_p_recalls_history_from_a_multiline_buffer() {
+    let mut app = app();
+    for c in "earlier".chars() {
+        app.handle_event(&plain(KeyCode::Char(c)));
+    }
+    assert!(app.handle_event(&plain(KeyCode::Enter)));
+    for c in "ab".chars() {
+        app.handle_event(&plain(KeyCode::Char(c)));
+    }
+    assert!(app.handle_event(&key(KeyCode::Enter, KeyModifiers::SHIFT)));
+    app.handle_event(&plain(KeyCode::Char('c')));
+
+    assert!(app.handle_event(&key(KeyCode::Char('p'), KeyModifiers::CONTROL)));
+    assert_eq!(
+        app.input(),
+        "earlier",
+        "Ctrl-P reaches history even while editing multiple lines"
     );
 }
