@@ -602,6 +602,49 @@ fn scrolling_up_during_a_stream_holds_the_viewport() {
 }
 
 #[test]
+fn a_detached_view_stays_anchored_when_the_layout_shrinks() {
+    let (observer, mut app) = streaming_app();
+    drop(observer);
+    for i in 0..40 {
+        app.push_message(TuiMessage::User {
+            text: format!("line{i}"),
+            timestamp: chrono::Utc::now(),
+        });
+    }
+    seed(&app, &paras(1, 9));
+    render_to_buffer(&mut app, 40, 24);
+
+    app.handle_event(&plain(KeyCode::PageUp));
+    app.handle_event(&plain(KeyCode::PageUp));
+    assert!(!app.auto_scroll(), "the view is detached");
+    let held = render_to_buffer(&mut app, 40, 24);
+    let top_before = row_texts(&held)[0].trim().to_string();
+    assert!(
+        top_before.starts_with("line"),
+        "the detached viewport sits on a conversation row: {top_before:?}"
+    );
+
+    let mut buffer = app.streaming_text().lock().unwrap();
+    buffer.clear();
+    drop(buffer);
+    let shrunk = render_to_buffer(&mut app, 40, 24);
+    let rows = row_texts(&shrunk);
+    assert_eq!(
+        rows[0].trim(),
+        top_before,
+        "the viewport holds its anchor when the streaming region collapses"
+    );
+    assert!(
+        !view_text(&shrunk, 40, 24).contains("line0"),
+        "a shrinking layout never pins the detached view at the document start"
+    );
+    assert!(
+        !app.auto_scroll(),
+        "collapsing content does not silently re-arm stickiness"
+    );
+}
+
+#[test]
 fn end_rearms_stickiness_and_snaps_to_the_newest_line() {
     let (_, mut app) = streaming_app();
     seed(&app, &paras(1, 35));
@@ -868,6 +911,32 @@ fn a_poisoned_stream_buffer_still_appends() {
     assert!(
         recovered.ends_with('x'),
         "the recovered guard still appends after poisoning"
+    );
+}
+
+#[test]
+fn a_poisoned_stream_buffer_still_renders() {
+    let (observer, mut app) = streaming_app();
+    seed(&app, &paras(1, 3));
+    let panicked = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let _guard = app.streaming_text().lock().unwrap();
+        panic!("poison the streaming lock");
+    }));
+    assert!(panicked.is_err(), "the poisoning panic must unwind");
+
+    let terminal = render_to_buffer(&mut app, 40, 24);
+    let view = view_text(&terminal, 40, 24);
+    assert!(
+        view.contains("para1") && view.contains("para3"),
+        "the live region renders through the poisoned lock instead of going blank: {view:?}"
+    );
+
+    observer.on_text_delta(&delta(0, "post-poison tail"));
+    drop(observer);
+    let second = render_to_buffer(&mut app, 40, 24);
+    assert!(
+        view_text(&second, 40, 24).contains("post-poison tail"),
+        "deltas arriving after the poisoning keep rendering on later frames"
     );
 }
 

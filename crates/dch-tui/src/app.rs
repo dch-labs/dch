@@ -140,8 +140,8 @@ pub struct TuiApp {
     /// Total lines the previous layout produced.
     ///
     /// While detached, each layout compensates the scroll offset for
-    /// growth since this value, holding the viewport steady as the
-    /// streaming region extends below it.
+    /// growth or shrinkage since this value, holding the viewport
+    /// steady as the streaming region extends below it or collapses.
     last_layout_lines: usize,
 
     /// Rendered lines of the streaming buffer's frozen prefix.
@@ -486,8 +486,8 @@ impl TuiApp {
     /// Whether any tool call is in flight.
     ///
     /// The tick consults this to keep in-flight elapsed stamps live;
-    /// a poisoned lock reads as none, the same policy the render
-    /// path applies to the live region.
+    /// a poisoned lock reads as none, the same policy the tool
+    /// indicator rows apply.
     fn any_tools_running(&self) -> bool {
         self.state
             .active_tools
@@ -609,8 +609,10 @@ impl TuiApp {
     /// frozen blocks render from the cache, the live complete lines
     /// re-parse as markdown, and the unterminated tail renders as
     /// plaintext. A pinned view re-anchors to the newest line; a
-    /// detached view's offset is compensated for layout growth, so
-    /// the viewport holds while content streams in below it.
+    /// detached view's offset is compensated for layout growth and
+    /// shrinkage and clamped to the document's scrollable height, so
+    /// the viewport holds while content streams in below it or
+    /// collapses away.
     pub fn render(&mut self, frame: &mut Frame) {
         self.drain_shared_state();
         let area = frame.area();
@@ -637,8 +639,15 @@ impl TuiApp {
         if self.auto_scroll {
             self.scroll_offset = 0;
         } else {
-            let growth = total_lines.saturating_sub(self.last_layout_lines);
-            self.scroll_offset = self.scroll_offset.saturating_add(growth);
+            let delta = total_lines.abs_diff(self.last_layout_lines);
+            if total_lines >= self.last_layout_lines {
+                self.scroll_offset = self.scroll_offset.saturating_add(delta);
+            } else {
+                self.scroll_offset = self.scroll_offset.saturating_sub(delta);
+            }
+            self.scroll_offset = self
+                .scroll_offset
+                .min(total_lines.saturating_sub(conversation_height));
         }
         self.last_layout_lines = total_lines;
         let skip = total_lines
@@ -778,13 +787,16 @@ impl TuiApp {
     /// renders as plaintext until it freezes, bounding the
     /// per-frame parse); and the unterminated tail —
     /// the line still being typed, as width-wrapped plaintext. An
-    /// empty or poisoned buffer renders nothing.
+    /// empty buffer renders nothing; a poisoned lock is recovered —
+    /// the same policy the drain applies — so the live view keeps
+    /// rendering after another thread's panic.
     fn streaming_region_lines(&mut self, width: u16) -> Vec<Line<'static>> {
         let buffer = self
             .state
             .streaming_text
             .lock()
-            .map_or_else(|_| String::new(), |text| text.clone());
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         if buffer.is_empty() {
             self.reset_stream_cache();
             return Vec::new();
