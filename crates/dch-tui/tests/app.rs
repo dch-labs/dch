@@ -96,6 +96,31 @@ fn typing_echoes_into_the_input() {
 }
 
 #[test]
+fn the_caret_follows_display_width_not_bytes() {
+    let mut app = app();
+    for c in ['h', 'é', 'x'] {
+        app.handle_event(&plain(KeyCode::Char(c)));
+    }
+    let mut terminal = render_to_buffer(&mut app, 80, 30);
+    let caret = terminal.get_cursor_position().unwrap();
+    assert_eq!(
+        caret.x, 4,
+        "one border column plus three display columns of text"
+    );
+
+    let mut wide_app = TuiApp::new(config_with_theme("dracula"));
+    for c in ['h', '😀'] {
+        wide_app.handle_event(&plain(KeyCode::Char(c)));
+    }
+    let mut wide_terminal = render_to_buffer(&mut wide_app, 80, 30);
+    let caret = wide_terminal.get_cursor_position().unwrap();
+    assert_eq!(
+        caret.x, 4,
+        "one border column plus one column and a double-width glyph"
+    );
+}
+
+#[test]
 fn backspace_deletes_whole_characters() {
     let mut app = app();
     for c in ['h', 'é', 'l', 'l', 'o'] {
