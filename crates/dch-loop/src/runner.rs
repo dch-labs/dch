@@ -193,6 +193,37 @@ impl Runner {
         self.inner.cancel();
     }
 
+    /// The session identity the inner engine owns.
+    ///
+    /// A UUID minted once when the engine is constructed and stable
+    /// across every `run()` call on this runner — hosts use it to key
+    /// per-session artifacts (saved transcripts) so they match the id
+    /// the agent loop itself carries. The runner never rotates it.
+    #[must_use]
+    pub fn session_id(&self) -> uuid::Uuid {
+        self.inner.session().id
+    }
+
+    /// The assistant text of every turn the session completed, in
+    /// order.
+    ///
+    /// Reads the engine's own run records, so turns a failed run
+    /// completed before its error are included — a host saving a
+    /// transcript after a failure still sees the assistant text that
+    /// was produced. Pure tool-call turns carry no text and are
+    /// skipped.
+    #[must_use]
+    pub fn session_turn_outputs(&self) -> Vec<String> {
+        self.inner
+            .session()
+            .runs
+            .iter()
+            .flat_map(|run| run.turns.iter())
+            .map(|turn| turn.output.clone())
+            .filter(|output| !output.trim().is_empty())
+            .collect()
+    }
+
     /// The shared cancel signal, cloned from the inner loop.
     ///
     /// For external callers that need to select on cancellation from a
@@ -1006,6 +1037,90 @@ mod tests {
                 .expect("slot lock")
                 .is_some(),
             "the sender must land in the shared slot tools read"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_id_is_stable_and_non_nil() {
+        let mut config = offline_config();
+        config.api.base_url = "http://127.0.0.1:1".to_string();
+        let dir = TempDir::new().expect("tempdir");
+        let mut runner = Runner::builder(&config, dir.path())
+            .build()
+            .await
+            .expect("Runner::new constructs");
+        let first = runner.session_id();
+        assert!(
+            !first.is_nil(),
+            "the engine mints a real UUID at construction"
+        );
+        drop(runner.run("first").await);
+        drop(runner.run("second").await);
+        assert_eq!(
+            runner.session_id(),
+            first,
+            "the identity survives run boundaries — two refused runs did not rotate it"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completed_turns_survive_a_later_failure_in_the_same_run() {
+        // Turn 1 answers with text and a Read call, so the loop runs
+        // a second model turn; that call is denied permanently. The
+        // run fails, but turn 1's text was recorded before the
+        // failure and must remain readable.
+        let denied = r#"{"error":{"message":"invalid api key"}}"#.to_string();
+        let first_turn = [
+            serde_json::json!({
+                "id": "c1", "model": "test-model",
+                "choices": [{"delta": {"content": "first turn complete"}, "finish_reason": null}]
+            }),
+            serde_json::json!({
+                "id": "c1", "model": "test-model",
+                "choices": [{"delta": {"tool_calls": [{
+                    "index": 0, "id": "call_1",
+                    "function": {"name": "Read", "arguments": ""}
+                }]}, "finish_reason": null}]
+            }),
+            serde_json::json!({
+                "id": "c1", "model": "test-model",
+                "choices": [{"delta": {"tool_calls": [{
+                    "index": 0,
+                    "function": {"arguments": "{\"file_path\":\"note.txt\"}"}}
+                ]}, "finish_reason": null}]
+            }),
+            serde_json::json!({
+                "id": "c1", "model": "test-model",
+                "choices": [{"delta": null, "finish_reason": "tool_calls"}]
+            }),
+        ]
+        .iter()
+        .map(|chunk| format!("data: {chunk}\n\n"))
+        .chain(std::iter::once("data: [DONE]\n\n".to_string()))
+        .collect();
+        let server = SseServer::start_canned(vec![
+            CannedResponse {
+                status: 200,
+                body: first_turn,
+            },
+            CannedResponse {
+                status: 401,
+                body: denied,
+            },
+        ])
+        .await;
+        let dir = TempDir::new().expect("tempdir");
+        let config = wire_config(server.port, 10);
+        let mut runner = Runner::builder(&config, dir.path())
+            .build()
+            .await
+            .expect("constructs");
+        let result = runner.run("do it").await;
+        assert!(result.is_err(), "the second model call fails the run");
+        assert_eq!(
+            runner.session_turn_outputs(),
+            vec!["first turn complete".to_string()],
+            "the text of a turn completed before the failure is retained"
         );
     }
 

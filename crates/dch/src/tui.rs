@@ -11,6 +11,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use dch_tui::TuiMessage;
 use dch_tui::{TerminalGuard, TuiApp, TuiObserverState};
 use tokio::sync::mpsc;
 
@@ -69,8 +70,21 @@ async fn run_tui_session(args: &Args) -> Result<(), String> {
         .map_err(|err| format!("agent construction: {err}"))?;
 
     let (submit_tx, submit_rx) = mpsc::unbounded_channel();
+    let model = config.api.model.clone();
     let mut app = TuiApp::from_observer_state(config, state.clone());
     app.set_submit_tx(submit_tx);
+
+    // Save the transcript off the render thread whenever a turn
+    // ends: one ordered writer receives the snapshots, so the newest
+    // transcript lands last and teardown joins the final write.
+    let saver = Arc::new(crate::session::SessionSaver::with_model(
+        runner.session_id(),
+        model,
+    ));
+    let (transcript_handle, transcript_worker) = TranscriptWorker::spawn(saver);
+    app.set_turn_end_hook(Box::new(move |conversation| {
+        transcript_handle.send(conversation.to_vec());
+    }));
 
     TerminalGuard::install_panic_hook();
     let (guard, mut terminal) =
@@ -90,8 +104,208 @@ async fn run_tui_session(args: &Args) -> Result<(), String> {
     shutting_down.store(true, Ordering::SeqCst);
     cancel.cancel();
     drop(driver.await);
+    transcript_worker.join();
     drop(guard);
     session.map_err(|err| format!("terminal error: {err}"))
+}
+
+/// The handle a turn-end hook uses to hand transcripts to the writer.
+///
+/// Holds the shared one-slot mailbox: publishing a snapshot
+/// overwrites whatever is still waiting, so at most one pending
+/// transcript is ever retained — a stalled write cannot pile
+/// snapshots up behind it. Publishing is all the hook does — cheap
+/// enough to run inline on the render task.
+struct TranscriptHandle {
+    slot: Arc<std::sync::Mutex<Option<Vec<TuiMessage>>>>,
+    signal: Arc<std::sync::Condvar>,
+}
+
+impl TranscriptHandle {
+    /// Publish one conversation snapshot for the writer.
+    ///
+    /// Overwrites a still-pending snapshot — only the newest
+    /// transcript is ever worth writing — then wakes the writer.
+    /// Never blocks and never fails visibly.
+    fn send(&self, snapshot: Vec<TuiMessage>) {
+        let mut slot = self
+            .slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot = Some(snapshot);
+        drop(slot);
+        self.signal.notify_one();
+    }
+}
+
+/// The single writer thread that persists turn-end snapshots.
+///
+/// One thread takes the newest published snapshot, writes it, and
+/// waits for the next — so the newest transcript always lands last
+/// and an older, slower save can never rename over a newer one.
+/// The one-slot mailbox bounds retention at a single snapshot even
+/// while a write is stalled. Joining waits out the in-flight write
+/// and any snapshot still in the slot, so a quitting session
+/// persists its last turn.
+struct TranscriptWorker {
+    slot: Arc<std::sync::Mutex<Option<Vec<TuiMessage>>>>,
+    signal: Arc<std::sync::Condvar>,
+    shutdown: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+/// How the writer waits for the next snapshot.
+///
+/// Takes the locked slot and returns it re-acquired — the condvar
+/// wait in production, anything a test needs to interpose in
+/// between.
+type WaitFn = std::sync::Arc<
+    dyn Fn(
+            std::sync::MutexGuard<'_, Option<Vec<TuiMessage>>>,
+        ) -> std::sync::MutexGuard<'_, Option<Vec<TuiMessage>>>
+        + Send
+        + Sync,
+>;
+
+impl TranscriptWorker {
+    /// Spawn the writer for `saver` and return its publish handle.
+    ///
+    /// Constructs the session's single writer thread together with
+    /// the handle the turn-end hook publishes through; the worker
+    /// half is joined at teardown so the last transcript is on disk
+    /// before the session returns.
+    fn spawn(saver: Arc<crate::session::SessionSaver>) -> (TranscriptHandle, Self) {
+        let signal = Arc::new(std::sync::Condvar::new());
+        let wait_signal = Arc::clone(&signal);
+        Self::spawn_inner(
+            saver,
+            signal,
+            Arc::new(move |guard| {
+                wait_signal
+                    .wait(guard)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            }),
+        )
+    }
+
+    /// Spawn a writer whose wait runs `park` first, holding the slot.
+    ///
+    /// Test seam: `park` runs while the slot lock is held, between
+    /// the predicate check and the condvar wait — the exact state in
+    /// which a notification fired without that lock would be lost.
+    /// A test holds the writer there for exactly as long as it
+    /// needs.
+    #[cfg(test)]
+    fn spawn_gated(
+        saver: Arc<crate::session::SessionSaver>,
+        park: std::sync::Arc<dyn Fn() + Send + Sync>,
+    ) -> (TranscriptHandle, Self) {
+        let signal = Arc::new(std::sync::Condvar::new());
+        let wait_signal = Arc::clone(&signal);
+        Self::spawn_inner(
+            saver,
+            signal,
+            Arc::new(move |guard| {
+                park();
+                wait_signal
+                    .wait(guard)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            }),
+        )
+    }
+
+    /// The writer body every spawn variant shares.
+    ///
+    /// Runs the loop — wait through the injected `wait`, take the
+    /// newest snapshot, save it — and returns the handle/worker pair
+    /// wired to one slot, signal, and shutdown flag. The variants
+    /// differ only in the wait they inject.
+    fn spawn_inner(
+        saver: Arc<crate::session::SessionSaver>,
+        signal: Arc<std::sync::Condvar>,
+        wait: WaitFn,
+    ) -> (TranscriptHandle, Self) {
+        let slot = Arc::new(std::sync::Mutex::new(None::<Vec<TuiMessage>>));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_slot = Arc::clone(&slot);
+        let thread_shutdown = Arc::clone(&shutdown);
+        let handle = std::thread::spawn(move || {
+            loop {
+                let mut guard = thread_slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                while guard.is_none() && !thread_shutdown.load(Ordering::SeqCst) {
+                    guard = wait(guard);
+                }
+                let snapshot = guard.take();
+                drop(guard);
+                let Some(snapshot) = snapshot else {
+                    break;
+                };
+                if let Err(err) = saver.save(&snapshot) {
+                    tracing::warn!(error = %err, "session transcript could not be saved");
+                }
+            }
+        });
+        let worker_slot = Arc::clone(&slot);
+        (
+            TranscriptHandle {
+                slot,
+                signal: Arc::clone(&signal),
+            },
+            TranscriptWorker {
+                slot: worker_slot,
+                signal,
+                shutdown,
+                handle: Some(handle),
+            },
+        )
+    }
+
+    /// Store the shutdown flag under the slot lock and wake the
+    /// writer.
+    ///
+    /// The store must hold the lock — a notification fired between
+    /// the writer's predicate check and its wait would otherwise be
+    /// lost, and the writer would sleep forever. A snapshot still in
+    /// the slot when the writer wakes is written before the thread
+    /// exits.
+    fn signal_shutdown(&self) {
+        {
+            let _slot = self
+                .slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.shutdown.store(true, Ordering::SeqCst);
+        }
+        self.signal.notify_all();
+    }
+
+    /// Wait for the writer to drain and exit.
+    ///
+    /// Runs the shutdown sequence and joins the thread; when this
+    /// returns, the last published transcript is on disk.
+    fn join(mut self) {
+        self.signal_shutdown();
+        if let Some(handle) = self.handle.take() {
+            drop(handle.join());
+        }
+    }
+}
+
+impl Drop for TranscriptWorker {
+    /// Park off the writer even when no join happens.
+    ///
+    /// The early-failure paths return without joining; without this
+    /// the writer would wait on its condvar forever. Idempotent with
+    /// [`TranscriptWorker::join`], which takes the handle first and
+    /// leaves this nothing to do.
+    fn drop(&mut self) {
+        self.signal_shutdown();
+        if let Some(handle) = self.handle.take() {
+            drop(handle.join());
+        }
+    }
 }
 
 /// Execute submitted tasks one at a time until the session ends.
@@ -291,6 +505,219 @@ mod tests {
             state.queued.load(Ordering::SeqCst),
             1,
             "the overtaken send stays counted as unclaimed"
+        );
+    }
+
+    /// A saver rooted at a throwaway directory plus its coordinates.
+    ///
+    /// The writer pins never touch the real sessions root: the
+    /// saver's base is the temp dir, returned alongside it (kept
+    /// alive by the caller) and the session id its file lands under.
+    fn worker_saver() -> (
+        Arc<crate::session::SessionSaver>,
+        tempfile::TempDir,
+        uuid::Uuid,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let id = uuid::Uuid::new_v4();
+        let saver = Arc::new(crate::session::SessionSaver::with_base_dir(
+            id,
+            "worker-model".to_string(),
+            dir.path().to_path_buf(),
+        ));
+        (saver, dir, id)
+    }
+
+    /// Read a worker-written transcript back from disk.
+    ///
+    /// Parses the envelope directly rather than going through the
+    /// saver, so a pin proves what is actually in the file — not
+    /// what the saver's own reader would reconstruct from it.
+    fn saved_messages(dir: &std::path::Path, id: uuid::Uuid) -> Vec<TuiMessage> {
+        let path = dir.join(id.to_string()).join("session.json");
+        let json = std::fs::read_to_string(path).expect("the transcript file");
+        let envelope: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        serde_json::from_value(
+            envelope
+                .get("messages")
+                .expect("the messages field")
+                .clone(),
+        )
+        .expect("the messages parse back")
+    }
+
+    #[test]
+    fn an_older_snapshot_never_overwrites_a_newer_one() {
+        let (saver, dir, id) = worker_saver();
+        let (handle, worker) = TranscriptWorker::spawn(saver);
+        let now = chrono::Utc::now();
+        let bulky = vec![
+            TuiMessage::User {
+                text: "x".repeat(20_000),
+                timestamp: now,
+            };
+            100
+        ];
+        let final_turn = vec![TuiMessage::User {
+            text: "final turn".to_string(),
+            timestamp: now,
+        }];
+        handle.send(bulky);
+        handle.send(final_turn);
+        drop(handle);
+        worker.join();
+        let messages = saved_messages(dir.path(), id);
+        assert_eq!(
+            messages.len(),
+            1,
+            "the transcript is the newest snapshot, however the queue interleaved"
+        );
+        assert!(
+            matches!(&messages.first().expect("the one message"), TuiMessage::User { text, .. } if text == "final turn"),
+            "a slow older snapshot must not rename over a completed newer one"
+        );
+    }
+
+    #[test]
+    fn joining_the_writer_flushes_the_final_snapshot() {
+        let (saver, dir, id) = worker_saver();
+        let (handle, worker) = TranscriptWorker::spawn(saver);
+        handle.send(vec![TuiMessage::User {
+            text: "the last turn".to_string(),
+            timestamp: chrono::Utc::now(),
+        }]);
+        drop(handle);
+        worker.join();
+        let messages = saved_messages(dir.path(), id);
+        assert_eq!(
+            messages.len(),
+            1,
+            "join returns only after the final write is on disk"
+        );
+        assert!(
+            matches!(&messages.first().expect("the one message"), TuiMessage::User { text, .. } if text == "the last turn"),
+            "the persisted transcript is the joined snapshot"
+        );
+    }
+
+    /// Holds a thread at a chosen point until released.
+    ///
+    /// The gated-spawn pins park the writer on this between its
+    /// predicate check and its wait — the state a lost notification
+    /// lives in — for exactly as long as the test needs.
+    struct Gate {
+        open: std::sync::Mutex<bool>,
+        signal: std::sync::Condvar,
+        parked: std::sync::atomic::AtomicBool,
+    }
+
+    impl Gate {
+        fn closed() -> Self {
+            Self {
+                open: std::sync::Mutex::new(false),
+                signal: std::sync::Condvar::new(),
+                parked: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn hold(&self) {
+            self.parked.store(true, Ordering::SeqCst);
+            let mut open = self.open.lock().expect("the gate lock");
+            while !*open {
+                open = self.signal.wait(open).expect("the gate wait");
+            }
+            self.parked.store(false, Ordering::SeqCst);
+        }
+
+        fn release(&self) {
+            let mut open = self.open.lock().expect("the gate lock");
+            *open = true;
+            drop(open);
+            self.signal.notify_all();
+        }
+
+        fn wait_parked(&self) {
+            while !self.parked.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    #[test]
+    fn a_shutdown_notification_is_never_lost_between_check_and_wait() {
+        let (saver, dir, id) = worker_saver();
+        let gate = Arc::new(Gate::closed());
+        let hold = Arc::clone(&gate);
+        let (_handle, worker) = TranscriptWorker::spawn_gated(saver, Arc::new(move || hold.hold()));
+
+        // Park the writer in the exact state the race lives in:
+        // predicate checked false, slot lock still held, not yet
+        // waiting on the writer's own signal.
+        gate.wait_parked();
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let joiner = std::thread::spawn(move || {
+            worker.join();
+            // A failed send means the test already gave up on this
+            // joiner.
+            let _sent = done_tx.send(());
+        });
+        // Let join meet the held lock (or, on the unfixed shape,
+        // fire its notification into the vacant window).
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        gate.release();
+
+        if done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .is_err()
+        {
+            panic!(
+                "join hung: the shutdown notification fired while the \
+                 writer sat between its predicate check and its wait, and \
+                 was lost — the flag must be stored under the slot lock"
+            );
+        }
+        drop(joiner.join());
+        drop((dir, id));
+    }
+
+    #[test]
+    fn a_dropped_writer_takes_no_late_publish() {
+        let (saver, dir, id) = worker_saver();
+        let gate = Arc::new(Gate::closed());
+        let hold = Arc::clone(&gate);
+        let (handle, worker) = TranscriptWorker::spawn_gated(saver, Arc::new(move || hold.hold()));
+        gate.wait_parked();
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let dropper = std::thread::spawn(move || {
+            // Dropping, not joining — the early-failure path's shape.
+            // With the shutdown store under the lock, this blocks
+            // until the gate opens, then parks the writer off.
+            drop(worker);
+            let _sent = done_tx.send(());
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        gate.release();
+        if done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .is_err()
+        {
+            panic!("drop hung: an unjoined worker must still be parked off");
+        }
+        drop(dropper.join());
+
+        // The writer is gone: a publish after the drop has no
+        // consumer and must never reach the disk.
+        handle.send(vec![TuiMessage::User {
+            text: "late".to_string(),
+            timestamp: chrono::Utc::now(),
+        }]);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let path = dir.path().join(id.to_string()).join("session.json");
+        assert!(
+            !path.exists(),
+            "a dropped worker must not leave a writer behind to consume a late publish"
         );
     }
 }

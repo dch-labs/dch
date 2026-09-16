@@ -8,6 +8,8 @@
 mod args;
 mod done;
 mod headless;
+mod messages;
+mod session;
 mod signals;
 mod tui;
 

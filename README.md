@@ -195,12 +195,13 @@ more. Errors are typed (`thiserror`); logs are structured
 ## Status
 
 Pre-1.0. Working: the interactive TUI with multi-line input,
-history, paste, and mouse-wheel scrolling, single-run mode with exit
-codes and done-files, the tool set above, MCP attachment, roles,
-fallback models, signal handling. Not implemented yet: session
-save/resume (`--resume` / `--list-sessions` exit with an error) and
-permission prompting (tools run without confirmation — treat `bash`
-accordingly).
+history, paste, and mouse-wheel scrolling, session auto-save (every
+completed turn is persisted under `~/.dch/sessions/`), single-run
+mode with exit codes and done-files, the tool set above, MCP
+attachment, roles, fallback models, signal handling. Not implemented
+yet: session resume and listing (`--resume` / `--list-sessions` exit
+with an error) and permission prompting (tools run without
+confirmation — treat `bash` accordingly).
 
 ## License
 

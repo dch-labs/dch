@@ -230,6 +230,8 @@ fn interrupts_exit_130_and_leave_a_done_file() {
         .arg(&config_path)
         .arg("--done-file")
         .arg(&done_path)
+        .env("HOME", dir.path())
+        .env("XDG_CONFIG_HOME", dir.path())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()

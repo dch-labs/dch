@@ -792,6 +792,107 @@ fn poisoned_shared_buffers_still_graduate_through_render() {
 }
 
 #[test]
+fn a_turn_end_hook_receives_the_graduated_reply() {
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    kept.completed_replies
+        .lock()
+        .expect("the replies lock")
+        .push("the finished reply".to_string());
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    let snapshots: Arc<std::sync::Mutex<Snapshots>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&snapshots);
+    app.set_turn_end_hook(Box::new(move |conversation| {
+        snapshots_lock(&sink).push(conversation.to_vec());
+    }));
+    drop(render_to_buffer(&mut app, 80, 30));
+    let seen = snapshots_lock(&snapshots);
+    assert_eq!(seen.len(), 1, "the hook fired exactly once");
+    assert!(
+        seen.first()
+            .expect("the one snapshot")
+            .iter()
+            .any(|message| matches!(
+                message,
+                TuiMessage::Assistant { blocks, .. }
+                    if blocks.iter().any(|block| matches!(
+                        block,
+                        ContentBlock::Text { text } if text == "the finished reply"
+                    ))
+            )),
+        "the snapshot carries the graduated reply"
+    );
+}
+
+#[test]
+fn a_turn_end_hook_fires_for_surfaced_errors() {
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    kept.errors
+        .lock()
+        .expect("the errors lock")
+        .push("provider unreachable".to_string());
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    let snapshots: Arc<std::sync::Mutex<Snapshots>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&snapshots);
+    app.set_turn_end_hook(Box::new(move |conversation| {
+        snapshots_lock(&sink).push(conversation.to_vec());
+    }));
+    drop(render_to_buffer(&mut app, 80, 30));
+    let seen = snapshots_lock(&snapshots);
+    assert_eq!(seen.len(), 1, "a surfaced failure is a turn end too");
+    assert!(
+        seen.first()
+            .expect("the one snapshot")
+            .iter()
+            .any(|message| matches!(
+                message,
+                TuiMessage::Error { text, .. } if text == "provider unreachable"
+            )),
+        "the snapshot carries the failure"
+    );
+}
+
+#[test]
+fn a_quiet_frame_does_not_fire_the_turn_end_hook() {
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept.clone());
+    let snapshots: Arc<std::sync::Mutex<Snapshots>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&snapshots);
+    app.set_turn_end_hook(Box::new(move |conversation| {
+        snapshots_lock(&sink).push(conversation.to_vec());
+    }));
+    drop(render_to_buffer(&mut app, 80, 30));
+    assert!(
+        snapshots_lock(&snapshots).is_empty(),
+        "a frame that graduates nothing fires nothing"
+    );
+
+    kept.completed_replies
+        .lock()
+        .expect("the replies lock")
+        .push("a late reply".to_string());
+    drop(render_to_buffer(&mut app, 80, 30));
+    assert_eq!(
+        snapshots_lock(&snapshots).len(),
+        1,
+        "the next graduation fires the hook"
+    );
+}
+
+/// Conversation snapshots captured by a turn-end hook.
+type Snapshots = Vec<Vec<TuiMessage>>;
+
+/// Lock the hook sink for assertions.
+fn snapshots_lock(sink: &Arc<std::sync::Mutex<Snapshots>>) -> std::sync::MutexGuard<'_, Snapshots> {
+    sink.lock().expect("the snapshots lock")
+}
+
+#[test]
 fn run_failures_drain_into_the_conversation_as_errors() {
     let state = dch_tui::TuiObserverState::new();
     let (observer, kept) = state.into_observer();
