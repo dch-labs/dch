@@ -301,11 +301,15 @@ fn load_from(path: &Path, session_id: Uuid) -> Result<Vec<TuiMessage>, SessionEr
 /// problems skip the entry instead.
 #[allow(dead_code)]
 fn list_sessions_in(base: &Path) -> Result<Vec<SessionSummary>, SessionError> {
-    if !base.is_dir() {
-        return Ok(Vec::new());
-    }
+    let entries = match std::fs::read_dir(base) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Vec::new());
+        }
+        Err(err) => return Err(SessionError::Io(err)),
+    };
     let mut sessions = Vec::new();
-    for entry in std::fs::read_dir(base)? {
+    for entry in entries {
         let Ok(entry) = entry else {
             continue;
         };
@@ -590,6 +594,35 @@ mod tests {
             list_sessions_in(&missing).expect("list"),
             Vec::new(),
             "a missing root lists nothing"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_inaccessible_sessions_root_reports_the_io_error() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if unsafe { libc::getuid() } == 0 {
+            // Root ignores directory permissions, so the lock this
+            // test forces would not block the stat it probes.
+            return;
+        }
+        let parent = tempfile::tempdir().expect("tempdir");
+        let root = parent.path().join("sessions");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        let mut locked = std::fs::metadata(parent.path())
+            .expect("the parent")
+            .permissions();
+        locked.set_mode(0o000);
+        std::fs::set_permissions(parent.path(), locked).expect("lock the parent");
+        let listed = list_sessions_in(&root);
+        let mut open = std::fs::metadata(parent.path())
+            .expect("the parent")
+            .permissions();
+        open.set_mode(0o755);
+        std::fs::set_permissions(parent.path(), open).expect("unlock the parent");
+        assert!(
+            matches!(listed, Err(SessionError::Io(_))),
+            "a root the process cannot reach is an error, not an empty listing: {listed:?}"
         );
     }
 
