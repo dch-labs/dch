@@ -447,13 +447,14 @@ impl TuiApp {
             let needs_redraw = tokio::select! {
                 maybe_event = events.recv() => {
                     match maybe_event {
-                        Some(event) => {
-                            let mut handled = self.handle_event(&event);
-                            while let Some(extra) = events.poll() {
-                                handled |= self.handle_event(&extra);
+                        Some(result) => match result {
+                            Ok(event) => {
+                                let mut handled = self.handle_event(&event);
+                                handled |= self.drain_ready(|| events.poll())?;
+                                handled
                             }
-                            handled
-                        }
+                            Err(err) => return Err(err.into()),
+                        },
                         None => return Ok(()),
                     }
                 }
@@ -465,6 +466,41 @@ impl TuiApp {
             }
         }
         Ok(())
+    }
+
+    /// Handle the events already waiting behind the first one.
+    ///
+    /// A touchpad's wheel momentum and a fast typist both deliver
+    /// bursts far faster than a frame; handling one event per loop
+    /// iteration makes each wait its own full render, so a
+    /// direction reversal queues behind the backlog and the display
+    /// keeps scrolling the old way. Draining the ready events first
+    /// applies the whole burst to the state — the offsets simply
+    /// accumulate — and the caller draws once afterwards. The drain
+    /// stops at a quit event, so nothing queued behind the user's
+    /// Esc — an Enter, a send, an echo — is applied after the
+    /// decision to leave. A read failure from the source propagates
+    /// out instead of masquerading as a clean exit.
+    ///
+    /// Returns whether anything in the burst requires a redraw.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a terminal read failure delivered by the source;
+    /// the caller surfaces it as a session error rather than
+    /// exiting silently.
+    pub fn drain_ready<F>(&mut self, mut next: F) -> Result<bool, std::io::Error>
+    where
+        F: FnMut() -> Option<Result<Event, std::io::Error>>,
+    {
+        let mut needs_redraw = false;
+        while !self.quitting
+            && let Some(result) = next()
+        {
+            let event = result?;
+            needs_redraw |= self.handle_event(&event);
+        }
+        Ok(needs_redraw)
     }
 
     /// Apply one terminal event to the app state.
@@ -726,7 +762,7 @@ impl TuiApp {
         self.drain_shared_state();
         let area = frame.area();
         let input_width = area.width.max(1).saturating_sub(2);
-        let input_rows = self.input.wrapped_lines(input_width).len();
+        let input_rows = self.input.display_rows(input_width).len();
         let input_height = u16::try_from(input_rows.saturating_add(2))
             .unwrap_or(u16::MAX)
             .min(area.height.saturating_div(2))
@@ -860,10 +896,12 @@ impl TuiApp {
         for message in &self.conversation {
             match message {
                 TuiMessage::User { text, .. } => {
-                    lines.push(Line::styled(
-                        text.clone(),
-                        Style::default().fg(self.theme.ui.user_message_fg),
-                    ));
+                    for segment in text.split('\n') {
+                        lines.push(Line::styled(
+                            segment.to_string(),
+                            Style::default().fg(self.theme.ui.user_message_fg),
+                        ));
+                    }
                 }
                 TuiMessage::Assistant { blocks, .. } => {
                     for block in blocks {
@@ -897,10 +935,12 @@ impl TuiApp {
                     }
                 }
                 TuiMessage::System { text, .. } => {
-                    lines.push(Line::styled(
-                        text.clone(),
-                        Style::default().fg(self.theme.ui.dim),
-                    ));
+                    for segment in text.split('\n') {
+                        lines.push(Line::styled(
+                            segment.to_string(),
+                            Style::default().fg(self.theme.ui.dim),
+                        ));
+                    }
                 }
                 TuiMessage::Error { text, .. } => {
                     lines.extend(plain_wrapped_lines(
@@ -931,9 +971,12 @@ impl TuiApp {
     /// [`LIVE_PARSE_LINE_CAP`] lines or [`LIVE_PARSE_BYTE_CAP`]
     /// bytes keeps only its trailing cap as markdown and its head
     /// renders as plaintext until it freezes, bounding the
-    /// per-frame parse); and the unterminated tail —
-    /// the line still being typed, as width-wrapped plaintext. An
-    /// empty buffer renders nothing; a poisoned lock is recovered —
+    /// per-frame parse); and the unterminated tail — the last
+    /// line of what the freeze has not yet consumed, as
+    /// width-wrapped plaintext, so a closer the frozen block
+    /// already rendered never draws twice while growth after it
+    /// appears as it arrives. An empty buffer renders nothing; a
+    /// poisoned lock is recovered —
     /// the same policy the drain applies — so the live view keeps
     /// rendering after another thread's panic.
     fn refresh_streaming_region(&mut self, width: u16) {
@@ -960,12 +1003,12 @@ impl TuiApp {
         }
         self.advance_freeze(&buffer, width);
 
-        let live = buffer
+        let unfrozen = buffer.get(self.frozen_upto..).unwrap_or("");
+        let live = unfrozen
             .rsplit_once('\n')
-            .map_or(buffer.as_str(), |(_, tail)| tail);
-        let live_md_len = buffer.len().saturating_sub(live.len());
-        let live_md = buffer
-            .get(self.frozen_upto..live_md_len)
+            .map_or(unfrozen, |(_, tail)| tail);
+        let live_md = unfrozen
+            .get(..unfrozen.len().saturating_sub(live.len()))
             .filter(|segment| !segment.is_empty());
         let stamp = live_md.map_or(0, fingerprint) ^ {
             let mut seed = live.len() as u64;
@@ -1133,7 +1176,7 @@ impl TuiApp {
     /// column and wrapped row.
     fn render_input(&self, frame: &mut Frame, area: Rect) {
         let width = area.width.max(1).saturating_sub(2);
-        let rows = self.input.wrapped_lines(width);
+        let rows = self.input.display_rows(width);
         let queued = self.state.queued.load(Ordering::SeqCst);
         let title = if queued > 0 {
             format!(" ⏳ {queued} queued · ⏎ enter · shift+enter or \\+enter for newline ")

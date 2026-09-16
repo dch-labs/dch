@@ -491,6 +491,66 @@ fn streaming_text_renders_when_nonempty() {
 }
 
 #[test]
+fn a_stream_ending_on_an_unterminated_closing_fence_renders_it_once() {
+    let mut app = app();
+    app.streaming_text()
+        .lock()
+        .expect("the streaming lock")
+        .push_str("intro\n\n```rust\nlet x = 1;\n```");
+    let closed = render_to_buffer(&mut app, 60, 20);
+    let rows = row_texts(&closed);
+    assert!(
+        rows.iter().any(|row| row.contains("let x = 1;")),
+        "the code inside the closed block still renders: {rows:?}"
+    );
+    assert!(
+        rows.iter().all(|row| !row.contains("```")),
+        "the closer renders inside the framed block, never as a stray row: {rows:?}"
+    );
+
+    app.streaming_text()
+        .lock()
+        .expect("the streaming lock")
+        .push('\n');
+    let terminated = render_to_buffer(&mut app, 60, 20);
+    let rows = row_texts(&terminated);
+    assert!(
+        rows.iter().all(|row| !row.contains("```")),
+        "the newline-terminated closer stays single-rendered: {rows:?}"
+    );
+}
+
+#[test]
+fn growth_after_a_frozen_closer_renders_without_waiting_for_a_newline() {
+    let mut app = app();
+    app.streaming_text()
+        .lock()
+        .expect("the streaming lock")
+        .push_str("intro\n\n```rust\nlet x = 1;\n```");
+    let closed = render_to_buffer(&mut app, 60, 20);
+    assert!(
+        row_texts(&closed).iter().all(|row| !row.contains("```")),
+        "the closer is consumed by the frozen block: {:?}",
+        row_texts(&closed)
+    );
+
+    app.streaming_text()
+        .lock()
+        .expect("the streaming lock")
+        .push_str("tail-growth");
+    let grown = render_to_buffer(&mut app, 60, 20);
+    let rows = row_texts(&grown);
+    assert!(
+        rows.iter().any(|row| row.contains("tail-growth")),
+        "a newline-free delta after the frozen closer renders on arrival: {rows:?}"
+    );
+    assert!(
+        rows.iter().all(|row| !row.contains("```")),
+        "the growth does not resurrect the closer as a stray row: {rows:?}"
+    );
+}
+
+#[test]
 fn active_tools_render_as_running_lines() {
     let mut app = app();
     app.active_tools()
@@ -1029,4 +1089,127 @@ fn a_failed_send_rolls_the_queue_increment_back() {
         "a send no receiver takes must not stay counted as queued"
     );
     assert_eq!(app.conversation().len(), 1, "the echo still lands");
+}
+
+#[test]
+fn multiline_user_and_system_echoes_render_on_separate_rows() {
+    let mut app = app();
+    app.push_message(TuiMessage::User {
+        text: "first\nsecond".to_string(),
+        timestamp: chrono::Utc::now(),
+    });
+    app.push_message(TuiMessage::System {
+        text: "alpha\nbeta".to_string(),
+        timestamp: chrono::Utc::now(),
+    });
+    let terminal = render_to_buffer(&mut app, 40, 20);
+    let rows = row_texts(&terminal);
+    let row_of = |needle: &str| rows.iter().position(|row| row.contains(needle));
+    let (Some(first), Some(second), Some(alpha), Some(beta)) = (
+        row_of("first"),
+        row_of("second"),
+        row_of("alpha"),
+        row_of("beta"),
+    ) else {
+        panic!("all four segments must render: {rows:?}");
+    };
+    assert!(
+        first < second && alpha < beta,
+        "each message's segments occupy distinct, ordered rows: {rows:?}"
+    );
+    assert!(
+        rows.iter().all(|row| !row.contains("firstsecond")),
+        "ratatui must not smash the newline-stripped segments onto one row"
+    );
+}
+
+#[test]
+fn a_read_failure_propagates_from_the_event_drain() {
+    let mut app = app();
+    let failure = std::io::Error::other("terminal broke");
+    let mut queued = std::collections::VecDeque::from(vec![
+        Ok(plain(KeyCode::Char('x'))),
+        Err(failure),
+        Ok(plain(KeyCode::Char('y'))),
+    ]);
+    let result = app.drain_ready(move || queued.pop_front());
+    assert!(
+        result.is_err(),
+        "a read failure must surface as an error, not a silent exit"
+    );
+    assert_eq!(
+        app.input(),
+        "x",
+        "the trailing event never applies past the failure"
+    );
+}
+
+#[test]
+fn the_caret_renders_on_the_continuation_row_at_an_exact_fill() {
+    let mut app = app();
+    for c in "abcdefghij".chars() {
+        app.handle_event(&plain(KeyCode::Char(c)));
+    }
+    let mut terminal = render_to_buffer(&mut app, 12, 10);
+    let rows = row_texts(&terminal);
+    let text_row = rows
+        .iter()
+        .position(|row| row.contains("abcdefghij"))
+        .unwrap_or_else(|| panic!("the typed text renders: {rows:?}"));
+    let caret_y = u16::try_from(text_row).unwrap() + 1;
+    terminal.backend_mut().assert_cursor_position((1, caret_y));
+    assert!(
+        rows.get(text_row + 1).is_some_and(|row| !row.contains('x')),
+        "the continuation row below the caret is empty: {rows:?}"
+    );
+}
+
+#[test]
+fn the_drain_stops_at_a_quit_event() {
+    let mut app = app();
+    app.handle_event(&plain(KeyCode::Char('h')));
+    app.handle_event(&plain(KeyCode::Char('i')));
+    let mut queued = std::collections::VecDeque::from(vec![
+        Ok(plain(KeyCode::Esc)),
+        Ok(plain(KeyCode::Enter)),
+        Ok(plain(KeyCode::Char('!'))),
+    ]);
+    let redraws = app
+        .drain_ready(move || queued.pop_front())
+        .expect("no failure in the batch");
+    assert!(redraws, "the batch up to quit needs a redraw");
+    assert!(app.is_quitting(), "the Esc quit lands");
+    assert_eq!(
+        app.conversation().len(),
+        0,
+        "the Enter queued behind the quit never submits the buffered text"
+    );
+    assert_eq!(app.input(), "hi", "the trailing keystroke never applies");
+}
+
+#[test]
+fn a_submit_before_the_quit_in_one_burst_lands() {
+    let mut app = app();
+    app.handle_event(&plain(KeyCode::Char('h')));
+    app.handle_event(&plain(KeyCode::Char('i')));
+    let mut queued = std::collections::VecDeque::from(vec![
+        Ok(plain(KeyCode::Enter)),
+        Ok(plain(KeyCode::Esc)),
+        Ok(plain(KeyCode::Char('x'))),
+    ]);
+    let redraws = app
+        .drain_ready(move || queued.pop_front())
+        .expect("no failure in the batch");
+    assert!(redraws, "the landing submit redraws");
+    assert!(app.is_quitting(), "the Esc quit still lands after it");
+    assert_eq!(
+        app.conversation().len(),
+        1,
+        "a text-backed Enter ahead of the quit submits and echoes"
+    );
+    assert_eq!(
+        app.input(),
+        "",
+        "the submit clears the buffer; only the post-quit keystroke is dropped"
+    );
 }

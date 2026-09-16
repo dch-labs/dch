@@ -118,15 +118,14 @@ Input (always insert mode):
 | `Tab` | Indent (four spaces) |
 | paste | Inserts whole, newlines included — never submits |
 
-Conversation (or while the input is empty with nothing
-recallable):
+Conversation:
 
 | Key | Action |
 | --- | --- |
-| `Up` / `Down` | Scroll one line |
+| `Up` / `Down` | Scroll one line (only while the input is empty with nothing recallable) |
 | `PageUp` / `PageDown` | Scroll ten lines |
 | mouse wheel | Scroll three lines per event |
-| `End` | Snap to the newest line |
+| `End` | Snap to the newest line (only while the input is empty) |
 
 Anywhere:
 

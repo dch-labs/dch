@@ -10,7 +10,7 @@ description = "Ratatui terminal UI for dch: themes, markdown rendering, streamin
 loopctl                = { workspace = true }
 dch-config             = { workspace = true }
 ratatui                = { workspace = true }
-crossterm              = { workspace = true, features = ["event-stream"] }
+crossterm              = { workspace = true }
 event-listener         = { workspace = true }
 chrono                 = { workspace = true }
 futures                = { workspace = true }

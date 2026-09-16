@@ -304,6 +304,31 @@ fn max_chars_caps_a_pathological_paste() {
 }
 
 #[test]
+fn a_cap_rejected_insert_leaves_the_stashed_draft_recoverable() {
+    let mut editor = InputEditor::new();
+    editor.insert_str(&"x".repeat(100_000));
+    assert_eq!(
+        editor.handle_key(plain(KeyCode::Enter)),
+        InputAction::Submit("x".repeat(100_000)),
+        "the full-cap entry submits and records"
+    );
+    type_str(&mut editor, "draf");
+    editor.handle_key(plain(KeyCode::Up));
+    assert_eq!(
+        editor.text().chars().count(),
+        100_000,
+        "Up recalls the full-cap entry over the stashed draft"
+    );
+    editor.handle_key(plain(KeyCode::Char('x')));
+    editor.handle_key(plain(KeyCode::Down));
+    assert_eq!(
+        editor.text(),
+        "draf",
+        "a keystroke the cap rejects must not cost the half-typed line"
+    );
+}
+
+#[test]
 fn cursor_cell_tracks_display_width_not_chars() {
     let mut editor = InputEditor::new();
     type_str(&mut editor, "ab😀");
@@ -327,6 +352,73 @@ fn cursor_cell_lands_on_the_wrapped_row() {
 }
 
 #[test]
+fn display_rows_grows_the_carets_continuation_row_at_an_exact_fill() {
+    let mut editor = InputEditor::new();
+    editor.set_text("abcdefghij".to_string());
+    assert_eq!(
+        editor.wrapped_lines(10),
+        vec!["abcdefghij".to_string()],
+        "the raw wrap fits the text on one row"
+    );
+    assert_eq!(
+        editor.display_rows(10),
+        vec!["abcdefghij".to_string(), String::new()],
+        "an exactly full final row gains the caret's continuation row"
+    );
+    assert_eq!(
+        editor.cursor_cell(10),
+        Some((1, 0)),
+        "the caret names the continuation row the renderer draws"
+    );
+    assert_eq!(
+        editor.display_rows(9).len(),
+        editor.wrapped_lines(9).len(),
+        "a caret inside the wrapped grid grows nothing"
+    );
+}
+
+#[test]
+fn the_caret_stays_inside_the_rendered_grid_across_the_wrap_corpus() {
+    let mut editor = InputEditor::new();
+    for (buffer, width) in [
+        ("abcdefghij", 10_u16),
+        ("  😀  é  x  ", 10),
+        ("ab\ncdef", 4),
+        ("a", 1),
+        ("abcdefghij", 9),
+    ] {
+        editor.set_text(buffer.to_string());
+        let rows = editor.display_rows(width);
+        if let Some((row, _)) = editor.cursor_cell(width) {
+            assert!(
+                usize::from(row) < rows.len(),
+                "the end caret lands in the grid for {buffer:?} at width {width}: {rows:?}"
+            );
+        }
+    }
+
+    editor.set_text("x".repeat(200));
+    let rows = editor.display_rows(40);
+    if let Some((row, _)) = editor.cursor_cell(40) {
+        assert_eq!(
+            usize::from(row),
+            rows.len() - 1,
+            "a width multiple puts the end caret on the continuation row"
+        );
+    }
+    for _ in 0..3 {
+        editor.handle_key(plain(KeyCode::Left));
+        let rows = editor.display_rows(40);
+        if let Some((row, _)) = editor.cursor_cell(40) {
+            assert!(
+                usize::from(row) < rows.len(),
+                "a mid-buffer caret lands in the grid: {rows:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn tab_indents_with_spaces() {
     let mut editor = InputEditor::new();
     editor.handle_key(plain(KeyCode::Tab));
@@ -346,6 +438,19 @@ fn ctrl_l_asks_for_a_redraw() {
 fn word_motion_and_deletion_cross_whitespace() {
     let mut editor = InputEditor::new();
     type_str(&mut editor, "one two");
+    editor.handle_key(plain(KeyCode::Home));
+    editor.handle_key(key(KeyCode::Right, KeyModifiers::ALT));
+    assert_eq!(
+        editor.cursor_cell(40).map(|(_, col)| col),
+        Some(3),
+        "word-right lands just past the word at the cursor, on the space"
+    );
+    editor.handle_key(key(KeyCode::Right, KeyModifiers::ALT));
+    assert_eq!(
+        editor.cursor_cell(40).map(|(_, col)| col),
+        Some(7),
+        "from whitespace, word-right skips the run and the word after it"
+    );
     editor.handle_key(key(KeyCode::Left, KeyModifiers::ALT));
     assert_eq!(
         editor.cursor_cell(40).map(|(_, col)| col),

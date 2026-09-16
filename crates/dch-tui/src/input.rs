@@ -4,7 +4,7 @@
 //! editor: a multi-line buffer with a char-boundary cursor, a
 //! readline-style history, and word-wrap geometry for rendering.
 //! It owns no frame and no terminal — the app renders
-//! [`InputEditor::wrapped_lines`] and positions the terminal
+//! [`InputEditor::display_rows`] and positions the terminal
 //! cursor from [`InputEditor::cursor_cell`].
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -28,11 +28,13 @@ pub enum InputAction {
     /// The editor has already cleared its buffer and recorded the
     /// text on history, so the host receives the text exactly once.
     Submit(String),
+
     /// Ctrl-L was pressed.
     ///
     /// The app clears and forces one full redraw; the editor's own
     /// state does not change.
     Redraw,
+
     /// The key was consumed or ignored.
     ///
     /// No app-level action follows — though the caller still redraws,
@@ -54,12 +56,14 @@ pub struct InputHistory {
     /// Ordered so the navigation cursor is a plain index and the
     /// oldest entry is the first to leave when the cap evicts.
     entries: Vec<String>,
+
     /// Index into the entries, or `None` at the live position.
     ///
     /// `None` means the caller is typing a new entry; `Some(i)`
     /// means a browsed entry is loaded and returning to live
     /// restores the stashed draft.
     cursor: Option<usize>,
+
     /// Maximum entries retained; zero means unbounded.
     ///
     /// Bounds a long-running session's memory; eviction happens
@@ -161,7 +165,7 @@ impl Default for InputHistory {
 /// Single editing mode, always insert. The buffer holds `\n`
 /// separated logical lines; the cursor is a byte offset that always
 /// sits on a UTF-8 character boundary, from which the display
-/// geometry ([`InputEditor::wrapped_lines`],
+/// geometry ([`InputEditor::display_rows`],
 /// [`InputEditor::cursor_cell`]) is derived per render — nothing
 /// position-shaped is stored, so re-wraps on resize are free.
 #[derive(Debug, Clone)]
@@ -193,7 +197,8 @@ pub struct InputEditor {
     /// never costs the half-typed line.
     draft: Option<String>,
 
-    /// Soft cap in characters; zero means unlimited.
+    /// Soft cap in characters; an insert admits only what fits
+    /// under it.
     ///
     /// A defense against pathological pastes — the model's own
     /// context limit sits upstream and is not this editor's concern.
@@ -277,16 +282,18 @@ impl InputEditor {
     /// Insert text at the cursor, respecting the character cap.
     ///
     /// The bracketed-paste path lands whole blocks here as one edit,
-    /// so a multi-line paste never partial-submits.
+    /// so a multi-line paste never partial-submits. A cap-rejected
+    /// insert touches nothing — the buffer, the browse position, and
+    /// any stashed draft come out exactly as they went in.
     pub fn insert_str(&mut self, pasted: &str) {
         debug_assert!(self.text.is_char_boundary(self.cursor));
-        self.history.reset();
-        self.draft = None;
         let remaining = self.max_chars.saturating_sub(self.text.chars().count());
         let prefix: String = pasted.chars().take(remaining).collect();
         if prefix.is_empty() {
             return;
         }
+        self.history.reset();
+        self.draft = None;
         self.text.insert_str(self.cursor, &prefix);
         self.cursor = self.cursor.saturating_add(prefix.len());
     }
@@ -406,13 +413,38 @@ impl InputEditor {
         rows
     }
 
-    /// The cursor's `(row, column)` within the wrapped-rows grid, in
-    /// display columns (wide glyphs count their width).
+    /// The rows the input box renders at a wrap width.
+    ///
+    /// [`wrapped_lines`](Self::wrapped_lines) plus, when the caret
+    /// sits just past text that exactly fills the buffer's final
+    /// row, one empty continuation row — the wrap grid has no cell
+    /// there, and the box renders where the next character will
+    /// land instead of clamping the caret back onto the full row's
+    /// first cell. Sizing and rendering must both use this so the
+    /// caret's row always exists in the drawn area.
+    #[must_use]
+    pub fn display_rows(&self, width: u16) -> Vec<String> {
+        let mut rows = self.wrapped_lines(width);
+        if self
+            .cursor_cell(width)
+            .is_some_and(|(row, _)| usize::from(row) == rows.len())
+        {
+            rows.push(String::new());
+        }
+        rows
+    }
+
+    /// The cursor's `(row, column)` within the grid
+    /// [`display_rows`](Self::display_rows) renders, in display
+    /// columns (wide glyphs count their width).
     ///
     /// `None` when the buffer is empty — the caller places the
     /// terminal cursor at the box start. The column comes from
     /// wrapping the cursor's line prefix, so it follows the same
-    /// breaks the rendered rows use.
+    /// breaks the rendered rows use; when that prefix exactly fills
+    /// its final row the coordinates name the continuation row
+    /// [`display_rows`](Self::display_rows) appends for exactly
+    /// this case.
     #[must_use]
     pub fn cursor_cell(&self, width: u16) -> Option<(u16, u16)> {
         if self.text.is_empty() {
@@ -678,10 +710,11 @@ impl InputEditor {
         self.cursor = 0;
     }
 
-    /// Move to the start of the next word.
+    /// Move to the end of the next word.
     ///
-    /// Skips the word at the cursor and the whitespace behind the
-    /// next one, landing at its first character.
+    /// Skips the word at the cursor — or, from whitespace, the run
+    /// and the word after it — landing just past that word's last
+    /// character: the readline forward-word spot.
     fn move_word_right(&mut self) {
         let rest = self.text.get(self.cursor..).unwrap_or("");
         let mut saw_word = false;
