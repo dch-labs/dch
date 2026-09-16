@@ -262,16 +262,15 @@ impl TranscriptWorker {
         )
     }
 
-    /// Wait for the writer to drain and exit.
+    /// Store the shutdown flag under the slot lock and wake the
+    /// writer.
     ///
-    /// Sets the shutdown flag under the slot lock and wakes the
-    /// writer: a snapshot still in the slot is written before the
-    /// thread exits, so when this returns the last published
-    /// transcript is on disk. The store must hold the lock — a
-    /// notification fired between the writer's predicate check and
-    /// its wait would otherwise be lost, and this would never
-    /// return.
-    fn join(mut self) {
+    /// The store must hold the lock — a notification fired between
+    /// the writer's predicate check and its wait would otherwise be
+    /// lost, and the writer would sleep forever. A snapshot still in
+    /// the slot when the writer wakes is written before the thread
+    /// exits.
+    fn signal_shutdown(&self) {
         {
             let _slot = self
                 .slot
@@ -280,6 +279,29 @@ impl TranscriptWorker {
             self.shutdown.store(true, Ordering::SeqCst);
         }
         self.signal.notify_all();
+    }
+
+    /// Wait for the writer to drain and exit.
+    ///
+    /// Runs the shutdown sequence and joins the thread; when this
+    /// returns, the last published transcript is on disk.
+    fn join(mut self) {
+        self.signal_shutdown();
+        if let Some(handle) = self.handle.take() {
+            drop(handle.join());
+        }
+    }
+}
+
+impl Drop for TranscriptWorker {
+    /// Park off the writer even when no join happens.
+    ///
+    /// The early-failure paths return without joining; without this
+    /// the writer would wait on its condvar forever. Idempotent with
+    /// [`TranscriptWorker::join`], which takes the handle first and
+    /// leaves this nothing to do.
+    fn drop(&mut self) {
+        self.signal_shutdown();
         if let Some(handle) = self.handle.take() {
             drop(handle.join());
         }
@@ -578,38 +600,60 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_shutdown_notification_is_never_lost_between_check_and_wait() {
-        struct Gate {
-            open: std::sync::Mutex<bool>,
-            signal: std::sync::Condvar,
-            parked: std::sync::atomic::AtomicBool,
-        }
-        impl Gate {
-            fn hold(&self) {
-                self.parked.store(true, Ordering::SeqCst);
-                let mut open = self.open.lock().expect("the gate lock");
-                while !*open {
-                    open = self.signal.wait(open).expect("the gate wait");
-                }
-                self.parked.store(false, Ordering::SeqCst);
+    /// Holds a thread at a chosen point until released.
+    ///
+    /// The gated-spawn pins park the writer on this between its
+    /// predicate check and its wait — the state a lost notification
+    /// lives in — for exactly as long as the test needs.
+    struct Gate {
+        open: std::sync::Mutex<bool>,
+        signal: std::sync::Condvar,
+        parked: std::sync::atomic::AtomicBool,
+    }
+
+    impl Gate {
+        fn closed() -> Self {
+            Self {
+                open: std::sync::Mutex::new(false),
+                signal: std::sync::Condvar::new(),
+                parked: std::sync::atomic::AtomicBool::new(false),
             }
         }
+
+        fn hold(&self) {
+            self.parked.store(true, Ordering::SeqCst);
+            let mut open = self.open.lock().expect("the gate lock");
+            while !*open {
+                open = self.signal.wait(open).expect("the gate wait");
+            }
+            self.parked.store(false, Ordering::SeqCst);
+        }
+
+        fn release(&self) {
+            let mut open = self.open.lock().expect("the gate lock");
+            *open = true;
+            drop(open);
+            self.signal.notify_all();
+        }
+
+        fn wait_parked(&self) {
+            while !self.parked.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    #[test]
+    fn a_shutdown_notification_is_never_lost_between_check_and_wait() {
         let (saver, dir, id) = worker_saver();
-        let gate = Arc::new(Gate {
-            open: std::sync::Mutex::new(false),
-            signal: std::sync::Condvar::new(),
-            parked: std::sync::atomic::AtomicBool::new(false),
-        });
+        let gate = Arc::new(Gate::closed());
         let hold = Arc::clone(&gate);
         let (_handle, worker) = TranscriptWorker::spawn_gated(saver, Arc::new(move || hold.hold()));
 
         // Park the writer in the exact state the race lives in:
         // predicate checked false, slot lock still held, not yet
         // waiting on the writer's own signal.
-        while !gate.parked.load(Ordering::SeqCst) {
-            std::thread::yield_now();
-        }
+        gate.wait_parked();
 
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
         let joiner = std::thread::spawn(move || {
@@ -621,10 +665,7 @@ mod tests {
         // Let join meet the held lock (or, on the unfixed shape,
         // fire its notification into the vacant window).
         std::thread::sleep(std::time::Duration::from_millis(100));
-        let mut open = gate.open.lock().expect("the gate lock");
-        *open = true;
-        drop(open);
-        gate.signal.notify_all();
+        gate.release();
 
         if done_rx
             .recv_timeout(std::time::Duration::from_secs(5))
@@ -638,5 +679,45 @@ mod tests {
         }
         drop(joiner.join());
         drop((dir, id));
+    }
+
+    #[test]
+    fn a_dropped_writer_takes_no_late_publish() {
+        let (saver, dir, id) = worker_saver();
+        let gate = Arc::new(Gate::closed());
+        let hold = Arc::clone(&gate);
+        let (handle, worker) = TranscriptWorker::spawn_gated(saver, Arc::new(move || hold.hold()));
+        gate.wait_parked();
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let dropper = std::thread::spawn(move || {
+            // Dropping, not joining — the early-failure path's shape.
+            // With the shutdown store under the lock, this blocks
+            // until the gate opens, then parks the writer off.
+            drop(worker);
+            let _sent = done_tx.send(());
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        gate.release();
+        if done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .is_err()
+        {
+            panic!("drop hung: an unjoined worker must still be parked off");
+        }
+        drop(dropper.join());
+
+        // The writer is gone: a publish after the drop has no
+        // consumer and must never reach the disk.
+        handle.send(vec![TuiMessage::User {
+            text: "late".to_string(),
+            timestamp: chrono::Utc::now(),
+        }]);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let path = dir.path().join(id.to_string()).join("session.json");
+        assert!(
+            !path.exists(),
+            "a dropped worker must not leave a writer behind to consume a late publish"
+        );
     }
 }

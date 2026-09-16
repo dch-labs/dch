@@ -153,10 +153,9 @@ impl SessionSaver {
 
     /// Construct a saver rooted at `base_dir` instead of the default.
     ///
-    /// Test seam pointing at a throwaway directory so no test ever
-    /// touches the real `~/.dch/sessions`; shared crate-wide under
-    /// `cfg(test)`.
-    #[cfg(test)]
+    /// The injection point every test path shares — the session
+    /// suite and the headless test seam both point it at a throwaway
+    /// directory so no test ever touches the real `~/.dch/sessions`.
     pub(crate) fn with_base_dir(session_id: Uuid, model: String, base_dir: PathBuf) -> Self {
         Self {
             session_id,

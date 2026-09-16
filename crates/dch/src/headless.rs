@@ -146,7 +146,25 @@ impl HeadlessOutcome {
 /// 2 for run-level failures, 130 for cancellation.
 pub async fn run_headless(args: &Args, startup_bridge: crate::signals::CancelBridge) -> u8 {
     let inherited_mode = capture_marker_mode(args.done_file.as_ref());
-    match run_headless_inner(args, startup_bridge, inherited_mode).await {
+    match run_headless_inner(args, startup_bridge, inherited_mode, None).await {
+        Ok(outcome) | Err(outcome) => outcome.exit_code,
+    }
+}
+
+/// Run the headless pipeline with the session transcript rooted at
+/// `saver_root` instead of the user's sessions directory.
+///
+/// The in-process test entry: every path that resolves a run —
+/// cancelled runs included — would otherwise write a transcript into
+/// a real home.
+#[cfg(test)]
+pub(crate) async fn run_headless_rooted(
+    args: &Args,
+    startup_bridge: crate::signals::CancelBridge,
+    saver_root: std::path::PathBuf,
+) -> u8 {
+    let inherited_mode = capture_marker_mode(args.done_file.as_ref());
+    match run_headless_inner(args, startup_bridge, inherited_mode, Some(saver_root)).await {
         Ok(outcome) | Err(outcome) => outcome.exit_code,
     }
 }
@@ -176,7 +194,9 @@ pub(crate) fn capture_marker_mode(
 /// write fails closed through the force hook rather than killing the
 /// process with no marker. Once the run's own marker is written the
 /// force hook stands down: a repeat interrupt still exits 130, but the
-/// recorded outcome survives in the done-file.
+/// recorded outcome survives in the done-file. `saver_root` overrides
+/// where the session transcript is written; `None` uses the user's
+/// sessions directory.
 ///
 /// # Errors
 ///
@@ -186,6 +206,7 @@ async fn run_headless_inner(
     args: &Args,
     startup_bridge: crate::signals::CancelBridge,
     inherited_mode: Option<std::fs::Permissions>,
+    saver_root: Option<std::path::PathBuf>,
 ) -> Result<HeadlessOutcome, HeadlessOutcome> {
     if let Some(path) = &args.done_file {
         match std::fs::remove_file(path) {
@@ -229,31 +250,36 @@ async fn run_headless_inner(
     });
     startup_bridge.stop().await;
 
-    let saver = crate::session::SessionSaver::with_model(runner.session_id(), model);
-    let run = match runner.run(&prompt).await {
-        Ok(run) => run,
+    let saver = match saver_root {
+        Some(root) => crate::session::SessionSaver::with_base_dir(runner.session_id(), model, root),
+        None => crate::session::SessionSaver::with_model(runner.session_id(), model),
+    };
+    let result = runner.run(&prompt).await;
+    let turn_outputs = runner.session_turn_outputs();
+    match result {
+        Ok(run) => {
+            let outcome = HeadlessOutcome::from_run(&run);
+            write_done_file_if_requested(args, &outcome, inherited_mode.as_ref());
+            outcome_recorded.store(true, Ordering::SeqCst);
+            save_transcript(
+                &saver,
+                &crate::messages::transcript_from(&prompt, &turn_outputs, None),
+            );
+            bridge.stop().await;
+            Ok(outcome)
+        }
         Err(err) => {
             let outcome = HeadlessOutcome::from_loop_error(&err);
             write_done_file_if_requested(args, &outcome, inherited_mode.as_ref());
             outcome_recorded.store(true, Ordering::SeqCst);
             save_transcript(
                 &saver,
-                &crate::messages::transcript_from_run(&prompt, &Err(err)),
+                &crate::messages::transcript_from(&prompt, &turn_outputs, Some(&err)),
             );
             bridge.stop().await;
-            return Err(outcome);
+            Err(outcome)
         }
-    };
-
-    let outcome = HeadlessOutcome::from_run(&run);
-    write_done_file_if_requested(args, &outcome, inherited_mode.as_ref());
-    outcome_recorded.store(true, Ordering::SeqCst);
-    save_transcript(
-        &saver,
-        &crate::messages::transcript_from_run(&prompt, &Ok(run)),
-    );
-    bridge.stop().await;
-    Ok(outcome)
+    }
 }
 
 /// Persist the run's transcript; a failed save never fails the run.
@@ -261,9 +287,9 @@ async fn run_headless_inner(
 /// The transcript is the artifact a user returns for, so it is
 /// written on every exit path the run resolves — success, failure,
 /// and cancel alike. A forced exit (the repeated interrupt) writes
-/// nothing: that run never resolved, so only its prompt ever
-/// existed. A save that itself fails only warns: the run's own
-/// outcome outranks the bookkeeping.
+/// nothing: that run never resolved, so nothing is written for it.
+/// A save that itself fails only warns: the run's own outcome
+/// outranks the bookkeeping.
 fn save_transcript(saver: &crate::session::SessionSaver, transcript: &[dch_tui::TuiMessage]) {
     if let Err(err) = saver.save(transcript) {
         tracing::warn!(error = %err, "session transcript could not be saved");
@@ -1051,7 +1077,13 @@ mod tests {
 
         let armed = server.signal_when_streaming(signal);
 
-        let code = run_headless(&args, crate::signals::install_construction_handler(|| {})).await;
+        let sessions = tempfile::tempdir().unwrap();
+        let code = run_headless_rooted(
+            &args,
+            crate::signals::install_construction_handler(|| {}),
+            sessions.path().to_path_buf(),
+        )
+        .await;
         assert!(
             armed.await.unwrap(),
             "the run must reach mid-stream for the signal to fire"
@@ -1118,10 +1150,12 @@ mod tests {
         ];
         let args = parse(&flags);
         let run_args = args.clone();
+        let sessions_root = dir.path().join("sessions");
         let run = tokio::spawn(async move {
-            run_headless(
+            run_headless_rooted(
                 &run_args,
                 crate::signals::install_construction_handler(|| {}),
+                sessions_root,
             )
             .await
         });
