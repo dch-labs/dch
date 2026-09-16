@@ -10,10 +10,11 @@ use clap::Parser;
 
 /// dch — a terminal-based agentic coding assistant built on loopctl.
 ///
-/// With no mode flags, launches the interactive TUI. Use `--headless` to run
-/// a single task non-interactively, or `--resume`/`--list-sessions` for
-/// session management. Run-mode selection happens in `main`, not here; this
-/// struct is only the parsed input.
+/// A task argument (`dch "fix the bug"`) or a piped stdin
+/// (`echo "fix the bug" | dch`) selects the single-run non-interactive
+/// mode; with neither, launches the interactive TUI. `--resume`/
+/// `--list-sessions` manage sessions. Run-mode selection happens in
+/// `main`, not here; this struct is only the parsed input.
 #[derive(Debug, Clone, Parser)]
 #[command(
     name = "dch",
@@ -22,21 +23,16 @@ use clap::Parser;
     long_about = None
 )]
 pub struct Args {
-    /// Run a single task non-interactively and print the result to stdout.
+    /// The task for a single non-interactive run.
     ///
-    /// The task may be supplied inline (`--headless "fix the bug"`) or, when
-    /// the value is omitted, read from stdin by the runner
-    /// (`echo "fix the bug" | dch --headless`). `None` means the flag is
-    /// absent; `Some("")` means the flag is present with the value still to
-    /// come from stdin.
+    /// A non-empty value is the task verbatim; an empty one defers to
+    /// stdin, exactly like omitting the argument with stdin piped.
     #[arg(
-        long,
         value_name = "TASK",
-        num_args = 0..=1,
-        default_missing_value = "",
+        conflicts_with_all = ["resume", "list_sessions"],
         help_heading = "Mode"
     )]
-    pub headless: Option<String>,
+    pub task: Option<String>,
 
     /// Resume a previously saved session by id.
     ///
@@ -111,10 +107,11 @@ pub struct Args {
 /// individual flags keep their own help headings and docs.
 #[derive(Debug, Clone, Parser)]
 pub struct ConfigArgs {
-    /// Path to an alternate config file (overrides the default `~/.dch`
-    /// config lookup). Points at a file, not a directory, and is kept
-    /// exactly as given — relative paths resolve against the process's
-    /// current directory when the file is loaded.
+    /// Path to an alternate config file.
+    ///
+    /// Overrides the default `~/.dch` lookup. Points at a file, not a
+    /// directory, and is kept exactly as given — relative paths resolve
+    /// against the process's current directory when the file is loaded.
     #[arg(
         long = "config",
         value_name = "PATH",
@@ -166,7 +163,7 @@ mod tests {
     #[test]
     fn bare_invocation_yields_all_defaults() {
         let args = parse(&[]).unwrap();
-        assert_eq!(args.headless, None);
+        assert_eq!(args.task, None);
         assert_eq!(args.resume, None);
         assert!(!args.list_sessions);
         assert_eq!(args.theme, None);
@@ -179,17 +176,35 @@ mod tests {
     }
 
     #[test]
-    fn headless_captures_the_inline_task() {
-        let args = parse(&["--headless", "fix the bug"]).unwrap();
-        assert_eq!(args.headless, Some("fix the bug".to_string()));
+    fn task_argument_captures_the_inline_task() {
+        let args = parse(&["fix the bug"]).unwrap();
+        assert_eq!(args.task, Some("fix the bug".to_string()));
     }
 
     #[test]
-    fn headless_without_a_value_still_parses() {
-        // The value-less form is the stdin pipeline shape; the runner reads
-        // stdin when the flag is present with no text.
-        let args = parse(&["--headless"]).unwrap();
-        assert!(args.headless.is_some());
+    fn an_empty_task_argument_parses_and_defers_to_stdin() {
+        // The prompt resolver treats `Some("")` as "read the task from
+        // stdin", so the parser must hand an empty positional through
+        // verbatim rather than normalizing it to absence.
+        let args = parse(&[""]).unwrap();
+        assert_eq!(args.task, Some(String::new()));
+    }
+
+    #[test]
+    fn the_task_argument_conflicts_with_the_session_verbs() {
+        let id = uuid::Uuid::new_v4();
+        let id = id.to_string();
+        for conflicting in [
+            vec!["t", "--resume", id.as_str()],
+            vec!["t", "--list-sessions"],
+        ] {
+            let err = parse(&conflicting).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                ErrorKind::ArgumentConflict,
+                "a task cannot combine with session verbs: {err}"
+            );
+        }
     }
 
     #[test]
@@ -251,17 +266,11 @@ mod tests {
 
     #[test]
     fn flags_compose_in_any_order() {
-        let args = parse(&["--model", "m", "--headless", "t", "-v", "--done-file", "d"]).unwrap();
+        let args = parse(&["--model", "m", "t", "-v", "--done-file", "d"]).unwrap();
         assert_eq!(args.model, Some("m".to_string()));
-        assert_eq!(args.headless, Some("t".to_string()));
+        assert_eq!(args.task, Some("t".to_string()));
         assert!(args.verbose);
         assert_eq!(args.done_file, Some(PathBuf::from("d")));
-    }
-
-    #[test]
-    fn headless_accepts_the_equals_form() {
-        let args = parse(&["--headless=t"]).unwrap();
-        assert_eq!(args.headless, Some("t".to_string()));
     }
 
     #[test]
@@ -304,7 +313,7 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::DisplayHelp);
         let help = err.render().to_string();
         for flag in [
-            "--headless",
+            "TASK",
             "--resume",
             "--list-sessions",
             "--theme",

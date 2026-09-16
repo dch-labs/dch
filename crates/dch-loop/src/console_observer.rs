@@ -1,7 +1,7 @@
 //! Headless console rendering of agent-run events.
 //!
 //! [`ConsoleObserver`] turns a running agent loop into terminal output for
-//! `dch --headless`: the model's text streams to stdout, and everything else
+//! single-run invocations: the model's text streams to stdout, and everything else
 //! — tool calls, turn markers, token usage, compaction and model-switch
 //! notes, errors — goes to stderr, keeping stdout a clean transcript of what
 //! the model said. Output volume is governed by

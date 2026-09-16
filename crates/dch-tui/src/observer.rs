@@ -110,6 +110,18 @@ pub struct TuiObserverState {
     /// failure as an error row in the conversation.
     pub errors: Arc<Mutex<Vec<String>>>,
 
+    /// Submitted tasks the agent driver has not taken yet.
+    ///
+    /// Incremented by the display before the submit is sent and
+    /// decremented by the driver after its receive, so
+    /// increment-before-send-before-receive-before-decrement is
+    /// totally ordered under any scheduler and the count can never
+    /// wrap. The input area's title renders it so a
+    /// mid-run submit is visibly queued. Not cleared by
+    /// [`reset`](TuiObserver::reset) — queued submissions outlive
+    /// turn state.
+    pub queued: Arc<std::sync::atomic::AtomicUsize>,
+
     /// Token usage counters, per-turn and cumulative.
     ///
     /// Updated from stream and turn events.
@@ -136,6 +148,7 @@ impl TuiObserverState {
             active_tools: Arc::new(Mutex::new(Vec::new())),
             tool_results: Arc::new(Mutex::new(Vec::new())),
             errors: Arc::new(Mutex::new(Vec::new())),
+            queued: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             tokens: Arc::new(Mutex::new(TokenCounts::default())),
             render_notify: Arc::new(event_listener::Event::new()),
         }
@@ -145,7 +158,7 @@ impl TuiObserverState {
     ///
     /// The two are produced together and share the same underlying
     /// allocations, so they can never drift. Cheap — cloning the
-    /// state bumps seven reference counts and copies no data.
+    /// state bumps eight reference counts and copies no data.
     #[must_use]
     pub fn into_observer(self) -> (TuiObserver, Self) {
         let observer = TuiObserver {

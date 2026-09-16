@@ -23,7 +23,7 @@ use loopctl::tool::{Tool, ToolContext};
 use serde_json::json;
 
 use dch_tools::RunnerContext;
-use dch_tools::{EditInput, ReadInput, WriteInput};
+use dch_tools::{EditInput, MultiEditTool, ReadInput, WriteInput};
 
 fn ctx_in(cwd: &str) -> ToolContext {
     let mut ctx = ToolContext::default();
@@ -234,4 +234,110 @@ async fn reads_of_many_files_keep_distinct_baselines() {
     assert!(!write(&ctx, "b.txt", "b2\n").await);
     assert_eq!(disk(tmp.path(), "a.txt"), "a2\n");
     assert_eq!(disk(tmp.path(), "b.txt"), "EXTERNAL\n");
+}
+
+#[tokio::test]
+async fn skip_linter_bypasses_the_lint_gate_but_not_the_staleness_guard() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("gate.rs"), "fn v1() {}\n").unwrap();
+    let ctx = ctx_in(tmp.path().to_str().unwrap());
+
+    read(&ctx, "gate.rs").await;
+    std::fs::write(tmp.path().join("gate.rs"), "EXTERNAL\n").unwrap();
+    force_mtime_change(&tmp.path().join("gate.rs"));
+
+    // The content is deliberately invalid Rust, so the lint gate would have
+    // blocked it too — only the "changed on disk" refusal proves the guard
+    // fired independently of the gate the flag skips.
+    let tool = WriteInput::default();
+    let out = tool
+        .call(
+            json!({
+                "file_path": "gate.rs",
+                "content": "fn broken() { let x = ; }",
+                "skip_linter": true
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    assert!(out.is_error, "skip_linter lifts the lint gate only");
+    assert!(
+        out.text_content().contains("changed on disk"),
+        "the refusal must come from the staleness guard: {}",
+        out.text_content()
+    );
+    assert_eq!(disk(tmp.path(), "gate.rs"), "EXTERNAL\n");
+}
+
+#[tokio::test]
+async fn relative_and_absolute_spellings_share_one_baseline() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("note.txt"), "v1\n").unwrap();
+    let ctx = ctx_in(tmp.path().to_str().unwrap());
+    let absolute = tmp.path().join("note.txt");
+
+    // A relative read arms the guard; the absolute spelling of the same file
+    // must not dodge it.
+    read(&ctx, "note.txt").await;
+    std::fs::write(&absolute, "EXTERNAL\n").unwrap();
+    force_mtime_change(&absolute);
+    assert!(
+        !write(&ctx, absolute.to_str().unwrap(), "v2\n").await,
+        "the absolute spelling resolves to the armed file"
+    );
+    assert_eq!(disk(tmp.path(), "note.txt"), "EXTERNAL\n");
+
+    // The mirror direction: an absolute read, a relative write.
+    std::fs::write(&absolute, "v1\n").unwrap();
+    read(&ctx, absolute.to_str().unwrap()).await;
+    std::fs::write(&absolute, "EXTERNAL\n").unwrap();
+    force_mtime_change(&absolute);
+    assert!(
+        !write(&ctx, "note.txt", "v3\n").await,
+        "the relative spelling resolves to the armed file"
+    );
+    assert_eq!(disk(tmp.path(), "note.txt"), "EXTERNAL\n");
+}
+
+#[tokio::test]
+async fn a_multiedit_refreshes_the_baseline_a_later_write_consults() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("code.rs"), "fn a() {}\n").unwrap();
+    let ctx = ctx_in(tmp.path().to_str().unwrap());
+
+    // The file was never Read; MultiEdit's own phase-1 read applies the edit
+    // and records the post-write content as the model's known state.
+    let tool = MultiEditTool;
+    let out = tool
+        .call(
+            json!({
+                "edits": [
+                    {
+                        "file_path": "code.rs",
+                        "old_text": "fn a() {}",
+                        "new_text": "fn b() {}"
+                    }
+                ]
+            }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.text_content());
+
+    // An external change after the batch must refuse the Write — the guard
+    // consults the content the batch itself recorded.
+    std::fs::write(tmp.path().join("code.rs"), "EXTERNAL\n").unwrap();
+    force_mtime_change(&tmp.path().join("code.rs"));
+    assert!(
+        !write(&ctx, "code.rs", "fn c() {}\n").await,
+        "a write after the batch must be guarded by the batch's baseline"
+    );
+    assert_eq!(disk(tmp.path(), "code.rs"), "EXTERNAL\n");
+
+    // Re-reading the external content recovers the loop, as with Read/Edit.
+    read(&ctx, "code.rs").await;
+    assert!(write(&ctx, "code.rs", "fn c() {}\n").await);
+    assert_eq!(disk(tmp.path(), "code.rs"), "fn c() {}\n");
 }

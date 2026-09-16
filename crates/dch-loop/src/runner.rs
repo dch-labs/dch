@@ -873,6 +873,67 @@ mod tests {
         );
     }
 
+    /// A tool whose output echoes what a diff echo carries: a long
+    /// high-entropy token beside ordinary text.
+    struct HighEntropyEchoTool;
+
+    impl loopctl::tool::Tool for HighEntropyEchoTool {
+        fn name(&self) -> &'static str {
+            "HighEntropyEcho"
+        }
+
+        fn description(&self) -> &'static str {
+            "Test probe: echoes a fixed high-entropy payload."
+        }
+
+        fn schema(&self) -> loopctl::tool::ToolSchema {
+            loopctl::tool::ToolSchema {
+                tool: self.name().to_string(),
+                description: self.description().to_string(),
+                input_schema: serde_json::json!({"type": "object", "properties": {}}),
+            }
+        }
+
+        fn call(
+            &self,
+            _input: serde_json::Value,
+            _ctx: &loopctl::tool::ToolContext,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<loopctl::tool::ToolOutput, loopctl::tool::ToolError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async {
+                Ok(loopctl::tool::ToolOutput::text(
+                    "wrote fixture with token qX7vK2mP9wL4nR8tY3jH6bF1cD5gS0aZ7eU2iO and padding aaaaaaaa",
+                ))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn redaction_scrubs_high_entropy_tokens_in_tool_output() {
+        let mut registry = loopctl::tool::ToolRegistry::new();
+        registry.register(HighEntropyEchoTool);
+        let pipeline = build_pipeline(&sample_context("/tmp/probe-cwd"), &[], true, registry)
+            .expect("static composition builds");
+        let mut ctx = probe_dispatch_context();
+        ctx.tool_name = "HighEntropyEcho".to_string();
+
+        let result = pipeline.dispatch(&mut ctx).await;
+        let text = result.output.to_string();
+        assert!(
+            text.contains("[REDACTED:high_entropy]"),
+            "the default-on redaction reaches the model's own echoed tokens: {text}"
+        );
+        assert!(
+            text.contains("aaaaaaaa"),
+            "low-entropy padding survives untouched: {text}"
+        );
+    }
+
     #[tokio::test]
     async fn injector_also_populates_the_native_context_fields() {
         let pipeline = probe_pipeline(true);

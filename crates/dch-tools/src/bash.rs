@@ -493,7 +493,9 @@ impl Tool for BashTool {
         Some(
             "Run commands via the Bash tool. Prefer specific commands over \
              scripts. Never run destructive commands (`rm -rf /`, force-push) \
-             without stating intent first. Background long jobs."
+             without stating intent first. Background jobs you expect to \
+             outlast ten minutes cannot finish — the timeout bounds them at \
+             600 seconds; split the work or checkpoint and resume."
                 .to_string(),
         )
     }
