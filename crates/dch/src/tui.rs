@@ -111,65 +111,98 @@ async fn run_tui_session(args: &Args) -> Result<(), String> {
 
 /// The handle a turn-end hook uses to hand transcripts to the writer.
 ///
-/// Cloned into the hook; every send queues one snapshot for the
-/// worker thread. Sending is all the hook does — cheap enough to
-/// run inline on the render task.
-#[derive(Clone)]
+/// Holds the shared one-slot mailbox: publishing a snapshot
+/// overwrites whatever is still waiting, so at most one pending
+/// transcript is ever retained — a stalled write cannot pile
+/// snapshots up behind it. Publishing is all the hook does — cheap
+/// enough to run inline on the render task.
 struct TranscriptHandle {
-    tx: std::sync::mpsc::Sender<Vec<TuiMessage>>,
+    slot: Arc<std::sync::Mutex<Option<Vec<TuiMessage>>>>,
+    signal: Arc<std::sync::Condvar>,
 }
 
 impl TranscriptHandle {
-    /// Queue one conversation snapshot for writing.
+    /// Publish one conversation snapshot for the writer.
     ///
-    /// Never blocks and never fails visibly — a receiver that has
-    /// gone away means the session is already ending, and the
-    /// snapshot's turn was persisted or superseded before that.
+    /// Overwrites a still-pending snapshot — only the newest
+    /// transcript is ever worth writing — then wakes the writer.
+    /// Never blocks and never fails visibly.
     fn send(&self, snapshot: Vec<TuiMessage>) {
-        drop(self.tx.send(snapshot));
+        let mut slot = self
+            .slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot = Some(snapshot);
+        drop(slot);
+        self.signal.notify_one();
     }
 }
 
 /// The single writer thread that persists turn-end snapshots.
 ///
-/// One thread writes snapshots in arrival order, so the newest
-/// transcript always lands last — an older, slower save can never
-/// rename over a newer one. A snapshot superseded while a write is
-/// in flight is skipped outright: only the newest queued snapshot
-/// is written. Joining after the last handle drops waits out the
-/// final write, so a quitting session still persists its last turn.
+/// One thread takes the newest published snapshot, writes it, and
+/// waits for the next — so the newest transcript always lands last
+/// and an older, slower save can never rename over a newer one.
+/// The one-slot mailbox bounds retention at a single snapshot even
+/// while a write is stalled. Joining waits out the in-flight write
+/// and any snapshot still in the slot, so a quitting session
+/// persists its last turn.
 struct TranscriptWorker {
+    signal: Arc<std::sync::Condvar>,
+    shutdown: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl TranscriptWorker {
-    /// Spawn the writer for `saver` and return its queue handle.
+    /// Spawn the writer for `saver` and return its publish handle.
     fn spawn(saver: Arc<crate::session::SessionSaver>) -> (TranscriptHandle, Self) {
-        let (tx, rx) = std::sync::mpsc::channel::<Vec<TuiMessage>>();
+        let slot = Arc::new(std::sync::Mutex::new(None::<Vec<TuiMessage>>));
+        let signal = Arc::new(std::sync::Condvar::new());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_slot = Arc::clone(&slot);
+        let thread_signal = Arc::clone(&signal);
+        let thread_shutdown = Arc::clone(&shutdown);
         let handle = std::thread::spawn(move || {
-            while let Ok(mut newest) = rx.recv() {
-                while let Ok(newer) = rx.try_recv() {
-                    newest = newer;
+            loop {
+                let mut guard = thread_slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                while guard.is_none() && !thread_shutdown.load(Ordering::SeqCst) {
+                    guard = thread_signal
+                        .wait(guard)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                 }
-                if let Err(err) = saver.save(&newest) {
+                let snapshot = guard.take();
+                drop(guard);
+                let Some(snapshot) = snapshot else {
+                    break;
+                };
+                if let Err(err) = saver.save(&snapshot) {
                     tracing::warn!(error = %err, "session transcript could not be saved");
                 }
             }
         });
         (
-            TranscriptHandle { tx },
+            TranscriptHandle {
+                slot,
+                signal: Arc::clone(&signal),
+            },
             TranscriptWorker {
+                signal,
+                shutdown,
                 handle: Some(handle),
             },
         )
     }
 
-    /// Wait for the writer to drain its queue and exit.
+    /// Wait for the writer to drain and exit.
     ///
-    /// Call after every [`TranscriptHandle`] has dropped — the
-    /// writer then finishes its last save and returns; when this
-    /// returns, that save is on disk.
+    /// Sets the shutdown flag and wakes the writer: a snapshot still
+    /// in the slot is written before the thread exits, so when this
+    /// returns the last published transcript is on disk.
     fn join(mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        self.signal.notify_all();
         if let Some(handle) = self.handle.take() {
             drop(handle.join());
         }

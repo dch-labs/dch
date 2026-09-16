@@ -240,7 +240,7 @@ mod tests {
                     },
                 ],
                 timestamp: now,
-                duration_ms: Some(1200),
+                duration_ms: None,
             },
             TuiMessage::System {
                 text: "resumed".to_string(),
@@ -261,8 +261,8 @@ mod tests {
             "block tags are the frozen type tags: {json}"
         );
         assert!(
-            !json.contains("duration_ms:null"),
-            "an absent duration is skipped, not nulled: {json}"
+            !json.contains("duration_ms"),
+            "an absent duration is omitted from the serialized form, not nulled: {json}"
         );
         let back: Vec<TuiMessage> = serde_json::from_str(&json).expect("the model parses back");
         assert_eq!(back, messages, "a round-trip is lossless");
