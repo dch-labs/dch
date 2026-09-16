@@ -3,6 +3,12 @@
 //! These types carry what the TUI renders. They hold no behavior: the
 //! conversation view decides how to paint each message, the session
 //! layer decides how to serialize it.
+//!
+//! The serde representation is the frozen on-disk schema: variants
+//! carry an internal `role`/`type` tag with `snake_case` names, so a
+//! serialized message reads `{"role":"user",…}` and a block
+//! `{"type":"tool",…}`. Changing a tag key or variant name is a
+//! format break, not a refactor.
 
 use chrono::{DateTime, Utc};
 
@@ -11,7 +17,8 @@ use chrono::{DateTime, Utc};
 /// The block model splits assistant output into ordered
 /// [`ContentBlock`]s so text and tool activity can interleave
 /// faithfully; user, system, and error messages stay plain text.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "role", rename_all = "snake_case")]
 pub enum TuiMessage {
     /// Text the user submitted from the input line.
     ///
@@ -47,7 +54,9 @@ pub enum TuiMessage {
 
         /// How long the reply took, in milliseconds.
         ///
-        /// `None` while the duration is unknown or unmeasured.
+        /// `None` while the duration is unknown or unmeasured; absent
+        /// from the serialized form rather than written as `null`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         duration_ms: Option<u64>,
     },
 
@@ -84,9 +93,10 @@ pub enum TuiMessage {
 
 /// A block within an assistant message.
 ///
-/// Blocks carry the reply's content in order; the renderer walks
-/// them so tool summaries sit between the text around them.
-#[derive(Debug, Clone)]
+/// Blocks carry the reply's content in order; the renderer walks them
+/// so tool summaries sit between the text around it.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
     /// A stretch of assistant text, possibly markdown.
     ///
@@ -193,4 +203,68 @@ pub struct ActiveTool {
     /// Elapsed time derives from this monotonically increasing
     /// clock.
     pub start: std::time::Instant,
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc
+)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn messages_round_trip_through_the_frozen_tags() {
+        let now = DateTime::parse_from_rfc3339("2026-09-16T12:00:00Z")
+            .expect("a fixed timestamp")
+            .with_timezone(&Utc);
+        let messages = vec![
+            TuiMessage::User {
+                text: "hi\nthere".to_string(),
+                timestamp: now,
+            },
+            TuiMessage::Assistant {
+                blocks: vec![
+                    ContentBlock::Text {
+                        text: "looking".to_string(),
+                    },
+                    ContentBlock::Tool {
+                        name: "Read".to_string(),
+                        input_preview: "a.rs".to_string(),
+                        success: true,
+                        elapsed_secs: 1.5,
+                        output_preview: "…".to_string(),
+                    },
+                ],
+                timestamp: now,
+                duration_ms: Some(1200),
+            },
+            TuiMessage::System {
+                text: "resumed".to_string(),
+                timestamp: now,
+            },
+            TuiMessage::Error {
+                text: "boom".to_string(),
+                timestamp: now,
+            },
+        ];
+        let json = serde_json::to_string(&messages).expect("the model serializes");
+        assert!(
+            json.contains(r#""role":"user""#),
+            "variant tags are the frozen role tags: {json}"
+        );
+        assert!(
+            json.contains(r#""type":"tool""#),
+            "block tags are the frozen type tags: {json}"
+        );
+        assert!(
+            !json.contains("duration_ms:null"),
+            "an absent duration is skipped, not nulled: {json}"
+        );
+        let back: Vec<TuiMessage> = serde_json::from_str(&json).expect("the model parses back");
+        assert_eq!(back, messages, "a round-trip is lossless");
+    }
 }

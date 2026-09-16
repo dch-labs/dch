@@ -32,6 +32,13 @@ use crate::message::{ActiveTool, ContentBlock, TokenCounts, TuiMessage};
 use crate::observer::{ToolResultDisplay, TuiObserverState};
 use crate::theme::Theme;
 
+/// The callback fired when a turn's outcome joins the conversation.
+///
+/// Installed by the mode driver to persist the session transcript;
+/// receives the conversation snapshot, so the host never reaches
+/// into display state.
+type TurnEndHook = Box<dyn Fn(&[TuiMessage]) + Send + Sync>;
+
 /// How many completed tool calls the live region keeps visible.
 ///
 /// Oldest entries drop off the drained history once the count passes
@@ -108,6 +115,14 @@ pub struct TuiApp {
     /// non-empty submit through it alongside the local echo. `None`
     /// on a bare app — submits render locally and reach no agent.
     submit_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+
+    /// Notified when a turn's outcome lands in the conversation.
+    ///
+    /// Installed by the mode driver; receives the full conversation
+    /// snapshot each time a reply graduates or a failure surfaces, so
+    /// the host can persist it without reaching into display state.
+    /// `None` on a bare app — turns come and go unpersisted.
+    turn_end_hook: Option<TurnEndHook>,
 
     /// Completed tool calls this display has taken from the shared
     /// buffer.
@@ -291,6 +306,7 @@ impl TuiApp {
             conversation: Vec::new(),
             state,
             submit_tx: None,
+            turn_end_hook: None,
             tool_history: Vec::new(),
             input: InputEditor::new(),
             scroll_offset: 0,
@@ -410,6 +426,16 @@ impl TuiApp {
     /// receiver awaits is dropped — the session is ending.
     pub fn set_submit_tx(&mut self, tx: tokio::sync::mpsc::UnboundedSender<String>) {
         self.submit_tx = Some(tx);
+    }
+
+    /// Install the callback fired when a turn ends.
+    ///
+    /// The hook receives the conversation snapshot at the moment a
+    /// completed reply or a surfaced failure joins it — the natural
+    /// save point for a session transcript. It runs inline on the
+    /// render task, so heavy work must move itself off-thread.
+    pub fn set_turn_end_hook(&mut self, hook: TurnEndHook) {
+        self.turn_end_hook = Some(hook);
     }
 
     /// Run the UI event loop until the user exits.
@@ -849,12 +875,15 @@ impl TuiApp {
     /// messages; completed tool calls move into this display's
     /// bounded history; run failures recorded by the mode driver
     /// surface as error messages — so none of the shared buffers
-    /// accumulates across frames. A poisoned lock is recovered — the
-    /// same policy the observer writes with — so finalized data
-    /// still graduates.
+    /// accumulates across frames. Whenever a reply or a failure
+    /// lands, the turn-end hook — when installed — receives the
+    /// conversation snapshot, the host's save point. A poisoned lock
+    /// is recovered — the same policy the observer writes with — so
+    /// finalized data still graduates.
     fn drain_shared_state(&mut self) {
         let replies = take_locked(&self.state.completed_replies);
         let now = chrono::Utc::now();
+        let mut turn_ended = !replies.is_empty();
         for text in replies {
             self.push_message(TuiMessage::Assistant {
                 blocks: vec![ContentBlock::Text { text }],
@@ -869,11 +898,16 @@ impl TuiApp {
         self.tool_history.extend(drained_tools);
         let drop_count = self.tool_history.len().saturating_sub(TOOL_HISTORY_DEPTH);
         self.tool_history.drain(..drop_count);
-        for text in take_locked(&self.state.errors) {
+        let errors = take_locked(&self.state.errors);
+        turn_ended |= !errors.is_empty();
+        for text in errors {
             self.push_message(TuiMessage::Error {
                 text,
                 timestamp: now,
             });
+        }
+        if turn_ended && let Some(hook) = &self.turn_end_hook {
+            hook(&self.conversation);
         }
     }
 

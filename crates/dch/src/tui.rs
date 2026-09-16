@@ -11,6 +11,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use dch_tui::TuiMessage;
 use dch_tui::{TerminalGuard, TuiApp, TuiObserverState};
 use tokio::sync::mpsc;
 
@@ -69,8 +70,21 @@ async fn run_tui_session(args: &Args) -> Result<(), String> {
         .map_err(|err| format!("agent construction: {err}"))?;
 
     let (submit_tx, submit_rx) = mpsc::unbounded_channel();
+    let model = config.api.model.clone();
     let mut app = TuiApp::from_observer_state(config, state.clone());
     app.set_submit_tx(submit_tx);
+
+    // Save the transcript off the render thread whenever a turn
+    // ends: one ordered writer receives the snapshots, so the newest
+    // transcript lands last and teardown joins the final write.
+    let saver = Arc::new(crate::session::SessionSaver::with_model(
+        runner.session_id(),
+        model,
+    ));
+    let (transcript_handle, transcript_worker) = TranscriptWorker::spawn(saver);
+    app.set_turn_end_hook(Box::new(move |conversation| {
+        transcript_handle.send(conversation.to_vec());
+    }));
 
     TerminalGuard::install_panic_hook();
     let (guard, mut terminal) =
@@ -90,8 +104,76 @@ async fn run_tui_session(args: &Args) -> Result<(), String> {
     shutting_down.store(true, Ordering::SeqCst);
     cancel.cancel();
     drop(driver.await);
+    transcript_worker.join();
     drop(guard);
     session.map_err(|err| format!("terminal error: {err}"))
+}
+
+/// The handle a turn-end hook uses to hand transcripts to the writer.
+///
+/// Cloned into the hook; every send queues one snapshot for the
+/// worker thread. Sending is all the hook does — cheap enough to
+/// run inline on the render task.
+#[derive(Clone)]
+struct TranscriptHandle {
+    tx: std::sync::mpsc::Sender<Vec<TuiMessage>>,
+}
+
+impl TranscriptHandle {
+    /// Queue one conversation snapshot for writing.
+    ///
+    /// Never blocks and never fails visibly — a receiver that has
+    /// gone away means the session is already ending, and the
+    /// snapshot's turn was persisted or superseded before that.
+    fn send(&self, snapshot: Vec<TuiMessage>) {
+        drop(self.tx.send(snapshot));
+    }
+}
+
+/// The single writer thread that persists turn-end snapshots.
+///
+/// One thread writes snapshots in arrival order, so the newest
+/// transcript always lands last — an older, slower save can never
+/// rename over a newer one. A snapshot superseded while a write is
+/// in flight is skipped outright: only the newest queued snapshot
+/// is written. Joining after the last handle drops waits out the
+/// final write, so a quitting session still persists its last turn.
+struct TranscriptWorker {
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl TranscriptWorker {
+    /// Spawn the writer for `saver` and return its queue handle.
+    fn spawn(saver: Arc<crate::session::SessionSaver>) -> (TranscriptHandle, Self) {
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<TuiMessage>>();
+        let handle = std::thread::spawn(move || {
+            while let Ok(mut newest) = rx.recv() {
+                while let Ok(newer) = rx.try_recv() {
+                    newest = newer;
+                }
+                if let Err(err) = saver.save(&newest) {
+                    tracing::warn!(error = %err, "session transcript could not be saved");
+                }
+            }
+        });
+        (
+            TranscriptHandle { tx },
+            TranscriptWorker {
+                handle: Some(handle),
+            },
+        )
+    }
+
+    /// Wait for the writer to drain its queue and exit.
+    ///
+    /// Call after every [`TranscriptHandle`] has dropped — the
+    /// writer then finishes its last save and returns; when this
+    /// returns, that save is on disk.
+    fn join(mut self) {
+        if let Some(handle) = self.handle.take() {
+            drop(handle.join());
+        }
+    }
 }
 
 /// Execute submitted tasks one at a time until the session ends.
@@ -291,6 +373,90 @@ mod tests {
             state.queued.load(Ordering::SeqCst),
             1,
             "the overtaken send stays counted as unclaimed"
+        );
+    }
+
+    /// A saver rooted at a throwaway directory plus its coordinates.
+    fn worker_saver() -> (
+        Arc<crate::session::SessionSaver>,
+        tempfile::TempDir,
+        uuid::Uuid,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let id = uuid::Uuid::new_v4();
+        let saver = Arc::new(crate::session::SessionSaver::with_base_dir(
+            id,
+            "worker-model".to_string(),
+            dir.path().to_path_buf(),
+        ));
+        (saver, dir, id)
+    }
+
+    /// Read a worker-written transcript back from disk.
+    fn saved_messages(dir: &std::path::Path, id: uuid::Uuid) -> Vec<TuiMessage> {
+        let path = dir.join(id.to_string()).join("session.json");
+        let json = std::fs::read_to_string(path).expect("the transcript file");
+        let envelope: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        serde_json::from_value(
+            envelope
+                .get("messages")
+                .expect("the messages field")
+                .clone(),
+        )
+        .expect("the messages parse back")
+    }
+
+    #[test]
+    fn an_older_snapshot_never_overwrites_a_newer_one() {
+        let (saver, dir, id) = worker_saver();
+        let (handle, worker) = TranscriptWorker::spawn(saver);
+        let now = chrono::Utc::now();
+        let bulky = vec![
+            TuiMessage::User {
+                text: "x".repeat(20_000),
+                timestamp: now,
+            };
+            100
+        ];
+        let final_turn = vec![TuiMessage::User {
+            text: "final turn".to_string(),
+            timestamp: now,
+        }];
+        handle.send(bulky);
+        handle.send(final_turn);
+        drop(handle);
+        worker.join();
+        let messages = saved_messages(dir.path(), id);
+        assert_eq!(
+            messages.len(),
+            1,
+            "the transcript is the newest snapshot, however the queue interleaved"
+        );
+        assert!(
+            matches!(&messages.first().expect("the one message"), TuiMessage::User { text, .. } if text == "final turn"),
+            "a slow older snapshot must not rename over a completed newer one"
+        );
+    }
+
+    #[test]
+    fn joining_the_writer_flushes_the_final_snapshot() {
+        let (saver, dir, id) = worker_saver();
+        let (handle, worker) = TranscriptWorker::spawn(saver);
+        handle.send(vec![TuiMessage::User {
+            text: "the last turn".to_string(),
+            timestamp: chrono::Utc::now(),
+        }]);
+        drop(handle);
+        worker.join();
+        let messages = saved_messages(dir.path(), id);
+        assert_eq!(
+            messages.len(),
+            1,
+            "join returns only after the final write is on disk"
+        );
+        assert!(
+            matches!(&messages.first().expect("the one message"), TuiMessage::User { text, .. } if text == "the last turn"),
+            "the persisted transcript is the joined snapshot"
         );
     }
 }

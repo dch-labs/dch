@@ -193,6 +193,17 @@ impl Runner {
         self.inner.cancel();
     }
 
+    /// The session identity the inner engine owns.
+    ///
+    /// A UUID minted once when the engine is constructed and stable
+    /// across every `run()` call on this runner — hosts use it to key
+    /// per-session artifacts (saved transcripts) so they match the id
+    /// the agent loop itself carries. The runner never rotates it.
+    #[must_use]
+    pub fn session_id(&self) -> uuid::Uuid {
+        self.inner.session().id
+    }
+
     /// The shared cancel signal, cloned from the inner loop.
     ///
     /// For external callers that need to select on cancellation from a
@@ -1006,6 +1017,29 @@ mod tests {
                 .expect("slot lock")
                 .is_some(),
             "the sender must land in the shared slot tools read"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_id_is_stable_and_non_nil() {
+        let mut config = offline_config();
+        config.api.base_url = "http://127.0.0.1:1".to_string();
+        let dir = TempDir::new().expect("tempdir");
+        let mut runner = Runner::builder(&config, dir.path())
+            .build()
+            .await
+            .expect("Runner::new constructs");
+        let first = runner.session_id();
+        assert!(
+            !first.is_nil(),
+            "the engine mints a real UUID at construction"
+        );
+        drop(runner.run("first").await);
+        drop(runner.run("second").await);
+        assert_eq!(
+            runner.session_id(),
+            first,
+            "the identity survives run boundaries — two refused runs did not rotate it"
         );
     }
 

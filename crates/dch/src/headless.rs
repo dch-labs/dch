@@ -214,7 +214,11 @@ async fn run_headless_inner(
             return Err(outcome);
         }
     };
-    let ConstructedRun { prompt, mut runner } = built;
+    let ConstructedRun {
+        prompt,
+        mut runner,
+        model,
+    } = built;
 
     let force_args = args.clone();
     let hook_mode = inherited_mode.clone();
@@ -225,12 +229,17 @@ async fn run_headless_inner(
     });
     startup_bridge.stop().await;
 
+    let saver = crate::session::SessionSaver::with_model(runner.session_id(), model);
     let run = match runner.run(&prompt).await {
         Ok(run) => run,
         Err(err) => {
             let outcome = HeadlessOutcome::from_loop_error(&err);
             write_done_file_if_requested(args, &outcome, inherited_mode.as_ref());
             outcome_recorded.store(true, Ordering::SeqCst);
+            save_transcript(
+                &saver,
+                &crate::messages::transcript_from_run(&prompt, &Err(err)),
+            );
             bridge.stop().await;
             return Err(outcome);
         }
@@ -239,8 +248,26 @@ async fn run_headless_inner(
     let outcome = HeadlessOutcome::from_run(&run);
     write_done_file_if_requested(args, &outcome, inherited_mode.as_ref());
     outcome_recorded.store(true, Ordering::SeqCst);
+    save_transcript(
+        &saver,
+        &crate::messages::transcript_from_run(&prompt, &Ok(run)),
+    );
     bridge.stop().await;
     Ok(outcome)
+}
+
+/// Persist the run's transcript; a failed save never fails the run.
+///
+/// The transcript is the artifact a user returns for, so it is
+/// written on every exit path the run resolves — success, failure,
+/// and cancel alike. A forced exit (the repeated interrupt) writes
+/// nothing: that run never resolved, so only its prompt ever
+/// existed. A save that itself fails only warns: the run's own
+/// outcome outranks the bookkeeping.
+fn save_transcript(saver: &crate::session::SessionSaver, transcript: &[dch_tui::TuiMessage]) {
+    if let Err(err) = saver.save(transcript) {
+        tracing::warn!(error = %err, "session transcript could not be saved");
+    }
 }
 
 /// The force hook's marker write, stood down once a run outcome exists.
@@ -282,6 +309,12 @@ struct ConstructedRun {
     /// directory, observer attached, with its shared cancel signal ready
     /// for the run bridge to install.
     runner: dch_loop::Runner,
+
+    /// The model the run uses, from the loaded config.
+    ///
+    /// Carried out of construction so the session transcript records
+    /// the model the session actually ran.
+    model: String,
 }
 
 /// Resolve the prompt, load the config, and build the runner.
@@ -323,7 +356,12 @@ async fn construct_run(
         .map_err(|err| {
             construction_failure(args, format!("agent construction: {err}"), inherited_mode)
         })?;
-    Ok(ConstructedRun { prompt, runner })
+    let model = config.api.model.clone();
+    Ok(ConstructedRun {
+        prompt,
+        runner,
+        model,
+    })
 }
 
 /// Write the done-file for an interrupt that lands before the runner
