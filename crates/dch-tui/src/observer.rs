@@ -52,6 +52,13 @@ pub struct ToolResultDisplay {
     /// Wall-clock time from dispatch to completion.
     pub duration: Duration,
 
+    /// The call's input, compacted, as stashed at dispatch.
+    ///
+    /// Carried forward from the retiring active entry so the
+    /// completed line can humanize ("Reading src/main.rs") without
+    /// re-deriving the input; empty when no summary was stashed.
+    pub input_summary: String,
+
     /// A short preview of the call's output.
     ///
     /// Empty from the lifecycle events alone — they carry no output
@@ -98,9 +105,9 @@ pub struct TuiObserverState {
 
     /// Completed tool calls, newest appended.
     ///
-    /// The display drains this on redraw into its own bounded
-    /// history, so completed calls stay visible without the buffer
-    /// accumulating across a session.
+    /// The display drains this on redraw and graduates each entry
+    /// into the conversation, so completed calls stay visible
+    /// without the buffer accumulating across a session.
     pub tool_results: Arc<Mutex<Vec<ToolResultDisplay>>>,
 
     /// Run-level failures the display has not taken yet.
@@ -220,14 +227,16 @@ fn recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// Condense a tool call's input into a glanceable summary.
 ///
-/// Renders the JSON compactly and caps it on a character boundary,
-/// so the pending indicator stays one line whatever the input.
-fn summarize_input(input: &serde_json::Value) -> String {
-    let compact = input.to_string();
-    if compact.chars().count() <= SUMMARY_LIMIT {
-        return compact;
+/// Extracts the call's primary value from the full input JSON while
+/// it is still in hand, then caps it on a character boundary — a
+/// capped bare value stays usable for humanizing, where capped JSON
+/// would no longer parse.
+fn summarize_input(tool: &str, input: &serde_json::Value) -> String {
+    let value = crate::tool_render::display_input(tool, input);
+    if value.chars().count() <= SUMMARY_LIMIT {
+        return value;
     }
-    let truncated: String = compact
+    let truncated: String = value
         .chars()
         .take(SUMMARY_LIMIT.saturating_sub(1))
         .collect();
@@ -249,20 +258,25 @@ impl TuiObserver {
     /// Record a completed tool call and retire its active entry.
     ///
     /// The call id pairs this completion with its dispatch exactly —
-    /// same-tool retries and parallel calls included. The
+    /// same-tool retries and parallel calls included. The retiring
+    /// entry's input summary carries forward, so the completed line
+    /// can humanize without re-deriving the call's input. The
     /// loop-detection fingerprint and any display hint stay out of
     /// the recorded fields.
     pub fn finish_tool(&self, call_id: &str, name: &str, is_error: bool, duration: Duration) {
-        {
+        let input_summary = {
             let mut tools = recover(&self.state.active_tools);
-            if let Some(position) = tools.iter().position(|tool| tool.call_id == call_id) {
-                tools.remove(position);
-            }
-        }
+            tools
+                .iter()
+                .position(|tool| tool.call_id == call_id)
+                .map(|position| tools.remove(position).input_summary)
+                .unwrap_or_default()
+        };
         recover(&self.state.tool_results).push(ToolResultDisplay {
             name: name.to_string(),
             is_error,
             duration,
+            input_summary,
             output_preview: String::new(),
         });
         self.notify();
@@ -294,7 +308,7 @@ impl LoopObserver for TuiObserver {
     }
 
     fn on_tool_call_received(&self, ctx: &ToolCallReceivedContext) {
-        let summary = summarize_input(&ctx.input);
+        let summary = summarize_input(&ctx.tool, &ctx.input);
         let mut stash = recover(&self.pending_summaries);
         if stash.len() >= PENDING_SUMMARY_CAP {
             stash.clear();

@@ -435,3 +435,58 @@ fn a_poisoned_buffer_is_recovered_not_propagated() {
         "the observer keeps writing through a poisoned lock"
     );
 }
+
+#[test]
+fn a_long_input_stashes_its_extracted_value_not_truncated_json() {
+    let (observer, kept) = state_and_observer();
+    observer.on_tool_call_received(&received(
+        "call-1",
+        "Edit",
+        json!({
+            "file_path": "src/lib.rs",
+            "old_string": "fn main() { let x = 1; }",
+            "new_string": "fn main() { let x = 2; }"
+        }),
+    ));
+    observer.on_tool_pre(&pre("call-1", "Edit"));
+    let tools = kept.active_tools.lock().unwrap().clone();
+    let summary = &tools.first().expect("one active tool").input_summary;
+    assert_eq!(
+        summary, "src/lib.rs",
+        "the stash holds the extracted value — capped JSON would no longer humanize: {summary}"
+    );
+}
+
+#[test]
+fn batch_tools_stash_their_counts_with_the_value() {
+    let (observer, kept) = state_and_observer();
+    observer.on_tool_call_received(&received(
+        "call-1",
+        "MultiEdit",
+        json!({
+            "edits": [
+                {"file_path": "a.rs"},
+                {"file_path": "b.rs"},
+                {"file_path": "c.rs"}
+            ]
+        }),
+    ));
+    observer.on_tool_call_received(&received(
+        "call-2",
+        "TodoWrite",
+        json!({"todos": [{"a": 1}, {"b": 2}]}),
+    ));
+    observer.on_tool_pre(&pre("call-1", "MultiEdit"));
+    observer.on_tool_pre(&pre("call-2", "TodoWrite"));
+    let tools = kept.active_tools.lock().unwrap().clone();
+    let multiedit = &tools.first().expect("the MultiEdit").input_summary;
+    assert_eq!(
+        multiedit, "a.rs (3 edits)",
+        "the count lives in the stash — it cannot be recovered at render: {multiedit}"
+    );
+    let todo = &tools.get(1).expect("the TodoWrite").input_summary;
+    assert_eq!(
+        todo, "2 items",
+        "a list-only input carries its size as the value: {todo}"
+    );
+}
