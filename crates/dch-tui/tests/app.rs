@@ -444,8 +444,8 @@ fn completed_tool_blocks_render_between_text() {
     }
     let joined = rows.join("\n");
     assert!(
-        joined.contains("✓ Read src/main.rs (0.4s)"),
-        "a successful tool renders its summary and elapsed stamp: {joined:?}"
+        joined.contains("✓ Reading src/main.rs… (0.4s)"),
+        "a successful tool renders its humanized summary and elapsed stamp: {joined:?}"
     );
     assert!(
         joined.contains("✗ Grep \"todo\" (1m1s)"),
@@ -616,7 +616,7 @@ fn elapsed_stamps_round_once_before_splitting() {
     let rows = row_texts(&terminal);
     let joined = rows.join("\n");
     assert!(
-        joined.contains("Read a.rs (1m30s)"),
+        joined.contains("Reading a.rs… (1m30s)"),
         "90s rounds to 1m30s, not 2m30s: {joined:?}"
     );
     assert!(
@@ -624,7 +624,7 @@ fn elapsed_stamps_round_once_before_splitting() {
         "119.6s rounds once to 2m0s, not 1m60s or 2m60s: {joined:?}"
     );
     assert!(
-        joined.contains("Bash true (1m0s)"),
+        joined.contains("Running: true (1m0s)"),
         "59.6s crosses the minute boundary once rounded: {joined:?}"
     );
 }
@@ -698,12 +698,21 @@ fn a_finalized_reply_graduates_into_the_conversation() {
 }
 
 #[test]
-fn completed_tool_results_drain_into_a_bounded_history() {
+fn completed_tools_graduate_inline_into_the_conversation() {
     let state = dch_tui::TuiObserverState::new();
     let (observer, kept) = state.into_observer();
     let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept.clone());
 
     for index in 0..25 {
+        kept.active_tools
+            .lock()
+            .expect("the tools lock")
+            .push(dch_tui::ActiveTool {
+                call_id: format!("call-{index}"),
+                name: format!("tool-{index}"),
+                input_summary: format!("{{\"n\":{index}}}"),
+                start: std::time::Instant::now(),
+            });
         observer.finish_tool(
             &format!("call-{index}"),
             &format!("tool-{index}"),
@@ -717,18 +726,16 @@ fn completed_tool_results_drain_into_a_bounded_history() {
     let view = view_text(&terminal, 80, 30);
     assert!(
         view.contains("✓ tool-24"),
-        "the newest completed tool renders after its active line retires: {view:?}"
+        "the newest completed tool renders inline: {view:?}"
+    );
+    assert_eq!(
+        app.conversation().len(),
+        25,
+        "every completion graduates into the conversation — no display depth cap drops any"
     );
     assert!(
-        !view.contains("✓ tool-4"),
-        "history older than the display depth drops off instead of scrolling everything: {view:?}"
-    );
-    assert!(
-        kept.tool_results
-            .lock()
-            .expect("the results lock")
-            .is_empty(),
-        "the shared buffer drains on redraw, so it cannot accumulate across a session"
+        kept.graduations.lock().expect("the queue lock").is_empty(),
+        "the shared queue drains on redraw, so it cannot accumulate across a session"
     );
 }
 
@@ -744,21 +751,13 @@ fn poisoned_shared_buffers_still_graduate_through_render() {
     });
     observer.finish_tool("call-1", "Grep", false, std::time::Duration::from_millis(3));
 
-    let poisoned_replies = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _guard = kept.completed_replies.lock().expect("the replies lock");
-        panic!("poison the replies lock");
+    let poisoned_graduations = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = kept.graduations.lock().expect("the queue lock");
+        panic!("poison the queue lock");
     }));
     assert!(
-        poisoned_replies.is_err(),
-        "the replies poisoning must unwind"
-    );
-    let poisoned_results = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _guard = kept.tool_results.lock().expect("the results lock");
-        panic!("poison the results lock");
-    }));
-    assert!(
-        poisoned_results.is_err(),
-        "the results poisoning must unwind"
+        poisoned_graduations.is_err(),
+        "the queue poisoning must unwind"
     );
 
     observer.on_response(&loopctl::observer::ResponseContext {
@@ -778,7 +777,7 @@ fn poisoned_shared_buffers_still_graduate_through_render() {
     );
     assert!(
         view.contains("✓ Grep") && view.contains("✓ Read"),
-        "poisoned tool results still drain into the history: {view:?}"
+        "poisoned tool results still graduate into the conversation: {view:?}"
     );
     let assistant_count = app
         .conversation()
@@ -786,8 +785,8 @@ fn poisoned_shared_buffers_still_graduate_through_render() {
         .filter(|message| matches!(message, dch_tui::TuiMessage::Assistant { .. }))
         .count();
     assert_eq!(
-        assistant_count, 2,
-        "both replies graduated into the conversation through the poisoned lock"
+        assistant_count, 4,
+        "both replies and both tool completions graduated through the poisoned locks"
     );
 }
 
@@ -796,10 +795,10 @@ fn a_turn_end_hook_receives_the_graduated_reply() {
     let state = dch_tui::TuiObserverState::new();
     let (observer, kept) = state.into_observer();
     drop(observer);
-    kept.completed_replies
+    kept.graduations
         .lock()
-        .expect("the replies lock")
-        .push("the finished reply".to_string());
+        .expect("the queue lock")
+        .push(dch_tui::Graduation::Reply("the finished reply".to_string()));
     let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
     let snapshots: Arc<std::sync::Mutex<Snapshots>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&snapshots);
@@ -872,10 +871,10 @@ fn a_quiet_frame_does_not_fire_the_turn_end_hook() {
         "a frame that graduates nothing fires nothing"
     );
 
-    kept.completed_replies
+    kept.graduations
         .lock()
-        .expect("the replies lock")
-        .push("a late reply".to_string());
+        .expect("the queue lock")
+        .push(dch_tui::Graduation::Reply("a late reply".to_string()));
     drop(render_to_buffer(&mut app, 80, 30));
     assert_eq!(
         snapshots_lock(&snapshots).len(),
@@ -1312,5 +1311,186 @@ fn a_submit_before_the_quit_in_one_burst_lands() {
         app.input(),
         "",
         "the submit clears the buffer; only the post-quit keystroke is dropped"
+    );
+}
+
+#[test]
+fn f2_cycles_verbosity_and_rerenders_completed_tools() {
+    let mut app = app();
+    app.push_message(TuiMessage::Assistant {
+        blocks: vec![ContentBlock::Tool {
+            name: "Read".to_string(),
+            input_preview: r#"{"file_path":"a.rs"}"#.to_string(),
+            success: true,
+            elapsed_secs: 0.42,
+            output_preview: String::new(),
+        }],
+        timestamp: chrono::Utc::now(),
+        duration_ms: None,
+    });
+
+    let normal = render_to_buffer(&mut app, 80, 30);
+    let normal_rows = row_texts(&normal).join("\n");
+    assert!(
+        normal_rows.contains("✓ Reading a.rs… (0.4s)"),
+        "Normal shows the humanized summary and duration: {normal_rows:?}"
+    );
+
+    app.handle_event(&key(KeyCode::F(2), KeyModifiers::NONE));
+    let verbose = render_to_buffer(&mut app, 80, 30);
+    let verbose_rows = row_texts(&verbose).join("\n");
+    assert!(
+        verbose_rows.contains("Read "),
+        "Verbose shows the raw name: {verbose_rows:?}"
+    );
+    assert!(
+        verbose_rows.contains("    Input:"),
+        "Verbose shows the input block after one F2 (Normal→Verbose via default order check): {verbose_rows:?}"
+    );
+
+    app.handle_event(&key(KeyCode::F(2), KeyModifiers::NONE));
+    let quiet = render_to_buffer(&mut app, 80, 30);
+    let quiet_rows = row_texts(&quiet).join("\n");
+    assert!(
+        quiet_rows.contains("✓ Reading a.rs…") && !quiet_rows.contains("(0.4s)"),
+        "Quiet collapses to one dim line without duration — the cache re-rendered: {quiet_rows:?}"
+    );
+}
+
+#[test]
+fn running_tools_render_their_humanized_summary() {
+    let mut app = app();
+    app.active_tools()
+        .lock()
+        .expect("the tools lock")
+        .push(dch_tui::ActiveTool {
+            call_id: "call-1".to_string(),
+            name: "Read".to_string(),
+            input_summary: r#"{"file_path":"src/lib.rs"}"#.to_string(),
+            start: std::time::Instant::now(),
+        });
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&terminal);
+    assert!(
+        rows.iter().any(|row| row.contains("Reading src/lib.rs")),
+        "a running tool humanizes its summary live: {rows:?}"
+    );
+}
+
+#[test]
+fn a_tool_graduation_fires_the_turn_end_hook() {
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    kept.graduations
+        .lock()
+        .expect("the queue lock")
+        .push(dch_tui::Graduation::Tool(dch_tui::ToolResultDisplay {
+            name: "Read".to_string(),
+            is_error: false,
+            duration: std::time::Duration::from_millis(2),
+            input_summary: String::new(),
+            output_preview: String::new(),
+        }));
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    let snapshots: Arc<std::sync::Mutex<Snapshots>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&snapshots);
+    app.set_turn_end_hook(Box::new(move |conversation| {
+        snapshots_lock(&sink).push(conversation.to_vec());
+    }));
+    drop(render_to_buffer(&mut app, 80, 30));
+    let seen = snapshots_lock(&snapshots);
+    assert_eq!(
+        seen.len(),
+        1,
+        "a graduating tool is turn progress — the hook fires so the transcript keeps it"
+    );
+    assert!(
+        seen.first()
+            .expect("the one snapshot")
+            .iter()
+            .any(|message| matches!(
+                message,
+                TuiMessage::Assistant { blocks, .. }
+                    if blocks.iter().any(|block| matches!(block, ContentBlock::Tool { name, .. } if name == "Read"))
+            )),
+        "the snapshot carries the graduated tool"
+    );
+}
+
+#[test]
+fn hostile_elapsed_values_render_instead_of_panicking() {
+    let mut app = app();
+    for elapsed_secs in [-1.0, f64::NAN, 1.0e300] {
+        app.push_message(TuiMessage::Assistant {
+            blocks: vec![ContentBlock::Tool {
+                name: "Read".to_string(),
+                input_preview: "a.rs".to_string(),
+                success: true,
+                elapsed_secs,
+                output_preview: String::new(),
+            }],
+            timestamp: chrono::Utc::now(),
+            duration_ms: None,
+        });
+    }
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&terminal);
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.contains("Reading a.rs"))
+            .count(),
+        3,
+        "negative, NaN, and overflowing elapsed values all render as zero: {rows:?}"
+    );
+}
+
+#[test]
+fn a_reply_graduates_below_the_tool_that_preceded_it() {
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    // A tool completes, then the turn's reply arrives — no draw
+    // between them, so both wait in the queue together.
+    kept.graduations
+        .lock()
+        .expect("the queue lock")
+        .push(dch_tui::Graduation::Tool(dch_tui::ToolResultDisplay {
+            name: "Read".to_string(),
+            is_error: false,
+            duration: std::time::Duration::from_millis(3),
+            input_summary: String::new(),
+            output_preview: String::new(),
+        }));
+    kept.graduations
+        .lock()
+        .expect("the queue lock")
+        .push(dch_tui::Graduation::Reply(
+            "here is what I found".to_string(),
+        ));
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    drop(render_to_buffer(&mut app, 80, 30));
+    let kinds: Vec<&str> = app
+        .conversation()
+        .iter()
+        .map(|message| match message {
+            TuiMessage::Assistant { blocks, .. } => {
+                if blocks
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::Tool { .. }))
+                {
+                    "tool"
+                } else {
+                    "text"
+                }
+            }
+            _ => "other",
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["tool", "text"],
+        "the conversation keeps the order the events happened — the tool that \
+         produced the reply sits above it"
     );
 }

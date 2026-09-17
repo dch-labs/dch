@@ -17,7 +17,7 @@ use ratatui::Frame;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
-use ratatui::text::{Line, Span};
+use ratatui::text::Line;
 use ratatui::widgets::{
     Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
@@ -25,12 +25,15 @@ use unicode_width::UnicodeWidthChar;
 
 use dch_config::DchConfig;
 
+use crate::Graduation;
 use crate::events::TerminalEvents;
 use crate::input::{InputAction, InputEditor};
 use crate::markdown;
 use crate::message::{ActiveTool, ContentBlock, TokenCounts, TuiMessage};
 use crate::observer::{ToolResultDisplay, TuiObserverState};
 use crate::theme::Theme;
+use crate::tool_render::SPINNER_FRAMES;
+use dch_config::Verbosity;
 
 /// The callback fired when a turn's outcome joins the conversation.
 ///
@@ -39,12 +42,12 @@ use crate::theme::Theme;
 /// into display state.
 type TurnEndHook = Box<dyn Fn(&[TuiMessage]) + Send + Sync>;
 
-/// How many completed tool calls the live region keeps visible.
+/// The largest elapsed span a persisted tool block may carry.
 ///
-/// Oldest entries drop off the drained history once the count passes
-/// this depth, so a long session neither loses recent completions nor
-/// accumulates all of them.
-const TOOL_HISTORY_DEPTH: usize = 20;
+/// `Duration::from_secs_f64` panics past its own representable
+/// range; a hostile or corrupted value beyond this bound renders as
+/// zero instead of killing the first frame after resume.
+const MAX_ELAPSED_SECS: f64 = 9.0e18;
 
 /// The minimum spacing between background-initiated frames.
 ///
@@ -124,13 +127,19 @@ pub struct TuiApp {
     /// `None` on a bare app — turns come and go unpersisted.
     turn_end_hook: Option<TurnEndHook>,
 
-    /// Completed tool calls this display has taken from the shared
-    /// buffer.
+    /// The display verbosity shaping tool lines.
     ///
-    /// Drained from the shared state on every redraw and capped at
-    /// [`TOOL_HISTORY_DEPTH`], so finished calls stay visible while
-    /// nothing accumulates without bound.
-    tool_history: Vec<ToolResultDisplay>,
+    /// Initialized from the config and cycled at runtime; switching
+    /// invalidates the conversation and live caches so completed
+    /// bodies re-render in the new mode on the next frame.
+    verbosity: Verbosity,
+
+    /// The braille spinner's current frame.
+    ///
+    /// Advanced one frame per render tick while any tool runs;
+    /// running lines rebuild every frame anyway, so the pulse costs
+    /// nothing extra.
+    spinner_idx: usize,
 
     /// The input editor: multi-line buffer, cursor, and history.
     ///
@@ -237,9 +246,17 @@ pub struct TuiApp {
     live_stamp: u64,
 
     /// The freeze offset the live cache was built at.
+    ///
+    /// A live rebuild is valid only for the frozen prefix it
+    /// started from; when the freeze advances, the cached lines
+    /// describe a different suffix and this key forces the rebuild.
     live_frozen_upto: usize,
 
     /// The pane width the live cache was built at.
+    ///
+    /// Wrapped live lines are width-shaped; a resize re-wraps
+    /// rather than reusing, so a narrowed pane never clips rows
+    /// baked for the old width.
     live_width: u16,
 
     /// Rendered lines of the settled conversation.
@@ -253,17 +270,25 @@ pub struct TuiApp {
     conversation_cache: Vec<Line<'static>>,
 
     /// The pane width the conversation cache was built for.
+    ///
+    /// Settled markdown re-flows with the pane; a width change
+    /// invalidates the cache wholesale so the next frame rebuilds
+    /// every block at the new wrap.
     conversation_cache_width: u16,
 
     /// Monotonic count of settled-conversation mutations.
     ///
-    /// Every message push, drained tool result, and echoed submit
-    /// bumps it; the render cache detects staleness by falling
-    /// behind, which keeps the comparison against the width key
-    /// uniform.
+    /// Every message push and verbosity switch bumps it; the render
+    /// cache detects staleness by falling behind, which keeps the
+    /// comparison against the width key uniform.
     conversation_generation: u64,
 
     /// The generation the conversation cache was built at.
+    ///
+    /// Paired with
+    /// [`conversation_generation`](Self::conversation_generation):
+    /// the cache is stale exactly when the live count has moved
+    /// past this stamp, whatever caused the bump.
     conversation_cache_generation: u64,
 
     /// Whether the run loop should exit.
@@ -307,7 +332,8 @@ impl TuiApp {
             state,
             submit_tx: None,
             turn_end_hook: None,
-            tool_history: Vec::new(),
+            verbosity: config.display.verbosity,
+            spinner_idx: 0,
             input: InputEditor::new(),
             scroll_offset: 0,
             auto_scroll: true,
@@ -428,6 +454,33 @@ impl TuiApp {
         self.submit_tx = Some(tx);
     }
 
+    /// Switch the display verbosity.
+    ///
+    /// Invalidates the conversation and live caches so every
+    /// completed tool body re-renders in the new mode on the next
+    /// frame — the shapes differ across modes, so stale lines must
+    /// not linger until the next real event.
+    pub fn set_verbosity(&mut self, verbosity: Verbosity) {
+        self.verbosity = verbosity;
+        self.conversation_generation = self.conversation_generation.saturating_add(1);
+        self.live_stamp = 0;
+    }
+
+    /// Advance to the next verbosity mode, wrapping around.
+    ///
+    /// F2's handler: one press moves one step along Quiet → Normal
+    /// → Verbose → Quiet, each press taking effect on the next
+    /// frame through [`set_verbosity`](Self::set_verbosity)'s cache
+    /// invalidation.
+    fn cycle_verbosity(&mut self) {
+        let next = match self.verbosity {
+            Verbosity::Quiet => Verbosity::Normal,
+            Verbosity::Normal => Verbosity::Verbose,
+            Verbosity::Verbose => Verbosity::Quiet,
+        };
+        self.set_verbosity(next);
+    }
+
     /// Install the callback fired when a turn ends.
     ///
     /// The hook receives the conversation snapshot at the moment a
@@ -447,7 +500,7 @@ impl TuiApp {
     /// is delivered on the next iteration rather than lost.
     /// Background redraws are frame-capped: a notify renders at most
     /// once per frame interval, a request arriving sooner parks
-    /// itself for the tick to claim, and a queued finalized reply
+    /// itself for the tick to claim, and any queued graduation
     /// forces the frame. Input-driven redraws are not capped. The
     /// tick redraws while tool calls are in flight (keeping their
     /// elapsed stamps live), claims parked background requests, and
@@ -563,6 +616,10 @@ impl TuiApp {
         match (key.code, key.modifiers) {
             (KeyCode::Char('c' | 'd'), KeyModifiers::CONTROL) | (KeyCode::Esc, _) => {
                 self.quitting = true;
+                true
+            }
+            (KeyCode::F(2), _) => {
+                self.cycle_verbosity();
                 true
             }
             (KeyCode::PageUp, _) => {
@@ -688,13 +745,13 @@ impl TuiApp {
 
     /// Decide whether a background-requested redraw may run now.
     ///
-    /// A queued finalized reply always forces the frame — the
-    /// graduated message must not wait out the cap. Otherwise a
+    /// A queued graduation always forces the frame — the graduated
+    /// message must not wait out the cap. Otherwise a
     /// frame renders at most once per frame interval; a request
     /// arriving sooner parks itself in the pending flag for the
     /// periodic tick to claim. The caller supplies the frame clock.
     pub fn redraw_due(&mut self, now: Instant) -> bool {
-        if self.finalized_reply_waiting() {
+        if self.graduation_waiting() {
             self.render_pending = false;
             self.last_frame = Some(now);
             return true;
@@ -747,36 +804,44 @@ impl TuiApp {
 
     /// Handle a periodic tick.
     ///
-    /// Claims any parked background redraw first, then redraws when
-    /// tool calls are in flight (keeping their elapsed stamps live)
-    /// or a claim was made; an idle tick with nothing parked and no
-    /// tools in flight draws nothing.
+    /// Claims any parked background redraw first, advances the
+    /// spinner one frame while tools run, then redraws — the tick
+    /// itself is the animation beat. An idle tick with nothing
+    /// parked and no tools in flight draws nothing.
     pub fn tick_wake(&mut self, now: Instant) -> bool {
         let claimed = self.take_pending_redraw(now);
+        if self.any_tools_running() {
+            let next = self.spinner_idx.saturating_add(1);
+            self.spinner_idx = if next >= SPINNER_FRAMES.len() {
+                0
+            } else {
+                next
+            };
+        }
         self.any_tools_running() || claimed
     }
 
-    /// Whether a finalized reply is waiting to graduate.
+    /// Whether a graduation is waiting to land.
     ///
     /// A poisoned lock recovers — the same policy the drain applies
-    /// — so a finalized reply still forces its frame after another
+    /// — so a waiting event still forces its frame after another
     /// thread's panic.
-    fn finalized_reply_waiting(&self) -> bool {
-        let replies = self
+    fn graduation_waiting(&self) -> bool {
+        let graduations = self
             .state
-            .completed_replies
+            .graduations
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        !replies.is_empty()
+        !graduations.is_empty()
     }
 
     /// Render one frame of the three-pane layout.
     ///
     /// Conversation fills the space above the input box; the status
     /// bar closes the frame at the bottom row. Each frame first takes
-    /// what the observer finished — finalized replies graduate into
-    /// the conversation, completed tool calls into the bounded
-    /// history. The streaming region follows the conversation:
+    /// what the observer finished — finalized replies and completed
+    /// tool calls alike graduate into the conversation. The
+    /// streaming region follows the conversation:
     /// frozen blocks render from the cache, the live complete lines
     /// re-parse as markdown, and the unterminated tail renders as
     /// plaintext. A pinned view re-anchors to the newest line; a
@@ -871,33 +936,43 @@ impl TuiApp {
 
     /// Take what the observer finished since the last frame.
     ///
-    /// Finalized replies move into the conversation as assistant
-    /// messages; completed tool calls move into this display's
-    /// bounded history; run failures recorded by the mode driver
-    /// surface as error messages — so none of the shared buffers
-    /// accumulates across frames. Whenever a reply or a failure
-    /// lands, the turn-end hook — when installed — receives the
-    /// conversation snapshot, the host's save point. A poisoned lock
-    /// is recovered — the same policy the observer writes with — so
+    /// Finalized replies and completed tool calls alike move into
+    /// the conversation as assistant messages; run failures
+    /// recorded by the mode driver surface as error messages — so
+    /// none of the shared buffers accumulates across frames.
+    /// Whenever a reply, a tool completion, or a failure lands, the
+    /// turn-end hook — when installed — receives the conversation
+    /// snapshot, the host's save point. A poisoned lock is
+    /// recovered — the same policy the observer writes with — so
     /// finalized data still graduates.
     fn drain_shared_state(&mut self) {
-        let replies = take_locked(&self.state.completed_replies);
+        let graduations = take_locked(&self.state.graduations);
         let now = chrono::Utc::now();
-        let mut turn_ended = !replies.is_empty();
-        for text in replies {
-            self.push_message(TuiMessage::Assistant {
-                blocks: vec![ContentBlock::Text { text }],
-                timestamp: now,
-                duration_ms: None,
-            });
+        let mut turn_ended = !graduations.is_empty();
+        for graduation in graduations {
+            match graduation {
+                Graduation::Reply(text) => {
+                    self.push_message(TuiMessage::Assistant {
+                        blocks: vec![ContentBlock::Text { text }],
+                        timestamp: now,
+                        duration_ms: None,
+                    });
+                }
+                Graduation::Tool(result) => {
+                    self.push_message(TuiMessage::Assistant {
+                        blocks: vec![ContentBlock::Tool {
+                            name: result.name,
+                            input_preview: result.input_summary,
+                            success: !result.is_error,
+                            elapsed_secs: result.duration.as_secs_f64(),
+                            output_preview: result.output_preview,
+                        }],
+                        timestamp: now,
+                        duration_ms: None,
+                    });
+                }
+            }
         }
-        let drained_tools = take_locked(&self.state.tool_results);
-        if !drained_tools.is_empty() {
-            self.conversation_generation = self.conversation_generation.saturating_add(1);
-        }
-        self.tool_history.extend(drained_tools);
-        let drop_count = self.tool_history.len().saturating_sub(TOOL_HISTORY_DEPTH);
-        self.tool_history.drain(..drop_count);
         let errors = take_locked(&self.state.errors);
         turn_ended |= !errors.is_empty();
         for text in errors {
@@ -918,10 +993,9 @@ impl TuiApp {
     /// single styled lines; error messages wrap as styled plaintext
     /// at the pane width, so a long failure body stays readable
     /// instead of clipping at the right edge; a completed tool
-    /// block renders as one dim summary line between the text
-    /// blocks around it. The bounded history of drained tool
-    /// results closes the settled content; the live region
-    /// (streaming text, in-flight tools) is assembled by the caller.
+    /// block renders its verbosity-shaped summary line(s) between
+    /// the text blocks around it. The live region (streaming text,
+    /// in-flight tools) is assembled by the caller.
     fn conversation_lines(&self, area: Rect) -> Vec<Line<'static>> {
         let width = area.width.max(1);
         let markdown_theme = markdown::MarkdownTheme::from(&self.theme);
@@ -957,12 +1031,25 @@ impl TuiApp {
                                 elapsed_secs,
                                 ..
                             } => {
-                                lines.push(completed_tool_line(
-                                    name,
-                                    input_preview,
-                                    *success,
-                                    *elapsed_secs,
+                                let elapsed = if elapsed_secs.is_finite()
+                                    && *elapsed_secs >= 0.0
+                                    && *elapsed_secs <= MAX_ELAPSED_SECS
+                                {
+                                    std::time::Duration::from_secs_f64(*elapsed_secs)
+                                } else {
+                                    std::time::Duration::ZERO
+                                };
+                                let record = ToolResultDisplay {
+                                    name: name.clone(),
+                                    is_error: !*success,
+                                    duration: elapsed,
+                                    input_summary: input_preview.clone(),
+                                    output_preview: String::new(),
+                                };
+                                lines.extend(crate::tool_render::completed_tool_lines(
+                                    &record,
                                     &self.theme,
+                                    self.verbosity,
                                 ));
                             }
                         }
@@ -984,9 +1071,6 @@ impl TuiApp {
                     ));
                 }
             }
-        }
-        for result in &self.tool_history {
-            lines.push(result_line(result, &self.theme));
         }
         lines
     }
@@ -1195,7 +1279,14 @@ impl TuiApp {
             .map_or_else(|_| Vec::new(), |tools| tools.clone());
         tools
             .iter()
-            .map(|tool| running_tool_line(tool, &self.theme))
+            .flat_map(|tool| {
+                crate::tool_render::running_tool_lines(
+                    tool,
+                    self.spinner_idx,
+                    &self.theme,
+                    self.verbosity,
+                )
+            })
             .collect()
     }
 
@@ -1263,90 +1354,6 @@ impl TuiApp {
             ),
             area,
         );
-    }
-}
-
-/// Build the conversation line for a completed tool call.
-///
-/// The outcome marker carries the theme's success or error color; the
-/// name, input preview, and elapsed stamp stay dim so tool activity
-/// reads as one glanceable line between the text blocks around it.
-fn completed_tool_line(
-    name: &str,
-    input_preview: &str,
-    success: bool,
-    elapsed_secs: f64,
-    theme: &Theme,
-) -> Line<'static> {
-    let (marker, marker_color) = if success {
-        ("✓", theme.ui.status_success)
-    } else {
-        ("✗", theme.ui.status_error)
-    };
-    Line::from(vec![
-        Span::styled(marker, Style::default().fg(marker_color)),
-        Span::styled(
-            format!(" {name} {input_preview}{}", format_elapsed(elapsed_secs)),
-            Style::default().fg(theme.ui.dim),
-        ),
-    ])
-}
-
-/// Build the conversation line for a drained tool result.
-///
-/// The result record carries no input preview — the conversation
-/// around it supplies the what — so the line is the outcome marker,
-/// the name, and the elapsed stamp.
-fn result_line(result: &ToolResultDisplay, theme: &Theme) -> Line<'static> {
-    let (marker, marker_color) = if result.is_error {
-        ("✗", theme.ui.status_error)
-    } else {
-        ("✓", theme.ui.status_success)
-    };
-    Line::from(vec![
-        Span::styled(marker, Style::default().fg(marker_color)),
-        Span::styled(
-            format!(
-                " {}{}",
-                result.name,
-                format_elapsed(result.duration.as_secs_f64())
-            ),
-            Style::default().fg(theme.ui.dim),
-        ),
-    ])
-}
-
-/// Build the conversation line for an in-flight tool call.
-///
-/// The marker and summary stay dim — a quiet cue that the call is
-/// working, replaced by the colored outcome marker once it completes.
-fn running_tool_line(tool: &ActiveTool, theme: &Theme) -> Line<'static> {
-    let elapsed = tool.start.elapsed().as_secs_f64();
-    Line::from(vec![
-        Span::styled("⏳", Style::default().fg(theme.ui.dim)),
-        Span::styled(
-            format!(
-                " {} {}{}",
-                tool.name,
-                tool.input_summary,
-                format_elapsed(elapsed)
-            ),
-            Style::default().fg(theme.ui.dim),
-        ),
-    ])
-}
-
-/// Render a duration as a parenthesized elapsed stamp.
-///
-/// Sub-minute durations keep one decimal (`(0.4s)`); at a minute the
-/// total is rounded once, then split into minutes and whole seconds
-/// (`(1m30s)`), so the components never round past the true value.
-fn format_elapsed(secs: f64) -> String {
-    let total = secs.round();
-    if total >= 60.0 {
-        format!(" ({:.0}m{:.0}s)", (total / 60.0).floor(), total % 60.0)
-    } else {
-        format!(" ({secs:.1}s)")
     }
 }
 

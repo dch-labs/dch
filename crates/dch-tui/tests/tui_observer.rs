@@ -14,6 +14,7 @@
 
 use std::time::Duration;
 
+use dch_tui::Graduation;
 use dch_tui::TokenCounts;
 use dch_tui::observer::{TuiObserver, TuiObserverState};
 use loopctl::observer::{
@@ -134,7 +135,16 @@ fn a_response_hands_the_finalized_reply_to_the_display_buffer() {
         text: "partial reply".to_string(),
         usage: None,
     });
-    let replies = kept.completed_replies.lock().unwrap().clone();
+    let replies: Vec<String> = kept
+        .graduations
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|event| match event {
+            Graduation::Reply(text) => Some(text.clone()),
+            Graduation::Tool(_) => None,
+        })
+        .collect();
     assert_eq!(
         replies,
         vec!["partial reply".to_string()],
@@ -155,8 +165,8 @@ fn a_response_without_deltas_keeps_the_only_reply_copy() {
         usage: None,
     });
     assert_eq!(
-        kept.completed_replies.lock().unwrap().clone(),
-        vec!["the whole reply".to_string()],
+        kept.graduations.lock().unwrap().clone(),
+        vec![Graduation::Reply("the whole reply".to_string())],
         "a non-streaming turn's response text is the reply's only copy — it must not be dropped"
     );
 }
@@ -185,8 +195,10 @@ fn a_tool_post_moves_the_active_tool_to_results() {
     observer.finish_tool("call-1", "Edit", false, Duration::from_millis(5));
 
     assert!(kept.active_tools.lock().unwrap().is_empty());
-    let results = kept.tool_results.lock().unwrap().clone();
-    let result = results.first().expect("one completed result");
+    let results = kept.graduations.lock().unwrap().clone();
+    let Graduation::Tool(result) = results.first().expect("one completed result") else {
+        panic!("a completed tool graduates as a Tool event");
+    };
     assert_eq!(result.name, "Edit");
     assert!(!result.is_error);
     assert_eq!(result.duration, Duration::from_millis(5));
@@ -268,9 +280,9 @@ fn reset_clears_every_buffer_and_the_private_maps() {
     observer.reset();
 
     assert!(kept.streaming_text.lock().unwrap().is_empty());
-    assert!(kept.completed_replies.lock().unwrap().is_empty());
+    assert!(kept.graduations.lock().unwrap().is_empty());
     assert!(kept.active_tools.lock().unwrap().is_empty());
-    assert!(kept.tool_results.lock().unwrap().is_empty());
+
     assert!(
         kept.errors.lock().unwrap().is_empty(),
         "the driver's error buffer clears with the rest"
@@ -433,5 +445,60 @@ fn a_poisoned_buffer_is_recovered_not_propagated() {
     assert!(
         written.contains("after"),
         "the observer keeps writing through a poisoned lock"
+    );
+}
+
+#[test]
+fn a_long_input_stashes_its_extracted_value_not_truncated_json() {
+    let (observer, kept) = state_and_observer();
+    observer.on_tool_call_received(&received(
+        "call-1",
+        "Edit",
+        json!({
+            "file_path": "src/lib.rs",
+            "old_string": "fn main() { let x = 1; }",
+            "new_string": "fn main() { let x = 2; }"
+        }),
+    ));
+    observer.on_tool_pre(&pre("call-1", "Edit"));
+    let tools = kept.active_tools.lock().unwrap().clone();
+    let summary = &tools.first().expect("one active tool").input_summary;
+    assert_eq!(
+        summary, "src/lib.rs",
+        "the stash holds the extracted value — capped JSON would no longer humanize: {summary}"
+    );
+}
+
+#[test]
+fn batch_tools_stash_their_counts_with_the_value() {
+    let (observer, kept) = state_and_observer();
+    observer.on_tool_call_received(&received(
+        "call-1",
+        "MultiEdit",
+        json!({
+            "edits": [
+                {"file_path": "a.rs"},
+                {"file_path": "b.rs"},
+                {"file_path": "c.rs"}
+            ]
+        }),
+    ));
+    observer.on_tool_call_received(&received(
+        "call-2",
+        "TodoWrite",
+        json!({"todos": [{"a": 1}, {"b": 2}]}),
+    ));
+    observer.on_tool_pre(&pre("call-1", "MultiEdit"));
+    observer.on_tool_pre(&pre("call-2", "TodoWrite"));
+    let tools = kept.active_tools.lock().unwrap().clone();
+    let multiedit = &tools.first().expect("the MultiEdit").input_summary;
+    assert_eq!(
+        multiedit, "a.rs (3 edits)",
+        "the count lives in the stash — it cannot be recovered at render: {multiedit}"
+    );
+    let todo = &tools.get(1).expect("the TodoWrite").input_summary;
+    assert_eq!(
+        todo, "2 items",
+        "a list-only input carries its size as the value: {todo}"
     );
 }

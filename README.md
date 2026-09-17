@@ -131,6 +131,7 @@ Anywhere:
 
 | Key | Action |
 | --- | --- |
+| `F2` | Cycle tool-line verbosity (Quiet → Normal → Verbose; initial mode from `display.verbosity`) |
 | `Esc`, `Ctrl-C`, `Ctrl-D` | Quit (cancels the in-flight run; queued submissions are not started) |
 
 ## Configuration
