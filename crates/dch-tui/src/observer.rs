@@ -35,7 +35,7 @@ const PENDING_SUMMARY_CAP: usize = 64;
 /// Carries what a glanceable result line needs — name, outcome,
 /// duration — while the full output stays in the conversation. The
 /// numeric loop-detection fingerprint never reaches these fields.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ToolResultDisplay {
     /// The invoked tool's name.
     ///
@@ -66,6 +66,28 @@ pub struct ToolResultDisplay {
     pub output_preview: String,
 }
 
+/// One conversation-ordered completion event.
+///
+/// Replies and tool completions graduate through a single queue so
+/// the conversation preserves the order the events actually
+/// happened — separate per-kind buffers would drain in buffer order,
+/// not event order, and a reply could land above the tool that
+/// produced it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Graduation {
+    /// A finalized reply's committed text.
+    ///
+    /// Pushed by the response event — for a non-streaming turn the
+    /// only copy of the text.
+    Reply(String),
+
+    /// A completed tool call.
+    ///
+    /// Carries the input summary stashed at dispatch, so the
+    /// graduated line humanizes without re-deriving the input.
+    Tool(ToolResultDisplay),
+}
+
 /// Shared, thread-safe state exchanged between the observer and the
 /// display.
 ///
@@ -83,32 +105,26 @@ pub struct TuiObserverState {
     /// The in-flight assistant text, accumulated delta by delta.
     ///
     /// The response event records the turn's committed text in
-    /// [`completed_replies`](Self::completed_replies) and clears this
+    /// [`graduations`](Self::graduations) and clears this
     /// buffer — the buffer's own accumulation, which a retried stream
     /// can leave duplicated or truncated, is not what graduates. A
     /// failed turn discards the partial text at its turn-end event,
     /// so the buffer never outlives its reply.
     pub streaming_text: Arc<Mutex<String>>,
 
-    /// Finalized assistant replies the display has not taken yet.
+    /// Conversation events waiting to graduate, oldest first.
     ///
-    /// The response event pushes the turn's complete text here — for a
-    /// non-streaming turn this is the only copy — and the display
-    /// drains the buffer on redraw, graduating each text into its
-    /// conversation.
-    pub completed_replies: Arc<Mutex<Vec<String>>>,
+    /// Replies and tool completions arrive here in the order they
+    /// happen, whatever kind they are; the display drains the queue
+    /// on redraw and graduates each event into the conversation, so
+    /// completed calls stay visible without the buffer accumulating
+    /// across a session.
+    pub graduations: Arc<Mutex<Vec<Graduation>>>,
 
     /// Tools currently executing.
     ///
     /// One entry per dispatched call, removed on completion.
     pub active_tools: Arc<Mutex<Vec<ActiveTool>>>,
-
-    /// Completed tool calls, newest appended.
-    ///
-    /// The display drains this on redraw and graduates each entry
-    /// into the conversation, so completed calls stay visible
-    /// without the buffer accumulating across a session.
-    pub tool_results: Arc<Mutex<Vec<ToolResultDisplay>>>,
 
     /// Run-level failures the display has not taken yet.
     ///
@@ -151,9 +167,8 @@ impl TuiObserverState {
     pub fn new() -> Self {
         Self {
             streaming_text: Arc::new(Mutex::new(String::new())),
-            completed_replies: Arc::new(Mutex::new(Vec::new())),
+            graduations: Arc::new(Mutex::new(Vec::new())),
             active_tools: Arc::new(Mutex::new(Vec::new())),
-            tool_results: Arc::new(Mutex::new(Vec::new())),
             errors: Arc::new(Mutex::new(Vec::new())),
             queued: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             tokens: Arc::new(Mutex::new(TokenCounts::default())),
@@ -165,7 +180,7 @@ impl TuiObserverState {
     ///
     /// The two are produced together and share the same underlying
     /// allocations, so they can never drift. Cheap — cloning the
-    /// state bumps eight reference counts and copies no data.
+    /// state bumps seven reference counts and copies no data.
     #[must_use]
     pub fn into_observer(self) -> (TuiObserver, Self) {
         let observer = TuiObserver {
@@ -272,13 +287,13 @@ impl TuiObserver {
                 .map(|position| tools.remove(position).input_summary)
                 .unwrap_or_default()
         };
-        recover(&self.state.tool_results).push(ToolResultDisplay {
+        recover(&self.state.graduations).push(Graduation::Tool(ToolResultDisplay {
             name: name.to_string(),
             is_error,
             duration,
             input_summary,
             output_preview: String::new(),
-        });
+        }));
         self.notify();
     }
 }
@@ -301,7 +316,7 @@ impl LoopObserver for TuiObserver {
 
     fn on_response(&self, ctx: &ResponseContext) {
         if !ctx.text.is_empty() {
-            recover(&self.state.completed_replies).push(ctx.text.clone());
+            recover(&self.state.graduations).push(Graduation::Reply(ctx.text.clone()));
         }
         recover(&self.state.streaming_text).clear();
         self.notify();
@@ -363,9 +378,8 @@ impl LoopObserver for TuiObserver {
 
     fn reset(&self) {
         recover(&self.state.streaming_text).clear();
-        recover(&self.state.completed_replies).clear();
+        recover(&self.state.graduations).clear();
         recover(&self.state.active_tools).clear();
-        recover(&self.state.tool_results).clear();
         recover(&self.state.errors).clear();
         *recover(&self.state.tokens) = TokenCounts::default();
         recover(&self.pending_summaries).clear();

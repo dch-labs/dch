@@ -734,11 +734,8 @@ fn completed_tools_graduate_inline_into_the_conversation() {
         "every completion graduates into the conversation — no display depth cap drops any"
     );
     assert!(
-        kept.tool_results
-            .lock()
-            .expect("the results lock")
-            .is_empty(),
-        "the shared buffer drains on redraw, so it cannot accumulate across a session"
+        kept.graduations.lock().expect("the queue lock").is_empty(),
+        "the shared queue drains on redraw, so it cannot accumulate across a session"
     );
 }
 
@@ -754,21 +751,13 @@ fn poisoned_shared_buffers_still_graduate_through_render() {
     });
     observer.finish_tool("call-1", "Grep", false, std::time::Duration::from_millis(3));
 
-    let poisoned_replies = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _guard = kept.completed_replies.lock().expect("the replies lock");
-        panic!("poison the replies lock");
+    let poisoned_graduations = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = kept.graduations.lock().expect("the queue lock");
+        panic!("poison the queue lock");
     }));
     assert!(
-        poisoned_replies.is_err(),
-        "the replies poisoning must unwind"
-    );
-    let poisoned_results = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _guard = kept.tool_results.lock().expect("the results lock");
-        panic!("poison the results lock");
-    }));
-    assert!(
-        poisoned_results.is_err(),
-        "the results poisoning must unwind"
+        poisoned_graduations.is_err(),
+        "the queue poisoning must unwind"
     );
 
     observer.on_response(&loopctl::observer::ResponseContext {
@@ -806,10 +795,10 @@ fn a_turn_end_hook_receives_the_graduated_reply() {
     let state = dch_tui::TuiObserverState::new();
     let (observer, kept) = state.into_observer();
     drop(observer);
-    kept.completed_replies
+    kept.graduations
         .lock()
-        .expect("the replies lock")
-        .push("the finished reply".to_string());
+        .expect("the queue lock")
+        .push(dch_tui::Graduation::Reply("the finished reply".to_string()));
     let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
     let snapshots: Arc<std::sync::Mutex<Snapshots>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&snapshots);
@@ -882,10 +871,10 @@ fn a_quiet_frame_does_not_fire_the_turn_end_hook() {
         "a frame that graduates nothing fires nothing"
     );
 
-    kept.completed_replies
+    kept.graduations
         .lock()
-        .expect("the replies lock")
-        .push("a late reply".to_string());
+        .expect("the queue lock")
+        .push(dch_tui::Graduation::Reply("a late reply".to_string()));
     drop(render_to_buffer(&mut app, 80, 30));
     assert_eq!(
         snapshots_lock(&snapshots).len(),
@@ -1393,16 +1382,16 @@ fn a_tool_graduation_fires_the_turn_end_hook() {
     let state = dch_tui::TuiObserverState::new();
     let (observer, kept) = state.into_observer();
     drop(observer);
-    kept.tool_results
+    kept.graduations
         .lock()
-        .expect("the results lock")
-        .push(dch_tui::ToolResultDisplay {
+        .expect("the queue lock")
+        .push(dch_tui::Graduation::Tool(dch_tui::ToolResultDisplay {
             name: "Read".to_string(),
             is_error: false,
             duration: std::time::Duration::from_millis(2),
             input_summary: String::new(),
             output_preview: String::new(),
-        });
+        }));
     let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
     let snapshots: Arc<std::sync::Mutex<Snapshots>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&snapshots);
@@ -1453,5 +1442,55 @@ fn hostile_elapsed_values_render_instead_of_panicking() {
             .count(),
         3,
         "negative, NaN, and overflowing elapsed values all render as zero: {rows:?}"
+    );
+}
+
+#[test]
+fn a_reply_graduates_below_the_tool_that_preceded_it() {
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    // A tool completes, then the turn's reply arrives — no draw
+    // between them, so both wait in the queue together.
+    kept.graduations
+        .lock()
+        .expect("the queue lock")
+        .push(dch_tui::Graduation::Tool(dch_tui::ToolResultDisplay {
+            name: "Read".to_string(),
+            is_error: false,
+            duration: std::time::Duration::from_millis(3),
+            input_summary: String::new(),
+            output_preview: String::new(),
+        }));
+    kept.graduations
+        .lock()
+        .expect("the queue lock")
+        .push(dch_tui::Graduation::Reply(
+            "here is what I found".to_string(),
+        ));
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    drop(render_to_buffer(&mut app, 80, 30));
+    let kinds: Vec<&str> = app
+        .conversation()
+        .iter()
+        .map(|message| match message {
+            TuiMessage::Assistant { blocks, .. } => {
+                if blocks
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::Tool { .. }))
+                {
+                    "tool"
+                } else {
+                    "text"
+                }
+            }
+            _ => "other",
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["tool", "text"],
+        "the conversation keeps the order the events happened — the tool that \
+         produced the reply sits above it"
     );
 }

@@ -272,7 +272,7 @@ fn a_poisoned_reply_buffer_still_forces_the_frame() {
     let (observer, state) = TuiObserverState::new().into_observer();
     let mut app = TuiApp::from_observer_state(config(), state.clone());
     let panicked = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        let _guard = state.completed_replies.lock().unwrap();
+        let _guard = state.graduations.lock().unwrap();
         panic!("poison the replies lock");
     }));
     assert!(panicked.is_err(), "the poisoning panic must unwind");

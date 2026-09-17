@@ -14,6 +14,7 @@
 
 use std::time::Duration;
 
+use dch_tui::Graduation;
 use dch_tui::TokenCounts;
 use dch_tui::observer::{TuiObserver, TuiObserverState};
 use loopctl::observer::{
@@ -134,7 +135,16 @@ fn a_response_hands_the_finalized_reply_to_the_display_buffer() {
         text: "partial reply".to_string(),
         usage: None,
     });
-    let replies = kept.completed_replies.lock().unwrap().clone();
+    let replies: Vec<String> = kept
+        .graduations
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|event| match event {
+            Graduation::Reply(text) => Some(text.clone()),
+            Graduation::Tool(_) => None,
+        })
+        .collect();
     assert_eq!(
         replies,
         vec!["partial reply".to_string()],
@@ -155,8 +165,8 @@ fn a_response_without_deltas_keeps_the_only_reply_copy() {
         usage: None,
     });
     assert_eq!(
-        kept.completed_replies.lock().unwrap().clone(),
-        vec!["the whole reply".to_string()],
+        kept.graduations.lock().unwrap().clone(),
+        vec![Graduation::Reply("the whole reply".to_string())],
         "a non-streaming turn's response text is the reply's only copy — it must not be dropped"
     );
 }
@@ -185,8 +195,10 @@ fn a_tool_post_moves_the_active_tool_to_results() {
     observer.finish_tool("call-1", "Edit", false, Duration::from_millis(5));
 
     assert!(kept.active_tools.lock().unwrap().is_empty());
-    let results = kept.tool_results.lock().unwrap().clone();
-    let result = results.first().expect("one completed result");
+    let results = kept.graduations.lock().unwrap().clone();
+    let Graduation::Tool(result) = results.first().expect("one completed result") else {
+        panic!("a completed tool graduates as a Tool event");
+    };
     assert_eq!(result.name, "Edit");
     assert!(!result.is_error);
     assert_eq!(result.duration, Duration::from_millis(5));
@@ -268,9 +280,9 @@ fn reset_clears_every_buffer_and_the_private_maps() {
     observer.reset();
 
     assert!(kept.streaming_text.lock().unwrap().is_empty());
-    assert!(kept.completed_replies.lock().unwrap().is_empty());
+    assert!(kept.graduations.lock().unwrap().is_empty());
     assert!(kept.active_tools.lock().unwrap().is_empty());
-    assert!(kept.tool_results.lock().unwrap().is_empty());
+
     assert!(
         kept.errors.lock().unwrap().is_empty(),
         "the driver's error buffer clears with the rest"

@@ -10,6 +10,7 @@
 use dch_config::Verbosity;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
+use unicode_width::{UnicodeWidthChar as _, UnicodeWidthStr as _};
 
 use crate::ToolResultDisplay;
 use crate::message::ActiveTool;
@@ -40,7 +41,7 @@ pub const OK_GLYPH: &str = "✓";
 /// summary so the reader still sees what was attempted.
 pub const ERR_GLYPH: &str = "✗";
 
-/// The character budget tool summaries truncate to.
+/// The display-column budget tool summaries truncate to.
 ///
 /// Wide enough for a real path or command, narrow enough that the
 /// summary stays the one glanceable line the conversation view is
@@ -61,7 +62,11 @@ pub fn display_input(name: &str, input: &serde_json::Value) -> String {
     let value = extract_primary_value(name, &compact);
     match name {
         "MultiEdit" => match edit_count(&compact) {
-            Some(count) => format!("{value} ({count} edits)"),
+            Some(count) => {
+                let suffix = format!(" ({count} edits)");
+                let budget = SUMMARY_WIDTH.saturating_sub(suffix.width());
+                format!("{}{suffix}", truncate_width(&value, budget))
+            }
             None => value,
         },
         "TodoWrite" => match todo_count(&compact) {
@@ -79,14 +84,20 @@ pub fn display_input(name: &str, input: &serde_json::Value) -> String {
 /// primary value the observer extracted at dispatch or a JSON
 /// object. Unknown tools fall back to
 /// `"{Name}: {value}"`. Long subjects truncate to
-/// a fixed character budget.
+/// a fixed display-column budget.
 #[must_use]
 pub fn humanize_tool_summary(name: &str, input: &str) -> String {
     let value = extract_primary_value(name, input);
     match name {
         "Read" => format!("Reading {value}…"),
         "Write" => format!("Writing {value}…"),
-        "Edit" | "MultiEdit" => format!("Editing {value}…"),
+        "Edit" | "MultiEdit" => {
+            if value.ends_with('…') {
+                format!("Editing {value}")
+            } else {
+                format!("Editing {value}…")
+            }
+        }
         "Bash" => format!("Running: {value}"),
         "FileViewer" => format!("Viewing {value}…"),
         "Glob" => format!("Glob {value}"),
@@ -175,16 +186,37 @@ fn todo_count(input: &str) -> Option<String> {
         .map(|items| items.len().to_string())
 }
 
-/// Trim a value to the summary width on a character boundary.
+/// Trim a value to a display-column budget, glyph-boundary safe.
 ///
-/// Counts characters, never bytes, so a multi-byte path cannot be
-/// cut mid-glyph; the ellipsis marks that a cut happened.
-fn truncate(value: &str) -> String {
-    if value.chars().count() <= SUMMARY_WIDTH {
+/// Measures with terminal columns — a wide glyph counts twice — so
+/// the budget is what the pane actually spends; the cut never lands
+/// mid-glyph, and the ellipsis's one column is reserved inside the
+/// budget.
+fn truncate_width(value: &str, budget: usize) -> String {
+    if value.width() <= budget {
         return value.to_string();
     }
-    let cut: String = value.chars().take(SUMMARY_WIDTH - 1).collect();
+    let mut used: usize = 0;
+    let mut cut = String::new();
+    for glyph in value.chars() {
+        let span = glyph.width().unwrap_or(0);
+        if used.saturating_add(span) > budget.saturating_sub(1) {
+            break;
+        }
+        cut.push(glyph);
+        used = used.saturating_add(span);
+    }
     format!("{cut}…")
+}
+
+/// Trim a value to the summary width.
+///
+/// The budget every plain subject shares — the one place callers
+/// reach for when they have no tighter bound of their own; the
+/// `MultiEdit` decoration reserves its suffix's columns before
+/// delegating here.
+fn truncate(value: &str) -> String {
+    truncate_width(value, SUMMARY_WIDTH)
 }
 
 /// The lines for a tool currently in flight.

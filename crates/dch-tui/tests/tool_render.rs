@@ -330,3 +330,44 @@ fn braille_frames_are_one_column_wide() {
         "every spinner frame is one display column"
     );
 }
+
+#[test]
+fn a_long_multiedit_path_keeps_its_edit_count() {
+    let long_path = format!("/very/long/path/{}.rs", "x".repeat(80));
+    let value = dch_tui::tool_render::display_input(
+        "MultiEdit",
+        &serde_json::json!({
+            "edits": [
+                {"file_path": long_path},
+                {"file_path": "other.rs"},
+                {"file_path": "third.rs"}
+            ]
+        }),
+    );
+    assert!(
+        value.ends_with("(3 edits)"),
+        "the count suffix survives a path that alone exceeds the budget: {value:?}"
+    );
+    assert!(
+        value.width() <= 48,
+        "the combined value stays inside the summary budget: {}",
+        value.width()
+    );
+    assert!(
+        humanize_tool_summary("MultiEdit", &value).contains("(3 edits)"),
+        "the humanized summary keeps the count"
+    );
+}
+
+#[test]
+fn a_wide_value_truncates_by_display_columns() {
+    // Thirty CJK glyphs occupy sixty terminal columns.
+    let wide = "漢".repeat(30);
+    let summary = humanize_tool_summary("Read", &format!(r#"{{"file_path":"{wide}"}}"#));
+    assert!(
+        summary.width() <= 48 + "Reading ".width(),
+        "a wide value's summary stays inside the column budget: {}",
+        summary.width()
+    );
+    assert!(summary.ends_with('…'), "the cut is marked: {summary:?}");
+}

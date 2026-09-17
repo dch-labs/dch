@@ -25,6 +25,7 @@ use unicode_width::UnicodeWidthChar;
 
 use dch_config::DchConfig;
 
+use crate::Graduation;
 use crate::events::TerminalEvents;
 use crate::input::{InputAction, InputEditor};
 use crate::markdown;
@@ -499,7 +500,7 @@ impl TuiApp {
     /// is delivered on the next iteration rather than lost.
     /// Background redraws are frame-capped: a notify renders at most
     /// once per frame interval, a request arriving sooner parks
-    /// itself for the tick to claim, and a queued finalized reply
+    /// itself for the tick to claim, and any queued graduation
     /// forces the frame. Input-driven redraws are not capped. The
     /// tick redraws while tool calls are in flight (keeping their
     /// elapsed stamps live), claims parked background requests, and
@@ -744,13 +745,13 @@ impl TuiApp {
 
     /// Decide whether a background-requested redraw may run now.
     ///
-    /// A queued finalized reply always forces the frame — the
-    /// graduated message must not wait out the cap. Otherwise a
+    /// A queued graduation always forces the frame — the graduated
+    /// message must not wait out the cap. Otherwise a
     /// frame renders at most once per frame interval; a request
     /// arriving sooner parks itself in the pending flag for the
     /// periodic tick to claim. The caller supplies the frame clock.
     pub fn redraw_due(&mut self, now: Instant) -> bool {
-        if self.finalized_reply_waiting() {
+        if self.graduation_waiting() {
             self.render_pending = false;
             self.last_frame = Some(now);
             return true;
@@ -820,18 +821,18 @@ impl TuiApp {
         self.any_tools_running() || claimed
     }
 
-    /// Whether a finalized reply is waiting to graduate.
+    /// Whether a graduation is waiting to land.
     ///
     /// A poisoned lock recovers — the same policy the drain applies
-    /// — so a finalized reply still forces its frame after another
+    /// — so a waiting event still forces its frame after another
     /// thread's panic.
-    fn finalized_reply_waiting(&self) -> bool {
-        let replies = self
+    fn graduation_waiting(&self) -> bool {
+        let graduations = self
             .state
-            .completed_replies
+            .graduations
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        !replies.is_empty()
+        !graduations.is_empty()
     }
 
     /// Render one frame of the three-pane layout.
@@ -945,30 +946,32 @@ impl TuiApp {
     /// recovered — the same policy the observer writes with — so
     /// finalized data still graduates.
     fn drain_shared_state(&mut self) {
-        let replies = take_locked(&self.state.completed_replies);
+        let graduations = take_locked(&self.state.graduations);
         let now = chrono::Utc::now();
-        let mut turn_ended = !replies.is_empty();
-        for text in replies {
-            self.push_message(TuiMessage::Assistant {
-                blocks: vec![ContentBlock::Text { text }],
-                timestamp: now,
-                duration_ms: None,
-            });
-        }
-        let results = take_locked(&self.state.tool_results);
-        turn_ended |= !results.is_empty();
-        for result in results {
-            self.push_message(TuiMessage::Assistant {
-                blocks: vec![ContentBlock::Tool {
-                    name: result.name,
-                    input_preview: result.input_summary,
-                    success: !result.is_error,
-                    elapsed_secs: result.duration.as_secs_f64(),
-                    output_preview: result.output_preview,
-                }],
-                timestamp: now,
-                duration_ms: None,
-            });
+        let mut turn_ended = !graduations.is_empty();
+        for graduation in graduations {
+            match graduation {
+                Graduation::Reply(text) => {
+                    self.push_message(TuiMessage::Assistant {
+                        blocks: vec![ContentBlock::Text { text }],
+                        timestamp: now,
+                        duration_ms: None,
+                    });
+                }
+                Graduation::Tool(result) => {
+                    self.push_message(TuiMessage::Assistant {
+                        blocks: vec![ContentBlock::Tool {
+                            name: result.name,
+                            input_preview: result.input_summary,
+                            success: !result.is_error,
+                            elapsed_secs: result.duration.as_secs_f64(),
+                            output_preview: result.output_preview,
+                        }],
+                        timestamp: now,
+                        duration_ms: None,
+                    });
+                }
+            }
         }
         let errors = take_locked(&self.state.errors);
         turn_ended |= !errors.is_empty();

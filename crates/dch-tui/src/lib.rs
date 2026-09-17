@@ -17,5 +17,5 @@ pub use app::TuiApp;
 pub use events::TerminalEvents;
 pub use input::{InputAction, InputEditor, InputHistory};
 pub use message::{ActiveTool, ContentBlock, TokenCounts, TuiMessage};
-pub use observer::{ToolResultDisplay, TuiObserver, TuiObserverState};
+pub use observer::{Graduation, ToolResultDisplay, TuiObserver, TuiObserverState};
 pub use terminal::{TerminalGuard, init_terminal, restore_terminal};
