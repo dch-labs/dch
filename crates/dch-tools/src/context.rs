@@ -240,6 +240,47 @@ impl RunnerContext {
         newest.map(|baseline| baseline.hash)
     }
 
+    /// Record what a fresh read of `file_path` observes, the way a
+    /// live `Read` dispatch would.
+    ///
+    /// The resume path's guard continuity: a session restored from a
+    /// transcript carries its prior reads as previews only — no
+    /// bytes, so no baselines — and without this the
+    /// read-before-write guard would treat every previously-read
+    /// file as never-read, silently disarming the staleness check
+    /// for exactly the files the model believes it knows. Resolving
+    /// and re-reading the file's current bytes rebuilds the baseline
+    /// that prior read left behind. Returns whether the path
+    /// resolved and the file could be read; a missing, moved,
+    /// unreadable, or out-of-reach file records nothing and the
+    /// guard simply stays disarmed for it, as it is today.
+    #[must_use]
+    pub fn record_resumed_read(&self, file_path: &str) -> bool {
+        if crate::util::is_url(file_path) {
+            return false;
+        }
+        let Ok(full_path) = crate::util::resolve_path(file_path, &self.cwd, self.resolve_policy)
+        else {
+            return false;
+        };
+        let full_path = if self.resolve_policy == ResolvePolicy::Unrestricted {
+            match crate::util::canonicalize_existing(&full_path) {
+                Ok(canonical) => canonical,
+                Err(_) => return false,
+            }
+        } else {
+            full_path
+        };
+        match std::fs::read(&full_path) {
+            Ok(bytes) => {
+                let baseline = crate::state::observe_bytes(&bytes);
+                self.record_baseline(&full_path, baseline);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     /// The baseline map key for `path`, per the run's resolve policy.
     ///
     /// Under [`ResolvePolicy::Contained`] the key is the path as given —
@@ -673,6 +714,54 @@ mod tests {
         assert_eq!(
             rc.baseline_for(&hard),
             Some(crate::state::content_hash(b"EXT"))
+        );
+    }
+
+    #[test]
+    fn record_resumed_read_rebuilds_the_baseline_a_prior_read_left() {
+        // The resume seeding's whole contract: the file's current bytes
+        // become the recorded baseline exactly as a live Read would have
+        // left them, through the same resolution rules.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("note.txt"), b"current state").unwrap();
+
+        let rc = RunnerContext::new(tmp.path().to_path_buf());
+        assert!(
+            rc.record_resumed_read("note.txt"),
+            "a readable in-reach file records"
+        );
+        assert_eq!(
+            rc.baseline_for(&tmp.path().join("note.txt")),
+            Some(crate::state::content_hash(b"current state")),
+            "the baseline hashes the bytes a fresh read observes"
+        );
+
+        assert!(
+            !rc.record_resumed_read("gone.txt"),
+            "a missing file records nothing"
+        );
+        assert!(
+            !rc.record_resumed_read("../outside.txt"),
+            "an out-of-reach spelling records nothing under containment"
+        );
+        assert!(
+            !rc.record_resumed_read("https://example.com/x"),
+            "a URL preview is not a path to read"
+        );
+    }
+
+    #[test]
+    fn record_resumed_read_keys_an_unrestricted_spelling_canonically() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("note.txt"), b"one").unwrap();
+
+        let rc = RunnerContext::new(tmp.path().to_path_buf())
+            .with_resolve_policy(ResolvePolicy::Unrestricted);
+        assert!(rc.record_resumed_read("note.txt"));
+        assert_eq!(
+            rc.baseline_for(&tmp.path().join("note.txt")),
+            Some(crate::state::content_hash(b"one")),
+            "an unrestricted record lands under the canonical key a live read uses"
         );
     }
 

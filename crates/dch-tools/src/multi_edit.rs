@@ -2172,6 +2172,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_stale_second_file_aborts_the_batch_and_names_what_was_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.rs"), "fn one() {}\n").unwrap();
+        std::fs::write(tmp.path().join("b.rs"), "EXTERNAL\n").unwrap();
+        let ctx = ctx_in(tmp.path().to_str().unwrap());
+        let history = crate::context::runner_ctx(&ctx);
+        let op_at = |file: &str, old: &str, new: &str| EditOperation {
+            file_path: file.to_string(),
+            full_path: tmp.path().join(file),
+            old_text: old.to_string(),
+            new_text: new.to_string(),
+        };
+        let operations = vec![
+            op_at("a.rs", "fn one() {}", "fn uno() {}"),
+            op_at("b.rs", "fn two() {}", "fn dos() {}"),
+        ];
+        // b.rs changed after the batch's phase-1 read: the original the
+        // batch recorded no longer matches what the staleness check
+        // re-reads from disk.
+        let mut originals = BTreeMap::new();
+        originals.insert("a.rs".to_string(), "fn one() {}\n".to_string());
+        originals.insert("b.rs".to_string(), "fn two() {}\n".to_string());
+        let mut finals = BTreeMap::new();
+        finals.insert("a.rs".to_string(), "fn uno() {}\n".to_string());
+        finals.insert("b.rs".to_string(), "fn dos() {}\n".to_string());
+
+        let conflict = write_finals(
+            &operations,
+            &originals,
+            &finals,
+            history,
+            tmp.path(),
+            ResolvePolicy::default(),
+        )
+        .await
+        .unwrap()
+        .expect("the stale second file aborts the batch");
+        assert_eq!(conflict.applied, vec!["a.rs".to_string()]);
+        assert_eq!(conflict.path, "b.rs");
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("a.rs")).unwrap(),
+            "fn uno() {}\n",
+            "files written before the abort stay written"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("b.rs")).unwrap(),
+            "EXTERNAL\n",
+            "the stale file is left as the external writer left it"
+        );
+    }
+
+    #[tokio::test]
     async fn dry_run_writes_nothing() {
         let tmp = tempfile::TempDir::new().unwrap();
         let f1 = tmp.path().join("a.rs");

@@ -399,15 +399,19 @@ pub struct UIStyle {
     /// a tone away from the user's color.
     pub assistant_message_fg: Color,
 
-    /// Border color of the input box.
+    /// The input field's accent color.
     ///
-    /// Frames the editing surface; themes often echo the secondary accent
-    /// here.
+    /// The field carries no border glyphs — its shape is a
+    /// background tint — so this color draws the composer's state
+    /// tag on the status bar (queued submissions, line position);
+    /// themes often echo the secondary accent here.
     pub input_border: Color,
 
-    /// Text color inside the input box.
+    /// Text color inside the input field.
     ///
-    /// Kept at full contrast — the input is always the user's active focus.
+    /// Kept at full contrast — the input is always the user's active
+    /// focus, and it sits on the field's tint rather than the plain
+    /// background.
     pub input_text: Color,
 
     /// The status bar's background.

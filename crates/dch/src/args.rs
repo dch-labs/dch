@@ -27,9 +27,11 @@ pub struct Args {
     ///
     /// A non-empty value is the task verbatim; an empty one defers to
     /// stdin, exactly like omitting the argument with stdin piped.
+    /// Composes with `--resume` — a task plus a session id continues
+    /// that session headless.
     #[arg(
         value_name = "TASK",
-        conflicts_with_all = ["resume", "list_sessions"],
+        conflicts_with_all = ["list_sessions"],
         help_heading = "Mode"
     )]
     pub task: Option<String>,
@@ -38,11 +40,13 @@ pub struct Args {
     ///
     /// The id is validated here — a malformed value is a parse error rather
     /// than a later load failure. Long-only: a 36-character id has no useful
-    /// short form.
+    /// short form. Combines with a task argument or a piped stdin to resume
+    /// headless, and with neither to resume in the TUI.
     #[arg(
         long,
         value_name = "SESSION_ID",
         value_parser = clap::value_parser!(uuid::Uuid),
+        conflicts_with_all = ["list_sessions"],
         help_heading = "Sessions"
     )]
     pub resume: Option<uuid::Uuid>,
@@ -70,6 +74,11 @@ pub struct Args {
     pub model: Option<String>,
 
     /// Config-facing switches, flattened into [`Args`].
+    ///
+    /// The flags a run can layer over the loaded config file — an
+    /// alternate path, a contained-paths opt-out — grouped so the
+    /// top-level struct stays a small bag of mode flags while each
+    /// switch keeps its own help heading and docs.
     #[command(flatten)]
     pub config: ConfigArgs,
 
@@ -191,20 +200,32 @@ mod tests {
     }
 
     #[test]
-    fn the_task_argument_conflicts_with_the_session_verbs() {
+    fn the_task_argument_conflicts_with_the_listing_verb() {
+        let err = parse(&["t", "--list-sessions"]).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            ErrorKind::ArgumentConflict,
+            "a task cannot combine with the listing verb: {err}"
+        );
+    }
+
+    #[test]
+    fn the_task_argument_composes_with_resume() {
         let id = uuid::Uuid::new_v4();
-        let id = id.to_string();
-        for conflicting in [
-            vec!["t", "--resume", id.as_str()],
-            vec!["t", "--list-sessions"],
-        ] {
-            let err = parse(&conflicting).unwrap_err();
-            assert_eq!(
-                err.kind(),
-                ErrorKind::ArgumentConflict,
-                "a task cannot combine with session verbs: {err}"
-            );
-        }
+        let args = parse(&["fix the tests", "--resume", &id.to_string()]).unwrap();
+        assert_eq!(args.task, Some("fix the tests".to_string()));
+        assert_eq!(args.resume, Some(id));
+    }
+
+    #[test]
+    fn resume_conflicts_with_the_listing_verb() {
+        let id = uuid::Uuid::new_v4();
+        let err = parse(&["--resume", &id.to_string(), "--list-sessions"]).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            ErrorKind::ArgumentConflict,
+            "resuming and listing cannot combine: {err}"
+        );
     }
 
     #[test]

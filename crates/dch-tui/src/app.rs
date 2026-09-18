@@ -18,10 +18,9 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::Line;
-use ratatui::widgets::{
-    Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
-};
-use unicode_width::UnicodeWidthChar;
+use ratatui::widgets::Paragraph;
+use unicode_width::UnicodeWidthChar as _;
+use unicode_width::UnicodeWidthStr as _;
 
 use dch_config::DchConfig;
 
@@ -374,6 +373,22 @@ impl TuiApp {
     pub fn push_message(&mut self, message: TuiMessage) {
         self.conversation.push(message);
         self.conversation_generation = self.conversation_generation.saturating_add(1);
+    }
+
+    /// Install a whole prior conversation as the session's starting
+    /// state.
+    ///
+    /// The resume path's display seeding: the restored transcript
+    /// becomes the conversation in one mutation, the view stays
+    /// pinned to the newest line, and the first frame renders the
+    /// full history as though it had always been there. Call before
+    /// the run loop starts; a mid-session call would splice history
+    /// into a live conversation.
+    pub fn seed_messages(&mut self, messages: Vec<TuiMessage>) {
+        self.conversation.extend(messages);
+        self.conversation_generation = self.conversation_generation.saturating_add(1);
+        self.scroll_offset = 0;
+        self.auto_scroll = true;
     }
 
     /// The input buffer's current text.
@@ -835,49 +850,52 @@ impl TuiApp {
         !graduations.is_empty()
     }
 
-    /// Render one frame of the three-pane layout.
+    /// Render one frame of the layout.
     ///
-    /// Conversation fills the space above the input box; the status
-    /// bar closes the frame at the bottom row. Each frame first takes
-    /// what the observer finished — finalized replies and completed
-    /// tool calls alike graduate into the conversation. The
-    /// streaming region follows the conversation:
-    /// frozen blocks render from the cache, the live complete lines
-    /// re-parse as markdown, and the unterminated tail renders as
-    /// plaintext. A pinned view re-anchors to the newest line; a
-    /// detached view's offset is compensated for layout growth and
-    /// shrinkage and clamped to the document's scrollable height, so
-    /// the viewport holds while content streams in below it or
-    /// collapses away.
+    /// Conversation fills the space above a blank spacer row that
+    /// separates it from the fixed multi-row input field; the status
+    /// bar closes the frame at the bottom row — each pane renders
+    /// through its own method. The input field never changes height,
+    /// so the conversation pane above it never reflows while the
+    /// user types.
     pub fn render(&mut self, frame: &mut Frame) {
         self.drain_shared_state();
         let area = frame.area();
-        let input_width = area.width.max(1).saturating_sub(2);
-        let input_rows = self.input.display_rows(input_width).len();
-        let input_height = u16::try_from(input_rows.saturating_add(2))
-            .unwrap_or(u16::MAX)
-            .min(area.height.saturating_div(2))
-            .max(3);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(0),
-                Constraint::Length(input_height),
+                Constraint::Length(1),
+                Constraint::Length(INPUT_FIELD_ROWS),
                 Constraint::Length(1),
             ])
             .split(area);
 
         let fallback = area;
-        let conversation_area = pane(&chunks, 0, fallback);
-        let input_area = pane(&chunks, 1, fallback);
-        let status_area = pane(&chunks, 2, fallback);
+        self.render_conversation(frame, pane(&chunks, 0, fallback));
+        self.render_input(frame, pane(&chunks, 2, fallback));
+        self.render_status_bar(frame, pane(&chunks, 3, fallback));
+    }
 
-        let conversation_height = conversation_area.height as usize;
-        let width = conversation_area.width.max(1);
+    /// Render the conversation pane: the settled conversation, the
+    /// streaming region below it, any running tools, and the
+    /// scrollbar in a reserved right gutter.
+    ///
+    /// The gutter is one column off the pane's right edge, reserved
+    /// whether or not the document scrolls, so wrapped text never
+    /// collides with the scrollbar and the wrap width stays stable
+    /// as the document crosses the scrollability threshold. A
+    /// pinned view re-anchors to the newest line; a detached view
+    /// holds its place while content streams in below it or
+    /// collapses away.
+    fn render_conversation(&mut self, frame: &mut Frame, area: Rect) {
+        let (text_area, scrollbar_area) = split_scrollbar_gutter(area);
+        let conversation_height = text_area.height as usize;
+        let width = text_area.width.max(1);
         if self.conversation_cache_generation != self.conversation_generation
             || self.conversation_cache_width != width
         {
-            self.conversation_cache = self.conversation_lines(conversation_area);
+            self.conversation_cache = self.conversation_lines(text_area);
             self.conversation_cache_width = width;
             self.conversation_cache_generation = self.conversation_generation;
         }
@@ -889,20 +907,7 @@ impl TuiApp {
             .saturating_add(self.frozen_lines.len())
             .saturating_add(self.live_lines.len())
             .saturating_add(tools.len());
-        if self.auto_scroll {
-            self.scroll_offset = 0;
-        } else {
-            let delta = total_lines.abs_diff(self.last_layout_lines);
-            if total_lines >= self.last_layout_lines {
-                self.scroll_offset = self.scroll_offset.saturating_add(delta);
-            } else {
-                self.scroll_offset = self.scroll_offset.saturating_sub(delta);
-            }
-            self.scroll_offset = self
-                .scroll_offset
-                .min(total_lines.saturating_sub(conversation_height));
-        }
-        self.last_layout_lines = total_lines;
+        self.settle_scroll_offset(total_lines, conversation_height);
         let skip = total_lines
             .saturating_sub(conversation_height)
             .saturating_sub(self.scroll_offset);
@@ -916,22 +921,44 @@ impl TuiApp {
             skip,
             conversation_height,
         );
-        let visible_len = visible.len();
 
-        frame.render_widget(Paragraph::new(visible), conversation_area);
-        if total_lines > conversation_height && !conversation_area.is_empty() {
-            let mut scrollbar_state = ScrollbarState::new(total_lines)
-                .position(skip)
-                .viewport_content_length(visible_len);
-            frame.render_stateful_widget(
-                Scrollbar::new(ScrollbarOrientation::VerticalRight),
-                conversation_area,
-                &mut scrollbar_state,
+        frame.render_widget(Paragraph::new(visible), text_area);
+        if let Some(gutter) = scrollbar_area
+            && let Some((thumb_pos, thumb_len)) =
+                scrollbar_geometry(total_lines, conversation_height, skip)
+        {
+            render_scrollbar(
+                frame,
+                gutter,
+                thumb_pos,
+                thumb_len,
+                self.theme.ui.scrollbar_thumb,
+                self.theme.ui.scrollbar_track,
             );
         }
+    }
 
-        self.render_input(frame, input_area);
-        self.render_status_bar(frame, status_area);
+    /// Settle the scroll offset for this frame's layout.
+    ///
+    /// A pinned view sits at the newest line: the offset resets to
+    /// zero and growth below the viewport carries it along. A
+    /// detached view holds its anchor: the offset is compensated for
+    /// the document growing or shrinking since the last frame and
+    /// clamped to the scrollable height, so the same lines stay in
+    /// view while content streams in below or collapses away.
+    fn settle_scroll_offset(&mut self, total_lines: usize, viewport: usize) {
+        if self.auto_scroll {
+            self.scroll_offset = 0;
+        } else {
+            let delta = total_lines.abs_diff(self.last_layout_lines);
+            if total_lines >= self.last_layout_lines {
+                self.scroll_offset = self.scroll_offset.saturating_add(delta);
+            } else {
+                self.scroll_offset = self.scroll_offset.saturating_sub(delta);
+            }
+            self.scroll_offset = self.scroll_offset.min(total_lines.saturating_sub(viewport));
+        }
+        self.last_layout_lines = total_lines;
     }
 
     /// Take what the observer finished since the last frame.
@@ -1290,52 +1317,85 @@ impl TuiApp {
             .collect()
     }
 
-    /// Render the input box: wrapped editor rows, the newline hint,
-    /// the queued indicator, and the terminal cursor's cell.
+    /// Render the input field: a fixed multi-row window onto the
+    /// buffer, as a borderless composer tinted a step off the
+    /// theme's background and padded on all sides.
     ///
-    /// The block title always teaches the two newline gestures — the
-    /// hint is the discovery path on terminals where Shift+Enter
-    /// arrives as a plain Enter — and prefixes the queued-submission
-    /// count while the driver has unclaimed sends. The caret sits
-    /// one cell inside the border, offset by the cursor's display
-    /// column and wrapped row.
+    /// The field's shape is a pure background fill with square
+    /// corners — solid by construction, like the scrollbar. Corners
+    /// stay square deliberately: a cell grid cannot draw a smooth
+    /// curve, and both approximations it can draw (corner glyphs,
+    /// clipped corner cells) render as pixel-like steps. The text sits
+    /// inside horizontal and vertical padding; the window shows the
+    /// caret's line and the lines above it, so typing at the end
+    /// sees the newest lines and browsing up scrolls with the
+    /// caret. The field carries no text of its own — queue and
+    /// line-position state lives on the status bar.
     fn render_input(&self, frame: &mut Frame, area: Rect) {
-        let width = area.width.max(1).saturating_sub(2);
+        let width = area
+            .width
+            .max(1)
+            .saturating_sub(INPUT_SIDE_INSET.saturating_mul(2));
         let rows = self.input.display_rows(width);
-        let queued = self.state.queued.load(Ordering::SeqCst);
-        let title = if queued > 0 {
-            format!(" ⏳ {queued} queued · ⏎ enter · shift+enter or \\+enter for newline ")
-        } else {
-            " ⏎ enter · shift+enter or \\+enter for newline ".to_string()
+        let (caret_row, column) = self.input.cursor_cell(width).unwrap_or((0, 0));
+
+        let tint = surface_tint(self.theme.ui.background);
+        let text_style = Style::default().fg(self.theme.ui.input_text).bg(tint);
+        for y in area.y..area.bottom() {
+            for x in area.x..area.right() {
+                frame.buffer_mut()[(x, y)].set_char(' ').set_bg(tint);
+            }
+        }
+        let text_height = INPUT_TEXT_ROWS.min(area.height);
+        let interior = Rect {
+            x: area
+                .x
+                .saturating_add(INPUT_SIDE_INSET)
+                .min(area.right().saturating_sub(1)),
+            y: area.y.saturating_add(INPUT_VERTICAL_PADDING),
+            width,
+            height: text_height,
         };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(self.theme.ui.input_border))
-            .title(title);
-        let inner = block.inner(area);
+        // The window shows the caret's line and the lines above it —
+        // typing at the end sees the newest lines, browsing up
+        // scrolls with the caret.
+        let visible_rows = usize::from(text_height);
+        let start = usize::from(caret_row).saturating_sub(visible_rows.saturating_sub(1));
         let lines: Vec<Line<'_>> = rows
             .iter()
-            .map(|row| Line::styled(row.as_str(), Style::default().fg(self.theme.ui.input_text)))
+            .skip(start)
+            .take(visible_rows)
+            .map(|row| Line::styled(row.as_str(), text_style))
             .collect();
-        frame.render_widget(Paragraph::new(lines), inner);
-        frame.render_widget(block, area);
+        frame.render_widget(Paragraph::new(lines), interior);
 
-        let (row, column) = self.input.cursor_cell(width).unwrap_or((0, 0));
-        let caret_x = inner
+        let caret_x = area
             .x
+            .saturating_add(INPUT_SIDE_INSET)
             .saturating_add(column)
-            .min(inner.right().saturating_sub(1));
-        let caret_y = inner
+            .min(
+                area.x
+                    .saturating_add(INPUT_SIDE_INSET)
+                    .saturating_add(width)
+                    .saturating_sub(1),
+            )
+            .min(area.right().saturating_sub(2));
+        let caret_y = area
             .y
-            .saturating_add(row)
-            .min(inner.bottom().saturating_sub(1));
+            .saturating_add(INPUT_VERTICAL_PADDING)
+            .saturating_add(
+                u16::try_from(usize::from(caret_row).saturating_sub(start)).unwrap_or(0),
+            );
         frame.set_cursor_position((caret_x, caret_y));
     }
 
     /// Render the one-line status bar.
     ///
-    /// Names the configured model on the left and the cumulative
-    /// token totals on the right; both sit on the themed bar colors.
+    /// Names the configured model and the cumulative token totals on
+    /// the left; while the input holds state — submissions queued
+    /// behind the driver, or a buffer longer than the composer's
+    /// window — a position tag sits right-aligned in the theme's
+    /// input accent color. Both sit on the themed bar colors.
     fn render_status_bar(&self, frame: &mut Frame, area: Rect) {
         let tokens = self.state.tokens.lock().map_or_else(
             |_| 0,
@@ -1346,14 +1406,61 @@ impl TuiApp {
             },
         );
         let status_text = format!(" {}  │  {tokens} tok", self.config.api.model);
+        let bar_style = Style::default()
+            .fg(self.theme.ui.status_bar_fg)
+            .bg(self.theme.ui.status_bar_bg);
         frame.render_widget(
-            Paragraph::new(status_text).style(
-                Style::default()
-                    .fg(self.theme.ui.status_bar_fg)
-                    .bg(self.theme.ui.status_bar_bg),
-            ),
-            area,
+            Paragraph::new(status_text).style(bar_style),
+            Rect { height: 1, ..area },
         );
+        let tag = self.input_state_tag(
+            area.width
+                .max(1)
+                .saturating_sub(INPUT_SIDE_INSET.saturating_mul(2)),
+        );
+        if !tag.is_empty() && area.width > 4 {
+            let tag_width = u16::try_from(tag.width().saturating_add(2))
+                .unwrap_or(area.width)
+                .min(area.width);
+            let tag_area = Rect {
+                x: area.right().saturating_sub(tag_width),
+                width: tag_width,
+                height: 1,
+                ..area
+            };
+            frame.render_widget(
+                Paragraph::new(Line::styled(
+                    tag,
+                    Style::default().fg(self.theme.ui.input_border),
+                ))
+                .style(bar_style)
+                .alignment(ratatui::layout::Alignment::Right),
+                tag_area,
+            );
+        }
+    }
+
+    /// The composer's state as a status-bar tag, empty when idle.
+    ///
+    /// Reports submissions queued behind the driver and, while the
+    /// buffer holds more lines than the composer's window, which
+    /// line the caret is on — the two facts a user can act on.
+    fn input_state_tag(&self, width: u16) -> String {
+        let rows = self.input.display_rows(width);
+        let queued = self.state.queued.load(Ordering::SeqCst);
+        let mut parts = Vec::new();
+        if queued > 0 {
+            parts.push(format!("{queued} queued"));
+        }
+        if rows.len() > usize::from(INPUT_TEXT_ROWS) {
+            let (caret_row, _) = self.input.cursor_cell(width).unwrap_or((0, 0));
+            parts.push(format!(
+                "{}/{}",
+                usize::from(caret_row).saturating_add(1).min(rows.len()),
+                rows.len()
+            ));
+        }
+        parts.join(" · ")
     }
 }
 
@@ -1404,6 +1511,133 @@ fn pane(chunks: &[Rect], index: usize, fallback: Rect) -> Rect {
     chunks.get(index).copied().unwrap_or(fallback)
 }
 
+/// Split the conversation pane into its text area and scrollbar
+/// gutter.
+///
+/// The gutter is one column off the right edge, reserved whether or
+/// not the document scrolls — wrapped text can never collide with
+/// the scrollbar, and the wrap width never churns when the document
+/// crosses the scrollability threshold. Returns the gutter as `None`
+/// only in the degenerate one-column pane, where the text keeps the
+/// full width and no scrollbar renders.
+fn split_scrollbar_gutter(area: Rect) -> (Rect, Option<Rect>) {
+    if area.width < 2 {
+        return (area, None);
+    }
+    let gutter = Rect {
+        x: area.right().saturating_sub(1),
+        width: 1,
+        ..area
+    };
+    let text = Rect {
+        width: area.width.saturating_sub(1),
+        ..area
+    };
+    (text, Some(gutter))
+}
+
+/// Columns of tinted breathing room at each end of the input field's
+/// text, inside the fill's edge.
+const INPUT_SIDE_INSET: u16 = 2;
+
+/// Rows of text the input field shows. The field is fixed at this
+/// height however long the buffer grows: multi-line editing always
+/// shows this window, and the conversation pane above never moves
+/// while the user types.
+const INPUT_TEXT_ROWS: u16 = 2;
+
+/// Blank tinted rows of breathing room above and below the field's
+/// text rows — the vertical half of the composer's inner padding.
+const INPUT_VERTICAL_PADDING: u16 = 1;
+
+/// The field's full height: text rows wrapped in vertical padding.
+///
+/// What the layout reserves for the composer — the window's text rows
+/// plus one blank tinted row above and below — so a fixed allocation
+/// holds the field whether the buffer fills it or not.
+const INPUT_FIELD_ROWS: u16 = INPUT_TEXT_ROWS + INPUT_VERTICAL_PADDING * 2;
+
+/// A surface color one small step off the theme's background: a
+/// step lighter on dark themes, a step darker on light ones.
+///
+/// The input field's shape is this tint — it must read against the
+/// background on every palette without new per-theme entries, so it
+/// is derived from the background the theme already defines. The
+/// step is small on purpose: a whisper of elevation, not a new
+/// color.
+fn surface_tint(base: ratatui::style::Color) -> ratatui::style::Color {
+    let ratatui::style::Color::Rgb(red, green, blue) = base else {
+        return base;
+    };
+    let luminance = u32::from(red)
+        .saturating_add(u32::from(green))
+        .saturating_add(u32::from(blue));
+    let step = |channel: u8| {
+        if luminance < 384 {
+            channel.saturating_add(12)
+        } else {
+            channel.saturating_sub(12)
+        }
+    };
+    ratatui::style::Color::Rgb(step(red), step(green), step(blue))
+}
+
+/// The scrollbar thumb's track position and length for a document of
+/// `content` lines shown through a `viewport`-line window whose top
+/// line is `skip` lines into the document.
+///
+/// Exact integer proportion: the thumb covers the viewport's share
+/// of the track — never less than one cell, never more than the
+/// track — and sits where the viewport sits in the document, flush
+/// with the track's top at the document's start and its bottom at
+/// the end. Returns `None` when the document fits the viewport or
+/// the viewport has no rows: no thumb, and the caller leaves the
+/// gutter blank.
+fn scrollbar_geometry(content: usize, viewport: usize, skip: usize) -> Option<(usize, usize)> {
+    let scrollable = content.checked_sub(viewport)?;
+    let track = viewport;
+    if scrollable == 0 || track == 0 {
+        return None;
+    }
+    let thumb = track
+        .saturating_mul(viewport)
+        .checked_div(content)?
+        .clamp(1, track);
+    let reach = track.saturating_sub(thumb);
+    let position = skip
+        .min(scrollable)
+        .saturating_mul(reach)
+        .checked_div(scrollable)?;
+    Some((position, thumb))
+}
+
+/// Paint the scrollbar into its gutter as background fills: a
+/// bright thumb segment over a dim rail, both in the theme's
+/// scrollbar colors.
+///
+/// Background color is the only solid-fill primitive a terminal
+/// guarantees: it covers the whole cell rectangle regardless of
+/// font metrics, so consecutive rows join into one unbroken bar.
+/// Glyphs cannot do this — on terminals whose cell height exceeds
+/// the font's em, every glyph (blocks included) leaves a hairline
+/// gap between rows and a glyph column reads as stacked bars.
+fn render_scrollbar(
+    frame: &mut Frame,
+    gutter: Rect,
+    thumb_pos: usize,
+    thumb_len: usize,
+    thumb_color: ratatui::style::Color,
+    track_color: ratatui::style::Color,
+) {
+    for (row, y) in (gutter.y..gutter.bottom()).enumerate() {
+        let in_thumb = row >= thumb_pos && row < thumb_pos.saturating_add(thumb_len);
+        let color = if in_thumb { thumb_color } else { track_color };
+        frame.buffer_mut()[(gutter.x, y)]
+            .set_char(' ')
+            .set_bg(color);
+    }
+}
+
 /// How a non-blank line can continue a block across a blank line.
 ///
 /// Only lists and quotes do in the grammar: a blank inside a loose
@@ -1412,14 +1646,28 @@ fn pane(chunks: &[Rect], index: usize, fallback: Rect) -> Rect {
 #[derive(Clone, Copy, PartialEq)]
 enum ContLine {
     /// A `-`/`*`/numbered item line.
+    ///
+    /// Continues a loose list: the blank line above it separates
+    /// items, not blocks, so the list stays open across it.
     List,
     /// A `>`-prefixed quote line.
+    ///
+    /// Continues a multi-paragraph quote: consecutive `>`-prefixed
+    /// lines around a blank belong to one blockquote.
     Quote,
     /// Anything else.
+    ///
+    /// Starts a fresh block — a blank line above it closes whatever
+    /// came before, and the scanner may settle content there.
     Other,
 }
 
 /// Classify a non-blank line's cross-blank continuation kind.
+///
+/// A lexical check, not a parse: leading spaces are skipped and the
+/// line's first token is matched against the list and quote markers
+/// the grammar accepts. The caller has already established the line
+/// is non-blank.
 fn cont_line_kind(line: &str) -> ContLine {
     let trimmed = line.trim_start_matches(' ');
     if trimmed.starts_with('>') {
@@ -1661,6 +1909,63 @@ mod tests {
 
     fn app() -> TuiApp {
         TuiApp::new(dch_config::DchConfig::default())
+    }
+
+    #[test]
+    fn scrollbar_geometry_is_hidden_when_the_document_fits() {
+        assert_eq!(
+            scrollbar_geometry(10, 10, 0),
+            None,
+            "exactly full: no thumb"
+        );
+        assert_eq!(
+            scrollbar_geometry(9, 10, 0),
+            None,
+            "shorter than the viewport: none"
+        );
+    }
+
+    #[test]
+    fn scrollbar_geometry_pins_flush_at_both_ends() {
+        assert_eq!(
+            scrollbar_geometry(100, 10, 0),
+            Some((0, 1)),
+            "at the document's start the thumb is flush with the track's top"
+        );
+        assert_eq!(
+            scrollbar_geometry(100, 10, 90),
+            Some((9, 1)),
+            "at its end the thumb is flush with the track's bottom"
+        );
+    }
+
+    #[test]
+    fn scrollbar_geometry_sizes_the_thumb_proportionally() {
+        assert_eq!(
+            scrollbar_geometry(20, 10, 0),
+            Some((0, 5)),
+            "a document twice the viewport gives the thumb half the track"
+        );
+        assert_eq!(
+            scrollbar_geometry(11, 10, 1),
+            Some((1, 9)),
+            "one scrollable line gives a near-full thumb at the far end"
+        );
+        let (mid_pos, thumb) = scrollbar_geometry(100, 10, 45).expect("scrollable");
+        assert_eq!(
+            (mid_pos, thumb),
+            (4, 1),
+            "the midpoint sits at the track's middle"
+        );
+    }
+
+    #[test]
+    fn scrollbar_geometry_clamps_an_out_of_range_skip() {
+        assert_eq!(
+            scrollbar_geometry(100, 10, 999),
+            scrollbar_geometry(100, 10, 90),
+            "a skip past the end reports the end, never past the track"
+        );
     }
 
     #[test]

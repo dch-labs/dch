@@ -134,7 +134,12 @@ impl HeadlessOutcome {
 /// Loads config, builds a non-interactive runner with a `ConsoleObserver`,
 /// resolves the prompt (from the task argument or stdin), runs one full
 /// session, writes the `--done-file` (if requested), and returns the exit
-/// code. The caller (`main`) turns the code into the process exit status. The
+/// code. The caller (`main`) turns the code into the process exit status. A
+/// resumed `control` continues the loaded session: the saved model applies
+/// unless the CLI overrides it, the agent starts from the restored history,
+/// the session id is the loaded one, and the saved transcript is the whole
+/// resumed conversation rather than the new turn alone; a degradation
+/// warning is printed to stderr before the run starts. The
 /// startup bridge armed before this call is stopped once the run bridge is
 /// installed; the two briefly overlap, where an interrupt fails closed
 /// through the construction hook. A construction-phase failure stops the
@@ -144,9 +149,13 @@ impl HeadlessOutcome {
 ///
 /// Returns the exit code for any failure: 1 for construction-phase errors,
 /// 2 for run-level failures, 130 for cancellation.
-pub async fn run_headless(args: &Args, startup_bridge: crate::signals::CancelBridge) -> u8 {
+pub async fn run_headless(
+    args: &Args,
+    startup_bridge: crate::signals::CancelBridge,
+    control: crate::resume::ResumeControl,
+) -> u8 {
     let inherited_mode = capture_marker_mode(args.done_file.as_ref());
-    match run_headless_inner(args, startup_bridge, inherited_mode, None).await {
+    match run_headless_inner(args, startup_bridge, inherited_mode, None, control).await {
         Ok(outcome) | Err(outcome) => outcome.exit_code,
     }
 }
@@ -162,9 +171,18 @@ pub(crate) async fn run_headless_rooted(
     args: &Args,
     startup_bridge: crate::signals::CancelBridge,
     saver_root: std::path::PathBuf,
+    control: crate::resume::ResumeControl,
 ) -> u8 {
     let inherited_mode = capture_marker_mode(args.done_file.as_ref());
-    match run_headless_inner(args, startup_bridge, inherited_mode, Some(saver_root)).await {
+    match run_headless_inner(
+        args,
+        startup_bridge,
+        inherited_mode,
+        Some(saver_root),
+        control,
+    )
+    .await
+    {
         Ok(outcome) | Err(outcome) => outcome.exit_code,
     }
 }
@@ -196,7 +214,8 @@ pub(crate) fn capture_marker_mode(
 /// force hook stands down: a repeat interrupt still exits 130, but the
 /// recorded outcome survives in the done-file. `saver_root` overrides
 /// where the session transcript is written; `None` uses the user's
-/// sessions directory.
+/// sessions directory. `control` carries the resume resolution — a
+/// degradation warning prints to stderr before anything else runs.
 ///
 /// # Errors
 ///
@@ -207,7 +226,15 @@ async fn run_headless_inner(
     startup_bridge: crate::signals::CancelBridge,
     inherited_mode: Option<std::fs::Permissions>,
     saver_root: Option<std::path::PathBuf>,
+    control: crate::resume::ResumeControl,
 ) -> Result<HeadlessOutcome, HeadlessOutcome> {
+    if let crate::resume::ResumeControl::Fresh {
+        warn: Some(warning),
+        ..
+    } = &control
+    {
+        eprintln!("dch: {warning}");
+    }
     if let Some(path) = &args.done_file {
         match std::fs::remove_file(path) {
             Ok(()) => {}
@@ -228,7 +255,7 @@ async fn run_headless_inner(
             }
         }
     }
-    let built = match construct_run(args, inherited_mode.as_ref()).await {
+    let built = match construct_run(args, inherited_mode.as_ref(), &control).await {
         Ok(built) => built,
         Err(outcome) => {
             startup_bridge.stop().await;
@@ -250,9 +277,23 @@ async fn run_headless_inner(
     });
     startup_bridge.stop().await;
 
+    let session_id = match &control {
+        crate::resume::ResumeControl::Resumed(outcome) => outcome.session_id,
+        crate::resume::ResumeControl::Fresh {
+            session_id: Some(id),
+            ..
+        } => *id,
+        crate::resume::ResumeControl::Fresh {
+            session_id: None, ..
+        } => runner.session_id(),
+    };
     let saver = match saver_root {
-        Some(root) => crate::session::SessionSaver::with_base_dir(runner.session_id(), model, root),
-        None => crate::session::SessionSaver::with_model(runner.session_id(), model),
+        Some(root) => crate::session::SessionSaver::with_base_dir(session_id, model, root),
+        None => crate::session::SessionSaver::with_model(session_id, model),
+    };
+    let mut transcript = match &control {
+        crate::resume::ResumeControl::Resumed(outcome) => outcome.messages.clone(),
+        crate::resume::ResumeControl::Fresh { .. } => Vec::new(),
     };
     let result = runner.run(&prompt).await;
     let turn_outputs = runner.session_turn_outputs();
@@ -261,10 +302,12 @@ async fn run_headless_inner(
             let outcome = HeadlessOutcome::from_run(&run);
             write_done_file_if_requested(args, &outcome, inherited_mode.as_ref());
             outcome_recorded.store(true, Ordering::SeqCst);
-            save_transcript(
-                &saver,
-                &crate::messages::transcript_from(&prompt, &turn_outputs, None),
-            );
+            transcript.extend(crate::messages::transcript_from(
+                &prompt,
+                &turn_outputs,
+                None,
+            ));
+            save_transcript(&saver, &transcript);
             bridge.stop().await;
             Ok(outcome)
         }
@@ -272,10 +315,12 @@ async fn run_headless_inner(
             let outcome = HeadlessOutcome::from_loop_error(&err);
             write_done_file_if_requested(args, &outcome, inherited_mode.as_ref());
             outcome_recorded.store(true, Ordering::SeqCst);
-            save_transcript(
-                &saver,
-                &crate::messages::transcript_from(&prompt, &turn_outputs, Some(&err)),
-            );
+            transcript.extend(crate::messages::transcript_from(
+                &prompt,
+                &turn_outputs,
+                Some(&err),
+            ));
+            save_transcript(&saver, &transcript);
             bridge.stop().await;
             Err(outcome)
         }
@@ -347,7 +392,9 @@ struct ConstructedRun {
 ///
 /// Every step before the run bridge exists; each failure maps through
 /// [`construction_failure`], which writes the done-file marker before
-/// the outcome leaves this function.
+/// the outcome leaves this function. A resumed `control` shapes the
+/// construction: the saved model applies unless the CLI overrides it,
+/// and the agent's history starts from the restored conversation.
 ///
 /// # Errors
 ///
@@ -356,6 +403,7 @@ struct ConstructedRun {
 async fn construct_run(
     args: &Args,
     inherited_mode: Option<&std::fs::Permissions>,
+    control: &crate::resume::ResumeControl,
 ) -> Result<ConstructedRun, HeadlessOutcome> {
     let prompt = resolve_prompt_nonblocking(args)
         .await
@@ -364,6 +412,9 @@ async fn construct_run(
     let mut config = load_config(args.config.config_path.as_deref())
         .map_err(|message| construction_failure(args, message, inherited_mode))?;
     apply_cli_overrides(&mut config, args);
+    if let crate::resume::ResumeControl::Resumed(outcome) = control {
+        crate::resume::apply_resumed_model(&mut config, args, outcome);
+    }
 
     let verbosity = resolve_verbosity(&config, args);
     let observer = Arc::new(ConsoleObserver::new(
@@ -375,13 +426,25 @@ async fn construct_run(
         construction_failure(args, format!("cannot determine cwd: {err}"), inherited_mode)
     })?;
 
-    let runner = dch_loop::Runner::builder(&config, &workdir)
-        .with_observer(Arc::clone(&observer) as Arc<dyn loopctl::observer::LoopObserver>)
-        .build()
-        .await
-        .map_err(|err| {
-            construction_failure(args, format!("agent construction: {err}"), inherited_mode)
-        })?;
+    let mut builder = dch_loop::Runner::builder(&config, &workdir)
+        .with_observer(Arc::clone(&observer) as Arc<dyn loopctl::observer::LoopObserver>);
+    if let crate::resume::ResumeControl::Resumed(outcome) = control {
+        builder = builder.with_history(crate::resume::tui_messages_to_loopctl(
+            &outcome.messages,
+            config.security.redact_secrets,
+        ));
+    }
+    let runner = builder.build().await.map_err(|err| {
+        construction_failure(args, format!("agent construction: {err}"), inherited_mode)
+    })?;
+    // Rebuild the read-before-write guard's baselines for the files
+    // the restored transcript shows being read: without this, a
+    // resumed Write treats every previously-read file as never-read.
+    if let crate::resume::ResumeControl::Resumed(outcome) = control {
+        for path in crate::resume::resumed_read_paths(&outcome.messages) {
+            let _recorded = runner.context().record_resumed_read(&path);
+        }
+    }
     let model = config.api.model.clone();
     Ok(ConstructedRun {
         prompt,
@@ -636,6 +699,15 @@ mod tests {
     /// name.
     fn parse(args: &[&str]) -> Args {
         Args::try_parse_from(std::iter::once("dch").chain(args.iter().copied())).unwrap()
+    }
+
+    /// The control a plain invocation resolves to — no resume, no
+    /// warning.
+    fn fresh_control() -> crate::resume::ResumeControl {
+        crate::resume::ResumeControl::Fresh {
+            session_id: None,
+            warn: None,
+        }
     }
 
     #[test]
@@ -953,7 +1025,12 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let args = parse(&["Reply with exactly: ok"]);
         assert_eq!(
-            run_headless(&args, crate::signals::install_construction_handler(|| {}),).await,
+            run_headless(
+                &args,
+                crate::signals::install_construction_handler(|| {}),
+                fresh_control(),
+            )
+            .await,
             0
         );
     }
@@ -1082,6 +1159,7 @@ mod tests {
             &args,
             crate::signals::install_construction_handler(|| {}),
             sessions.path().to_path_buf(),
+            fresh_control(),
         )
         .await;
         assert!(
@@ -1156,6 +1234,7 @@ mod tests {
                 &run_args,
                 crate::signals::install_construction_handler(|| {}),
                 sessions_root,
+                fresh_control(),
             )
             .await
         });
@@ -1208,6 +1287,7 @@ mod tests {
         let code = run_headless(
             &parse(&flags),
             crate::signals::install_construction_handler(|| {}),
+            fresh_control(),
         )
         .await;
         let mut writable = std::fs::metadata(dir.path()).unwrap().permissions();
@@ -1254,6 +1334,7 @@ mod tests {
         let code = run_headless(
             &parse(&flags),
             crate::signals::install_construction_handler(|| {}),
+            fresh_control(),
         )
         .await;
         assert_eq!(code, 1, "the malformed config must fail construction");
@@ -1263,6 +1344,286 @@ mod tests {
             0o600,
             "the restrictive mode of a cleared marker must survive the \
              run that replaced it"
+        );
+    }
+
+    /// A local server answering every connection with one complete
+    /// streamed text turn, so any number of successive runs each
+    /// resolve successfully.
+    struct TurnServer {
+        /// The ephemeral port the agent's requests arrive on.
+        ///
+        /// Rendered into the temp config's `base_url`, so pointing
+        /// successive runs at the one server needs no name
+        /// resolution or a fixed port.
+        port: u16,
+    }
+
+    impl TurnServer {
+        /// Bind the server and spawn its accept loop.
+        ///
+        /// The port is bound before returning so the temp config can
+        /// name it; the loop keeps serving until the test process
+        /// exits.
+        async fn start() -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("ephemeral bind");
+            let port = listener.local_addr().expect("bound address").port();
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let body = [
+                        serde_json::json!({
+                            "id": "c1", "model": "test-model",
+                            "choices": [{"delta": {"content": "answered"}, "finish_reason": null}]
+                        }),
+                        serde_json::json!({
+                            "id": "c1", "model": "test-model",
+                            "choices": [{"delta": null, "finish_reason": "stop"}]
+                        }),
+                    ]
+                    .iter()
+                    .map(|chunk| format!("data: {chunk}\n\n"))
+                    .chain(std::iter::once("data: [DONE]\n\n".to_string()))
+                    .collect::<String>();
+                    let response =
+                        format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n{body}");
+                    let _written = stream.write_all(response.as_bytes()).await;
+                }
+            });
+            Self { port }
+        }
+
+        /// A config pointing the agent at this server.
+        ///
+        /// OpenAI-compatible against the bound port, with a
+        /// placeholder key and a timeout wide enough that only the
+        /// canned answer can end a turn.
+        fn config_toml(&self) -> String {
+            self.config_toml_with_model("test-model")
+        }
+
+        /// The same config under a chosen model, so precedence pins
+        /// can distinguish the config default from what a session
+        /// carried and what the CLI overrode.
+        fn config_toml_with_model(&self, model: &str) -> String {
+            format!(
+                "[api]\napi_type = \"openai\"\nbase_url = \"http://127.0.0.1:{}\"\
+                 \napi_key = \"dummy\"\nmodel = \"{model}\"\nrequest_timeout_secs = 10\n",
+                self.port
+            )
+        }
+    }
+
+    /// The UUID-named session directories under `root`.
+    ///
+    /// Reads the directory the way the listing does, so the pins can
+    /// assert which identities exist on disk — non-UUID strays are
+    /// ignored exactly as a real listing would ignore them.
+    fn session_ids(root: &std::path::Path) -> Vec<uuid::Uuid> {
+        std::fs::read_dir(root)
+            .expect("the sessions root")
+            .filter_map(|entry| {
+                entry
+                    .ok()
+                    .and_then(|entry| entry.file_name().into_string().ok())
+                    .and_then(|name| uuid::Uuid::parse_str(&name).ok())
+            })
+            .collect()
+    }
+
+    /// Save → resume → continue → save again lands in the same file,
+    /// holding the whole conversation.
+    ///
+    /// The end-to-end composition the unit pins build toward: a fresh
+    /// run saves its transcript, a second run resumes it by id, and
+    /// the resumed save reuses the same session directory while its
+    /// transcript carries the restored turns ahead of the new one.
+    /// The signal lock is held throughout: each run installs an
+    /// interrupt bridge, and a signal another test delivers while a
+    /// bridge is live would land in it and exit the process.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_resumed_headless_run_appends_to_the_resumed_session_file() {
+        let _signal_lock = SIGNAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let server = TurnServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, server.config_toml()).unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let config_flag = config_path.to_str().unwrap();
+
+        let first = parse(&["first task", "--config", config_flag]);
+        assert_eq!(
+            run_headless_rooted(
+                &first,
+                crate::signals::install_construction_handler(|| {}),
+                sessions.path().to_path_buf(),
+                fresh_control(),
+            )
+            .await,
+            0,
+            "the first run completes against the canned turn"
+        );
+
+        let saved = session_ids(sessions.path());
+        assert_eq!(saved.len(), 1, "one fresh session was saved");
+        let Some(id) = saved.first() else {
+            panic!("the saved session id is readable: {saved:?}")
+        };
+
+        let second = parse(&[
+            "second task",
+            "--config",
+            config_flag,
+            "--resume",
+            &id.to_string(),
+        ]);
+        let control = crate::resume::resolve_resume_in(&second, sessions.path());
+        assert!(
+            matches!(control, crate::resume::ResumeControl::Resumed(_)),
+            "the saved session resolves for resume"
+        );
+        assert_eq!(
+            run_headless_rooted(
+                &second,
+                crate::signals::install_construction_handler(|| {}),
+                sessions.path().to_path_buf(),
+                control,
+            )
+            .await,
+            0,
+            "the resumed run completes against the canned turn"
+        );
+
+        assert_eq!(
+            session_ids(sessions.path()),
+            vec![*id],
+            "the resumed run reuses the loaded session's identity — no second directory"
+        );
+        let (messages, _model) = crate::session::load_with_meta_in(*id, sessions.path()).unwrap();
+        assert_eq!(
+            messages.len(),
+            4,
+            "two turns of two messages each — the restored conversation ahead of the new turn"
+        );
+        for (at, message) in messages.iter().enumerate() {
+            match (at, message) {
+                (0, dch_tui::TuiMessage::User { text, .. }) => {
+                    assert_eq!(text, "first task");
+                }
+                (1 | 3, dch_tui::TuiMessage::Assistant { blocks, .. }) => {
+                    assert!(
+                        matches!(&blocks[..], [dch_tui::ContentBlock::Text { text }] if text == "answered"),
+                        "each answer is the canned turn"
+                    );
+                }
+                (2, dch_tui::TuiMessage::User { text, .. }) => {
+                    assert_eq!(text, "second task");
+                }
+                _ => panic!("unexpected message at position {at}: {message:?}"),
+            }
+        }
+    }
+
+    /// Session model beats the config default on resume; the CLI flag
+    /// beats both.
+    ///
+    /// The precedence the resume docs promise, exercised end to end:
+    /// a first run saves under the config's model; a resumed run over
+    /// a config naming a different model keeps the session's; adding
+    /// `--model` overrides both and the re-saved envelope records
+    /// the override. The signal lock is held throughout — each run
+    /// installs an interrupt bridge, which a concurrently delivered
+    /// test signal would hijack.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_resumed_run_keeps_the_session_model_until_the_cli_overrides_it() {
+        let _signal_lock = SIGNAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let server = TurnServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let sessions = tempfile::tempdir().unwrap();
+        let config_flag = config_path.to_str().unwrap();
+
+        std::fs::write(&config_path, server.config_toml_with_model("m-first")).unwrap();
+        let first = parse(&["first task", "--config", config_flag]);
+        assert_eq!(
+            run_headless_rooted(
+                &first,
+                crate::signals::install_construction_handler(|| {}),
+                sessions.path().to_path_buf(),
+                fresh_control(),
+            )
+            .await,
+            0,
+            "the first run completes against the canned turn"
+        );
+        let saved = session_ids(sessions.path());
+        let Some(id) = saved.first() else {
+            panic!("the saved session id is readable: {saved:?}")
+        };
+        let (_, model) = crate::session::load_with_meta_in(*id, sessions.path()).unwrap();
+        assert_eq!(
+            model, "m-first",
+            "the first save records the model the config named"
+        );
+
+        std::fs::write(&config_path, server.config_toml_with_model("m-second")).unwrap();
+        let second = parse(&[
+            "second task",
+            "--config",
+            config_flag,
+            "--resume",
+            &id.to_string(),
+        ]);
+        let control = crate::resume::resolve_resume_in(&second, sessions.path());
+        assert_eq!(
+            run_headless_rooted(
+                &second,
+                crate::signals::install_construction_handler(|| {}),
+                sessions.path().to_path_buf(),
+                control,
+            )
+            .await,
+            0,
+            "the resumed run completes against the canned turn"
+        );
+        let (_, model) = crate::session::load_with_meta_in(*id, sessions.path()).unwrap();
+        assert_eq!(
+            model, "m-first",
+            "a resumed session keeps the model it ran with, not the new config default"
+        );
+
+        let third = parse(&[
+            "third task",
+            "--config",
+            config_flag,
+            "--resume",
+            &id.to_string(),
+            "--model",
+            "m-cli",
+        ]);
+        let control = crate::resume::resolve_resume_in(&third, sessions.path());
+        assert_eq!(
+            run_headless_rooted(
+                &third,
+                crate::signals::install_construction_handler(|| {}),
+                sessions.path().to_path_buf(),
+                control,
+            )
+            .await,
+            0,
+            "the CLI-overridden resume completes against the canned turn"
+        );
+        let (_, model) = crate::session::load_with_meta_in(*id, sessions.path()).unwrap();
+        assert_eq!(
+            model, "m-cli",
+            "an explicit --model overrides the session's recorded model"
         );
     }
 }

@@ -17,25 +17,28 @@ use tokio::sync::mpsc;
 
 use crate::args::Args;
 use crate::headless::{apply_cli_overrides, load_config};
+use crate::resume::ResumeControl;
 
 /// Run the interactive session and return the process exit code.
 ///
 /// Loads config, builds a streaming runner with the TUI observer
 /// attached, initializes the terminal, and hosts the app's event loop
-/// until the user quits. Submissions travel the app's submit channel
-/// to a driver task that owns the runner and executes them strictly
-/// one at a time; a failed run surfaces as an error message in the
-/// conversation instead of ending the session. Quitting cancels an
-/// in-flight run, stops the driver from starting any submissions
-/// still queued behind it, waits for the driver, and restores the
-/// terminal.
+/// until the user quits — continuing from `control` when it carries a
+/// resumed session: the restored transcript seeds the display, the
+/// agent's history, and the file further auto-saves write to.
+/// Submissions travel the app's submit channel to a driver task that
+/// owns the runner and executes them strictly one at a time; a failed
+/// run surfaces as an error message in the conversation instead of
+/// ending the session. Quitting cancels an in-flight run, stops the
+/// driver from starting any submissions still queued behind it,
+/// waits for the driver, and restores the terminal.
 ///
 /// # Errors
 ///
 /// Returns the exit code for any failure: 1 for construction or
 /// session-level failures, 0 for a clean quit.
-pub async fn run_tui(args: &Args) -> u8 {
-    match run_tui_session(args).await {
+pub async fn run_tui(args: &Args, control: ResumeControl) -> u8 {
+    match run_tui_session(args, control).await {
         Ok(()) => 0,
         Err(message) => {
             crate::signals::report(&format!("dch: {message}"));
@@ -50,37 +53,87 @@ pub async fn run_tui(args: &Args) -> u8 {
 /// terminal — runs before the alternate screen is entered, so a
 /// failure reports to the user's normal terminal. Draw failures after
 /// the session started are reported only once the guard has restored
-/// the terminal, so the message never lands inside raw mode.
+/// the terminal, so the message never lands inside raw mode. A
+/// resumed control shapes each step: the saved model applies unless
+/// the CLI overrides it, the restored conversation seeds both the
+/// agent's history and the display, and the session id is the loaded
+/// one so auto-saves keep writing the resumed file.
 ///
 /// # Errors
 ///
 /// Returns the user-facing failure message for any construction or
 /// session-level failure; the caller maps it to the exit code.
-async fn run_tui_session(args: &Args) -> Result<(), String> {
+async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), String> {
+    if let ResumeControl::Fresh {
+        warn: Some(warn), ..
+    } = &control
+    {
+        crate::signals::report(&format!("dch: {warn}"));
+    }
     let mut config = load_config(args.config.config_path.as_deref())?;
     apply_cli_overrides(&mut config, args);
+    if let ResumeControl::Resumed(outcome) = &control {
+        crate::resume::apply_resumed_model(&mut config, args, outcome);
+    }
 
     let workdir = std::env::current_dir().map_err(|err| format!("cannot determine cwd: {err}"))?;
 
     let (observer, state) = TuiObserverState::new().into_observer();
-    let runner = dch_loop::Runner::builder(&config, &workdir)
-        .with_observer(Arc::new(observer) as Arc<dyn loopctl::observer::LoopObserver>)
+    let mut builder = dch_loop::Runner::builder(&config, &workdir)
+        .with_observer(Arc::new(observer) as Arc<dyn loopctl::observer::LoopObserver>);
+    if let ResumeControl::Resumed(outcome) = &control {
+        builder = builder.with_history(crate::resume::tui_messages_to_loopctl(
+            &outcome.messages,
+            config.security.redact_secrets,
+        ));
+    }
+    let runner = builder
         .build()
         .await
         .map_err(|err| format!("agent construction: {err}"))?;
+
+    // Rebuild the read-before-write guard's baselines for the files
+    // the restored transcript shows being read: without this, a
+    // resumed Write treats every previously-read file as never-read.
+    if let ResumeControl::Resumed(outcome) = &control {
+        for path in crate::resume::resumed_read_paths(&outcome.messages) {
+            let _recorded = runner.context().record_resumed_read(&path);
+        }
+    }
 
     let (submit_tx, submit_rx) = mpsc::unbounded_channel();
     let model = config.api.model.clone();
     let mut app = TuiApp::from_observer_state(config, state.clone());
     app.set_submit_tx(submit_tx);
 
+    // Seed the display from the control — the restored transcript, or
+    // the note that a resume degraded to this fresh session — and take
+    // the id the saver writes under: the resumed file's own identity.
+    let session_id = match control {
+        ResumeControl::Resumed(outcome) => {
+            app.seed_messages(outcome.messages);
+            outcome.session_id
+        }
+        ResumeControl::Fresh {
+            session_id,
+            warn: Some(warn),
+        } => {
+            app.push_message(TuiMessage::System {
+                text: warn,
+                timestamp: chrono::Utc::now(),
+            });
+            session_id.unwrap_or_else(|| runner.session_id())
+        }
+        ResumeControl::Fresh {
+            session_id,
+            warn: None,
+        } => session_id.unwrap_or_else(|| runner.session_id()),
+    };
+
     // Save the transcript off the render thread whenever a turn
     // ends: one ordered writer receives the snapshots, so the newest
     // transcript lands last and teardown joins the final write.
-    let saver = Arc::new(crate::session::SessionSaver::with_model(
-        runner.session_id(),
-        model,
-    ));
+    let saver = Arc::new(crate::session::SessionSaver::with_model(session_id, model));
     let (transcript_handle, transcript_worker) = TranscriptWorker::spawn(saver);
     app.set_turn_end_hook(Box::new(move |conversation| {
         transcript_handle.send(conversation.to_vec());
@@ -389,6 +442,10 @@ mod tests {
     }
 
     /// A driver shutdown flag in the given state.
+    ///
+    /// Reads as the driver's loop condition, so a `true` flag makes
+    /// the pins below exercise the quitting path without any
+    /// terminal or user input.
     fn shutdown_flag(set: bool) -> Arc<AtomicBool> {
         Arc::new(AtomicBool::new(set))
     }

@@ -8,8 +8,11 @@
 use std::io::{self, Stdout};
 
 use crossterm::cursor::SetCursorStyle;
+use std::io::Write as _;
+
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -22,10 +25,16 @@ use ratatui::backend::CrosstermBackend;
 ///
 /// Enables raw mode and enters the alternate screen with bracketed
 /// paste and mouse capture armed — paste lands as one atomic event
-/// and the wheel scrolls the conversation — and asks the terminal
-/// for a blinking block cursor, which many terminals do not offer
-/// by default; terminals that ignore the style request simply keep
-/// their own. Returns a terminal bound to stdout. Pair with [`restore_terminal`] — or hold a
+/// and the wheel scrolls the conversation — asks the terminal for a
+/// blinking block cursor, which many terminals do not offer by
+/// default (terminals that ignore the style request simply keep
+/// their own) — and asks for full key reporting through both
+/// extension protocols, so Shift+Enter arrives with its modifier
+/// instead of folding into a bare Enter: the kitty protocol
+/// (report-all-keys with alternate keys, so shifted letters still
+/// deliver their text) on terminals that speak it, and xterm's
+/// modifyOtherKeys on the rest. Terminals implementing neither
+/// ignore both pushes and keep their legacy byte stream. Returns a terminal bound to stdout. Pair with [`restore_terminal`] — or hold a
 /// [`TerminalGuard`] so the pairing is automatic. A failure after
 /// raw mode was enabled undoes the partial setup — raw mode off
 /// first, the escape sequences best-effort — before returning the
@@ -44,8 +53,19 @@ pub fn init_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
             EnterAlternateScreen,
             EnableBracketedPaste,
             EnableMouseCapture,
-            SetCursorStyle::BlinkingBlock
+            SetCursorStyle::BlinkingBlock,
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS,
+            )
         )?;
+        // The xterm/VTE counterpart, for terminals without the kitty
+        // protocol: report modified keys that would otherwise fold
+        // into a plain byte — Shift+Enter above all. Kitty-family
+        // terminals ignore this push; each mechanism covers its own.
+        write!(stdout, "\x1b[>4;2m")?;
+        stdout.flush()?;
         let backend = CrosstermBackend::new(stdout);
         Terminal::new(backend)
     })();
@@ -79,9 +99,15 @@ pub fn restore_terminal() -> io::Result<()> {
         SetCursorStyle::DefaultUserShape,
         DisableMouseCapture,
         DisableBracketedPaste,
+        PopKeyboardEnhancementFlags,
         LeaveAlternateScreen
     );
-    raw_result.and(alt_result)
+    let modify_result = (|| {
+        let mut stdout = io::stdout();
+        write!(stdout, "\x1b[>4;0m")?;
+        stdout.flush()
+    })();
+    raw_result.and(alt_result).and(modify_result)
 }
 
 /// RAII ownership of an initialized TUI terminal.

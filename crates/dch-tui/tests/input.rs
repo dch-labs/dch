@@ -489,3 +489,38 @@ fn vertical_moves_never_land_mid_character_and_survive_inserts() {
         "typing after a Down that lands inside é must not panic"
     );
 }
+
+#[test]
+fn ctrl_j_inserts_a_newline_on_every_terminal() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "one");
+    editor.handle_key(key(KeyCode::Char('j'), KeyModifiers::CONTROL));
+    type_str(&mut editor, "two");
+    assert_eq!(
+        editor.text(),
+        "one\ntwo",
+        "Ctrl+J is the terminal's own newline key — raw mode reports it as control-j everywhere"
+    );
+}
+
+#[test]
+fn ctrl_m_submits_where_the_terminal_reports_the_modifier() {
+    // Ctrl+M arrives under three spellings: plain Enter on legacy
+    // terminals, Enter with the modifier on modifyOtherKeys ones,
+    // and control-m on kitty-protocol ones. All must submit.
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "send me");
+    assert_eq!(
+        editor.handle_key(key(KeyCode::Enter, KeyModifiers::CONTROL)),
+        InputAction::Submit("send me".to_string()),
+        "the modifyOtherKeys spelling submits"
+    );
+    assert!(editor.text().is_empty(), "a submitted buffer clears");
+    type_str(&mut editor, "again");
+    assert_eq!(
+        editor.handle_key(key(KeyCode::Char('m'), KeyModifiers::CONTROL)),
+        InputAction::Submit("again".to_string()),
+        "the kitty-protocol control-m spelling submits"
+    );
+    assert!(editor.text().is_empty(), "a submitted buffer clears");
+}

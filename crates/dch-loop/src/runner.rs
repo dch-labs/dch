@@ -40,6 +40,7 @@ use dch_tools::RunnerContext;
 use dch_tools::builtin_registry;
 use loopctl::engine::BareLoop;
 use loopctl::engine::Loop;
+use loopctl::engine::LoopMachine;
 use loopctl::engine::Run;
 use loopctl::engine::RunConfig;
 use loopctl::error::LoopError;
@@ -48,6 +49,7 @@ use loopctl::managers::LoopManagers;
 use loopctl::mcp::CommandSpec;
 use loopctl::mcp::McpClient;
 use loopctl::mcp::McpToolProvider;
+use loopctl::message::Message;
 use loopctl::middleware::RedactingMiddleware;
 use loopctl::middleware::SecretPatternSet;
 use loopctl::middleware::ToolDispatchContext;
@@ -82,12 +84,14 @@ use crate::with_context;
 pub struct Runner {
     /// The agent loop, monomorphized over the concrete [`DchClient`].
     ///
-    /// Constructed once in [`RunnerBuilder::build`] via `new_with_managers`
-    /// with the builtin tool registry, the composed session config, and the
-    /// observer-carrying managers (which carry the dispatch pipeline with the
-    /// context injector installed). Every public method delegates to it; the
-    /// concrete (non-`dyn`) client keeps the per-turn LLM call statically
-    /// dispatched.
+    /// Constructed once in [`RunnerBuilder::build`] via
+    /// `from_machine_with_managers` with the builtin tool registry, the
+    /// composed session config, and the observer-carrying managers (which
+    /// carry the dispatch pipeline with the context injector installed)
+    /// over a state machine seeded with the builder's prior history —
+    /// empty for a fresh session. Every public method delegates to it;
+    /// the concrete (non-`dyn`) client keeps the per-turn LLM call
+    /// statically dispatched.
     inner: BareLoop<DchClient>,
 
     /// The shared per-runner context, cloned into every tool dispatch.
@@ -127,6 +131,7 @@ impl Runner {
             observers: Vec::new(),
             middleware: Vec::new(),
             mcp_providers: Vec::new(),
+            history: Vec::new(),
         }
     }
 
@@ -196,9 +201,12 @@ impl Runner {
     /// The session identity the inner engine owns.
     ///
     /// A UUID minted once when the engine is constructed and stable
-    /// across every `run()` call on this runner — hosts use it to key
-    /// per-session artifacts (saved transcripts) so they match the id
-    /// the agent loop itself carries. The runner never rotates it.
+    /// across every `run()` call on this runner — hosts key
+    /// per-session artifacts (saved transcripts) by it. A resumed
+    /// host keys by the restored session's id instead, so its
+    /// artifacts keep appending to the resumed file; this accessor
+    /// reports the engine's own identity either way. The runner
+    /// never rotates it.
     #[must_use]
     pub fn session_id(&self) -> uuid::Uuid {
         self.inner.session().id
@@ -325,6 +333,14 @@ pub struct RunnerBuilder<'a> {
     /// join the registry beside the builtin tools in the order added. Use
     /// these for transports the config cannot express.
     mcp_providers: Vec<McpToolProvider>,
+
+    /// Prior conversation the built loop starts from, empty for a fresh
+    /// session.
+    ///
+    /// Seeded into the loop's state machine at construction (see
+    /// [`RunnerBuilder::with_history`]); a `run` on the built runner
+    /// continues from the restored point instead of an empty history.
+    history: Vec<Message>,
 }
 
 impl RunnerBuilder<'_> {
@@ -360,6 +376,29 @@ impl RunnerBuilder<'_> {
     #[must_use]
     pub fn with_mcp_provider(mut self, provider: McpToolProvider) -> Self {
         self.mcp_providers.push(provider);
+        self
+    }
+
+    /// Start the built loop from a prior conversation instead of an empty
+    /// one.
+    ///
+    /// The history is seeded into the loop's state machine, so the first
+    /// [`run`](Runner::run) on the built runner continues the restored
+    /// conversation rather than beginning a new one — the resume path's
+    /// reconstruction step. Provide a well-formed conversation: user
+    /// and assistant messages alternating — a turn's tool results
+    /// ride the user message that follows their calls — and every
+    /// tool call paired with a matching tool result. A transcript
+    /// ending mid-turn leaves its final tool results as the
+    /// conversation's last user message on their own. The loop does
+    /// not validate the shape; providers that reject it surface the
+    /// refusal as an API error on the first run. Observers and
+    /// middleware registered on the builder keep receiving every
+    /// event of the continued session — the seeding touches only the
+    /// conversation.
+    #[must_use]
+    pub fn with_history(mut self, history: Vec<Message>) -> Self {
+        self.history = history;
         self
     }
 
@@ -413,10 +452,11 @@ impl RunnerBuilder<'_> {
             core_registry,
         )?);
 
-        let inner = BareLoop::<DchClient>::new_with_managers(
+        let inner = BareLoop::<DchClient>::from_machine_with_managers(
+            LoopMachine::from_history(self.history),
+            session_config,
             Arc::new(client),
             registry,
-            session_config,
             managers,
         );
 
@@ -776,6 +816,12 @@ mod tests {
     }
 
     /// A pass-through middleware whose name proves pipeline placement.
+    ///
+    /// Alters nothing about a dispatch; its only behavior is its
+    /// name, which the pipeline exposes in `middleware_names()` —
+    /// letting the placement pins observe layering through the real
+    /// public surface instead of reaching into the pipeline's
+    /// internals.
     struct HostProbe;
 
     impl ToolMiddleware for HostProbe {
@@ -1063,6 +1109,109 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_built_runner_carries_the_seeded_history() {
+        let config = offline_config();
+        let dir = TempDir::new().expect("tempdir");
+        let history = vec![
+            loopctl::message::Message::user("earlier turn"),
+            loopctl::message::Message::assistant("earlier answer"),
+        ];
+        let runner = Runner::builder(&config, dir.path())
+            .with_history(history.clone())
+            .build()
+            .await
+            .expect("Runner::new constructs");
+        let conversation = runner.inner.conversation();
+        assert_eq!(
+            conversation.len(),
+            history.len(),
+            "the built loop must start from the restored conversation, not an empty one"
+        );
+        for (seeded, restored) in history.iter().zip(&conversation) {
+            assert_eq!(restored.role, seeded.role, "roles survive the seeding");
+            match (seeded.parts.first(), restored.parts.first()) {
+                (
+                    Some(loopctl::message::MessagePart::Text { text: seeded_text }),
+                    Some(loopctl::message::MessagePart::Text {
+                        text: restored_text,
+                    }),
+                ) => assert_eq!(
+                    restored_text, seeded_text,
+                    "the text parts survive the seeding verbatim"
+                ),
+                parts => panic!("both fixtures are single-text-part messages: {parts:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_runner_without_seeded_history_starts_empty() {
+        let config = offline_config();
+        let dir = TempDir::new().expect("tempdir");
+        let runner = Runner::builder(&config, dir.path())
+            .build()
+            .await
+            .expect("Runner::new constructs");
+        assert!(
+            runner.inner.conversation().is_empty(),
+            "a fresh session must not inherit any conversation"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_seeded_runner_sends_the_restored_history_on_the_first_request() {
+        let server = SseServer::start(vec![sse_text_turn("continued")]).await;
+        let dir = TempDir::new().expect("tempdir");
+        let history = vec![
+            loopctl::message::Message::user("earlier turn"),
+            loopctl::message::Message::assistant("earlier answer"),
+        ];
+        let mut runner = Runner::builder(&wire_config(server.port, 7), dir.path())
+            .with_history(history)
+            .build()
+            .await
+            .expect("constructs");
+        let run = tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("fresh"))
+            .await
+            .expect("run completes")
+            .expect("run succeeds");
+        assert_eq!(run.output.as_deref(), Some("continued"));
+        let requests = recorded_requests(&server);
+        assert_eq!(requests.len(), 1, "one text turn, one request");
+        assert!(
+            requests[0].contains("earlier turn")
+                && requests[0].contains("earlier answer")
+                && requests[0].contains("fresh"),
+            "the restored conversation rides the first provider request ahead of the new prompt"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn observers_fire_in_lifecycle_order_on_a_seeded_runner() {
+        let server = SseServer::start(vec![sse_text_turn("hello")]).await;
+        let dir = TempDir::new().expect("tempdir");
+        let observer = Arc::new(RecordingObserver::new());
+        let mut runner = Runner::builder(&wire_config(server.port, 7), dir.path())
+            .with_observer(Arc::clone(&observer) as Arc<dyn LoopObserver>)
+            .with_history(vec![
+                loopctl::message::Message::user("earlier turn"),
+                loopctl::message::Message::assistant("earlier answer"),
+            ])
+            .build()
+            .await
+            .expect("constructs");
+        tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("hi"))
+            .await
+            .expect("run completes")
+            .expect("run succeeds");
+        assert_eq!(
+            observer.snapshot(),
+            vec!["run_start", "turn_start", "response", "turn_end", "run_end"],
+            "the continued session is observed exactly like a fresh one"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn completed_turns_survive_a_later_failure_in_the_same_run() {
         // Turn 1 answers with text and a Read call, so the loop runs
@@ -1334,10 +1483,20 @@ mod tests {
     }
 
     /// One canned HTTP response: status code plus body.
+    ///
+    /// The server consumes these one per connection, in order, so a
+    /// test scripts a whole multi-request conversation — including
+    /// its failures — by stacking them.
     struct CannedResponse {
         /// HTTP status the server answers with.
+        ///
+        /// Any code the provider client can receive; non-2xx bodies
+        /// become provider errors the run surfaces.
         status: u16,
         /// Response body bytes.
+        ///
+        /// Verbatim on the wire — for SSE responses, the full
+        /// `data:`-event stream the client parses.
         body: String,
     }
 
@@ -1419,6 +1578,10 @@ mod tests {
     }
 
     /// Reason phrase for the statuses the canned server emits.
+    ///
+    /// The hand-written HTTP response needs one per status line;
+    /// keeping the table local avoids an http-crate dependency just
+    /// to spell "Unauthorized" in a fixture.
     fn reason_phrase(status: u16) -> &'static str {
         match status {
             200 => "OK",
@@ -1471,6 +1634,10 @@ mod tests {
     }
 
     /// An observer that records the lifecycle events it receives, in order.
+    ///
+    /// Gives the ordering pins something deterministic to read: each
+    /// callback appends its name, and the finished run's sequence is
+    /// asserted against the expected lifecycle order.
     struct RecordingObserver {
         events: Mutex<Vec<&'static str>>,
     }
@@ -1609,6 +1776,10 @@ mod tests {
     }
 
     /// An rmcp server exposing one `greet` tool, for the MCP registration test.
+    ///
+    /// Serves over an in-memory transport, so the registration pin
+    /// exercises the real MCP handshake and tool discovery without
+    /// spawning a process or opening a socket.
     #[derive(Clone)]
     struct GreetServer {
         // rmcp's tool_handler macro reaches the router through its generated
