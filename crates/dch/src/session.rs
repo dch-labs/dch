@@ -296,7 +296,7 @@ pub(crate) fn load_with_meta_in(
     id: Uuid,
     base: &Path,
 ) -> Result<(Vec<TuiMessage>, String), SessionError> {
-    let stored = load_envelope(&base.join(id.to_string()).join("session.json"), id)?;
+    let stored = load_envelope(&base.join(id.to_string()).join("session.json"), id, base)?;
     Ok((stored.messages, stored.model))
 }
 
@@ -312,17 +312,26 @@ pub(crate) fn load_with_meta_in(
 /// directory's name reads as `ENOTDIR`, which is the same "nothing
 /// resumable under this id" fact as an absent directory;
 /// [`SessionError::Corrupt`] when it does not parse or its format
-/// tag is unknown; [`SessionError::Io`] when the read fails.
-fn load_envelope(path: &Path, session_id: Uuid) -> Result<StoredSession, SessionError> {
+/// tag is unknown; [`SessionError::Io`] when the read fails —
+/// including an `ENOTDIR` whose broken component is the sessions
+/// root itself, which is a broken layout worth stopping for, not a
+/// missing session: degrading to a fresh id there would silently
+/// lose every later save to the same broken root.
+fn load_envelope(
+    path: &Path,
+    session_id: Uuid,
+    base: &Path,
+) -> Result<StoredSession, SessionError> {
     let json = match std::fs::read_to_string(path) {
         Ok(json) => json,
-        Err(err)
-            if matches!(
-                err.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-            ) =>
-        {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return Err(SessionError::NotFound(session_id));
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotADirectory => {
+            if base.is_dir() {
+                return Err(SessionError::NotFound(session_id));
+            }
+            return Err(SessionError::Io(err));
         }
         Err(err) => return Err(SessionError::Io(err)),
     };
@@ -432,7 +441,7 @@ mod tests {
     /// Load through the path-injectable core so tests never read the
     /// real sessions root.
     fn load(dir: &std::path::Path, id: Uuid) -> Result<Vec<TuiMessage>, SessionError> {
-        Ok(load_envelope(&dir.join(id.to_string()).join("session.json"), id)?.messages)
+        Ok(load_envelope(&dir.join(id.to_string()).join("session.json"), id, dir)?.messages)
     }
 
     fn sample_messages() -> Vec<TuiMessage> {
@@ -586,9 +595,13 @@ mod tests {
     fn load_reports_a_missing_session_as_not_found() {
         let dir = tempfile::tempdir().expect("tempdir");
         let id = Uuid::new_v4();
-        let err = load_envelope(&dir.path().join(id.to_string()).join("session.json"), id)
-            .map(|stored| stored.messages)
-            .expect_err("nothing was saved");
+        let err = load_envelope(
+            &dir.path().join(id.to_string()).join("session.json"),
+            id,
+            dir.path(),
+        )
+        .map(|stored| stored.messages)
+        .expect_err("nothing was saved");
         assert!(
             matches!(&err, SessionError::NotFound(missing) if *missing == id),
             "a missing file is typed NotFound, got {err:?}"
@@ -600,15 +613,43 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let id = Uuid::new_v4();
         // A regular file squatting on the directory name: reading
-        // <id>/session.json fails with ENOTDIR, not ENOENT.
+        // <id>/session.json fails with ENOTDIR, not ENOENT. The root is
+        // sound, so this is the same "nothing resumable" fact as a
+        // missing id — not a layout worth stopping for.
         std::fs::write(dir.path().join(id.to_string()), "not a directory")
             .expect("write the stray file");
-        let err = load_envelope(&dir.path().join(id.to_string()).join("session.json"), id)
-            .map(|stored| stored.messages)
-            .expect_err("no session can exist under the id");
+        let err = load_envelope(
+            &dir.path().join(id.to_string()).join("session.json"),
+            id,
+            dir.path(),
+        )
+        .map(|stored| stored.messages)
+        .expect_err("no session can exist under the id");
         assert!(
             matches!(&err, SessionError::NotFound(missing) if *missing == id),
             "an unreachable path is typed NotFound like an absent one, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_regular_file_where_the_sessions_root_belongs_is_an_io_failure() {
+        // ENOTDIR with the root itself as the broken component is a
+        // broken sessions layout, not a missing session: degrading to
+        // fresh would hand the run a session id whose every later save
+        // fails against the same file root, losing the transcript
+        // silently. The load must surface Io — the arm resume exits on.
+        let root = tempfile::NamedTempFile::new().expect("the root as a regular file");
+        let id = Uuid::new_v4();
+        let err = load_envelope(
+            &root.path().join(id.to_string()).join("session.json"),
+            id,
+            root.path(),
+        )
+        .map(|stored| stored.messages)
+        .expect_err("no session can load under a file root");
+        assert!(
+            matches!(err, SessionError::Io(ref io_err) if io_err.kind() == std::io::ErrorKind::NotADirectory),
+            "the broken root is typed Io, got {err:?}"
         );
     }
 
@@ -619,7 +660,7 @@ mod tests {
         let path = dir.path().join(id.to_string()).join("session.json");
         std::fs::create_dir_all(path.parent().expect("dir")).expect("mkdir");
         std::fs::write(&path, "{not valid json").expect("write garbage");
-        let err = load_envelope(&path, id)
+        let err = load_envelope(&path, id, dir.path())
             .map(|stored| stored.messages)
             .expect_err("garbage must fail");
         assert!(
@@ -635,7 +676,7 @@ mod tests {
         let path = dir.path().join(id.to_string()).join("session.json");
         std::fs::create_dir_all(path.parent().expect("dir")).expect("mkdir");
         std::fs::write(&path, r#"{"wrong":"shape"}"#).expect("write a wrong shape");
-        let err = load_envelope(&path, id)
+        let err = load_envelope(&path, id, dir.path())
             .map(|stored| stored.messages)
             .expect_err("a wrong shape must fail");
         assert!(
@@ -654,7 +695,7 @@ mod tests {
             "{{\"format\":\"dch.v9\",\"session_id\":\"{id}\",\"model\":\"m\",\"saved_at\":\"2026-09-16T12:00:00Z\",\"messages\":[]}}"
         );
         std::fs::write(&path, future).expect("write a future format");
-        let err = load_envelope(&path, id)
+        let err = load_envelope(&path, id, dir.path())
             .map(|stored| stored.messages)
             .expect_err("an unknown tag must be refused");
         assert!(

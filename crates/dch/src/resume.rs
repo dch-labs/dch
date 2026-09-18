@@ -30,8 +30,9 @@ use crate::session::SessionSummary;
 /// load, the degradation policy, and the model precedence are decided
 /// exactly once. `Fresh` covers both a plain invocation (no flag, no
 /// warning) and a resume that degraded — the warning, when present,
-/// is the mode's to render (stderr headless, a system note in the
-/// TUI).
+/// is the mode's to render (stderr in headless; in the TUI, a stderr
+/// line at startup — which survives a construction failure — plus a
+/// system note in the conversation).
 #[derive(Debug)]
 pub(crate) enum ResumeControl {
     /// `--resume <id>` was given and the session loaded.
@@ -448,8 +449,8 @@ fn push_assistant_message(converted: &mut Vec<Message>, parts: Vec<MessagePart>)
 /// preview path re-resolves against the *resume-time* cwd when the
 /// baseline is re-armed — resuming from a different directory misses
 /// the file (the guard stays disarmed, the safe direction) or arms
-/// a different same-named file under the new cwd (the baseline
-/// reflects the bytes actually re-read, so still no false refusal).
+/// a different same-named file under the new cwd (a resume-armed
+/// baseline holds the first write for a live Read here either way).
 /// Order is preserved and duplicates kept: re-recording a baseline
 /// is idempotent for the guard's purposes.
 pub(crate) fn resumed_read_paths(messages: &[TuiMessage]) -> Vec<String> {

@@ -18,4 +18,4 @@ pub use events::TerminalEvents;
 pub use input::{InputAction, InputEditor, InputHistory};
 pub use message::{ActiveTool, ContentBlock, TokenCounts, TuiMessage};
 pub use observer::{Graduation, ToolResultDisplay, TuiObserver, TuiObserverState};
-pub use terminal::{TerminalGuard, init_terminal, restore_terminal};
+pub use terminal::{TerminalGuard, init_terminal, restore_terminal, sync_default_background};

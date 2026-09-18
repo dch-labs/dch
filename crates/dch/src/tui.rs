@@ -97,7 +97,7 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
     // resumed Write treats every previously-read file as never-read.
     if let ResumeControl::Resumed(outcome) = &control {
         for path in crate::resume::resumed_read_paths(&outcome.messages) {
-            let _recorded = runner.context().record_resumed_read(&path);
+            let _recorded = runner.context().record_resumed_read(&path).await;
         }
     }
 
@@ -142,6 +142,10 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
     TerminalGuard::install_panic_hook();
     let (guard, mut terminal) =
         TerminalGuard::new().map_err(|err| format!("terminal init: {err}"))?;
+    // Render draws the grid on the terminal's default background;
+    // this points that default at the theme's canvas color for the
+    // session's lifetime, so the margin around the grid matches it.
+    dch_tui::sync_default_background(app.theme.ui.background);
 
     let cancel = runner.cancel_signal();
     let shutting_down = Arc::new(AtomicBool::new(false));

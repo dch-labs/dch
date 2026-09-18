@@ -442,7 +442,7 @@ async fn construct_run(
     // resumed Write treats every previously-read file as never-read.
     if let crate::resume::ResumeControl::Resumed(outcome) = control {
         for path in crate::resume::resumed_read_paths(&outcome.messages) {
-            let _recorded = runner.context().record_resumed_read(&path);
+            let _recorded = runner.context().record_resumed_read(&path).await;
         }
     }
     let model = config.api.model.clone();

@@ -624,6 +624,7 @@ dependencies = [
  "dch-config",
  "event-listener",
  "futures",
+ "libc",
  "loopctl",
  "pest",
  "pest_derive",

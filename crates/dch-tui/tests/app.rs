@@ -23,7 +23,12 @@ use dch_tui::message::{ActiveTool, ContentBlock, TuiMessage};
 use dch_tui::theme::Theme;
 use loopctl::observer::LoopObserver as _;
 use ratatui::Terminal;
+use ratatui::backend::Backend as _;
 use ratatui::backend::TestBackend;
+use ratatui::layout::Constraint;
+use ratatui::layout::Direction;
+use ratatui::layout::Layout;
+use ratatui::layout::Rect;
 
 fn config_with_theme(name: &str) -> DchConfig {
     let mut config = DchConfig::default();
@@ -1182,6 +1187,161 @@ fn an_exactly_filled_line_stays_visible_with_its_caret_at_the_end() {
         .assert_cursor_position((2, u16::try_from(text_row).unwrap() + 1));
 }
 
+/// The composer chunk [`TuiApp::render`] lays out, mirrored here so the
+/// undersize pins can name the rows each pane owns at a starved height.
+fn composer_chunk(width: u16, height: u16) -> Rect {
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(1),
+            Constraint::Length(4),
+            Constraint::Length(1),
+        ])
+        .split(Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        })[2]
+}
+
+#[test]
+fn the_caret_stays_inside_the_composer_in_undersized_terminals() {
+    // The layout starves the composer before the status bar, so under
+    // six rows the field gets fewer rows than its padding plus text
+    // window — at two rows, none at all. Unclamped, the cursor landed
+    // on the status bar's row or past the frame's last row entirely;
+    // the clamp parks it on a row the field owns, and a field with no
+    // rows parks no cursor.
+    for height in [2u16, 3, 4, 5] {
+        let mut app = app();
+        app.handle_event(&Event::Paste("one\ntwo".to_string()));
+        let mut terminal = render_to_buffer(&mut app, 40, height);
+        let composer = composer_chunk(40, height);
+        let (_x, y) = {
+            let position = terminal
+                .backend_mut()
+                .get_cursor_position()
+                .expect("the backend reports a cursor position");
+            (position.x, position.y)
+        };
+        assert!(
+            y < height,
+            "h={height}: the cursor must stay inside the frame, got row {y}"
+        );
+        if composer.height > 0 {
+            assert!(
+                y >= composer.y && y < composer.bottom(),
+                "h={height}: the cursor must sit on a composer row ({composer:?}), got {y}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_status_bar_paints_only_its_own_row_in_undersized_terminals() {
+    // Whatever the height, the bar may paint at most one row — the
+    // frame's last — so a starved composer keeps every row it was
+    // given and never cedes its last one to the bar. The bar is
+    // detected by its own paint, foreground and background together:
+    // the composer's rows share the bar's surface background on their
+    // text cells, so the pair — and the padding cells the composer
+    // leaves at a Reset foreground — is what isolates the bar's row.
+    for height in [2u16, 3, 4, 5, 6] {
+        let mut app = app();
+        let terminal = render_to_buffer(&mut app, 40, height);
+        let buffer = terminal.backend().buffer();
+        let bar_rows: Vec<u16> = (0..height)
+            .filter(|&y| {
+                buffer[(0, y)].fg == app.theme.ui.status_bar_fg
+                    && buffer[(0, y)].bg == app.theme.ui.status_bar_bg
+            })
+            .collect();
+        assert!(
+            bar_rows.iter().all(|&y| y + 1 == height),
+            "h={height}: the bar must paint only the frame's last row, found {bar_rows:?}"
+        );
+    }
+}
+
+#[test]
+fn the_conversation_pane_renders_on_the_terminal_s_own_background() {
+    // The one-layer canvas contract: the session points the terminal's
+    // default background at the theme's `background` (OSC 11), and the
+    // conversation pane renders on that default instead of painting
+    // cells — window margin and grid share one color on one layer, so
+    // no per-cell paint can differ from the margin beside it. Only the
+    // raised surfaces paint: the composer on `surface`, the bar on its
+    // own row.
+    let mut app = app();
+    let terminal = render_to_buffer(&mut app, 40, 10);
+    let buffer = terminal.backend().buffer();
+    assert_eq!(
+        buffer[(5, 2)].bg,
+        ratatui::style::Color::Reset,
+        "the conversation pane leaves its cells to the terminal default — \
+         painting them is what shows a seam against the margin"
+    );
+    let composer = composer_chunk(40, 10);
+    assert_eq!(
+        buffer[(0, composer.y)].bg,
+        app.theme.ui.surface,
+        "the composer draws on the surface color"
+    );
+    assert_eq!(
+        buffer[(0, 9)].bg,
+        app.theme.ui.status_bar_bg,
+        "the status bar paints its own row"
+    );
+}
+
+#[test]
+fn the_status_tag_claims_its_columns_from_the_status_text() {
+    // On a narrow frame the right-aligned tag owns its columns
+    // outright: the model/tokens text clips one column short of the
+    // tag, so a long model name never renders beneath the tag and a
+    // blank column separates the two.
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    let mut config = config_with_theme("dracula");
+    config.api.model = "a-very-long-model-name".to_string();
+    let mut app = TuiApp::from_observer_state(config, kept.clone());
+    kept.queued.store(2, std::sync::atomic::Ordering::SeqCst);
+
+    let terminal = render_to_buffer(&mut app, 20, 8);
+    let rows = row_texts(&terminal);
+    let status = rows.last().expect("the status row");
+    assert!(status.contains("2 queued"), "the tag renders: {status}");
+    assert!(
+        !status.contains("a-very-long-model-name"),
+        "a model name this long must clip short of the tag: {status}"
+    );
+    // "2 queued" is 8 cells inside a 10-cell tag area anchored at the
+    // right edge (columns 10-19); the left text clips at column 9, so
+    // that column — the gutter, not the tag area's own right-alignment
+    // padding — must be blank. Unclipped, the model name's tenth
+    // character renders there, beneath the tag's edge.
+    let columns = status.chars().collect::<Vec<_>>();
+    let gap_at = 20 - 10 - 1;
+    assert!(
+        columns
+            .get(gap_at)
+            .is_some_and(|column| column.is_whitespace()),
+        "a blank column must separate the text from the tag: {status}"
+    );
+    assert_eq!(
+        columns.get(9),
+        Some(&' '),
+        "the clipped text ends one column short of the tag area: {status}"
+    );
+    assert!(
+        status.starts_with(" a-very-l"),
+        "the clipped model text keeps its readable prefix: {status}"
+    );
+}
+
 #[test]
 fn the_conversation_pane_holds_still_while_typing() {
     // The stability contract the fixed input box exists for: a
@@ -1675,8 +1835,7 @@ fn the_scrollbar_owns_its_gutter_and_never_touches_text() {
             timestamp: chrono::Utc::now(),
         });
     }
-    // 12 rows: 8 for the conversation, 3 for the input box, 1 for
-    // the status bar. 20 one-line messages over 8 rows make the
+    // 20 one-line messages over the conversation pane make the
     // document scrollable; the pinned view sits at its bottom.
     let terminal = render_to_buffer(&mut app, 20, 12);
     let buffer = terminal.backend().buffer();

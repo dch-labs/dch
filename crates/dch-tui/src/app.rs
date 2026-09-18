@@ -873,8 +873,18 @@ impl TuiApp {
 
         let fallback = area;
         self.render_conversation(frame, pane(&chunks, 0, fallback));
-        self.render_input(frame, pane(&chunks, 2, fallback));
-        self.render_status_bar(frame, pane(&chunks, 3, fallback));
+        // The composer's wrap is computed once per frame and shared by
+        // the field and the status tag, so a frame wraps the buffer
+        // through the text once however long it has grown.
+        let input_area = pane(&chunks, 2, fallback);
+        let width = input_area
+            .width
+            .max(1)
+            .saturating_sub(INPUT_SIDE_INSET.saturating_mul(2));
+        let rows = self.input.display_rows(width);
+        let caret = self.input.cursor_cell(width).unwrap_or((0, 0));
+        self.render_input(frame, input_area, &rows, caret);
+        self.render_status_bar(frame, pane(&chunks, 3, fallback), &rows, caret);
     }
 
     /// Render the conversation pane: the settled conversation, the
@@ -1318,8 +1328,8 @@ impl TuiApp {
     }
 
     /// Render the input field: a fixed multi-row window onto the
-    /// buffer, as a borderless composer tinted a step off the
-    /// theme's background and padded on all sides.
+    /// buffer, as a borderless composer drawn on the theme's surface
+    /// color and padded on all sides.
     ///
     /// The field's shape is a pure background fill with square
     /// corners — solid by construction, like the scrollbar. Corners
@@ -1330,22 +1340,21 @@ impl TuiApp {
     /// caret's line and the lines above it, so typing at the end
     /// sees the newest lines and browsing up scrolls with the
     /// caret. The field carries no text of its own — queue and
-    /// line-position state lives on the status bar.
-    fn render_input(&self, frame: &mut Frame, area: Rect) {
-        let width = area
-            .width
-            .max(1)
-            .saturating_sub(INPUT_SIDE_INSET.saturating_mul(2));
-        let rows = self.input.display_rows(width);
-        let (caret_row, column) = self.input.cursor_cell(width).unwrap_or((0, 0));
+    /// line-position state lives on the status bar. `rows` and
+    /// `caret` are the frame's single wrap of the buffer, computed by
+    /// [`render`](Self::render) and shared with the status tag. The
+    /// cursor position is clamped into the pane, so a terminal too
+    /// short for the field's full height parks the cursor on the
+    /// field's own last row rather than on the status bar below it;
+    /// a field allotted no rows at all parks no cursor.
+    fn render_input(&self, frame: &mut Frame, area: Rect, rows: &[String], caret: (u16, u16)) {
+        let (caret_row, column) = caret;
 
-        let tint = surface_tint(self.theme.ui.background);
-        let text_style = Style::default().fg(self.theme.ui.input_text).bg(tint);
-        for y in area.y..area.bottom() {
-            for x in area.x..area.right() {
-                frame.buffer_mut()[(x, y)].set_char(' ').set_bg(tint);
-            }
-        }
+        let surface = self.theme.ui.surface;
+        let text_style = Style::default().fg(self.theme.ui.input_text).bg(surface);
+        frame
+            .buffer_mut()
+            .set_style(area, Style::default().bg(surface));
         let text_height = INPUT_TEXT_ROWS.min(area.height);
         let interior = Rect {
             x: area
@@ -1353,7 +1362,10 @@ impl TuiApp {
                 .saturating_add(INPUT_SIDE_INSET)
                 .min(area.right().saturating_sub(1)),
             y: area.y.saturating_add(INPUT_VERTICAL_PADDING),
-            width,
+            width: area
+                .width
+                .max(1)
+                .saturating_sub(INPUT_SIDE_INSET.saturating_mul(2)),
             height: text_height,
         };
         // The window shows the caret's line and the lines above it —
@@ -1376,7 +1388,7 @@ impl TuiApp {
             .min(
                 area.x
                     .saturating_add(INPUT_SIDE_INSET)
-                    .saturating_add(width)
+                    .saturating_add(interior.width)
                     .saturating_sub(1),
             )
             .min(area.right().saturating_sub(2));
@@ -1385,8 +1397,11 @@ impl TuiApp {
             .saturating_add(INPUT_VERTICAL_PADDING)
             .saturating_add(
                 u16::try_from(usize::from(caret_row).saturating_sub(start)).unwrap_or(0),
-            );
-        frame.set_cursor_position((caret_x, caret_y));
+            )
+            .min(area.bottom().saturating_sub(1));
+        if area.height > 0 {
+            frame.set_cursor_position((caret_x, caret_y));
+        }
     }
 
     /// Render the one-line status bar.
@@ -1395,8 +1410,16 @@ impl TuiApp {
     /// the left; while the input holds state — submissions queued
     /// behind the driver, or a buffer longer than the composer's
     /// window — a position tag sits right-aligned in the theme's
-    /// input accent color. Both sit on the themed bar colors.
-    fn render_status_bar(&self, frame: &mut Frame, area: Rect) {
+    /// input accent color. Both sit on the themed bar colors, and
+    /// the status text is clipped short of the tag's columns, so
+    /// the two never paint over each other on a narrow frame. A
+    /// chunk allotted no rows renders nothing — the bar never paints
+    /// a row another pane owns. `rows` and `caret` arrive from the
+    /// frame's single wrap of the buffer.
+    fn render_status_bar(&self, frame: &mut Frame, area: Rect, rows: &[String], caret: (u16, u16)) {
+        if area.height == 0 {
+            return;
+        }
         let tokens = self.state.tokens.lock().map_or_else(
             |_| 0,
             |counts| {
@@ -1409,19 +1432,34 @@ impl TuiApp {
         let bar_style = Style::default()
             .fg(self.theme.ui.status_bar_fg)
             .bg(self.theme.ui.status_bar_bg);
+        let tag = self.input_state_tag(rows, caret);
+        let tag_width = if !tag.is_empty() && area.width > 4 {
+            u16::try_from(tag.width().saturating_add(2))
+                .unwrap_or(area.width)
+                .min(area.width)
+        } else {
+            0
+        };
+        let left_width = match tag_width {
+            0 => area.width,
+            reserved => area.width.saturating_sub(reserved.saturating_add(1)),
+        };
+        // The bar's own background spans the whole row first, so the
+        // gutter column a clipped left edge leaves between the two
+        // paragraphs reads as bar, not as a hole in it.
+        frame.buffer_mut().set_style(
+            Rect { height: 1, ..area },
+            Style::default().bg(self.theme.ui.status_bar_bg),
+        );
         frame.render_widget(
             Paragraph::new(status_text).style(bar_style),
-            Rect { height: 1, ..area },
+            Rect {
+                width: left_width,
+                height: 1,
+                ..area
+            },
         );
-        let tag = self.input_state_tag(
-            area.width
-                .max(1)
-                .saturating_sub(INPUT_SIDE_INSET.saturating_mul(2)),
-        );
-        if !tag.is_empty() && area.width > 4 {
-            let tag_width = u16::try_from(tag.width().saturating_add(2))
-                .unwrap_or(area.width)
-                .min(area.width);
+        if tag_width > 0 {
             let tag_area = Rect {
                 x: area.right().saturating_sub(tag_width),
                 width: tag_width,
@@ -1445,15 +1483,16 @@ impl TuiApp {
     /// Reports submissions queued behind the driver and, while the
     /// buffer holds more lines than the composer's window, which
     /// line the caret is on — the two facts a user can act on.
-    fn input_state_tag(&self, width: u16) -> String {
-        let rows = self.input.display_rows(width);
+    /// `rows` and `caret` arrive from the frame's single wrap of the
+    /// buffer, so asking never re-wraps the editor.
+    fn input_state_tag(&self, rows: &[String], caret: (u16, u16)) -> String {
         let queued = self.state.queued.load(Ordering::SeqCst);
         let mut parts = Vec::new();
         if queued > 0 {
             parts.push(format!("{queued} queued"));
         }
         if rows.len() > usize::from(INPUT_TEXT_ROWS) {
-            let (caret_row, _) = self.input.cursor_cell(width).unwrap_or((0, 0));
+            let (caret_row, _) = caret;
             parts.push(format!(
                 "{}/{}",
                 usize::from(caret_row).saturating_add(1).min(rows.len()),
@@ -1556,31 +1595,6 @@ const INPUT_VERTICAL_PADDING: u16 = 1;
 /// plus one blank tinted row above and below — so a fixed allocation
 /// holds the field whether the buffer fills it or not.
 const INPUT_FIELD_ROWS: u16 = INPUT_TEXT_ROWS + INPUT_VERTICAL_PADDING * 2;
-
-/// A surface color one small step off the theme's background: a
-/// step lighter on dark themes, a step darker on light ones.
-///
-/// The input field's shape is this tint — it must read against the
-/// background on every palette without new per-theme entries, so it
-/// is derived from the background the theme already defines. The
-/// step is small on purpose: a whisper of elevation, not a new
-/// color.
-fn surface_tint(base: ratatui::style::Color) -> ratatui::style::Color {
-    let ratatui::style::Color::Rgb(red, green, blue) = base else {
-        return base;
-    };
-    let luminance = u32::from(red)
-        .saturating_add(u32::from(green))
-        .saturating_add(u32::from(blue));
-    let step = |channel: u8| {
-        if luminance < 384 {
-            channel.saturating_add(12)
-        } else {
-            channel.saturating_sub(12)
-        }
-    };
-    ratatui::style::Color::Rgb(step(red), step(green), step(blue))
-}
 
 /// The scrollbar thumb's track position and length for a document of
 /// `content` lines shown through a `viewport`-line window whose top

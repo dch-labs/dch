@@ -345,11 +345,28 @@ pub struct MarkdownTheme {
 /// renderers, the surface decides whether to use it.
 #[derive(Debug, Clone)]
 pub struct UIStyle {
-    /// The application background.
+    /// The application background — the canvas.
     ///
-    /// Every surface without its own palette entry draws on this; the
-    /// foreground must hold contrast against it everywhere.
+    /// The session points the terminal's default background at this
+    /// (OSC 11, where the terminal supports it), and the conversation
+    /// pane renders on that default rather than on painted cells —
+    /// window margin and cell grid share one color on one layer, so
+    /// the theme reads edge to edge with no seam between them. On a
+    /// terminal without that support the canvas is the terminal's own
+    /// configured background. The foreground must hold contrast
+    /// against it everywhere.
     pub background: Color,
+
+    /// The raised-surface background — the palette's own elevated
+    /// step off the canvas.
+    ///
+    /// The composer, markdown code blocks, and the status bar draw on
+    /// this, so a surface reads as elevated over
+    /// [`background`](Self::background) rather than as a hole in it.
+    /// Each theme carries its palette's own elevated background step
+    /// (a current-line, mantle, or bg1 tone) rather than a derived
+    /// tint, which is what gives the chrome per-theme color at rest.
+    pub surface: Color,
 
     /// The default foreground.
     ///
@@ -504,7 +521,7 @@ impl From<&Theme> for crate::markdown::MarkdownTheme {
             bold: value.markdown.bold,
             italic: value.markdown.italic,
             code_inline: value.markdown.code_inline,
-            code_block: value.markdown.code_block.bg.unwrap_or(value.ui.background),
+            code_block: value.markdown.code_block.bg.unwrap_or(value.ui.surface),
             link: value.markdown.link,
             quote: value.markdown.quote,
             list_item: value.markdown.list_item,
@@ -582,7 +599,7 @@ mod tests {
         // removed without updating this test fails here first.
         assert_eq!(
             theme_data::THEME_CONSTRUCTORS.len(),
-            16,
+            20,
             "the registry scope moved; update this census with it"
         );
         for key in [
@@ -602,6 +619,10 @@ mod tests {
             "monokai",
             "github_dark",
             "github_light",
+            "ayu_dark",
+            "rose_pine",
+            "kanagawa_wave",
+            "dark_plus",
         ] {
             assert!(
                 theme_data::THEME_CONSTRUCTORS
@@ -717,6 +738,110 @@ mod tests {
     }
 
     #[test]
+    fn every_theme_s_status_bar_paints_on_its_elevated_surface() {
+        // The bar is chrome, not canvas: it carries the theme's
+        // elevated step — the same color the composer and code blocks
+        // draw on — and must differ from the canvas it closes, or the
+        // one surface that spans the full window width at rest would
+        // carry no theme color at all.
+        for (key, _) in theme_data::THEME_CONSTRUCTORS {
+            let ui = Theme::by_name(key).unwrap().ui;
+            assert_eq!(
+                ui.status_bar_bg, ui.surface,
+                "{key}: the bar paints on the theme's elevated surface"
+            );
+            assert_ne!(
+                ui.status_bar_bg, ui.background,
+                "{key}: the bar must step off the canvas"
+            );
+        }
+    }
+
+    #[test]
+    fn every_theme_s_status_text_reads_on_its_bar() {
+        // WCAG relative luminance, the same floor the inline-code chip
+        // holds: model and token counts must stay legible on the
+        // elevated bar.
+        fn channel(v: u8) -> f32 {
+            let c = f32::from(v) / 255.0;
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        fn luminance(color: Color) -> f32 {
+            let (r, g, b) = match color {
+                Color::Rgb(r, g, b) => (r, g, b),
+                other => panic!("bar colors must be RGB, got {other:?}"),
+            };
+            0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+        }
+        for (key, _) in theme_data::THEME_CONSTRUCTORS {
+            let ui = Theme::by_name(key).unwrap().ui;
+            let (lf, lb) = (luminance(ui.status_bar_fg), luminance(ui.status_bar_bg));
+            let (lighter, darker) = if lf > lb { (lf, lb) } else { (lb, lf) };
+            let ratio = (lighter + 0.05) / (darker + 0.05);
+            assert!(
+                ratio >= 3.0,
+                "{key}: status-text contrast {ratio:.2} is below 3:1"
+            );
+        }
+    }
+
+    #[test]
+    fn every_theme_s_inline_code_chip_stays_on_its_canvas_side_of_the_palette() {
+        // The chip is a highlight, not an inversion: an inline-code
+        // background from the opposite pole of the theme's canvas
+        // renders as a foreign dark block on a light theme (or the
+        // reverse) — the copy-paste slip class this pins shut.
+        let dark_side = |color: Color| match color {
+            Color::Rgb(red, green, blue) => {
+                u32::from(red)
+                    .saturating_add(u32::from(green))
+                    .saturating_add(u32::from(blue))
+                    < 384
+            }
+            _ => false,
+        };
+        for (key, _) in theme_data::THEME_CONSTRUCTORS {
+            let theme = Theme::by_name(key).unwrap();
+            let Some(chip) = theme.markdown.code_inline.bg else {
+                continue;
+            };
+            assert_eq!(
+                dark_side(chip),
+                dark_side(theme.ui.background),
+                "{key}: the inline-code chip must stay on its canvas's side of the palette"
+            );
+        }
+    }
+
+    #[test]
+    fn every_theme_keeps_its_surfaces_and_scrollbar_visible_on_the_canvas() {
+        // The session points the terminal's default background at
+        // `background`, so the colors that must read against it — the
+        // composer's `surface`, the scrollbar's thumb and track —
+        // cannot equal it: a match would render the element invisible
+        // on the canvas rather than elevated or visible.
+        for (key, _) in theme_data::THEME_CONSTRUCTORS {
+            let ui = Theme::by_name(key).unwrap().ui;
+            assert_ne!(
+                ui.surface, ui.background,
+                "{key}: the composer surface must step off the canvas"
+            );
+            assert_ne!(
+                ui.scrollbar_thumb, ui.background,
+                "{key}: the scrollbar thumb must be visible on the canvas"
+            );
+            assert_ne!(
+                ui.scrollbar_track, ui.background,
+                "{key}: the scrollbar track must be visible on the canvas"
+            );
+        }
+    }
+
+    #[test]
     fn no_theme_palette_contains_reset_colors() {
         // `Reset` in a palette is a gap, not a color choice: every theme
         // must fully specify every field of its syntax and chrome palettes.
@@ -750,6 +875,7 @@ mod tests {
             let ui = theme.ui;
             let ui_fields = [
                 ui.background,
+                ui.surface,
                 ui.foreground,
                 ui.primary,
                 ui.secondary,
@@ -882,7 +1008,7 @@ mod tests {
         assert_eq!(markdown.dim, theme.ui.dim);
         assert_eq!(
             markdown.code_block,
-            theme.markdown.code_block.bg.unwrap_or(theme.ui.background)
+            theme.markdown.code_block.bg.unwrap_or(theme.ui.surface)
         );
 
         assert_eq!(syntax.plain, theme.ui.foreground);

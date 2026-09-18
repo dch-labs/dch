@@ -95,7 +95,11 @@ dch --list-sessions
 
 A missing session id warns and starts fresh; a corrupt file warns
 loudly, starts fresh, and is never modified; a session file that
-cannot be read at all exits non-zero.
+cannot be read at all exits non-zero. Files the restored transcript
+shows being read are guarded for writes, but the first `Write` to one
+requires a fresh `Read` — the transcript cannot carry what the model
+originally saw, so a stale overwrite of externally-changed files is
+refused until the current bytes are read.
 
 Common options:
 
@@ -114,7 +118,8 @@ Themes: `dracula` (default), `nord`, `tokyo_night`, `gruvbox_dark`,
 `gruvbox_light`, `solarized_dark`, `solarized_light`,
 `catppuccin_latte`, `catppuccin_frappe`, `catppuccin_macchiato`,
 `catppuccin_mocha`, `one_dark`, `monokai`, `github_dark`,
-`github_light`. An unknown name falls back to the default.
+`github_light`, `ayu_dark`, `rose_pine`, `kanagawa_wave`, `dark_plus`.
+An unknown name falls back to the default.
 
 ### Exit codes and the done-file
 
