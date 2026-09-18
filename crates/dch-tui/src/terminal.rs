@@ -48,11 +48,11 @@ static ORIGINAL_BACKGROUND: OnceLock<(u8, u8, u8)> = OnceLock::new();
 /// modifyOtherKeys on the rest. Terminals implementing neither
 /// ignore both pushes and keep their legacy byte stream. Returns a
 /// terminal bound to stdout. Pair with [`restore_terminal`] — or
-/// hold a [`TerminalGuard`] so the pairing is automatic. A failure after
-/// raw mode was enabled undoes the partial setup — raw mode off
-/// first, the escape sequences best-effort — before returning the
-/// error, so an unwritable stdout cannot strand the shell in raw
-/// mode.
+/// hold a [`TerminalGuard`] so the pairing is automatic. A failure
+/// after raw mode was enabled undoes the partial setup — raw mode
+/// off first, the escape sequences best-effort — before returning
+/// the error, so an unwritable stdout cannot strand the shell in
+/// raw mode.
 ///
 /// # Errors
 /// Fails when the terminal mode or escape-sequence writes are
@@ -151,13 +151,18 @@ fn background_sequence((red, green, blue): (u8, u8, u8)) -> String {
 /// not a key event, so it is read directly.
 ///
 /// Typed-ahead input shares this window, and is gated rather than
-/// blindly consumed: an OSC reply always opens with `ESC`, so a first
-/// byte that is not one stops the query at the cost of that single
-/// byte instead of drinking everything the user typed. An ESC-leading
-/// keystroke (an arrow key, Esc itself) arriving in the window on a
-/// terminal that never answers can still be consumed with the failed
-/// reply attempt — a one-shot, sub-200 ms startup window that is
-/// accepted rather than bridged.
+/// blindly consumed. Input already queued when the query would run
+/// skips the sync outright — those bytes are the user's, and the
+/// margin keeps the terminal's own background. Failing that, an OSC
+/// reply always opens with `ESC`, so a first byte that is not one
+/// stops the query at the cost of that single byte instead of
+/// drinking everything the user typed; and every byte is read alone,
+/// so a keystroke arriving behind the reply stays unconsumed for the
+/// event reader rather than riding the same read out of the
+/// terminal. An ESC-leading keystroke (an arrow key, Esc itself)
+/// arriving in the window on a terminal that never answers can
+/// still be consumed with the failed reply attempt — a one-shot,
+/// sub-200 ms startup window that is accepted rather than bridged.
 #[cfg(unix)]
 fn query_default_background() -> Option<(u8, u8, u8)> {
     use std::time::Duration;
@@ -165,36 +170,29 @@ fn query_default_background() -> Option<(u8, u8, u8)> {
 
     const QUERY_DEADLINE: Duration = Duration::from_millis(200);
 
+    if stdin_ready(Duration::ZERO) {
+        return None;
+    }
     let mut stdout = io::stdout();
     write!(stdout, "\x1b]11;?\x1b\\").ok()?;
     stdout.flush().ok()?;
 
     let deadline = Instant::now().checked_add(QUERY_DEADLINE)?;
     let mut reply = Vec::new();
-    let mut first = [0u8; 1];
-    let mut chunk = [0u8; 32];
+    let mut byte = [0u8; 1];
     while !reply_terminated(&reply) {
         let wait = deadline.saturating_duration_since(Instant::now());
         if wait.is_zero() || !stdin_ready(wait) {
             break;
         }
-        if reply.is_empty() {
-            let read = read_stdin_raw(&mut first)?;
-            if read == 0 {
-                return None;
-            }
-            let byte = first.first().copied()?;
-            if byte != 0x1b {
-                return None;
-            }
-            reply.push(byte);
-        } else {
-            let read = read_stdin_raw(&mut chunk)?;
-            if read == 0 {
-                return None;
-            }
-            reply.extend_from_slice(chunk.get(..read)?);
+        if read_stdin_raw(&mut byte)? == 0 {
+            return None;
         }
+        let byte = byte.first().copied()?;
+        if reply.is_empty() && byte != 0x1b {
+            return None;
+        }
+        reply.push(byte);
     }
     parse_background_reply(&reply)
 }

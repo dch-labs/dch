@@ -65,10 +65,10 @@ const STICK_TOLERANCE: usize = 2;
 
 /// Lines one wheel or touchpad scroll event moves.
 ///
-/// The terminal convention per notch: enough that touchpad momentum
-/// accumulates into fast travel without overshooting a single
-/// gesture.
-const WHEEL_SCROLL_LINES: usize = 3;
+/// One line per wheel event: a burst of events still accumulates
+/// into fast travel, while a single notch lands the smallest useful
+/// step.
+const WHEEL_SCROLL_LINES: usize = 1;
 
 /// The most lines of the live segment parsed as markdown per frame.
 ///
@@ -1343,10 +1343,12 @@ impl TuiApp {
     /// line-position state lives on the status bar. `rows` and
     /// `caret` are the frame's single wrap of the buffer, computed by
     /// [`render`](Self::render) and shared with the status tag. The
-    /// cursor position is clamped into the pane, so a terminal too
-    /// short for the field's full height parks the cursor on the
-    /// field's own last row rather than on the status bar below it;
-    /// a field allotted no rows at all parks no cursor.
+    /// text window takes its height from the pane's own rows net of
+    /// the vertical padding, so no paint of the field's lands
+    /// outside the pane it was given; the cursor position is clamped
+    /// the same way, so a terminal too short for the field's full
+    /// height parks the cursor on a row the field owns, and a field
+    /// allotted no rows at all parks no cursor.
     fn render_input(&self, frame: &mut Frame, area: Rect, rows: &[String], caret: (u16, u16)) {
         let (caret_row, column) = caret;
 
@@ -1355,7 +1357,7 @@ impl TuiApp {
         frame
             .buffer_mut()
             .set_style(area, Style::default().bg(surface));
-        let text_height = INPUT_TEXT_ROWS.min(area.height);
+        let text_height = INPUT_TEXT_ROWS.min(area.height.saturating_sub(INPUT_VERTICAL_PADDING));
         let interior = Rect {
             x: area
                 .x

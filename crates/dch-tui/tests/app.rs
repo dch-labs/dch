@@ -1059,10 +1059,10 @@ fn long_error_messages_wrap_at_the_pane_width() {
 }
 
 #[test]
-fn the_mouse_wheel_scrolls_three_lines_per_event() {
+fn the_mouse_wheel_scrolls_one_line_per_event() {
     let mut app = app();
     assert!(app.handle_event(&wheel_event(MouseEventKind::ScrollUp)));
-    assert_eq!(app.scroll_offset(), 3);
+    assert_eq!(app.scroll_offset(), 1);
     assert!(!app.auto_scroll(), "wheel up detaches stickiness");
     assert!(app.handle_event(&wheel_event(MouseEventKind::ScrollDown)));
     assert_eq!(app.scroll_offset(), 0, "one wheel down clears one wheel up");
