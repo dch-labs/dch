@@ -1823,6 +1823,236 @@ fn a_rebuilt_line_space_forfeits_the_selection() {
 }
 
 #[test]
+fn a_press_on_a_running_tool_row_anchors_on_the_selectable_transcript() {
+    // Tool rows render below the transcript but never join the
+    // selection's line space: a press on one — or on the empty pane
+    // under short content — clamps onto the last line a copy can
+    // walk, so the highlight never spans rows the copy cannot read.
+    let mut app = app();
+    let now = chrono::Utc::now();
+    app.push_message(TuiMessage::User {
+        text: "abcdefghij".to_string(),
+        timestamp: now,
+    });
+    app.active_tools()
+        .lock()
+        .expect("the tools lock")
+        .push(ActiveTool {
+            call_id: String::new(),
+            name: "Grep".to_string(),
+            input_summary: "\"todo\"".to_string(),
+            start: std::time::Instant::now(),
+        });
+    let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&copied);
+    app.set_selection_copier(Box::new(move |text| {
+        sink.lock().expect("sink").push(text.to_string());
+    }));
+
+    let probe = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&probe);
+    let row = rows
+        .iter()
+        .position(|r| r.contains("abcdefghij"))
+        .unwrap_or(0);
+    let col = rows[row].find("abcdefghij").unwrap_or(0);
+    let tool_row = rows.iter().position(|r| r.contains("Grep")).unwrap_or(0);
+
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        u16::try_from(col).unwrap_or(0),
+        u16::try_from(tool_row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 3).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 3).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+
+    let copied = copied.lock().expect("sink").clone();
+    assert_eq!(copied.len(), 1, "exactly one silent copy");
+    assert_eq!(
+        copied[0], "abcd",
+        "the press clamps onto the message line, anchoring where a copy can walk"
+    );
+    let selected = render_to_buffer(&mut app, 80, 24);
+    assert!(
+        reversed_cells_on_row(&selected, u16::try_from(row).unwrap_or(0)) >= 1,
+        "the highlight covers the transcript text"
+    );
+    assert_eq!(
+        reversed_cells_on_row(&selected, u16::try_from(tool_row).unwrap_or(0)),
+        0,
+        "the highlight never reaches the tool row"
+    );
+}
+
+#[test]
+fn a_press_with_nothing_selectable_starts_no_selection() {
+    // With the transcript empty and only a tool running, the pane
+    // offers no selectable line: a press there creates no anchor,
+    // so nothing highlights and a later drag has nothing to grow.
+    let mut app = app();
+    app.active_tools()
+        .lock()
+        .expect("the tools lock")
+        .push(ActiveTool {
+            call_id: String::new(),
+            name: "Grep".to_string(),
+            input_summary: "\"todo\"".to_string(),
+            start: std::time::Instant::now(),
+        });
+    let _ = render_to_buffer(&mut app, 80, 24);
+    let press = mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        4,
+        2,
+    );
+    assert!(
+        !app.handle_event(&press),
+        "a press over unselectable rows creates no selection"
+    );
+    let frame = render_to_buffer(&mut app, 80, 24);
+    assert_eq!(reversed_cells(&frame), 0, "nothing highlights");
+}
+
+#[test]
+fn a_streaming_delta_forfeits_a_selection_reaching_into_the_live_region() {
+    // The live region re-renders on every delta — re-wrapped,
+    // re-numbered — so a selection stored against its old lines
+    // would highlight and copy whatever moved under the indexes.
+    // Like a rebuilt conversation, a re-flowed stream forfeits the
+    // selection.
+    let mut app = app();
+    let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&copied);
+    app.set_selection_copier(Box::new(move |text| {
+        sink.lock().expect("sink").push(text.to_string());
+    }));
+    app.streaming_text()
+        .lock()
+        .expect("the streaming lock")
+        .push_str("streaming reply");
+    let probe = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&probe);
+    let row = rows
+        .iter()
+        .position(|r| r.contains("streaming reply"))
+        .unwrap_or(0);
+    let col = rows[row].find("streaming reply").unwrap_or(0);
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        u16::try_from(col).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 4).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 4).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    let selected = render_to_buffer(&mut app, 80, 24);
+    assert!(
+        reversed_cells(&selected) >= 1,
+        "sanity: the live text highlights while it holds still"
+    );
+
+    app.streaming_text()
+        .lock()
+        .expect("the streaming lock")
+        .push_str(" grows");
+    let grown = render_to_buffer(&mut app, 80, 24);
+    assert!(
+        row_texts(&grown)
+            .iter()
+            .any(|r| r.contains("streaming reply grows")),
+        "the delta renders: {:?}",
+        row_texts(&grown)
+    );
+    assert_eq!(
+        reversed_cells(&grown),
+        0,
+        "a re-rendered live region forfeits the selection stored against its old lines"
+    );
+}
+
+#[test]
+fn a_streaming_delta_preserves_a_selection_in_the_settled_transcript() {
+    // The settled transcript keeps its line numbering while the
+    // stream grows below it, so a selection made there survives the
+    // re-render — the forfeit is scoped to what actually moved.
+    let mut app = app();
+    let now = chrono::Utc::now();
+    app.push_message(TuiMessage::User {
+        text: "abcdefghij".to_string(),
+        timestamp: now,
+    });
+    let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&copied);
+    app.set_selection_copier(Box::new(move |text| {
+        sink.lock().expect("sink").push(text.to_string());
+    }));
+    app.streaming_text()
+        .lock()
+        .expect("the streaming lock")
+        .push_str("streaming reply");
+    let probe = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&probe);
+    let row = rows
+        .iter()
+        .position(|r| r.contains("abcdefghij"))
+        .unwrap_or(0);
+    let col = rows[row].find("abcdefghij").unwrap_or(0);
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        u16::try_from(col).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 3).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 3).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    let copied = copied.lock().expect("sink").clone();
+    assert_eq!(copied.len(), 1, "one copy of the settled text");
+    assert_eq!(copied[0], "abcd", "the settled text copies");
+
+    app.streaming_text()
+        .lock()
+        .expect("the streaming lock")
+        .push_str(" grows");
+    let grown = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&grown);
+    let live_row = rows
+        .iter()
+        .position(|r| r.contains("streaming reply grows"))
+        .unwrap_or(0);
+    assert!(
+        reversed_cells_on_row(&grown, u16::try_from(row).unwrap_or(0)) >= 1,
+        "the settled selection survives the stream's re-render"
+    );
+    assert_eq!(
+        reversed_cells_on_row(&grown, u16::try_from(live_row).unwrap_or(0)),
+        0,
+        "the re-rendered live line is not highlighted"
+    );
+}
+
+#[test]
 fn the_caret_blinks_on_the_tick_and_input_resolidifies_it() {
     // The terminal's blinking-cursor request is often ignored or
     // preference-gated, so the app owns the blink: half a second

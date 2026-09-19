@@ -865,7 +865,9 @@ impl TuiApp {
     /// step per movement and the periodic tick keeps running it once
     /// per beat while the push continues. The scroll stops at the
     /// document's first or last line whatever the drag state says,
-    /// and the state itself ends on the release or, when that
+    /// and the head clamps into the selectable document, so an edge
+    /// push never extends the highlight onto the tool rows. The
+    /// state itself ends on the release or, when that
     /// arrived outside the terminal's view, on the first buttonless
     /// motion — so a lost release cannot carry the scroll far.
     /// Returns whether the view or the head moved.
@@ -880,11 +882,12 @@ impl TuiApp {
         if height == 0 || view.total == 0 {
             return false;
         }
+        let selectable_last = view.selectable.saturating_sub(1);
         let col = usize::from(column.saturating_sub(view.area.x))
             .min(usize::from(view.area.width.saturating_sub(1)));
         if row <= view.area.y {
             let head = CellPos {
-                line: view.skip.saturating_sub(1),
+                line: view.skip.saturating_sub(1).min(selectable_last),
                 col,
             };
             let scrolled = view.skip > 0;
@@ -901,7 +904,8 @@ impl TuiApp {
                 .min(view.total.saturating_sub(height))
                 .saturating_add(height)
                 .saturating_sub(1)
-                .min(view.total.saturating_sub(1));
+                .min(view.total.saturating_sub(1))
+                .min(selectable_last);
             let head = CellPos { line: last, col };
             let scrolled = self.scroll_offset > 0;
             self.scroll_offset = self.scroll_offset.saturating_sub(1);
@@ -1083,6 +1087,13 @@ impl TuiApp {
 
     /// The transcript cell under screen column/row, if the position
     /// lands inside the last frame's conversation pane.
+    ///
+    /// The line clamps into the selectable document: running tools
+    /// render below it but never join the selection's line space,
+    /// so a press on a tool row — or on the empty pane under short
+    /// content — anchors on the last line a copy can walk, the way
+    /// an editor clamps a click below a document's end. A pane with
+    /// nothing selectable offers no cell at all.
     fn cell_at(&self, column: u16, row: u16) -> Option<CellPos> {
         let view = self.last_view.as_ref()?;
         if column < view.area.x
@@ -1092,10 +1103,11 @@ impl TuiApp {
         {
             return None;
         }
+        let last = view.selectable.checked_sub(1)?;
         let line = view
             .skip
-            .saturating_add(usize::from(row.saturating_sub(view.area.y)));
-        let line = line.min(view.total.saturating_sub(1));
+            .saturating_add(usize::from(row.saturating_sub(view.area.y)))
+            .min(last);
         let col = usize::from(column.saturating_sub(view.area.x));
         Some(CellPos { line, col })
     }
@@ -1419,14 +1431,30 @@ impl TuiApp {
             self.selection = None;
             self.drag_position = None;
         }
-        self.refresh_streaming_region(width);
+        // The streaming region re-renders as its reply grows — a
+        // delta re-wraps the live lines, a freeze advances the frozen
+        // ones — re-numbering every line from the frozen prefix down.
+        // A selection reaching into that region is stored against the
+        // old numbering and forfeits, the same way a rebuilt
+        // conversation forfeits one; a selection entirely within the
+        // settled transcript keeps its indexes and survives.
+        let conversation_len = self.conversation_cache.len();
+        if self.refresh_streaming_region(width)
+            && self
+                .selection
+                .as_ref()
+                .is_some_and(|selection| ordered(selection).1.line >= conversation_len)
+        {
+            self.selection = None;
+            self.drag_position = None;
+        }
         let tools = self.active_tool_lines();
-        let total_lines = self
+        let selectable_lines = self
             .conversation_cache
             .len()
             .saturating_add(self.frozen_lines.len())
-            .saturating_add(self.live_lines.len())
-            .saturating_add(tools.len());
+            .saturating_add(self.live_lines.len());
+        let total_lines = selectable_lines.saturating_add(tools.len());
         self.settle_scroll_offset(total_lines, conversation_height);
         let skip = total_lines
             .saturating_sub(conversation_height)
@@ -1445,6 +1473,7 @@ impl TuiApp {
             area: text_area,
             skip,
             total: total_lines,
+            selectable: selectable_lines,
         });
         if let Some(selection) = &self.selection {
             reverse_selection(&mut visible, skip, selection);
@@ -1650,8 +1679,10 @@ impl TuiApp {
     /// appears as it arrives. An empty buffer renders nothing; a
     /// poisoned lock is recovered —
     /// the same policy the drain applies — so the live view keeps
-    /// rendering after another thread's panic.
-    fn refresh_streaming_region(&mut self, width: u16) {
+    /// rendering after another thread's panic. Returns whether the
+    /// region's rendered lines changed this call — the signal that
+    /// the line numbering below the settled transcript moved.
+    fn refresh_streaming_region(&mut self, width: u16) -> bool {
         let buffer = self
             .state
             .streaming_text
@@ -1659,21 +1690,24 @@ impl TuiApp {
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
         if buffer.is_empty() {
-            self.reset_stream_cache();
-            return;
+            return self.reset_stream_cache();
         }
+        let mut changed = false;
         if self.stream_cache_width != width {
-            self.reset_stream_cache();
+            changed = self.reset_stream_cache();
             self.stream_cache_width = width;
-        }
-        if self.frozen_upto > 0
+        } else if self.frozen_upto > 0
             && buffer
                 .get(..self.frozen_upto)
                 .is_none_or(|prefix| fingerprint(prefix) != self.frozen_fingerprint)
         {
-            self.reset_stream_cache();
+            changed = self.reset_stream_cache();
         }
+        let frozen_before = self.frozen_lines.len();
         self.advance_freeze(&buffer, width);
+        if self.frozen_lines.len() != frozen_before {
+            changed = true;
+        }
 
         let unfrozen = buffer.get(self.frozen_upto..).unwrap_or("");
         let live = unfrozen
@@ -1693,7 +1727,7 @@ impl TuiApp {
             && self.live_frozen_upto == self.frozen_upto
             && self.live_width == width
         {
-            return;
+            return changed;
         }
 
         let markdown_theme = markdown::MarkdownTheme::from(&self.theme);
@@ -1748,6 +1782,7 @@ impl TuiApp {
         self.live_frozen_upto = self.frozen_upto;
         self.live_width = width;
         self.live_lines = lines;
+        true
     }
 
     /// Reset the streaming cache.
@@ -1756,7 +1791,9 @@ impl TuiApp {
     /// layout re-freezes from the buffer's start. Called when the
     /// buffer empties (the reply graduated or the turn failed), its
     /// frozen prefix stops matching, or the pane width changes.
-    fn reset_stream_cache(&mut self) {
+    /// Returns whether any rendered lines were dropped.
+    fn reset_stream_cache(&mut self) -> bool {
+        let dropped = !(self.frozen_lines.is_empty() && self.live_lines.is_empty());
         self.frozen_lines.clear();
         self.frozen_upto = 0;
         self.frozen_separators = 0;
@@ -1765,6 +1802,7 @@ impl TuiApp {
         self.live_frozen_upto = 0;
         self.live_width = 0;
         self.live_lines.clear();
+        dropped
     }
 
     /// Freeze every newly settled block into the cache.
@@ -2138,6 +2176,10 @@ struct ViewState {
     skip: usize,
     /// The conversation's total line count that frame.
     total: usize,
+    /// The line count a selection can cover — the total without the
+    /// running-tool rows, which render below the selectable document
+    /// and never join the selection's line space.
+    selectable: usize,
 }
 
 /// Hand `text` to the clipboard.
