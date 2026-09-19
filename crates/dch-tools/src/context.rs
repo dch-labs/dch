@@ -252,7 +252,8 @@ impl RunnerContext {
     /// path resolves under the run's policy and the file's current
     /// bytes are read — bounded the way the live Read tool bounds its
     /// reads: regular files at or under the size cap only, at most the
-    /// cap's worth of bytes, and on the blocking pool so the async
+    /// cap's worth of bytes, the opened handle verified against the
+    /// pinned workspace, and on the blocking pool so the async
     /// executor is never held. The observation lands marked
     /// [`resumed`](crate::state::FileBaseline::resumed): the model
     /// never saw these bytes in this session, so the Write tool's
@@ -267,11 +268,14 @@ impl RunnerContext {
         }
         let cwd = self.cwd.clone();
         let policy = self.resolve_policy;
+        let anchor = Arc::clone(&self.workspace_anchor);
         let spelling = file_path.to_string();
-        let read = tokio::task::spawn_blocking(move || read_resumable(&spelling, &cwd, policy))
-            .await
-            .ok()
-            .flatten();
+        let read = tokio::task::spawn_blocking(move || {
+            read_resumable(&spelling, &cwd, policy, Some(&anchor))
+        })
+        .await
+        .ok()
+        .flatten();
         match read {
             Some((full_path, bytes)) => {
                 let baseline = crate::state::observe_resumed_bytes(&bytes);
@@ -317,6 +321,7 @@ fn read_resumable(
     file_path: &str,
     cwd: &Path,
     policy: ResolvePolicy,
+    anchor: Option<&crate::fs::WorkspaceAnchor>,
 ) -> Option<(PathBuf, Vec<u8>)> {
     let full_path = crate::util::resolve_path(file_path, cwd, policy).ok()?;
     let full_path = if policy == ResolvePolicy::Unrestricted {
@@ -329,6 +334,9 @@ fn read_resumable(
         return None;
     }
     let file = std::fs::File::open(&full_path).ok()?;
+    if policy == ResolvePolicy::Contained {
+        crate::util::verify_handle_inside(&file, cwd, anchor).ok()?;
+    }
     let cap = crate::read::MAX_FILE_SIZE_BYTES.saturating_add(1);
     let mut bytes = Vec::new();
     file.take(cap as u64).read_to_end(&mut bytes).ok()?;
@@ -753,6 +761,28 @@ mod tests {
         assert_eq!(
             rc.baseline_for(&hard).map(|baseline| baseline.hash),
             Some(crate::state::content_hash(b"EXT"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_resumed_read_through_an_escaping_symlink_records_nothing() {
+        // The resume re-arm resolves under the same policy as the live
+        // Read: an in-workspace symlink whose target sits outside the
+        // workspace records nothing — the baseline guard stays disarmed
+        // rather than arming on bytes outside the pinned workspace.
+        use std::os::unix::fs::symlink;
+
+        let work = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, "SHOULD NOT BE READ").unwrap();
+        symlink(&secret, work.path().join("link.txt")).unwrap();
+
+        let rc = RunnerContext::new(work.path().to_path_buf());
+        assert!(
+            !rc.record_resumed_read("link.txt").await,
+            "the escaping symlink records nothing"
         );
     }
 

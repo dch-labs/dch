@@ -55,6 +55,27 @@ const MAX_ELAPSED_SECS: f64 = 9.0e18;
 /// frame whatever the token rate.
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
+/// The periodic beat the run loop wakes on.
+///
+/// The animation cadence while tools run — the spinner advances and
+/// the elapsed stamps move one display step (a tenth of a second)
+/// per tick, matching the stamps' finest shown digit so they march
+/// uniformly whether or not input is redrawing — and the scroll beat
+/// a drag parked at the conversation pane's edge and the composer
+/// caret's blink phase step with. An idle tick between events draws
+/// nothing: it claims a parked background redraw, and neither that,
+/// a drag, nor a blink flip being due, the loop sleeps on.
+const TICK_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Ticks per caret blink phase.
+///
+/// Half a second on, half a second off — the cadence editors settle
+/// on when they own the blink themselves. The terminal's own
+/// blinking-cursor request may be ignored or preference-gated, so
+/// the app toggles visibility on its tick instead: what the user
+/// sees does not depend on the terminal's cooperation.
+const CARET_BLINK_TICKS: u32 = 5;
+
 /// How close to the newest line a scroll action must land to count
 /// as "back at the bottom".
 ///
@@ -147,6 +168,32 @@ pub struct TuiApp {
     /// travel the submit channel to the agent driver.
     input: InputEditor,
 
+    /// The column count the composer last rendered at.
+    ///
+    /// The editor's vertical keys navigate the wrap grid this width
+    /// defines; the event loop runs between frames, so the last
+    /// rendered width is the geometry the user is looking at when a
+    /// key lands.
+    input_wrap_width: u16,
+
+    /// What the last frame's composer pane looked like.
+    ///
+    /// A press inside the pane places the composer's caret where it
+    /// landed — the pane rect to claim the press, the interior cell
+    /// where the wrap grid begins, and the window of wrap rows the
+    /// pane was showing when the user was looking at it.
+    input_view: Option<InputView>,
+
+    /// The composer caret's blink state.
+    ///
+    /// The app owns the caret's blink — the terminal's own
+    /// blinking-cursor request is too often ignored or
+    /// preference-gated to rely on — and this is the phase the frame
+    /// renders from: the caret parks on its cell while visible and
+    /// nowhere while dark. [`CaretBlink`] carries the cadence and the
+    /// input-reset contract.
+    caret_blink: CaretBlink,
+
     /// Lines scrolled up from the bottom of the view.
     ///
     /// Zero means pinned to the newest line; submitting resets it.
@@ -179,6 +226,44 @@ pub struct TuiApp {
     /// growth or shrinkage since this value, holding the viewport
     /// steady as the streaming region extends below it or collapses.
     last_layout_lines: usize,
+
+    /// The mouse selection over the transcript, if any.
+    ///
+    /// Both ends are display cells — conversation line index plus
+    /// column — in the coordinate space of the rendered lines, so
+    /// the selection is character-granular and holds still while the
+    /// view scrolls. It survives the release — the copy happens then,
+    /// the highlight stays up — until the next press replaces it; a
+    /// press-release without travel clears it.
+    selection: Option<CellSelection>,
+
+    /// The previous frame's conversation viewport.
+    ///
+    /// Mouse events arrive between frames carrying screen cells;
+    /// this maps them onto conversation lines using the geometry of
+    /// the frame the user is looking at.
+    last_view: Option<ViewState>,
+
+    /// The screen cell the drag last reported, while the button is
+    /// held.
+    ///
+    /// Set between a press inside the conversation pane and its
+    /// release. A terminal reports a drag only while the pointer
+    /// moves, so a pointer pushed against the pane's edge goes quiet
+    /// — the periodic tick reads this to keep scrolling there, one
+    /// line per beat, until the release arrives or the document runs
+    /// out. A release delivered outside the terminal's view never
+    /// arrives as an event; buttonless motion (only sent with no
+    /// button held) ends the drag instead, so a lost release cannot
+    /// run the scroll for long.
+    drag_position: Option<(u16, u16)>,
+
+    /// Where a completed selection's text goes.
+    ///
+    /// The default copies through OSC 52 and, where present,
+    /// `pbcopy`; tests install a recorder to observe the copy
+    /// without touching any clipboard.
+    copier: Box<dyn Fn(&str)>,
 
     /// Rendered lines of the streaming buffer's frozen prefix.
     ///
@@ -334,11 +419,18 @@ impl TuiApp {
             verbosity: config.display.verbosity,
             spinner_idx: 0,
             input: InputEditor::new(),
+            input_wrap_width: 80,
+            input_view: None,
+            caret_blink: CaretBlink::default(),
             scroll_offset: 0,
             auto_scroll: true,
             render_pending: false,
             last_frame: None,
             last_layout_lines: 0,
+            selection: None,
+            last_view: None,
+            drag_position: None,
+            copier: Box::new(copy_to_clipboard),
             frozen_lines: Vec::new(),
             frozen_upto: 0,
             frozen_separators: 0,
@@ -469,6 +561,15 @@ impl TuiApp {
         self.submit_tx = Some(tx);
     }
 
+    /// Replace the selection copier.
+    ///
+    /// The instrumentation seam for the selection pins: a recorder
+    /// observes what a release copies without touching any real
+    /// clipboard. Production never calls this.
+    pub fn set_selection_copier(&mut self, copier: Box<dyn Fn(&str)>) {
+        self.copier = copier;
+    }
+
     /// Switch the display verbosity.
     ///
     /// Invalidates the conversation and live caches so every
@@ -531,7 +632,7 @@ impl TuiApp {
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.quitting = false;
         let mut events = TerminalEvents::spawn();
-        let mut tick = tokio::time::interval(Duration::from_millis(250));
+        let mut tick = tokio::time::interval(TICK_INTERVAL);
         let notify = Arc::clone(&self.state.render_notify);
         let mut listener = notify.listen();
 
@@ -600,9 +701,9 @@ impl TuiApp {
     /// Apply one terminal event to the app state.
     ///
     /// Returns whether the event requires a redraw. Key releases and
-    /// repeats are ignored so a held key fires once per press. Mouse
-    /// events other than the wheel are ignored.
+    /// repeats are ignored so a held key fires once per press.
     pub fn handle_event(&mut self, event: &Event) -> bool {
+        self.caret_blink.resolidify();
         match event {
             Event::Key(key) => {
                 if key.kind != KeyEventKind::Press {
@@ -624,9 +725,11 @@ impl TuiApp {
     /// everything else belongs to the input editor.
     ///
     /// Up, Down, and End fall back to the transcript while the input
-    /// sits empty with no history to recall — a fresh session's
-    /// arrows still scroll the conversation — and join the editor as
-    /// soon as anything is typed or recallable.
+    /// sits empty with nothing to recall — a fresh session's arrows
+    /// still scroll the conversation — and join the editor as soon as
+    /// anything is typed or recallable. Shift and an arrow, with a
+    /// transcript selection up, moves the selection's head instead:
+    /// the editor's select-by-keyboard.
     fn handle_key(&mut self, key: KeyEvent) -> bool {
         match (key.code, key.modifiers) {
             (KeyCode::Char('c' | 'd'), KeyModifiers::CONTROL) | (KeyCode::Esc, _) => {
@@ -665,8 +768,14 @@ impl TuiApp {
                 self.scroll_to_bottom();
                 true
             }
+            (KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right, KeyModifiers::SHIFT)
+                if self.selection.is_some() =>
+            {
+                self.nudge_selection(key.code);
+                true
+            }
             _ => {
-                let action = self.input.handle_key(key);
+                let action = self.input.handle_key(key, self.input_wrap_width);
                 self.apply_input_action(action)
             }
         }
@@ -674,8 +783,16 @@ impl TuiApp {
 
     /// Apply one mouse event.
     ///
-    /// The wheel scrolls by [`WHEEL_SCROLL_LINES`]; anything else is
-    /// ignored.
+    /// The wheel scrolls by [`WHEEL_SCROLL_LINES`]; a press-drag-
+    /// release over the conversation pane selects rendered
+    /// characters — inside the app — and the release quietly hands
+    /// the covered text to the clipboard while the highlight stays
+    /// up until the next press. A drag pushed against the pane's
+    /// top or bottom row scrolls the view in the drag's direction,
+    /// extending the selection — one line per movement report, and
+    /// one per tick while the pointer stays parked there; a press
+    /// over the composer pane places its caret where it landed.
+    /// Anything else is ignored.
     fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
@@ -688,8 +805,355 @@ impl TuiApp {
                 self.rearm_if_near_bottom();
                 true
             }
+            MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                match self.cell_at(mouse.column, mouse.row) {
+                    Some(cell) => {
+                        self.selection = Some(CellSelection {
+                            anchor: cell,
+                            head: cell,
+                        });
+                        self.drag_position = Some((mouse.column, mouse.row));
+                        true
+                    }
+                    None => self.place_input_caret(mouse.column, mouse.row),
+                }
+            }
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+                if self.selection.is_none() {
+                    return false;
+                }
+                self.drag_position = Some((mouse.column, mouse.row));
+                let mut handled = false;
+                if let Some(cell) = self.cell_at(mouse.column, mouse.row)
+                    && let Some(selection) = self.selection.as_mut()
+                {
+                    selection.head = cell;
+                    handled = true;
+                }
+                self.drag_autoscroll() || handled
+            }
+            MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
+                self.drag_position = None;
+                match self.selection.take() {
+                    Some(selection) => {
+                        if selection.anchor != selection.head {
+                            let text = self.selection_text(&selection);
+                            (self.copier)(&text);
+                            self.selection = Some(selection);
+                        }
+                        true
+                    }
+                    None => false,
+                }
+            }
+            MouseEventKind::Moved => {
+                self.drag_position = None;
+                false
+            }
             _ => false,
         }
+    }
+
+    /// Scroll one step while a drag sits at the pane's top or bottom
+    /// row, extending the selection head to the edge's line after
+    /// the step.
+    ///
+    /// Editors scroll the document under a selection dragged past
+    /// the viewport, in the drag's direction. A terminal reports a
+    /// drag only while the pointer moves, so a pointer parked at the
+    /// edge goes quiet — the drag arm runs this for an immediate
+    /// step per movement and the periodic tick keeps running it once
+    /// per beat while the push continues. The scroll stops at the
+    /// document's first or last line whatever the drag state says,
+    /// and the state itself ends on the release or, when that
+    /// arrived outside the terminal's view, on the first buttonless
+    /// motion — so a lost release cannot carry the scroll far.
+    /// Returns whether the view or the head moved.
+    fn drag_autoscroll(&mut self) -> bool {
+        let Some((column, row)) = self.drag_position else {
+            return false;
+        };
+        let Some(view) = self.last_view.as_ref().copied() else {
+            return false;
+        };
+        let height = usize::from(view.area.height);
+        if height == 0 || view.total == 0 {
+            return false;
+        }
+        let col = usize::from(column.saturating_sub(view.area.x))
+            .min(usize::from(view.area.width.saturating_sub(1)));
+        if row <= view.area.y {
+            let head = CellPos {
+                line: view.skip.saturating_sub(1),
+                col,
+            };
+            let scrolled = view.skip > 0;
+            if scrolled {
+                self.scroll_offset = self.scroll_offset.saturating_add(1);
+                self.auto_scroll = false;
+            }
+            let extended = self.extend_selection_head(head);
+            scrolled || extended
+        } else if usize::from(row).saturating_add(1) >= usize::from(view.area.bottom()) {
+            let last = view
+                .skip
+                .saturating_add(1)
+                .min(view.total.saturating_sub(height))
+                .saturating_add(height)
+                .saturating_sub(1)
+                .min(view.total.saturating_sub(1));
+            let head = CellPos { line: last, col };
+            let scrolled = self.scroll_offset > 0;
+            self.scroll_offset = self.scroll_offset.saturating_sub(1);
+            self.rearm_if_near_bottom();
+            let extended = self.extend_selection_head(head);
+            scrolled || extended
+        } else {
+            false
+        }
+    }
+
+    /// Point the selection head at `head`, reporting whether it moved.
+    ///
+    /// Exactly one selection is in play during a drag; with none —
+    /// the button already released, say — there is nothing to extend.
+    fn extend_selection_head(&mut self, head: CellPos) -> bool {
+        match self.selection.as_mut() {
+            Some(selection) => {
+                let moved = selection.head != head;
+                selection.head = head;
+                moved
+            }
+            None => false,
+        }
+    }
+
+    /// Move the selection head one step for Shift and an arrow key.
+    ///
+    /// The head moves and the anchor stays, so stepping away from the
+    /// anchor extends the selection and stepping back over it shrinks
+    /// it — the same select-by-keyboard every editor ships. Left and
+    /// Right step one cell and wrap at line ends; Up and Down step
+    /// one rendered line and keep the column. The viewport follows
+    /// the head, and the adjusted text replaces the clipboard copy
+    /// silently, exactly as a release does.
+    fn nudge_selection(&mut self, direction: KeyCode) {
+        let Some(selection) = self.selection.as_ref() else {
+            return;
+        };
+        let head = selection.head;
+        let up_one = head.line.saturating_sub(1);
+        let down_one = head.line.saturating_add(1);
+        let nudged = match direction {
+            KeyCode::Left => {
+                if head.col > 0 {
+                    CellPos {
+                        line: head.line,
+                        col: head.col.saturating_sub(1),
+                    }
+                } else if head.line > 0 {
+                    let width = self.line_width(up_one).unwrap_or(0);
+                    CellPos {
+                        line: up_one,
+                        col: width.saturating_sub(1),
+                    }
+                } else {
+                    head
+                }
+            }
+            KeyCode::Right => {
+                let width = self.line_width(head.line).unwrap_or(0);
+                if width > 0 && head.col.saturating_add(1) < width {
+                    CellPos {
+                        line: head.line,
+                        col: head.col.saturating_add(1),
+                    }
+                } else if self.line_width(down_one).is_some() {
+                    CellPos {
+                        line: down_one,
+                        col: 0,
+                    }
+                } else {
+                    head
+                }
+            }
+            KeyCode::Up => {
+                if head.line > 0 {
+                    CellPos {
+                        line: up_one,
+                        col: head.col,
+                    }
+                } else {
+                    head
+                }
+            }
+            KeyCode::Down => {
+                if self.line_width(down_one).is_some() {
+                    CellPos {
+                        line: down_one,
+                        col: head.col,
+                    }
+                } else {
+                    head
+                }
+            }
+            _ => head,
+        };
+        if nudged == head {
+            return;
+        }
+        if let Some(selection) = self.selection.as_mut() {
+            selection.head = nudged;
+        }
+        self.follow_head(nudged.line);
+        if let Some(selection) = self.selection.as_ref()
+            && selection.anchor != selection.head
+        {
+            let text = self.selection_text(selection);
+            // A head walked onto a blank line can cover no text at
+            // all; copying that would wipe the clipboard for
+            // nothing.
+            if !text.is_empty() {
+                (self.copier)(&text);
+            }
+        }
+    }
+
+    /// The rendered width, in cells, of one selectable conversation
+    /// line.
+    ///
+    /// `None` past the end of the document the selection walks — the
+    /// same line segments [`Self::selectable_window`] windows over,
+    /// with running tools excluded. Left and Right use the width as
+    /// their wrap boundary and Down uses existence as its floor.
+    fn line_width(&self, index: usize) -> Option<usize> {
+        self.selectable_window(index, 1)
+            .into_iter()
+            .next()
+            .map(|line| line.spans.iter().map(|span| span.content.width()).sum())
+    }
+
+    /// A window over the lines a selection can cover.
+    ///
+    /// The settled conversation, the frozen streaming prefix, and
+    /// the live region — running tools render after these but are
+    /// not selectable, so they stay out of the selection's line
+    /// space: what a copy walks and what the highlight spans are the
+    /// same lines the pane shows above any tool block.
+    fn selectable_window(&self, skip: usize, height: usize) -> Vec<Line<'_>> {
+        visible_window(
+            [
+                &self.conversation_cache,
+                &self.frozen_lines,
+                &self.live_lines,
+                &NO_LINES,
+            ],
+            skip,
+            height,
+        )
+    }
+
+    /// Scroll the view just enough to keep `line` on screen.
+    ///
+    /// A keyboard-walked selection head moves through the document
+    /// under its own power; the viewport follows so the moving end
+    /// stays visible — stepping upward detaches the view, and
+    /// stepping back within the stick tolerance re-arms it.
+    fn follow_head(&mut self, line: usize) {
+        let Some(view) = self.last_view.as_ref().copied() else {
+            return;
+        };
+        let height = usize::from(view.area.height);
+        if height == 0 {
+            return;
+        }
+        if line < view.skip {
+            self.scroll_offset = self
+                .scroll_offset
+                .saturating_add(view.skip.saturating_sub(line));
+            self.auto_scroll = false;
+        } else if line >= view.skip.saturating_add(height) {
+            let excess = line
+                .saturating_sub(view.skip.saturating_add(height))
+                .saturating_add(1);
+            self.scroll_offset = self.scroll_offset.saturating_sub(excess);
+            self.rearm_if_near_bottom();
+        }
+    }
+
+    /// The transcript cell under screen column/row, if the position
+    /// lands inside the last frame's conversation pane.
+    fn cell_at(&self, column: u16, row: u16) -> Option<CellPos> {
+        let view = self.last_view.as_ref()?;
+        if column < view.area.x
+            || column >= view.area.right()
+            || row < view.area.y
+            || row >= view.area.bottom()
+        {
+            return None;
+        }
+        let line = view
+            .skip
+            .saturating_add(usize::from(row.saturating_sub(view.area.y)));
+        let line = line.min(view.total.saturating_sub(1));
+        let col = usize::from(column.saturating_sub(view.area.x));
+        Some(CellPos { line, col })
+    }
+
+    /// Place the composer's caret where a press landed.
+    ///
+    /// Presses inside the composer pane claim the press — padding
+    /// rows included, click-clamped the way editors clamp: the row
+    /// clamps into the text window, and the column travels raw so
+    /// the caret search clamps it to that row's own width. Returns
+    /// whether the press belonged to the composer at all.
+    fn place_input_caret(&mut self, column: u16, row: u16) -> bool {
+        let Some(view) = self.input_view else {
+            return false;
+        };
+        if column < view.pane.x
+            || column >= view.pane.right()
+            || row < view.pane.y
+            || row >= view.pane.bottom()
+        {
+            return false;
+        }
+        let grid_row = view.start.saturating_add(
+            usize::from(row.saturating_sub(view.origin.1)).min(view.visible.saturating_sub(1)),
+        );
+        let grid_column = usize::from(column.saturating_sub(view.origin.0));
+        self.input
+            .move_caret_to_cell(self.input_wrap_width, grid_row, grid_column);
+        true
+    }
+
+    /// The characters the selection covers, as plain text.
+    ///
+    /// Walks the same rendered lines the highlight walks, so what is
+    /// copied is exactly what is shown selected.
+    fn selection_text(&self, selection: &CellSelection) -> String {
+        let (from, to) = ordered(selection);
+        let lines = self.selectable_window(
+            from.line,
+            to.line.saturating_sub(from.line).saturating_add(1),
+        );
+        let mut text = String::new();
+        for (offset, line) in lines.iter().enumerate() {
+            let line_index = from.line.saturating_add(offset);
+            let start = if line_index == from.line { from.col } else { 0 };
+            let end = if line_index == to.line {
+                to.col
+            } else {
+                usize::MAX
+            };
+            let flat: String = line.spans.iter().map(|s| s.content.to_string()).collect();
+            let covered = covered_chars(&flat, start, end);
+            text.push_str(&covered);
+            if line_index < to.line {
+                text.push('\n');
+            }
+        }
+        text
     }
 
     /// Route an editor action.
@@ -790,7 +1254,7 @@ impl TuiApp {
     /// claim does not itself re-check the interval — a parked
     /// request is owed its frame whenever the tick lands, which can
     /// sit inside the interval after a notify-initiated frame; the
-    /// tick is spaced far wider than the interval, so the reading is
+    /// tick stays several frame intervals wide, so the reading is
     /// deliberate. Ticks with nothing pending and no tools in
     /// flight still draw nothing.
     pub fn take_pending_redraw(&mut self, now: Instant) -> bool {
@@ -820,9 +1284,12 @@ impl TuiApp {
     /// Handle a periodic tick.
     ///
     /// Claims any parked background redraw first, advances the
-    /// spinner one frame while tools run, then redraws — the tick
-    /// itself is the animation beat. An idle tick with nothing
-    /// parked and no tools in flight draws nothing.
+    /// spinner one frame while tools run, steps the view while a
+    /// drag is parked at the conversation pane's top or bottom row —
+    /// the beat that keeps an edge push scrolling between movement
+    /// reports — and flips the composer caret's blink phase on its
+    /// own beat. An idle tick between flips and away from all of the
+    /// above draws nothing.
     pub fn tick_wake(&mut self, now: Instant) -> bool {
         let claimed = self.take_pending_redraw(now);
         if self.any_tools_running() {
@@ -833,7 +1300,9 @@ impl TuiApp {
                 next
             };
         }
-        self.any_tools_running() || claimed
+        let dragged = self.drag_autoscroll();
+        let blinked = self.caret_blink.tick();
+        self.any_tools_running() || claimed || dragged || blinked
     }
 
     /// Whether a graduation is waiting to land.
@@ -853,26 +1322,63 @@ impl TuiApp {
     /// Render one frame of the layout.
     ///
     /// Conversation fills the space above a blank spacer row that
-    /// separates it from the fixed multi-row input field; the status
-    /// bar closes the frame at the bottom row — each pane renders
-    /// through its own method. The input field never changes height,
-    /// so the conversation pane above it never reflows while the
-    /// user types.
+    /// separates it from the input field; the two-row status bar
+    /// closes the frame at the bottom — each pane renders through its
+    /// own method. The input field grows with its buffer up to its
+    /// text-row cap and then holds: the conversation pane reflows
+    /// while the composer grows and holds still once it has.
     pub fn render(&mut self, frame: &mut Frame) {
         self.drain_shared_state();
         let area = frame.area();
+        // The composer's height follows its buffer: one text row when
+        // empty, one more per line — typed or wrapped — up to the cap.
+        // The wrap width is the pane's regardless of how tall the pane
+        // ends up, so it comes from the terminal itself, not a prior
+        // frame's split.
+        let wrap_width = area
+            .width
+            .max(1)
+            .saturating_sub(INPUT_SIDE_INSET.saturating_mul(2));
+        let text_rows = u16::try_from(self.input.display_rows(wrap_width).len())
+            .unwrap_or(1)
+            .clamp(1, INPUT_TEXT_ROWS);
+        let composer_height = text_rows.saturating_add(INPUT_VERTICAL_PADDING.saturating_mul(2));
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(0),
                 Constraint::Length(1),
-                Constraint::Length(INPUT_FIELD_ROWS),
-                Constraint::Length(1),
+                Constraint::Length(composer_height),
+                Constraint::Length(STATUS_BAR_ROWS),
             ])
             .split(area);
 
         let fallback = area;
         self.render_conversation(frame, pane(&chunks, 0, fallback));
+        // The paintless theme's composer marking: hairline rules the
+        // terminal draws itself — an underlined spacer puts a 1px
+        // line at the box's top edge, an underlined last row at its
+        // bottom. Solid and thin on every terminal: the rule is the
+        // terminal's own decoration, not glyphs (which gap between
+        // rows on some) or paint (which is a full cell thick).
+        if let Some(color) = self.theme.ui.composer_border {
+            let spacer = pane(&chunks, 1, fallback);
+            let composer = pane(&chunks, 2, fallback);
+            let rule = Style::default()
+                .fg(color)
+                .add_modifier(ratatui::style::Modifier::UNDERLINED);
+            if spacer.height > 0 {
+                frame.buffer_mut().set_style(spacer, rule);
+            }
+            if composer.height > 0 {
+                let bottom = Rect {
+                    y: composer.bottom().saturating_sub(1),
+                    height: 1,
+                    ..composer
+                };
+                frame.buffer_mut().set_style(bottom, rule);
+            }
+        }
         // The composer's wrap is computed once per frame and shared by
         // the field and the status tag, so a frame wraps the buffer
         // through the text once however long it has grown.
@@ -881,6 +1387,7 @@ impl TuiApp {
             .width
             .max(1)
             .saturating_sub(INPUT_SIDE_INSET.saturating_mul(2));
+        self.input_wrap_width = width;
         let rows = self.input.display_rows(width);
         let caret = self.input.cursor_cell(width).unwrap_or((0, 0));
         self.render_input(frame, input_area, &rows, caret);
@@ -908,6 +1415,14 @@ impl TuiApp {
             self.conversation_cache = self.conversation_lines(text_area);
             self.conversation_cache_width = width;
             self.conversation_cache_generation = self.conversation_generation;
+            // A rebuilt line space — a new message graduating in, a
+            // verbosity switch, a resize — re-numbers every line under
+            // the selection's stored indexes, so the highlight would
+            // silently re-target other text; a re-flowed document
+            // forfeits the selection instead, the way a terminal's
+            // native one is lost on redraw.
+            self.selection = None;
+            self.drag_position = None;
         }
         self.refresh_streaming_region(width);
         let tools = self.active_tool_lines();
@@ -921,7 +1436,7 @@ impl TuiApp {
         let skip = total_lines
             .saturating_sub(conversation_height)
             .saturating_sub(self.scroll_offset);
-        let visible = visible_window(
+        let mut visible = visible_window(
             [
                 &self.conversation_cache,
                 &self.frozen_lines,
@@ -931,7 +1446,14 @@ impl TuiApp {
             skip,
             conversation_height,
         );
-
+        self.last_view = Some(ViewState {
+            area: text_area,
+            skip,
+            total: total_lines,
+        });
+        if let Some(selection) = &self.selection {
+            reverse_selection(&mut visible, skip, selection);
+        }
         frame.render_widget(Paragraph::new(visible), text_area);
         if let Some(gutter) = scrollbar_area
             && let Some((thumb_pos, thumb_len)) =
@@ -1349,14 +1871,20 @@ impl TuiApp {
     /// the same way, so a terminal too short for the field's full
     /// height parks the cursor on a row the field owns, and a field
     /// allotted no rows at all parks no cursor.
-    fn render_input(&self, frame: &mut Frame, area: Rect, rows: &[String], caret: (u16, u16)) {
+    fn render_input(&mut self, frame: &mut Frame, area: Rect, rows: &[String], caret: (u16, u16)) {
         let (caret_row, column) = caret;
 
         let surface = self.theme.ui.surface;
-        let text_style = Style::default().fg(self.theme.ui.input_text).bg(surface);
-        frame
-            .buffer_mut()
-            .set_style(area, Style::default().bg(surface));
+        let text_style = if self.theme.ui.composer_border.is_some() {
+            // A bordered composer paints nothing — the hairline rules
+            // live in `render`, on the rows above and below this pane.
+            Style::default().fg(self.theme.ui.input_text)
+        } else {
+            frame
+                .buffer_mut()
+                .set_style(area, Style::default().bg(surface));
+            Style::default().fg(self.theme.ui.input_text).bg(surface)
+        };
         let text_height = INPUT_TEXT_ROWS.min(area.height.saturating_sub(INPUT_VERTICAL_PADDING));
         let interior = Rect {
             x: area
@@ -1375,6 +1903,12 @@ impl TuiApp {
         // scrolls with the caret.
         let visible_rows = usize::from(text_height);
         let start = usize::from(caret_row).saturating_sub(visible_rows.saturating_sub(1));
+        self.input_view = Some(InputView {
+            pane: area,
+            origin: (interior.x, interior.y),
+            start,
+            visible: visible_rows,
+        });
         let lines: Vec<Line<'_>> = rows
             .iter()
             .skip(start)
@@ -1401,7 +1935,7 @@ impl TuiApp {
                 u16::try_from(usize::from(caret_row).saturating_sub(start)).unwrap_or(0),
             )
             .min(area.bottom().saturating_sub(1));
-        if area.height > 0 {
+        if area.height > 0 && self.caret_blink.on {
             frame.set_cursor_position((caret_x, caret_y));
         }
     }
@@ -1446,27 +1980,30 @@ impl TuiApp {
             0 => area.width,
             reserved => area.width.saturating_sub(reserved.saturating_add(1)),
         };
-        // The bar's own background spans the whole row first, so the
-        // gutter column a clipped left edge leaves between the two
-        // paragraphs reads as bar, not as a hole in it.
-        frame.buffer_mut().set_style(
-            Rect { height: 1, ..area },
-            Style::default().bg(self.theme.ui.status_bar_bg),
-        );
+        // The bar's own background spans both of its rows first, so
+        // the gutter column a clipped left edge leaves between the two
+        // paragraphs reads as bar, not as a hole in it; the content
+        // sits on the bottom row, the row above it breathing room.
+        frame
+            .buffer_mut()
+            .set_style(area, Style::default().bg(self.theme.ui.status_bar_bg));
+        let content = Rect {
+            y: area.bottom().saturating_sub(1),
+            height: 1,
+            ..area
+        };
         frame.render_widget(
             Paragraph::new(status_text).style(bar_style),
             Rect {
                 width: left_width,
-                height: 1,
-                ..area
+                ..content
             },
         );
         if tag_width > 0 {
             let tag_area = Rect {
-                x: area.right().saturating_sub(tag_width),
+                x: content.right().saturating_sub(tag_width),
                 width: tag_width,
-                height: 1,
-                ..area
+                ..content
             };
             frame.render_widget(
                 Paragraph::new(Line::styled(
@@ -1502,6 +2039,225 @@ impl TuiApp {
             ));
         }
         parts.join(" · ")
+    }
+}
+
+/// One display cell of the rendered transcript.
+///
+/// A conversation line index paired with the column, in cells, of
+/// the character within that rendered line — the unit a mouse
+/// selection drags over.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CellPos {
+    /// The conversation line the cell sits on.
+    line: usize,
+    /// The cell column within the rendered line.
+    col: usize,
+}
+
+/// A mouse selection between two display cells.
+///
+/// Order-independent: whichever end the press anchored stays put
+/// while the head follows the drag — and the edge-scroll steps that
+/// carry it past the viewport — in content coordinates, so scrolling
+/// between drags does not move the selection.
+struct CellSelection {
+    /// The cell the press landed on.
+    anchor: CellPos,
+    /// The cell the drag currently reaches.
+    head: CellPos,
+}
+
+/// The composer caret's blink state.
+///
+/// The terminal's blinking-cursor request is often ignored or
+/// preference-gated, so the app owns the blink: half a second
+/// visible, half a second dark. Any input event resolidifies the
+/// caret and restarts the phase, so typing or mouse motion holds it
+/// solid and the blink resumes after half a second of stillness.
+struct CaretBlink {
+    /// Whether the caret is in its visible phase.
+    on: bool,
+    /// Ticks since the phase last flipped.
+    ticks: u32,
+}
+
+impl Default for CaretBlink {
+    fn default() -> Self {
+        Self { on: true, ticks: 0 }
+    }
+}
+
+impl CaretBlink {
+    /// Restart the visible phase — the reaction to any input.
+    fn resolidify(&mut self) {
+        self.on = true;
+        self.ticks = 0;
+    }
+
+    /// Advance one tick, flipping the phase when it is due.
+    ///
+    /// Returns whether the phase flipped, so the caller can redraw —
+    /// the only idle activity a blink generates.
+    fn tick(&mut self) -> bool {
+        self.ticks = self.ticks.saturating_add(1);
+        if self.ticks >= CARET_BLINK_TICKS {
+            self.ticks = 0;
+            self.on = !self.on;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// What the last frame's composer pane looked like.
+///
+/// The bridge between a press (screen cells, between frames) and the
+/// composer's wrap grid: which pane rect belongs to the composer,
+/// which interior cell holds the grid's first row and column, and
+/// which slice of the grid the pane's text window was showing.
+#[derive(Clone, Copy)]
+struct InputView {
+    /// The composer pane's rect — presses inside belong to it.
+    pane: Rect,
+    /// The interior cell where the wrap grid's row 0, column 0 sits.
+    origin: (u16, u16),
+    /// The wrap-grid row the text window's top row shows.
+    start: usize,
+    /// How many wrap rows the text window shows.
+    visible: usize,
+}
+
+/// What the last frame's conversation pane looked like.
+///
+/// The bridge between mouse events (screen cells, between frames)
+/// and the conversation's line indices: the pane's rect and the skip
+/// the viewport rendered with. Stale by at most one event while
+/// frames are in flight — imperceptible for a drag.
+#[derive(Clone, Copy)]
+struct ViewState {
+    /// The conversation pane's rect, gutter excluded.
+    area: Rect,
+    /// The first conversation line the pane showed.
+    skip: usize,
+    /// The conversation's total line count that frame.
+    total: usize,
+}
+
+/// Hand `text` to the clipboard.
+///
+/// Two transports, both attempted: OSC 52 — the terminal-side
+/// clipboard escape, honored by most modern terminals — and macOS's
+/// `pbcopy`, which is authoritative where it exists. Failures are
+/// silent: a copy that cannot be delivered is a nuisance, not an
+/// error worth interrupting a session for.
+fn copy_to_clipboard(text: &str) {
+    use std::io::Write as _;
+
+    use base64::Engine as _;
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+    let mut stdout = std::io::stdout();
+    drop(write!(stdout, "\x1b]52;c;{encoded}\x07"));
+    drop(stdout.flush());
+    if cfg!(target_os = "macos")
+        && let Ok(mut child) = std::process::Command::new("pbcopy")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+    {
+        if let Some(stdin) = child.stdin.as_mut() {
+            drop(stdin.write_all(text.as_bytes()));
+        }
+        drop(child.wait());
+    }
+}
+
+/// The empty stand-in for the tool segment a selection never covers.
+///
+/// Running tools render below the selectable document; the window
+/// helpers want four segments, and this one is always empty — a
+/// `static` so a returned window can borrow it past the call.
+static NO_LINES: [Line<'static>; 0] = [];
+
+/// Order a selection's ends by line then column.
+fn ordered(selection: &CellSelection) -> (&CellPos, &CellPos) {
+    let (a, b) = (&selection.anchor, &selection.head);
+    if (a.line, a.col) <= (b.line, b.col) {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+/// The characters of `flat` whose cells fall in `start..=end`.
+///
+/// Walks by display cells — a wide character occupies two and is
+/// covered when its first cell is — so the copied characters match
+/// the highlighted cells exactly.
+fn covered_chars(flat: &str, start: usize, end_inclusive: usize) -> String {
+    let mut out = String::new();
+    let mut cell = 0;
+    for ch in flat.chars() {
+        let width = ch.width().unwrap_or(0);
+        if cell >= start && cell <= end_inclusive {
+            out.push(ch);
+        }
+        cell = cell.saturating_add(width.max(1));
+        if cell > end_inclusive {
+            break;
+        }
+    }
+    out
+}
+
+/// Reverse-video the selected cells across the visible lines.
+///
+/// Splits the affected lines' spans at the selection's cell
+/// boundaries and flips exactly the covered characters, so the
+/// highlight is character-granular whatever the underlying styles.
+fn reverse_selection(lines: &mut [Line<'_>], skip: usize, selection: &CellSelection) {
+    let (from, to) = ordered(selection);
+    for (offset, line) in lines.iter_mut().enumerate() {
+        let line_index = skip.saturating_add(offset);
+        if line_index < from.line || line_index > to.line {
+            continue;
+        }
+        let start = if line_index == from.line { from.col } else { 0 };
+        let end = if line_index == to.line {
+            to.col
+        } else {
+            usize::MAX
+        };
+        let mut cell = 0;
+        let mut spans = Vec::with_capacity(line.spans.len().saturating_add(2));
+        for span in line.spans.drain(..) {
+            let content = span.content;
+            let mut chunk = String::new();
+            for ch in content.chars() {
+                let width = ch.width().unwrap_or(0).max(1);
+                let selected = cell >= start && cell <= end;
+                if selected {
+                    if !chunk.is_empty() {
+                        spans.push(ratatui::text::Span::styled(
+                            std::mem::take(&mut chunk),
+                            span.style,
+                        ));
+                    }
+                    spans.push(ratatui::text::Span::styled(
+                        ch.to_string(),
+                        span.style.add_modifier(ratatui::style::Modifier::REVERSED),
+                    ));
+                } else {
+                    chunk.push(ch);
+                }
+                cell = cell.saturating_add(width);
+            }
+            if !chunk.is_empty() {
+                spans.push(ratatui::text::Span::styled(chunk, span.style));
+            }
+        }
+        line.spans = spans;
     }
 }
 
@@ -1581,22 +2337,21 @@ fn split_scrollbar_gutter(area: Rect) -> (Rect, Option<Rect>) {
 /// text, inside the fill's edge.
 const INPUT_SIDE_INSET: u16 = 2;
 
-/// Rows of text the input field shows. The field is fixed at this
-/// height however long the buffer grows: multi-line editing always
-/// shows this window, and the conversation pane above never moves
-/// while the user types.
-const INPUT_TEXT_ROWS: u16 = 2;
+/// Rows of text the input field shows at its largest.
+///
+/// The field starts as a single line and grows one row per line of
+/// buffer — typed or wrapped — up to this cap; past it the text
+/// window scrolls with the caret and the conversation pane above
+/// holds still again.
+const INPUT_TEXT_ROWS: u16 = 3;
 
 /// Blank tinted rows of breathing room above and below the field's
 /// text rows — the vertical half of the composer's inner padding.
 const INPUT_VERTICAL_PADDING: u16 = 1;
 
-/// The field's full height: text rows wrapped in vertical padding.
-///
-/// What the layout reserves for the composer — the window's text rows
-/// plus one blank tinted row above and below — so a fixed allocation
-/// holds the field whether the buffer fills it or not.
-const INPUT_FIELD_ROWS: u16 = INPUT_TEXT_ROWS + INPUT_VERTICAL_PADDING * 2;
+/// Rows the status bar spans: its content on the bottom row, one row
+/// of breathing room above it.
+const STATUS_BAR_ROWS: u16 = 2;
 
 /// The scrollbar thumb's track position and length for a document of
 /// `content` lines shown through a `viewport`-line window whose top

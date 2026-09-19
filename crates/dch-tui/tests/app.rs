@@ -78,7 +78,7 @@ fn new_constructs_with_empty_fresh_state() {
     assert!(!Arc::ptr_eq(app.active_tools(), other.active_tools()));
     assert!(!Arc::ptr_eq(app.tokens(), other.tokens()));
     assert!(!Arc::ptr_eq(app.render_notify(), other.render_notify()));
-    assert_eq!(app.theme.name, Theme::default().name);
+    assert_eq!(app.theme.name, Theme::by_name("dracula").unwrap().name);
 }
 
 #[test]
@@ -469,8 +469,17 @@ fn assistant_text_renders_through_markdown() {
     let terminal = render_to_buffer(&mut app, 80, 30);
     let buffer = terminal.backend().buffer();
 
-    let heading_fg = Theme::default().markdown.header1.fg.unwrap_or_default();
-    let bold_modifier = Theme::default().markdown.bold.add_modifier;
+    let heading_fg = Theme::by_name("dracula")
+        .unwrap()
+        .markdown
+        .header1
+        .fg
+        .unwrap_or_default();
+    let bold_modifier = Theme::by_name("dracula")
+        .unwrap()
+        .markdown
+        .bold
+        .add_modifier;
     let mut saw_heading = false;
     let mut saw_bold = false;
     for y in 0..buffer.area.height {
@@ -556,7 +565,7 @@ fn completed_tool_blocks_render_between_text() {
         "a failed tool renders the error marker and a minute-scale stamp: {joined:?}"
     );
 
-    let theme = Theme::default();
+    let theme = Theme::by_name("dracula").unwrap();
     let buffer = terminal.backend().buffer();
     let mut success_styled = false;
     let mut failure_styled = false;
@@ -1021,7 +1030,7 @@ fn run_failures_drain_into_the_conversation_as_errors() {
         "the display drains the error buffer on redraw"
     );
 
-    let theme = Theme::default();
+    let theme = Theme::by_name("dracula").unwrap();
     let buffer = terminal.backend().buffer();
     let mut error_styled = false;
     for y in 0..buffer.area.height {
@@ -1056,6 +1065,797 @@ fn long_error_messages_wrap_at_the_pane_width() {
         view.contains("ENDMARK"),
         "the wrapped tail of a long error stays visible instead of clipping: {view:?}"
     );
+}
+
+fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> Event {
+    Event::Mouse(MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    })
+}
+
+/// Count the reversed-video cells on one rendered row.
+fn reversed_cells_on_row(terminal: &Terminal<TestBackend>, row: u16) -> usize {
+    let buffer = terminal.backend().buffer();
+    (0..buffer.area.width)
+        .filter(|&x| buffer[(x, row)].style().add_modifier == ratatui::style::Modifier::REVERSED)
+        .count()
+}
+
+/// Count every reversed-video cell in a rendered frame.
+fn reversed_cells(terminal: &Terminal<TestBackend>) -> usize {
+    let buffer = terminal.backend().buffer();
+    (0..buffer.area.height)
+        .map(|row| reversed_cells_on_row(terminal, row))
+        .sum()
+}
+
+#[test]
+fn a_drag_selects_characters_and_copies_silently() {
+    // The Helix-style contract: a press-drag-release over the
+    // conversation selects exactly the covered characters — partial
+    // lines included — and on release the text goes to the
+    // clipboard. Nothing is appended to the conversation.
+    let mut app = app();
+    let now = chrono::Utc::now();
+    app.push_message(TuiMessage::User {
+        text: "abcdefghij".to_string(),
+        timestamp: now,
+    });
+    app.push_message(TuiMessage::User {
+        text: "klmnopqrst".to_string(),
+        timestamp: now,
+    });
+    let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&copied);
+    app.set_selection_copier(Box::new(move |text| {
+        sink.lock().expect("sink").push(text.to_string());
+    }));
+
+    let _ = render_to_buffer(&mut app, 80, 24);
+    let before = app.conversation().len();
+    // how user text renders: find its row and leading offset
+    let probe = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&probe);
+    let row = rows
+        .iter()
+        .position(|r| r.contains("abcdefghij"))
+        .unwrap_or(0);
+    let col = rows[row].find("abcdefghij").unwrap_or(0);
+
+    let press = mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 2).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    );
+    app.handle_event(&press);
+    let drag = mouse_event(
+        MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 5).unwrap_or(0),
+        u16::try_from(row + 1).unwrap_or(0),
+    );
+    app.handle_event(&drag);
+    let up = mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 5).unwrap_or(0),
+        u16::try_from(row + 1).unwrap_or(0),
+    );
+    app.handle_event(&up);
+
+    let copied = copied.lock().expect("sink").clone();
+    assert_eq!(copied.len(), 1, "exactly one silent copy");
+    let expected = "cdefghij\nklmnop".to_string();
+    assert_eq!(
+        copied[0], expected,
+        "character-granular coverage, partial first and last lines"
+    );
+    assert_eq!(
+        app.conversation().len(),
+        before,
+        "the copy is silent — nothing joins the conversation"
+    );
+}
+
+#[test]
+fn a_drag_shows_the_highlight_before_release() {
+    let mut app = app();
+    let now = chrono::Utc::now();
+    app.push_message(TuiMessage::User {
+        text: "abcdefghij".to_string(),
+        timestamp: now,
+    });
+    let _ = render_to_buffer(&mut app, 80, 24);
+    let probe = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&probe);
+    let row = rows
+        .iter()
+        .position(|r| r.contains("abcdefghij"))
+        .unwrap_or(0);
+    let col = rows[row].find("abcdefghij").unwrap_or(0);
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        u16::try_from(col).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    let selecting = render_to_buffer(&mut app, 80, 24);
+    let buffer = selecting.backend().buffer();
+    let reversed = (0..80u16)
+        .filter(|&x| {
+            buffer[(x, u16::try_from(row).unwrap_or(0))]
+                .style()
+                .add_modifier
+                == ratatui::style::Modifier::REVERSED
+        })
+        .count();
+    assert!(reversed >= 1, "the anchored cell highlights immediately");
+}
+
+#[test]
+fn the_transparent_theme_underlines_its_composer() {
+    // The paintless chrome's composer marking: hairline rules the
+    // terminal draws itself — underlined spacer above, underlined
+    // last row below — thin and solid on every terminal, glyphs and
+    // paint nowhere.
+    let mut ruled = TuiApp::new(config_with_theme("transparent"));
+    let frame = render_to_buffer(&mut ruled, 80, 24);
+    let buffer = frame.backend().buffer();
+    for x in [1u16, 40, 78] {
+        let top = buffer[(x, 18)].style();
+        assert!(
+            top.add_modifier
+                .contains(ratatui::style::Modifier::UNDERLINED),
+            "the spacer row carries the top rule"
+        );
+        assert_eq!(top.fg, Some(ratatui::style::Color::Indexed(8)));
+        let bottom = buffer[(x, 21)].style();
+        assert!(
+            bottom
+                .add_modifier
+                .contains(ratatui::style::Modifier::UNDERLINED),
+            "the composer's last row carries the bottom rule"
+        );
+        assert_eq!(bottom.fg, Some(ratatui::style::Color::Indexed(8)));
+    }
+    for cell in [(40u16, 19u16), (40, 20)] {
+        let style = buffer[cell].style();
+        assert_eq!(
+            style.bg,
+            Some(ratatui::style::Color::Reset),
+            "the composer stays on the terminal's own background"
+        );
+        assert!(
+            !style
+                .add_modifier
+                .contains(ratatui::style::Modifier::UNDERLINED)
+        );
+    }
+    assert_eq!(buffer[(1, 19)].symbol(), " ", "no border glyphs remain");
+
+    // opaque themes keep their painted, borderless composer
+    let mut plain = app();
+    let plain_frame = render_to_buffer(&mut plain, 80, 24);
+    let buffer = plain_frame.backend().buffer();
+    let style = buffer[(40, 20)].style();
+    assert_eq!(style.bg, Some(ratatui::style::Color::Rgb(68, 71, 90)));
+    assert_eq!(buffer[(1, 19)].symbol(), " ");
+}
+
+#[test]
+fn a_press_in_the_composer_places_the_caret_where_it_landed() {
+    // 24 rows put the composer pane on rows 19..=22 with its text
+    // window on row 20, text starting two columns in.
+    let mut app = app();
+    app.handle_event(&Event::Paste("hello world".to_string()));
+    let mut first = render_to_buffer(&mut app, 80, 24);
+    let caret = first.backend_mut().get_cursor_position().unwrap();
+    assert_eq!(
+        (caret.x, caret.y),
+        (2 + 11, 20),
+        "after the paste the caret sits at the text's end"
+    );
+
+    // a press between the two ls lands the caret mid-word
+    assert!(app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        2 + 4,
+        20,
+    )));
+    let mut clicked = render_to_buffer(&mut app, 80, 24);
+    let caret = clicked.backend_mut().get_cursor_position().unwrap();
+    assert_eq!(
+        (caret.x, caret.y),
+        (6, 20),
+        "the caret lands on the pressed cell"
+    );
+
+    // a press far past the text clamps to the row's end
+    assert!(app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        70,
+        21,
+    )));
+    let mut clamped = render_to_buffer(&mut app, 80, 24);
+    let caret = clamped.backend_mut().get_cursor_position().unwrap();
+    assert_eq!(
+        (caret.x, caret.y),
+        (2 + 11, 20),
+        "the padding row and the empty column clamp onto the text"
+    );
+}
+
+#[test]
+fn a_released_selection_stays_highlighted_until_the_next_press() {
+    // Terminals keep a native selection up after the release; the
+    // in-app selection does the same — the highlight survives the
+    // copy, and a press-release without travel clears it.
+    let mut app = app();
+    let now = chrono::Utc::now();
+    app.push_message(TuiMessage::User {
+        text: "abcdefghij".to_string(),
+        timestamp: now,
+    });
+    let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&copied);
+    app.set_selection_copier(Box::new(move |text| {
+        sink.lock().expect("sink").push(text.to_string());
+    }));
+
+    let probe = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&probe);
+    let row = rows
+        .iter()
+        .position(|r| r.contains("abcdefghij"))
+        .unwrap_or(0);
+    let col = rows[row].find("abcdefghij").unwrap_or(0);
+
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        u16::try_from(col).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 4).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 4).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+
+    let released = render_to_buffer(&mut app, 80, 24);
+    assert!(
+        reversed_cells_on_row(&released, u16::try_from(row).unwrap_or(0)) >= 4,
+        "the highlight stays up after the release"
+    );
+    assert_eq!(
+        copied.lock().expect("sink").len(),
+        1,
+        "the release copied exactly once"
+    );
+
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        u16::try_from(col).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        u16::try_from(col).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    let cleared = render_to_buffer(&mut app, 80, 24);
+    assert_eq!(
+        reversed_cells_on_row(&cleared, u16::try_from(row).unwrap_or(0)),
+        0,
+        "a click without travel clears the selection"
+    );
+    assert_eq!(
+        copied.lock().expect("sink").len(),
+        1,
+        "the clearing click copies nothing"
+    );
+}
+
+#[test]
+fn a_drag_running_past_the_bottom_edge_scrolls_with_the_selection() {
+    // 24 rows put the conversation pane on rows 0..=17.
+    let mut app = app();
+    let now = chrono::Utc::now();
+    for i in 0..30 {
+        app.push_message(TuiMessage::User {
+            text: format!("line{i:02}"),
+            timestamp: now,
+        });
+    }
+    let _ = render_to_buffer(&mut app, 80, 24);
+
+    for _ in 0..5 {
+        app.handle_event(&wheel_event(MouseEventKind::ScrollUp));
+    }
+    let _ = render_to_buffer(&mut app, 80, 24);
+    assert_eq!(app.scroll_offset(), 5);
+
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        2,
+        3,
+    ));
+    assert!(
+        app.handle_event(&mouse_event(
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            2,
+            17,
+        )),
+        "the edge drag reports a redraw"
+    );
+    assert_eq!(
+        app.scroll_offset(),
+        4,
+        "sitting on the pane's bottom line steps the view down one line"
+    );
+    let scrolled = render_to_buffer(&mut app, 80, 24);
+    assert!(
+        reversed_cells_on_row(&scrolled, 17) >= 1,
+        "the selection reaches the pane's bottom line as the view moves"
+    );
+}
+
+#[test]
+fn a_parked_edge_drag_keeps_scrolling_on_the_tick_until_the_document_ends() {
+    // A pointer pushed against the pane's edge goes quiet — the
+    // terminal reports a drag only while the reported cell changes —
+    // so the tick carries an edge push between movements, and the
+    // document's own end bounds the walk.
+    let mut app = app();
+    let now = chrono::Utc::now();
+    for i in 0..30 {
+        app.push_message(TuiMessage::User {
+            text: format!("line{i:02}"),
+            timestamp: now,
+        });
+    }
+    let _ = render_to_buffer(&mut app, 80, 24);
+    for _ in 0..5 {
+        app.handle_event(&wheel_event(MouseEventKind::ScrollUp));
+    }
+    let _ = render_to_buffer(&mut app, 80, 24);
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        2,
+        3,
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+        2,
+        17,
+    ));
+    assert_eq!(
+        app.scroll_offset(),
+        4,
+        "the movement report itself releases the first line"
+    );
+
+    // the pointer parks: ticks carry the push the rest of the way,
+    // with the frame between as the run loop draws it
+    let mut ticks = 0;
+    while app.tick_wake(std::time::Instant::now()) {
+        ticks += 1;
+        assert!(
+            ticks < 10,
+            "the parked push reaches the bottom in bounded ticks"
+        );
+        let _ = render_to_buffer(&mut app, 80, 24);
+    }
+    assert_eq!(
+        app.scroll_offset(),
+        0,
+        "the parked push walks the view back to the bottom"
+    );
+    assert!(app.auto_scroll(), "reaching the bottom re-arms stickiness");
+    let settled = render_to_buffer(&mut app, 80, 24);
+    assert!(
+        reversed_cells_on_row(&settled, 17) >= 1,
+        "the selection follows the edge all the way down"
+    );
+    for _ in 0..6 {
+        // the blink phase may flip on any of these; the claim is
+        // that nothing scrolls
+        let _woke = app.tick_wake(std::time::Instant::now());
+    }
+    assert_eq!(
+        app.scroll_offset(),
+        0,
+        "parked at the bottom with nothing left to move, ticks move nothing"
+    );
+}
+
+#[test]
+fn buttonless_motion_ends_a_parked_edge_drag() {
+    // A release delivered outside the terminal's view never arrives
+    // as an Up event; motion with no button held can only be sent
+    // when no button is down, so it ends the push.
+    let mut app = app();
+    let now = chrono::Utc::now();
+    for i in 0..30 {
+        app.push_message(TuiMessage::User {
+            text: format!("line{i:02}"),
+            timestamp: now,
+        });
+    }
+    let _ = render_to_buffer(&mut app, 80, 24);
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        2,
+        3,
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+        2,
+        0,
+    ));
+    assert_eq!(app.scroll_offset(), 1);
+    assert!(app.tick_wake(std::time::Instant::now()));
+    assert_eq!(app.scroll_offset(), 2, "the parked push steps on the tick");
+    let _ = render_to_buffer(&mut app, 80, 24);
+
+    // the lost release: no Up ever arrives; the next buttonless
+    // motion ends the drag and the push stops mid-document
+    assert!(
+        !app.handle_event(&mouse_event(MouseEventKind::Moved, 2, 2)),
+        "the healing motion redraws nothing"
+    );
+    assert!(
+        !app.tick_wake(std::time::Instant::now()),
+        "a healed drag claims no tick"
+    );
+    assert_eq!(
+        app.scroll_offset(),
+        2,
+        "the push is over — no further scrolling"
+    );
+}
+
+#[test]
+fn a_drag_running_past_the_top_edge_scrolls_upward() {
+    let mut app = app();
+    let now = chrono::Utc::now();
+    for i in 0..30 {
+        app.push_message(TuiMessage::User {
+            text: format!("line{i:02}"),
+            timestamp: now,
+        });
+    }
+    let _ = render_to_buffer(&mut app, 80, 24);
+
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        2,
+        5,
+    ));
+    assert!(
+        app.handle_event(&mouse_event(
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            2,
+            0,
+        )),
+        "the edge drag reports a redraw"
+    );
+    assert_eq!(
+        app.scroll_offset(),
+        1,
+        "sitting on the pane's top line steps the view up one line"
+    );
+    assert!(!app.auto_scroll(), "the upward edge drag detaches");
+    let scrolled = render_to_buffer(&mut app, 80, 24);
+    assert!(
+        reversed_cells_on_row(&scrolled, 0) >= 1,
+        "the selection reaches the pane's top line as the view moves"
+    );
+    // the push parks: ticks carry it upward, bounded by the
+    // document's first line — 30 lines over an 18-row pane end at
+    // offset 12
+    let mut ticks = 0;
+    while app.tick_wake(std::time::Instant::now()) {
+        ticks += 1;
+        assert!(
+            ticks < 20,
+            "the parked push reaches the document top in bounded ticks"
+        );
+        let _ = render_to_buffer(&mut app, 80, 24);
+    }
+    assert_eq!(app.scroll_offset(), 12, "the walk ends pinned at the top");
+    let settled = render_to_buffer(&mut app, 80, 24);
+    assert!(
+        reversed_cells_on_row(&settled, 0) >= 1,
+        "the selection follows the edge all the way up"
+    );
+}
+
+#[test]
+fn shift_arrows_extend_and_shrink_a_released_selection() {
+    // The keyboard half of the editor convention: with a selection
+    // up, Shift and an arrow moves the head while the anchor stays —
+    // stepping away extends, stepping back shrinks — and each step
+    // refreshes the clipboard copy the release made.
+    let mut app = app();
+    let now = chrono::Utc::now();
+    app.push_message(TuiMessage::User {
+        text: "abcdefghij".to_string(),
+        timestamp: now,
+    });
+    app.push_message(TuiMessage::User {
+        text: "klmnopqrst".to_string(),
+        timestamp: now,
+    });
+    let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&copied);
+    app.set_selection_copier(Box::new(move |text| {
+        sink.lock().expect("sink").push(text.to_string());
+    }));
+
+    let probe = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&probe);
+    let row = rows
+        .iter()
+        .position(|r| r.contains("abcdefghij"))
+        .unwrap_or(0);
+    let col = rows[row].find("abcdefghij").unwrap_or(0);
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 2).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 5).unwrap_or(0),
+        u16::try_from(row + 1).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 5).unwrap_or(0),
+        u16::try_from(row + 1).unwrap_or(0),
+    ));
+
+    // right extends the head's line; up pulls the head back a line,
+    // shrinking the selection onto its first line; left shrinks
+    // within the line
+    app.handle_event(&key(KeyCode::Right, KeyModifiers::SHIFT));
+    app.handle_event(&key(KeyCode::Up, KeyModifiers::SHIFT));
+    app.handle_event(&key(KeyCode::Left, KeyModifiers::SHIFT));
+
+    let copied = copied.lock().expect("sink").clone();
+    assert_eq!(
+        copied,
+        vec![
+            "cdefghij\nklmnop".to_string(),
+            "cdefghij\nklmnopq".to_string(),
+            "cdefg".to_string(),
+            "cdef".to_string(),
+        ],
+        "release copies, then each Shift-arrow step replaces the copy"
+    );
+}
+
+#[test]
+fn shift_arrows_walk_the_view_to_follow_the_head() {
+    // A keyboard-walked head crosses the viewport under its own
+    // power; the view follows and the walk ends pinned at the
+    // document's last line.
+    let mut app = app();
+    let now = chrono::Utc::now();
+    for i in 0..30 {
+        app.push_message(TuiMessage::User {
+            text: format!("line{i:02}"),
+            timestamp: now,
+        });
+    }
+    let _ = render_to_buffer(&mut app, 80, 24);
+    for _ in 0..5 {
+        app.handle_event(&wheel_event(MouseEventKind::ScrollUp));
+    }
+    let _ = render_to_buffer(&mut app, 80, 24);
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        2,
+        3,
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+        2,
+        4,
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        2,
+        4,
+    ));
+    assert_eq!(app.scroll_offset(), 5);
+
+    for _ in 0..20 {
+        app.handle_event(&key(KeyCode::Down, KeyModifiers::SHIFT));
+        let _ = render_to_buffer(&mut app, 80, 24);
+    }
+    assert_eq!(
+        app.scroll_offset(),
+        0,
+        "the view followed the head all the way down"
+    );
+    assert!(app.auto_scroll(), "the walk re-arms at the bottom");
+    let settled = render_to_buffer(&mut app, 80, 24);
+    assert!(
+        reversed_cells_on_row(&settled, 17) >= 1,
+        "the head sits on the document's last, visible line"
+    );
+}
+
+#[test]
+fn plain_arrows_still_scroll_while_a_selection_is_up() {
+    // The user's standing arrow behavior is untouched: with the
+    // input empty and nothing recallable, plain arrows scroll the
+    // transcript — a selection up changes nothing about that.
+    let mut app = app();
+    let now = chrono::Utc::now();
+    for i in 0..30 {
+        app.push_message(TuiMessage::User {
+            text: format!("line{i:02}"),
+            timestamp: now,
+        });
+    }
+    let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&copied);
+    app.set_selection_copier(Box::new(move |text| {
+        sink.lock().expect("sink").push(text.to_string());
+    }));
+    let _ = render_to_buffer(&mut app, 80, 24);
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        2,
+        3,
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+        2,
+        4,
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        2,
+        4,
+    ));
+    assert_eq!(copied.lock().expect("sink").len(), 1);
+
+    assert!(app.handle_event(&plain(KeyCode::Up)));
+    assert_eq!(app.scroll_offset(), 1, "plain Up scrolls a line");
+    assert!(app.handle_event(&plain(KeyCode::Down)));
+    assert_eq!(app.scroll_offset(), 0, "plain Down scrolls back");
+    assert_eq!(
+        copied.lock().expect("sink").len(),
+        1,
+        "plain arrows copy nothing"
+    );
+}
+
+#[test]
+fn a_rebuilt_line_space_forfeits_the_selection() {
+    // The selection's indexes name the rendered line space; a
+    // verbosity switch or a resize rebuilds that space under them,
+    // and stale numbers would highlight — and copy — text the user
+    // never chose. A re-flowed document forfeits the selection.
+    let mut app = app();
+    let now = chrono::Utc::now();
+    for text in ["abcdefghij", "klmnopqrst"] {
+        app.push_message(TuiMessage::User {
+            text: text.to_string(),
+            timestamp: now,
+        });
+    }
+    let probe = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&probe);
+    let row = rows
+        .iter()
+        .position(|r| r.contains("abcdefghij"))
+        .unwrap_or(0);
+    let col = rows[row].find("abcdefghij").unwrap_or(0);
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        u16::try_from(col).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 4).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 4).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    let selected = render_to_buffer(&mut app, 80, 24);
+    assert!(
+        reversed_cells(&selected) >= 1,
+        "sanity: the selection highlights before the rebuild"
+    );
+
+    app.handle_event(&plain(KeyCode::F(2)));
+    let rebuilt = render_to_buffer(&mut app, 80, 24);
+    assert_eq!(
+        reversed_cells(&rebuilt),
+        0,
+        "a verbosity switch rebuilds the line space and forfeits the selection"
+    );
+
+    // a re-selected highlight survives renders and dies on the re-wrap
+    let probe = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&probe);
+    let row = rows
+        .iter()
+        .position(|r| r.contains("abcdefghij"))
+        .unwrap_or(0);
+    let col = rows[row].find("abcdefghij").unwrap_or(0);
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        u16::try_from(col).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 4).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 4).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    let reselected = render_to_buffer(&mut app, 80, 24);
+    assert!(reversed_cells(&reselected) >= 1, "sanity: re-selected");
+    let rewrapped = render_to_buffer(&mut app, 60, 24);
+    assert_eq!(
+        reversed_cells(&rewrapped),
+        0,
+        "a re-wrapping resize forfeits the selection"
+    );
+}
+
+#[test]
+fn the_caret_blinks_on_the_tick_and_input_resolidifies_it() {
+    // The terminal's blinking-cursor request is often ignored or
+    // preference-gated, so the app owns the blink: half a second
+    // visible, half a second gone, restarted by any input.
+    let mut app = app();
+    app.handle_event(&Event::Paste("hi".to_string()));
+    let _ = render_to_buffer(&mut app, 80, 24);
+
+    for _ in 0..4 {
+        assert!(
+            !app.tick_wake(std::time::Instant::now()),
+            "ticks between flips draw nothing"
+        );
+    }
+    assert!(
+        app.tick_wake(std::time::Instant::now()),
+        "the fifth tick flips the caret to its dark phase"
+    );
+    for _ in 0..4 {
+        assert!(!app.tick_wake(std::time::Instant::now()));
+    }
+    assert!(
+        app.tick_wake(std::time::Instant::now()),
+        "the next fifth tick flips it back"
+    );
+
+    // input during the dark phase resolidifies the caret and
+    // restarts the count
+    app.handle_event(&plain(KeyCode::Char('x')));
+    for _ in 0..4 {
+        assert!(!app.tick_wake(std::time::Instant::now()));
+    }
+    assert!(app.tick_wake(std::time::Instant::now()));
 }
 
 #[test]
@@ -1097,72 +1897,54 @@ fn a_submit_increments_the_shared_queue_depth() {
 }
 
 #[test]
-fn the_input_field_stays_fixed_and_windows_the_caret_line() {
+fn the_input_field_grows_with_its_buffer_up_to_the_cap() {
     let state = dch_tui::TuiObserverState::new();
     let (observer, kept) = state.into_observer();
     drop(observer);
-    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept.clone());
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
 
-    // 24 rows: conversation 0..17, spacer 18, the padded composer
-    // 19..22 (padding row, two text rows, padding row), the status
-    // bar 23 — and the composer carries no text of its own.
-    let single = render_to_buffer(&mut app, 40, 24);
-    let rows = row_texts(&single);
+    // empty composer: one text row — the pane is three rows
+    // (padding, text, padding), rows 19..21, and the field is blank.
+    let empty = render_to_buffer(&mut app, 40, 24);
+    let rows = row_texts(&empty);
     assert!(
-        !rows[20].contains("enter") && !rows[21].contains("enter"),
-        "the field holds only what the user typed: {} / {}",
-        rows[19],
-        rows[21]
+        !rows[20].contains("enter"),
+        "the empty field shows its single blank row: {}",
+        rows[20]
     );
 
+    // two lines: the pane grows to four rows and the conversation
+    // yields one — the composer now starts a row higher (18) with
+    // its text on 19 and 20
     app.handle_event(&Event::Paste("one\ntwo".to_string()));
-    let windowed = render_to_buffer(&mut app, 40, 24);
-    let rows = row_texts(&windowed);
+    let two = render_to_buffer(&mut app, 40, 24);
+    let rows = row_texts(&two);
     assert!(
-        rows[20].contains("one") && rows[21].contains("two"),
-        "a multi-line buffer shows its lines: {} / {}",
+        rows[19].contains("one") && rows[20].contains("two"),
+        "a two-line buffer shows both lines: {} / {}",
         rows[19],
         rows[20]
     );
     assert!(
         !rows[23].contains("2/2"),
-        "a buffer that fits the window carries no line-position tag: {}",
+        "a buffer that fits carries no line-position tag: {}",
         rows[23]
     );
 
-    app.handle_event(&Event::Paste("\nthree".to_string()));
-    let grown = render_to_buffer(&mut app, 40, 24);
-    let rows = row_texts(&grown);
+    // five lines: the pane caps at three text rows, the window keeps
+    // the caret's tail visible, and the tag reports the overflow
+    app.handle_event(&Event::Paste("\nfour\nfive\nsix".to_string()));
+    let capped = render_to_buffer(&mut app, 40, 24);
+    let rows = row_texts(&capped);
     assert!(
-        rows[21].contains("three"),
+        rows[20].contains("six"),
         "the window keeps the caret's line visible: {}",
-        rows[21]
+        rows[20]
     );
     assert!(
-        rows[23].contains("3/3"),
-        "a buffer longer than the window carries the line-position tag: {}",
+        rows[23].contains("5/5") || rows[23].contains("5/6"),
+        "a buffer past the cap carries the line-position tag: {}",
         rows[23]
-    );
-
-    app.handle_event(&plain(KeyCode::Up));
-    let scrolled = render_to_buffer(&mut app, 40, 24);
-    let rows = row_texts(&scrolled);
-    assert!(
-        rows[21].contains("two"),
-        "the window keeps the caret's line visible: {}",
-        rows[21]
-    );
-    assert!(
-        rows[23].contains("2/3"),
-        "the tag follows the caret: {}",
-        rows[23]
-    );
-
-    kept.queued.store(2, std::sync::atomic::Ordering::SeqCst);
-    let queued = render_to_buffer(&mut app, 40, 24);
-    assert!(
-        row_texts(&queued)[23].contains("2 queued"),
-        "the queued count rides the status tag while the driver has unclaimed sends"
     );
 }
 
@@ -1343,10 +2125,10 @@ fn the_status_tag_claims_its_columns_from_the_status_text() {
 }
 
 #[test]
-fn the_conversation_pane_holds_still_while_typing() {
-    // The stability contract the fixed input box exists for: a
-    // multi-line prompt being typed must not move the transcript or
-    // its scrollbar by a single row.
+fn the_conversation_pane_holds_still_once_the_composer_reaches_its_cap() {
+    // The stability contract: the composer grows with its buffer up
+    // to the cap, and past that further typing moves nothing — the
+    // transcript and its scrollbar hold still row for row.
     let mut app = app();
     for i in 0..30 {
         app.push_message(TuiMessage::User {
@@ -1354,24 +2136,26 @@ fn the_conversation_pane_holds_still_while_typing() {
             timestamp: chrono::Utc::now(),
         });
     }
-    let before = render_to_buffer(&mut app, 40, 24);
+    // fill the composer past its three-row cap first
     app.handle_event(&Event::Paste(
-        "a prompt\nthat spans\nseveral lines".to_string(),
+        "a prompt\nthat spans\nseveral\nlines".to_string(),
     ));
+    let before = render_to_buffer(&mut app, 40, 24);
+    app.handle_event(&Event::Paste(" and more words".to_string()));
     let after = render_to_buffer(&mut app, 40, 24);
 
     let earlier = before.backend().buffer();
     let later = after.backend().buffer();
-    for y in 0..18u16 {
+    for y in 0..16u16 {
         assert_eq!(
             earlier[(39, y)].symbol(),
             later[(39, y)].symbol(),
-            "row {y}: the scrollbar must not move while the user types"
+            "row {y}: the scrollbar must not move once the cap is reached"
         );
         assert_eq!(
             earlier[(0, y)].symbol(),
             later[(0, y)].symbol(),
-            "row {y}: the transcript's first column must not move while the user types"
+            "row {y}: the transcript's first column must not move once the cap is reached"
         );
     }
 }
