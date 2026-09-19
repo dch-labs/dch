@@ -1333,13 +1333,16 @@ impl TuiApp {
         // The composer's height follows its buffer: one text row when
         // empty, one more per line — typed or wrapped — up to the cap.
         // The wrap width is the pane's regardless of how tall the pane
-        // ends up, so it comes from the terminal itself, not a prior
-        // frame's split.
+        // ends up — the vertical split gives every chunk the full
+        // width — so it comes from the terminal itself, and the one
+        // wrap computed here serves the height, the field, and the
+        // status tag alike.
         let wrap_width = area
             .width
             .max(1)
             .saturating_sub(INPUT_SIDE_INSET.saturating_mul(2));
-        let text_rows = u16::try_from(self.input.display_rows(wrap_width).len())
+        let rows = self.input.display_rows(wrap_width);
+        let text_rows = u16::try_from(rows.len())
             .unwrap_or(1)
             .clamp(1, INPUT_TEXT_ROWS);
         let composer_height = text_rows.saturating_add(INPUT_VERTICAL_PADDING.saturating_mul(2));
@@ -1379,17 +1382,9 @@ impl TuiApp {
                 frame.buffer_mut().set_style(bottom, rule);
             }
         }
-        // The composer's wrap is computed once per frame and shared by
-        // the field and the status tag, so a frame wraps the buffer
-        // through the text once however long it has grown.
         let input_area = pane(&chunks, 2, fallback);
-        let width = input_area
-            .width
-            .max(1)
-            .saturating_sub(INPUT_SIDE_INSET.saturating_mul(2));
-        self.input_wrap_width = width;
-        let rows = self.input.display_rows(width);
-        let caret = self.input.cursor_cell(width).unwrap_or((0, 0));
+        self.input_wrap_width = wrap_width;
+        let caret = self.input.cursor_cell(wrap_width).unwrap_or((0, 0));
         self.render_input(frame, input_area, &rows, caret);
         self.render_status_bar(frame, pane(&chunks, 3, fallback), &rows, caret);
     }
