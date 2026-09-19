@@ -144,11 +144,11 @@ fn background_sequence((red, green, blue): (u8, u8, u8)) -> String {
 
 /// Ask the terminal for its default background and read the reply.
 ///
-/// Writes the OSC 11 query and polls the terminal's input for the
-/// answer under a short deadline — a terminal that does not implement
-/// the query stays silent and the caller skips the whole override.
-/// Runs before any event reader owns stdin: the reply is raw input,
-/// not a key event, so it is read directly.
+/// Writes the OSC 11 query and waits for the answer under a short
+/// deadline — a terminal that does not implement the query stays
+/// silent and the caller skips the whole override. Runs before any
+/// event reader owns stdin: the reply is raw input, not a key
+/// event, so it is read directly.
 ///
 /// Typed-ahead input shares this window, and is gated rather than
 /// blindly consumed. Input already queued when the query would run
@@ -156,19 +156,29 @@ fn background_sequence((red, green, blue): (u8, u8, u8)) -> String {
 /// margin keeps the terminal's own background. Failing that, an OSC
 /// reply always opens with `ESC`, so a first byte that is not one
 /// stops the query at the cost of that single byte instead of
-/// drinking everything the user typed; and every byte is read alone,
-/// so a keystroke arriving behind the reply stays unconsumed for the
-/// event reader rather than riding the same read out of the
-/// terminal. An ESC-leading keystroke (an arrow key, Esc itself)
-/// arriving in the window on a terminal that never answers can
-/// still be consumed with the failed reply attempt — a one-shot,
-/// sub-200 ms startup window that is accepted rather than bridged.
+/// drinking everything the user typed; and every byte is read
+/// alone, so a keystroke arriving behind a completed reply stays
+/// unconsumed for the event reader.
+///
+/// A reply that has started owns the reading until it terminates:
+/// once its first byte has arrived, a second bounded window holds
+/// the query open for the rest, and every byte of it is consumed
+/// here whatever the parse will say — the event reader's parser
+/// does not know OSC replies, so an abandoned tail would reach the
+/// composer as keystrokes ("11;rgb:…" typed into the input). A
+/// reply that completes inside the window is used even though it
+/// outran the first deadline; one that outruns both leaves only
+/// bytes that had not yet arrived, and an ESC-leading keystroke (an
+/// arrow key, Esc itself) arriving in the window is consumed with
+/// the failed reply attempt — a one-shot startup window, bounded
+/// well under half a second, that is accepted rather than bridged.
 #[cfg(unix)]
 fn query_default_background() -> Option<(u8, u8, u8)> {
     use std::time::Duration;
     use std::time::Instant;
 
     const QUERY_DEADLINE: Duration = Duration::from_millis(200);
+    const REPLY_FINISH_DEADLINE: Duration = Duration::from_millis(200);
 
     if stdin_ready(Duration::ZERO) {
         return None;
@@ -177,24 +187,44 @@ fn query_default_background() -> Option<(u8, u8, u8)> {
     write!(stdout, "\x1b]11;?\x1b\\").ok()?;
     stdout.flush().ok()?;
 
-    let deadline = Instant::now().checked_add(QUERY_DEADLINE)?;
     let mut reply = Vec::new();
-    let mut byte = [0u8; 1];
-    while !reply_terminated(&reply) {
-        let wait = deadline.saturating_duration_since(Instant::now());
-        if wait.is_zero() || !stdin_ready(wait) {
-            break;
-        }
-        if read_stdin_raw(&mut byte)? == 0 {
-            return None;
-        }
-        let byte = byte.first().copied()?;
-        if reply.is_empty() && byte != 0x1b {
+    let query_deadline = Instant::now().checked_add(QUERY_DEADLINE)?;
+    while reply.is_empty() {
+        let byte = read_reply_byte(query_deadline)?;
+        if byte != 0x1b {
             return None;
         }
         reply.push(byte);
     }
+    let finish_deadline = Instant::now().checked_add(REPLY_FINISH_DEADLINE)?;
+    while !reply_terminated(&reply) {
+        let Some(byte) = read_reply_byte(finish_deadline) else {
+            break;
+        };
+        reply.push(byte);
+    }
     parse_background_reply(&reply)
+}
+
+/// Read one byte of a reply, waiting until `deadline`.
+///
+/// `None` when the wait expires or the read fails — the caller
+/// decides, phase by phase, what an unfinished reply means. Reads
+/// the descriptor directly through [`read_stdin_raw`], so nothing
+/// hides from the poll in a userspace buffer.
+#[cfg(unix)]
+fn read_reply_byte(deadline: std::time::Instant) -> Option<u8> {
+    use std::time::Instant;
+
+    let mut byte = [0u8; 1];
+    let wait = deadline.saturating_duration_since(Instant::now());
+    if wait.is_zero() || !stdin_ready(wait) {
+        return None;
+    }
+    if read_stdin_raw(&mut byte)? != 1 {
+        return None;
+    }
+    byte.first().copied()
 }
 
 /// Read up to `buf.len()` raw bytes from the terminal's input.
