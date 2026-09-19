@@ -230,6 +230,16 @@ impl InputEditor {
         &self.text
     }
 
+    /// The buffer's text before the caret.
+    ///
+    /// The display-side half of caret placement: a host that draws
+    /// its own prompt measures this prefix to know where the caret
+    /// sits, newlines flattened the same way its rendering does.
+    #[must_use]
+    pub fn text_before_caret(&self) -> &str {
+        self.text.get(..self.cursor).unwrap_or("")
+    }
+
     /// Whether the buffer holds nothing.
     ///
     /// One half of the arrow-key fallback gate — see
@@ -301,6 +311,10 @@ impl InputEditor {
     /// Process one key press; the editor mutates itself and reports
     /// what the app should do.
     ///
+    /// `wrap_width` is the column count the composer is being
+    /// rendered at — Up and Down navigate the wrap grid it defines,
+    /// so vertical motion lands on the rows the user is looking at.
+    ///
     /// Enter submits (whitespace-only buffers are cleared, not
     /// submitted); Shift+Enter inserts a newline where the terminal
     /// reports the modifier, and Ctrl+J — the terminal's own
@@ -314,7 +328,7 @@ impl InputEditor {
     /// control-m — all three spellings submit. Ctrl-C is
     /// deliberately not bound — quit and cancel own it at the app
     /// level.
-    pub fn handle_key(&mut self, key: KeyEvent) -> InputAction {
+    pub fn handle_key(&mut self, key: KeyEvent, wrap_width: u16) -> InputAction {
         debug_assert!(self.text.is_char_boundary(self.cursor));
         match (key.code, key.modifiers) {
             (KeyCode::Enter, KeyModifiers::SHIFT)
@@ -366,11 +380,11 @@ impl InputEditor {
                 InputAction::None
             }
             (KeyCode::Up, KeyModifiers::NONE) => {
-                self.up();
+                self.up(wrap_width);
                 InputAction::None
             }
             (KeyCode::Down, KeyModifiers::NONE) => {
-                self.down();
+                self.down(wrap_width);
                 InputAction::None
             }
             (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
@@ -457,15 +471,31 @@ impl InputEditor {
     /// this case.
     #[must_use]
     pub fn cursor_cell(&self, width: u16) -> Option<(u16, u16)> {
+        let (row, column) = self.cell_at(self.cursor, width)?;
+        Some((
+            u16::try_from(row).unwrap_or(u16::MAX),
+            u16::try_from(column).unwrap_or(u16::MAX),
+        ))
+    }
+
+    /// The display cell a caret offset lands on, in rows and display
+    /// columns.
+    ///
+    /// The mapping behind [`Self::cursor_cell`], exposed by offset
+    /// so vertical motion can search the grid without disturbing
+    /// the caret. `None` for an empty buffer. The cell rises with
+    /// the offset — each further character advances the column or
+    /// the row — which is what makes the grid searchable.
+    fn cell_at(&self, offset: usize, width: u16) -> Option<(usize, usize)> {
         if self.text.is_empty() {
             return None;
         }
         let cap = usize::from(width.max(1));
-        let before = self.text.get(..self.cursor).unwrap_or("");
+        let before = self.text.get(..offset).unwrap_or("");
         let line_index = before.matches('\n').count();
-        let line_col = before.rfind('\n').map_or(self.cursor, |i| {
-            self.cursor.saturating_sub(i.saturating_add(1))
-        });
+        let line_col = before
+            .rfind('\n')
+            .map_or(offset, |i| offset.saturating_sub(i.saturating_add(1)));
         let mut row: usize = 0;
         for (index, logical) in self.text.split('\n').enumerate() {
             let wrapped = textwrap::wrap(logical, cap);
@@ -482,11 +512,7 @@ impl InputEditor {
                     .last()
                     .map_or(0, |row| UnicodeWidthStr::width(row.as_ref()))
                     .saturating_sub(1);
-                let cell_row = row.saturating_add(row_in_line);
-                return Some((
-                    u16::try_from(cell_row).unwrap_or(u16::MAX),
-                    u16::try_from(column).unwrap_or(u16::MAX),
-                ));
+                return Some((row.saturating_add(row_in_line), column));
             }
             row = row.saturating_add(rows_here);
         }
@@ -593,77 +619,75 @@ impl InputEditor {
         }
     }
 
-    /// Move the cursor up one logical line.
-    ///
-    /// The byte column carries over clamped to the line above's
-    /// length, then rounds down to a character boundary — a short
-    /// or multi-byte-bearing line never leaves the cursor
-    /// mid-character.
-    fn move_up(&mut self) {
-        let start = self.line_start();
-        let column = self.cursor.saturating_sub(start);
-        let Some(preceding) = self.text.get(..start).and_then(|p| p.strip_suffix('\n')) else {
-            return;
-        };
-        let above_start = preceding.rfind('\n').map_or(0, |i| i.saturating_add(1));
-        let above_len = preceding.len().saturating_sub(above_start);
-        self.cursor = self.clamp_to_boundary(above_start.saturating_add(column.min(above_len)));
-    }
-
-    /// Move the cursor down one logical line.
-    ///
-    /// The byte column carries over clamped to the line below's
-    /// length, then rounds down to a character boundary — the same
-    /// guarantee [`InputEditor::move_up`] gives in the other
-    /// direction.
-    fn move_down(&mut self) {
-        let end = self.line_end();
-        let column = self.cursor.saturating_sub(self.line_start());
-        let Some(following) = self.text.get(end..).and_then(|r| r.strip_prefix('\n')) else {
-            return;
-        };
-        let below_len = following.find('\n').unwrap_or(following.len());
-        self.cursor =
-            self.clamp_to_boundary(end.saturating_add(1).saturating_add(column.min(below_len)));
-    }
-
-    /// Walk a byte offset back to the nearest UTF-8 character
-    /// boundary.
-    ///
-    /// Vertical movement clamps a byte column against a byte length,
-    /// which can land between the bytes of a multi-byte character on
-    /// the target line; the caret rounds down to the character it
-    /// lands inside. The buffer start is always a boundary, so the
-    /// walk terminates.
-    fn clamp_to_boundary(&self, mut target: usize) -> usize {
-        while !self.text.is_char_boundary(target) {
-            target = target.saturating_sub(1);
-        }
-        target
-    }
-
     /// The Up key.
     ///
-    /// A multi-line buffer moves the cursor up a logical line; a
-    /// single-line buffer recalls the previous history entry.
-    fn up(&mut self) {
-        if self.is_multiline() {
-            self.move_up();
-        } else {
-            self.history_prev();
+    /// The caret climbs one rendered row of the wrap grid while a
+    /// row sits above it; at the top row the press recalls the
+    /// previous history entry instead. The wrap grid — not the
+    /// buffer's newlines — decides: a long wrapped line navigates by
+    /// its rendered rows, and a buffer showing one row stays on
+    /// history.
+    fn up(&mut self, wrap_width: u16) {
+        match self.cursor_cell(wrap_width) {
+            Some((row, column)) if row > 0 => {
+                self.move_caret_to_cell(
+                    wrap_width,
+                    usize::from(row).saturating_sub(1),
+                    usize::from(column),
+                );
+            }
+            _ => self.history_prev(),
         }
     }
 
     /// The Down key.
     ///
-    /// A multi-line buffer moves the cursor down a logical line; a
-    /// single-line buffer steps to the next history entry.
-    fn down(&mut self) {
-        if self.is_multiline() {
-            self.move_down();
-        } else {
-            self.history_next();
+    /// The mirror of [`Self::up`]: the caret drops one rendered row
+    /// while a row sits below it, and the press steps to the next
+    /// history entry at the bottom row.
+    fn down(&mut self, wrap_width: u16) {
+        let rows = self.display_rows(wrap_width).len();
+        match self.cursor_cell(wrap_width) {
+            Some((row, column)) if usize::from(row).saturating_add(1) < rows => {
+                self.move_caret_to_cell(
+                    wrap_width,
+                    usize::from(row).saturating_add(1),
+                    usize::from(column),
+                );
+            }
+            _ => self.history_next(),
         }
+    }
+
+    /// Land the caret on a display cell of the wrap grid.
+    ///
+    /// The shared landing spot for vertical motion and for a host's
+    /// click-to-caret: the furthest caret offset whose cell sits at
+    /// or before `(row, column)`, so the column clamps to the target
+    /// row's own width by construction. Cells rise with the offset,
+    /// so a binary search over the character boundaries finds the
+    /// spot without re-deriving the wrapper's break points — the
+    /// cell mapping behind `cursor_cell` stays the one oracle for
+    /// where a caret lands, keeping motion, clicks, and rendering in
+    /// lockstep.
+    pub fn move_caret_to_cell(&mut self, wrap_width: u16, row: usize, column: usize) {
+        let mut boundaries: Vec<usize> = self.text.char_indices().map(|(i, _)| i).collect();
+        boundaries.push(self.text.len());
+        let mut lo: usize = 0;
+        let mut hi: usize = boundaries.len().saturating_sub(1);
+        while lo < hi {
+            let mid = lo.saturating_add(hi).saturating_add(1) / 2;
+            let at_or_before = boundaries
+                .get(mid)
+                .and_then(|&offset| self.cell_at(offset, wrap_width))
+                .is_some_and(|cell| cell <= (row, column));
+            if at_or_before {
+                lo = mid;
+            } else {
+                hi = mid.saturating_sub(1);
+            }
+        }
+        self.cursor = boundaries.get(lo).copied().unwrap_or(self.text.len());
     }
 
     /// Load the previous history entry.

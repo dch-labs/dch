@@ -100,6 +100,7 @@ impl Theme {
                 input_text: Color::Rgb(248, 248, 242),
                 status_bar_bg: Color::Rgb(68, 71, 90),
                 status_bar_fg: Color::Rgb(248, 248, 242),
+                composer_border: None,
                 status_success: Color::Rgb(110, 210, 220),
                 status_warning: Color::Rgb(241, 250, 140),
                 status_error: Color::Rgb(255, 85, 85),
@@ -168,6 +169,7 @@ impl Theme {
                 input_text: Color::Rgb(236, 239, 244),
                 status_bar_bg: Color::Rgb(59, 66, 82),
                 status_bar_fg: Color::Rgb(236, 239, 244),
+                composer_border: None,
                 status_success: Color::Rgb(163, 190, 140),
                 status_warning: Color::Rgb(235, 203, 139),
                 status_error: Color::Rgb(191, 97, 106),
@@ -236,6 +238,7 @@ impl Theme {
                 input_text: Color::Rgb(200, 208, 255),
                 status_bar_bg: Color::Rgb(41, 46, 66),
                 status_bar_fg: Color::Rgb(200, 208, 255),
+                composer_border: None,
                 status_success: Color::Rgb(169, 177, 214),
                 status_warning: Color::Rgb(235, 137, 88),
                 status_error: Color::Rgb(224, 108, 117),
@@ -304,6 +307,7 @@ impl Theme {
                 input_text: Color::Rgb(235, 219, 178),
                 status_bar_bg: Color::Rgb(60, 56, 54),
                 status_bar_fg: Color::Rgb(235, 219, 178),
+                composer_border: None,
                 status_success: Color::Rgb(152, 151, 26),
                 status_warning: Color::Rgb(215, 153, 33),
                 status_error: Color::Rgb(204, 36, 29),
@@ -372,6 +376,7 @@ impl Theme {
                 input_text: Color::Rgb(60, 56, 54),
                 status_bar_bg: Color::Rgb(235, 219, 178),
                 status_bar_fg: Color::Rgb(60, 56, 54),
+                composer_border: None,
                 status_success: Color::Rgb(152, 151, 26),
                 status_warning: Color::Rgb(215, 153, 33),
                 status_error: Color::Rgb(204, 36, 29),
@@ -440,6 +445,7 @@ impl Theme {
                 input_text: Color::Rgb(131, 148, 150),
                 status_bar_bg: Color::Rgb(7, 54, 66),
                 status_bar_fg: Color::Rgb(131, 148, 150),
+                composer_border: None,
                 status_success: Color::Rgb(133, 153, 0),
                 status_warning: Color::Rgb(181, 137, 0),
                 status_error: Color::Rgb(220, 50, 47),
@@ -508,6 +514,7 @@ impl Theme {
                 input_text: Color::Rgb(88, 110, 117),
                 status_bar_bg: Color::Rgb(238, 232, 213),
                 status_bar_fg: Color::Rgb(88, 110, 117),
+                composer_border: None,
                 status_success: Color::Rgb(133, 153, 0),
                 status_warning: Color::Rgb(181, 137, 0),
                 status_error: Color::Rgb(220, 50, 47),
@@ -576,6 +583,7 @@ impl Theme {
                 input_text: Color::Rgb(76, 79, 105),
                 status_bar_bg: Color::Rgb(230, 233, 239),
                 status_bar_fg: Color::Rgb(76, 79, 105),
+                composer_border: None,
                 status_success: Color::Rgb(64, 160, 43),
                 status_warning: Color::Rgb(223, 142, 29),
                 status_error: Color::Rgb(210, 15, 57),
@@ -644,6 +652,7 @@ impl Theme {
                 input_text: Color::Rgb(198, 208, 245),
                 status_bar_bg: Color::Rgb(41, 44, 60),
                 status_bar_fg: Color::Rgb(198, 208, 245),
+                composer_border: None,
                 status_success: Color::Rgb(166, 209, 137),
                 status_warning: Color::Rgb(229, 200, 144),
                 status_error: Color::Rgb(231, 130, 132),
@@ -712,6 +721,7 @@ impl Theme {
                 input_text: Color::Rgb(202, 211, 245),
                 status_bar_bg: Color::Rgb(30, 32, 48),
                 status_bar_fg: Color::Rgb(202, 211, 245),
+                composer_border: None,
                 status_success: Color::Rgb(166, 218, 149),
                 status_warning: Color::Rgb(238, 212, 159),
                 status_error: Color::Rgb(237, 135, 150),
@@ -780,6 +790,7 @@ impl Theme {
                 input_text: Color::Rgb(205, 214, 244),
                 status_bar_bg: Color::Rgb(24, 24, 37),
                 status_bar_fg: Color::Rgb(205, 214, 244),
+                composer_border: None,
                 status_success: Color::Rgb(166, 227, 161),
                 status_warning: Color::Rgb(249, 226, 175),
                 status_error: Color::Rgb(243, 139, 168),
@@ -848,6 +859,7 @@ impl Theme {
                 input_text: Color::Rgb(171, 178, 191),
                 status_bar_bg: Color::Rgb(44, 49, 58),
                 status_bar_fg: Color::Rgb(171, 178, 191),
+                composer_border: None,
                 status_success: Color::Rgb(152, 195, 121),
                 status_warning: Color::Rgb(209, 154, 102),
                 status_error: Color::Rgb(224, 108, 117),
@@ -916,6 +928,7 @@ impl Theme {
                 input_text: Color::Rgb(248, 248, 242),
                 status_bar_bg: Color::Rgb(62, 61, 50),
                 status_bar_fg: Color::Rgb(248, 248, 242),
+                composer_border: None,
                 status_success: Color::Rgb(166, 226, 46),
                 status_warning: Color::Rgb(244, 191, 117),
                 status_error: Color::Rgb(249, 38, 114),
@@ -984,6 +997,7 @@ impl Theme {
                 input_text: Color::Rgb(209, 213, 218),
                 status_bar_bg: Color::Rgb(48, 54, 61),
                 status_bar_fg: Color::Rgb(201, 209, 217),
+                composer_border: None,
                 status_success: Color::Rgb(63, 185, 80),
                 status_warning: Color::Rgb(187, 128, 9),
                 status_error: Color::Rgb(248, 81, 73),
@@ -1052,6 +1066,7 @@ impl Theme {
                 input_text: Color::Rgb(36, 41, 47),
                 status_bar_bg: Color::Rgb(246, 248, 250),
                 status_bar_fg: Color::Rgb(36, 41, 47),
+                composer_border: None,
                 status_success: Color::Rgb(40, 167, 69),
                 status_warning: Color::Rgb(219, 171, 9),
                 status_error: Color::Rgb(215, 58, 73),
@@ -1120,6 +1135,7 @@ impl Theme {
                 input_text: Color::Rgb(179, 177, 173),
                 status_bar_bg: Color::Rgb(16, 20, 28),
                 status_bar_fg: Color::Rgb(179, 177, 173),
+                composer_border: None,
                 status_success: Color::Rgb(145, 179, 98),
                 status_warning: Color::Rgb(249, 175, 79),
                 status_error: Color::Rgb(234, 108, 115),
@@ -1188,6 +1204,7 @@ impl Theme {
                 input_text: Color::Rgb(224, 222, 244),
                 status_bar_bg: Color::Rgb(31, 29, 46),
                 status_bar_fg: Color::Rgb(224, 222, 244),
+                composer_border: None,
                 status_success: Color::Rgb(49, 116, 143),
                 status_warning: Color::Rgb(246, 193, 119),
                 status_error: Color::Rgb(235, 111, 146),
@@ -1257,6 +1274,7 @@ impl Theme {
                 input_text: Color::Rgb(220, 215, 186),
                 status_bar_bg: Color::Rgb(42, 42, 55),
                 status_bar_fg: Color::Rgb(220, 215, 186),
+                composer_border: None,
                 status_success: Color::Rgb(118, 148, 106),
                 status_warning: Color::Rgb(192, 163, 110),
                 status_error: Color::Rgb(195, 64, 67),
@@ -1326,11 +1344,95 @@ impl Theme {
                 input_text: Color::Rgb(204, 204, 204),
                 status_bar_bg: Color::Rgb(37, 37, 38),
                 status_bar_fg: Color::Rgb(204, 204, 204),
+                composer_border: None,
                 status_success: Color::Rgb(106, 153, 85),
                 status_warning: Color::Rgb(228, 210, 1),
                 status_error: Color::Rgb(214, 24, 27),
                 scrollbar_thumb: Color::Rgb(102, 102, 102),
                 scrollbar_track: Color::Rgb(60, 60, 60),
+            },
+        }
+    }
+
+    /// The Transparent theme.
+    ///
+    /// No colors of its own: every background and foreground defers
+    /// to the terminal's scheme through `Reset`, so the interface
+    /// follows the terminal — light or dark, transparent or opaque —
+    /// instead of painting over it. The session leaves the
+    /// terminal's default background untouched (no background
+    /// override), and the palette carries only what must not defer
+    /// to plain defaults: hairline rules in the terminal's own dim
+    /// tone underline the rows above and below the composer — thin
+    /// and solid on every terminal, where glyphs gap between rows
+    /// and paint is a full cell thick — and the terminal-indexed
+    /// semantic trio (green,
+    /// yellow, red — the scheme's own, not ours) and the
+    /// scrollbar's neutral grays, mid enough to read on either
+    /// pole, carry the rest.
+    /// Syntax highlighting is deliberately absent: code renders in
+    /// the terminal's own foreground.
+    #[must_use]
+    pub(crate) fn transparent() -> Self {
+        Self {
+            name: "Transparent",
+            syntax: SyntaxTheme {
+                attribute: Color::Reset,
+                comment: Color::Reset,
+                constant: Color::Reset,
+                constructor: Color::Reset,
+                embedded: Color::Reset,
+                function: Color::Reset,
+                keyword: Color::Reset,
+                number: Color::Reset,
+                operator: Color::Reset,
+                property: Color::Reset,
+                punctuation: Color::Reset,
+                string: Color::Reset,
+                r#type: Color::Reset,
+                variable: Color::Reset,
+                variable_builtin: Color::Reset,
+                tag: Color::Reset,
+                delimiter: Color::Reset,
+                escape: Color::Reset,
+            },
+            markdown: MarkdownTheme {
+                header1: heading(Color::Reset),
+                header2: heading(Color::Reset),
+                header3: heading(Color::Reset),
+                header4: heading(Color::Reset),
+                header5: heading(Color::Reset),
+                header6: heading(Color::Reset),
+                bold: Style::default().add_modifier(Modifier::BOLD),
+                italic: Style::default().add_modifier(Modifier::ITALIC),
+                code_inline: plain(Color::Reset),
+                code_block: plain(Color::Reset),
+                link: link(Color::Reset),
+                quote: quote(Color::Reset),
+                list_item: plain(Color::Reset),
+                horizontal_rule: plain(Color::Reset),
+            },
+            ui: UIStyle {
+                background: Color::Reset,
+                surface: Color::Reset,
+                foreground: Color::Reset,
+                primary: Color::Reset,
+                secondary: Color::Reset,
+                dim: Color::Reset,
+                border_color: Color::Reset,
+                focused_border_color: Color::Reset,
+                user_message_fg: Color::Reset,
+                assistant_message_fg: Color::Reset,
+                input_border: Color::Reset,
+                input_text: Color::Reset,
+                status_bar_bg: Color::Reset,
+                status_bar_fg: Color::Reset,
+                composer_border: Some(Color::Indexed(8)),
+                status_success: Color::Indexed(2),
+                status_warning: Color::Indexed(3),
+                status_error: Color::Indexed(1),
+                scrollbar_thumb: Color::Rgb(142, 142, 142),
+                scrollbar_track: Color::Rgb(74, 74, 74),
             },
         }
     }
@@ -1370,4 +1472,5 @@ pub(crate) const THEME_CONSTRUCTORS: &[(&str, ThemeConstructor)] = &[
     ("rose_pine", Theme::rose_pine),
     ("kanagawa_wave", Theme::kanagawa_wave),
     ("dark_plus", Theme::dark_plus),
+    ("transparent", Theme::transparent),
 ];

@@ -10,6 +10,8 @@ use std::io::{self, Stdout};
 use crossterm::cursor::SetCursorStyle;
 use std::io::Write as _;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -36,17 +38,17 @@ static ORIGINAL_BACKGROUND: OnceLock<(u8, u8, u8)> = OnceLock::new();
 /// Initialize the terminal for a full-screen TUI session.
 ///
 /// Enables raw mode and enters the alternate screen with bracketed
-/// paste and mouse capture armed — paste lands as one atomic event
-/// and the wheel scrolls the conversation — asks the terminal for a
-/// blinking block cursor, which many terminals do not offer by
+/// paste armed — paste lands as one atomic event — asks the terminal for
+/// a blinking block cursor, which many terminals do not offer by
 /// default (terminals that ignore the style request simply keep
-/// their own) — and asks for full key reporting through both
-/// extension protocols, so Shift+Enter arrives with its modifier
-/// instead of folding into a bare Enter: the kitty protocol
-/// (report-all-keys with alternate keys, so shifted letters still
-/// deliver their text) on terminals that speak it, and xterm's
-/// modifyOtherKeys on the rest. Terminals implementing neither
-/// ignore both pushes and keep their legacy byte stream. Returns a
+/// their own) — and asks for modified-key reporting through the
+/// kitty protocol's disambiguate flag, so Shift+Enter arrives with
+/// its modifier instead of folding into a bare Enter on terminals
+/// that speak it. Terminals implementing neither keep their own
+/// reporting — iTerm2 already distinguishes Shift+Enter on its own,
+/// and xterm's modifyOtherKeys is deliberately left alone: honoring
+/// it switches keys to a spelling the event parser cannot read.
+/// Returns a
 /// terminal bound to stdout. Pair with [`restore_terminal`] — or
 /// hold a [`TerminalGuard`] so the pairing is automatic. A failure
 /// after raw mode was enabled undoes the partial setup — raw mode
@@ -57,7 +59,7 @@ static ORIGINAL_BACKGROUND: OnceLock<(u8, u8, u8)> = OnceLock::new();
 /// # Errors
 /// Fails when the terminal mode or escape-sequence writes are
 /// rejected, most commonly because stdout is not a terminal.
-pub fn init_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
+pub fn init_terminal(mouse_capture: bool) -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     let initialized = (|| {
         let mut stdout = io::stdout();
@@ -65,19 +67,15 @@ pub fn init_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
             stdout,
             EnterAlternateScreen,
             EnableBracketedPaste,
-            EnableMouseCapture,
             SetCursorStyle::BlinkingBlock,
-            PushKeyboardEnhancementFlags(
-                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                    | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
-                    | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS,
-            )
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         )?;
-        // The xterm/VTE counterpart, for terminals without the kitty
-        // protocol: report modified keys that would otherwise fold
-        // into a plain byte — Shift+Enter above all. Kitty-family
-        // terminals ignore this push; each mechanism covers its own.
-        write!(stdout, "\x1b[>4;2m")?;
+        if mouse_capture {
+            execute!(stdout, EnableMouseCapture)?;
+        } else {
+            write!(stdout, "{}", alternate_scroll_sequence(true))?;
+            ALTERNATE_SCROLL_ON.store(true, Ordering::Relaxed);
+        }
         stdout.flush()?;
         let backend = CrosstermBackend::new(stdout);
         Terminal::new(backend)
@@ -103,11 +101,14 @@ pub fn init_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
 /// [`restore_terminal`] on every exit path; a terminal that does not
 /// answer the background query is left exactly as it was, the query
 /// doubling as the capability probe — a set with no captured way
-/// home would repaint the user's shell window for good. The query
-/// occupies stdin for at most its short deadline before the event
-/// reader starts, and typed-ahead input in that window is gated, not
-/// blindly consumed (the query's own doc records the accepted
-/// residual).
+/// home would repaint the user's shell window for good. A non-RGB
+/// canvas — the transparent theme's `Reset`, which defers to the
+/// terminal's own background — leaves this a no-op: the terminal's
+/// configured background, transparent or not, stands exactly as the
+/// user set it. The query occupies stdin for at most its short
+/// deadline before the event reader starts, and typed-ahead input in
+/// that window is gated, not blindly consumed (the query's own doc
+/// records the accepted residual).
 pub fn sync_default_background(background: Color) {
     let Color::Rgb(red, green, blue) = background else {
         return;
@@ -317,6 +318,36 @@ fn parse_channel(token: &str) -> Option<u8> {
     u8::try_from(value.checked_mul(255)?.checked_div(scale)?).ok()
 }
 
+/// The alternate-scroll translation switch.
+///
+/// `CSI ? 1007 h` asks the terminal to turn wheel scrolls into arrow
+/// keys while the alternate screen is up — mouse reporting stays off,
+/// so click-drag selection remains the terminal's own. Byte-pinned so
+/// the enable the session writes and the disable teardown writes stay
+/// exact complements.
+#[cfg(unix)]
+fn alternate_scroll_sequence(enable: bool) -> &'static str {
+    if enable { "\x1b[?1007h" } else { "\x1b[?1007l" }
+}
+
+/// The non-unix counterpart: alternate-scroll translation is a DEC
+/// extension without a Windows analogue, so nothing is asked of the
+/// terminal either way.
+#[cfg(not(unix))]
+fn alternate_scroll_sequence(_enable: bool) -> &'static str {
+    ""
+}
+
+/// Whether this session turned alternate-scroll translation on.
+///
+/// Set by [`init_terminal`] when it writes the enable for a session
+/// that gave the mouse up; claimed by [`restore_terminal`], which
+/// stands down only what the session stood up. Alternate-scroll is a
+/// user-level setting some terminals ship on by default — turning
+/// off a switch the session never turned on would leave it off for
+/// whatever runs in that terminal next.
+static ALTERNATE_SCROLL_ON: AtomicBool = AtomicBool::new(false);
+
 /// Restore the terminal after a TUI session.
 ///
 /// Puts a default background the session overrode back first,
@@ -355,7 +386,9 @@ pub fn restore_terminal() -> io::Result<()> {
     let raw_result = disable_raw_mode();
     let modify_result = (|| {
         let mut stdout = io::stdout();
-        write!(stdout, "\x1b[>4;0m")?;
+        if ALTERNATE_SCROLL_ON.swap(false, Ordering::Relaxed) {
+            write!(stdout, "{}", alternate_scroll_sequence(false))?;
+        }
         stdout.flush()
     })();
     raw_result.and(modes_result).and(modify_result)
@@ -406,8 +439,8 @@ impl TerminalGuard {
     /// # Errors
     /// Propagates [`init_terminal`]'s failure — nothing was changed, so
     /// there is nothing to restore.
-    pub fn new() -> io::Result<(Self, Terminal<CrosstermBackend<Stdout>>)> {
-        let terminal = init_terminal()?;
+    pub fn new(mouse_capture: bool) -> io::Result<(Self, Terminal<CrosstermBackend<Stdout>>)> {
+        let terminal = init_terminal(mouse_capture)?;
         Ok((Self { _private: () }, terminal))
     }
 
@@ -446,6 +479,13 @@ impl Drop for TerminalGuard {
 )]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn the_alternate_scroll_sequences_are_exact_complements() {
+        assert_eq!(alternate_scroll_sequence(true), "\x1b[?1007h");
+        assert_eq!(alternate_scroll_sequence(false), "\x1b[?1007l");
+    }
 
     #[test]
     fn the_set_sequence_matches_the_verified_terminal_app_bytes() {
