@@ -837,11 +837,8 @@ impl TuiApp {
                 match self.selection.take() {
                     Some(selection) => {
                         if selection.anchor != selection.head {
-                            let text = self.selection_text(&selection);
-                            // A span between blank cells can cover no
-                            // text at all; copying that would wipe the
-                            // clipboard for nothing.
-                            if !text.is_empty() {
+                            let (text, covered_any) = self.selection_text(&selection);
+                            if covered_any {
                                 (self.copier)(&text);
                             }
                             self.selection = Some(selection);
@@ -1018,11 +1015,8 @@ impl TuiApp {
         if let Some(selection) = self.selection.as_ref()
             && selection.anchor != selection.head
         {
-            let text = self.selection_text(selection);
-            // A head walked onto a blank line can cover no text at
-            // all; copying that would wipe the clipboard for
-            // nothing.
-            if !text.is_empty() {
+            let (text, covered_any) = self.selection_text(selection);
+            if covered_any {
                 (self.copier)(&text);
             }
         }
@@ -1144,17 +1138,24 @@ impl TuiApp {
         true
     }
 
-    /// The characters the selection covers, as plain text.
+    /// The characters the selection covers, as plain text, with
+    /// whether any character was covered at all.
     ///
     /// Walks the same rendered lines the highlight walks, so what is
-    /// copied is exactly what is shown selected.
-    fn selection_text(&self, selection: &CellSelection) -> String {
+    /// copied is exactly what is shown selected. The flag is false
+    /// only when no row covered a single character — a span over
+    /// blank cells — so a caller can leave the clipboard alone even
+    /// though the separators make the text itself non-empty; an
+    /// interior blank line inside a genuine selection is content
+    /// and does not clear the flag.
+    fn selection_text(&self, selection: &CellSelection) -> (String, bool) {
         let (from, to) = ordered(selection);
         let lines = self.selectable_window(
             from.line,
             to.line.saturating_sub(from.line).saturating_add(1),
         );
         let mut text = String::new();
+        let mut covered_any = false;
         for (offset, line) in lines.iter().enumerate() {
             let line_index = from.line.saturating_add(offset);
             let start = if line_index == from.line { from.col } else { 0 };
@@ -1165,12 +1166,15 @@ impl TuiApp {
             };
             let flat: String = line.spans.iter().map(|s| s.content.to_string()).collect();
             let covered = covered_chars(&flat, start, end);
+            if !covered.is_empty() {
+                covered_any = true;
+            }
             text.push_str(&covered);
             if line_index < to.line {
                 text.push('\n');
             }
         }
-        text
+        (text, covered_any)
     }
 
     /// Route an editor action.

@@ -2058,11 +2058,12 @@ fn a_release_over_blank_cells_copies_nothing() {
     // the blank cells right of a short line: distinct endpoints, no
     // covered text. Overwriting the clipboard with that emptiness
     // would wipe it for nothing — the release applies the same
-    // guard the keyboard walk already does.
+    // guard the keyboard walk already does. Spanning two such rows
+    // must not sneak past the guard as a lone row separator.
     let mut app = app();
     let now = chrono::Utc::now();
     app.push_message(TuiMessage::User {
-        text: "abcdefghij".to_string(),
+        text: "abcdefghij\n\nklmnopqrst".to_string(),
         timestamp: now,
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -2078,6 +2079,11 @@ fn a_release_over_blank_cells_copies_nothing() {
         .position(|r| r.contains("abcdefghij"))
         .unwrap_or(0);
     let col = rows[row].find("abcdefghij").unwrap_or(0);
+    let krow = rows
+        .iter()
+        .position(|r| r.contains("klmnopqrst"))
+        .unwrap_or(0);
+    let blank_row = krow.saturating_sub(1);
     app.handle_event(&mouse_event(
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
         u16::try_from(col + 20).unwrap_or(0),
@@ -2096,6 +2102,78 @@ fn a_release_over_blank_cells_copies_nothing() {
     assert!(
         copied.lock().expect("sink").is_empty(),
         "a span over blank cells never replaces the clipboard"
+    );
+
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 20).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 30).unwrap_or(0),
+        u16::try_from(blank_row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 30).unwrap_or(0),
+        u16::try_from(blank_row).unwrap_or(0),
+    ));
+    assert!(
+        copied.lock().expect("sink").is_empty(),
+        "a two-row span over blank cells copies nothing — not even the row separator"
+    );
+}
+
+#[test]
+fn an_interior_blank_line_stays_in_a_multi_row_copy() {
+    // The covered-any flag only suppresses spans that covered no
+    // characters anywhere; a genuine selection crossing a blank
+    // line copies its text intact, separator rows included — they
+    // are content, not emptiness.
+    let mut app = app();
+    let now = chrono::Utc::now();
+    app.push_message(TuiMessage::User {
+        text: "abcdefghij\n\nklmnopqrst".to_string(),
+        timestamp: now,
+    });
+    let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&copied);
+    app.set_selection_copier(Box::new(move |text| {
+        sink.lock().expect("sink").push(text.to_string());
+    }));
+
+    let probe = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&probe);
+    let row = rows
+        .iter()
+        .position(|r| r.contains("abcdefghij"))
+        .unwrap_or(0);
+    let col = rows[row].find("abcdefghij").unwrap_or(0);
+    let krow = rows
+        .iter()
+        .position(|r| r.contains("klmnopqrst"))
+        .unwrap_or(0);
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 2).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 5).unwrap_or(0),
+        u16::try_from(krow).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 5).unwrap_or(0),
+        u16::try_from(krow).unwrap_or(0),
+    ));
+    let copied = copied.lock().expect("sink").clone();
+    assert_eq!(copied.len(), 1, "the spanning selection copies");
+    assert_eq!(
+        copied[0], "cdefghij\n\nklmnop",
+        "both partial lines and the blank row between them, verbatim"
     );
 }
 
