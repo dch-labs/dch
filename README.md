@@ -73,9 +73,10 @@ echo "summarize this repo" | dch
 ```
 
 A `TASK` argument selects single-run mode; with no argument, a stdin
-that is not a terminal selects it too. Only a bare invocation on a
-terminal launches the TUI. A `TASK` composes with `--resume` (continue
-a saved session headless); neither combines with `--list-sessions`.
+that is not a terminal selects it too. A bare invocation on a
+terminal opens the fullscreen TUI. A `TASK` composes with `--resume`
+(continue a saved session headless); neither combines with
+`--list-sessions`.
 
 Resume a saved session — the restored conversation seeds the display
 and the agent's context, further auto-saves keep writing the same
@@ -114,12 +115,17 @@ Common options:
 | `--done-file PATH` | Write a JSON completion status to PATH (single-run mode) |
 | `-v, --verbose` / `-q, --quiet` | Adjust verbosity |
 
-Themes: `dracula` (default), `nord`, `tokyo_night`, `gruvbox_dark`,
-`gruvbox_light`, `solarized_dark`, `solarized_light`,
+Themes: `transparent` (default), `dracula`, `nord`, `tokyo_night`,
+`gruvbox_dark`, `gruvbox_light`, `solarized_dark`, `solarized_light`,
 `catppuccin_latte`, `catppuccin_frappe`, `catppuccin_macchiato`,
 `catppuccin_mocha`, `one_dark`, `monokai`, `github_dark`,
 `github_light`, `ayu_dark`, `rose_pine`, `kanagawa_wave`, `dark_plus`.
-An unknown name falls back to the default.
+The transparent theme defers to the terminal's own colors, so the
+terminal's background (transparency included) shows through; hairline
+rules in the terminal's own dim tone mark the composer's top and
+bottom, and only the scrollbar and the success/warning/error
+indicators carry colors of their own. An unknown name falls back to
+the default.
 
 ### Exit codes and the done-file
 
@@ -136,8 +142,8 @@ Input (always insert mode):
 | Key | Action |
 | --- | --- |
 | `Enter`, `Ctrl+M` | Submit (Ctrl+M is the same byte as Enter on legacy terminals; enhanced ones report the modifier, and both submit) |
-| `Shift+Enter`, `Ctrl+J`, or `\`+`Enter` | Newline (Shift+Enter on terminals with key-modifier reporting — kitty, wezterm, foot, ghostty, alacritty, xterm, and recent gnome-terminal; macOS Terminal.app reports no modifiers, where Ctrl+J and the backslash form are the newline keys) |
-| `Up` / `Down` | History recall; cursor motion in a multi-line buffer |
+| `Shift+Enter`, `Ctrl+J`, or `\`+`Enter` | Newline (Shift+Enter on terminals with key-modifier reporting — kitty, wezterm, foot, ghostty, alacritty, xterm, and recent gnome-terminal; iTerm2 folds Shift+Enter into a plain one unless a profile key mapping sends `[13;2u` for it; macOS Terminal.app reports no modifiers at all — there Ctrl+J and the backslash form are the newline keys) |
+| `Up` / `Down` | Move the caret through the composer's rendered rows; history recall from the top and bottom rows |
 | `Ctrl-P` / `Ctrl-N` | History recall (always) |
 | `Left` / `Right`, `Home` / `End`, `Ctrl-A` / `Ctrl-E` | Move by character; to line start/end |
 | `Alt+Left` / `Alt+Right`, `Ctrl-W` | Move / delete by word |
@@ -151,8 +157,15 @@ Conversation:
 | --- | --- |
 | `Up` / `Down` | Scroll one line (only while the input is empty with nothing recallable) |
 | `PageUp` / `PageDown` | Scroll ten lines |
-| mouse wheel | Scroll three lines per event |
+| Mouse wheel | Scroll the transcript, one line per event |
+| Mouse drag | Select characters; the highlight stays after release and the text is copied to the clipboard. Dragging on the pane's top or bottom line scrolls the transcript with the selection |
+| Mouse click (composer) | Place the caret where the press landed, clamped to the text |
+| `Shift` + arrows | Move the selection head — extend or shrink the current selection; the view follows and each step refreshes the clipboard copy |
 | `End` | Snap to the newest line (only while the input is empty) |
+
+The mouse and selection rows need `mouse_capture = true` (the
+default): with capture off the terminal owns selection, a selection
+can never start, and the `Shift` + arrows rows do nothing.
 
 Anywhere:
 
@@ -166,7 +179,8 @@ Anywhere:
 Configuration lives in `~/.dch/config.toml`; a
 `~/.dch/config.local.toml`, when present, overrides it field by
 field. Every field has a default — an unconfigured `dch` works
-against a local Ollama server.
+against a local Ollama server. [`example.config`](./example.config)
+documents every option with its possible values and defaults.
 
 ```toml
 [api]
@@ -184,7 +198,9 @@ max_turns = 200
 role = "general"                  # general | coding | refactor | debug | review | docs | tests
 
 [display]
-theme = "dracula"
+theme = "transparent"
+# mouse_capture = true            # the wheel scrolls dch; false hands
+                                  # selection back to the terminal
 verbosity = "normal"              # quiet | normal | verbose
 
 # [[mcp.servers]]                 # external tool servers, connected over stdio
@@ -192,6 +208,11 @@ verbosity = "normal"              # quiet | normal | verbose
 # command = "npx"                 # executable (resolved on PATH or absolute)
 # args = ["-y", "@example/docs-server"]
 ```
+
+`mouse_capture = true` (the default) gives the app the wheel. Set it to
+`false` to keep click-drag text selection with the terminal instead —
+the two are mutually exclusive on terminals without a modifier bypass;
+keyboard scrolling (PageUp/PageDown) still works either way.
 
 See the `dch-config` crate docs (`make docs`) for the full schema.
 

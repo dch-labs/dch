@@ -443,6 +443,16 @@ pub struct UIStyle {
     /// so the pair stays high-contrast.
     pub status_bar_fg: Color,
 
+    /// The thin solid border marking the composer.
+    ///
+    /// `None` wherever the chrome paints — an elevated surface step
+    /// already separates the panes. A theme that paints nothing (the
+    /// transparent one) underlines the rows above and below the
+    /// composer in this color instead: hairline rules the terminal
+    /// draws itself, thin and solid everywhere, while the pane stays
+    /// on the terminal's own background.
+    pub composer_border: Option<Color>,
+
     /// Color for success indicators.
     ///
     /// Applied to check-style markers and completion notices in tool
@@ -503,7 +513,7 @@ impl Theme {
 
 impl Default for Theme {
     fn default() -> Self {
-        Self::dracula()
+        Self::transparent()
     }
 }
 
@@ -599,7 +609,7 @@ mod tests {
         // removed without updating this test fails here first.
         assert_eq!(
             theme_data::THEME_CONSTRUCTORS.len(),
-            20,
+            21,
             "the registry scope moved; update this census with it"
         );
         for key in [
@@ -623,6 +633,7 @@ mod tests {
             "rose_pine",
             "kanagawa_wave",
             "dark_plus",
+            "transparent",
         ] {
             assert!(
                 theme_data::THEME_CONSTRUCTORS
@@ -678,17 +689,20 @@ mod tests {
     }
 
     #[test]
-    fn default_is_dracula() {
-        assert_eq!(Theme::default().name, "Dracula");
+    fn default_is_transparent() {
+        assert_eq!(Theme::default().name, "Transparent");
         assert_eq!(
             Theme::default().syntax.keyword,
-            Theme::dracula().syntax.keyword
+            Theme::transparent().syntax.keyword
         );
     }
 
     #[test]
     fn the_default_key_aliases_the_default_theme() {
-        assert_eq!(Theme::by_name("default").map(|t| t.name), Some("Dracula"));
+        assert_eq!(
+            Theme::by_name("default").map(|t| t.name),
+            Some(Theme::default().name)
+        );
     }
 
     #[test]
@@ -724,6 +738,16 @@ mod tests {
         }
     }
 
+    /// Whether a theme defers its canvas to the terminal.
+    ///
+    /// The transparent theme paints no canvas of its own — `Reset`
+    /// backgrounds everywhere — so the pins that reason about paint
+    /// (elevation off the canvas, contrast against it, palette
+    /// polarity) have nothing to reason about and skip it.
+    fn defers_to_terminal(ui: &UIStyle) -> bool {
+        ui.background == Color::Reset
+    }
+
     #[test]
     fn scrollbar_thumb_contrasts_with_track() {
         // A thumb painted the track's own color is invisible; the pair must
@@ -746,6 +770,9 @@ mod tests {
         // carry no theme color at all.
         for (key, _) in theme_data::THEME_CONSTRUCTORS {
             let ui = Theme::by_name(key).unwrap().ui;
+            if defers_to_terminal(&ui) {
+                continue;
+            }
             assert_eq!(
                 ui.status_bar_bg, ui.surface,
                 "{key}: the bar paints on the theme's elevated surface"
@@ -779,6 +806,9 @@ mod tests {
         }
         for (key, _) in theme_data::THEME_CONSTRUCTORS {
             let ui = Theme::by_name(key).unwrap().ui;
+            if defers_to_terminal(&ui) {
+                continue;
+            }
             let (lf, lb) = (luminance(ui.status_bar_fg), luminance(ui.status_bar_bg));
             let (lighter, darker) = if lf > lb { (lf, lb) } else { (lb, lf) };
             let ratio = (lighter + 0.05) / (darker + 0.05);
@@ -826,10 +856,12 @@ mod tests {
         // on the canvas rather than elevated or visible.
         for (key, _) in theme_data::THEME_CONSTRUCTORS {
             let ui = Theme::by_name(key).unwrap().ui;
-            assert_ne!(
-                ui.surface, ui.background,
-                "{key}: the composer surface must step off the canvas"
-            );
+            if !defers_to_terminal(&ui) {
+                assert_ne!(
+                    ui.surface, ui.background,
+                    "{key}: the composer surface must step off the canvas"
+                );
+            }
             assert_ne!(
                 ui.scrollbar_thumb, ui.background,
                 "{key}: the scrollbar thumb must be visible on the canvas"
@@ -842,11 +874,48 @@ mod tests {
     }
 
     #[test]
+    fn the_transparent_theme_defers_every_paint_to_the_terminal() {
+        // The contract the user chose: no colors of the app's own —
+        // every foreground is the terminal's, the canvas, the
+        // composer, and the status bar paint nothing, a thin
+        // border in the terminal's dim tone marks the composer, the
+        // semantic trio defers through the terminal's indexed
+        // colors, and the scrollbar's neutral grays are the only
+        // paint of the theme's own.
+        let theme = Theme::by_name("transparent").unwrap();
+        let ui = theme.ui;
+        assert_eq!(ui.background, Color::Reset);
+        assert_eq!(ui.surface, Color::Reset);
+        assert_eq!(
+            ui.composer_border,
+            Some(Color::Indexed(8)),
+            "a thin border in the terminal's dim tone marks the composer"
+        );
+        assert_eq!(ui.status_bar_bg, Color::Reset);
+        assert_eq!(ui.foreground, Color::Reset);
+        assert_eq!(ui.user_message_fg, Color::Reset);
+        assert_eq!(ui.assistant_message_fg, Color::Reset);
+        assert_eq!(
+            theme.markdown.code_inline.bg, None,
+            "the inline-code chip paints no tint"
+        );
+        assert_eq!(ui.status_success, Color::Indexed(2));
+        assert_eq!(ui.status_warning, Color::Indexed(3));
+        assert_eq!(ui.status_error, Color::Indexed(1));
+        assert_ne!(ui.scrollbar_thumb, ui.scrollbar_track);
+    }
+
+    #[test]
     fn no_theme_palette_contains_reset_colors() {
-        // `Reset` in a palette is a gap, not a color choice: every theme
-        // must fully specify every field of its syntax and chrome palettes.
+        // `Reset` in a palette is a gap, not a color choice — except
+        // for the transparent theme, whose entire contract is deferral:
+        // every theme must fully specify every field of its syntax and
+        // chrome palettes.
         for (key, _) in theme_data::THEME_CONSTRUCTORS {
             let theme = Theme::by_name(key).unwrap();
+            if defers_to_terminal(&theme.ui) {
+                continue;
+            }
             let syntax = theme.syntax;
             let syntax_fields = [
                 syntax.attribute,
@@ -907,7 +976,8 @@ mod tests {
         // must set a foreground: a bare style would render the element in
         // ambient text color, hiding a palette gap instead of surfacing it.
         for (key, _) in theme_data::THEME_CONSTRUCTORS {
-            let markdown = Theme::by_name(key).unwrap().markdown;
+            let theme = Theme::by_name(key).unwrap();
+            let markdown = theme.markdown;
             let styled = [
                 markdown.header1,
                 markdown.header2,
@@ -923,6 +993,9 @@ mod tests {
                 markdown.horizontal_rule,
             ];
             for style in styled {
+                if defers_to_terminal(&theme.ui) {
+                    continue;
+                }
                 assert!(
                     style.fg.is_some_and(|fg| fg != Color::Reset),
                     "{key}: markdown style without a real foreground"
@@ -953,8 +1026,11 @@ mod tests {
         }
         for (key, _) in theme_data::THEME_CONSTRUCTORS {
             let style = Theme::by_name(key).unwrap().markdown.code_inline;
-            let fg = style.fg.unwrap();
-            let bg = style.bg.unwrap();
+            let (Some(fg), Some(bg)) = (style.fg, style.bg) else {
+                // A chipless theme — the transparent one paints no
+                // tint — has no pair to hold contrast between.
+                continue;
+            };
             let (lf, lb) = (luminance(fg), luminance(bg));
             let (lighter, darker) = if lf > lb { (lf, lb) } else { (lb, lf) };
             let ratio = (lighter + 0.05) / (darker + 0.05);

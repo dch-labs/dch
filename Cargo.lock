@@ -619,6 +619,7 @@ dependencies = [
 name = "dch-tui"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "crossterm",
  "dch-config",

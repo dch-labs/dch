@@ -639,8 +639,20 @@ pub struct DisplayConfig {
     /// Theme name (resolved by the TUI).
     ///
     /// A free-form name the TUI maps to a concrete color scheme. Defaults to
-    /// `"default"`.
+    /// `"transparent"`.
     pub theme: String,
+
+    /// Let the TUI capture the mouse.
+    ///
+    /// Capture is what lets the wheel scroll the conversation, and it is
+    /// also what takes click-drag text selection away from the terminal —
+    /// the two are mutually exclusive, and many terminals offer no
+    /// modifier bypass. Defaults to `true`: the wheel scrolls the
+    /// conversation. Set `false` to hand selection back to the terminal
+    /// — the wheel then reaches the app only where the terminal
+    /// supports alternate-scroll translation, and keyboard scrolling
+    /// (PageUp/PageDown, arrows on an empty editor) covers the rest.
+    pub mouse_capture: bool,
 }
 
 /// Runner runtime behavior.
@@ -883,7 +895,8 @@ impl Default for DisplayConfig {
         Self {
             no_color: false,
             verbosity: Verbosity::default(),
-            theme: "default".to_string(),
+            theme: "transparent".to_string(),
+            mouse_capture: true,
         }
     }
 }
@@ -1042,6 +1055,22 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    #[test]
+    fn display_defaults_to_capturing_the_wheel() {
+        let display = DisplayConfig::default();
+        assert!(
+            display.mouse_capture,
+            "the wheel scrolls the conversation by default"
+        );
+    }
+
+    #[test]
+    fn a_config_without_the_mouse_field_parses_to_capture() {
+        let display: DisplayConfig = toml::from_str(r#"theme = "dracula""#).unwrap();
+        assert!(display.mouse_capture);
+        assert_eq!(display.theme, "dracula");
+    }
+
     const FULL_FIXTURE: &str = r#"
 [api]
 model = "glm-4.7"
@@ -1100,7 +1129,7 @@ redact_secrets = false
         assert_eq!(c.api.max_tokens, 32_000);
         assert_eq!(c.api.request_timeout_secs, 120);
         assert_eq!(c.display.verbosity, Verbosity::Normal);
-        assert_eq!(c.display.theme, "default");
+        assert_eq!(c.display.theme, "transparent");
         assert_eq!(c.runner.max_turns, 200);
         assert_eq!(c.runner.compact_threshold, 80);
         assert_eq!(c.runner.permission_mode, PermissionMode::Auto);
@@ -1191,7 +1220,7 @@ redact_secrets = false
         write_config(tmp.path(), "config.local.toml", "[api]\nmodel = \"B\"\n");
         let c = DchConfig::load_from_dir(tmp.path()).unwrap();
         assert_eq!(c.api.model, "B");
-        assert_eq!(c.display.theme, "default");
+        assert_eq!(c.display.theme, "transparent");
     }
 
     #[test]
@@ -1324,7 +1353,7 @@ redact_secrets = false
         let c = DchConfig::default();
         let _sc = c.to_session_config();
         assert_eq!(c.api.base_url, "");
-        assert_eq!(c.display.theme, "default");
+        assert_eq!(c.display.theme, "transparent");
         assert_eq!(c.runner.permission_mode, PermissionMode::Auto);
         assert_eq!(c.telemetry.level, "info");
     }

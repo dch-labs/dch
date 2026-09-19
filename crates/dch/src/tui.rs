@@ -103,6 +103,7 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
 
     let (submit_tx, submit_rx) = mpsc::unbounded_channel();
     let model = config.api.model.clone();
+    let mouse_capture = config.display.mouse_capture;
     let mut app = TuiApp::from_observer_state(config, state.clone());
     app.set_submit_tx(submit_tx);
 
@@ -141,7 +142,7 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
 
     TerminalGuard::install_panic_hook();
     let (guard, mut terminal) =
-        TerminalGuard::new().map_err(|err| format!("terminal init: {err}"))?;
+        TerminalGuard::new(mouse_capture).map_err(|err| format!("terminal init: {err}"))?;
     // Render draws the grid on the terminal's default background;
     // this points that default at the theme's canvas color for the
     // session's lifetime, so the margin around the grid matches it.
