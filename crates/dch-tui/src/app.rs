@@ -838,7 +838,12 @@ impl TuiApp {
                     Some(selection) => {
                         if selection.anchor != selection.head {
                             let text = self.selection_text(&selection);
-                            (self.copier)(&text);
+                            // A span between blank cells can cover no
+                            // text at all; copying that would wipe the
+                            // clipboard for nothing.
+                            if !text.is_empty() {
+                                (self.copier)(&text);
+                            }
                             self.selection = Some(selection);
                         }
                         true
@@ -2227,20 +2232,31 @@ fn ordered(selection: &CellSelection) -> (&CellPos, &CellPos) {
     }
 }
 
-/// The characters of `flat` whose cells fall in `start..=end`.
+/// Whether a character's display cells meet the selection's span.
 ///
-/// Walks by display cells — a wide character occupies two and is
-/// covered when its first cell is — so the copied characters match
-/// the highlighted cells exactly.
+/// A character counts as covered when any of its cells does: a
+/// selection landing on the second cell of a wide character still
+/// picks it up, the way a terminal's native selection treats
+/// partially covered ink. The character occupies `cell..cell +
+/// width`; `start..=end` are the span's cell bounds.
+fn cells_overlap(cell: usize, width: usize, start: usize, end: usize) -> bool {
+    cell <= end && cell.saturating_add(width).saturating_sub(1) >= start
+}
+
+/// The characters of `flat` whose cells meet `start..=end`.
+///
+/// Walks by display cells and takes every character that overlaps
+/// the span — so the copied characters match the highlighted cells
+/// exactly.
 fn covered_chars(flat: &str, start: usize, end_inclusive: usize) -> String {
     let mut out = String::new();
     let mut cell = 0;
     for ch in flat.chars() {
-        let width = ch.width().unwrap_or(0);
-        if cell >= start && cell <= end_inclusive {
+        let width = ch.width().unwrap_or(0).max(1);
+        if cells_overlap(cell, width, start, end_inclusive) {
             out.push(ch);
         }
-        cell = cell.saturating_add(width.max(1));
+        cell = cell.saturating_add(width);
         if cell > end_inclusive {
             break;
         }
@@ -2273,7 +2289,7 @@ fn reverse_selection(lines: &mut [Line<'_>], skip: usize, selection: &CellSelect
             let mut chunk = String::new();
             for ch in content.chars() {
                 let width = ch.width().unwrap_or(0).max(1);
-                let selected = cell >= start && cell <= end;
+                let selected = cells_overlap(cell, width, start, end);
                 if selected {
                     if !chunk.is_empty() {
                         spans.push(ratatui::text::Span::styled(

@@ -2053,6 +2053,104 @@ fn a_streaming_delta_preserves_a_selection_in_the_settled_transcript() {
 }
 
 #[test]
+fn a_release_over_blank_cells_copies_nothing() {
+    // The press column travels raw, so a drag can sit entirely in
+    // the blank cells right of a short line: distinct endpoints, no
+    // covered text. Overwriting the clipboard with that emptiness
+    // would wipe it for nothing — the release applies the same
+    // guard the keyboard walk already does.
+    let mut app = app();
+    let now = chrono::Utc::now();
+    app.push_message(TuiMessage::User {
+        text: "abcdefghij".to_string(),
+        timestamp: now,
+    });
+    let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&copied);
+    app.set_selection_copier(Box::new(move |text| {
+        sink.lock().expect("sink").push(text.to_string());
+    }));
+
+    let probe = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&probe);
+    let row = rows
+        .iter()
+        .position(|r| r.contains("abcdefghij"))
+        .unwrap_or(0);
+    let col = rows[row].find("abcdefghij").unwrap_or(0);
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 20).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 30).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 30).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    assert!(
+        copied.lock().expect("sink").is_empty(),
+        "a span over blank cells never replaces the clipboard"
+    );
+}
+
+#[test]
+fn a_selection_landing_on_a_wide_characters_second_cell_takes_it() {
+    // A wide character's ink spans two cells, and a selection
+    // starting on the second still covers half of it. Both the
+    // highlight and the copy take the character, matching what a
+    // terminal's native selection does with partially covered ink.
+    let mut app = app();
+    let now = chrono::Utc::now();
+    app.push_message(TuiMessage::User {
+        text: "日x".to_string(),
+        timestamp: now,
+    });
+    let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&copied);
+    app.set_selection_copier(Box::new(move |text| {
+        sink.lock().expect("sink").push(text.to_string());
+    }));
+
+    let probe = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&probe);
+    let row = rows.iter().position(|r| r.contains("日x")).unwrap_or(0);
+    let col = rows[row].find("日x").unwrap_or(0);
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 1).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 2).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 2).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+
+    let copied = copied.lock().expect("sink").clone();
+    assert_eq!(copied.len(), 1, "one copy");
+    assert_eq!(
+        copied[0], "日x",
+        "the half-covered wide character joins the copy"
+    );
+    let selected = render_to_buffer(&mut app, 80, 24);
+    assert!(
+        reversed_cells_on_row(&selected, u16::try_from(row).unwrap_or(0)) >= 2,
+        "the wide character's own cell highlights alongside the covered one"
+    );
+}
+
+#[test]
 fn the_caret_blinks_on_the_tick_and_input_resolidifies_it() {
     // The terminal's blinking-cursor request is often ignored or
     // preference-gated, so the app owns the blink: half a second
