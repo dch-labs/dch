@@ -2,13 +2,15 @@
 //!
 //! Run-mode dispatch: a task argument or a piped stdin routes to the
 //! single-run headless mode (one task, non-interactive, exit code to the
-//! shell); otherwise the interactive TUI session is hosted. `--resume` and
-//! `--list-sessions` are not implemented and exit with an error.
+//! shell); otherwise the interactive TUI session is hosted.
+//! `--list-sessions` prints the session table and exits before any
+//! mode; `--resume` resolves to a control both modes continue from.
 
 mod args;
 mod done;
 mod headless;
 mod messages;
+mod resume;
 mod session;
 mod signals;
 mod tui;
@@ -27,15 +29,15 @@ fn wants_headless(args: &args::Args) -> bool {
 
 /// Whether the runtime-failure path may write the done-file marker.
 ///
-/// The normal dispatch serves the session verbs before the
-/// single-run mode and never writes a marker for them; this
-/// bootstrap-time mirror of that ordering keeps `--done-file`'s
-/// "ignored outside headless mode" promise true even when the
-/// runtime itself fails to construct.
-fn bootstrap_marker_applies(args: &args::Args, stdin_is_terminal: bool) -> bool {
-    !args.list_sessions
-        && args.resume.is_none()
-        && selects_single_run(args.task.as_deref(), stdin_is_terminal)
+/// The normal dispatch serves the listing verb before the single-run
+/// mode and never writes a marker for it; this bootstrap-time mirror
+/// of that ordering keeps `--done-file`'s "ignored outside headless
+/// mode" promise true even when the runtime itself fails to
+/// construct. A resumed run is served by the mode it resumes into —
+/// a task argument or a piped stdin still selects headless, so the
+/// marker rules follow the mode, not the resume flag.
+pub(crate) fn bootstrap_marker_applies(args: &args::Args, stdin_is_terminal: bool) -> bool {
+    !args.list_sessions && selects_single_run(args.task.as_deref(), stdin_is_terminal)
 }
 
 /// The mode decision over the task argument and the stdin kind.
@@ -71,21 +73,20 @@ fn main() -> std::process::ExitCode {
         });
     runtime.block_on(async move {
         if args.list_sessions {
-            eprintln!("--list-sessions is not yet available");
-            std::process::ExitCode::from(1)
-        } else if args.resume.is_some() {
-            eprintln!("--resume is not yet available");
-            std::process::ExitCode::from(1)
-        } else if wants_headless(&args) {
-            let startup_args = args.clone();
-            let startup_mode = headless::capture_marker_mode(args.done_file.as_ref());
-            let startup_bridge = signals::install_construction_handler(move || {
-                headless::write_startup_done_file(&startup_args, startup_mode.as_ref());
-            });
-            let code = headless::run_headless(&args, startup_bridge).await;
-            std::process::ExitCode::from(code)
+            resume::run_list_sessions()
         } else {
-            std::process::ExitCode::from(tui::run_tui(&args).await)
+            let control = resume::resolve_resume(&args);
+            if wants_headless(&args) {
+                let startup_args = args.clone();
+                let startup_mode = headless::capture_marker_mode(args.done_file.as_ref());
+                let startup_bridge = signals::install_construction_handler(move || {
+                    headless::write_startup_done_file(&startup_args, startup_mode.as_ref());
+                });
+                let code = headless::run_headless(&args, startup_bridge, control).await;
+                std::process::ExitCode::from(code)
+            } else {
+                std::process::ExitCode::from(tui::run_tui(&args, control).await)
+            }
         }
     })
 }
@@ -119,18 +120,32 @@ mod tests {
     }
 
     #[test]
-    fn session_verbs_never_take_the_bootstrap_marker() {
-        let id = uuid::Uuid::new_v4().to_string();
+    fn session_listings_never_take_the_bootstrap_marker() {
         let list = args::Args::try_parse_from(["dch", "--list-sessions"]).unwrap();
         assert!(!bootstrap_marker_applies(&list, false));
-        let resume = args::Args::try_parse_from(["dch", "--resume", id.as_str()]).unwrap();
-        assert!(!bootstrap_marker_applies(&resume, false));
+    }
+
+    #[test]
+    fn a_resumed_run_takes_the_marker_of_its_mode() {
+        let id = uuid::Uuid::new_v4().to_string();
+        // A task argument (with or without a resume) is headless and
+        // markers.
+        let task = args::Args::try_parse_from(["dch", "probe"]).unwrap();
+        assert!(bootstrap_marker_applies(&task, true));
+        let resumed_task =
+            args::Args::try_parse_from(["dch", "probe", "--resume", id.as_str()]).unwrap();
+        assert!(
+            bootstrap_marker_applies(&resumed_task, true),
+            "a resumed headless run ran a task and markers it"
+        );
+        // A resume into the TUI (terminal stdin, no task) is not
+        // headless and does not marker.
+        let resumed_tui = args::Args::try_parse_from(["dch", "--resume", id.as_str()]).unwrap();
+        assert!(!bootstrap_marker_applies(&resumed_tui, true));
     }
 
     #[test]
     fn single_run_invocations_take_the_bootstrap_marker() {
-        let task = args::Args::try_parse_from(["dch", "probe"]).unwrap();
-        assert!(bootstrap_marker_applies(&task, true));
         let piped = args::Args::try_parse_from(["dch"]).unwrap();
         assert!(bootstrap_marker_applies(&piped, false));
     }

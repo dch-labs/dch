@@ -81,19 +81,24 @@ impl WriteInput {
     /// Orchestrates validate → lint → staleness check → write. When the path
     /// has a recorded baseline (a prior Read this session), content that
     /// differs from the recorded hash refuses the write as a soft conflict;
-    /// the compared file's identity is pinned and re-checked at the rename,
-    /// so a target swapped in between aborts instead of replacing an
-    /// uncompared file. Under the contained policy, missing parent
-    /// directories are created through a walk that never follows symbolic
-    /// links. A successful write refreshes the recorded baseline, so the
-    /// model's own write never registers as a later external change.
+    /// a baseline whose only observation is resume-armed refuses the write
+    /// outright — the model never saw the file's bytes in this session, so
+    /// there is nothing honest to compare against — until a live Read
+    /// re-records the path. The compared file's identity is pinned and
+    /// re-checked at the rename, so a target swapped in between aborts
+    /// instead of replacing an uncompared file. Under the contained policy,
+    /// missing parent directories are created through a walk that never
+    /// follows symbolic links. A successful write refreshes the recorded
+    /// baseline, so the model's own write never registers as a later
+    /// external change.
     ///
     /// # Errors
     ///
     /// Returns [`ToolError`] for a missing `RunnerContext`, a missing
     /// `file_path`, a missing `content`, a URL `file_path` or a path escaping
-    /// the working directory, a target that changed while the write was
-    /// being prepared, or a file-system error during parent creation or the
+    /// the working directory, a target whose only recorded baseline is
+    /// resume-armed, a target that changed while the write was being
+    /// prepared, or a file-system error during parent creation or the
     /// atomic write.
     async fn write_inner(
         &self,
@@ -148,8 +153,11 @@ impl WriteInput {
         };
 
         let mut expected = None;
-        if let Some(baseline_hash) = rc.as_ref().and_then(|rc| rc.baseline_for(&full_path)) {
-            match crate::conflict::check_content_hash_unchanged(baseline_hash, &full_path).await {
+        if let Some(baseline) = rc.as_ref().and_then(|rc| rc.baseline_for(&full_path)) {
+            if baseline.resumed {
+                return Ok(ToolOutput::error_text(resumed_baseline_message(&full_path)));
+            }
+            match crate::conflict::check_content_hash_unchanged(baseline.hash, &full_path).await {
                 Ok(identity) => expected = Some(identity),
                 Err(failure) => {
                     return match failure {
@@ -182,6 +190,24 @@ impl WriteInput {
 
         Ok(ToolOutput::text(message).with_hint(DisplayHint::Diff))
     }
+}
+
+/// Format the soft-error message for a write held against a resume-armed
+/// baseline.
+///
+/// The path's only recorded observation came from re-arming on resume — the
+/// model never saw the file's bytes in this session — so a hash compare
+/// cannot honestly clear the write: changes made while the session was
+/// inactive would pass it unseen. The text states that and directs the
+/// model to the same recovery path as a staleness refusal.
+fn resumed_baseline_message(path: &Path) -> String {
+    format!(
+        "{path} was last read in a previous session, so its current bytes \
+         are not part of this session's context; not writing until it has \
+         been read here.\n\nRead the file with Read, then re-issue the write \
+         against the content it returns.",
+        path = path.display()
+    )
 }
 
 /// Format a [`LinterResult`] failure as a human-readable message for the tool
@@ -1150,6 +1176,49 @@ mod tests {
             std::fs::read_to_string(&target).unwrap(),
             "EXTERNAL\n",
             "the clobbering write must not happen"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resume_armed_baseline_holds_the_write_until_a_live_read() {
+        // The resume gap the marker exists for: the transcript cannot
+        // carry what the model originally saw, so a re-armed baseline is
+        // not the model's knowledge. The first write must refuse with
+        // the recovery path, a live Read must clear the hold, and the
+        // second write must go through.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("note.txt");
+        std::fs::write(&target, "v2\n").unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let ctx = ctx_in(cwd);
+
+        let rc = runner_ctx(&ctx).unwrap().clone();
+        assert!(rc.record_resumed_read("note.txt").await);
+
+        let tool = WriteInput::default();
+        let input = json!({ "file_path": "note.txt", "content": "derived-from-v1\n" });
+        let out = tool.call(input.clone(), &ctx).await.unwrap();
+        assert!(out.is_error, "{}", out.text_content());
+        let text = out.text_content();
+        assert!(text.contains("previous session"), "{text}");
+        assert!(text.contains("Read"), "{text}");
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "v2\n",
+            "the held write must not touch the file"
+        );
+
+        let read = crate::read::ReadInput::default();
+        read.call(json!({ "file_path": "note.txt" }), &ctx)
+            .await
+            .unwrap();
+
+        let out = tool.call(input, &ctx).await.unwrap();
+        assert!(!out.is_error, "{}", out.text_content());
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "derived-from-v1\n",
+            "a live read clears the hold and the write proceeds"
         );
     }
 

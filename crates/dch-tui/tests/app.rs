@@ -23,7 +23,12 @@ use dch_tui::message::{ActiveTool, ContentBlock, TuiMessage};
 use dch_tui::theme::Theme;
 use loopctl::observer::LoopObserver as _;
 use ratatui::Terminal;
+use ratatui::backend::Backend as _;
 use ratatui::backend::TestBackend;
+use ratatui::layout::Constraint;
+use ratatui::layout::Direction;
+use ratatui::layout::Layout;
+use ratatui::layout::Rect;
 
 fn config_with_theme(name: &str) -> DchConfig {
     let mut config = DchConfig::default();
@@ -77,6 +82,45 @@ fn new_constructs_with_empty_fresh_state() {
 }
 
 #[test]
+fn seeded_messages_become_the_conversation_pinned_to_the_newest() {
+    let mut app = app();
+    let now = chrono::Utc::now();
+    let restored = vec![
+        dch_tui::TuiMessage::User {
+            text: "earlier turn".to_string(),
+            timestamp: now,
+        },
+        dch_tui::TuiMessage::Assistant {
+            blocks: vec![dch_tui::ContentBlock::Text {
+                text: "earlier answer".to_string(),
+            }],
+            timestamp: now,
+            duration_ms: None,
+        },
+    ];
+    // A scroll-up first, so the pin the seeding must restore is not
+    // the constructor's default when it lands.
+    app.handle_event(&plain(KeyCode::PageUp));
+    assert!(!app.auto_scroll(), "the precondition detached the view");
+
+    app.seed_messages(restored);
+
+    assert_eq!(
+        app.conversation().len(),
+        2,
+        "the restored transcript is the conversation"
+    );
+    assert!(
+        matches!(app.conversation().first(), Some(dch_tui::TuiMessage::User { text, .. }) if text == "earlier turn"),
+        "the messages land in order, oldest first"
+    );
+    assert!(
+        app.auto_scroll() && app.scroll_offset() == 0,
+        "a seeded view opens pinned to the newest line"
+    );
+}
+
+#[test]
 fn an_unknown_theme_falls_back_to_default() {
     let app = TuiApp::new(config_with_theme("no such theme"));
     assert_eq!(app.theme.name, Theme::default().name);
@@ -99,9 +143,9 @@ fn typing_echoes_into_the_input() {
     let terminal = render_to_buffer(&mut app, 80, 30);
     let buffer = terminal.backend().buffer();
     let row: String = (0..buffer.area.width)
-        .map(|x| buffer[(x, 27)].symbol().to_string())
+        .map(|x| buffer[(x, 26)].symbol().to_string())
         .collect();
-    assert!(row.contains("hello"), "input box shows the typed text");
+    assert!(row.contains("hello"), "input field shows the typed text");
 }
 
 #[test]
@@ -113,8 +157,8 @@ fn the_caret_follows_display_width_not_bytes() {
     let mut terminal = render_to_buffer(&mut app, 80, 30);
     let caret = terminal.get_cursor_position().unwrap();
     assert_eq!(
-        caret.x, 4,
-        "one border column plus three display columns of text"
+        caret.x, 5,
+        "the padding columns plus three display columns of text"
     );
 
     let mut wide_app = TuiApp::new(config_with_theme("dracula"));
@@ -124,8 +168,8 @@ fn the_caret_follows_display_width_not_bytes() {
     let mut wide_terminal = render_to_buffer(&mut wide_app, 80, 30);
     let caret = wide_terminal.get_cursor_position().unwrap();
     assert_eq!(
-        caret.x, 4,
-        "one border column plus one column and a double-width glyph"
+        caret.x, 5,
+        "the padding columns plus one column and a double-width glyph"
     );
 }
 
@@ -267,8 +311,11 @@ fn scroll_keys_adjust_without_underflow() {
     assert!(app.handle_event(&plain(KeyCode::PageUp)));
     let scrolled = render_to_buffer(&mut app, 40, 10);
     let scrolled_view = view_text(&scrolled, 40, 10);
+    // Conversation is 4 rows at height 10 (spacer, padded two-row
+    // field, status bar); PageUp lifts the window ten lines off the
+    // bottom.
     assert!(
-        !scrolled_view.contains("line 59") && scrolled_view.contains("line 44"),
+        !scrolled_view.contains("line 59") && scrolled_view.contains("line 46"),
         "scrolling up shifts the visible window: {scrolled_view:?}"
     );
 }
@@ -331,20 +378,77 @@ fn layout_shows_three_panes() {
         "status bar names the model: {status_row:?}"
     );
 
-    let input_left_border: Vec<char> = (25..30)
-        .map(|y| {
-            buffer[(0, y)]
-                .symbol()
-                .to_string()
-                .chars()
-                .next()
-                .unwrap_or(' ')
-        })
+    // A blank spacer row separates the conversation from the input
+    // field; the field is the five rows above the status bar — a
+    // pure background tint (one padding row, three text rows, one
+    // padding row), no glyphs anywhere on its edge, no text of its
+    // own.
+    let spacer_row: String = (0..80)
+        .map(|x| buffer[(x, 24)].symbol().to_string())
         .collect();
     assert!(
-        input_left_border.contains(&'│'),
-        "input box borders rows 26-28: {input_left_border:?}"
+        spacer_row.trim().is_empty(),
+        "a blank spacer row separates conversation from input: {spacer_row:?}"
     );
+    let field_row = |y: u16| -> Vec<char> {
+        (0..80)
+            .map(|x| {
+                buffer[(x, y)]
+                    .symbol()
+                    .to_string()
+                    .chars()
+                    .next()
+                    .unwrap_or(' ')
+            })
+            .collect()
+    };
+    let top_pad = field_row(25);
+    let bottom_pad = field_row(28);
+    for row in [top_pad, bottom_pad] {
+        assert!(
+            row.iter().all(|c| *c == ' '),
+            "the field's vertical padding rows are pure blank tint: {row:?}"
+        );
+    }
+    // Square corners: the fill reaches every corner cell — the
+    // padding row's tint and its corner cell are one continuous
+    // rectangle, no clipping and no glyphs.
+    assert_eq!(
+        buffer[(0, 25)].bg,
+        buffer[(2, 25)].bg,
+        "the fill's corner cell carries the same tint as the padding row beside it"
+    );
+    let first_text = field_row(26);
+    assert!(
+        first_text.iter().take(2).all(|c| *c == ' '),
+        "the field's first text row starts after horizontal padding: {:?}",
+        first_text
+    );
+    for row in [field_row(25), field_row(26), field_row(28)] {
+        assert!(
+            !row.iter().any(|c| {
+                matches!(
+                    c,
+                    '│' | '┌'
+                        | '┐'
+                        | '└'
+                        | '┘'
+                        | '─'
+                        | '▗'
+                        | '▖'
+                        | '▝'
+                        | '▘'
+                        | '▐'
+                        | '▌'
+                )
+            }),
+            "the borderless field draws no box or corner glyphs: {row:?}"
+        );
+        assert!(
+            !row.contains(&'⏎'),
+            "the field carries no enter-key hint text: {row:?}"
+        );
+    }
 }
 
 #[test]
@@ -955,10 +1059,10 @@ fn long_error_messages_wrap_at_the_pane_width() {
 }
 
 #[test]
-fn the_mouse_wheel_scrolls_three_lines_per_event() {
+fn the_mouse_wheel_scrolls_one_line_per_event() {
     let mut app = app();
     assert!(app.handle_event(&wheel_event(MouseEventKind::ScrollUp)));
-    assert_eq!(app.scroll_offset(), 3);
+    assert_eq!(app.scroll_offset(), 1);
     assert!(!app.auto_scroll(), "wheel up detaches stickiness");
     assert!(app.handle_event(&wheel_event(MouseEventKind::ScrollDown)));
     assert_eq!(app.scroll_offset(), 0, "one wheel down clears one wheel up");
@@ -993,36 +1097,283 @@ fn a_submit_increments_the_shared_queue_depth() {
 }
 
 #[test]
-fn the_input_box_grows_with_wrapped_lines_and_shows_the_hint() {
+fn the_input_field_stays_fixed_and_windows_the_caret_line() {
     let state = dch_tui::TuiObserverState::new();
     let (observer, kept) = state.into_observer();
     drop(observer);
     let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept.clone());
 
+    // 24 rows: conversation 0..17, spacer 18, the padded composer
+    // 19..22 (padding row, two text rows, padding row), the status
+    // bar 23 — and the composer carries no text of its own.
     let single = render_to_buffer(&mut app, 40, 24);
     let rows = row_texts(&single);
     assert!(
-        rows[20].contains("shift+enter"),
-        "the hint rides the single-row input box's border: {}",
-        rows[20]
+        !rows[20].contains("enter") && !rows[21].contains("enter"),
+        "the field holds only what the user typed: {} / {}",
+        rows[19],
+        rows[21]
     );
 
     app.handle_event(&Event::Paste("one\ntwo".to_string()));
+    let windowed = render_to_buffer(&mut app, 40, 24);
+    let rows = row_texts(&windowed);
+    assert!(
+        rows[20].contains("one") && rows[21].contains("two"),
+        "a multi-line buffer shows its lines: {} / {}",
+        rows[19],
+        rows[20]
+    );
+    assert!(
+        !rows[23].contains("2/2"),
+        "a buffer that fits the window carries no line-position tag: {}",
+        rows[23]
+    );
+
+    app.handle_event(&Event::Paste("\nthree".to_string()));
     let grown = render_to_buffer(&mut app, 40, 24);
     let rows = row_texts(&grown);
     assert!(
-        rows[19].contains("shift+enter"),
-        "a second row moves the border and its title up: {}",
-        rows[19]
+        rows[21].contains("three"),
+        "the window keeps the caret's line visible: {}",
+        rows[21]
     );
-    assert!(rows[20].contains("one"), "the first wrapped row renders");
+    assert!(
+        rows[23].contains("3/3"),
+        "a buffer longer than the window carries the line-position tag: {}",
+        rows[23]
+    );
+
+    app.handle_event(&plain(KeyCode::Up));
+    let scrolled = render_to_buffer(&mut app, 40, 24);
+    let rows = row_texts(&scrolled);
+    assert!(
+        rows[21].contains("two"),
+        "the window keeps the caret's line visible: {}",
+        rows[21]
+    );
+    assert!(
+        rows[23].contains("2/3"),
+        "the tag follows the caret: {}",
+        rows[23]
+    );
 
     kept.queued.store(2, std::sync::atomic::Ordering::SeqCst);
     let queued = render_to_buffer(&mut app, 40, 24);
     assert!(
-        row_texts(&queued)[19].contains("2 queued"),
-        "the queued count prefixes the title while the driver has unclaimed sends"
+        row_texts(&queued)[23].contains("2 queued"),
+        "the queued count rides the status tag while the driver has unclaimed sends"
     );
+}
+
+#[test]
+fn an_exactly_filled_line_stays_visible_with_its_caret_at_the_end() {
+    let mut app = app();
+    for c in "abcdefgh".chars() {
+        app.handle_event(&plain(KeyCode::Char(c)));
+    }
+    // Width 12: the padding leaves an 8-char text width filled
+    // exactly, with the caret on the fresh continuation row behind
+    // it. The multi-row window shows the filled line and the caret
+    // on the row beneath it.
+    let mut terminal = render_to_buffer(&mut app, 12, 10);
+    let rows = row_texts(&terminal);
+    let text_row = rows
+        .iter()
+        .position(|row| row.contains("abcdefgh"))
+        .unwrap_or_else(|| panic!("the exactly filled line stays visible: {rows:?}"));
+    terminal
+        .backend_mut()
+        .assert_cursor_position((2, u16::try_from(text_row).unwrap() + 1));
+}
+
+/// The composer chunk [`TuiApp::render`] lays out, mirrored here so the
+/// undersize pins can name the rows each pane owns at a starved height.
+fn composer_chunk(width: u16, height: u16) -> Rect {
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(0),
+            Constraint::Length(1),
+            Constraint::Length(4),
+            Constraint::Length(1),
+        ])
+        .split(Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        })[2]
+}
+
+#[test]
+fn the_caret_stays_inside_the_composer_in_undersized_terminals() {
+    // The layout starves the composer before the status bar, so under
+    // six rows the field gets fewer rows than its padding plus text
+    // window — at two rows, none at all. Unclamped, the cursor landed
+    // on the status bar's row or past the frame's last row entirely;
+    // the clamp parks it on a row the field owns, and a field with no
+    // rows parks no cursor.
+    for height in [2u16, 3, 4, 5] {
+        let mut app = app();
+        app.handle_event(&Event::Paste("one\ntwo".to_string()));
+        let mut terminal = render_to_buffer(&mut app, 40, height);
+        let composer = composer_chunk(40, height);
+        let (_x, y) = {
+            let position = terminal
+                .backend_mut()
+                .get_cursor_position()
+                .expect("the backend reports a cursor position");
+            (position.x, position.y)
+        };
+        assert!(
+            y < height,
+            "h={height}: the cursor must stay inside the frame, got row {y}"
+        );
+        if composer.height > 0 {
+            assert!(
+                y >= composer.y && y < composer.bottom(),
+                "h={height}: the cursor must sit on a composer row ({composer:?}), got {y}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_status_bar_paints_only_its_own_row_in_undersized_terminals() {
+    // Whatever the height, the bar may paint at most one row — the
+    // frame's last — so a starved composer keeps every row it was
+    // given and never cedes its last one to the bar. The bar is
+    // detected by its own paint, foreground and background together:
+    // the composer's rows share the bar's surface background on their
+    // text cells, so the pair — and the padding cells the composer
+    // leaves at a Reset foreground — is what isolates the bar's row.
+    for height in [2u16, 3, 4, 5, 6] {
+        let mut app = app();
+        let terminal = render_to_buffer(&mut app, 40, height);
+        let buffer = terminal.backend().buffer();
+        let bar_rows: Vec<u16> = (0..height)
+            .filter(|&y| {
+                buffer[(0, y)].fg == app.theme.ui.status_bar_fg
+                    && buffer[(0, y)].bg == app.theme.ui.status_bar_bg
+            })
+            .collect();
+        assert!(
+            bar_rows.iter().all(|&y| y + 1 == height),
+            "h={height}: the bar must paint only the frame's last row, found {bar_rows:?}"
+        );
+    }
+}
+
+#[test]
+fn the_conversation_pane_renders_on_the_terminal_s_own_background() {
+    // The one-layer canvas contract: the session points the terminal's
+    // default background at the theme's `background` (OSC 11), and the
+    // conversation pane renders on that default instead of painting
+    // cells — window margin and grid share one color on one layer, so
+    // no per-cell paint can differ from the margin beside it. Only the
+    // raised surfaces paint: the composer on `surface`, the bar on its
+    // own row.
+    let mut app = app();
+    let terminal = render_to_buffer(&mut app, 40, 10);
+    let buffer = terminal.backend().buffer();
+    assert_eq!(
+        buffer[(5, 2)].bg,
+        ratatui::style::Color::Reset,
+        "the conversation pane leaves its cells to the terminal default — \
+         painting them is what shows a seam against the margin"
+    );
+    let composer = composer_chunk(40, 10);
+    assert_eq!(
+        buffer[(0, composer.y)].bg,
+        app.theme.ui.surface,
+        "the composer draws on the surface color"
+    );
+    assert_eq!(
+        buffer[(0, 9)].bg,
+        app.theme.ui.status_bar_bg,
+        "the status bar paints its own row"
+    );
+}
+
+#[test]
+fn the_status_tag_claims_its_columns_from_the_status_text() {
+    // On a narrow frame the right-aligned tag owns its columns
+    // outright: the model/tokens text clips one column short of the
+    // tag, so a long model name never renders beneath the tag and a
+    // blank column separates the two.
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    let mut config = config_with_theme("dracula");
+    config.api.model = "a-very-long-model-name".to_string();
+    let mut app = TuiApp::from_observer_state(config, kept.clone());
+    kept.queued.store(2, std::sync::atomic::Ordering::SeqCst);
+
+    let terminal = render_to_buffer(&mut app, 20, 8);
+    let rows = row_texts(&terminal);
+    let status = rows.last().expect("the status row");
+    assert!(status.contains("2 queued"), "the tag renders: {status}");
+    assert!(
+        !status.contains("a-very-long-model-name"),
+        "a model name this long must clip short of the tag: {status}"
+    );
+    // "2 queued" is 8 cells inside a 10-cell tag area anchored at the
+    // right edge (columns 10-19); the left text clips at column 9, so
+    // that column — the gutter, not the tag area's own right-alignment
+    // padding — must be blank. Unclipped, the model name's tenth
+    // character renders there, beneath the tag's edge.
+    let columns = status.chars().collect::<Vec<_>>();
+    let gap_at = 20 - 10 - 1;
+    assert!(
+        columns
+            .get(gap_at)
+            .is_some_and(|column| column.is_whitespace()),
+        "a blank column must separate the text from the tag: {status}"
+    );
+    assert_eq!(
+        columns.get(9),
+        Some(&' '),
+        "the clipped text ends one column short of the tag area: {status}"
+    );
+    assert!(
+        status.starts_with(" a-very-l"),
+        "the clipped model text keeps its readable prefix: {status}"
+    );
+}
+
+#[test]
+fn the_conversation_pane_holds_still_while_typing() {
+    // The stability contract the fixed input box exists for: a
+    // multi-line prompt being typed must not move the transcript or
+    // its scrollbar by a single row.
+    let mut app = app();
+    for i in 0..30 {
+        app.push_message(TuiMessage::User {
+            text: format!("line {i:02}"),
+            timestamp: chrono::Utc::now(),
+        });
+    }
+    let before = render_to_buffer(&mut app, 40, 24);
+    app.handle_event(&Event::Paste(
+        "a prompt\nthat spans\nseveral lines".to_string(),
+    ));
+    let after = render_to_buffer(&mut app, 40, 24);
+
+    let earlier = before.backend().buffer();
+    let later = after.backend().buffer();
+    for y in 0..18u16 {
+        assert_eq!(
+            earlier[(39, y)].symbol(),
+            later[(39, y)].symbol(),
+            "row {y}: the scrollbar must not move while the user types"
+        );
+        assert_eq!(
+            earlier[(0, y)].symbol(),
+            later[(0, y)].symbol(),
+            "row {y}: the transcript's first column must not move while the user types"
+        );
+    }
 }
 
 #[test]
@@ -1241,26 +1592,6 @@ fn a_read_failure_propagates_from_the_event_drain() {
         app.input(),
         "x",
         "the trailing event never applies past the failure"
-    );
-}
-
-#[test]
-fn the_caret_renders_on_the_continuation_row_at_an_exact_fill() {
-    let mut app = app();
-    for c in "abcdefghij".chars() {
-        app.handle_event(&plain(KeyCode::Char(c)));
-    }
-    let mut terminal = render_to_buffer(&mut app, 12, 10);
-    let rows = row_texts(&terminal);
-    let text_row = rows
-        .iter()
-        .position(|row| row.contains("abcdefghij"))
-        .unwrap_or_else(|| panic!("the typed text renders: {rows:?}"));
-    let caret_y = u16::try_from(text_row).unwrap() + 1;
-    terminal.backend_mut().assert_cursor_position((1, caret_y));
-    assert!(
-        rows.get(text_row + 1).is_some_and(|row| !row.contains('x')),
-        "the continuation row below the caret is empty: {rows:?}"
     );
 }
 
@@ -1493,4 +1824,75 @@ fn a_reply_graduates_below_the_tool_that_preceded_it() {
         "the conversation keeps the order the events happened — the tool that \
          produced the reply sits above it"
     );
+}
+
+#[test]
+fn the_scrollbar_owns_its_gutter_and_never_touches_text() {
+    let mut app = app();
+    for i in 0..20 {
+        app.push_message(TuiMessage::User {
+            text: format!("message {i:02}"),
+            timestamp: chrono::Utc::now(),
+        });
+    }
+    // 20 one-line messages over the conversation pane make the
+    // document scrollable; the pinned view sits at its bottom.
+    let terminal = render_to_buffer(&mut app, 20, 12);
+    let buffer = terminal.backend().buffer();
+    let thumb = app.theme.ui.scrollbar_thumb;
+    let track = app.theme.ui.scrollbar_track;
+    // 12 rows: 6 for the conversation (spacer, padded two-row
+    // input field, status bar). thumb = 6 * 6 / 20 = 1 row flush
+    // with the track's bottom.
+    for y in 0..6u16 {
+        let cell = &buffer[(19, y)];
+        let in_thumb = y >= 5;
+        assert_eq!(
+            cell.symbol(),
+            " ",
+            "row {y}: the scrollbar paints background fills, not glyphs"
+        );
+        assert_eq!(
+            cell.bg,
+            if in_thumb { thumb } else { track },
+            "row {y}: the solid bar is the theme's thumb and rail colors as cell backgrounds"
+        );
+    }
+    for y in 0..6u16 {
+        for x in 0..19u16 {
+            let cell = &buffer[(x, y)];
+            assert!(
+                cell.symbol() == " " || cell.bg != thumb,
+                "wrapped text never takes the scrollbar's thumb fill ({x},{y})"
+            );
+        }
+    }
+    assert!(
+        (0..19u16).any(|x| buffer[(x, 3)].symbol() != " "),
+        "the text area still carries content beside the gutter"
+    );
+}
+
+#[test]
+fn the_gutter_stays_blank_when_the_document_fits() {
+    let mut app = app();
+    app.push_message(TuiMessage::User {
+        text: "hello".to_string(),
+        timestamp: chrono::Utc::now(),
+    });
+    let terminal = render_to_buffer(&mut app, 20, 12);
+    let buffer = terminal.backend().buffer();
+    for y in 0..6u16 {
+        let cell = &buffer[(19, y)];
+        assert_eq!(
+            cell.symbol(),
+            " ",
+            "row {y}: a document that fits its viewport draws no scrollbar"
+        );
+        assert_eq!(
+            cell.bg,
+            ratatui::style::Color::Reset,
+            "row {y}: no rail fill either — the gutter is untouched"
+        );
+    }
 }

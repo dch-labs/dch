@@ -303,18 +303,28 @@ impl InputEditor {
     ///
     /// Enter submits (whitespace-only buffers are cleared, not
     /// submitted); Shift+Enter inserts a newline where the terminal
-    /// reports the modifier; `\` immediately before the cursor turns
-    /// Enter into a newline on every terminal, consuming the
-    /// backslash. Ctrl-C is deliberately not bound — quit and cancel
-    /// own it at the app level.
+    /// reports the modifier, and Ctrl+J — the terminal's own
+    /// newline key, reported as a control-j on every terminal —
+    /// does the same everywhere; `\` immediately before the cursor
+    /// turns Enter into a newline on every terminal, consuming the
+    /// backslash. Ctrl+M submits too: legacy terminals deliver it
+    /// as the same byte as Enter, terminals on the xterm
+    /// modifyOtherKeys protocol report the modifier on Enter
+    /// itself, and kitty-protocol terminals report it as a
+    /// control-m — all three spellings submit. Ctrl-C is
+    /// deliberately not bound — quit and cancel own it at the app
+    /// level.
     pub fn handle_key(&mut self, key: KeyEvent) -> InputAction {
         debug_assert!(self.text.is_char_boundary(self.cursor));
         match (key.code, key.modifiers) {
-            (KeyCode::Enter, KeyModifiers::SHIFT) | (KeyCode::Char('\n'), _) => {
+            (KeyCode::Enter, KeyModifiers::SHIFT)
+            | (KeyCode::Char('\n'), _)
+            | (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
                 self.insert_newline();
                 InputAction::None
             }
-            (KeyCode::Enter, KeyModifiers::NONE | KeyModifiers::ALT) => self.enter(),
+            (KeyCode::Enter, KeyModifiers::NONE | KeyModifiers::ALT | KeyModifiers::CONTROL)
+            | (KeyCode::Char('m'), KeyModifiers::CONTROL) => self.enter(),
             (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
                 self.insert_char(c);
                 InputAction::None

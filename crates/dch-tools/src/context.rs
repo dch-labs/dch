@@ -7,6 +7,7 @@
 //! policy the file tools resolve under.
 
 use std::fmt;
+use std::io::Read as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -198,7 +199,7 @@ impl RunnerContext {
         crate::state::record(&mut baselines, &key, baseline);
     }
 
-    /// The content hash recorded for `path`, if the path was touched.
+    /// The baseline recorded for `path`, if the path was touched.
     ///
     /// `path` is normalized with the same rule [`record_baseline`](Self::record_baseline)
     /// applies, so a lookup through any spelling of a file finds the
@@ -207,8 +208,10 @@ impl RunnerContext {
     /// the path key and the file's stat identity, since hard-link aliases
     /// are distinct path keys over one physical file — and holds whichever
     /// entry carries the newer observation, mirroring the record rule.
+    /// The entry carries its [`resumed`](crate::state::FileBaseline::resumed)
+    /// marker, which the Write tool's guard consults alongside the hash.
     /// Thin locking wrapper over the accessors in [`crate::state`].
-    pub(crate) fn baseline_for(&self, path: &Path) -> Option<u64> {
+    pub(crate) fn baseline_for(&self, path: &Path) -> Option<crate::state::FileBaseline> {
         let key = self.baseline_map_key(path);
         let by_path = {
             let baselines = self
@@ -218,7 +221,7 @@ impl RunnerContext {
             crate::state::entry(&baselines, &key)
         };
         if self.resolve_policy != ResolvePolicy::Unrestricted {
-            return by_path.map(|baseline| baseline.hash);
+            return by_path;
         }
         let by_identity = identity_of(path).and_then(|identity| {
             let identities = self
@@ -227,7 +230,7 @@ impl RunnerContext {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             crate::state::entry_identity(&identities, identity)
         });
-        let newest = match (by_path, by_identity) {
+        match (by_path, by_identity) {
             (Some(path_entry), Some(identity_entry)) => Some({
                 if identity_entry.observed > path_entry.observed {
                     identity_entry
@@ -236,8 +239,47 @@ impl RunnerContext {
                 }
             }),
             (only, None) | (None, only) => only,
-        };
-        newest.map(|baseline| baseline.hash)
+        }
+    }
+
+    /// Record what a re-read of `file_path`'s current bytes observes,
+    /// re-arming the read-before-write guard the resume path would
+    /// otherwise leave disarmed.
+    ///
+    /// A session restored from a transcript carries its prior reads as
+    /// previews only — no bytes, so no baselines — and without this the
+    /// guard would treat every previously-read file as never-read. The
+    /// path resolves under the run's policy and the file's current
+    /// bytes are read — bounded the way the live Read tool bounds its
+    /// reads: regular files at or under the size cap only, at most the
+    /// cap's worth of bytes, and on the blocking pool so the async
+    /// executor is never held. The observation lands marked
+    /// [`resumed`](crate::state::FileBaseline::resumed): the model
+    /// never saw these bytes in this session, so the Write tool's
+    /// guard holds the file for a fresh live Read before its first
+    /// write. Returns whether the path resolved and the file could be
+    /// read and recorded; a missing, moved, unreadable, out-of-reach,
+    /// irregular, or over-cap file records nothing and the guard
+    /// simply stays disarmed for it.
+    pub async fn record_resumed_read(&self, file_path: &str) -> bool {
+        if crate::util::is_url(file_path) {
+            return false;
+        }
+        let cwd = self.cwd.clone();
+        let policy = self.resolve_policy;
+        let spelling = file_path.to_string();
+        let read = tokio::task::spawn_blocking(move || read_resumable(&spelling, &cwd, policy))
+            .await
+            .ok()
+            .flatten();
+        match read {
+            Some((full_path, bytes)) => {
+                let baseline = crate::state::observe_resumed_bytes(&bytes);
+                self.record_baseline(&full_path, baseline);
+                true
+            }
+            None => false,
+        }
     }
 
     /// The baseline map key for `path`, per the run's resolve policy.
@@ -258,6 +300,42 @@ impl RunnerContext {
             }
         }
     }
+}
+
+/// Resolve `file_path` and read its current bytes when it is a regular
+/// file within the live Read tool's size cap.
+///
+/// The resume re-arm's bounded read, run on the blocking pool. Metadata
+/// comes first: anything other than a regular file (a directory, a
+/// device, a FIFO) or a size over the cap reads as nothing, so neither a
+/// special file's unbounded stream nor an oversized file's full bytes
+/// can enter memory. The open and the read that follow are capped one
+/// byte past the limit, so growth between the metadata check and the
+/// read cannot turn into an unbounded allocation either. Returns the
+/// resolved path with its bytes, or `None` for every refusal case.
+fn read_resumable(
+    file_path: &str,
+    cwd: &Path,
+    policy: ResolvePolicy,
+) -> Option<(PathBuf, Vec<u8>)> {
+    let full_path = crate::util::resolve_path(file_path, cwd, policy).ok()?;
+    let full_path = if policy == ResolvePolicy::Unrestricted {
+        crate::util::canonicalize_existing(&full_path).ok()?
+    } else {
+        full_path
+    };
+    let metadata = std::fs::metadata(&full_path).ok()?;
+    if !metadata.is_file() || metadata.len() > crate::read::MAX_FILE_SIZE_BYTES as u64 {
+        return None;
+    }
+    let file = std::fs::File::open(&full_path).ok()?;
+    let cap = crate::read::MAX_FILE_SIZE_BYTES.saturating_add(1);
+    let mut bytes = Vec::new();
+    file.take(cap as u64).read_to_end(&mut bytes).ok()?;
+    if bytes.len() > crate::read::MAX_FILE_SIZE_BYTES {
+        return None;
+    }
+    Some((full_path, bytes))
 }
 
 /// The stat identity (device, inode) of the file `path` reaches, if the
@@ -612,7 +690,8 @@ mod tests {
         std::fs::write(realdir.join("new.rs"), b"v1").unwrap();
         rc.record_baseline(&linkdir.join("new.rs"), crate::state::observe_bytes(b"v1"));
         assert_eq!(
-            rc.baseline_for(&realdir.join("new.rs")),
+            rc.baseline_for(&realdir.join("new.rs"))
+                .map(|baseline| baseline.hash),
             Some(crate::state::content_hash(b"v1")),
             "the lookup must normalize to the recorded physical key"
         );
@@ -636,7 +715,8 @@ mod tests {
         let rc = RunnerContext::new(tmp.path().to_path_buf());
         rc.record_baseline(&linkdir.join("a.rs"), crate::state::observe_bytes(b"A"));
         assert_eq!(
-            rc.baseline_for(&linkdir.join("a.rs")),
+            rc.baseline_for(&linkdir.join("a.rs"))
+                .map(|baseline| baseline.hash),
             Some(crate::state::content_hash(b"A")),
             "the recorded spelling must find its own baseline"
         );
@@ -666,13 +746,126 @@ mod tests {
         rc.record_baseline(&hard, crate::state::observe_bytes(b"EXT"));
 
         assert_eq!(
-            rc.baseline_for(&real),
+            rc.baseline_for(&real).map(|baseline| baseline.hash),
             Some(crate::state::content_hash(b"EXT")),
             "the alias's newer observation must supersede the stale path entry"
         );
         assert_eq!(
-            rc.baseline_for(&hard),
+            rc.baseline_for(&hard).map(|baseline| baseline.hash),
             Some(crate::state::content_hash(b"EXT"))
+        );
+    }
+
+    #[tokio::test]
+    async fn record_resumed_read_rebuilds_the_baseline_a_prior_read_left() {
+        // The resume seeding's whole contract: the file's current bytes
+        // become the recorded baseline through the same resolution rules
+        // — marked resume-armed, never as the model's live knowledge.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("note.txt"), b"current state").unwrap();
+
+        let rc = RunnerContext::new(tmp.path().to_path_buf());
+        assert!(
+            rc.record_resumed_read("note.txt").await,
+            "a readable in-reach file records"
+        );
+        assert_eq!(
+            rc.baseline_for(&tmp.path().join("note.txt"))
+                .map(|baseline| baseline.hash),
+            Some(crate::state::content_hash(b"current state")),
+            "the baseline hashes the bytes a fresh read observes"
+        );
+
+        assert!(
+            !rc.record_resumed_read("gone.txt").await,
+            "a missing file records nothing"
+        );
+        assert!(
+            !rc.record_resumed_read("../outside.txt").await,
+            "an out-of-reach spelling records nothing under containment"
+        );
+        assert!(
+            !rc.record_resumed_read("https://example.com/x").await,
+            "a URL preview is not a path to read"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_resumed_read_keys_an_unrestricted_spelling_canonically() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("note.txt"), b"one").unwrap();
+
+        let rc = RunnerContext::new(tmp.path().to_path_buf())
+            .with_resolve_policy(ResolvePolicy::Unrestricted);
+        assert!(rc.record_resumed_read("note.txt").await);
+        assert_eq!(
+            rc.baseline_for(&tmp.path().join("note.txt"))
+                .map(|baseline| baseline.hash),
+            Some(crate::state::content_hash(b"one")),
+            "an unrestricted record lands under the canonical key a live read uses"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resumed_baseline_is_marked_until_a_live_observation_supersedes_it() {
+        // The marker the write guard consults: re-arming observes bytes
+        // the model never saw in this session, so the baseline carries
+        // `resumed` until a live read or a successful write re-records
+        // the path.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("note.txt"), b"v2").unwrap();
+
+        let rc = RunnerContext::new(tmp.path().to_path_buf());
+        assert!(rc.record_resumed_read("note.txt").await);
+        assert!(
+            rc.baseline_for(&tmp.path().join("note.txt"))
+                .is_some_and(|baseline| baseline.resumed),
+            "a resume re-arm must not pose as the model's live knowledge"
+        );
+
+        rc.record_baseline(
+            &tmp.path().join("note.txt"),
+            crate::state::observe_bytes(b"v2"),
+        );
+        assert!(
+            rc.baseline_for(&tmp.path().join("note.txt"))
+                .is_some_and(|baseline| !baseline.resumed),
+            "a live observation supersedes the marker"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_resumed_read_skips_files_over_the_live_read_cap() {
+        // The bounded-read half of the resume re-arm: an over-cap file
+        // reads as nothing, exactly as the live Read tool would refuse
+        // it, so the re-arm cannot pull unbounded bytes into memory.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join("huge.bin"),
+            vec![b'x'; crate::read::MAX_FILE_SIZE_BYTES + 1],
+        )
+        .unwrap();
+
+        let rc = RunnerContext::new(tmp.path().to_path_buf());
+        assert!(
+            !rc.record_resumed_read("huge.bin").await,
+            "an over-cap file records nothing"
+        );
+        assert!(
+            rc.baseline_for(&tmp.path().join("huge.bin")).is_none(),
+            "no baseline, no guard arming"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_resumed_read_skips_directories() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("adir")).unwrap();
+
+        let rc = RunnerContext::new(tmp.path().to_path_buf());
+        assert!(
+            !rc.record_resumed_read("adir").await,
+            "a directory is not a readable baseline"
         );
     }
 
@@ -696,7 +889,7 @@ mod tests {
         rc.record_baseline(&hard, older);
         rc.record_baseline(&real, newer);
         assert_eq!(
-            rc.baseline_for(&hard),
+            rc.baseline_for(&hard).map(|baseline| baseline.hash),
             Some(newer.hash),
             "newer through the physical spelling must win on the alias"
         );
@@ -706,7 +899,7 @@ mod tests {
         rc.record_baseline(&real, older);
         rc.record_baseline(&hard, newer);
         assert_eq!(
-            rc.baseline_for(&real),
+            rc.baseline_for(&real).map(|baseline| baseline.hash),
             Some(newer.hash),
             "newer through the alias must win on the physical spelling"
         );

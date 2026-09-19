@@ -9,6 +9,11 @@
 //! touch carries a sequence number stamped when its bytes were in hand, and
 //! an older observation never supersedes a newer one, whichever insert lands
 //! last.
+//!
+//! An observation made by re-arming on resume carries a marker (see
+//! [`FileBaseline::resumed`]): the bytes were read at resume time, not by
+//! the model in this session, so the write guard holds such a file for a
+//! fresh live Read before the first write.
 
 use std::collections::BTreeMap;
 use std::collections::hash_map::DefaultHasher;
@@ -67,6 +72,20 @@ pub struct FileBaseline {
     /// Process-local fingerprint (see `content_hash`); compared against
     /// the target's current content at the next write.
     pub hash: u64,
+
+    /// Whether this observation comes from re-arming on resume rather
+    /// than a live read in this session.
+    ///
+    /// A resumed session re-reads the files its transcript shows being
+    /// read, but the model never saw those bytes live — the transcript
+    /// carries previews only — so the write guard cannot treat the
+    /// re-read as the model's knowledge: an edit made while the session
+    /// was inactive would otherwise pass a hash compare it was never
+    /// entitled to. A marked baseline makes the guard refuse the first
+    /// write to the file and direct the model to read it first; any
+    /// live observation (a Read, a successful write) records an
+    /// unmarked baseline and supersedes the marked one.
+    pub resumed: bool,
 }
 
 /// The process-local content hash of `bytes`.
@@ -84,10 +103,28 @@ pub(crate) fn content_hash(bytes: &[u8]) -> u64 {
 ///
 /// Call this at the moment the bytes are in hand — the stamp is what makes
 /// the baseline the *newest* observation rather than merely the last insert.
+/// The observation is unmarked: a live read or a successful write made it,
+/// so the write guard trusts it as the model's knowledge.
 pub(crate) fn observe_bytes(bytes: &[u8]) -> FileBaseline {
     FileBaseline {
         observed: OBSERVATION_SEQ.fetch_add(1, Ordering::Relaxed),
         hash: content_hash(bytes),
+        resumed: false,
+    }
+}
+
+/// Observe `bytes` the way the resume re-arm path does: stamped and hashed
+/// like a live observation, but marked as resume-armed.
+///
+/// The resume path holds the file's current bytes, not anything the model
+/// saw in this session, so the baseline it records carries
+/// [`FileBaseline::resumed`] — the write guard refuses the first write to
+/// such a file until a live Read records an unmarked baseline.
+pub(crate) fn observe_resumed_bytes(bytes: &[u8]) -> FileBaseline {
+    FileBaseline {
+        observed: OBSERVATION_SEQ.fetch_add(1, Ordering::Relaxed),
+        hash: content_hash(bytes),
+        resumed: true,
     }
 }
 

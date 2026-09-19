@@ -74,14 +74,40 @@ echo "summarize this repo" | dch
 
 A `TASK` argument selects single-run mode; with no argument, a stdin
 that is not a terminal selects it too. Only a bare invocation on a
-terminal launches the TUI. A `TASK` cannot be combined with
-`--resume` or `--list-sessions`.
+terminal launches the TUI. A `TASK` composes with `--resume` (continue
+a saved session headless); neither combines with `--list-sessions`.
+
+Resume a saved session — the restored conversation seeds the display
+and the agent's context, further auto-saves keep writing the same
+session file, and the saved model applies unless `--model` overrides
+it:
+
+```bash
+dch --resume 01234567-89ab-cdef-0123-456789abcdef   # in the TUI
+dch "keep going" --resume 01234567-89ab-cdef-0123-456789abcdef
+```
+
+List saved sessions (newest first) and exit:
+
+```bash
+dch --list-sessions
+```
+
+A missing session id warns and starts fresh; a corrupt file warns
+loudly, starts fresh, and is never modified; a session file that
+cannot be read at all exits non-zero. Files the restored transcript
+shows being read are guarded for writes, but the first `Write` to one
+requires a fresh `Read` — the transcript cannot carry what the model
+originally saw, so a stale overwrite of externally-changed files is
+refused until the current bytes are read.
 
 Common options:
 
 | Flag | Description |
 | --- | --- |
 | `-m, --model MODEL` | Override the configured model for this run |
+| `--resume SESSION_ID` | Resume a saved session by id |
+| `--list-sessions` | Print saved sessions and exit |
 | `--theme NAME` | Override the configured theme |
 | `--config PATH` | Use an alternate config file |
 | `--unsafe-paths` | Let file tools reach paths outside the working directory |
@@ -92,7 +118,8 @@ Themes: `dracula` (default), `nord`, `tokyo_night`, `gruvbox_dark`,
 `gruvbox_light`, `solarized_dark`, `solarized_light`,
 `catppuccin_latte`, `catppuccin_frappe`, `catppuccin_macchiato`,
 `catppuccin_mocha`, `one_dark`, `monokai`, `github_dark`,
-`github_light`. An unknown name falls back to the default.
+`github_light`, `ayu_dark`, `rose_pine`, `kanagawa_wave`, `dark_plus`.
+An unknown name falls back to the default.
 
 ### Exit codes and the done-file
 
@@ -108,8 +135,8 @@ Input (always insert mode):
 
 | Key | Action |
 | --- | --- |
-| `Enter` | Submit |
-| `Shift+Enter` or `\`+`Enter` | Newline (the backslash form works on every terminal) |
+| `Enter`, `Ctrl+M` | Submit (Ctrl+M is the same byte as Enter on legacy terminals; enhanced ones report the modifier, and both submit) |
+| `Shift+Enter`, `Ctrl+J`, or `\`+`Enter` | Newline (Shift+Enter on terminals with key-modifier reporting — kitty, wezterm, foot, ghostty, alacritty, xterm, and recent gnome-terminal; macOS Terminal.app reports no modifiers, where Ctrl+J and the backslash form are the newline keys) |
 | `Up` / `Down` | History recall; cursor motion in a multi-line buffer |
 | `Ctrl-P` / `Ctrl-N` | History recall (always) |
 | `Left` / `Right`, `Home` / `End`, `Ctrl-A` / `Ctrl-E` | Move by character; to line start/end |
@@ -197,11 +224,11 @@ more. Errors are typed (`thiserror`); logs are structured
 
 Pre-1.0. Working: the interactive TUI with multi-line input,
 history, paste, and mouse-wheel scrolling, session auto-save (every
-completed turn is persisted under `~/.dch/sessions/`), single-run
+completed turn is persisted under `~/.dch/sessions/`), session resume
+and listing (`--resume` / `--list-sessions`), single-run
 mode with exit codes and done-files, the tool set above, MCP
 attachment, roles, fallback models, signal handling. Not implemented
-yet: session resume and listing (`--resume` / `--list-sessions` exit
-with an error) and permission prompting (tools run without
+yet: permission prompting (tools run without
 confirmation — treat `bash` accordingly).
 
 ## License
