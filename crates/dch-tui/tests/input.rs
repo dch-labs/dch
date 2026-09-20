@@ -346,9 +346,11 @@ fn the_stamp_moves_only_on_mutations() {
     // a word delete that removes text stamps; one with nothing
     // behind the caret does not
     editor.set_text("one two".to_string());
+    // baseline after the set_text bump, so only the delete can cross it
+    let before_first_delete = editor.stamp();
     editor.handle_key(key(KeyCode::Char('w'), KeyModifiers::CONTROL), WRAP);
     assert!(
-        editor.stamp() > bound,
+        editor.stamp() > before_first_delete,
         "Ctrl-W removing a word is a mutation"
     );
     assert_eq!(editor.text(), "one ", "the word went");

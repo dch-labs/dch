@@ -561,8 +561,9 @@ impl InputEditor {
     /// [`display_rows`](Self::display_rows) renders, in display
     /// columns (wide glyphs count their width).
     ///
-    /// `None` when the buffer is empty — the caller places the
-    /// terminal cursor at the box start. The column comes from
+    /// `Some((0, 0))` for an empty buffer — one empty row is the
+    /// grid's whole shape, and the caret sits at its start. The
+    /// column comes from
     /// wrapping the cursor's line prefix, so it follows the same
     /// breaks the rendered rows use; when that prefix exactly fills
     /// its final row the coordinates name the continuation row
