@@ -342,6 +342,29 @@ fn the_stamp_moves_only_on_mutations() {
     let bound = editor.stamp();
     editor.handle_key(plain(KeyCode::F(9)), WRAP);
     assert_eq!(editor.stamp(), bound, "an unbound key stamps nothing");
+
+    // a word delete that removes text stamps; one with nothing
+    // behind the caret does not
+    editor.set_text("one two".to_string());
+    editor.handle_key(key(KeyCode::Char('w'), KeyModifiers::CONTROL), WRAP);
+    assert!(
+        editor.stamp() > bound,
+        "Ctrl-W removing a word is a mutation"
+    );
+    assert_eq!(editor.text(), "one ", "the word went");
+    let after_word = editor.stamp();
+    editor.handle_key(key(KeyCode::Char('w'), KeyModifiers::CONTROL), WRAP);
+    assert!(
+        editor.stamp() > after_word,
+        "deleting the remaining word stamps too"
+    );
+    let drained = editor.stamp();
+    editor.handle_key(key(KeyCode::Char('w'), KeyModifiers::CONTROL), WRAP);
+    assert_eq!(
+        editor.stamp(),
+        drained,
+        "Ctrl-W with an empty buffer stamps nothing"
+    );
 }
 
 #[test]

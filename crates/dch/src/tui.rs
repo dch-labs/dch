@@ -228,12 +228,6 @@ impl TranscriptHandle {
     }
 }
 
-/// The single writer thread that persists turn-end snapshots.
-///
-/// One thread takes the newest published snapshot, writes it, and
-/// waits for the next — so the newest transcript always lands last
-/// and an older, slower save can never rename over a newer one.
-///
 /// One turn-end snapshot: the conversation and its accounting.
 ///
 /// What the hook publishes and the writer persists together, so the
@@ -256,6 +250,11 @@ struct TranscriptSnapshot {
     tokens: crate::session::SessionTokens,
 }
 
+/// The single writer thread that persists turn-end snapshots.
+///
+/// One thread takes the newest published snapshot, writes it, and
+/// waits for the next — so the newest transcript always lands last
+/// and an older, slower save can never rename over a newer one.
 /// The one-slot mailbox bounds retention at a single snapshot even
 /// while a write is stalled. Joining waits out the in-flight write
 /// and any snapshot still in the slot, so a quitting session

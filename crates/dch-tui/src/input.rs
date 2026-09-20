@@ -948,8 +948,11 @@ impl InputEditor {
             }
             cut
         };
-        self.text.drain(target..self.cursor);
-        self.cursor = target;
+        if target < self.cursor {
+            self.touch();
+            self.text.drain(target..self.cursor);
+            self.cursor = target;
+        }
     }
 }
 
