@@ -37,7 +37,7 @@ fn wants_headless(args: &args::Args) -> bool {
 /// a task argument or a piped stdin still selects headless, so the
 /// marker rules follow the mode, not the resume flag.
 pub(crate) fn bootstrap_marker_applies(args: &args::Args, stdin_is_terminal: bool) -> bool {
-    !args.list_sessions && selects_single_run(args.task.as_deref(), stdin_is_terminal)
+    args.list_sessions.is_none() && selects_single_run(args.task.as_deref(), stdin_is_terminal)
 }
 
 /// The mode decision over the task argument and the stdin kind.
@@ -72,8 +72,8 @@ fn main() -> std::process::ExitCode {
             std::process::exit(1);
         });
     runtime.block_on(async move {
-        if args.list_sessions {
-            resume::run_list_sessions()
+        if let Some(limit) = args.list_sessions {
+            resume::run_list_sessions(limit)
         } else {
             let control = resume::resolve_resume(&args);
             if wants_headless(&args) {

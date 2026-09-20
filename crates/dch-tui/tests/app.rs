@@ -315,7 +315,7 @@ fn scroll_keys_adjust_without_underflow() {
     // field, status bar); PageUp lifts the window ten lines off the
     // bottom.
     assert!(
-        !scrolled_view.contains("line 59") && scrolled_view.contains("line 46"),
+        !scrolled_view.contains("line 59") && scrolled_view.contains("line 47"),
         "scrolling up shifts the visible window: {scrolled_view:?}"
     );
 }
@@ -400,7 +400,141 @@ fn clearing_the_draft_does_not_count_toward_the_quit_chord() {
 }
 
 #[test]
-fn the_status_bar_announces_the_armed_quit() {
+fn seeded_tool_blocks_stay_expandable_after_a_resume() {
+    // Retained input and output ride the session file, so a resumed
+    // session's tool blocks seed the detail store: the disclosure
+    // marker shows and the expansion carries the real command and
+    // output across the restart.
+    let mut app = app();
+    let now = chrono::Utc::now();
+    app.seed_messages(vec![TuiMessage::Assistant {
+        blocks: vec![ContentBlock::Tool {
+            name: "Bash".to_string(),
+            call_id: "call-saved".to_string(),
+            input_preview: "make test".to_string(),
+            success: true,
+            elapsed_secs: 3.0,
+            output_preview: "74 passed\n0 failed".to_string(),
+            retained_input: "{\n  \"command\": \"make test\"\n}".to_string(),
+        }],
+        timestamp: now,
+        duration_ms: None,
+    }]);
+    let probe = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&probe);
+    let row = rows
+        .iter()
+        .position(|r| r.contains("Running: make test"))
+        .unwrap_or(0);
+    assert!(
+        rows[row].contains("▸"),
+        "a seeded block with retained detail shows its marker: {:?}",
+        rows[row]
+    );
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        4,
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        4,
+        u16::try_from(row).unwrap_or(0),
+    ));
+    let open = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&open);
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("\"command\": \"make test\"")),
+        "the seeded command expands: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains("74 passed")),
+        "the seeded output expands: {rows:?}"
+    );
+}
+
+#[test]
+fn ctrl_c_cancels_a_running_agent_without_touching_the_quit_chord() {
+    // While a submission is in flight the press serves the run: a
+    // draft clears first, then an empty-composer press cancels —
+    // arming nothing, so exiting after the cancel takes its own two
+    // presses.
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    let running = Arc::clone(&kept.agent_running);
+    running.store(true, std::sync::atomic::Ordering::SeqCst);
+    let cancels: Arc<std::sync::Mutex<Vec<()>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&cancels);
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    app.set_run_canceller(Box::new(move || {
+        sink.lock().expect("sink").push(());
+    }));
+
+    app.handle_event(&Event::Paste("draft".to_string()));
+    app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(app.input().is_empty(), "the draft clears first");
+    assert_eq!(
+        cancels.lock().expect("sink").len(),
+        0,
+        "the clear cancels nothing"
+    );
+    assert!(!app.is_quitting());
+
+    app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert_eq!(
+        cancels.lock().expect("sink").len(),
+        1,
+        "the empty-composer press cancels the run"
+    );
+    assert!(!app.is_quitting(), "a cancel never quits");
+
+    // The run lands; the quit chord resumes from scratch.
+    running.store(false, std::sync::atomic::Ordering::SeqCst);
+    app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(!app.is_quitting(), "the first idle press only arms");
+    app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(app.is_quitting(), "the second idle press quits");
+}
+
+#[test]
+fn the_status_bar_shows_the_context_and_the_session_id() {
+    // One status line, three facts: the model, the session's token
+    // accounting labeled as context, and which session this is —
+    // the id a later `--resume` wants, readable straight off the
+    // bar.
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    {
+        let mut tokens = kept.tokens.lock().expect("tokens");
+        tokens.cumulative_input = 4_494;
+        tokens.cumulative_output = 156;
+    }
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    app.set_session_id("f005d097-c4ce-477a-88c0-2fc2cec5a466".to_string());
+    let bar = render_to_buffer(&mut app, 100, 24);
+    let rows = row_texts(&bar);
+    let status = rows
+        .iter()
+        .find(|r| r.contains("CTX:"))
+        .expect("the bar renders");
+    assert!(
+        status.contains("CTX: 4650"),
+        "the accounting reads as context: {status:?}"
+    );
+    assert!(
+        status.contains("f005d097-c4ce-477a-88c0-2fc2cec5a466"),
+        "the session id rides the bar: {status:?}"
+    );
+}
+
+#[test]
+fn the_notice_bar_carries_the_armed_quit_hint_above_the_composer() {
+    // The hint lives on its own reserved row above the prompt box —
+    // not the status bar — so the row can host glance-worthy
+    // messages without shifting anything when one arrives.
     let mut app = app();
     let calm = render_to_buffer(&mut app, 80, 24);
     assert!(
@@ -410,12 +544,58 @@ fn the_status_bar_announces_the_armed_quit() {
     );
     app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL));
     let armed = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&armed);
+    let hint_row = rows
+        .iter()
+        .position(|row| row.contains("press ctrl+c again to quit"))
+        .expect("the armed state shows its hint");
+    // the reserved notice row sits between the conversation and the
+    // spacer that tops the composer: the row below it is blank and
+    // the composer's text starts below that
     assert!(
-        row_texts(&armed)
+        rows.get(hint_row.saturating_add(1))
+            .is_some_and(|r| r.trim().is_empty()),
+        "the spacer row follows the notice: {rows:?}"
+    );
+    assert!(
+        !rows.last().is_some_and(|r| r.contains("ctrl+c")),
+        "the status bar no longer carries the hint: {:?}",
+        rows.last()
+    );
+}
+
+#[test]
+fn a_cancelled_agent_notices_and_the_notice_expires() {
+    // The cancel press lands its message on the notice row at once,
+    // and the message leaves when its hold elapses — the tick that
+    // retires it draws the blank row again.
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    kept.agent_running
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    app.set_run_canceller(Box::new(|| {}));
+    app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    let noticed = render_to_buffer(&mut app, 80, 24);
+    assert!(
+        row_texts(&noticed)
             .iter()
-            .any(|row| row.contains("press ctrl+c again to quit")),
-        "the armed state shows its hint: {:?}",
-        row_texts(&armed)
+            .any(|row| row.contains("Agent cancelled")),
+        "the cancel shows on the notice row: {:?}",
+        row_texts(&noticed)
+    );
+    let later = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    assert!(
+        app.tick_wake(later),
+        "the lap past the hold forces its redraw"
+    );
+    let blank = render_to_buffer(&mut app, 80, 24);
+    assert!(
+        !row_texts(&blank)
+            .iter()
+            .any(|row| row.contains("Agent cancelled")),
+        "the notice leaves when its hold elapses"
     );
 }
 
@@ -650,6 +830,7 @@ fn completed_tool_blocks_render_between_text() {
                 success: true,
                 elapsed_secs: 0.42,
                 output_preview: String::new(),
+                retained_input: String::new(),
             },
             ContentBlock::Tool {
                 call_id: String::new(),
@@ -658,6 +839,7 @@ fn completed_tool_blocks_render_between_text() {
                 success: false,
                 elapsed_secs: 61.4,
                 output_preview: String::new(),
+                retained_input: String::new(),
             },
             ContentBlock::Text {
                 text: "omega".to_string(),
@@ -834,6 +1016,7 @@ fn elapsed_stamps_round_once_before_splitting() {
                 success: true,
                 elapsed_secs: 90.0,
                 output_preview: String::new(),
+                retained_input: String::new(),
             },
             ContentBlock::Tool {
                 call_id: String::new(),
@@ -842,6 +1025,7 @@ fn elapsed_stamps_round_once_before_splitting() {
                 success: true,
                 elapsed_secs: 119.6,
                 output_preview: String::new(),
+                retained_input: String::new(),
             },
             ContentBlock::Tool {
                 call_id: String::new(),
@@ -850,6 +1034,7 @@ fn elapsed_stamps_round_once_before_splitting() {
                 success: true,
                 elapsed_secs: 59.6,
                 output_preview: String::new(),
+                retained_input: String::new(),
             },
         ],
         timestamp: chrono::Utc::now(),
@@ -1492,7 +1677,7 @@ fn a_released_selection_stays_highlighted_until_the_next_press() {
 
 #[test]
 fn a_drag_running_past_the_bottom_edge_scrolls_with_the_selection() {
-    // 24 rows put the conversation pane on rows 0..=17.
+    // 24 rows put the conversation pane on rows 0..=16.
     let mut app = app();
     let now = chrono::Utc::now();
     for i in 0..30 {
@@ -1518,7 +1703,7 @@ fn a_drag_running_past_the_bottom_edge_scrolls_with_the_selection() {
         app.handle_event(&mouse_event(
             MouseEventKind::Drag(crossterm::event::MouseButton::Left),
             2,
-            17,
+            16,
         )),
         "the edge drag reports a redraw"
     );
@@ -1529,7 +1714,7 @@ fn a_drag_running_past_the_bottom_edge_scrolls_with_the_selection() {
     );
     let scrolled = render_to_buffer(&mut app, 80, 24);
     assert!(
-        reversed_cells_on_row(&scrolled, 17) >= 1,
+        reversed_cells_on_row(&scrolled, 16) >= 1,
         "the selection reaches the pane's bottom line as the view moves"
     );
 }
@@ -1561,7 +1746,7 @@ fn a_parked_edge_drag_keeps_scrolling_on_the_tick_until_the_document_ends() {
     app.handle_event(&mouse_event(
         MouseEventKind::Drag(crossterm::event::MouseButton::Left),
         2,
-        17,
+        16,
     ));
     assert_eq!(
         app.scroll_offset(),
@@ -1588,7 +1773,7 @@ fn a_parked_edge_drag_keeps_scrolling_on_the_tick_until_the_document_ends() {
     assert!(app.auto_scroll(), "reaching the bottom re-arms stickiness");
     let settled = render_to_buffer(&mut app, 80, 24);
     assert!(
-        reversed_cells_on_row(&settled, 17) >= 1,
+        reversed_cells_on_row(&settled, 16) >= 1,
         "the selection follows the edge all the way down"
     );
     for _ in 0..6 {
@@ -1697,7 +1882,7 @@ fn a_drag_running_past_the_top_edge_scrolls_upward() {
         );
         let _ = render_to_buffer(&mut app, 80, 24);
     }
-    assert_eq!(app.scroll_offset(), 12, "the walk ends pinned at the top");
+    assert_eq!(app.scroll_offset(), 13, "the walk ends pinned at the top");
     let settled = render_to_buffer(&mut app, 80, 24);
     assert!(
         reversed_cells_on_row(&settled, 0) >= 1,
@@ -1817,7 +2002,7 @@ fn shift_arrows_walk_the_view_to_follow_the_head() {
     assert!(app.auto_scroll(), "the walk re-arms at the bottom");
     let settled = render_to_buffer(&mut app, 80, 24);
     assert!(
-        reversed_cells_on_row(&settled, 17) >= 1,
+        reversed_cells_on_row(&settled, 16) >= 1,
         "the head sits on the document's last, visible line"
     );
 }
@@ -2369,11 +2554,14 @@ fn a_press_outside_the_conversation_retires_the_selection_without_recopying() {
     );
 
     let status_row = 23;
-    app.handle_event(&mouse_event(
-        MouseEventKind::Down(crossterm::event::MouseButton::Left),
-        5,
-        status_row,
-    ));
+    assert!(
+        app.handle_event(&mouse_event(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            5,
+            status_row,
+        )),
+        "retiring the selection is itself a redraw — the highlight leaves now"
+    );
     app.handle_event(&mouse_event(
         MouseEventKind::Up(crossterm::event::MouseButton::Left),
         5,
@@ -2692,6 +2880,7 @@ fn composer_chunk(width: u16, height: u16) -> Rect {
         .constraints([
             Constraint::Min(0),
             Constraint::Length(1),
+            Constraint::Length(1),
             Constraint::Length(4),
             Constraint::Length(1),
         ])
@@ -2700,7 +2889,7 @@ fn composer_chunk(width: u16, height: u16) -> Rect {
             y: 0,
             width,
             height,
-        })[2]
+        })[3]
 }
 
 #[test]
@@ -3162,6 +3351,7 @@ fn f2_cycles_verbosity_and_rerenders_completed_tools() {
             success: true,
             elapsed_secs: 0.42,
             output_preview: String::new(),
+            retained_input: String::new(),
         }],
         timestamp: chrono::Utc::now(),
         duration_ms: None,
@@ -3632,10 +3822,12 @@ fn a_retried_call_ages_from_its_newest_attempt() {
     let graduations = std::sync::Arc::clone(&kept.graduations);
     {
         let mut queue = graduations.lock().expect("the queue lock");
-        // ids 0..=253 stay single (254), then call-dup twice: 256
-        // distinct calls, 256 graduations past the first — the cap
-        // is exactly full with no eviction.
-        for index in 0..254 {
+        // ids 0..=254 stay single (255), then call-dup twice: 256
+        // distinct calls, 257 graduations. Without the requeue the
+        // queue would exceed the cap and evict call-0; with it, the
+        // deduplicated queue sits exactly at capacity and nothing
+        // evicts.
+        for index in 0..255 {
             queue.push(graduation(format!("call-{index}")));
         }
         queue.push(graduation("call-dup".to_string()));
@@ -3904,6 +4096,10 @@ fn finish_tool_pairs_the_graduation_with_its_capture() {
         result.full_output, "src\ntarget",
         "the output rides the graduation"
     );
+    assert_eq!(
+        result.output_preview, "src\ntarget",
+        "the persisted preview carries the same retained output"
+    );
     assert!(
         kept.tool_captures
             .lock()
@@ -4058,6 +4254,7 @@ fn hostile_elapsed_values_render_instead_of_panicking() {
                 success: true,
                 elapsed_secs,
                 output_preview: String::new(),
+                retained_input: String::new(),
             }],
             timestamp: chrono::Utc::now(),
             duration_ms: None,
@@ -4142,12 +4339,12 @@ fn the_scrollbar_owns_its_gutter_and_never_touches_text() {
     let buffer = terminal.backend().buffer();
     let thumb = app.theme.ui.scrollbar_thumb;
     let track = app.theme.ui.scrollbar_track;
-    // 12 rows: 6 for the conversation (spacer, padded two-row
-    // input field, status bar). thumb = 6 * 6 / 20 = 1 row flush
-    // with the track's bottom.
-    for y in 0..6u16 {
+    // 12 rows: 5 for the conversation (notice row, spacer, padded
+    // two-row input field, status bar). thumb = 5 * 5 / 20 = 1 row
+    // flush with the track's bottom.
+    for y in 0..5u16 {
         let cell = &buffer[(19, y)];
-        let in_thumb = y >= 5;
+        let in_thumb = y >= 4;
         assert_eq!(
             cell.symbol(),
             " ",
@@ -4159,7 +4356,7 @@ fn the_scrollbar_owns_its_gutter_and_never_touches_text() {
             "row {y}: the solid bar is the theme's thumb and rail colors as cell backgrounds"
         );
     }
-    for y in 0..6u16 {
+    for y in 0..5u16 {
         for x in 0..19u16 {
             let cell = &buffer[(x, y)];
             assert!(

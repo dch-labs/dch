@@ -67,10 +67,12 @@ pub struct ToolResultDisplay {
     /// re-deriving the input; empty when no summary was stashed.
     pub input_summary: String,
 
-    /// A short preview of the call's output.
+    /// The call's retained output, as the capture recorded it.
     ///
-    /// Empty from the lifecycle events alone — they carry no output
-    /// text; the conversation is the record of what a tool printed.
+    /// Same text as [`full_output`](Self::full_output) — carried
+    /// twice so the transcript block's serialized field and the
+    /// runtime expansion feed from one graduation. Empty when the
+    /// call ran without a capture.
     pub output_preview: String,
 
     /// The call's full input, pretty-printed JSON, for expansion.
@@ -147,6 +149,14 @@ pub struct TuiObserverState {
     /// One entry per dispatched call, removed on completion.
     pub active_tools: Arc<Mutex<Vec<ActiveTool>>>,
 
+    /// Whether a submission is currently executing.
+    ///
+    /// Set by the mode driver around each run; the display reads it
+    /// to route Ctrl+C — a run in flight takes the press as a
+    /// cancel, an idle session takes it as the quit chord's first
+    /// half.
+    pub agent_running: Arc<std::sync::atomic::AtomicBool>,
+
     /// Full tool calls captured at dispatch, keyed by call id.
     ///
     /// Written by the capture middleware on the dispatch pipeline
@@ -199,6 +209,7 @@ impl TuiObserverState {
             streaming_text: Arc::new(Mutex::new(String::new())),
             graduations: Arc::new(Mutex::new(Vec::new())),
             active_tools: Arc::new(Mutex::new(Vec::new())),
+            agent_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tool_captures: Arc::new(Mutex::new(HashMap::new())),
             errors: Arc::new(Mutex::new(Vec::new())),
             queued: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -338,7 +349,7 @@ impl TuiObserver {
             is_error,
             duration,
             input_summary,
-            output_preview: String::new(),
+            output_preview: full_output.clone(),
             full_input,
             full_output,
         }));

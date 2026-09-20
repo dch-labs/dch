@@ -331,6 +331,17 @@ fn the_stamp_moves_only_on_mutations() {
         editor.stamp() > after_typing,
         "a caret move counts too — the caret shares the cache"
     );
+
+    // a cap-rejected insert changes nothing — not even the stamp
+    editor.set_text("x".repeat(2_000_000));
+    let full = editor.stamp();
+    editor.insert_str("more");
+    assert_eq!(editor.stamp(), full, "a rejected insert is not a mutation");
+
+    // an unbound key leaves the editor entirely alone
+    let bound = editor.stamp();
+    editor.handle_key(plain(KeyCode::F(9)), WRAP);
+    assert_eq!(editor.stamp(), bound, "an unbound key stamps nothing");
 }
 
 #[test]

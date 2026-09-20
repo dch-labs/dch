@@ -772,8 +772,9 @@ mod tests {
         // exists, which is what makes record_resumed_read return
         // false here. The handle check that runs after the open is
         // defense-in-depth for the swap-between-resolve-and-open
-        // window and is not deterministically reachable in a test —
-        // it cannot fail without the resolve layer also failing.
+        // window; this test does not deterministically exercise that
+        // race, and the check can fail on its own when a link is
+        // swapped in after resolution passes.
         use std::os::unix::fs::symlink;
 
         let work = tempfile::TempDir::new().unwrap();

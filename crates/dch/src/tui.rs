@@ -79,6 +79,14 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
     let workdir = std::env::current_dir().map_err(|err| format!("cannot determine cwd: {err}"))?;
 
     let (observer, state) = TuiObserverState::new().into_observer();
+    if let ResumeControl::Resumed(outcome) = &control {
+        let mut tokens = state
+            .tokens
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tokens.cumulative_input = outcome.tokens.cumulative_input;
+        tokens.cumulative_output = outcome.tokens.cumulative_output;
+    }
     let mut builder = dch_loop::Runner::builder(&config, &workdir)
         .with_observer(Arc::new(observer) as Arc<dyn loopctl::observer::LoopObserver>)
         .with_middleware(Arc::new(dch_tui::CapturingMiddleware::new(Arc::clone(
@@ -133,14 +141,31 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
             warn: None,
         } => session_id.unwrap_or_else(|| runner.session_id()),
     };
+    app.set_session_id(session_id.to_string());
 
     // Save the transcript off the render thread whenever a turn
     // ends: one ordered writer receives the snapshots, so the newest
     // transcript lands last and teardown joins the final write.
     let saver = Arc::new(crate::session::SessionSaver::with_model(session_id, model));
     let (transcript_handle, transcript_worker) = TranscriptWorker::spawn(saver);
+    let hook_tokens = Arc::clone(&state.tokens);
     app.set_turn_end_hook(Box::new(move |conversation| {
-        transcript_handle.send(conversation.to_vec());
+        let (cumulative_input, cumulative_output, last_input_tokens) =
+            hook_tokens.lock().map_or((0, 0, 0), |counts| {
+                (
+                    counts.cumulative_input,
+                    counts.cumulative_output,
+                    counts.input,
+                )
+            });
+        transcript_handle.send(
+            conversation.to_vec(),
+            crate::session::SessionTokens {
+                cumulative_input,
+                cumulative_output,
+                last_input_tokens,
+            },
+        );
     }));
 
     TerminalGuard::install_panic_hook();
@@ -152,6 +177,10 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
     dch_tui::sync_default_background(app.theme.ui.background);
 
     let cancel = runner.cancel_signal();
+    {
+        let cancel_for_app = Arc::clone(&cancel);
+        app.set_run_canceller(Box::new(move || cancel_for_app.cancel()));
+    }
     let shutting_down = Arc::new(AtomicBool::new(false));
     let driver = tokio::spawn(drive_submissions(
         runner,
@@ -178,7 +207,7 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
 /// snapshots up behind it. Publishing is all the hook does — cheap
 /// enough to run inline on the render task.
 struct TranscriptHandle {
-    slot: Arc<std::sync::Mutex<Option<Vec<TuiMessage>>>>,
+    slot: Arc<std::sync::Mutex<Option<TranscriptSnapshot>>>,
     signal: Arc<std::sync::Condvar>,
 }
 
@@ -188,12 +217,12 @@ impl TranscriptHandle {
     /// Overwrites a still-pending snapshot — only the newest
     /// transcript is ever worth writing — then wakes the writer.
     /// Never blocks and never fails visibly.
-    fn send(&self, snapshot: Vec<TuiMessage>) {
+    fn send(&self, messages: Vec<TuiMessage>, tokens: crate::session::SessionTokens) {
         let mut slot = self
             .slot
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *slot = Some(snapshot);
+        *slot = Some(TranscriptSnapshot { messages, tokens });
         drop(slot);
         self.signal.notify_one();
     }
@@ -204,12 +233,35 @@ impl TranscriptHandle {
 /// One thread takes the newest published snapshot, writes it, and
 /// waits for the next — so the newest transcript always lands last
 /// and an older, slower save can never rename over a newer one.
+///
+/// One turn-end snapshot: the conversation and its accounting.
+///
+/// What the hook publishes and the writer persists together, so the
+/// newest file always pairs the transcript with the totals the
+/// status bar showed when it was taken — the two halves of a
+/// session's state that a resume restores as one.
+struct TranscriptSnapshot {
+    /// The conversation at turn end.
+    ///
+    /// The display model verbatim, ordered as rendered; the writer
+    /// serializes it as the file's `messages` array unchanged.
+    messages: Vec<TuiMessage>,
+
+    /// The cumulative token totals at turn end.
+    ///
+    /// The session's accounting — lifetime input and output plus
+    /// the last turn's input — read from the shared counters at
+    /// publish time, so the file never carries a total the bar did
+    /// not show.
+    tokens: crate::session::SessionTokens,
+}
+
 /// The one-slot mailbox bounds retention at a single snapshot even
 /// while a write is stalled. Joining waits out the in-flight write
 /// and any snapshot still in the slot, so a quitting session
 /// persists its last turn.
 struct TranscriptWorker {
-    slot: Arc<std::sync::Mutex<Option<Vec<TuiMessage>>>>,
+    slot: Arc<std::sync::Mutex<Option<TranscriptSnapshot>>>,
     signal: Arc<std::sync::Condvar>,
     shutdown: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
@@ -222,8 +274,8 @@ struct TranscriptWorker {
 /// between.
 type WaitFn = std::sync::Arc<
     dyn Fn(
-            std::sync::MutexGuard<'_, Option<Vec<TuiMessage>>>,
-        ) -> std::sync::MutexGuard<'_, Option<Vec<TuiMessage>>>
+            std::sync::MutexGuard<'_, Option<TranscriptSnapshot>>,
+        ) -> std::sync::MutexGuard<'_, Option<TranscriptSnapshot>>
         + Send
         + Sync,
 >;
@@ -286,7 +338,7 @@ impl TranscriptWorker {
         signal: Arc<std::sync::Condvar>,
         wait: WaitFn,
     ) -> (TranscriptHandle, Self) {
-        let slot = Arc::new(std::sync::Mutex::new(None::<Vec<TuiMessage>>));
+        let slot = Arc::new(std::sync::Mutex::new(None::<TranscriptSnapshot>));
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread_slot = Arc::clone(&slot);
         let thread_shutdown = Arc::clone(&shutdown);
@@ -303,7 +355,7 @@ impl TranscriptWorker {
                 let Some(snapshot) = snapshot else {
                     break;
                 };
-                if let Err(err) = saver.save(&snapshot) {
+                if let Err(err) = saver.save(&snapshot.messages, snapshot.tokens) {
                     tracing::warn!(error = %err, "session transcript could not be saved");
                 }
             }
@@ -391,6 +443,7 @@ async fn drive_submissions(
     state: TuiObserverState,
     shutting_down: Arc<AtomicBool>,
 ) {
+    let cancel = runner.cancel_signal();
     while !shutting_down.load(Ordering::SeqCst)
         && let Some(text) = receiver.recv().await
     {
@@ -398,12 +451,31 @@ async fn drive_submissions(
             break;
         }
         state.queued.fetch_sub(1, Ordering::SeqCst);
-        if let Err(err) = runner.run(&text).await {
+        cancel.reset();
+        state.agent_running.store(true, Ordering::SeqCst);
+        let result = runner.run(&text).await;
+        state.agent_running.store(false, Ordering::SeqCst);
+        let run_errored = result.is_err();
+        if run_errored {
+            state
+                .active_tools
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+        }
+        if let Err(err) = result {
             state
                 .errors
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(err.to_string());
+        }
+        if cancel.is_cancelled() {
+            while receiver.try_recv().is_ok() {
+                state.queued.fetch_sub(1, Ordering::SeqCst);
+            }
+            state.render_notify.notify(1);
+        } else if run_errored {
             state.render_notify.notify(1);
         }
     }
@@ -490,6 +562,67 @@ mod tests {
                 .await
                 .is_ok(),
             "the driver wakes the frame, so the error row renders without a keypress"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_run_retires_stranded_tool_rows() {
+        let runner = unreachable_runner().await;
+        let (observer, state) = TuiObserverState::new().into_observer();
+        drop(observer);
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send("do a thing".to_string()).unwrap();
+        drop(tx);
+        // A tool stranded mid-flight: the engine will not fire its
+        // completion for a run that fails outright.
+        state
+            .active_tools
+            .lock()
+            .unwrap()
+            .push(dch_tui::ActiveTool {
+                call_id: "call-strand".to_string(),
+                name: "Read".to_string(),
+                input_summary: String::new(),
+                start: std::time::Instant::now(),
+            });
+        state.queued.store(1, Ordering::SeqCst);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            drive_submissions(runner, rx, state.clone(), shutdown_flag(false)),
+        )
+        .await
+        .expect("a refused connection resolves without hanging");
+        assert!(
+            state.active_tools.lock().unwrap().is_empty(),
+            "a failed run leaves no spinner spinning behind it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_marks_the_agent_running_until_it_lands() {
+        let runner = unreachable_runner().await;
+        let (observer, state) = TuiObserverState::new().into_observer();
+        drop(observer);
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send("do a thing".to_string()).unwrap();
+        drop(tx);
+
+        state.queued.store(1, Ordering::SeqCst);
+        let flag = Arc::clone(&state.agent_running);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            drive_submissions(runner, rx, state.clone(), shutdown_flag(false)),
+        )
+        .await
+        .expect("a refused connection resolves without hanging");
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "the running flag settles false once the run lands, failed or not"
+        );
+        assert_eq!(
+            state.queued.load(Ordering::SeqCst),
+            0,
+            "nothing stays queued behind the landed run"
         );
     }
 
@@ -627,8 +760,8 @@ mod tests {
             text: "final turn".to_string(),
             timestamp: now,
         }];
-        handle.send(bulky);
-        handle.send(final_turn);
+        handle.send(bulky, crate::session::SessionTokens::default());
+        handle.send(final_turn, crate::session::SessionTokens::default());
         drop(handle);
         worker.join();
         let messages = saved_messages(dir.path(), id);
@@ -647,10 +780,13 @@ mod tests {
     fn joining_the_writer_flushes_the_final_snapshot() {
         let (saver, dir, id) = worker_saver();
         let (handle, worker) = TranscriptWorker::spawn(saver);
-        handle.send(vec![TuiMessage::User {
-            text: "the last turn".to_string(),
-            timestamp: chrono::Utc::now(),
-        }]);
+        handle.send(
+            vec![TuiMessage::User {
+                text: "the last turn".to_string(),
+                timestamp: chrono::Utc::now(),
+            }],
+            crate::session::SessionTokens::default(),
+        );
         drop(handle);
         worker.join();
         let messages = saved_messages(dir.path(), id);
@@ -774,10 +910,13 @@ mod tests {
 
         // The writer is gone: a publish after the drop has no
         // consumer and must never reach the disk.
-        handle.send(vec![TuiMessage::User {
-            text: "late".to_string(),
-            timestamp: chrono::Utc::now(),
-        }]);
+        handle.send(
+            vec![TuiMessage::User {
+                text: "late".to_string(),
+                timestamp: chrono::Utc::now(),
+            }],
+            crate::session::SessionTokens::default(),
+        );
         std::thread::sleep(std::time::Duration::from_millis(300));
         let path = dir.path().join(id.to_string()).join("session.json");
         assert!(

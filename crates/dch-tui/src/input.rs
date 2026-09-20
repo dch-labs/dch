@@ -335,12 +335,12 @@ impl InputEditor {
     /// any stashed draft come out exactly as they went in.
     pub fn insert_str(&mut self, pasted: &str) {
         debug_assert!(self.text.is_char_boundary(self.cursor));
-        self.touch();
         let remaining = self.max_chars.saturating_sub(self.text.chars().count());
         let prefix: String = pasted.chars().take(remaining).collect();
         if prefix.is_empty() {
             return;
         }
+        self.touch();
         self.history.reset();
         self.draft = None;
         self.text.insert_str(self.cursor, &prefix);
@@ -370,7 +370,6 @@ impl InputEditor {
     /// quits, with Ctrl-Shift-C as the copy chord alongside.
     pub fn handle_key(&mut self, key: KeyEvent, wrap_width: u16) -> InputAction {
         debug_assert!(self.text.is_char_boundary(self.cursor));
-        self.touch();
         match (key.code, key.modifiers) {
             (KeyCode::Enter, KeyModifiers::SHIFT)
             | (KeyCode::Char('\n'), _)
@@ -413,11 +412,11 @@ impl InputEditor {
                 InputAction::None
             }
             (KeyCode::Home, _) | (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
-                self.cursor = self.line_start();
+                self.move_to_line_start();
                 InputAction::None
             }
             (KeyCode::End, _) | (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
-                self.cursor = self.line_end();
+                self.move_to_line_end();
                 InputAction::None
             }
             (KeyCode::Up, KeyModifiers::NONE) => {
@@ -438,12 +437,19 @@ impl InputEditor {
             }
             (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
                 let start = self.line_start();
-                self.text.drain(start..self.cursor);
-                self.cursor = start;
+                if start < self.cursor {
+                    self.touch();
+                    self.text.drain(start..self.cursor);
+                    self.cursor = start;
+                }
                 InputAction::None
             }
             (KeyCode::Char('k'), KeyModifiers::CONTROL) => {
-                self.text.drain(self.cursor..self.line_end());
+                let end = self.line_end();
+                if self.cursor < end {
+                    self.touch();
+                    self.text.drain(self.cursor..end);
+                }
                 InputAction::None
             }
             (KeyCode::Char('w'), KeyModifiers::CONTROL) => {
@@ -614,6 +620,7 @@ impl InputEditor {
     /// whitespace-only buffer clears without submitting; anything
     /// else submits and records on history.
     fn enter(&mut self) -> InputAction {
+        self.touch();
         if self.char_before() == Some('\\') {
             let cut = self.cursor.saturating_sub(1);
             self.text.drain(cut..self.cursor);
@@ -688,12 +695,35 @@ impl InputEditor {
             .map_or(self.text.len(), |i| self.cursor.saturating_add(i))
     }
 
+    /// Move to the current logical line's start.
+    ///
+    /// Stamps only when the caret actually moves — a press already
+    /// at the line start is a no-op for the wrap cache too.
+    fn move_to_line_start(&mut self) {
+        let landing = self.line_start();
+        if landing != self.cursor {
+            self.touch();
+            self.cursor = landing;
+        }
+    }
+
+    /// Move to the current logical line's end, stamping on motion
+    /// only — the mirror of [`Self::move_to_line_start`].
+    fn move_to_line_end(&mut self) {
+        let landing = self.line_end();
+        if landing != self.cursor {
+            self.touch();
+            self.cursor = landing;
+        }
+    }
+
     /// Step one character toward the buffer start.
     ///
     /// A multi-byte character crosses whole — the offset moves by
     /// its UTF-8 length, never into it.
     fn move_left(&mut self) {
         if let Some(c) = self.char_before() {
+            self.touch();
             self.cursor = self.cursor.saturating_sub(c.len_utf8());
         }
     }
@@ -704,6 +734,7 @@ impl InputEditor {
     /// its UTF-8 length, never into it.
     fn move_right(&mut self) {
         if let Some(c) = self.char_after() {
+            self.touch();
             self.cursor = self.cursor.saturating_add(c.len_utf8());
         }
     }
@@ -717,13 +748,9 @@ impl InputEditor {
     /// its rendered rows, and a buffer showing one row stays on
     /// history.
     fn up(&mut self, wrap_width: u16) {
-        match self.cursor_cell(wrap_width) {
+        match self.cell_at(self.cursor, wrap_width) {
             Some((row, column)) if row > 0 => {
-                self.move_caret_to_cell(
-                    wrap_width,
-                    usize::from(row).saturating_sub(1),
-                    usize::from(column),
-                );
+                self.move_caret_to_cell(wrap_width, row.saturating_sub(1), column);
             }
             _ => self.history_prev(),
         }
@@ -736,13 +763,9 @@ impl InputEditor {
     /// history entry at the bottom row.
     fn down(&mut self, wrap_width: u16) {
         let rows = self.display_rows(wrap_width).len();
-        match self.cursor_cell(wrap_width) {
-            Some((row, column)) if usize::from(row).saturating_add(1) < rows => {
-                self.move_caret_to_cell(
-                    wrap_width,
-                    usize::from(row).saturating_add(1),
-                    usize::from(column),
-                );
+        match self.cell_at(self.cursor, wrap_width) {
+            Some((row, column)) if row.saturating_add(1) < rows => {
+                self.move_caret_to_cell(wrap_width, row.saturating_add(1), column);
             }
             _ => self.history_next(),
         }
@@ -760,7 +783,7 @@ impl InputEditor {
     /// where a caret lands, keeping motion, clicks, and rendering in
     /// lockstep.
     pub fn move_caret_to_cell(&mut self, wrap_width: u16, row: usize, column: usize) {
-        self.touch();
+        let before = self.cursor;
         let mut boundaries: Vec<usize> = self.text.char_indices().map(|(i, _)| i).collect();
         boundaries.push(self.text.len());
         let mut lo: usize = 0;
@@ -778,6 +801,9 @@ impl InputEditor {
             }
         }
         self.cursor = boundaries.get(lo).copied().unwrap_or(self.text.len());
+        if self.cursor != before {
+            self.touch();
+        }
     }
 
     /// Load the previous history entry.
@@ -819,12 +845,16 @@ impl InputEditor {
     /// Skips any run of whitespace backward, then the word before
     /// it — the readline backward-word landing spot.
     fn move_word_left(&mut self) {
+        let before = self.cursor;
         let prefix = self.text.get(..self.cursor).unwrap_or("");
         let mut saw_word = false;
         for (index, c) in prefix.char_indices().rev() {
             if c.is_whitespace() {
                 if saw_word {
                     self.cursor = index.saturating_add(c.len_utf8());
+                    if self.cursor != before {
+                        self.touch();
+                    }
                     return;
                 }
             } else {
@@ -832,6 +862,9 @@ impl InputEditor {
             }
         }
         self.cursor = 0;
+        if self.cursor != before {
+            self.touch();
+        }
     }
 
     /// Move to the end of the next word.
@@ -840,12 +873,16 @@ impl InputEditor {
     /// and the word after it — landing just past that word's last
     /// character: the readline forward-word spot.
     fn move_word_right(&mut self) {
+        let before = self.cursor;
         let rest = self.text.get(self.cursor..).unwrap_or("");
         let mut saw_word = false;
         for (index, c) in rest.char_indices() {
             if c.is_whitespace() {
                 if saw_word {
                     self.cursor = self.cursor.saturating_add(index);
+                    if self.cursor != before {
+                        self.touch();
+                    }
                     return;
                 }
             } else {
@@ -853,6 +890,9 @@ impl InputEditor {
             }
         }
         self.cursor = self.text.len();
+        if self.cursor != before {
+            self.touch();
+        }
     }
 
     /// Delete the character before the cursor.
@@ -864,6 +904,7 @@ impl InputEditor {
         self.history.reset();
         self.draft = None;
         if let Some(c) = self.char_before() {
+            self.touch();
             let cut = self.cursor.saturating_sub(c.len_utf8());
             self.text.drain(cut..self.cursor);
             self.cursor = cut;
@@ -878,6 +919,7 @@ impl InputEditor {
         self.history.reset();
         self.draft = None;
         if let Some(c) = self.char_after() {
+            self.touch();
             let end = self.cursor.saturating_add(c.len_utf8());
             self.text.drain(self.cursor..end);
         }

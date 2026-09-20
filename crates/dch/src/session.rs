@@ -80,10 +80,20 @@ pub struct SessionSummary {
 
     /// How many messages the transcript holds.
     ///
-    /// A rough size signal for choosing between sessions: a long
-    /// transcript carries more context — and costs more tokens to
-    /// resume — than a short one.
-    pub message_count: usize,
+    /// The user's messages — their submissions, one per prompt.
+    ///
+    /// Not the raw entry count: tool calls, replies, and error rows
+    /// stay out of the figure, so tool-heavy turns do not inflate
+    /// it.
+    pub user_message_count: usize,
+
+    /// The session's total token accounting, shown as its context
+    /// size.
+    ///
+    /// Cumulative input plus output — exactly the figure the status
+    /// bar shows, and shows again on resume, so the listing's
+    /// CONTEXT column and the running session never disagree.
+    pub token_total: u64,
 }
 
 /// Errors arising while saving, loading, or listing sessions.
@@ -171,6 +181,48 @@ struct StoredSession {
     /// was saved, and resume seeds both the display and the agent
     /// reconstruction from this one array.
     messages: Vec<TuiMessage>,
+
+    /// The session's cumulative token totals at save time.
+    ///
+    /// Restamped per save like the timestamp, so the newest file
+    /// carries the whole session's accounting. Absent on files saved
+    /// before totals were persisted; those read as zero and keep
+    /// accumulating from the resume.
+    #[serde(default)]
+    tokens: SessionTokens,
+}
+
+/// A session's cumulative token accounting.
+///
+/// What the status bar's running total shows. The TUI persists and
+/// restores it, so a resumed session continues the count instead of
+/// restarting it at zero; headless single-runs keep no live counter
+/// and record zeros.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct SessionTokens {
+    /// Input tokens since the session began.
+    ///
+    /// Summed across every turn the API reported — a monotonically
+    /// growing spend figure, restamped per save and re-seeded on
+    /// resume so the count continues rather than restarts.
+    pub(crate) cumulative_input: u64,
+
+    /// Output tokens since the session began.
+    ///
+    /// The output half of the same accounting; added to
+    /// [`cumulative_input`](Self::cumulative_input) it is exactly
+    /// the figure the status bar shows and the listing's CONTEXT
+    /// column repeats.
+    pub(crate) cumulative_output: u64,
+
+    /// The input tokens of the most recent turn.
+    ///
+    /// What the API was billed for reading last — the system
+    /// prompt, the replayed history, the tool results — and so the
+    /// approximate size of the context a resume re-loads. Zero on
+    /// files saved before it was tracked.
+    #[serde(default)]
+    pub(crate) last_input_tokens: u64,
 }
 
 impl SessionSaver {
@@ -223,8 +275,12 @@ impl SessionSaver {
     ///
     /// Fails when the directory or file cannot be created, written,
     /// or renamed — always through a boxed [`SessionError`].
-    pub fn save(&self, messages: &[TuiMessage]) -> Result<(), Box<dyn std::error::Error>> {
-        self.save_inner(messages)?;
+    pub fn save(
+        &self,
+        messages: &[TuiMessage],
+        tokens: SessionTokens,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.save_inner(messages, tokens)?;
         Ok(())
     }
 
@@ -233,7 +289,11 @@ impl SessionSaver {
     /// # Errors
     ///
     /// Same conditions as [`SessionSaver::save`], typed.
-    fn save_inner(&self, messages: &[TuiMessage]) -> Result<(), SessionError> {
+    fn save_inner(
+        &self,
+        messages: &[TuiMessage],
+        tokens: SessionTokens,
+    ) -> Result<(), SessionError> {
         let path = self.session_path();
         let dir = path.parent().unwrap_or(Path::new("."));
         std::fs::create_dir_all(dir)?;
@@ -243,6 +303,7 @@ impl SessionSaver {
             model: self.model.clone(),
             saved_at: chrono::Utc::now(),
             messages: messages.to_vec(),
+            tokens,
         };
         let json = serde_json::to_string_pretty(&stored)?;
         let mut temp = tempfile::NamedTempFile::new_in(dir)?;
@@ -295,9 +356,9 @@ pub(crate) fn sessions_dir() -> PathBuf {
 pub(crate) fn load_with_meta_in(
     id: Uuid,
     base: &Path,
-) -> Result<(Vec<TuiMessage>, String), SessionError> {
+) -> Result<(Vec<TuiMessage>, String, SessionTokens), SessionError> {
     let stored = load_envelope(&base.join(id.to_string()).join("session.json"), id, base)?;
-    Ok((stored.messages, stored.model))
+    Ok((stored.messages, stored.model, stored.tokens))
 }
 
 /// Read and parse a transcript file into its full envelope.
@@ -358,7 +419,7 @@ fn load_envelope(
 ///
 /// Fails only when the root directory cannot be read — per-session
 /// problems skip the entry instead.
-fn list_sessions_in(base: &Path) -> Result<Vec<SessionSummary>, SessionError> {
+pub(crate) fn list_sessions_in(base: &Path) -> Result<Vec<SessionSummary>, SessionError> {
     let entries = match std::fs::read_dir(base) {
         Ok(entries) => entries,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -414,7 +475,15 @@ fn list_sessions_in(base: &Path) -> Result<Vec<SessionSummary>, SessionError> {
             id,
             model: stored.model,
             last_activity: stored.saved_at,
-            message_count: stored.messages.len(),
+            user_message_count: stored
+                .messages
+                .iter()
+                .filter(|message| matches!(message, dch_tui::TuiMessage::User { .. }))
+                .count(),
+            token_total: stored
+                .tokens
+                .cumulative_input
+                .saturating_add(stored.tokens.cumulative_output),
         });
     }
     sessions.sort_by_key(|summary| std::cmp::Reverse(summary.last_activity));
@@ -463,6 +532,7 @@ mod tests {
                         success: true,
                         elapsed_secs: 0.25,
                         output_preview: "…".to_string(),
+                        retained_input: String::new(),
                     },
                     ContentBlock::Text {
                         text: "done".to_string(),
@@ -496,6 +566,7 @@ mod tests {
             model: "test-model".to_string(),
             saved_at,
             messages: messages.to_vec(),
+            tokens: SessionTokens::default(),
         };
         let path = dir.join(id.to_string()).join("session.json");
         std::fs::create_dir_all(path.parent().expect("the session dir")).expect("mkdir");
@@ -514,7 +585,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let id = Uuid::new_v4();
         let messages = sample_messages();
-        saver(dir.path(), id).save(&messages).expect("save");
+        saver(dir.path(), id)
+            .save(&messages, SessionTokens::default())
+            .expect("save");
         let loaded = load(dir.path(), id).expect("load");
         assert_eq!(
             loaded, messages,
@@ -523,11 +596,55 @@ mod tests {
     }
 
     #[test]
+    fn token_totals_survive_a_save_and_default_for_legacy_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let id = Uuid::new_v4();
+        let totals = SessionTokens {
+            cumulative_input: 12_345,
+            cumulative_output: 678,
+            last_input_tokens: 54_321,
+        };
+        crate::session::SessionSaver::with_base_dir(
+            id,
+            "test-model".to_string(),
+            dir.path().to_path_buf(),
+        )
+        .save(&sample_messages(), totals)
+        .expect("save");
+        let (_, _, loaded) = load_with_meta_in(id, dir.path()).expect("load");
+        assert_eq!(loaded, totals, "the accounting rides the envelope");
+        let listed = list_sessions_in(dir.path()).expect("list");
+        assert_eq!(
+            listed.first().expect("the one session").token_total,
+            12_345 + 678,
+            "the listing carries the same total the status bar shows"
+        );
+
+        // A file saved before totals existed parses to zeros: the
+        // envelope omits the key entirely, as the old writer did.
+        let legacy = r#"{"format":"dch.v1","session_id":"ID","model":"m","saved_at":"2026-01-01T00:00:00Z","messages":[]}"#;
+        let legacy_id = Uuid::new_v4();
+        let legacy_dir = dir.path().join(legacy_id.to_string());
+        std::fs::create_dir_all(&legacy_dir).expect("legacy dir");
+        std::fs::write(
+            legacy_dir.join("session.json"),
+            legacy.replace("ID", &legacy_id.to_string()),
+        )
+        .expect("legacy file");
+        let (_, _, legacy_tokens) = load_with_meta_in(legacy_id, dir.path()).expect("load legacy");
+        assert_eq!(
+            legacy_tokens,
+            SessionTokens::default(),
+            "a pre-totals file reads as zero and keeps accumulating"
+        );
+    }
+
+    #[test]
     fn envelope_fields_survive_a_save() {
         let dir = tempfile::tempdir().expect("tempdir");
         let id = Uuid::new_v4();
         saver(dir.path(), id)
-            .save(&sample_messages())
+            .save(&sample_messages(), SessionTokens::default())
             .expect("save");
         let raw = std::fs::read_to_string(dir.path().join(id.to_string()).join("session.json"))
             .expect("read raw");
@@ -547,7 +664,7 @@ mod tests {
         let path = dir.path().join(id.to_string()).join("session.json");
         assert!(!path.exists(), "nothing saved yet");
         saver(dir.path(), id)
-            .save(&sample_messages())
+            .save(&sample_messages(), SessionTokens::default())
             .expect("save into a missing directory");
         assert!(path.is_file(), "the layout is sessions/<uuid>/session.json");
     }
@@ -557,7 +674,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let id = Uuid::new_v4();
         saver(dir.path(), id)
-            .save(&sample_messages())
+            .save(&sample_messages(), SessionTokens::default())
             .expect("save");
         let entries: Vec<String> = std::fs::read_dir(dir.path().join(id.to_string()))
             .expect("the session dir")
@@ -579,12 +696,16 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let id = Uuid::new_v4();
         let saver = saver(dir.path(), id);
-        saver.save(&sample_messages()).expect("first save");
+        saver
+            .save(&sample_messages(), SessionTokens::default())
+            .expect("first save");
         let second = vec![TuiMessage::User {
             text: "second".to_string(),
             timestamp: chrono::Utc::now(),
         }];
-        saver.save(&second).expect("second save");
+        saver
+            .save(&second, SessionTokens::default())
+            .expect("second save");
         assert_eq!(
             load(dir.path(), id).expect("load"),
             second,
@@ -820,13 +941,16 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let id = Uuid::new_v4();
         let messages = sample_messages();
-        let expected = messages.len();
+        let expected = messages
+            .iter()
+            .filter(|message| matches!(message, dch_tui::TuiMessage::User { .. }))
+            .count();
         write_envelope(dir.path(), id, stamp(0), &messages);
         let listed = list_sessions_in(dir.path()).expect("list");
         assert_eq!(
-            listed.first().expect("the one session").message_count,
+            listed.first().expect("the one session").user_message_count,
             expected,
-            "the summary counts the transcript's messages"
+            "the summary counts the user's turns, not every entry"
         );
     }
 
@@ -834,7 +958,9 @@ mod tests {
     fn an_empty_transcript_saves_and_loads() {
         let dir = tempfile::tempdir().expect("tempdir");
         let id = Uuid::new_v4();
-        saver(dir.path(), id).save(&[]).expect("save empty");
+        saver(dir.path(), id)
+            .save(&[], SessionTokens::default())
+            .expect("save empty");
         assert_eq!(
             load(dir.path(), id).expect("load"),
             Vec::new(),
@@ -847,7 +973,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let id = Uuid::new_v4();
         saver(dir.path(), id)
-            .save(&sample_messages())
+            .save(&sample_messages(), SessionTokens::default())
             .expect("save");
         let raw = std::fs::read_to_string(dir.path().join(id.to_string()).join("session.json"))
             .expect("read raw");

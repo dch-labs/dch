@@ -144,10 +144,23 @@ pub enum ContentBlock {
         /// Wall-clock time from dispatch to completion.
         elapsed_secs: f64,
 
-        /// A short preview of the call's output.
+        /// The call's retained output, sanitized and capped.
         ///
-        /// Truncated to what a scrolling reader needs.
+        /// What the dispatch-side capture kept — redacted where
+        /// redaction is on, head and tail within the retention
+        /// cap. Persisted so a resumed session's model remembers
+        /// what the call actually returned; empty on blocks saved
+        /// before the capture existed.
         output_preview: String,
+
+        /// The call's retained input, pretty-printed JSON, capped.
+        ///
+        /// The full arguments as the model supplied them, within
+        /// the same retention cap. A resumed session rebuilds the
+        /// tool call's real arguments from this; empty on blocks
+        /// saved before the capture existed.
+        #[serde(default)]
+        retained_input: String,
     },
 }
 
@@ -246,7 +259,8 @@ mod tests {
                         input_preview: "a.rs".to_string(),
                         success: true,
                         elapsed_secs: 1.5,
-                        output_preview: "…".to_string(),
+                        output_preview: "file contents".to_string(),
+                        retained_input: "{\n  \"path\": \"a.rs\"\n}".to_string(),
                     },
                 ],
                 timestamp: now,
@@ -284,8 +298,9 @@ mod tests {
             parsed.first().is_some_and(|message| matches!(message,
                 TuiMessage::Assistant { blocks, .. }
                 if blocks.iter().any(|block| matches!(block,
-                    ContentBlock::Tool { call_id, .. } if call_id.is_empty())))),
-            "a tool block without a call id defaults to empty"
+                    ContentBlock::Tool { call_id, retained_input, .. }
+                        if call_id.is_empty() && retained_input.is_empty())))),
+            "a tool block without a call id or retained input defaults both empty"
         );
     }
 }

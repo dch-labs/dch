@@ -88,6 +88,12 @@ const CARET_BLINK_TICKS: u32 = 5;
 /// ones that stay openable.
 const TOOL_DETAIL_CAP: usize = 256;
 
+/// How long a transient notice holds the row above the composer.
+///
+/// Long enough to be read at a glance, short enough that the row
+/// reads as empty by default.
+const NOTICE_HOLD: Duration = Duration::from_secs(4);
+
 /// How close to the newest line a scroll action must land to count
 /// as "back at the bottom".
 ///
@@ -393,6 +399,13 @@ pub struct TuiApp {
     /// both halves of it.
     quit: QuitState,
 
+    /// How a Ctrl+C cancels the run in flight, when one is.
+    ///
+    /// Installed by the mode driver alongside the shared running
+    /// flag; absent in tests and headless hosts, where a cancel
+    /// press simply reports handled.
+    run_canceller: Option<Box<dyn Fn()>>,
+
     /// Tool calls whose blocks render expanded.
     ///
     /// Keyed by call id; a click on a summary row toggles membership.
@@ -435,6 +448,22 @@ pub struct TuiApp {
     ///
     /// The status bar reads the model name from it.
     config: DchConfig,
+
+    /// The session's id, as the status bar shows it.
+    ///
+    /// Set by the host once the session's identity is known — the
+    /// resumed file's own id, or the runner's fresh one — so the
+    /// user can read (and copy out) which session they are in.
+    session_id: Option<String>,
+
+    /// The transient notice on the row above the composer, with
+    /// the instant its hold elapses.
+    ///
+    /// A glance-worthy event — a cancelled run — that is not a
+    /// transcript row: it shows for
+    /// [`NOTICE_HOLD`](self::NOTICE_HOLD) and leaves the reserved
+    /// row blank again.
+    transient_notice: Option<(String, Instant)>,
 
     /// The composer's cached wrap, if it is still fresh.
     ///
@@ -501,12 +530,15 @@ impl TuiApp {
             conversation_generation: 1,
             conversation_cache_generation: 0,
             quit: QuitState::default(),
+            run_canceller: None,
             expanded_tools: std::collections::HashSet::new(),
             tool_details: HashMap::new(),
             tool_detail_order: std::collections::VecDeque::new(),
             tool_summary_lines: HashMap::new(),
             tool_running_lines: HashMap::new(),
             input_wrap_cache: None,
+            session_id: None,
+            transient_notice: None,
             config,
         }
     }
@@ -529,6 +561,36 @@ impl TuiApp {
         self.conversation_generation = self.conversation_generation.saturating_add(1);
     }
 
+    /// Post a transient notice above the composer.
+    ///
+    /// Replaces any notice still holding — one row, one message,
+    /// the newest wins.
+    pub fn post_notice(&mut self, text: String) {
+        let until = Instant::now()
+            .checked_add(NOTICE_HOLD)
+            .unwrap_or_else(Instant::now);
+        self.transient_notice = Some((text, until));
+    }
+
+    /// Name the session the status bar shows.
+    ///
+    /// The host calls this once the session's identity settles —
+    /// before the run loop starts, so the first frame already
+    /// carries it.
+    pub fn set_session_id(&mut self, id: String) {
+        self.session_id = Some(id);
+    }
+
+    /// Install the run canceller.
+    ///
+    /// The mode driver's half of the Ctrl+C contract: while
+    /// [`agent_running`](TuiObserverState::agent_running) is set, a
+    /// Ctrl+C press on an empty composer calls this to stop the
+    /// submission in flight.
+    pub fn set_run_canceller(&mut self, canceller: Box<dyn Fn()>) {
+        self.run_canceller = Some(canceller);
+    }
+
     /// Install a whole prior conversation as the session's starting
     /// state.
     ///
@@ -539,6 +601,22 @@ impl TuiApp {
     /// the run loop starts; a mid-session call would splice history
     /// into a live conversation.
     pub fn seed_messages(&mut self, messages: Vec<TuiMessage>) {
+        for message in &messages {
+            let TuiMessage::Assistant { blocks, .. } = message else {
+                continue;
+            };
+            for block in blocks {
+                if let ContentBlock::Tool {
+                    call_id,
+                    retained_input,
+                    output_preview,
+                    ..
+                } = block
+                {
+                    self.retain_tool_detail(call_id, retained_input, output_preview);
+                }
+            }
+        }
         self.conversation.extend(messages);
         self.conversation_generation = self.conversation_generation.saturating_add(1);
         self.scroll_offset = 0;
@@ -815,7 +893,11 @@ impl TuiApp {
     /// Ctrl+C clears a non-empty buffer — arming nothing, so a
     /// cleared draft still takes two further presses to exit — and
     /// on an empty one the second press quits; any other key
-    /// disarms, so the chord never fires from stale intent.
+    /// disarms, so the chord never fires from stale intent. While a
+    /// run is in flight the press serves the run instead: a draft
+    /// clears first, then an empty-composer press cancels the run —
+    /// arming nothing, so exiting after the cancel takes its own
+    /// two presses.
     /// Ctrl+Shift+C copies the live selection where the terminal
     /// reports the shift; on terminals that collapse it to a plain
     /// Ctrl+C it simply joins the chord's clearing behavior. Up,
@@ -838,10 +920,18 @@ impl TuiApp {
                 true
             }
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                if !self.input.is_empty() {
-                    // Clearing is not consenting: the press that
-                    // empties the buffer arms nothing, so exiting
-                    // always takes two further presses.
+                if self
+                    .state
+                    .agent_running
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    if !self.input.is_empty() {
+                        self.input.clear();
+                    } else if let Some(cancel) = &self.run_canceller {
+                        cancel();
+                        self.post_notice("Agent cancelled".to_string());
+                    }
+                } else if !self.input.is_empty() {
                     self.input.clear();
                 } else if self.quit.armed {
                     self.quit.requested = true;
@@ -929,9 +1019,9 @@ impl TuiApp {
                     self.drag_position = Some((mouse.column, mouse.row));
                     true
                 } else {
-                    self.selection = None;
+                    let retired = self.selection.take().is_some();
                     self.drag_position = None;
-                    self.place_input_caret(mouse.column, mouse.row)
+                    self.place_input_caret(mouse.column, mouse.row) || retired
                 }
             }
             MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
@@ -953,10 +1043,6 @@ impl TuiApp {
                 match self.selection.take() {
                     Some(selection) => {
                         if selection.anchor == selection.head {
-                            // Press and release without travel: a
-                            // click. On a tool row it toggles that
-                            // call's expansion; anywhere else it just
-                            // clears the selection.
                             self.toggle_tool_at(mouse.column, mouse.row);
                         } else {
                             let (text, covered_any) = self.selection_text(&selection);
@@ -1272,10 +1358,6 @@ impl TuiApp {
         }
         if self.tool_details.contains_key(&call_id) {
             if expanding {
-                // Hold the clicked row steady: the block opens below
-                // it, and a detached view's growth compensation keeps
-                // the same top line where a pinned one would chase
-                // the document's new tail.
                 self.auto_scroll = false;
             }
             self.conversation_generation = self.conversation_generation.saturating_add(1);
@@ -1497,7 +1579,14 @@ impl TuiApp {
         }
         let dragged = self.drag_autoscroll();
         let blinked = self.caret_blink.tick();
-        self.any_tools_running() || claimed || dragged || blinked
+        let notice_lapsed = self
+            .transient_notice
+            .as_ref()
+            .is_some_and(|(_, until)| *until <= now);
+        if notice_lapsed {
+            self.transient_notice = None;
+        }
+        self.any_tools_running() || claimed || dragged || blinked || notice_lapsed
     }
 
     /// Whether a graduation is waiting to land.
@@ -1546,6 +1635,7 @@ impl TuiApp {
             .constraints([
                 Constraint::Min(0),
                 Constraint::Length(1),
+                Constraint::Length(1),
                 Constraint::Length(composer_height),
                 Constraint::Length(STATUS_BAR_ROWS),
             ])
@@ -1553,6 +1643,7 @@ impl TuiApp {
 
         let fallback = area;
         self.render_conversation(frame, pane(&chunks, 0, fallback));
+        self.render_notice(frame, pane(&chunks, 1, fallback));
         // The paintless theme's composer marking: hairline rules the
         // terminal draws itself — an underlined spacer puts a 1px
         // line at the box's top edge, an underlined last row at its
@@ -1560,8 +1651,8 @@ impl TuiApp {
         // terminal's own decoration, not glyphs (which gap between
         // rows on some) or paint (which is a full cell thick).
         if let Some(color) = self.theme.ui.composer_border {
-            let spacer = pane(&chunks, 1, fallback);
-            let composer = pane(&chunks, 2, fallback);
+            let spacer = pane(&chunks, 2, fallback);
+            let composer = pane(&chunks, 3, fallback);
             let rule = Style::default()
                 .fg(color)
                 .add_modifier(ratatui::style::Modifier::UNDERLINED);
@@ -1577,10 +1668,10 @@ impl TuiApp {
                 frame.buffer_mut().set_style(bottom, rule);
             }
         }
-        let input_area = pane(&chunks, 2, fallback);
+        let input_area = pane(&chunks, 3, fallback);
         self.input_wrap_width = wrap_width;
         self.render_input(frame, input_area, &rows, caret);
-        self.render_status_bar(frame, pane(&chunks, 3, fallback), &rows, caret);
+        self.render_status_bar(frame, pane(&chunks, 4, fallback), &rows, caret);
     }
 
     /// Render the conversation pane: the settled conversation, the
@@ -1705,6 +1796,35 @@ impl TuiApp {
         self.last_layout_lines = total_lines;
     }
 
+    /// Retain a graduated call's full detail, evicting at the cap.
+    ///
+    /// The one insertion path for the detail store: a graduation
+    /// with captured content, and the resume seeding of blocks the
+    /// file carried. A retried call graduates once per attempt
+    /// under the same id, so the queue is requeued rather than
+    /// duplicated and the detail ages from its newest attempt; the
+    /// oldest entry retires past the cap with its toggle state.
+    fn retain_tool_detail(&mut self, call_id: &str, input_json: &str, output: &str) {
+        if call_id.is_empty() || input_json.is_empty() {
+            return;
+        }
+        self.tool_detail_order.retain(|id| id != call_id);
+        self.tool_detail_order.push_back(call_id.to_string());
+        if self.tool_detail_order.len() > TOOL_DETAIL_CAP
+            && let Some(retired) = self.tool_detail_order.pop_front()
+        {
+            self.tool_details.remove(&retired);
+            self.expanded_tools.remove(&retired);
+        }
+        self.tool_details.insert(
+            call_id.to_string(),
+            ToolDetail {
+                input_json: input_json.to_string(),
+                output: output.to_string(),
+            },
+        );
+    }
+
     /// Take what the observer finished since the last frame.
     ///
     /// Finalized replies and completed tool calls alike move into
@@ -1730,29 +1850,11 @@ impl TuiApp {
                     });
                 }
                 Graduation::Tool(result) => {
-                    if !result.call_id.is_empty() && !result.full_input.is_empty() {
-                        // A retried call graduates once per attempt
-                        // under the same id: requeue it so the queue
-                        // holds no duplicate and the detail ages from
-                        // its newest attempt.
-                        self.tool_detail_order.retain(|id| id != &result.call_id);
-                        self.tool_detail_order.push_back(result.call_id.clone());
-                        if self.tool_detail_order.len() > TOOL_DETAIL_CAP
-                            && let Some(retired) = self.tool_detail_order.pop_front()
-                        {
-                            self.tool_details.remove(&retired);
-                            // The retired block is gone for good; its
-                            // toggle state goes with it.
-                            self.expanded_tools.remove(&retired);
-                        }
-                        self.tool_details.insert(
-                            result.call_id.clone(),
-                            ToolDetail {
-                                input_json: result.full_input.clone(),
-                                output: result.full_output.clone(),
-                            },
-                        );
-                    }
+                    self.retain_tool_detail(
+                        &result.call_id,
+                        &result.full_input,
+                        &result.full_output,
+                    );
                     self.push_message(TuiMessage::Assistant {
                         blocks: vec![ContentBlock::Tool {
                             name: result.name,
@@ -1761,6 +1863,7 @@ impl TuiApp {
                             success: !result.is_error,
                             elapsed_secs: result.duration.as_secs_f64(),
                             output_preview: result.output_preview,
+                            retained_input: result.full_input,
                         }],
                         timestamp: now,
                         duration_ms: None,
@@ -2176,22 +2279,52 @@ impl TuiApp {
     /// cache keys on the editor's mutation stamp and the wrap
     /// width, so only edits and resizes re-wrap; everything else
     /// clones the cached grid.
-    fn composer_wrap(&mut self, width: u16) -> (Vec<String>, (u16, u16)) {
+    fn composer_wrap(&mut self, width: u16) -> (Arc<Vec<String>>, (u16, u16)) {
         if let Some(cache) = &self.input_wrap_cache
             && cache.stamp == self.input.stamp()
             && cache.width == width
         {
-            return (cache.rows.clone(), cache.caret);
+            return (Arc::clone(&cache.rows), cache.caret);
         }
         let (rows, caret) = self.input.display_rows_and_caret(width);
         let caret = caret.unwrap_or((0, 0));
+        let rows = Arc::new(rows);
         self.input_wrap_cache = Some(InputWrapCache {
             stamp: self.input.stamp(),
             width,
-            rows: rows.clone(),
+            rows: Arc::clone(&rows),
             caret,
         });
         (rows, caret)
+    }
+
+    /// Render the notice row: one line of transient or state-driven
+    /// message above the composer.
+    ///
+    /// The armed-quit hint owns the row while it holds — safety
+    /// wording outranks anything expiring — and a transient notice
+    /// (a cancel, an event worth a glance, not a transcript row)
+    /// shows until its hold elapses. Blank otherwise; the row is
+    /// always reserved so nothing on screen shifts when a message
+    /// arrives or leaves.
+    fn render_notice(&self, frame: &mut Frame, area: Rect) {
+        if area.height == 0 {
+            return;
+        }
+        let text = if self.quit.armed {
+            Some("press ctrl+c again to quit")
+        } else {
+            self.transient_notice
+                .as_ref()
+                .filter(|(_, until)| *until > Instant::now())
+                .map(|(text, _)| text.as_str())
+        };
+        if let Some(text) = text {
+            frame.render_widget(
+                Paragraph::new(text).style(Style::default().fg(self.theme.ui.input_border)),
+                area,
+            );
+        }
     }
 
     /// Render the input field: a fixed multi-row window onto the
@@ -2309,9 +2442,10 @@ impl TuiApp {
                     .saturating_add(counts.cumulative_output)
             },
         );
-        let mut status_text = format!(" {}  │  {tokens} tok", self.config.api.model);
-        if self.quit.armed {
-            status_text.push_str("  │  press ctrl+c again to quit");
+        let mut status_text = format!(" {}  │  CTX: {tokens}", self.config.api.model);
+        if let Some(id) = &self.session_id {
+            status_text.push_str("  │  ");
+            status_text.push_str(id);
         }
         let bar_style = Style::default()
             .fg(self.theme.ui.status_bar_fg)
@@ -2569,8 +2703,9 @@ struct InputWrapCache {
     /// The editor mutation stamp the wrap was computed at.
     ///
     /// The cache holds exactly while this matches the editor's
-    /// current stamp; every edit and caret move advances it, which
-    /// is what tells an untouched frame to reuse the grid.
+    /// current stamp; every accepted edit and caret move advances
+    /// it, which is what tells an untouched frame to reuse the
+    /// grid.
     stamp: u64,
 
     /// The wrap width the grid was built for.
@@ -2580,12 +2715,13 @@ struct InputWrapCache {
     /// baked for the old one.
     width: u16,
 
-    /// The wrapped rows.
+    /// The wrapped rows, shared by `Arc`.
     ///
-    /// The same grid `display_rows` would rebuild, cloned to a
-    /// caller on a cache hit — an idle frame pays the clone,
-    /// never the wrap.
-    rows: Vec<String>,
+    /// The same grid `display_rows` would rebuild; a cache hit
+    /// clones the reference, not the grid — an idle frame pays
+    /// neither the wrap nor a copy of its tens of thousands of
+    /// rows.
+    rows: Arc<Vec<String>>,
 
     /// The caret's cell on that grid.
     ///

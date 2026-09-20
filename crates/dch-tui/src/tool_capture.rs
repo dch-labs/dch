@@ -144,62 +144,58 @@ fn content_text(content: &ToolContent) -> String {
 /// drops escape sequences whole, keeps line breaks, expands tabs,
 /// and removes the remaining control characters.
 fn sanitize_for_display(text: &str) -> String {
-    let chars: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(text.len());
-    let mut index = 0;
-    while let Some(&ch) = chars.get(index) {
-        index = index.saturating_add(1);
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
         match ch {
-            '\x1b' => match chars.get(index) {
+            '\x1b' => match chars.next() {
                 Some('[') => {
-                    index = index.saturating_add(1);
-                    while let Some(&c) = chars.get(index) {
-                        index = index.saturating_add(1);
+                    for c in chars.by_ref() {
                         if ('\x40'..='\x7e').contains(&c) {
                             break;
                         }
                     }
                 }
-                Some(']') => {
-                    index = index.saturating_add(1);
-                    while let Some(&c) = chars.get(index) {
-                        index = index.saturating_add(1);
-                        if c == '\x07' {
-                            break;
+                Some(']') => loop {
+                    match chars.next() {
+                        None | Some('\x07') => break,
+                        Some('\x1b') => {
+                            if chars.peek() == Some(&'\\') {
+                                chars.next();
+                                break;
+                            }
                         }
-                        if c == '\x1b' && chars.get(index) == Some(&'\\') {
-                            index = index.saturating_add(1);
-                            break;
-                        }
+                        Some(_) => {}
                     }
-                }
-                Some('P' | 'X' | '^' | '_') => {
-                    index = index.saturating_add(1);
-                    while let Some(&c) = chars.get(index) {
-                        index = index.saturating_add(1);
-                        if c == '\x1b' && chars.get(index) == Some(&'\\') {
-                            index = index.saturating_add(1);
-                            break;
+                },
+                // String sequences — DCS, SOS, PM, APC — run to
+                // their string terminator.
+                Some('P' | 'X' | '^' | '_') => loop {
+                    match chars.next() {
+                        None => break,
+                        Some('\x1b') => {
+                            if chars.peek() == Some(&'\\') {
+                                chars.next();
+                                break;
+                            }
                         }
+                        Some(_) => {}
                     }
-                }
+                },
                 // Any other escape: a run of intermediate bytes
                 // (0x20–0x2f — charset designations, their
                 // introducers) then one final byte.
                 Some(_) => {
-                    while chars
-                        .get(index)
-                        .is_some_and(|&c| ('\x20'..='\x2f').contains(&c))
-                    {
-                        index = index.saturating_add(1);
+                    while chars.peek().is_some_and(|c| ('\x20'..='\x2f').contains(c)) {
+                        chars.next();
                     }
-                    index = index.saturating_add(1);
+                    chars.next();
                 }
                 None => {}
             },
             '\r' => {
-                if chars.get(index) == Some(&'\n') {
-                    index = index.saturating_add(1);
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
                 }
                 out.push('\n');
             }
