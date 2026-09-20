@@ -305,27 +305,109 @@ fn ctrl_c_is_not_bound_in_the_editor() {
 }
 
 #[test]
-fn max_chars_caps_a_pathological_paste() {
+fn the_stamp_moves_only_on_mutations() {
+    // The wrap cache's key: queries leave it alone, every edit and
+    // every caret move advances it, so a cached grid is reused
+    // exactly until the editor changes.
+    let mut editor = InputEditor::new();
+    let fresh = editor.stamp();
+    let queried = (
+        editor.text().to_string(),
+        editor.display_rows(WRAP),
+        editor.cursor_cell(WRAP),
+    );
+    assert!(
+        queried.1.len() == 1 && queried.2.is_some(),
+        "the queries answer while leaving the stamp alone"
+    );
+    assert_eq!(editor.stamp(), fresh, "queries do not mutate");
+
+    type_str(&mut editor, "hi");
+    let after_typing = editor.stamp();
+    assert!(after_typing > fresh, "typing moves the stamp");
+
+    editor.handle_key(plain(KeyCode::Left), WRAP);
+    assert!(
+        editor.stamp() > after_typing,
+        "a caret move counts too — the caret shares the cache"
+    );
+
+    // a cap-rejected insert changes nothing — not even the stamp
+    editor.set_text("x".repeat(2_000_000));
+    let full = editor.stamp();
+    editor.insert_str("more");
+    assert_eq!(editor.stamp(), full, "a rejected insert is not a mutation");
+
+    // an unbound key leaves the editor entirely alone
+    let bound = editor.stamp();
+    editor.handle_key(plain(KeyCode::F(9)), WRAP);
+    assert_eq!(editor.stamp(), bound, "an unbound key stamps nothing");
+
+    // a word delete that removes text stamps; one with nothing
+    // behind the caret does not
+    editor.set_text("one two".to_string());
+    // baseline after the set_text bump, so only the delete can cross it
+    let before_first_delete = editor.stamp();
+    editor.handle_key(key(KeyCode::Char('w'), KeyModifiers::CONTROL), WRAP);
+    assert!(
+        editor.stamp() > before_first_delete,
+        "Ctrl-W removing a word is a mutation"
+    );
+    assert_eq!(editor.text(), "one ", "the word went");
+    let after_word = editor.stamp();
+    editor.handle_key(key(KeyCode::Char('w'), KeyModifiers::CONTROL), WRAP);
+    assert!(
+        editor.stamp() > after_word,
+        "deleting the remaining word stamps too"
+    );
+    let drained = editor.stamp();
+    editor.handle_key(key(KeyCode::Char('w'), KeyModifiers::CONTROL), WRAP);
+    assert_eq!(
+        editor.stamp(),
+        drained,
+        "Ctrl-W with an empty buffer stamps nothing"
+    );
+}
+
+#[test]
+fn a_realistic_huge_paste_lands_whole_and_submits_whole() {
     let mut editor = InputEditor::new();
     let huge = "x".repeat(200_001);
     editor.insert_str(&huge);
-    assert_eq!(editor.text().chars().count(), 100_000);
+    assert_eq!(
+        editor.text().chars().count(),
+        200_001,
+        "a paste far past the old cap lands in full"
+    );
+    assert_eq!(
+        editor.handle_key(plain(KeyCode::Enter), WRAP),
+        InputAction::Submit("x".repeat(200_001)),
+        "Enter submits the whole thing"
+    );
+}
+
+#[test]
+fn max_chars_still_caps_a_pathological_paste() {
+    let mut editor = InputEditor::new();
+    let huge = "x".repeat(2_000_001);
+    editor.insert_str(&huge);
+    assert_eq!(editor.text().chars().count(), 2_000_000);
 }
 
 #[test]
 fn a_cap_rejected_insert_leaves_the_stashed_draft_recoverable() {
     let mut editor = InputEditor::new();
-    editor.insert_str(&"x".repeat(100_000));
+    editor.insert_str(&"x".repeat(2_000_000));
     assert_eq!(
         editor.handle_key(plain(KeyCode::Enter), WRAP),
-        InputAction::Submit("x".repeat(100_000)),
+        InputAction::Submit("x".repeat(2_000_000)),
         "the full-cap entry submits and records"
     );
     type_str(&mut editor, "draf");
     editor.handle_key(plain(KeyCode::Up), WRAP);
     assert_eq!(
         editor.text().chars().count(),
-        100_000,
+        2_000_000,
         "Up recalls the full-cap entry over the stashed draft"
     );
     editor.handle_key(plain(KeyCode::Char('x')), WRAP);

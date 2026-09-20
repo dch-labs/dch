@@ -4,6 +4,7 @@
 //! state background producers write through; `run` drives the
 //! render ↔ input ↔ scroll loop until the user quits.
 
+use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::Ordering;
@@ -16,9 +17,10 @@ use crossterm::event::{
 use ratatui::Frame;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::Style;
-use ratatui::text::Line;
+use ratatui::style::{Color, Style};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use unicode_segmentation::UnicodeSegmentation as _;
 use unicode_width::UnicodeWidthChar as _;
 use unicode_width::UnicodeWidthStr as _;
 
@@ -75,6 +77,22 @@ const TICK_INTERVAL: Duration = Duration::from_millis(100);
 /// the app toggles visibility on its tick instead: what the user
 /// sees does not depend on the terminal's cooperation.
 const CARET_BLINK_TICKS: u32 = 5;
+
+/// How many graduated calls keep their expansion data.
+///
+/// The most recent calls stay expandable; older ones fold back to
+/// plain summary rows once this many newer calls have graduated.
+/// The retained set is bounded the way the capture store is, in
+/// FIFO order rather than a wholesale drop — the newest tool
+/// blocks, the ones a reader is still working through, are the
+/// ones that stay openable.
+const TOOL_DETAIL_CAP: usize = 256;
+
+/// How long a transient notice holds the row above the composer.
+///
+/// Long enough to be read at a glance, short enough that the row
+/// reads as empty by default.
+const NOTICE_HOLD: Duration = Duration::from_secs(4);
 
 /// How close to the newest line a scroll action must land to count
 /// as "back at the bottom".
@@ -375,16 +393,83 @@ pub struct TuiApp {
     /// past this stamp, whatever caused the bump.
     conversation_cache_generation: u64,
 
-    /// Whether the run loop should exit.
+    /// The quit lifecycle.
     ///
-    /// Set by the quit keys; the loop leaves at the top of its next
-    /// iteration.
-    quitting: bool,
+    /// Exit is a deliberate chord, not a slip: the state carries
+    /// both halves of it.
+    quit: QuitState,
+
+    /// How a Ctrl+C cancels the run in flight, when one is.
+    ///
+    /// Installed by the mode driver alongside the shared running
+    /// flag; absent in tests and headless hosts, where a cancel
+    /// press simply reports handled.
+    run_canceller: Option<Box<dyn Fn()>>,
+
+    /// Tool calls whose blocks render expanded.
+    ///
+    /// Keyed by call id; a click on a summary row toggles membership.
+    /// Running calls share the key with their completed block, so an
+    /// expansion opened while the tool runs survives its graduation.
+    expanded_tools: std::collections::HashSet<String>,
+
+    /// Full command and output per tool call, keyed by call id.
+    ///
+    /// Filled from the dispatch-side capture as calls graduate; a
+    /// block renders its expansion from here. Runtime-only — the
+    /// serialized session keeps previews, not payloads — and
+    /// bounded to the most recent `TOOL_DETAIL_CAP` calls in FIFO
+    /// order, so a long session's oldest blocks fold back to plain
+    /// summary rows instead of retaining payloads forever.
+    tool_details: HashMap<String, ToolDetail>,
+
+    /// Graduation order of the retained tool details, oldest first.
+    ///
+    /// The eviction queue behind the detail cap's FIFO: the front
+    /// names the entry the next graduation retires.
+    tool_detail_order: std::collections::VecDeque<String>,
+
+    /// Conversation line index to call id, for tool block rows.
+    ///
+    /// The click targets: every line of each completed block that
+    /// has retained detail — summary and expansion alike, so a
+    /// click anywhere on an open block folds it. Rebuilt with the
+    /// conversation cache.
+    tool_summary_lines: HashMap<usize, String>,
+
+    /// Line index to call id, for running tool block rows.
+    ///
+    /// The same click targets for in-flight calls — the row and its
+    /// expansion — in the line space the tools segment occupies;
+    /// recorded per frame.
+    tool_running_lines: HashMap<usize, String>,
 
     /// The application configuration this shell was built from.
     ///
     /// The status bar reads the model name from it.
     config: DchConfig,
+
+    /// The session's id, as the status bar shows it.
+    ///
+    /// Set by the host once the session's identity is known — the
+    /// resumed file's own id, or the runner's fresh one — so the
+    /// user can read (and copy out) which session they are in.
+    session_id: Option<String>,
+
+    /// The transient notice on the row above the composer, with
+    /// the instant its hold elapses.
+    ///
+    /// A glance-worthy event — a cancelled run — that is not a
+    /// transcript row: it shows for
+    /// [`NOTICE_HOLD`](self::NOTICE_HOLD) and leaves the reserved
+    /// row blank again.
+    transient_notice: Option<(String, Instant)>,
+
+    /// The composer's cached wrap, if it is still fresh.
+    ///
+    /// Valid for one buffer mutation at one width — see
+    /// [`composer_wrap`](Self::composer_wrap).
+    input_wrap_cache: Option<InputWrapCache>,
 }
 
 impl TuiApp {
@@ -444,7 +529,16 @@ impl TuiApp {
             conversation_cache_width: 0,
             conversation_generation: 1,
             conversation_cache_generation: 0,
-            quitting: false,
+            quit: QuitState::default(),
+            run_canceller: None,
+            expanded_tools: std::collections::HashSet::new(),
+            tool_details: HashMap::new(),
+            tool_detail_order: std::collections::VecDeque::new(),
+            tool_summary_lines: HashMap::new(),
+            tool_running_lines: HashMap::new(),
+            input_wrap_cache: None,
+            session_id: None,
+            transient_notice: None,
             config,
         }
     }
@@ -467,6 +561,36 @@ impl TuiApp {
         self.conversation_generation = self.conversation_generation.saturating_add(1);
     }
 
+    /// Post a transient notice above the composer.
+    ///
+    /// Replaces any notice still holding — one row, one message,
+    /// the newest wins.
+    pub fn post_notice(&mut self, text: String) {
+        let until = Instant::now()
+            .checked_add(NOTICE_HOLD)
+            .unwrap_or_else(Instant::now);
+        self.transient_notice = Some((text, until));
+    }
+
+    /// Name the session the status bar shows.
+    ///
+    /// The host calls this once the session's identity settles —
+    /// before the run loop starts, so the first frame already
+    /// carries it.
+    pub fn set_session_id(&mut self, id: String) {
+        self.session_id = Some(id);
+    }
+
+    /// Install the run canceller.
+    ///
+    /// The mode driver's half of the Ctrl+C contract: while
+    /// [`agent_running`](TuiObserverState::agent_running) is set, a
+    /// Ctrl+C press on an empty composer calls this to stop the
+    /// submission in flight.
+    pub fn set_run_canceller(&mut self, canceller: Box<dyn Fn()>) {
+        self.run_canceller = Some(canceller);
+    }
+
     /// Install a whole prior conversation as the session's starting
     /// state.
     ///
@@ -477,6 +601,22 @@ impl TuiApp {
     /// the run loop starts; a mid-session call would splice history
     /// into a live conversation.
     pub fn seed_messages(&mut self, messages: Vec<TuiMessage>) {
+        for message in &messages {
+            let TuiMessage::Assistant { blocks, .. } = message else {
+                continue;
+            };
+            for block in blocks {
+                if let ContentBlock::Tool {
+                    call_id,
+                    retained_input,
+                    output_preview,
+                    ..
+                } = block
+                {
+                    self.retain_tool_detail(call_id, retained_input, output_preview);
+                }
+            }
+        }
         self.conversation.extend(messages);
         self.conversation_generation = self.conversation_generation.saturating_add(1);
         self.scroll_offset = 0;
@@ -500,6 +640,16 @@ impl TuiApp {
         self.scroll_offset
     }
 
+    /// Whether the composer caret is in its visible blink phase.
+    ///
+    /// The terminal's own cursor stands in for the caret, so this is
+    /// the app-side half of the blink contract: keyboard input
+    /// resolidifies it, mouse traffic does not.
+    #[must_use]
+    pub fn caret_visible(&self) -> bool {
+        self.caret_blink.on
+    }
+
     /// Whether the view follows the newest content.
     ///
     /// True while pinned; any scroll-up detaches until the view
@@ -514,7 +664,7 @@ impl TuiApp {
     /// True after a quit key; the loop observes it between events.
     #[must_use]
     pub fn is_quitting(&self) -> bool {
-        self.quitting
+        self.quit.requested
     }
 
     /// The shared streaming-text buffer.
@@ -630,7 +780,7 @@ impl TuiApp {
         &mut self,
         terminal: &mut ratatui::Terminal<CrosstermBackend<std::io::Stdout>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        self.quitting = false;
+        self.quit = QuitState::default();
         let mut events = TerminalEvents::spawn();
         let mut tick = tokio::time::interval(TICK_INTERVAL);
         let notify = Arc::clone(&self.state.render_notify);
@@ -638,7 +788,7 @@ impl TuiApp {
 
         terminal.draw(|frame| self.render(frame))?;
 
-        while !self.quitting {
+        while !self.quit.requested {
             let needs_redraw = tokio::select! {
                 maybe_event = events.recv() => {
                     match maybe_event {
@@ -663,6 +813,20 @@ impl TuiApp {
         Ok(())
     }
 
+    /// Copy the live selection, if any.
+    ///
+    /// The terminal-standard copy chord. A span that covered no
+    /// characters leaves the clipboard alone — the same discipline
+    /// the release and the keyboard walk apply.
+    fn copy_selection_now(&mut self) {
+        if let Some(selection) = self.selection.as_ref() {
+            let (text, covered_any) = self.selection_text(selection);
+            if covered_any {
+                (self.copier)(&text);
+            }
+        }
+    }
+
     /// Handle the events already waiting behind the first one.
     ///
     /// A touchpad's wheel momentum and a fast typist both deliver
@@ -673,7 +837,7 @@ impl TuiApp {
     /// applies the whole burst to the state — the offsets simply
     /// accumulate — and the caller draws once afterwards. The drain
     /// stops at a quit event, so nothing queued behind the user's
-    /// Esc — an Enter, a send, an echo — is applied after the
+    /// confirming Ctrl+C — an Enter, a send, an echo — is applied after the
     /// decision to leave. A read failure from the source propagates
     /// out instead of masquerading as a clean exit.
     ///
@@ -689,7 +853,7 @@ impl TuiApp {
         F: FnMut() -> Option<Result<Event, std::io::Error>>,
     {
         let mut needs_redraw = false;
-        while !self.quitting
+        while !self.quit.requested
             && let Some(result) = next()
         {
             let event = result?;
@@ -703,9 +867,9 @@ impl TuiApp {
     /// Returns whether the event requires a redraw. Key releases and
     /// repeats are ignored so a held key fires once per press.
     pub fn handle_event(&mut self, event: &Event) -> bool {
-        self.caret_blink.resolidify();
         match event {
             Event::Key(key) => {
+                self.caret_blink.resolidify();
                 if key.kind != KeyEventKind::Press {
                     return false;
                 }
@@ -713,7 +877,8 @@ impl TuiApp {
             }
             Event::Mouse(mouse) => self.handle_mouse(*mouse),
             Event::Paste(text) => {
-                self.input.insert_str(text);
+                self.caret_blink.resolidify();
+                self.input.insert_str(&normalize_pasted_newlines(text));
                 true
             }
             Event::Resize(_, _) => true,
@@ -721,19 +886,58 @@ impl TuiApp {
         }
     }
 
-    /// Apply one key press: quit and page-scroll keys stay app-level,
-    /// everything else belongs to the input editor.
+    /// Apply one key press: the quit chord, copy chord, and
+    /// page-scroll keys stay app-level, everything else belongs to
+    /// the input editor.
     ///
-    /// Up, Down, and End fall back to the transcript while the input
+    /// Ctrl+C clears a non-empty buffer — arming nothing, so a
+    /// cleared draft still takes two further presses to exit — and
+    /// on an empty one the second press quits; any other key
+    /// disarms, so the chord never fires from stale intent. While a
+    /// run is in flight the press serves the run instead: a draft
+    /// clears first, then an empty-composer press cancels the run —
+    /// arming nothing, so exiting after the cancel takes its own
+    /// two presses.
+    /// Ctrl+Shift+C copies the live selection where the terminal
+    /// reports the shift; on terminals that collapse it to a plain
+    /// Ctrl+C it simply joins the chord's clearing behavior. Up,
+    /// Down, and End fall back to the transcript while the input
     /// sits empty with nothing to recall — a fresh session's arrows
     /// still scroll the conversation — and join the editor as soon as
     /// anything is typed or recallable. Shift and an arrow, with a
     /// transcript selection up, moves the selection's head instead:
     /// the editor's select-by-keyboard.
     fn handle_key(&mut self, key: KeyEvent) -> bool {
+        if !matches!(
+            (key.code, key.modifiers),
+            (KeyCode::Char('c'), KeyModifiers::CONTROL)
+        ) {
+            self.quit.disarm();
+        }
         match (key.code, key.modifiers) {
-            (KeyCode::Char('c' | 'd'), KeyModifiers::CONTROL) | (KeyCode::Esc, _) => {
-                self.quitting = true;
+            (KeyCode::Char('c'), mods) if mods == KeyModifiers::CONTROL | KeyModifiers::SHIFT => {
+                self.copy_selection_now();
+                true
+            }
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                if self
+                    .state
+                    .agent_running
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    if !self.input.is_empty() {
+                        self.input.clear();
+                    } else if let Some(cancel) = &self.run_canceller {
+                        cancel();
+                        self.post_notice("Agent cancelled".to_string());
+                    }
+                } else if !self.input.is_empty() {
+                    self.input.clear();
+                } else if self.quit.armed {
+                    self.quit.requested = true;
+                } else {
+                    self.quit.arm();
+                }
                 true
             }
             (KeyCode::F(2), _) => {
@@ -806,16 +1010,18 @@ impl TuiApp {
                 true
             }
             MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
-                match self.cell_at(mouse.column, mouse.row) {
-                    Some(cell) => {
-                        self.selection = Some(CellSelection {
-                            anchor: cell,
-                            head: cell,
-                        });
-                        self.drag_position = Some((mouse.column, mouse.row));
-                        true
-                    }
-                    None => self.place_input_caret(mouse.column, mouse.row),
+                self.quit.disarm();
+                if let Some(cell) = self.cell_at(mouse.column, mouse.row) {
+                    self.selection = Some(CellSelection {
+                        anchor: cell,
+                        head: cell,
+                    });
+                    self.drag_position = Some((mouse.column, mouse.row));
+                    true
+                } else {
+                    let retired = self.selection.take().is_some();
+                    self.drag_position = None;
+                    self.place_input_caret(mouse.column, mouse.row) || retired
                 }
             }
             MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
@@ -836,7 +1042,9 @@ impl TuiApp {
                 self.drag_position = None;
                 match self.selection.take() {
                     Some(selection) => {
-                        if selection.anchor != selection.head {
+                        if selection.anchor == selection.head {
+                            self.toggle_tool_at(mouse.column, mouse.row);
+                        } else {
                             let (text, covered_any) = self.selection_text(&selection);
                             if covered_any {
                                 (self.copier)(&text);
@@ -845,7 +1053,7 @@ impl TuiApp {
                         }
                         true
                     }
-                    None => false,
+                    None => self.toggle_tool_at(mouse.column, mouse.row),
                 }
             }
             MouseEventKind::Moved => {
@@ -1111,6 +1319,54 @@ impl TuiApp {
         Some(CellPos { line, col })
     }
 
+    /// Toggle the tool expansion at screen column/row, if any.
+    ///
+    /// A click — press and release without travel — on a tool
+    /// summary row or a running tool row opens or closes that
+    /// call's expansion. Toggling a completed block changes the
+    /// rendered line count below it, so it bumps the conversation
+    /// generation and forfeits the selection, the same way any
+    /// renumbering mutation does; a running call's rows are
+    /// rebuilt every frame and need no bump. Returns whether a
+    /// tool row was hit at all.
+    fn toggle_tool_at(&mut self, column: u16, row: u16) -> bool {
+        let Some(view) = self.last_view else {
+            return false;
+        };
+        if column < view.area.x
+            || column >= view.area.right()
+            || row < view.area.y
+            || row >= view.area.bottom()
+        {
+            return false;
+        }
+        let line = view
+            .skip
+            .saturating_add(usize::from(row.saturating_sub(view.area.y)));
+        let call_id = self
+            .tool_summary_lines
+            .get(&line)
+            .or_else(|| self.tool_running_lines.get(&line))
+            .cloned()
+            .unwrap_or_default();
+        if call_id.is_empty() {
+            return false;
+        }
+        let expanding = !self.expanded_tools.remove(&call_id);
+        if expanding {
+            self.expanded_tools.insert(call_id.clone());
+        }
+        if self.tool_details.contains_key(&call_id) {
+            if expanding {
+                self.auto_scroll = false;
+            }
+            self.conversation_generation = self.conversation_generation.saturating_add(1);
+            self.selection = None;
+            self.drag_position = None;
+        }
+        true
+    }
+
     /// Place the composer's caret where a press landed.
     ///
     /// Presses inside the composer pane claim the press — padding
@@ -1323,7 +1579,14 @@ impl TuiApp {
         }
         let dragged = self.drag_autoscroll();
         let blinked = self.caret_blink.tick();
-        self.any_tools_running() || claimed || dragged || blinked
+        let notice_lapsed = self
+            .transient_notice
+            .as_ref()
+            .is_some_and(|(_, until)| *until <= now);
+        if notice_lapsed {
+            self.transient_notice = None;
+        }
+        self.any_tools_running() || claimed || dragged || blinked || notice_lapsed
     }
 
     /// Whether a graduation is waiting to land.
@@ -1362,7 +1625,7 @@ impl TuiApp {
             .width
             .max(1)
             .saturating_sub(INPUT_SIDE_INSET.saturating_mul(2));
-        let rows = self.input.display_rows(wrap_width);
+        let (rows, caret) = self.composer_wrap(wrap_width);
         let text_rows = u16::try_from(rows.len())
             .unwrap_or(1)
             .clamp(1, INPUT_TEXT_ROWS);
@@ -1372,6 +1635,7 @@ impl TuiApp {
             .constraints([
                 Constraint::Min(0),
                 Constraint::Length(1),
+                Constraint::Length(1),
                 Constraint::Length(composer_height),
                 Constraint::Length(STATUS_BAR_ROWS),
             ])
@@ -1379,6 +1643,7 @@ impl TuiApp {
 
         let fallback = area;
         self.render_conversation(frame, pane(&chunks, 0, fallback));
+        self.render_notice(frame, pane(&chunks, 1, fallback));
         // The paintless theme's composer marking: hairline rules the
         // terminal draws itself — an underlined spacer puts a 1px
         // line at the box's top edge, an underlined last row at its
@@ -1386,8 +1651,8 @@ impl TuiApp {
         // terminal's own decoration, not glyphs (which gap between
         // rows on some) or paint (which is a full cell thick).
         if let Some(color) = self.theme.ui.composer_border {
-            let spacer = pane(&chunks, 1, fallback);
-            let composer = pane(&chunks, 2, fallback);
+            let spacer = pane(&chunks, 2, fallback);
+            let composer = pane(&chunks, 3, fallback);
             let rule = Style::default()
                 .fg(color)
                 .add_modifier(ratatui::style::Modifier::UNDERLINED);
@@ -1403,11 +1668,10 @@ impl TuiApp {
                 frame.buffer_mut().set_style(bottom, rule);
             }
         }
-        let input_area = pane(&chunks, 2, fallback);
+        let input_area = pane(&chunks, 3, fallback);
         self.input_wrap_width = wrap_width;
-        let caret = self.input.cursor_cell(wrap_width).unwrap_or((0, 0));
         self.render_input(frame, input_area, &rows, caret);
-        self.render_status_bar(frame, pane(&chunks, 3, fallback), &rows, caret);
+        self.render_status_bar(frame, pane(&chunks, 4, fallback), &rows, caret);
     }
 
     /// Render the conversation pane: the settled conversation, the
@@ -1428,7 +1692,9 @@ impl TuiApp {
         if self.conversation_cache_generation != self.conversation_generation
             || self.conversation_cache_width != width
         {
-            self.conversation_cache = self.conversation_lines(text_area);
+            let mut summary_lines = HashMap::new();
+            self.conversation_cache = self.conversation_lines(text_area, &mut summary_lines);
+            self.tool_summary_lines = summary_lines;
             self.conversation_cache_width = width;
             self.conversation_cache_generation = self.conversation_generation;
             // A rebuilt line space — a new message graduating in, a
@@ -1457,12 +1723,16 @@ impl TuiApp {
             self.selection = None;
             self.drag_position = None;
         }
-        let tools = self.active_tool_lines();
+        let (tools, running_rows) = self.active_tool_lines(width);
         let selectable_lines = self
             .conversation_cache
             .len()
             .saturating_add(self.frozen_lines.len())
             .saturating_add(self.live_lines.len());
+        self.tool_running_lines = running_rows
+            .into_iter()
+            .map(|(index, call_id)| (index.saturating_add(selectable_lines), call_id))
+            .collect();
         let total_lines = selectable_lines.saturating_add(tools.len());
         self.settle_scroll_offset(total_lines, conversation_height);
         let skip = total_lines
@@ -1526,6 +1796,35 @@ impl TuiApp {
         self.last_layout_lines = total_lines;
     }
 
+    /// Retain a graduated call's full detail, evicting at the cap.
+    ///
+    /// The one insertion path for the detail store: a graduation
+    /// with captured content, and the resume seeding of blocks the
+    /// file carried. A retried call graduates once per attempt
+    /// under the same id, so the queue is requeued rather than
+    /// duplicated and the detail ages from its newest attempt; the
+    /// oldest entry retires past the cap with its toggle state.
+    fn retain_tool_detail(&mut self, call_id: &str, input_json: &str, output: &str) {
+        if call_id.is_empty() || input_json.is_empty() {
+            return;
+        }
+        self.tool_detail_order.retain(|id| id != call_id);
+        self.tool_detail_order.push_back(call_id.to_string());
+        if self.tool_detail_order.len() > TOOL_DETAIL_CAP
+            && let Some(retired) = self.tool_detail_order.pop_front()
+        {
+            self.tool_details.remove(&retired);
+            self.expanded_tools.remove(&retired);
+        }
+        self.tool_details.insert(
+            call_id.to_string(),
+            ToolDetail {
+                input_json: input_json.to_string(),
+                output: output.to_string(),
+            },
+        );
+    }
+
     /// Take what the observer finished since the last frame.
     ///
     /// Finalized replies and completed tool calls alike move into
@@ -1551,13 +1850,20 @@ impl TuiApp {
                     });
                 }
                 Graduation::Tool(result) => {
+                    self.retain_tool_detail(
+                        &result.call_id,
+                        &result.full_input,
+                        &result.full_output,
+                    );
                     self.push_message(TuiMessage::Assistant {
                         blocks: vec![ContentBlock::Tool {
                             name: result.name,
+                            call_id: result.call_id,
                             input_preview: result.input_summary,
                             success: !result.is_error,
                             elapsed_secs: result.duration.as_secs_f64(),
                             output_preview: result.output_preview,
+                            retained_input: result.full_input,
                         }],
                         timestamp: now,
                         duration_ms: None,
@@ -1588,7 +1894,11 @@ impl TuiApp {
     /// block renders its verbosity-shaped summary line(s) between
     /// the text blocks around it. The live region (streaming text,
     /// in-flight tools) is assembled by the caller.
-    fn conversation_lines(&self, area: Rect) -> Vec<Line<'static>> {
+    fn conversation_lines(
+        &self,
+        area: Rect,
+        summary_lines: &mut HashMap<usize, String>,
+    ) -> Vec<Line<'static>> {
         let width = area.width.max(1);
         let markdown_theme = markdown::MarkdownTheme::from(&self.theme);
         let syntax_theme = markdown::SyntaxTheme::from(&self.theme);
@@ -1596,10 +1906,15 @@ impl TuiApp {
         for message in &self.conversation {
             match message {
                 TuiMessage::User { text, .. } => {
+                    // Wrapped, not clipped: pasted text routinely
+                    // runs lines past the pane's width, and a row
+                    // cut at the edge reads as text that never
+                    // arrived.
                     for segment in text.split('\n') {
-                        lines.push(Line::styled(
-                            segment.to_string(),
-                            Style::default().fg(self.theme.ui.user_message_fg),
+                        lines.extend(plain_wrapped_lines(
+                            segment,
+                            usize::from(width),
+                            self.theme.ui.user_message_fg,
                         ));
                     }
                 }
@@ -1618,6 +1933,7 @@ impl TuiApp {
                             }
                             ContentBlock::Tool {
                                 name,
+                                call_id,
                                 input_preview,
                                 success,
                                 elapsed_secs,
@@ -1633,25 +1949,51 @@ impl TuiApp {
                                 };
                                 let record = ToolResultDisplay {
                                     name: name.clone(),
+                                    call_id: String::new(),
                                     is_error: !*success,
                                     duration: elapsed,
                                     input_summary: input_preview.clone(),
                                     output_preview: String::new(),
+                                    full_input: String::new(),
+                                    full_output: String::new(),
                                 };
+                                let first = lines.len();
                                 lines.extend(crate::tool_render::completed_tool_lines(
                                     &record,
                                     &self.theme,
                                     self.verbosity,
                                 ));
+                                if let Some(detail) = self.tool_details.get(call_id) {
+                                    let expanded = self.expanded_tools.contains(call_id);
+                                    prepend_marker(
+                                        &mut lines,
+                                        first,
+                                        if expanded { "▾ " } else { "▸ " },
+                                        self.theme.ui.dim,
+                                    );
+                                    if expanded {
+                                        lines.extend(expansion_lines(
+                                            &detail.input_json,
+                                            Some(&detail.output),
+                                            width,
+                                            self.theme.ui.assistant_message_fg,
+                                            self.theme.ui.dim,
+                                        ));
+                                    }
+                                    for index in first..lines.len() {
+                                        summary_lines.insert(index, call_id.clone());
+                                    }
+                                }
                             }
                         }
                     }
                 }
                 TuiMessage::System { text, .. } => {
                     for segment in text.split('\n') {
-                        lines.push(Line::styled(
-                            segment.to_string(),
-                            Style::default().fg(self.theme.ui.dim),
+                        lines.extend(plain_wrapped_lines(
+                            segment,
+                            usize::from(width),
+                            self.theme.ui.dim,
                         ));
                     }
                 }
@@ -1868,27 +2210,121 @@ impl TuiApp {
         }
     }
 
-    /// The in-flight tool indicator lines.
+    /// The in-flight tool indicator lines, with their click rows.
     ///
-    /// One dim line per dispatched call; a poisoned lock renders
-    /// none, the same policy the status bar applies.
-    fn active_tool_lines(&self) -> Vec<Line<'static>> {
+    /// One dim line per dispatched call — expanded, when opened,
+    /// to the call's captured input with the output pending; a
+    /// poisoned lock renders none, the same policy the status bar
+    /// applies. Returns the lines and, for each call the capture
+    /// store knows, every row of its block — summary and
+    /// expansion alike, the rows a click toggles.
+    fn active_tool_lines(&self, width: u16) -> (Vec<Line<'static>>, HashMap<usize, String>) {
         let tools = self
             .state
             .active_tools
             .lock()
             .map_or_else(|_| Vec::new(), |tools| tools.clone());
-        tools
-            .iter()
-            .flat_map(|tool| {
-                crate::tool_render::running_tool_lines(
-                    tool,
-                    self.spinner_idx,
-                    &self.theme,
-                    self.verbosity,
-                )
-            })
-            .collect()
+        let captures = self
+            .state
+            .tool_captures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut lines = Vec::new();
+        let mut rows = HashMap::new();
+        for tool in &tools {
+            let first = lines.len();
+            lines.extend(crate::tool_render::running_tool_lines(
+                tool,
+                self.spinner_idx,
+                &self.theme,
+                self.verbosity,
+            ));
+            let Some(capture) = captures.get(&tool.call_id) else {
+                continue;
+            };
+            let expanded = self.expanded_tools.contains(&tool.call_id);
+            prepend_marker(
+                &mut lines,
+                first,
+                if expanded { "▾ " } else { "▸ " },
+                self.theme.ui.dim,
+            );
+            if expanded {
+                let output = if capture.done {
+                    Some(capture.output.as_str())
+                } else {
+                    None
+                };
+                lines.extend(expansion_lines(
+                    &capture.input_json,
+                    output,
+                    width,
+                    self.theme.ui.assistant_message_fg,
+                    self.theme.ui.dim,
+                ));
+            }
+            for index in first..lines.len() {
+                rows.insert(index, tool.call_id.clone());
+            }
+        }
+        (lines, rows)
+    }
+
+    /// The frame's single wrap of the composer, reused across
+    /// frames that do not touch it.
+    ///
+    /// A full-buffer wrap costs tens of milliseconds at the paste
+    /// cap, and idle frames — the caret's blink, the tool spinner,
+    /// a streaming delta — would otherwise pay it every time. The
+    /// cache keys on the editor's mutation stamp and the wrap
+    /// width, so only edits and resizes re-wrap; everything else
+    /// clones the cached grid.
+    fn composer_wrap(&mut self, width: u16) -> (Arc<Vec<String>>, (u16, u16)) {
+        if let Some(cache) = &self.input_wrap_cache
+            && cache.stamp == self.input.stamp()
+            && cache.width == width
+        {
+            return (Arc::clone(&cache.rows), cache.caret);
+        }
+        let (rows, caret) = self.input.display_rows_and_caret(width);
+        let caret = caret.unwrap_or((0, 0));
+        let rows = Arc::new(rows);
+        self.input_wrap_cache = Some(InputWrapCache {
+            stamp: self.input.stamp(),
+            width,
+            rows: Arc::clone(&rows),
+            caret,
+        });
+        (rows, caret)
+    }
+
+    /// Render the notice row: one line of transient or state-driven
+    /// message above the composer.
+    ///
+    /// The armed-quit hint owns the row while it holds — safety
+    /// wording outranks anything expiring — and a transient notice
+    /// (a cancel, an event worth a glance, not a transcript row)
+    /// shows until its hold elapses. Blank otherwise; the row is
+    /// always reserved so nothing on screen shifts when a message
+    /// arrives or leaves.
+    fn render_notice(&self, frame: &mut Frame, area: Rect) {
+        if area.height == 0 {
+            return;
+        }
+        let text = if self.quit.armed {
+            Some("press ctrl+c again to quit")
+        } else {
+            self.transient_notice
+                .as_ref()
+                .filter(|(_, until)| *until > Instant::now())
+                .map(|(text, _)| text.as_str())
+        };
+        if let Some(text) = text {
+            frame.render_widget(
+                Paragraph::new(text).style(Style::default().fg(self.theme.ui.input_border)),
+                area,
+            );
+        }
     }
 
     /// Render the input field: a fixed multi-row window onto the
@@ -2006,7 +2442,11 @@ impl TuiApp {
                     .saturating_add(counts.cumulative_output)
             },
         );
-        let status_text = format!(" {}  │  {tokens} tok", self.config.api.model);
+        let mut status_text = format!(" {}  │  CTX: {tokens}", self.config.api.model);
+        if let Some(id) = &self.session_id {
+            status_text.push_str("  │  ");
+            status_text.push_str(id);
+        }
         let bar_style = Style::default()
             .fg(self.theme.ui.status_bar_fg)
             .bg(self.theme.ui.status_bar_bg);
@@ -2084,6 +2524,61 @@ impl TuiApp {
     }
 }
 
+/// Prefix a disclosure glyph onto one rendered line.
+///
+/// The summary row's existing spans shift right by the glyph, so
+/// the marker rides whatever styling the row already carries.
+fn prepend_marker(lines: &mut [Line<'static>], index: usize, glyph: &str, color: Color) {
+    let Some(line) = lines.get_mut(index) else {
+        return;
+    };
+    let mut spans = Vec::with_capacity(line.spans.len().saturating_add(1));
+    spans.push(Span::styled(glyph.to_string(), Style::default().fg(color)));
+    spans.extend(std::mem::take(&mut line.spans));
+    line.spans = spans;
+}
+
+/// The lines of a tool block's expansion.
+///
+/// The full command — the call's pretty-printed input — over the
+/// call's output, each indented under its label and wrapped at the
+/// pane width. A call still running shows its command with the
+/// output pending, so an expansion opened early is not a dead end.
+fn expansion_lines(
+    input_json: &str,
+    output: Option<&str>,
+    width: u16,
+    base: Color,
+    dim: Color,
+) -> Vec<Line<'static>> {
+    let wrap = usize::from(width.max(1));
+    let mut lines = Vec::new();
+    lines.push(Line::styled(
+        "    input:".to_string(),
+        Style::default().fg(dim),
+    ));
+    for raw in input_json.split('\n') {
+        lines.extend(plain_wrapped_lines(&format!("    {raw}"), wrap, dim));
+    }
+    match output {
+        Some(text) => {
+            lines.push(Line::styled(
+                "    output:".to_string(),
+                Style::default().fg(dim),
+            ));
+            for raw in text.split('\n') {
+                lines.extend(plain_wrapped_lines(&format!("    {raw}"), wrap, base));
+            }
+        }
+        None => lines.push(Line::styled(
+            "    output: … running".to_string(),
+            Style::default().fg(dim),
+        )),
+    }
+    lines.push(Line::from(""));
+    lines
+}
+
 /// One display cell of the rendered transcript.
 ///
 /// A conversation line index paired with the column, in cells, of
@@ -2095,6 +2590,18 @@ struct CellPos {
     line: usize,
     /// The cell column within the rendered line.
     col: usize,
+}
+
+/// A tool call's retained full data, for the expanded block.
+///
+/// What the dispatch-side capture recorded, held on the app past
+/// graduation so the expansion outlives the shared store's
+/// turnover.
+struct ToolDetail {
+    /// The call's input, pretty-printed JSON.
+    input_json: String,
+    /// The call's output, within the retention cap.
+    output: String,
 }
 
 /// A mouse selection between two display cells.
@@ -2110,13 +2617,45 @@ struct CellSelection {
     head: CellPos,
 }
 
+/// The quit lifecycle's two halves.
+///
+/// Exit is Ctrl+C pressed twice on an empty buffer: the first
+/// arms, the second confirms and requests the exit. The press
+/// that clears a non-empty buffer arms nothing — clearing is not
+/// consenting — and any other key or mouse press disarms, so the
+/// chord never fires from stale intent.
+#[derive(Debug, Clone, Copy, Default)]
+struct QuitState {
+    /// Whether one press has armed the exit.
+    armed: bool,
+    /// Whether the second press confirmed it.
+    ///
+    /// The run loop leaves at the top of its next iteration.
+    requested: bool,
+}
+
+impl QuitState {
+    /// Record a first press.
+    fn arm(&mut self) {
+        self.armed = true;
+    }
+
+    /// Take back a first press.
+    ///
+    /// Any key that is not the chord's own spelling disarms it.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
 /// The composer caret's blink state.
 ///
 /// The terminal's blinking-cursor request is often ignored or
 /// preference-gated, so the app owns the blink: half a second
-/// visible, half a second dark. Any input event resolidifies the
-/// caret and restarts the phase, so typing or mouse motion holds it
-/// solid and the blink resumes after half a second of stillness.
+/// visible, half a second dark. Keyboard input resolidifies the
+/// caret and restarts the phase, so typing holds it solid and the
+/// blink resumes after half a second of stillness; mouse traffic
+/// reads, it does not type, and leaves the phase alone.
 struct CaretBlink {
     /// Whether the caret is in its visible phase.
     on: bool,
@@ -2153,6 +2692,45 @@ impl CaretBlink {
     }
 }
 
+/// The composer's cached wrap.
+///
+/// One buffer mutation at one width: the rows the buffer wraps to
+/// and the caret's resolved cell among them, kept until the
+/// editor's stamp or the pane width moves. The answers a frame's
+/// sizing, painting, and status tag all need, computed once per
+/// change instead of once per frame.
+struct InputWrapCache {
+    /// The editor mutation stamp the wrap was computed at.
+    ///
+    /// The cache holds exactly while this matches the editor's
+    /// current stamp; every accepted edit and caret move advances
+    /// it, which is what tells an untouched frame to reuse the
+    /// grid.
+    stamp: u64,
+
+    /// The wrap width the grid was built for.
+    ///
+    /// A resize re-wraps rather than reuses — wrapped rows are
+    /// width-shaped, and a pane of another width would clip rows
+    /// baked for the old one.
+    width: u16,
+
+    /// The wrapped rows, shared by `Arc`.
+    ///
+    /// The same grid `display_rows` would rebuild; a cache hit
+    /// clones the reference, not the grid — an idle frame pays
+    /// neither the wrap nor a copy of its tens of thousands of
+    /// rows.
+    rows: Arc<Vec<String>>,
+
+    /// The caret's cell on that grid.
+    ///
+    /// Resolved, the empty buffer's `(0, 0)` parking spot included,
+    /// so a hit answers both questions the frame asks without
+    /// touching the editor again.
+    caret: (u16, u16),
+}
+
 /// What the last frame's composer pane looked like.
 ///
 /// The bridge between a press (screen cells, between frames) and the
@@ -2162,12 +2740,28 @@ impl CaretBlink {
 #[derive(Clone, Copy)]
 struct InputView {
     /// The composer pane's rect — presses inside belong to it.
+    ///
+    /// The press-routing claim: a press inside this rect places the
+    /// caret, everything outside it falls to the conversation's
+    /// selection logic.
     pane: Rect,
+
     /// The interior cell where the wrap grid's row 0, column 0 sits.
+    ///
+    /// Press coordinates become grid coordinates by subtracting
+    /// this, net of the pane's own side inset.
     origin: (u16, u16),
+
     /// The wrap-grid row the text window's top row shows.
+    ///
+    /// The window follows the caret's line; this records which
+    /// slice was on screen when the press landed.
     start: usize,
+
     /// How many wrap rows the text window shows.
+    ///
+    /// A press below the window's last row clamps into it — the
+    /// way editors clamp a click below a document's end.
     visible: usize,
 }
 
@@ -2180,11 +2774,26 @@ struct InputView {
 #[derive(Clone, Copy)]
 struct ViewState {
     /// The conversation pane's rect, gutter excluded.
+    ///
+    /// The screen-cell bounds a mouse event is tested against; the
+    /// scrollbar's gutter column stays outside so a press there
+    /// belongs to nothing.
     area: Rect,
+
     /// The first conversation line the pane showed.
+    ///
+    /// The additive base that turns a screen row into a
+    /// conversation line index — clicks, drags, and the
+    /// edge-scroll all map through it.
     skip: usize,
+
     /// The conversation's total line count that frame.
+    ///
+    /// The scroll space's size: running-tool rows are included,
+    /// because the viewport scrolls over them even though a
+    /// selection cannot cover them.
     total: usize,
+
     /// The line count a selection can cover — the total without the
     /// running-tool rows, which render below the selectable document
     /// and never join the selection's line space.
@@ -2226,7 +2835,42 @@ fn copy_to_clipboard(text: &str) {
 /// `static` so a returned window can borrow it past the call.
 static NO_LINES: [Line<'static>; 0] = [];
 
+/// Spell a paste's line breaks the editor's way.
+///
+/// Terminals differ in how they relay newlines inside a bracketed
+/// paste — some send line feeds, some carriage returns, some both.
+/// The editor's line model is the line feed, and a carriage return
+/// that survives as content welds the whole paste into one logical
+/// line (the composer's window then shows only its tail) and later
+/// reaches the terminal as a cell the renderer never meant to
+/// draw. Both spellings fold here; every other character passes
+/// through untouched.
+fn normalize_pasted_newlines(text: &str) -> String {
+    if !text.contains('\r') {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\r' {
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            out.push('\n');
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 /// Order a selection's ends by line then column.
+///
+/// The anchor stays wherever the press landed and the head follows
+/// the drag, so either end can sit above the other; walking the
+/// covered span and highlighting it both need the ends sorted.
+/// Returns the lower end first, compared as `(line, column)` —
+/// the order the rendered line space reads.
 fn ordered(selection: &CellSelection) -> (&CellPos, &CellPos) {
     let (a, b) = (&selection.anchor, &selection.head);
     if (a.line, a.col) <= (b.line, b.col) {
@@ -2247,18 +2891,20 @@ fn cells_overlap(cell: usize, width: usize, start: usize, end: usize) -> bool {
     cell <= end && cell.saturating_add(width).saturating_sub(1) >= start
 }
 
-/// The characters of `flat` whose cells meet `start..=end`.
+/// The graphemes of `flat` whose cells meet `start..=end`.
 ///
-/// Walks by display cells and takes every character that overlaps
-/// the span — so the copied characters match the highlighted cells
-/// exactly.
+/// Walks by display cells and takes every grapheme cluster that
+/// overlaps the span — so the copied text matches the highlighted
+/// cells exactly. Clusters, not characters: a combining mark adds
+/// no cell of its own, so the selection's grid stays the one the
+/// renderer painted, and a selected base carries its marks.
 fn covered_chars(flat: &str, start: usize, end_inclusive: usize) -> String {
     let mut out = String::new();
     let mut cell = 0;
-    for ch in flat.chars() {
-        let width = ch.width().unwrap_or(0).max(1);
+    for cluster in flat.graphemes(true) {
+        let width = cluster.width();
         if cells_overlap(cell, width, start, end_inclusive) {
-            out.push(ch);
+            out.push_str(cluster);
         }
         cell = cell.saturating_add(width);
         if cell > end_inclusive {
@@ -2291,8 +2937,8 @@ fn reverse_selection(lines: &mut [Line<'_>], skip: usize, selection: &CellSelect
         for span in line.spans.drain(..) {
             let content = span.content;
             let mut chunk = String::new();
-            for ch in content.chars() {
-                let width = ch.width().unwrap_or(0).max(1);
+            for cluster in content.graphemes(true) {
+                let width = cluster.width();
                 let selected = cells_overlap(cell, width, start, end);
                 if selected {
                     if !chunk.is_empty() {
@@ -2302,11 +2948,11 @@ fn reverse_selection(lines: &mut [Line<'_>], skip: usize, selection: &CellSelect
                         ));
                     }
                     spans.push(ratatui::text::Span::styled(
-                        ch.to_string(),
+                        cluster.to_string(),
                         span.style.add_modifier(ratatui::style::Modifier::REVERSED),
                     ));
                 } else {
-                    chunk.push(ch);
+                    chunk.push_str(cluster);
                 }
                 cell = cell.saturating_add(width);
             }

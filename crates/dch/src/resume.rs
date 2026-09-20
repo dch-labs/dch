@@ -88,6 +88,12 @@ pub(crate) struct ResumeOutcome {
     /// model, so a resumed session keeps running what it started
     /// with unless the user says otherwise.
     pub(crate) model: String,
+
+    /// The session's cumulative token totals, from the envelope.
+    ///
+    /// Seeds the resumed display's running count so it continues
+    /// the session's accounting instead of restarting at zero.
+    pub(crate) tokens: crate::session::SessionTokens,
 }
 
 /// Why a resume could not load a session.
@@ -149,11 +155,25 @@ pub(crate) fn resolve_resume(args: &Args) -> ResumeControl {
 /// The injection point the resume tests share, so none of them reads
 /// the real `~/.dch/sessions`.
 pub(crate) fn resolve_resume_in(args: &Args, base: &Path) -> ResumeControl {
-    let Some(id) = args.resume else {
-        return ResumeControl::Fresh {
-            session_id: None,
-            warn: None,
-        };
+    let id = match (args.resume, args.continue_session.unwrap_or(false)) {
+        (Some(id), _) => id,
+        (None, true) => match latest_session_in(base) {
+            Some(id) => id,
+            None => {
+                return ResumeControl::Fresh {
+                    session_id: None,
+                    warn: Some(
+                        "no saved session to continue; starting a fresh session".to_string(),
+                    ),
+                };
+            }
+        },
+        (None, false) => {
+            return ResumeControl::Fresh {
+                session_id: None,
+                warn: None,
+            };
+        }
     };
     match load_for_resume_in(id, base) {
         Ok(outcome) => ResumeControl::Resumed(outcome),
@@ -235,6 +255,18 @@ pub(crate) fn apply_resumed_model(
     }
 }
 
+/// The most recently saved session under `base`, if any.
+///
+/// What `--continue` resolves to: the session whose last completed
+/// turn is newest — the one the user most likely just closed.
+fn latest_session_in(base: &Path) -> Option<uuid::Uuid> {
+    crate::session::list_sessions_in(base)
+        .ok()?
+        .into_iter()
+        .max_by_key(|summary| summary.last_activity)
+        .map(|summary| summary.id)
+}
+
 /// Load a session by id under `base` into everything resume needs.
 ///
 /// One read yields the messages and the envelope's model; the
@@ -243,15 +275,17 @@ pub(crate) fn apply_resumed_model(
 ///
 /// # Errors
 ///
-/// [`ResumeError::NotFound`] when nothing exists under the id;
-/// [`ResumeError::Corrupt`] when the file does not parse or carries
-/// an unknown format; [`ResumeError::Io`] when the read itself fails.
+/// [`ResumeError::NotFound`] when no session exists under `id`;
+/// [`ResumeError::Corrupt`] when the file is not a readable
+/// `dch.v1` transcript; [`ResumeError::Io`] when the medium fails
+/// underneath the read.
 pub(crate) fn load_for_resume_in(id: Uuid, base: &Path) -> Result<ResumeOutcome, ResumeError> {
-    let (messages, model) = crate::session::load_with_meta_in(id, base)?;
+    let (messages, model, tokens) = crate::session::load_with_meta_in(id, base)?;
     Ok(ResumeOutcome {
         session_id: id,
         messages,
         model,
+        tokens,
     })
 }
 
@@ -275,8 +309,10 @@ pub(crate) fn load_for_resume_in(id: Uuid, base: &Path) -> Result<ResumeOutcome,
 ///   records, where the live engine recorded one message per model
 ///   response; coalescing restores that shape and keeps each tool
 ///   call adjacent to the user message that carries its result.
-///   Each tool call's input is wrapped as `{"preview": …}` — the
-///   object shape tool-call inputs carry on the wire.
+///   Each tool call's arguments are its retained input parsed back
+///   to the object the model sent — or, for blocks saved before the
+///   capture, a scrubbed `{"preview": …}` wrapper carrying the
+///   one-line summary.
 /// - `System` and `Error` are dropped: the model never saw them the
 ///   first time (they are display-layer notices), so it must not see
 ///   them on resume. The system prompt is likewise not part of this
@@ -297,14 +333,16 @@ pub(crate) fn load_for_resume_in(id: Uuid, base: &Path) -> Result<ResumeOutcome,
 /// the context — a session saved before redaction was enabled must
 /// not re-admit what it captured.
 ///
-/// The reconstruction is **lossy by design**: tool blocks carry
-/// previews, not the full input and output the original call exchanged,
-/// and no original tool-call id. Ids are synthesized positionally
-/// (`resume-0`, `resume-1`, … across the whole transcript) and shared
-/// between each call and its result so the correlation holds. A
-/// resumed session with large tool outputs may drift from what the
-/// model originally saw; the display transcript is the faithful
-/// record, this is the best-effort context.
+/// The reconstruction replays what the call actually exchanged:
+/// tool blocks carry their retained input and output — the capped
+/// capture of the real arguments and result — under a synthesized
+/// positional id (`resume-0`, `resume-1`, … across the whole
+/// transcript) shared between each call and its result so the
+/// correlation holds. Blocks saved before the capture keep a
+/// scrubbed one-line preview stand-in in place of the arguments,
+/// and every retained byte sits under the capture's cap, so the
+/// replay can still be a bounded approximation of a very large
+/// original — the display transcript remains the faithful record.
 pub(crate) fn tui_messages_to_loopctl(
     messages: &[TuiMessage],
     redact_secrets: bool,
@@ -332,21 +370,28 @@ pub(crate) fn tui_messages_to_loopctl(
                             input_preview,
                             success,
                             output_preview,
+                            retained_input,
                             ..
                         } => {
                             let id = format!("resume-{tool_index}");
                             tool_index = tool_index.saturating_add(1);
-                            let mut input = input_preview.clone();
+                            let mut retained = retained_input.clone();
+                            if let Some(patterns) = &patterns {
+                                patterns.scrub(&mut retained);
+                            }
+                            let args = serde_json::from_str::<serde_json::Value>(&retained)
+                                .unwrap_or_else(|_| {
+                                    let mut preview = input_preview.clone();
+                                    if let Some(patterns) = &patterns {
+                                        patterns.scrub(&mut preview);
+                                    }
+                                    serde_json::json!({ "preview": preview })
+                                });
                             let mut output = output_preview.clone();
                             if let Some(patterns) = &patterns {
-                                patterns.scrub(&mut input);
                                 patterns.scrub(&mut output);
                             }
-                            parts.push(MessagePart::tool_call(
-                                id.clone(),
-                                name.clone(),
-                                serde_json::json!({ "preview": input }),
-                            ));
+                            parts.push(MessagePart::tool_call(id.clone(), name.clone(), args));
                             pending_results.push(MessagePart::tool_result(
                                 id,
                                 name.clone(),
@@ -480,12 +525,22 @@ pub(crate) fn resumed_read_paths(messages: &[TuiMessage]) -> Vec<String> {
 /// mode. An empty listing is the answer "nothing", not a failure, so
 /// it prints its notice and exits 0. A listing that cannot happen —
 /// the sessions root is unreadable — reports to stderr and exits 1.
-pub(crate) fn run_list_sessions() -> ! {
+pub(crate) fn run_list_sessions(limit: crate::args::ListCount) -> ! {
     match crate::session::SessionSaver::list_sessions() {
         Ok(sessions) => {
+            let (shown, hidden) = cap_for_listing(sessions, limit);
             let stdout = std::io::stdout();
             let mut out = stdout.lock();
-            if let Err(err) = render_sessions(&sessions, &mut out) {
+            if let Err(err) = render_sessions(&shown, &mut out) {
+                crate::signals::report(&format!("dch: cannot print the session table: {err}"));
+                std::process::exit(1);
+            }
+            if hidden > 0
+                && let Err(err) = writeln!(
+                    out,
+                    "… and {hidden} more — `dch --list-sessions all` shows them"
+                )
+            {
                 crate::signals::report(&format!("dch: cannot print the session table: {err}"));
                 std::process::exit(1);
             }
@@ -507,6 +562,27 @@ pub(crate) fn run_list_sessions() -> ! {
 const ID_WIDTH: usize = 38;
 const MODEL_WIDTH: usize = 24;
 const ACTIVITY_WIDTH: usize = 17;
+const CONTEXT_WIDTH: usize = 10;
+
+/// Narrow a listing to what its limit shows.
+///
+/// The listing's newest-first order is the data layer's; the cap
+/// keeps the head of it — the sessions a user is most likely
+/// reaching for — and reports how many older ones stay hidden so
+/// the footer can say how to see them.
+fn cap_for_listing(
+    sessions: Vec<crate::session::SessionSummary>,
+    limit: crate::args::ListCount,
+) -> (Vec<crate::session::SessionSummary>, usize) {
+    match limit {
+        crate::args::ListCount::All => (sessions, 0),
+        crate::args::ListCount::Count(count) => {
+            let hidden = sessions.len().saturating_sub(count);
+            let shown = sessions.into_iter().take(count).collect();
+            (shown, hidden)
+        }
+    }
+}
 
 /// Render the session table, newest-first as given, to `out`.
 ///
@@ -529,25 +605,27 @@ pub(crate) fn render_sessions(
     }
     writeln!(
         out,
-        "{:<ID_WIDTH$} {:<MODEL_WIDTH$} {:<ACTIVITY_WIDTH$} {:>4}",
-        "SESSION ID", "MODEL", "LAST ACTIVITY", "MSGS",
+        "{:<ID_WIDTH$} {:<MODEL_WIDTH$} {:<ACTIVITY_WIDTH$} {:>4} {:>CONTEXT_WIDTH$}",
+        "SESSION ID", "MODEL", "LAST ACTIVITY", "MSGS", "CONTEXT",
     )?;
     writeln!(
         out,
-        "{:<ID_WIDTH$} {:<MODEL_WIDTH$} {:<ACTIVITY_WIDTH$} {:>4}",
+        "{:<ID_WIDTH$} {:<MODEL_WIDTH$} {:<ACTIVITY_WIDTH$} {:>4} {:>CONTEXT_WIDTH$}",
         "─".repeat(ID_WIDTH),
         "─".repeat(MODEL_WIDTH),
         "─".repeat(ACTIVITY_WIDTH),
         "─".repeat(4),
+        "─".repeat(CONTEXT_WIDTH),
     )?;
     for summary in sessions {
         writeln!(
             out,
-            "{:<ID_WIDTH$} {} {:<ACTIVITY_WIDTH$} {:>4}",
-            summary.id,
+            "{:<ID_WIDTH$} {} {:<ACTIVITY_WIDTH$} {:>4} {:>CONTEXT_WIDTH$}",
+            summary.id.to_string(),
             fit_column(&summary.model, MODEL_WIDTH),
             summary.last_activity.format("%Y-%m-%d %H:%M"),
-            summary.message_count,
+            summary.user_message_count,
+            summary.token_total,
         )?;
     }
     Ok(())
@@ -610,11 +688,13 @@ mod tests {
 
     fn tool_block(name: &str, success: bool) -> ContentBlock {
         ContentBlock::Tool {
+            call_id: String::new(),
             name: name.to_string(),
             input_preview: "a.rs".to_string(),
             success,
             elapsed_secs: 0.25,
             output_preview: "first lines…".to_string(),
+            retained_input: String::new(),
         }
     }
 
@@ -649,6 +729,76 @@ mod tests {
                 (id, format!("{name}|{result_id}"), is_error)
             })
             .collect()
+    }
+
+    #[test]
+    fn a_secret_inside_parseable_retained_input_scrubs_before_replay() {
+        // The primary path replays the call's real arguments; a
+        // session saved without redaction (or a model that embedded
+        // a token in its command) must not re-admit it through
+        // those arguments on resume.
+        use dch_tui::{ContentBlock, TuiMessage};
+        let now = chrono::Utc::now();
+        let messages = vec![TuiMessage::Assistant {
+            blocks: vec![ContentBlock::Tool {
+                name: "Bash".to_string(),
+                call_id: "call-s".to_string(),
+                input_preview: "echo token".to_string(),
+                success: true,
+                elapsed_secs: 1.0,
+                output_preview: "ok".to_string(),
+                retained_input: r#"{"command":"echo ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}"#
+                    .to_string(),
+            }],
+            timestamp: now,
+            duration_ms: None,
+        }];
+        let converted = super::tui_messages_to_loopctl(&messages, true);
+        let text = serde_json::to_string(&converted).expect("serializes");
+        assert!(
+            !text.contains("ghp_"),
+            "the secret never re-enters the replayed arguments: {text}"
+        );
+        assert!(
+            text.contains("[REDACTED:"),
+            "the scrub leaves its placeholder inside the arguments: {text}"
+        );
+    }
+
+    #[test]
+    fn a_resumed_tool_call_carries_its_real_arguments_and_result() {
+        // Retained input and output ride the transcript now: the
+        // resumed history rebuilds the call's actual arguments and the
+        // result the tool returned, not a preview stand-in.
+        use dch_tui::{ContentBlock, TuiMessage};
+        let now = chrono::Utc::now();
+        let messages = vec![TuiMessage::Assistant {
+            blocks: vec![ContentBlock::Tool {
+                name: "Bash".to_string(),
+                call_id: "call-9".to_string(),
+                input_preview: "make test".to_string(),
+                success: true,
+                elapsed_secs: 2.0,
+                output_preview: "74 passed".to_string(),
+                retained_input: r#"{"command":"make test"}"#.to_string(),
+            }],
+            timestamp: now,
+            duration_ms: None,
+        }];
+        let converted = super::tui_messages_to_loopctl(&messages, false);
+        let text = serde_json::to_string(&converted).expect("serializes");
+        assert!(
+            text.contains(r#""command":"make test""#),
+            "the call's real arguments ride the history: {text}"
+        );
+        assert!(
+            text.contains("74 passed"),
+            "the tool's returned output rides the history: {text}"
+        );
+        assert!(
+            !text.contains("preview"),
+            "no stand-in wrapper remains: {text}"
+        );
     }
 
     #[test]
@@ -916,11 +1066,13 @@ mod tests {
     fn redaction_scrubs_secret_shaped_previews() {
         let token = format!("ghp_{}", "x".repeat(36));
         let leaked = assistant(vec![ContentBlock::Tool {
+            call_id: String::new(),
             name: "Bash".to_string(),
             input_preview: format!("echo {token}"),
             success: true,
             elapsed_secs: 0.1,
             output_preview: format!("leaked {token} again"),
+            retained_input: String::new(),
         }]);
         let debug = format!(
             "{:?}",
@@ -1021,10 +1173,90 @@ mod tests {
         );
     }
 
+    #[test]
+    fn continue_resolves_the_most_recently_saved_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let older = Uuid::new_v4();
+        let newer = Uuid::new_v4();
+        save_session(dir.path(), older, "m", &[user("older turn")]);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        save_session(dir.path(), newer, "m", &[user("newer turn")]);
+
+        let mut args = parse(&[]);
+        args.continue_session = Some(true);
+        match resolve_resume_in(&args, dir.path()) {
+            ResumeControl::Resumed(outcome) => {
+                assert_eq!(outcome.session_id, newer, "the latest save wins");
+                assert!(
+                    outcome.messages.iter().any(
+                        |m| matches!(m, TuiMessage::User { text, .. } if text == "newer turn")
+                    ),
+                    "the newest session's transcript loads"
+                );
+            }
+            ResumeControl::Fresh { .. } => panic!("--continue resumes"),
+        }
+
+        // Nothing saved: a fresh start with a note, never a crash.
+        let empty = tempfile::tempdir().expect("tempdir");
+        match resolve_resume_in(&args, empty.path()) {
+            ResumeControl::Fresh { warn, .. } => assert!(
+                warn.as_deref()
+                    .is_some_and(|w| w.contains("no saved session")),
+                "the empty case explains itself: {warn:?}"
+            ),
+            ResumeControl::Resumed(_) => panic!("no sessions means fresh"),
+        }
+    }
+
     fn save_session(dir: &std::path::Path, id: Uuid, model: &str, messages: &[TuiMessage]) {
         crate::session::SessionSaver::with_base_dir(id, model.to_string(), dir.to_path_buf())
-            .save(messages)
+            .save(messages, crate::session::SessionTokens::default())
             .expect("save the fixture session");
+    }
+
+    #[test]
+    fn the_listing_cap_keeps_the_newest_and_counts_the_hidden() {
+        fn summary(id: u32) -> crate::session::SessionSummary {
+            crate::session::SessionSummary {
+                id: Uuid::from_u64_pair(u64::from(id), 0),
+                model: "m".to_string(),
+                last_activity: now(),
+                user_message_count: 1,
+                token_total: 0,
+            }
+        }
+        let sessions: Vec<_> = (0..13).map(summary).collect();
+        let (shown, hidden) = cap_for_listing(sessions.clone(), crate::args::ListCount::Count(10));
+        assert_eq!(shown.len(), 10, "the default keeps ten");
+        assert_eq!(hidden, 3, "the older three stay counted");
+        assert_eq!(
+            shown.first().map(|s| s.id),
+            sessions.first().map(|s| s.id),
+            "the cap keeps the head — the newest sessions"
+        );
+        let (all, hidden) = cap_for_listing(sessions, crate::args::ListCount::All);
+        assert_eq!(all.len(), 13, "all shows everything");
+        assert_eq!(hidden, 0);
+    }
+
+    #[test]
+    fn a_resumed_outcome_carries_the_sessions_token_totals() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let id = Uuid::new_v4();
+        let totals = crate::session::SessionTokens {
+            cumulative_input: 9_999,
+            cumulative_output: 111,
+            last_input_tokens: 9_999,
+        };
+        crate::session::SessionSaver::with_base_dir(id, "m".to_string(), dir.path().to_path_buf())
+            .save(&[user("hi")], totals)
+            .expect("save");
+        let outcome = load_for_resume_in(id, dir.path()).expect("load");
+        assert_eq!(
+            outcome.tokens, totals,
+            "the resumed session continues its own accounting"
+        );
     }
 
     #[test]
@@ -1111,7 +1343,8 @@ mod tests {
                     0,
                 )
                 .unwrap(),
-            message_count: count,
+            user_message_count: count,
+            token_total: 0,
         }
     }
 
@@ -1131,7 +1364,7 @@ mod tests {
         let header = lines.next().expect("the header line");
         let rule = lines.next().expect("the separator rule");
         assert!(
-            ["SESSION ID", "MODEL", "LAST ACTIVITY", "MSGS"]
+            ["SESSION ID", "MODEL", "LAST ACTIVITY", "MSGS", "CONTEXT"]
                 .iter()
                 .all(|column| header.contains(column)),
             "the header names every column: {header}"
@@ -1139,6 +1372,21 @@ mod tests {
         assert!(
             rule.chars().all(|c| c == '─' || c == ' '),
             "the rule is dashes under the columns: {rule}"
+        );
+        let total = sessions
+            .first()
+            .expect("the fixture row")
+            .token_total
+            .to_string();
+        let data_row = table.lines().last().expect("the data row");
+        let digits_end = data_row
+            .rfind(&total)
+            .map(|start| start.saturating_add(total.len()))
+            .expect("the total renders");
+        assert_eq!(
+            digits_end,
+            header.trim_end().len(),
+            "the tokens figure right-aligns under its header: {data_row}"
         );
         let rows: Vec<&str> = lines.collect();
         assert_eq!(rows.len(), 2, "one row per session: {table}");
@@ -1173,7 +1421,7 @@ mod tests {
         let table = rendered(&[summary(Uuid::new_v4(), &long, 0, 1)]);
         let row = table.lines().last().expect("the data row");
         assert!(
-            row.chars().count() <= ID_WIDTH + MODEL_WIDTH + ACTIVITY_WIDTH + 4 + 6,
+            row.chars().count() <= ID_WIDTH + MODEL_WIDTH + ACTIVITY_WIDTH + 4 + CONTEXT_WIDTH + 7,
             "a long model must not shift the columns that follow: {row}"
         );
         assert!(row.contains('…'), "the cap is visible: {row}");
@@ -1242,6 +1490,7 @@ mod tests {
             session_id: Uuid::new_v4(),
             messages: Vec::new(),
             model: "resume-model".to_string(),
+            tokens: crate::session::SessionTokens::default(),
         };
         let mut config = dch_config::DchConfig::default();
         config.api.model = "config-model".to_string();

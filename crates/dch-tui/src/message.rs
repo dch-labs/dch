@@ -120,6 +120,15 @@ pub enum ContentBlock {
         /// As reported by the dispatcher.
         name: String,
 
+        /// The model-issued call id.
+        ///
+        /// Keys the runtime expansion data — the full input and
+        /// output captured for this call — which outlives the block
+        /// only in memory, never in the serialized session. Empty on
+        /// blocks from sessions recorded before the field existed.
+        #[serde(default)]
+        call_id: String,
+
         /// A one-line summary of the call's input.
         ///
         /// Condensed from the full arguments.
@@ -135,10 +144,23 @@ pub enum ContentBlock {
         /// Wall-clock time from dispatch to completion.
         elapsed_secs: f64,
 
-        /// A short preview of the call's output.
+        /// The call's retained output, sanitized and capped.
         ///
-        /// Truncated to what a scrolling reader needs.
+        /// What the dispatch-side capture kept — redacted where
+        /// redaction is on, head and tail within the retention
+        /// cap. Persisted so a resumed session's model remembers
+        /// what the call actually returned; empty on blocks saved
+        /// before the capture existed.
         output_preview: String,
+
+        /// The call's retained input, pretty-printed JSON, capped.
+        ///
+        /// The full arguments as the model supplied them, within
+        /// the same retention cap. A resumed session rebuilds the
+        /// tool call's real arguments from this; empty on blocks
+        /// saved before the capture existed.
+        #[serde(default)]
+        retained_input: String,
     },
 }
 
@@ -233,10 +255,12 @@ mod tests {
                     },
                     ContentBlock::Tool {
                         name: "Read".to_string(),
+                        call_id: "call_1".to_string(),
                         input_preview: "a.rs".to_string(),
                         success: true,
                         elapsed_secs: 1.5,
-                        output_preview: "…".to_string(),
+                        output_preview: "file contents".to_string(),
+                        retained_input: "{\n  \"path\": \"a.rs\"\n}".to_string(),
                     },
                 ],
                 timestamp: now,
@@ -266,5 +290,17 @@ mod tests {
         );
         let back: Vec<TuiMessage> = serde_json::from_str(&json).expect("the model parses back");
         assert_eq!(back, messages, "a round-trip is lossless");
+
+        let old = r#"[{"role":"assistant","blocks":[{"type":"tool","name":"Read","input_preview":"a.rs","success":true,"elapsed_secs":1.5,"output_preview":"…"}],"timestamp":"2026-09-16T12:00:00Z"}]"#;
+        let parsed: Vec<TuiMessage> =
+            serde_json::from_str(old).expect("sessions recorded before call ids parse");
+        assert!(
+            parsed.first().is_some_and(|message| matches!(message,
+                TuiMessage::Assistant { blocks, .. }
+                if blocks.iter().any(|block| matches!(block,
+                    ContentBlock::Tool { call_id, retained_input, .. }
+                        if call_id.is_empty() && retained_input.is_empty())))),
+            "a tool block without a call id or retained input defaults both empty"
+        );
     }
 }

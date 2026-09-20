@@ -563,11 +563,11 @@ fn auto_scroll_pins_the_newest_line_while_streaming() {
         observer.on_text_delta(&delta(0, &format!("para{line}\n\n")));
         let terminal = render_to_buffer(&mut app, 40, 24);
         let rows = row_texts(&terminal);
-        // 24 rows: 18 for the conversation (spacer, padded two-row
-        // input field, status bar) — the pinned view keeps the newest
-        // line on the pane's last row.
+        // 24 rows: 17 for the conversation (notice row, spacer,
+        // padded two-row input field, status bar) — the pinned view
+        // keeps the newest line on the pane's last row.
         assert!(
-            rows[17].contains(&format!("para{line}")),
+            rows[16].contains(&format!("para{line}")),
             "the newest buffered line stays visible: {}",
             rows[17]
         );
@@ -582,8 +582,10 @@ fn scrolling_up_during_a_stream_holds_the_viewport() {
     render_to_buffer(&mut app, 40, 24);
 
     // PageUp alone lands the viewport's top on a blank paragraph
-    // separator; one arrow-up sits it on content.
+    // separator; arrow-ups sit it on content — one more than the
+    // wider pane needed, the notice row's row back.
     app.handle_event(&plain(KeyCode::PageUp));
+    app.handle_event(&plain(KeyCode::Up));
     app.handle_event(&plain(KeyCode::Up));
     let held = render_to_buffer(&mut app, 40, 24);
     let top_before = row_texts(&held)[0].clone();
@@ -662,7 +664,7 @@ fn end_rearms_stickiness_and_snaps_to_the_newest_line() {
     assert!(app.auto_scroll(), "End re-arms stickiness");
     let terminal = render_to_buffer(&mut app, 40, 24);
     assert!(
-        row_texts(&terminal)[17].contains("para35"),
+        row_texts(&terminal)[16].contains("para35"),
         "the next render snaps to the newest line"
     );
 }

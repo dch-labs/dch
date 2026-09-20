@@ -200,9 +200,22 @@ pub struct InputEditor {
     /// Soft cap in characters; an insert admits only what fits
     /// under it.
     ///
-    /// A defense against pathological pastes — the model's own
-    /// context limit sits upstream and is not this editor's concern.
+    /// Sized so any realistic paste lands whole — a whole file, a
+    /// whole log, several of them — at a measured cost: re-wrapping
+    /// a full buffer costs tens of milliseconds per mutation
+    /// (about 55 ms at the cap, width 80, release profile), while
+    /// untouched frames pay nothing when the host caches the wrap
+    /// against the editor's stamp. The model's own context limit
+    /// sits upstream and is not this editor's concern.
     max_chars: usize,
+
+    /// Count of buffer or caret mutations, bumped by every edit and
+    /// every caret move.
+    ///
+    /// The wrap cache's invalidation key: a host that renders the
+    /// buffer re-wraps only when this moved and the width held,
+    /// so untouched frames reuse the previous grid.
+    stamp: u64,
 }
 
 impl InputEditor {
@@ -217,7 +230,8 @@ impl InputEditor {
             cursor: 0,
             history: InputHistory::default(),
             draft: None,
-            max_chars: 100_000,
+            max_chars: 2_000_000,
+            stamp: 0,
         }
     }
 
@@ -238,6 +252,28 @@ impl InputEditor {
     #[must_use]
     pub fn text_before_caret(&self) -> &str {
         self.text.get(..self.cursor).unwrap_or("")
+    }
+
+    /// The mutation stamp's current value.
+    ///
+    /// Moves on every edit and every caret move; a host caches
+    /// derived state (the wrap grid) against it and recomputes only
+    /// when it changed.
+    #[must_use]
+    pub fn stamp(&self) -> u64 {
+        self.stamp
+    }
+
+    /// Mark the editor mutated.
+    ///
+    /// The head of every mutator — an insert, a deletion, a caret
+    /// move, a history landing: whatever changes the buffer or the
+    /// caret advances the stamp, which is the whole signal a
+    /// host's cached wrap invalidates on. The addition wraps, so a
+    /// session long enough to exhaust the counter keeps the
+    /// contract (the stamp moved) without panicking.
+    fn touch(&mut self) {
+        self.stamp = self.stamp.wrapping_add(1);
     }
 
     /// Whether the buffer holds nothing.
@@ -273,6 +309,7 @@ impl InputEditor {
     /// here.
     pub fn set_text(&mut self, text: String) {
         debug_assert!(self.text.is_char_boundary(self.cursor));
+        self.touch();
         self.cursor = text.len();
         self.text = text;
     }
@@ -283,6 +320,7 @@ impl InputEditor {
     /// a stashed draft is dropped with the buffer, not restored.
     pub fn clear(&mut self) {
         debug_assert!(self.text.is_char_boundary(self.cursor));
+        self.touch();
         self.text.clear();
         self.cursor = 0;
         self.draft = None;
@@ -302,6 +340,7 @@ impl InputEditor {
         if prefix.is_empty() {
             return;
         }
+        self.touch();
         self.history.reset();
         self.draft = None;
         self.text.insert_str(self.cursor, &prefix);
@@ -325,9 +364,10 @@ impl InputEditor {
     /// as the same byte as Enter, terminals on the xterm
     /// modifyOtherKeys protocol report the modifier on Enter
     /// itself, and kitty-protocol terminals report it as a
-    /// control-m — all three spellings submit. Ctrl-C is
-    /// deliberately not bound — quit and cancel own it at the app
-    /// level.
+    /// control-m — all three spellings submit. Ctrl-C stays
+    /// unbound here — the app owns it as the exit chord's first
+    /// half, clearing a non-empty buffer before a second press
+    /// quits, with Ctrl-Shift-C as the copy chord alongside.
     pub fn handle_key(&mut self, key: KeyEvent, wrap_width: u16) -> InputAction {
         debug_assert!(self.text.is_char_boundary(self.cursor));
         match (key.code, key.modifiers) {
@@ -372,11 +412,11 @@ impl InputEditor {
                 InputAction::None
             }
             (KeyCode::Home, _) | (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
-                self.cursor = self.line_start();
+                self.move_to_line_start();
                 InputAction::None
             }
             (KeyCode::End, _) | (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
-                self.cursor = self.line_end();
+                self.move_to_line_end();
                 InputAction::None
             }
             (KeyCode::Up, KeyModifiers::NONE) => {
@@ -397,12 +437,19 @@ impl InputEditor {
             }
             (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
                 let start = self.line_start();
-                self.text.drain(start..self.cursor);
-                self.cursor = start;
+                if start < self.cursor {
+                    self.touch();
+                    self.text.drain(start..self.cursor);
+                    self.cursor = start;
+                }
                 InputAction::None
             }
             (KeyCode::Char('k'), KeyModifiers::CONTROL) => {
-                self.text.drain(self.cursor..self.line_end());
+                let end = self.line_end();
+                if self.cursor < end {
+                    self.touch();
+                    self.text.drain(self.cursor..end);
+                }
                 InputAction::None
             }
             (KeyCode::Char('w'), KeyModifiers::CONTROL) => {
@@ -448,22 +495,75 @@ impl InputEditor {
     /// caret's row always exists in the drawn area.
     #[must_use]
     pub fn display_rows(&self, width: u16) -> Vec<String> {
-        let mut rows = self.wrapped_lines(width);
-        if self
-            .cursor_cell(width)
-            .is_some_and(|(row, _)| usize::from(row) == rows.len())
-        {
+        self.display_rows_and_caret(width).0
+    }
+
+    /// The rendered rows and the caret's cell among them, from a
+    /// single wrap of the buffer.
+    ///
+    /// [`display_rows`](Self::display_rows) and
+    /// [`cursor_cell`](Self::cursor_cell) both answer from this one
+    /// pass, so a frame that needs the two — sizing, painting, the
+    /// status tag — wraps the buffer once, not once per question.
+    /// The caret's column follows the same breaks the rows use,
+    /// including the sentinel-guarded prefix and the continuation
+    /// row a final-row-filling caret appends.
+    #[must_use]
+    pub fn display_rows_and_caret(&self, width: u16) -> (Vec<String>, Option<(u16, u16)>) {
+        let cap = usize::from(width.max(1));
+        let before = self.text.get(..self.cursor).unwrap_or("");
+        let caret_line = before.matches('\n').count();
+        let caret_bytes = before.rfind('\n').map_or(self.cursor, |i| {
+            self.cursor.saturating_sub(i.saturating_add(1))
+        });
+        let mut rows: Vec<String> = Vec::new();
+        let mut caret: Option<(usize, usize)> = None;
+        let mut row: usize = 0;
+        for (index, logical) in self.text.split('\n').enumerate() {
+            if index == caret_line {
+                let prefix = logical.get(..caret_bytes).unwrap_or("");
+                // The sentinel keeps a trailing space attached through
+                // the wrap — textwrap right-trims it otherwise and the
+                // caret would report a column left of its true cell.
+                let guarded = format!("{prefix}x");
+                let partial = textwrap::wrap(&guarded, cap);
+                let row_in_line = partial.len().saturating_sub(1);
+                let column = partial
+                    .last()
+                    .map_or(0, |row| UnicodeWidthStr::width(row.as_ref()))
+                    .saturating_sub(1);
+                caret = Some((row.saturating_add(row_in_line), column));
+            }
+            let wrapped = textwrap::wrap(logical, cap);
+            if wrapped.is_empty() {
+                rows.push(String::new());
+            } else {
+                rows.extend(wrapped.into_iter().map(std::borrow::Cow::into_owned));
+            }
+            row = rows.len();
+        }
+        if rows.is_empty() {
             rows.push(String::new());
         }
-        rows
+        if caret.is_some_and(|(row, _)| row == rows.len()) {
+            rows.push(String::new());
+        }
+        let caret = caret.map(|(row, column)| {
+            (
+                u16::try_from(row).unwrap_or(u16::MAX),
+                u16::try_from(column).unwrap_or(u16::MAX),
+            )
+        });
+        (rows, caret)
     }
 
     /// The cursor's `(row, column)` within the grid
     /// [`display_rows`](Self::display_rows) renders, in display
     /// columns (wide glyphs count their width).
     ///
-    /// `None` when the buffer is empty — the caller places the
-    /// terminal cursor at the box start. The column comes from
+    /// `Some((0, 0))` for an empty buffer — one empty row is the
+    /// grid's whole shape, and the caret sits at its start. The
+    /// column comes from
     /// wrapping the cursor's line prefix, so it follows the same
     /// breaks the rendered rows use; when that prefix exactly fills
     /// its final row the coordinates name the continuation row
@@ -471,11 +571,7 @@ impl InputEditor {
     /// this case.
     #[must_use]
     pub fn cursor_cell(&self, width: u16) -> Option<(u16, u16)> {
-        let (row, column) = self.cell_at(self.cursor, width)?;
-        Some((
-            u16::try_from(row).unwrap_or(u16::MAX),
-            u16::try_from(column).unwrap_or(u16::MAX),
-        ))
+        self.display_rows_and_caret(width).1
     }
 
     /// The display cell a caret offset lands on, in rows and display
@@ -525,6 +621,7 @@ impl InputEditor {
     /// whitespace-only buffer clears without submitting; anything
     /// else submits and records on history.
     fn enter(&mut self) -> InputAction {
+        self.touch();
         if self.char_before() == Some('\\') {
             let cut = self.cursor.saturating_sub(1);
             self.text.drain(cut..self.cursor);
@@ -599,12 +696,35 @@ impl InputEditor {
             .map_or(self.text.len(), |i| self.cursor.saturating_add(i))
     }
 
+    /// Move to the current logical line's start.
+    ///
+    /// Stamps only when the caret actually moves — a press already
+    /// at the line start is a no-op for the wrap cache too.
+    fn move_to_line_start(&mut self) {
+        let landing = self.line_start();
+        if landing != self.cursor {
+            self.touch();
+            self.cursor = landing;
+        }
+    }
+
+    /// Move to the current logical line's end, stamping on motion
+    /// only — the mirror of [`Self::move_to_line_start`].
+    fn move_to_line_end(&mut self) {
+        let landing = self.line_end();
+        if landing != self.cursor {
+            self.touch();
+            self.cursor = landing;
+        }
+    }
+
     /// Step one character toward the buffer start.
     ///
     /// A multi-byte character crosses whole — the offset moves by
     /// its UTF-8 length, never into it.
     fn move_left(&mut self) {
         if let Some(c) = self.char_before() {
+            self.touch();
             self.cursor = self.cursor.saturating_sub(c.len_utf8());
         }
     }
@@ -615,6 +735,7 @@ impl InputEditor {
     /// its UTF-8 length, never into it.
     fn move_right(&mut self) {
         if let Some(c) = self.char_after() {
+            self.touch();
             self.cursor = self.cursor.saturating_add(c.len_utf8());
         }
     }
@@ -628,13 +749,9 @@ impl InputEditor {
     /// its rendered rows, and a buffer showing one row stays on
     /// history.
     fn up(&mut self, wrap_width: u16) {
-        match self.cursor_cell(wrap_width) {
+        match self.cell_at(self.cursor, wrap_width) {
             Some((row, column)) if row > 0 => {
-                self.move_caret_to_cell(
-                    wrap_width,
-                    usize::from(row).saturating_sub(1),
-                    usize::from(column),
-                );
+                self.move_caret_to_cell(wrap_width, row.saturating_sub(1), column);
             }
             _ => self.history_prev(),
         }
@@ -647,13 +764,9 @@ impl InputEditor {
     /// history entry at the bottom row.
     fn down(&mut self, wrap_width: u16) {
         let rows = self.display_rows(wrap_width).len();
-        match self.cursor_cell(wrap_width) {
-            Some((row, column)) if usize::from(row).saturating_add(1) < rows => {
-                self.move_caret_to_cell(
-                    wrap_width,
-                    usize::from(row).saturating_add(1),
-                    usize::from(column),
-                );
+        match self.cell_at(self.cursor, wrap_width) {
+            Some((row, column)) if row.saturating_add(1) < rows => {
+                self.move_caret_to_cell(wrap_width, row.saturating_add(1), column);
             }
             _ => self.history_next(),
         }
@@ -671,6 +784,7 @@ impl InputEditor {
     /// where a caret lands, keeping motion, clicks, and rendering in
     /// lockstep.
     pub fn move_caret_to_cell(&mut self, wrap_width: u16, row: usize, column: usize) {
+        let before = self.cursor;
         let mut boundaries: Vec<usize> = self.text.char_indices().map(|(i, _)| i).collect();
         boundaries.push(self.text.len());
         let mut lo: usize = 0;
@@ -688,6 +802,9 @@ impl InputEditor {
             }
         }
         self.cursor = boundaries.get(lo).copied().unwrap_or(self.text.len());
+        if self.cursor != before {
+            self.touch();
+        }
     }
 
     /// Load the previous history entry.
@@ -729,12 +846,16 @@ impl InputEditor {
     /// Skips any run of whitespace backward, then the word before
     /// it — the readline backward-word landing spot.
     fn move_word_left(&mut self) {
+        let before = self.cursor;
         let prefix = self.text.get(..self.cursor).unwrap_or("");
         let mut saw_word = false;
         for (index, c) in prefix.char_indices().rev() {
             if c.is_whitespace() {
                 if saw_word {
                     self.cursor = index.saturating_add(c.len_utf8());
+                    if self.cursor != before {
+                        self.touch();
+                    }
                     return;
                 }
             } else {
@@ -742,6 +863,9 @@ impl InputEditor {
             }
         }
         self.cursor = 0;
+        if self.cursor != before {
+            self.touch();
+        }
     }
 
     /// Move to the end of the next word.
@@ -750,12 +874,16 @@ impl InputEditor {
     /// and the word after it — landing just past that word's last
     /// character: the readline forward-word spot.
     fn move_word_right(&mut self) {
+        let before = self.cursor;
         let rest = self.text.get(self.cursor..).unwrap_or("");
         let mut saw_word = false;
         for (index, c) in rest.char_indices() {
             if c.is_whitespace() {
                 if saw_word {
                     self.cursor = self.cursor.saturating_add(index);
+                    if self.cursor != before {
+                        self.touch();
+                    }
                     return;
                 }
             } else {
@@ -763,6 +891,9 @@ impl InputEditor {
             }
         }
         self.cursor = self.text.len();
+        if self.cursor != before {
+            self.touch();
+        }
     }
 
     /// Delete the character before the cursor.
@@ -774,6 +905,7 @@ impl InputEditor {
         self.history.reset();
         self.draft = None;
         if let Some(c) = self.char_before() {
+            self.touch();
             let cut = self.cursor.saturating_sub(c.len_utf8());
             self.text.drain(cut..self.cursor);
             self.cursor = cut;
@@ -788,6 +920,7 @@ impl InputEditor {
         self.history.reset();
         self.draft = None;
         if let Some(c) = self.char_after() {
+            self.touch();
             let end = self.cursor.saturating_add(c.len_utf8());
             self.text.drain(self.cursor..end);
         }
@@ -816,8 +949,11 @@ impl InputEditor {
             }
             cut
         };
-        self.text.drain(target..self.cursor);
-        self.cursor = target;
+        if target < self.cursor {
+            self.touch();
+            self.text.drain(target..self.cursor);
+            self.cursor = target;
+        }
     }
 }
 

@@ -7,7 +7,7 @@ license.workspace = true
 description = "Ratatui terminal UI for dch: themes, markdown rendering, streaming, TuiObserver"
 
 [dependencies]
-loopctl                = { workspace = true }
+loopctl                = { workspace = true, features = ["redaction"] }
 dch-config             = { workspace = true }
 ratatui                = { workspace = true }
 crossterm              = { workspace = true }
@@ -21,6 +21,7 @@ serde_json             = { workspace = true }
 pest                   = "2.8"
 pest_derive            = "2.8"
 unicode-width          = "0.1"
+unicode-segmentation   = "1.10"
 base64                 = "0.22"
 textwrap               = "0.16.4"
 tree-sitter            = { version = "0.26", optional = true }

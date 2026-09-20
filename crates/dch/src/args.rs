@@ -8,13 +8,45 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-/// dch — a terminal-based agentic coding assistant built on loopctl.
+/// How much of the session listing to show.
 ///
-/// A task argument (`dch "fix the bug"`) or a piped stdin
-/// (`echo "fix the bug" | dch`) selects the single-run non-interactive
-/// mode; with neither, launches the interactive TUI. `--resume`/
-/// `--list-sessions` manage sessions. Run-mode selection happens in
-/// `main`, not here; this struct is only the parsed input.
+/// The `--list-sessions` flag's optional value: absent means the
+/// recent default, a number widens the window, `all` removes it —
+/// one type so the flag's parsing, the listing's cap, and the
+/// truncated-table footer all agree on what was asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListCount {
+    /// The most recent N sessions.
+    ///
+    /// The newest-first listing keeps its head — the sessions a
+    /// user is most likely reaching for — and reports how many
+    /// older ones stayed hidden.
+    Count(usize),
+
+    /// Every saved session.
+    ///
+    /// No cap and no footer: the table runs as long as the history
+    /// does.
+    All,
+}
+
+/// Parse a `--list-sessions` value: a positive count or `all`.
+///
+/// # Errors
+///
+/// Refuses anything that is neither a positive whole number nor
+/// `all` (case-insensitive) — clap surfaces the message as the
+/// flag's usage error.
+fn parse_list_count(value: &str) -> Result<ListCount, String> {
+    if value.eq_ignore_ascii_case("all") {
+        return Ok(ListCount::All);
+    }
+    match value.parse::<usize>() {
+        Ok(count) if count > 0 => Ok(ListCount::Count(count)),
+        _ => Err(format!("expected a positive count or 'all', got '{value}'")),
+    }
+}
+
 #[derive(Debug, Clone, Parser)]
 #[command(
     name = "dch",
@@ -22,6 +54,13 @@ use clap::Parser;
     about = "A terminal-based agentic coding assistant built on loopctl",
     long_about = None
 )]
+/// dch — a terminal-based agentic coding assistant built on loopctl.
+///
+/// A task argument (`dch "fix the bug"`) or a piped stdin
+/// (`echo "fix the bug" | dch`) selects the single-run non-interactive
+/// mode; with neither, launches the interactive TUI. `--resume`/
+/// `--list-sessions` manage sessions. Run-mode selection happens in
+/// `main`, not here; this struct is only the parsed input.
 pub struct Args {
     /// The task for a single non-interactive run.
     ///
@@ -51,11 +90,36 @@ pub struct Args {
     )]
     pub resume: Option<uuid::Uuid>,
 
-    /// Print known sessions (id, model, last activity, message count) and exit.
+    /// Print known sessions and exit.
     ///
-    /// Long-only: a rare action that needs no short form.
-    #[arg(long, help_heading = "Sessions")]
-    pub list_sessions: bool,
+    /// Newest first, limited by default to the ten most recent —
+    /// enough to find what was just closed without paging past a
+    /// long history. A value widens it: a count
+    /// (`--list-sessions 30`) or `all` for everything.
+    #[arg(
+        long,
+        value_name = "COUNT|all",
+        value_parser = parse_list_count,
+        num_args = 0..=1,
+        default_missing_value = "10",
+        help_heading = "Sessions"
+    )]
+    pub list_sessions: Option<ListCount>,
+
+    /// Continue the most recently saved session.
+    ///
+    /// Resolves to whatever session was saved last, sparing the
+    /// `--list-sessions` and `--resume <id>` round trip. Composes
+    /// like `--resume`: with a task argument or piped stdin it
+    /// continues headless, with neither in the TUI. No saved
+    /// session exists means a fresh start with a note.
+    #[arg(
+        long = "continue",
+        action = clap::ArgAction::SetTrue,
+        help_heading = "Sessions",
+        conflicts_with_all = ["resume", "list_sessions"]
+    )]
+    pub continue_session: Option<bool>,
 
     /// Override the configured theme.
     ///
@@ -174,7 +238,7 @@ mod tests {
         let args = parse(&[]).unwrap();
         assert_eq!(args.task, None);
         assert_eq!(args.resume, None);
-        assert!(!args.list_sessions);
+        assert_eq!(args.list_sessions, None);
         assert_eq!(args.theme, None);
         assert_eq!(args.model, None);
         assert_eq!(args.config.config_path, None);
@@ -210,6 +274,23 @@ mod tests {
     }
 
     #[test]
+    fn continue_parses_and_conflicts_with_resume() {
+        let args = parse(&["--continue"]).unwrap();
+        assert!(args.continue_session.is_some());
+        assert_eq!(args.resume, None);
+
+        assert!(
+            parse(&[
+                "--continue",
+                "--resume",
+                "05ce48c6-34cd-4d03-b68c-e5d54cc6f62c"
+            ])
+            .is_err(),
+            "--continue and --resume are mutually exclusive"
+        );
+    }
+
+    #[test]
     fn the_task_argument_composes_with_resume() {
         let id = uuid::Uuid::new_v4();
         let args = parse(&["fix the tests", "--resume", &id.to_string()]).unwrap();
@@ -238,7 +319,19 @@ mod tests {
     #[test]
     fn list_sessions_flag_parses() {
         let args = parse(&["--list-sessions"]).unwrap();
-        assert!(args.list_sessions);
+        assert_eq!(args.list_sessions, Some(ListCount::Count(10)));
+        let args = parse(&["--list-sessions", "3"]).unwrap();
+        assert_eq!(args.list_sessions, Some(ListCount::Count(3)));
+        let args = parse(&["--list-sessions", "all"]).unwrap();
+        assert_eq!(args.list_sessions, Some(ListCount::All));
+        assert!(
+            parse(&["--list-sessions", "0"]).is_err(),
+            "zero is not a count"
+        );
+        assert!(
+            parse(&["--list-sessions", "many"]).is_err(),
+            "junk is refused"
+        );
     }
 
     #[test]

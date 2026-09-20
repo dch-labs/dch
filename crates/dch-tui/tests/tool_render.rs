@@ -23,6 +23,9 @@ use unicode_width::UnicodeWidthStr;
 
 fn result(name: &str, input: &str, is_error: bool, secs: f64) -> ToolResultDisplay {
     ToolResultDisplay {
+        call_id: String::new(),
+        full_input: String::new(),
+        full_output: String::new(),
         name: name.to_string(),
         is_error,
         duration: std::time::Duration::from_secs_f64(secs),

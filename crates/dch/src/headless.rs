@@ -336,7 +336,7 @@ async fn run_headless_inner(
 /// A save that itself fails only warns: the run's own outcome
 /// outranks the bookkeeping.
 fn save_transcript(saver: &crate::session::SessionSaver, transcript: &[dch_tui::TuiMessage]) {
-    if let Err(err) = saver.save(transcript) {
+    if let Err(err) = saver.save(transcript, crate::session::SessionTokens::default()) {
         tracing::warn!(error = %err, "session transcript could not be saved");
     }
 }
@@ -1503,7 +1503,8 @@ mod tests {
             vec![*id],
             "the resumed run reuses the loaded session's identity — no second directory"
         );
-        let (messages, _model) = crate::session::load_with_meta_in(*id, sessions.path()).unwrap();
+        let (messages, _model, _tokens) =
+            crate::session::load_with_meta_in(*id, sessions.path()).unwrap();
         assert_eq!(
             messages.len(),
             4,
@@ -1567,7 +1568,7 @@ mod tests {
         let Some(id) = saved.first() else {
             panic!("the saved session id is readable: {saved:?}")
         };
-        let (_, model) = crate::session::load_with_meta_in(*id, sessions.path()).unwrap();
+        let (_, model, _) = crate::session::load_with_meta_in(*id, sessions.path()).unwrap();
         assert_eq!(
             model, "m-first",
             "the first save records the model the config named"
@@ -1593,7 +1594,7 @@ mod tests {
             0,
             "the resumed run completes against the canned turn"
         );
-        let (_, model) = crate::session::load_with_meta_in(*id, sessions.path()).unwrap();
+        let (_, model, _) = crate::session::load_with_meta_in(*id, sessions.path()).unwrap();
         assert_eq!(
             model, "m-first",
             "a resumed session keeps the model it ran with, not the new config default"
@@ -1620,7 +1621,7 @@ mod tests {
             0,
             "the CLI-overridden resume completes against the canned turn"
         );
-        let (_, model) = crate::session::load_with_meta_in(*id, sessions.path()).unwrap();
+        let (_, model, _) = crate::session::load_with_meta_in(*id, sessions.path()).unwrap();
         assert_eq!(
             model, "m-cli",
             "an explicit --model overrides the session's recorded model"

@@ -75,24 +75,40 @@ echo "summarize this repo" | dch
 A `TASK` argument selects single-run mode; with no argument, a stdin
 that is not a terminal selects it too. A bare invocation on a
 terminal opens the fullscreen TUI. A `TASK` composes with `--resume`
-(continue a saved session headless); neither combines with
-`--list-sessions`.
+or `--continue` (continue a saved session headless); neither combines
+with `--list-sessions`.
 
 Resume a saved session — the restored conversation seeds the display
-and the agent's context, further auto-saves keep writing the same
-session file, and the saved model applies unless `--model` overrides
-it:
+and the agent's context (tool blocks carry their retained command
+and output, so the model remembers what its tools returned),
+further auto-saves keep writing the same session file, and the saved
+model applies unless `--model` overrides it:
 
 ```bash
 dch --resume 01234567-89ab-cdef-0123-456789abcdef   # in the TUI
 dch "keep going" --resume 01234567-89ab-cdef-0123-456789abcdef
 ```
 
-List saved sessions (newest first) and exit:
+Continue the most recently saved session — the `--resume` id hunt,
+skipped:
 
 ```bash
-dch --list-sessions
+dch --continue
 ```
+
+List saved sessions (newest first) and exit. The ten most recent
+show by default; pass a count or `all` for more:
+
+```bash
+dch --list-sessions          # the 10 most recent
+dch --list-sessions 30       # the 30 most recent
+dch --list-sessions all      # everything
+```
+
+The MSGS column counts your messages — your submissions, with tool
+calls and replies left out. CONTEXT is the session's size in
+tokens — its cumulative input-plus-output accounting, exactly the
+figure the status bar shows, and shows again on resume.
 
 A missing session id warns and starts fresh; a corrupt file warns
 loudly, starts fresh, and is never modified; a session file that
@@ -160,19 +176,23 @@ Conversation:
 | Mouse wheel | Scroll the transcript, one line per event |
 | Mouse drag | Select characters; the highlight stays after release and the text is copied to the clipboard. Dragging on the pane's top or bottom line scrolls the transcript with the selection |
 | Mouse click (composer) | Place the caret where the press landed, clamped to the text |
+| Mouse click (tool row) | Expand a tool call's block to its full command and output — pretty-printed input, then the (redacted) output; click any row of the open block to fold it back. Long output scrolls with the transcript. The last 256 tool calls stay expandable |
 | `Shift` + arrows | Move the selection head — extend or shrink the current selection; the view follows and each step refreshes the clipboard copy |
 | `End` | Snap to the newest line (only while the input is empty) |
 
 The mouse and selection rows need `mouse_capture = true` (the
 default): with capture off the terminal owns selection, a selection
-can never start, and the `Shift` + arrows rows do nothing.
+can never start, the `Shift` + arrows rows do nothing, and the
+click-to-expand rows below them have no path — expanding is
+mouse-only.
 
 Anywhere:
 
 | Key | Action |
 | --- | --- |
 | `F2` | Cycle tool-line verbosity (Quiet → Normal → Verbose; initial mode from `display.verbosity`) |
-| `Esc`, `Ctrl-C`, `Ctrl-D` | Quit (cancels the in-flight run; queued submissions are not started) |
+| `Ctrl-C` | While a run is in flight: with text in the composer, clear it first; with an empty composer, cancel the run (submissions queued behind it are dropped). Otherwise: with text, clear it; with an empty composer, first press arms, second press quits |
+| `Ctrl-Shift-C` | Copy the selected transcript text (where the terminal reports the modifier) |
 
 ## Configuration
 

@@ -315,7 +315,7 @@ fn scroll_keys_adjust_without_underflow() {
     // field, status bar); PageUp lifts the window ten lines off the
     // bottom.
     assert!(
-        !scrolled_view.contains("line 59") && scrolled_view.contains("line 46"),
+        !scrolled_view.contains("line 59") && scrolled_view.contains("line 47"),
         "scrolling up shifts the visible window: {scrolled_view:?}"
     );
 }
@@ -328,20 +328,325 @@ fn view_text(terminal: &Terminal<TestBackend>, width: u16, height: u16) -> Strin
 }
 
 #[test]
-fn quit_keys_set_quitting() {
-    for quit_event in [
-        key(KeyCode::Char('c'), KeyModifiers::CONTROL),
-        key(KeyCode::Char('d'), KeyModifiers::CONTROL),
-        plain(KeyCode::Esc),
-    ] {
+fn a_lone_ctrl_c_esc_and_ctrl_d_no_longer_quit() {
+    // Quitting is a deliberate chord now: one Ctrl+C clears or arms,
+    // Esc does nothing, and the old Ctrl-D exit is gone — none of
+    // them takes the session down on a single slip.
+    {
         let mut app = app();
-        assert!(app.handle_event(&quit_event));
-        assert!(app.is_quitting());
+        app.handle_event(&Event::Paste("draft".to_string()));
+        assert!(app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+        assert!(
+            !app.is_quitting(),
+            "the first press clears, it does not quit"
+        );
+        assert!(app.input().is_empty(), "the draft is gone");
     }
 
+    {
+        let mut app = app();
+        app.handle_event(&plain(KeyCode::Esc));
+        assert!(!app.is_quitting(), "Esc no longer quits");
+        app.handle_event(&key(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert!(!app.is_quitting(), "Ctrl-D no longer exits");
+
+        app.handle_event(&plain(KeyCode::Char('x')));
+        assert!(!app.is_quitting());
+    }
+}
+
+#[test]
+fn the_second_ctrl_c_quits_and_any_other_key_disarms() {
+    {
+        let mut app = app();
+        assert!(app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+        assert!(
+            !app.is_quitting(),
+            "the first press on an empty buffer arms"
+        );
+        assert!(app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+        assert!(app.is_quitting(), "the second press confirms the quit");
+    }
+
+    {
+        let mut app = app();
+        assert!(app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+        app.handle_event(&plain(KeyCode::Char('x')));
+        assert!(!app.is_quitting(), "typing between the presses disarms");
+        assert!(
+            app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            "the chord restarts from scratch"
+        );
+        assert!(!app.is_quitting(), "a fresh first press only re-arms");
+    }
+}
+
+#[test]
+fn clearing_the_draft_does_not_count_toward_the_quit_chord() {
+    // Clearing is not consenting: the press that empties the
+    // buffer arms nothing, so after a clear the exit still needs
+    // its own two presses.
     let mut app = app();
-    app.handle_event(&plain(KeyCode::Char('x')));
+    app.handle_event(&Event::Paste("draft".to_string()));
+    assert!(app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+    assert!(app.input().is_empty(), "the draft is cleared");
+    assert!(!app.is_quitting(), "clearing does not quit");
+
+    app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(!app.is_quitting(), "the press after a clear only arms");
+
+    app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(app.is_quitting(), "the second empty-buffer press confirms");
+}
+
+#[test]
+fn seeded_tool_blocks_stay_expandable_after_a_resume() {
+    // Retained input and output ride the session file, so a resumed
+    // session's tool blocks seed the detail store: the disclosure
+    // marker shows and the expansion carries the real command and
+    // output across the restart.
+    let mut app = app();
+    let now = chrono::Utc::now();
+    app.seed_messages(vec![TuiMessage::Assistant {
+        blocks: vec![ContentBlock::Tool {
+            name: "Bash".to_string(),
+            call_id: "call-saved".to_string(),
+            input_preview: "make test".to_string(),
+            success: true,
+            elapsed_secs: 3.0,
+            output_preview: "74 passed\n0 failed".to_string(),
+            retained_input: "{\n  \"command\": \"make test\"\n}".to_string(),
+        }],
+        timestamp: now,
+        duration_ms: None,
+    }]);
+    let probe = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&probe);
+    let row = rows
+        .iter()
+        .position(|r| r.contains("Running: make test"))
+        .unwrap_or(0);
+    assert!(
+        rows[row].contains("▸"),
+        "a seeded block with retained detail shows its marker: {:?}",
+        rows[row]
+    );
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        4,
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        4,
+        u16::try_from(row).unwrap_or(0),
+    ));
+    let open = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&open);
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("\"command\": \"make test\"")),
+        "the seeded command expands: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains("74 passed")),
+        "the seeded output expands: {rows:?}"
+    );
+}
+
+#[test]
+fn ctrl_c_cancels_a_running_agent_without_touching_the_quit_chord() {
+    // While a submission is in flight the press serves the run: a
+    // draft clears first, then an empty-composer press cancels —
+    // arming nothing, so exiting after the cancel takes its own two
+    // presses.
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    let running = Arc::clone(&kept.agent_running);
+    running.store(true, std::sync::atomic::Ordering::SeqCst);
+    let cancels: Arc<std::sync::Mutex<Vec<()>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&cancels);
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    app.set_run_canceller(Box::new(move || {
+        sink.lock().expect("sink").push(());
+    }));
+
+    app.handle_event(&Event::Paste("draft".to_string()));
+    app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(app.input().is_empty(), "the draft clears first");
+    assert_eq!(
+        cancels.lock().expect("sink").len(),
+        0,
+        "the clear cancels nothing"
+    );
     assert!(!app.is_quitting());
+
+    app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert_eq!(
+        cancels.lock().expect("sink").len(),
+        1,
+        "the empty-composer press cancels the run"
+    );
+    assert!(!app.is_quitting(), "a cancel never quits");
+
+    // The run lands; the quit chord resumes from scratch.
+    running.store(false, std::sync::atomic::Ordering::SeqCst);
+    app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(!app.is_quitting(), "the first idle press only arms");
+    app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(app.is_quitting(), "the second idle press quits");
+}
+
+#[test]
+fn the_status_bar_shows_the_context_and_the_session_id() {
+    // One status line, three facts: the model, the session's token
+    // accounting labeled as context, and which session this is —
+    // the id a later `--resume` wants, readable straight off the
+    // bar.
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    {
+        let mut tokens = kept.tokens.lock().expect("tokens");
+        tokens.cumulative_input = 4_494;
+        tokens.cumulative_output = 156;
+    }
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    app.set_session_id("f005d097-c4ce-477a-88c0-2fc2cec5a466".to_string());
+    let bar = render_to_buffer(&mut app, 100, 24);
+    let rows = row_texts(&bar);
+    let status = rows
+        .iter()
+        .find(|r| r.contains("CTX:"))
+        .expect("the bar renders");
+    assert!(
+        status.contains("CTX: 4650"),
+        "the accounting reads as context: {status:?}"
+    );
+    assert!(
+        status.contains("f005d097-c4ce-477a-88c0-2fc2cec5a466"),
+        "the session id rides the bar: {status:?}"
+    );
+}
+
+#[test]
+fn the_notice_bar_carries_the_armed_quit_hint_above_the_composer() {
+    // The hint lives on its own reserved row above the prompt box —
+    // not the status bar — so the row can host glance-worthy
+    // messages without shifting anything when one arrives.
+    let mut app = app();
+    let calm = render_to_buffer(&mut app, 80, 24);
+    assert!(
+        !view_text(&calm, 80, 24).contains("ctrl+c again"),
+        "the hint is absent until the chord arms: {:?}",
+        row_texts(&calm)
+    );
+    app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    let armed = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&armed);
+    let hint_row = rows
+        .iter()
+        .position(|row| row.contains("press ctrl+c again to quit"))
+        .expect("the armed state shows its hint");
+    // the reserved notice row sits between the conversation and the
+    // spacer that tops the composer: the row below it is blank and
+    // the composer's text starts below that
+    assert!(
+        rows.get(hint_row.saturating_add(1))
+            .is_some_and(|r| r.trim().is_empty()),
+        "the spacer row follows the notice: {rows:?}"
+    );
+    assert!(
+        !rows.last().is_some_and(|r| r.contains("ctrl+c")),
+        "the status bar no longer carries the hint: {:?}",
+        rows.last()
+    );
+}
+
+#[test]
+fn a_cancelled_agent_notices_and_the_notice_expires() {
+    // The cancel press lands its message on the notice row at once,
+    // and the message leaves when its hold elapses — the tick that
+    // retires it draws the blank row again.
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    kept.agent_running
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    app.set_run_canceller(Box::new(|| {}));
+    app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    let noticed = render_to_buffer(&mut app, 80, 24);
+    assert!(
+        row_texts(&noticed)
+            .iter()
+            .any(|row| row.contains("Agent cancelled")),
+        "the cancel shows on the notice row: {:?}",
+        row_texts(&noticed)
+    );
+    let later = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    assert!(
+        app.tick_wake(later),
+        "the lap past the hold forces its redraw"
+    );
+    let blank = render_to_buffer(&mut app, 80, 24);
+    assert!(
+        !row_texts(&blank)
+            .iter()
+            .any(|row| row.contains("Agent cancelled")),
+        "the notice leaves when its hold elapses"
+    );
+}
+
+#[test]
+fn ctrl_shift_c_copies_the_selection_without_quitting() {
+    // The terminal-standard copy chord takes the live selection —
+    // and never touches the quit chord, whatever the input holds.
+    let mut app = app();
+    let now = chrono::Utc::now();
+    app.push_message(TuiMessage::User {
+        text: "abcdefghij".to_string(),
+        timestamp: now,
+    });
+    let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&copied);
+    app.set_selection_copier(Box::new(move |text| {
+        sink.lock().expect("sink").push(text.to_string());
+    }));
+    let probe = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&probe);
+    let row = rows
+        .iter()
+        .position(|r| r.contains("abcdefghij"))
+        .unwrap_or(0);
+    let col = rows[row].find("abcdefghij").unwrap_or(0);
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 2).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 5).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&Event::Paste("draft".to_string()));
+    assert!(
+        app.handle_event(&key(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT
+        )),
+        "the chord is handled"
+    );
+    assert!(!app.is_quitting(), "the copy chord never quits");
+    assert_eq!(
+        app.input(),
+        "draft",
+        "the copy chord does not clear the buffer either"
+    );
+    let copied = copied.lock().expect("sink").clone();
+    assert_eq!(copied.as_slice(), ["cdef"], "the selection copies");
 }
 
 #[test]
@@ -519,18 +824,22 @@ fn completed_tool_blocks_render_between_text() {
                 text: "alpha".to_string(),
             },
             ContentBlock::Tool {
+                call_id: String::new(),
                 name: "Read".to_string(),
                 input_preview: "src/main.rs".to_string(),
                 success: true,
                 elapsed_secs: 0.42,
                 output_preview: String::new(),
+                retained_input: String::new(),
             },
             ContentBlock::Tool {
+                call_id: String::new(),
                 name: "Grep".to_string(),
                 input_preview: "\"todo\"".to_string(),
                 success: false,
                 elapsed_secs: 61.4,
                 output_preview: String::new(),
+                retained_input: String::new(),
             },
             ContentBlock::Text {
                 text: "omega".to_string(),
@@ -701,25 +1010,31 @@ fn elapsed_stamps_round_once_before_splitting() {
     app.push_message(TuiMessage::Assistant {
         blocks: vec![
             ContentBlock::Tool {
+                call_id: String::new(),
                 name: "Read".to_string(),
                 input_preview: "a.rs".to_string(),
                 success: true,
                 elapsed_secs: 90.0,
                 output_preview: String::new(),
+                retained_input: String::new(),
             },
             ContentBlock::Tool {
+                call_id: String::new(),
                 name: "Grep".to_string(),
                 input_preview: "\"x\"".to_string(),
                 success: true,
                 elapsed_secs: 119.6,
                 output_preview: String::new(),
+                retained_input: String::new(),
             },
             ContentBlock::Tool {
+                call_id: String::new(),
                 name: "Bash".to_string(),
                 input_preview: "true".to_string(),
                 success: true,
                 elapsed_secs: 59.6,
                 output_preview: String::new(),
+                retained_input: String::new(),
             },
         ],
         timestamp: chrono::Utc::now(),
@@ -1362,7 +1677,7 @@ fn a_released_selection_stays_highlighted_until_the_next_press() {
 
 #[test]
 fn a_drag_running_past_the_bottom_edge_scrolls_with_the_selection() {
-    // 24 rows put the conversation pane on rows 0..=17.
+    // 24 rows put the conversation pane on rows 0..=16.
     let mut app = app();
     let now = chrono::Utc::now();
     for i in 0..30 {
@@ -1388,7 +1703,7 @@ fn a_drag_running_past_the_bottom_edge_scrolls_with_the_selection() {
         app.handle_event(&mouse_event(
             MouseEventKind::Drag(crossterm::event::MouseButton::Left),
             2,
-            17,
+            16,
         )),
         "the edge drag reports a redraw"
     );
@@ -1399,7 +1714,7 @@ fn a_drag_running_past_the_bottom_edge_scrolls_with_the_selection() {
     );
     let scrolled = render_to_buffer(&mut app, 80, 24);
     assert!(
-        reversed_cells_on_row(&scrolled, 17) >= 1,
+        reversed_cells_on_row(&scrolled, 16) >= 1,
         "the selection reaches the pane's bottom line as the view moves"
     );
 }
@@ -1431,7 +1746,7 @@ fn a_parked_edge_drag_keeps_scrolling_on_the_tick_until_the_document_ends() {
     app.handle_event(&mouse_event(
         MouseEventKind::Drag(crossterm::event::MouseButton::Left),
         2,
-        17,
+        16,
     ));
     assert_eq!(
         app.scroll_offset(),
@@ -1458,7 +1773,7 @@ fn a_parked_edge_drag_keeps_scrolling_on_the_tick_until_the_document_ends() {
     assert!(app.auto_scroll(), "reaching the bottom re-arms stickiness");
     let settled = render_to_buffer(&mut app, 80, 24);
     assert!(
-        reversed_cells_on_row(&settled, 17) >= 1,
+        reversed_cells_on_row(&settled, 16) >= 1,
         "the selection follows the edge all the way down"
     );
     for _ in 0..6 {
@@ -1567,7 +1882,7 @@ fn a_drag_running_past_the_top_edge_scrolls_upward() {
         );
         let _ = render_to_buffer(&mut app, 80, 24);
     }
-    assert_eq!(app.scroll_offset(), 12, "the walk ends pinned at the top");
+    assert_eq!(app.scroll_offset(), 13, "the walk ends pinned at the top");
     let settled = render_to_buffer(&mut app, 80, 24);
     assert!(
         reversed_cells_on_row(&settled, 0) >= 1,
@@ -1687,7 +2002,7 @@ fn shift_arrows_walk_the_view_to_follow_the_head() {
     assert!(app.auto_scroll(), "the walk re-arms at the bottom");
     let settled = render_to_buffer(&mut app, 80, 24);
     assert!(
-        reversed_cells_on_row(&settled, 17) >= 1,
+        reversed_cells_on_row(&settled, 16) >= 1,
         "the head sits on the document's last, visible line"
     );
 }
@@ -2126,6 +2441,146 @@ fn a_release_over_blank_cells_copies_nothing() {
 }
 
 #[test]
+fn combining_marks_carry_with_their_base_and_line_up_with_the_rendered_cells() {
+    // A combining mark paints no cell of its own — "e" + acute + "x"
+    // renders two cells — so the selection walks clusters, not
+    // characters: the cell that shows "x" copies "x", and a selected
+    // base carries its mark along.
+    let mut app = app();
+    let now = chrono::Utc::now();
+    app.push_message(TuiMessage::User {
+        text: "e\u{301}x".to_string(),
+        timestamp: now,
+    });
+    let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&copied);
+    app.set_selection_copier(Box::new(move |text| {
+        sink.lock().expect("sink").push(text.to_string());
+    }));
+    let probe = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&probe);
+    let row = rows.iter().position(|r| r.contains('x')).unwrap_or(0);
+    let col = rows[row].find('e').unwrap_or(0);
+
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 1).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 2).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 2).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    let first = copied.lock().expect("sink").clone();
+    assert_eq!(
+        first.as_slice(),
+        ["x"],
+        "the second rendered cell copies x, not the mark"
+    );
+
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        u16::try_from(col).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 1).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 1).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    let again = copied.lock().expect("sink").clone();
+    assert_eq!(
+        again.get(1).map(String::as_str),
+        Some("e\u{301}x"),
+        "both cells copy with the mark riding its base — no phantom third cell"
+    );
+}
+
+#[test]
+fn a_press_outside_the_conversation_retires_the_selection_without_recopying() {
+    // The selection's release copies; a press that anchors nothing —
+    // into the composer, the status bar, or off the pane — starts a
+    // new interaction instead. The stale selection is retired there,
+    // so its release never re-copies a span over whatever the user
+    // put on the clipboard in between.
+    let mut app = app();
+    let now = chrono::Utc::now();
+    app.push_message(TuiMessage::User {
+        text: "abcdefghij".to_string(),
+        timestamp: now,
+    });
+    let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&copied);
+    app.set_selection_copier(Box::new(move |text| {
+        sink.lock().expect("sink").push(text.to_string());
+    }));
+    let probe = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&probe);
+    let row = rows
+        .iter()
+        .position(|r| r.contains("abcdefghij"))
+        .unwrap_or(0);
+    let col = rows[row].find("abcdefghij").unwrap_or(0);
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 2).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 5).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 5).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    assert_eq!(
+        copied.lock().expect("sink").len(),
+        1,
+        "the drag copied once"
+    );
+
+    let status_row = 23;
+    assert!(
+        app.handle_event(&mouse_event(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            5,
+            status_row,
+        )),
+        "retiring the selection is itself a redraw — the highlight leaves now"
+    );
+    app.handle_event(&mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        5,
+        status_row,
+    ));
+    assert_eq!(
+        copied.lock().expect("sink").len(),
+        1,
+        "the off-pane release copies nothing"
+    );
+    let after = render_to_buffer(&mut app, 80, 24);
+    assert_eq!(
+        reversed_cells(&after),
+        0,
+        "the highlight retired with the press"
+    );
+}
+
+#[test]
 fn an_interior_blank_line_stays_in_a_multi_row_copy() {
     // The covered-any flag only suppresses spans that covered no
     // characters anywhere; a genuine selection crossing a blank
@@ -2226,6 +2681,48 @@ fn a_selection_landing_on_a_wide_characters_second_cell_takes_it() {
         reversed_cells_on_row(&selected, u16::try_from(row).unwrap_or(0)) >= 2,
         "the wide character's own cell highlights alongside the covered one"
     );
+}
+
+#[test]
+fn mouse_traffic_leaves_the_caret_blink_alone() {
+    // Reading is not typing: wheel scrolls, hovers, and clicks in
+    // the conversation keep arriving while the user reads, and each
+    // one used to restart the blink phase — the caret sat solid
+    // through a whole mouse-driven session. Only keyboard input
+    // resolidifies the caret now.
+    let mut app = app();
+    let _ = render_to_buffer(&mut app, 80, 24);
+    for _ in 0..4 {
+        assert!(!app.tick_wake(std::time::Instant::now()));
+    }
+    assert!(
+        app.tick_wake(std::time::Instant::now()),
+        "the fifth tick flips the caret to its dark phase"
+    );
+    assert!(
+        !app.caret_visible(),
+        "sanity: the caret is dark before the mouse traffic"
+    );
+
+    app.handle_event(&mouse_event(MouseEventKind::ScrollUp, 5, 5));
+    app.handle_event(&mouse_event(MouseEventKind::Moved, 6, 6));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        7,
+        7,
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        7,
+        7,
+    ));
+    assert!(
+        !app.caret_visible(),
+        "wheel, motion, and clicks leave the dark phase alone"
+    );
+
+    app.handle_event(&plain(KeyCode::Char('x')));
+    assert!(app.caret_visible(), "typing still resolidifies the caret");
 }
 
 #[test]
@@ -2383,6 +2880,7 @@ fn composer_chunk(width: u16, height: u16) -> Rect {
         .constraints([
             Constraint::Min(0),
             Constraint::Length(1),
+            Constraint::Length(1),
             Constraint::Length(4),
             Constraint::Length(1),
         ])
@@ -2391,7 +2889,7 @@ fn composer_chunk(width: u16, height: u16) -> Rect {
             y: 0,
             width,
             height,
-        })[2]
+        })[3]
 }
 
 #[test]
@@ -2791,7 +3289,9 @@ fn the_drain_stops_at_a_quit_event() {
     app.handle_event(&plain(KeyCode::Char('h')));
     app.handle_event(&plain(KeyCode::Char('i')));
     let mut queued = std::collections::VecDeque::from(vec![
-        Ok(plain(KeyCode::Esc)),
+        Ok(key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        Ok(key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        Ok(key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
         Ok(plain(KeyCode::Enter)),
         Ok(plain(KeyCode::Char('!'))),
     ]);
@@ -2799,13 +3299,17 @@ fn the_drain_stops_at_a_quit_event() {
         .drain_ready(move || queued.pop_front())
         .expect("no failure in the batch");
     assert!(redraws, "the batch up to quit needs a redraw");
-    assert!(app.is_quitting(), "the Esc quit lands");
+    assert!(app.is_quitting(), "the confirming press quits");
     assert_eq!(
         app.conversation().len(),
         0,
         "the Enter queued behind the quit never submits the buffered text"
     );
-    assert_eq!(app.input(), "hi", "the trailing keystroke never applies");
+    assert_eq!(
+        app.input(),
+        "",
+        "the chord cleared the draft; the trailing keystroke never applies"
+    );
 }
 
 #[test]
@@ -2815,14 +3319,15 @@ fn a_submit_before_the_quit_in_one_burst_lands() {
     app.handle_event(&plain(KeyCode::Char('i')));
     let mut queued = std::collections::VecDeque::from(vec![
         Ok(plain(KeyCode::Enter)),
-        Ok(plain(KeyCode::Esc)),
+        Ok(key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        Ok(key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
         Ok(plain(KeyCode::Char('x'))),
     ]);
     let redraws = app
         .drain_ready(move || queued.pop_front())
         .expect("no failure in the batch");
     assert!(redraws, "the landing submit redraws");
-    assert!(app.is_quitting(), "the Esc quit still lands after it");
+    assert!(app.is_quitting(), "the quit chord still lands after it");
     assert_eq!(
         app.conversation().len(),
         1,
@@ -2840,11 +3345,13 @@ fn f2_cycles_verbosity_and_rerenders_completed_tools() {
     let mut app = app();
     app.push_message(TuiMessage::Assistant {
         blocks: vec![ContentBlock::Tool {
+            call_id: String::new(),
             name: "Read".to_string(),
             input_preview: r#"{"file_path":"a.rs"}"#.to_string(),
             success: true,
             elapsed_secs: 0.42,
             output_preview: String::new(),
+            retained_input: String::new(),
         }],
         timestamp: chrono::Utc::now(),
         duration_ms: None,
@@ -2907,6 +3414,9 @@ fn a_tool_graduation_fires_the_turn_end_hook() {
         .lock()
         .expect("the queue lock")
         .push(dch_tui::Graduation::Tool(dch_tui::ToolResultDisplay {
+            call_id: String::new(),
+            full_input: String::new(),
+            full_output: String::new(),
             name: "Read".to_string(),
             is_error: false,
             duration: std::time::Duration::from_millis(2),
@@ -2940,16 +3450,811 @@ fn a_tool_graduation_fires_the_turn_end_hook() {
 }
 
 #[test]
+fn a_click_expands_a_completed_tool_block_and_clicking_again_collapses_it() {
+    // The summary row is a disclosure: a click with no travel opens
+    // the block to its full command and output — indented, labeled,
+    // wrapped — and a second click folds it back. The data rides the
+    // graduation from the dispatch-side capture.
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    kept.graduations
+        .lock()
+        .expect("the queue lock")
+        .push(dch_tui::Graduation::Tool(dch_tui::ToolResultDisplay {
+            call_id: "call-9".to_string(),
+            name: "Bash".to_string(),
+            is_error: false,
+            duration: std::time::Duration::from_millis(25),
+            input_summary: r#"{"command":"make test"}"#.to_string(),
+            output_preview: String::new(),
+            full_input: "{\n  \"command\": \"make test\"\n}".to_string(),
+            full_output: "running 74 tests\nfailures: 0".to_string(),
+        }));
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+
+    let probe = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&probe);
+    let row = rows
+        .iter()
+        .position(|r| r.contains("Running: make test"))
+        .unwrap_or(0);
+    assert!(
+        rows.iter().any(|r| r.contains("▸")),
+        "a block with retained detail shows its closed marker: {rows:?}"
+    );
+
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        4,
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        4,
+        u16::try_from(row).unwrap_or(0),
+    ));
+    let open = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&open);
+    assert!(
+        rows.iter().any(|r| r.contains("▾")),
+        "the marker flips open: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("\"command\": \"make test\"")),
+        "the full command renders: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains("running 74 tests")),
+        "the full output renders: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains("failures: 0")),
+        "every output line renders: {rows:?}"
+    );
+
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        4,
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        4,
+        u16::try_from(row).unwrap_or(0),
+    ));
+    let shut = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&shut);
+    assert!(
+        rows.iter()
+            .all(|r| !r.contains("\"command\": \"make test\"")),
+        "the second click folds the block back: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains("▸")),
+        "the marker returns to closed: {rows:?}"
+    );
+}
+
+#[test]
+fn a_running_tool_row_expands_to_its_captured_input() {
+    // The capture middleware records the input before the call runs,
+    // so a running row is expandable the moment it appears — full
+    // command now, output pending until the dispatch completes.
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    kept.tool_captures.lock().expect("the capture lock").insert(
+        "call-4".to_string(),
+        dch_tui::ToolCapture {
+            input_json: "{\n  \"command\": \"cargo test\"\n}".to_string(),
+            output: String::new(),
+            is_error: false,
+            done: false,
+        },
+    );
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    app.active_tools()
+        .lock()
+        .expect("the tools lock")
+        .push(dch_tui::ActiveTool {
+            call_id: "call-4".to_string(),
+            name: "Bash".to_string(),
+            input_summary: r#"{"command":"cargo test"}"#.to_string(),
+            start: std::time::Instant::now(),
+        });
+
+    let probe = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&probe);
+    let row = rows
+        .iter()
+        .position(|r| r.contains("Running: cargo test"))
+        .unwrap_or(0);
+    assert!(
+        rows[row].contains("▸"),
+        "a captured running row is expandable: {:?}",
+        rows[row]
+    );
+
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        4,
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        4,
+        u16::try_from(row).unwrap_or(0),
+    ));
+    let open = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&open);
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("\"command\": \"cargo test\"")),
+        "the running call's full command renders: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains("… running")),
+        "the output reads as pending: {rows:?}"
+    );
+}
+
+#[test]
+fn an_expansion_opened_while_running_survives_the_calls_completion() {
+    // Running rows and their graduated block share the call id, so
+    // an expansion opened mid-run hands over to the completed block
+    // and the output fills in place.
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    let graduations = std::sync::Arc::clone(&kept.graduations);
+    kept.tool_captures.lock().expect("the capture lock").insert(
+        "call-7".to_string(),
+        dch_tui::ToolCapture {
+            input_json: "{\n  \"file_path\": \"src/lib.rs\" }".to_string(),
+            output: String::new(),
+            is_error: false,
+            done: false,
+        },
+    );
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    app.active_tools()
+        .lock()
+        .expect("the tools lock")
+        .push(dch_tui::ActiveTool {
+            call_id: "call-7".to_string(),
+            name: "Read".to_string(),
+            input_summary: r#"{"file_path":"src/lib.rs"}"#.to_string(),
+            start: std::time::Instant::now(),
+        });
+
+    let probe = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&probe);
+    let row = rows
+        .iter()
+        .position(|r| r.contains("Reading src/lib.rs"))
+        .unwrap_or(0);
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        4,
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        4,
+        u16::try_from(row).unwrap_or(0),
+    ));
+    let running = render_to_buffer(&mut app, 80, 30);
+    assert!(
+        row_texts(&running).iter().any(|r| r.contains("… running")),
+        "sanity: the expansion is open while the call runs"
+    );
+
+    app.active_tools().lock().expect("the tools lock").clear();
+    graduations
+        .lock()
+        .expect("the queue lock")
+        .push(dch_tui::Graduation::Tool(dch_tui::ToolResultDisplay {
+            call_id: "call-7".to_string(),
+            name: "Read".to_string(),
+            is_error: false,
+            duration: std::time::Duration::from_millis(4),
+            input_summary: r#"{"file_path":"src/lib.rs"}"#.to_string(),
+            output_preview: String::new(),
+            full_input: "{\n  \"file_path\": \"src/lib.rs\" }".to_string(),
+            full_output: "pub fn answer() -> u32 { 42 }".to_string(),
+        }));
+    let done = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&done);
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("pub fn answer() -> u32 { 42 }")),
+        "the completed block fills the output in place: {rows:?}"
+    );
+    assert!(
+        rows.iter().all(|r| !r.contains("… running")),
+        "the pending note is gone: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains("▾")),
+        "the expansion stayed open across the handover: {rows:?}"
+    );
+}
+
+#[test]
+fn the_oldest_tool_details_retire_past_the_cap() {
+    // The detail store is FIFO-bounded: past the cap the oldest
+    // graduated call loses its expansion — the marker and the
+    // click go with it — while the newest stay expandable.
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    let graduations = std::sync::Arc::clone(&kept.graduations);
+    {
+        let mut queue = graduations.lock().expect("the queue lock");
+        for index in 0..257 {
+            queue.push(dch_tui::Graduation::Tool(dch_tui::ToolResultDisplay {
+                call_id: format!("call-{index}"),
+                name: "Bash".to_string(),
+                is_error: false,
+                duration: std::time::Duration::from_millis(1),
+                input_summary: format!(r#"{{"command":"cmd {index}"}}"#),
+                output_preview: String::new(),
+                full_input: format!("{{\n  \"command\": \"cmd {index}\"\n}}"),
+                full_output: format!("out {index}"),
+            }));
+        }
+    }
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    let probe = render_to_buffer(&mut app, 80, 300);
+    let rows = row_texts(&probe);
+    let oldest = rows
+        .iter()
+        .position(|r| r.contains("cmd 0"))
+        .expect("the oldest block renders");
+    assert!(
+        !rows[oldest].contains("▸"),
+        "the retired block carries no marker: {:?}",
+        rows[oldest]
+    );
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        4,
+        u16::try_from(oldest).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        4,
+        u16::try_from(oldest).unwrap_or(0),
+    ));
+    let clicked = render_to_buffer(&mut app, 80, 300);
+    assert!(
+        !row_texts(&clicked).iter().any(|r| r.contains("out 0")),
+        "the retired block no longer expands"
+    );
+
+    let newest = rows
+        .iter()
+        .position(|r| r.contains("cmd 256"))
+        .expect("the newest block renders");
+    assert!(
+        rows[newest].contains("▸"),
+        "the newest block stays expandable: {:?}",
+        rows[newest]
+    );
+}
+
+#[test]
+fn carriage_return_pastes_fold_to_line_breaks() {
+    // Terminals spell pasted newlines differently — Alacritty sends
+    // carriage returns, Ghostty line feeds. A CR that survives as
+    // content welds the paste into one logical line: the composer's
+    // window shows only the tail and the echo reads as one clipped
+    // row. Both CR spellings fold to the editor's line feed.
+    let mut app = app();
+    let cr_text = "FIRST LINE\rx\r\nSECOND LINE\rTHIRD LINE".to_string();
+    app.handle_event(&Event::Paste(cr_text));
+    assert_eq!(
+        app.input(),
+        "FIRST LINE\nx\nSECOND LINE\nTHIRD LINE",
+        "CRLF and bare CR both fold; nothing else changes"
+    );
+    assert!(
+        !app.input().contains('\r'),
+        "no carriage return survives as content"
+    );
+
+    app.handle_event(&plain(KeyCode::Enter));
+    let echo = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&echo);
+    let first = rows.iter().position(|r| r.contains("FIRST LINE"));
+    let second = rows.iter().position(|r| r.contains("SECOND LINE"));
+    let third = rows.iter().position(|r| r.contains("THIRD LINE"));
+    assert!(
+        rows.iter().any(|r| r.contains("FIRST LINE")),
+        "the paste's head renders: {rows:?}"
+    );
+    assert!(
+        first.is_some_and(|f| second.is_some_and(|s| third.is_some_and(|t| f < s && s < t))),
+        "each source line renders on its own row, in order: {rows:?}"
+    );
+}
+
+#[test]
+fn long_user_lines_wrap_in_the_conversation_instead_of_clipping() {
+    // A pasted line longer than the pane reads as missing text when
+    // the row clips at the edge; wrapped, its tail is on screen and
+    // the transcript shows everything that was submitted.
+    let mut app = app();
+    let now = chrono::Utc::now();
+    let long = format!("{}{}", "x".repeat(90), "THE-TAIL-IS-HERE");
+    app.push_message(TuiMessage::User {
+        text: long,
+        timestamp: now,
+    });
+    let terminal = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&terminal);
+    assert!(
+        rows.iter().any(|row| row.contains("THE-TAIL-IS-HERE")),
+        "the line's tail is visible past the pane width: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.starts_with('x')),
+        "the line's head starts the first row"
+    );
+    let spanned = rows.iter().filter(|row| row.contains('x')).count();
+    assert!(
+        spanned >= 2,
+        "the line flows across rows instead of clipping: {spanned} rows, {rows:?}"
+    );
+}
+
+#[test]
+fn a_retried_call_ages_from_its_newest_attempt() {
+    // A retry graduates again under the same call id; the eviction
+    // queue must not hold the id twice — a duplicate would retire
+    // another call's detail early and leave the set of expandable
+    // blocks one short of the cap.
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    let graduations = std::sync::Arc::clone(&kept.graduations);
+    {
+        let mut queue = graduations.lock().expect("the queue lock");
+        // ids 0..=254 stay single (255), then call-dup twice: 256
+        // distinct calls, 257 graduations. Without the requeue the
+        // queue would exceed the cap and evict call-0; with it, the
+        // deduplicated queue sits exactly at capacity and nothing
+        // evicts.
+        for index in 0..255 {
+            queue.push(graduation(format!("call-{index}")));
+        }
+        queue.push(graduation("call-dup".to_string()));
+        queue.push(graduation("call-dup".to_string()));
+    }
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    let probe = render_to_buffer(&mut app, 80, 300);
+    let rows = row_texts(&probe);
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("cmd call-0") && r.contains("▸")),
+        "the duplicate did not push the oldest detail out early: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("cmd call-dup") && r.contains("▸")),
+        "the retried call itself stays expandable"
+    );
+}
+
+fn graduation(call_id: String) -> dch_tui::Graduation {
+    dch_tui::Graduation::Tool(dch_tui::ToolResultDisplay {
+        name: "Bash".to_string(),
+        is_error: false,
+        duration: std::time::Duration::from_millis(1),
+        input_summary: format!(r#"{{"command":"cmd {}"}}"#, call_id),
+        output_preview: String::new(),
+        full_input: format!("{{\"command\": \"cmd {call_id}\"}}"),
+        full_output: format!("out {call_id}"),
+        call_id,
+    })
+}
+
+#[test]
+fn a_captureless_completion_never_advertises_an_expansion() {
+    // Refused-before-execution calls graduate with empty capture
+    // halves; the marker is a promise of retained content, so no
+    // detail means no glyph and no toggle — the block never opens
+    // onto bare labels.
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    kept.graduations
+        .lock()
+        .expect("the queue lock")
+        .push(dch_tui::Graduation::Tool(dch_tui::ToolResultDisplay {
+            call_id: "call-refused".to_string(),
+            name: "Bash".to_string(),
+            is_error: true,
+            duration: std::time::Duration::from_millis(0),
+            input_summary: r#"{"command":"rm -rf /"}"#.to_string(),
+            output_preview: String::new(),
+            full_input: String::new(),
+            full_output: String::new(),
+        }));
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    let probe = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&probe);
+    let row = rows.iter().position(|r| r.contains("rm -rf")).unwrap_or(0);
+    assert!(
+        !rows.iter().any(|r| r.contains("▸")),
+        "no marker without retained content: {rows:?}"
+    );
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        4,
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        4,
+        u16::try_from(row).unwrap_or(0),
+    ));
+    let clicked = render_to_buffer(&mut app, 80, 24);
+    assert!(
+        !row_texts(&clicked).iter().any(|r| r.contains("input:")),
+        "nothing expands: {:?}",
+        row_texts(&clicked)
+    );
+}
+
+#[test]
+fn a_mouse_press_between_the_chord_disarms_it() {
+    // The two Ctrl+C presses must be consecutive input: a click in
+    // between starts a different interaction and disarms the chord.
+    let mut app = app();
+    assert!(app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        4,
+        4,
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        4,
+        4,
+    ));
+    app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(
+        !app.is_quitting(),
+        "a click between the presses breaks the chord"
+    );
+}
+
+#[test]
+fn a_block_without_retained_detail_is_not_expandable() {
+    // Blocks with nothing retained — calls that ran without a
+    // capture, sessions resumed from before the field existed —
+    // carry no marker and no toggle: their rows stay plain.
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    kept.graduations
+        .lock()
+        .expect("the queue lock")
+        .push(dch_tui::Graduation::Tool(dch_tui::ToolResultDisplay {
+            call_id: String::new(),
+            name: "Bash".to_string(),
+            is_error: false,
+            duration: std::time::Duration::from_millis(3),
+            input_summary: r#"{"command":"ls"}"#.to_string(),
+            output_preview: String::new(),
+            full_input: String::new(),
+            full_output: String::new(),
+        }));
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+
+    let probe = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&probe);
+    let row = rows
+        .iter()
+        .position(|r| r.contains("Running: ls"))
+        .unwrap_or(0);
+    assert!(
+        !rows.iter().any(|r| r.contains("▸")),
+        "no marker without retained detail: {rows:?}"
+    );
+
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        4,
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        4,
+        u16::try_from(row).unwrap_or(0),
+    ));
+    let clicked = render_to_buffer(&mut app, 80, 30);
+    assert!(
+        !row_texts(&clicked).iter().any(|r| r.contains("input:")),
+        "the click does not open anything: {:?}",
+        row_texts(&clicked)
+    );
+}
+
+#[test]
+fn dragging_from_a_summary_row_still_selects_instead_of_toggling() {
+    // The summary row keeps its selection behavior: a press that
+    // travels is a drag, not a click, so it selects text and copies
+    // on release — the expansion never opens.
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    kept.graduations
+        .lock()
+        .expect("the queue lock")
+        .push(dch_tui::Graduation::Tool(dch_tui::ToolResultDisplay {
+            call_id: "call-2".to_string(),
+            name: "Bash".to_string(),
+            is_error: false,
+            duration: std::time::Duration::from_millis(8),
+            input_summary: r#"{"command":"make"}"#.to_string(),
+            output_preview: String::new(),
+            full_input: "{\n  \"command\": \"make\"\n}".to_string(),
+            full_output: "built".to_string(),
+        }));
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    let now = chrono::Utc::now();
+    app.push_message(TuiMessage::User {
+        text: "abcdefghij".to_string(),
+        timestamp: now,
+    });
+    let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&copied);
+    app.set_selection_copier(Box::new(move |text| {
+        sink.lock().expect("sink").push(text.to_string());
+    }));
+
+    let probe = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&probe);
+    let user_row = rows
+        .iter()
+        .position(|r| r.contains("abcdefghij"))
+        .unwrap_or(0);
+    let col = rows[user_row].find("abcdefghij").unwrap_or(0);
+    let tool_row = rows
+        .iter()
+        .position(|r| r.contains("Running: make"))
+        .unwrap_or(0);
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        4,
+        u16::try_from(tool_row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 3).unwrap_or(0),
+        u16::try_from(user_row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 3).unwrap_or(0),
+        u16::try_from(user_row).unwrap_or(0),
+    ));
+    let copied = copied.lock().expect("sink").clone();
+    assert!(
+        !copied.is_empty(),
+        "the drag selected and copied, not toggled"
+    );
+    let after = render_to_buffer(&mut app, 80, 30);
+    assert!(
+        row_texts(&after).iter().all(|r| !r.contains("input:")),
+        "the block never expanded: {:?}",
+        row_texts(&after)
+    );
+}
+
+#[test]
+fn finish_tool_pairs_the_graduation_with_its_capture() {
+    // The lifecycle event carries no output text; the capture store
+    // holds it. Completing a call takes its capture into the
+    // graduation — keyed exactly by call id — and retires the entry.
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    kept.tool_captures.lock().expect("the capture lock").insert(
+        "call-3".to_string(),
+        dch_tui::ToolCapture {
+            input_json: "{\n  \"command\": \"ls\"\n}".to_string(),
+            output: "src\ntarget".to_string(),
+            is_error: false,
+            done: true,
+        },
+    );
+    kept.active_tools
+        .lock()
+        .expect("the tools lock")
+        .push(dch_tui::ActiveTool {
+            call_id: "call-3".to_string(),
+            name: "Bash".to_string(),
+            input_summary: r#"{"command":"ls"}"#.to_string(),
+            start: std::time::Instant::now(),
+        });
+    observer.finish_tool("call-3", "Bash", false, std::time::Duration::from_millis(5));
+
+    let graduations = kept.graduations.lock().expect("the queue lock").clone();
+    let Some(dch_tui::Graduation::Tool(result)) = graduations.first() else {
+        panic!("the completion graduates: {graduations:?}");
+    };
+    assert_eq!(result.call_id, "call-3", "the call id rides the graduation");
+    assert_eq!(
+        result.full_input, "{\n  \"command\": \"ls\"\n}",
+        "the capture's input rides the graduation"
+    );
+    assert_eq!(
+        result.full_output, "src\ntarget",
+        "the output rides the graduation"
+    );
+    assert_eq!(
+        result.output_preview, "src\ntarget",
+        "the persisted preview carries the same retained output"
+    );
+    assert!(
+        kept.tool_captures
+            .lock()
+            .expect("the capture lock")
+            .get("call-3")
+            .is_none(),
+        "the entry retires with the graduation"
+    );
+}
+
+#[test]
+fn a_click_on_any_row_of_an_expanded_block_collapses_it() {
+    // The whole open block is the toggle target, not just its
+    // summary row: after a long expansion scrolls the summary out
+    // of view, a click anywhere on the visible expansion folds it.
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    kept.graduations
+        .lock()
+        .expect("the queue lock")
+        .push(dch_tui::Graduation::Tool(dch_tui::ToolResultDisplay {
+            call_id: "call-5".to_string(),
+            name: "Bash".to_string(),
+            is_error: false,
+            duration: std::time::Duration::from_millis(10),
+            input_summary: r#"{"command":"make test"}"#.to_string(),
+            output_preview: String::new(),
+            full_input: "{\n  \"command\": \"make test\"\n}".to_string(),
+            full_output: (0..30)
+                .map(|i| format!("output line {i:02}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }));
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    let probe = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&probe);
+    let row = rows
+        .iter()
+        .position(|r| r.contains("Running: make test"))
+        .unwrap_or(0);
+
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        4,
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        4,
+        u16::try_from(row).unwrap_or(0),
+    ));
+    let open = render_to_buffer(&mut app, 80, 24);
+    let open_rows = row_texts(&open);
+    let output_row = open_rows
+        .iter()
+        .position(|r| r.contains("output line"))
+        .expect("the expansion is on screen");
+    assert!(
+        open_rows.iter().any(|r| r.contains("Running: make test")),
+        "the summary row held still while the block opened: {open_rows:?}"
+    );
+
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        4,
+        u16::try_from(output_row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        4,
+        u16::try_from(output_row).unwrap_or(0),
+    ));
+    let shut = render_to_buffer(&mut app, 80, 24);
+    let shut_rows = row_texts(&shut);
+    assert!(
+        shut_rows
+            .iter()
+            .all(|r| !r.contains("output line") && !r.contains("input:")),
+        "a click on the expansion's own rows folds the block: {shut_rows:?}"
+    );
+}
+
+#[test]
+fn expanding_holds_the_clicked_row_steady_instead_of_chasing_the_tail() {
+    // A pinned view follows the document's tail, so a naive expand
+    // of a long block would scroll the block's own summary out of
+    // view. Expanding detaches: the growth compensation below the
+    // clicked row keeps it on screen with the expansion flowing
+    // under it.
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    kept.graduations
+        .lock()
+        .expect("the queue lock")
+        .push(dch_tui::Graduation::Tool(dch_tui::ToolResultDisplay {
+            call_id: "call-6".to_string(),
+            name: "Bash".to_string(),
+            is_error: false,
+            duration: std::time::Duration::from_millis(10),
+            input_summary: r#"{"command":"make build"}"#.to_string(),
+            output_preview: String::new(),
+            full_input: "{\n  \"command\": \"make build\"\n}".to_string(),
+            full_output: (0..30)
+                .map(|i| format!("build line {i:02}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }));
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    let probe = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&probe);
+    let row = rows
+        .iter()
+        .position(|r| r.contains("Running: make build"))
+        .unwrap_or(0);
+    assert_eq!(row, 0, "sanity: the short document starts at the top");
+
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        4,
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        4,
+        u16::try_from(row).unwrap_or(0),
+    ));
+    let open = render_to_buffer(&mut app, 80, 24);
+    let open_rows = row_texts(&open);
+    assert!(
+        open_rows
+            .first()
+            .is_some_and(|r| r.contains("Running: make build")),
+        "the clicked row stays at the top: {open_rows:?}"
+    );
+    assert!(
+        open_rows.iter().any(|r| r.contains("build line 00")),
+        "the expansion's start shows under it: {open_rows:?}"
+    );
+}
+
+#[test]
 fn hostile_elapsed_values_render_instead_of_panicking() {
     let mut app = app();
     for elapsed_secs in [-1.0, f64::NAN, 1.0e300] {
         app.push_message(TuiMessage::Assistant {
             blocks: vec![ContentBlock::Tool {
+                call_id: String::new(),
                 name: "Read".to_string(),
                 input_preview: "a.rs".to_string(),
                 success: true,
                 elapsed_secs,
                 output_preview: String::new(),
+                retained_input: String::new(),
             }],
             timestamp: chrono::Utc::now(),
             duration_ms: None,
@@ -2977,6 +4282,9 @@ fn a_reply_graduates_below_the_tool_that_preceded_it() {
         .lock()
         .expect("the queue lock")
         .push(dch_tui::Graduation::Tool(dch_tui::ToolResultDisplay {
+            call_id: String::new(),
+            full_input: String::new(),
+            full_output: String::new(),
             name: "Read".to_string(),
             is_error: false,
             duration: std::time::Duration::from_millis(3),
@@ -3031,12 +4339,12 @@ fn the_scrollbar_owns_its_gutter_and_never_touches_text() {
     let buffer = terminal.backend().buffer();
     let thumb = app.theme.ui.scrollbar_thumb;
     let track = app.theme.ui.scrollbar_track;
-    // 12 rows: 6 for the conversation (spacer, padded two-row
-    // input field, status bar). thumb = 6 * 6 / 20 = 1 row flush
-    // with the track's bottom.
-    for y in 0..6u16 {
+    // 12 rows: 5 for the conversation (notice row, spacer, padded
+    // two-row input field, status bar). thumb = 5 * 5 / 20 = 1 row
+    // flush with the track's bottom.
+    for y in 0..5u16 {
         let cell = &buffer[(19, y)];
-        let in_thumb = y >= 5;
+        let in_thumb = y >= 4;
         assert_eq!(
             cell.symbol(),
             " ",
@@ -3048,7 +4356,7 @@ fn the_scrollbar_owns_its_gutter_and_never_touches_text() {
             "row {y}: the solid bar is the theme's thumb and rail colors as cell backgrounds"
         );
     }
-    for y in 0..6u16 {
+    for y in 0..5u16 {
         for x in 0..19u16 {
             let cell = &buffer[(x, y)];
             assert!(
