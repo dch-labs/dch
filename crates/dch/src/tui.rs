@@ -80,7 +80,10 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
 
     let (observer, state) = TuiObserverState::new().into_observer();
     let mut builder = dch_loop::Runner::builder(&config, &workdir)
-        .with_observer(Arc::new(observer) as Arc<dyn loopctl::observer::LoopObserver>);
+        .with_observer(Arc::new(observer) as Arc<dyn loopctl::observer::LoopObserver>)
+        .with_middleware(Arc::new(dch_tui::CapturingMiddleware::new(Arc::clone(
+            &state.tool_captures,
+        ))));
     if let ResumeControl::Resumed(outcome) = &control {
         builder = builder.with_history(crate::resume::tui_messages_to_loopctl(
             &outcome.messages,

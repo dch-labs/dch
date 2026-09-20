@@ -610,6 +610,7 @@ mod tests {
 
     fn tool_block(name: &str, success: bool) -> ContentBlock {
         ContentBlock::Tool {
+            call_id: String::new(),
             name: name.to_string(),
             input_preview: "a.rs".to_string(),
             success,
@@ -916,6 +917,7 @@ mod tests {
     fn redaction_scrubs_secret_shaped_previews() {
         let token = format!("ghp_{}", "x".repeat(36));
         let leaked = assistant(vec![ContentBlock::Tool {
+            call_id: String::new(),
             name: "Bash".to_string(),
             input_preview: format!("echo {token}"),
             success: true,

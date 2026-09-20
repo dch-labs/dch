@@ -33,14 +33,22 @@ const PENDING_SUMMARY_CAP: usize = 64;
 /// A completed tool call, formatted for display.
 ///
 /// Carries what a glanceable result line needs — name, outcome,
-/// duration — while the full output stays in the conversation. The
-/// numeric loop-detection fingerprint never reaches these fields.
+/// duration — beside the full command and output the expansion
+/// shows, taken from the dispatch-side capture when one exists.
+/// The numeric loop-detection fingerprint never reaches these
+/// fields.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolResultDisplay {
     /// The invoked tool's name.
     ///
     /// As reported by the dispatcher.
     pub name: String,
+
+    /// The model-issued call id.
+    ///
+    /// Keys the runtime expansion data; empty when no capture
+    /// recorded the call.
+    pub call_id: String,
 
     /// Whether the call returned an error.
     ///
@@ -64,6 +72,19 @@ pub struct ToolResultDisplay {
     /// Empty from the lifecycle events alone — they carry no output
     /// text; the conversation is the record of what a tool printed.
     pub output_preview: String,
+
+    /// The call's full input, pretty-printed JSON, for expansion.
+    ///
+    /// Taken from the dispatch-side capture; empty when the call
+    /// ran without one.
+    pub full_input: String,
+
+    /// The call's full output, within the retention cap, for
+    /// expansion.
+    ///
+    /// Taken from the dispatch-side capture — the redacted text the
+    /// pipeline returned; empty when the call ran without one.
+    pub full_output: String,
 }
 
 /// One conversation-ordered completion event.
@@ -126,6 +147,15 @@ pub struct TuiObserverState {
     /// One entry per dispatched call, removed on completion.
     pub active_tools: Arc<Mutex<Vec<ActiveTool>>>,
 
+    /// Full tool calls captured at dispatch, keyed by call id.
+    ///
+    /// Written by the capture middleware on the dispatch pipeline
+    /// and drained by [`finish_tool`](TuiObserver::finish_tool) as
+    /// calls complete — the lifecycle events alone carry no output
+    /// text. Absent in modes that install no middleware; entries
+    /// that never graduate are bounded by the store's own cap.
+    pub tool_captures: crate::tool_capture::ToolCaptureSink,
+
     /// Run-level failures the display has not taken yet.
     ///
     /// Written by the mode driver when a submitted task's run fails;
@@ -169,6 +199,7 @@ impl TuiObserverState {
             streaming_text: Arc::new(Mutex::new(String::new())),
             graduations: Arc::new(Mutex::new(Vec::new())),
             active_tools: Arc::new(Mutex::new(Vec::new())),
+            tool_captures: Arc::new(Mutex::new(HashMap::new())),
             errors: Arc::new(Mutex::new(Vec::new())),
             queued: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             tokens: Arc::new(Mutex::new(TokenCounts::default())),
@@ -264,8 +295,13 @@ impl TuiObserver {
     /// A listener registered before the notify observes it; a notify
     /// with no registered listener is dropped — which is why the
     /// app's run loop keeps one listener registered across draws
-    /// and event handling, so no mutation's wake-up is ever lost.
-    /// Never blocks either way.
+    /// and event handling. A residual window remains: a mutation
+    /// landing in the gap between a fired listener and the loop's
+    /// re-registration finds none, and its wake-up is lost — the
+    /// shared state already holds the mutation, and the caret's
+    /// blink tick forces a frame within half a second, so the cost
+    /// is a bounded render delay, never a lost update. Never
+    /// blocks either way.
     fn notify(&self) {
         self.state.render_notify.notify(1);
     }
@@ -275,9 +311,11 @@ impl TuiObserver {
     /// The call id pairs this completion with its dispatch exactly —
     /// same-tool retries and parallel calls included. The retiring
     /// entry's input summary carries forward, so the completed line
-    /// can humanize without re-deriving the call's input. The
-    /// loop-detection fingerprint and any display hint stay out of
-    /// the recorded fields.
+    /// can humanize without re-deriving the call's input, and the
+    /// dispatch-side capture — when the pipeline installed one —
+    /// rides along for the expansion. The loop-detection
+    /// fingerprint and any display hint stay out of the recorded
+    /// fields.
     pub fn finish_tool(&self, call_id: &str, name: &str, is_error: bool, duration: Duration) {
         let input_summary = {
             let mut tools = recover(&self.state.active_tools);
@@ -287,12 +325,22 @@ impl TuiObserver {
                 .map(|position| tools.remove(position).input_summary)
                 .unwrap_or_default()
         };
+        let (full_input, full_output) = {
+            let mut captures = recover(&self.state.tool_captures);
+            captures
+                .remove(call_id)
+                .map(|capture| (capture.input_json, capture.output))
+                .unwrap_or_default()
+        };
         recover(&self.state.graduations).push(Graduation::Tool(ToolResultDisplay {
             name: name.to_string(),
+            call_id: call_id.to_string(),
             is_error,
             duration,
             input_summary,
             output_preview: String::new(),
+            full_input,
+            full_output,
         }));
         self.notify();
     }

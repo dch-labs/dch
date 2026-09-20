@@ -200,9 +200,22 @@ pub struct InputEditor {
     /// Soft cap in characters; an insert admits only what fits
     /// under it.
     ///
-    /// A defense against pathological pastes — the model's own
-    /// context limit sits upstream and is not this editor's concern.
+    /// Sized so any realistic paste lands whole — a whole file, a
+    /// whole log, several of them — at a measured cost: re-wrapping
+    /// a full buffer costs tens of milliseconds per mutation
+    /// (about 55 ms at the cap, width 80, release profile), while
+    /// untouched frames pay nothing when the host caches the wrap
+    /// against the editor's stamp. The model's own context limit
+    /// sits upstream and is not this editor's concern.
     max_chars: usize,
+
+    /// Count of buffer or caret mutations, bumped by every edit and
+    /// every caret move.
+    ///
+    /// The wrap cache's invalidation key: a host that renders the
+    /// buffer re-wraps only when this moved and the width held,
+    /// so untouched frames reuse the previous grid.
+    stamp: u64,
 }
 
 impl InputEditor {
@@ -217,7 +230,8 @@ impl InputEditor {
             cursor: 0,
             history: InputHistory::default(),
             draft: None,
-            max_chars: 100_000,
+            max_chars: 2_000_000,
+            stamp: 0,
         }
     }
 
@@ -238,6 +252,28 @@ impl InputEditor {
     #[must_use]
     pub fn text_before_caret(&self) -> &str {
         self.text.get(..self.cursor).unwrap_or("")
+    }
+
+    /// The mutation stamp's current value.
+    ///
+    /// Moves on every edit and every caret move; a host caches
+    /// derived state (the wrap grid) against it and recomputes only
+    /// when it changed.
+    #[must_use]
+    pub fn stamp(&self) -> u64 {
+        self.stamp
+    }
+
+    /// Mark the editor mutated.
+    ///
+    /// The head of every mutator — an insert, a deletion, a caret
+    /// move, a history landing: whatever changes the buffer or the
+    /// caret advances the stamp, which is the whole signal a
+    /// host's cached wrap invalidates on. The addition wraps, so a
+    /// session long enough to exhaust the counter keeps the
+    /// contract (the stamp moved) without panicking.
+    fn touch(&mut self) {
+        self.stamp = self.stamp.wrapping_add(1);
     }
 
     /// Whether the buffer holds nothing.
@@ -273,6 +309,7 @@ impl InputEditor {
     /// here.
     pub fn set_text(&mut self, text: String) {
         debug_assert!(self.text.is_char_boundary(self.cursor));
+        self.touch();
         self.cursor = text.len();
         self.text = text;
     }
@@ -283,6 +320,7 @@ impl InputEditor {
     /// a stashed draft is dropped with the buffer, not restored.
     pub fn clear(&mut self) {
         debug_assert!(self.text.is_char_boundary(self.cursor));
+        self.touch();
         self.text.clear();
         self.cursor = 0;
         self.draft = None;
@@ -297,6 +335,7 @@ impl InputEditor {
     /// any stashed draft come out exactly as they went in.
     pub fn insert_str(&mut self, pasted: &str) {
         debug_assert!(self.text.is_char_boundary(self.cursor));
+        self.touch();
         let remaining = self.max_chars.saturating_sub(self.text.chars().count());
         let prefix: String = pasted.chars().take(remaining).collect();
         if prefix.is_empty() {
@@ -325,11 +364,13 @@ impl InputEditor {
     /// as the same byte as Enter, terminals on the xterm
     /// modifyOtherKeys protocol report the modifier on Enter
     /// itself, and kitty-protocol terminals report it as a
-    /// control-m — all three spellings submit. Ctrl-C is
-    /// deliberately not bound — quit and cancel own it at the app
-    /// level.
+    /// control-m — all three spellings submit. Ctrl-C stays
+    /// unbound here — the app owns it as the exit chord's first
+    /// half, clearing a non-empty buffer before a second press
+    /// quits, with Ctrl-Shift-C as the copy chord alongside.
     pub fn handle_key(&mut self, key: KeyEvent, wrap_width: u16) -> InputAction {
         debug_assert!(self.text.is_char_boundary(self.cursor));
+        self.touch();
         match (key.code, key.modifiers) {
             (KeyCode::Enter, KeyModifiers::SHIFT)
             | (KeyCode::Char('\n'), _)
@@ -448,14 +489,66 @@ impl InputEditor {
     /// caret's row always exists in the drawn area.
     #[must_use]
     pub fn display_rows(&self, width: u16) -> Vec<String> {
-        let mut rows = self.wrapped_lines(width);
-        if self
-            .cursor_cell(width)
-            .is_some_and(|(row, _)| usize::from(row) == rows.len())
-        {
+        self.display_rows_and_caret(width).0
+    }
+
+    /// The rendered rows and the caret's cell among them, from a
+    /// single wrap of the buffer.
+    ///
+    /// [`display_rows`](Self::display_rows) and
+    /// [`cursor_cell`](Self::cursor_cell) both answer from this one
+    /// pass, so a frame that needs the two — sizing, painting, the
+    /// status tag — wraps the buffer once, not once per question.
+    /// The caret's column follows the same breaks the rows use,
+    /// including the sentinel-guarded prefix and the continuation
+    /// row a final-row-filling caret appends.
+    #[must_use]
+    pub fn display_rows_and_caret(&self, width: u16) -> (Vec<String>, Option<(u16, u16)>) {
+        let cap = usize::from(width.max(1));
+        let before = self.text.get(..self.cursor).unwrap_or("");
+        let caret_line = before.matches('\n').count();
+        let caret_bytes = before.rfind('\n').map_or(self.cursor, |i| {
+            self.cursor.saturating_sub(i.saturating_add(1))
+        });
+        let mut rows: Vec<String> = Vec::new();
+        let mut caret: Option<(usize, usize)> = None;
+        let mut row: usize = 0;
+        for (index, logical) in self.text.split('\n').enumerate() {
+            if index == caret_line {
+                let prefix = logical.get(..caret_bytes).unwrap_or("");
+                // The sentinel keeps a trailing space attached through
+                // the wrap — textwrap right-trims it otherwise and the
+                // caret would report a column left of its true cell.
+                let guarded = format!("{prefix}x");
+                let partial = textwrap::wrap(&guarded, cap);
+                let row_in_line = partial.len().saturating_sub(1);
+                let column = partial
+                    .last()
+                    .map_or(0, |row| UnicodeWidthStr::width(row.as_ref()))
+                    .saturating_sub(1);
+                caret = Some((row.saturating_add(row_in_line), column));
+            }
+            let wrapped = textwrap::wrap(logical, cap);
+            if wrapped.is_empty() {
+                rows.push(String::new());
+            } else {
+                rows.extend(wrapped.into_iter().map(std::borrow::Cow::into_owned));
+            }
+            row = rows.len();
+        }
+        if rows.is_empty() {
             rows.push(String::new());
         }
-        rows
+        if caret.is_some_and(|(row, _)| row == rows.len()) {
+            rows.push(String::new());
+        }
+        let caret = caret.map(|(row, column)| {
+            (
+                u16::try_from(row).unwrap_or(u16::MAX),
+                u16::try_from(column).unwrap_or(u16::MAX),
+            )
+        });
+        (rows, caret)
     }
 
     /// The cursor's `(row, column)` within the grid
@@ -471,11 +564,7 @@ impl InputEditor {
     /// this case.
     #[must_use]
     pub fn cursor_cell(&self, width: u16) -> Option<(u16, u16)> {
-        let (row, column) = self.cell_at(self.cursor, width)?;
-        Some((
-            u16::try_from(row).unwrap_or(u16::MAX),
-            u16::try_from(column).unwrap_or(u16::MAX),
-        ))
+        self.display_rows_and_caret(width).1
     }
 
     /// The display cell a caret offset lands on, in rows and display
@@ -671,6 +760,7 @@ impl InputEditor {
     /// where a caret lands, keeping motion, clicks, and rendering in
     /// lockstep.
     pub fn move_caret_to_cell(&mut self, wrap_width: u16, row: usize, column: usize) {
+        self.touch();
         let mut boundaries: Vec<usize> = self.text.char_indices().map(|(i, _)| i).collect();
         boundaries.push(self.text.len());
         let mut lo: usize = 0;

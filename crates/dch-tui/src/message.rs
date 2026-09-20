@@ -120,6 +120,15 @@ pub enum ContentBlock {
         /// As reported by the dispatcher.
         name: String,
 
+        /// The model-issued call id.
+        ///
+        /// Keys the runtime expansion data — the full input and
+        /// output captured for this call — which outlives the block
+        /// only in memory, never in the serialized session. Empty on
+        /// blocks from sessions recorded before the field existed.
+        #[serde(default)]
+        call_id: String,
+
         /// A one-line summary of the call's input.
         ///
         /// Condensed from the full arguments.
@@ -233,6 +242,7 @@ mod tests {
                     },
                     ContentBlock::Tool {
                         name: "Read".to_string(),
+                        call_id: "call_1".to_string(),
                         input_preview: "a.rs".to_string(),
                         success: true,
                         elapsed_secs: 1.5,
@@ -266,5 +276,16 @@ mod tests {
         );
         let back: Vec<TuiMessage> = serde_json::from_str(&json).expect("the model parses back");
         assert_eq!(back, messages, "a round-trip is lossless");
+
+        let old = r#"[{"role":"assistant","blocks":[{"type":"tool","name":"Read","input_preview":"a.rs","success":true,"elapsed_secs":1.5,"output_preview":"…"}],"timestamp":"2026-09-16T12:00:00Z"}]"#;
+        let parsed: Vec<TuiMessage> =
+            serde_json::from_str(old).expect("sessions recorded before call ids parse");
+        assert!(
+            parsed.first().is_some_and(|message| matches!(message,
+                TuiMessage::Assistant { blocks, .. }
+                if blocks.iter().any(|block| matches!(block,
+                    ContentBlock::Tool { call_id, .. } if call_id.is_empty())))),
+            "a tool block without a call id defaults to empty"
+        );
     }
 }

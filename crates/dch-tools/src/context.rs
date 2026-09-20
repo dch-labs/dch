@@ -767,10 +767,13 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_resumed_read_through_an_escaping_symlink_records_nothing() {
-        // The resume re-arm resolves under the same policy as the live
-        // Read: an in-workspace symlink whose target sits outside the
-        // workspace records nothing — the baseline guard stays disarmed
-        // rather than arming on bytes outside the pinned workspace.
+        // This pins the resolve layer's refusal: the contained
+        // policy's symlink walk rejects the escape before any handle
+        // exists, which is what makes record_resumed_read return
+        // false here. The handle check that runs after the open is
+        // defense-in-depth for the swap-between-resolve-and-open
+        // window and is not deterministically reachable in a test —
+        // it cannot fail without the resolve layer also failing.
         use std::os::unix::fs::symlink;
 
         let work = tempfile::TempDir::new().unwrap();

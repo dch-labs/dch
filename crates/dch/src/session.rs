@@ -457,6 +457,7 @@ mod tests {
                         text: "reading first".to_string(),
                     },
                     ContentBlock::Tool {
+                        call_id: String::new(),
                         name: "Read".to_string(),
                         input_preview: "a.rs".to_string(),
                         success: true,

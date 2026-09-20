@@ -160,19 +160,23 @@ Conversation:
 | Mouse wheel | Scroll the transcript, one line per event |
 | Mouse drag | Select characters; the highlight stays after release and the text is copied to the clipboard. Dragging on the pane's top or bottom line scrolls the transcript with the selection |
 | Mouse click (composer) | Place the caret where the press landed, clamped to the text |
+| Mouse click (tool row) | Expand a tool call's block to its full command and output — pretty-printed input, then the (redacted) output; click any row of the open block to fold it back. Long output scrolls with the transcript. The last 256 tool calls stay expandable |
 | `Shift` + arrows | Move the selection head — extend or shrink the current selection; the view follows and each step refreshes the clipboard copy |
 | `End` | Snap to the newest line (only while the input is empty) |
 
 The mouse and selection rows need `mouse_capture = true` (the
 default): with capture off the terminal owns selection, a selection
-can never start, and the `Shift` + arrows rows do nothing.
+can never start, the `Shift` + arrows rows do nothing, and the
+click-to-expand rows below them have no path — expanding is
+mouse-only.
 
 Anywhere:
 
 | Key | Action |
 | --- | --- |
 | `F2` | Cycle tool-line verbosity (Quiet → Normal → Verbose; initial mode from `display.verbosity`) |
-| `Esc`, `Ctrl-C`, `Ctrl-D` | Quit (cancels the in-flight run; queued submissions are not started) |
+| `Ctrl-C` | With text in the composer: clear it. With an empty composer: first press arms, second press quits (cancels the in-flight run; queued submissions are not started) |
+| `Ctrl-Shift-C` | Copy the selected transcript text (where the terminal reports the modifier) |
 
 ## Configuration
 
