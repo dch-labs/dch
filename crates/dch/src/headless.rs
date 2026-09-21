@@ -614,8 +614,9 @@ pub(crate) fn load_config(path: Option<&Path>) -> Result<dch_config::DchConfig, 
 /// Apply CLI overrides to the config before agent construction.
 ///
 /// Deliberately small: `--model` is the only per-run provider override,
-/// `--theme` the only per-run display switch, and `--unsafe-paths` the
-/// only per-run access switch. Verbosity resolves separately when the
+/// `--theme` the only per-run display switch, `--unsafe-paths` the
+/// only per-run access switch, and `--permission-mode` the only
+/// per-run policy switch. Verbosity resolves separately when the
 /// observer is built. Both mode runners apply the same overrides.
 pub(crate) fn apply_cli_overrides(config: &mut dch_config::DchConfig, args: &Args) {
     if let Some(model) = &args.model {
@@ -626,6 +627,9 @@ pub(crate) fn apply_cli_overrides(config: &mut dch_config::DchConfig, args: &Arg
     }
     if args.config.unsafe_paths {
         config.runner.unsafe_paths = true;
+    }
+    if let Some(mode) = args.permission_mode {
+        config.runner.permission_mode = mode.into();
     }
 }
 
@@ -992,6 +996,27 @@ mod tests {
         let mut config = dch_config::DchConfig::default();
         apply_cli_overrides(&mut config, &parse(&[]));
         assert!(!config.runner.unsafe_paths);
+    }
+
+    #[test]
+    fn the_permission_mode_flag_overrides_the_configured_mode() {
+        let mut config = dch_config::DchConfig::default();
+        config.runner.permission_mode = dch_config::PermissionMode::Interactive;
+        apply_cli_overrides(&mut config, &parse(&["--permission-mode", "plan"]));
+        assert_eq!(
+            config.runner.permission_mode,
+            dch_config::PermissionMode::Plan,
+            "the flag beats the configured mode"
+        );
+
+        let mut config = dch_config::DchConfig::default();
+        config.runner.permission_mode = dch_config::PermissionMode::AcceptEdits;
+        apply_cli_overrides(&mut config, &parse(&[]));
+        assert_eq!(
+            config.runner.permission_mode,
+            dch_config::PermissionMode::AcceptEdits,
+            "with no flag the configured mode stands"
+        );
     }
 
     #[test]

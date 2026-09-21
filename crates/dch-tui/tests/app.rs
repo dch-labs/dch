@@ -4394,3 +4394,473 @@ fn the_gutter_stays_blank_when_the_document_fits() {
         );
     }
 }
+
+/// Stage `requests` as pending permission asks on a fresh app.
+///
+/// Returns the app, the bridge's sender half (for staging more
+/// requests mid-test), and each request's reply receiver in order.
+fn permission_app(
+    requests: &[(&str, &str)],
+) -> (
+    TuiApp,
+    tokio::sync::mpsc::UnboundedSender<dch_tui::PermissionRequest>,
+    Vec<tokio::sync::oneshot::Receiver<bool>>,
+) {
+    let mut app = app();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut receivers = Vec::new();
+    for (tool, prompt) in requests {
+        let (reply, reply_rx) = tokio::sync::oneshot::channel();
+        tx.send(dch_tui::PermissionRequest {
+            tool_name: (*tool).to_string(),
+            prompt: (*prompt).to_string(),
+            reply,
+        })
+        .expect("receiver alive");
+        receivers.push(reply_rx);
+    }
+    app.set_permission_requests(rx);
+    app.poll_permission_requests();
+    (app, tx, receivers)
+}
+
+/// The first row index whose rendered text contains `needle`.
+///
+/// Panics when `needle` is nowhere on screen — the position pins read
+/// as failures naming what failed to render.
+fn row_of(terminal: &Terminal<TestBackend>, needle: &str) -> usize {
+    let buffer = terminal.backend().buffer();
+    for y in 0..buffer.area.height {
+        let row: String = (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol().to_string())
+            .collect();
+        if row.contains(needle) {
+            return usize::from(y);
+        }
+    }
+    panic!("{needle:?} is not on screen");
+}
+
+/// Every glyph the last frame drew, row by row.
+///
+/// One line per terminal row, newline-joined, so content assertions
+/// can ask about the whole screen at once; position questions go
+/// through `row_of` instead.
+fn screen_text(terminal: &Terminal<TestBackend>) -> String {
+    let buffer = terminal.backend().buffer();
+    let mut text = String::new();
+    for y in 0..buffer.area.height {
+        for x in 0..buffer.area.width {
+            text.push_str(buffer[(x, y)].symbol());
+        }
+        text.push('\n');
+    }
+    text
+}
+
+#[test]
+fn no_terminal_cursor_while_a_permission_ask_is_pending() {
+    // The caret's blink is forced on first (any keypress resolidifies
+    // it), so the pin reads the pending ask alone.
+    let (mut app, _tx, mut replies) = permission_app(&[("Bash", "allow bash?")]);
+    assert!(!app.handle_event(&plain(KeyCode::Char('x'))));
+    assert!(
+        !app.composer_caret_visible(),
+        "the sheet owns the composer — no cursor under it"
+    );
+
+    assert!(app.handle_event(&plain(KeyCode::Char('y'))));
+    drop(replies.remove(0));
+    assert!(
+        app.composer_caret_visible(),
+        "the caret returns once the ask is answered"
+    );
+}
+
+#[test]
+fn the_permission_sheet_sits_over_the_prompt_box() {
+    let (mut app, _tx, _replies) = permission_app(&[("Bash", "allow bash?")]);
+    app.push_message(TuiMessage::User {
+        text: "top of the conversation".to_string(),
+        timestamp: chrono::Utc::now(),
+    });
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let title_row = row_of(&terminal, "Permission required");
+    let message_row = row_of(&terminal, "top of the conversation");
+    assert!(
+        message_row < title_row,
+        "the conversation must stay visible above the sheet ({message_row} vs {title_row})"
+    );
+    assert!(
+        title_row >= 30 - 2 - 7,
+        "the sheet must sit in the prompt-box region, not mid-conversation ({title_row})"
+    );
+    let status_row = row_of(&terminal, "CTX:");
+    assert!(
+        status_row > title_row,
+        "the status bar must stay visible below the sheet ({status_row} vs {title_row})"
+    );
+}
+
+#[test]
+fn a_pending_permission_request_renders_the_overlay() {
+    let (mut app, _tx, _replies) =
+        permission_app(&[("Bash", "Allow 'Bash' (ShellExecute) in AcceptEdits mode?")]);
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let screen = screen_text(&terminal);
+    assert!(
+        screen.contains("Permission required"),
+        "the overlay's title must render: {screen}"
+    );
+    assert!(
+        screen.contains("Allow 'Bash' (ShellExecute) in AcceptEdits mode?"),
+        "the gate's prompt must render: {screen}"
+    );
+    assert!(
+        screen.contains("[y] allow"),
+        "the key hints must render: {screen}"
+    );
+}
+
+#[test]
+fn y_and_enter_allow_the_pending_request() {
+    let (mut app, _tx, mut replies) = permission_app(&[("Bash", "allow bash?")]);
+    assert!(app.handle_event(&plain(KeyCode::Char('y'))));
+    assert_eq!(
+        replies.pop().expect("one reply staged").blocking_recv(),
+        Ok(true),
+        "'y' must answer the ask with allow"
+    );
+
+    let (mut app, _tx, mut replies) = permission_app(&[("Bash", "again?")]);
+    assert!(app.handle_event(&plain(KeyCode::Enter)));
+    assert_eq!(
+        replies.remove(0).blocking_recv(),
+        Ok(true),
+        "Enter must answer the ask with allow"
+    );
+}
+
+#[test]
+fn n_and_esc_deny_the_pending_request() {
+    let (mut app, _tx, mut replies) = permission_app(&[("Bash", "allow bash?")]);
+    assert!(app.handle_event(&plain(KeyCode::Char('n'))));
+    assert_eq!(
+        replies.pop().expect("one reply staged").blocking_recv(),
+        Ok(false),
+        "'n' must answer the ask with deny"
+    );
+
+    let (mut app, _tx, mut replies) = permission_app(&[("Bash", "allow bash?")]);
+    assert!(app.handle_event(&plain(KeyCode::Esc)));
+    assert_eq!(
+        replies.pop().expect("one reply staged").blocking_recv(),
+        Ok(false),
+        "Esc must answer the ask with deny"
+    );
+}
+
+#[test]
+fn other_keys_are_inert_while_a_request_is_pending() {
+    // The draft is written before the prompt lands, so the pins below
+    // distinguish prompt ownership from an empty composer's no-submit.
+    let mut app = app();
+    for c in ['d', 'r', 'a', 'f', 't'] {
+        app.handle_event(&plain(KeyCode::Char(c)));
+    }
+    assert_eq!(app.input(), "draft", "the draft is written before the ask");
+
+    let (requests_tx, requests_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (reply, reply_rx) = tokio::sync::oneshot::channel();
+    requests_tx
+        .send(dch_tui::PermissionRequest {
+            tool_name: "Bash".to_string(),
+            prompt: "allow bash?".to_string(),
+            reply,
+        })
+        .expect("receiver alive");
+    app.set_permission_requests(requests_rx);
+    app.poll_permission_requests();
+
+    assert!(
+        !app.handle_event(&plain(KeyCode::Char('x'))),
+        "a swallowed key asks for no redraw"
+    );
+    assert_eq!(
+        app.input(),
+        "draft",
+        "the composer must not take keystrokes while a prompt is up"
+    );
+
+    let (submit_tx, mut submit_rx) = tokio::sync::mpsc::unbounded_channel();
+    app.set_submit_tx(submit_tx);
+    assert!(app.handle_event(&plain(KeyCode::Enter)));
+    assert_eq!(
+        reply_rx.blocking_recv(),
+        Ok(true),
+        "Enter belongs to the prompt, allowing the ask"
+    );
+    assert!(
+        submit_rx.try_recv().is_err(),
+        "Enter must not submit a drafted composer while a prompt is up"
+    );
+    assert_eq!(
+        app.input(),
+        "draft",
+        "the draft survives the prompt untouched"
+    );
+}
+
+#[test]
+fn queued_requests_render_front_first() {
+    let (mut app, _tx, mut replies) = permission_app(&[
+        ("Bash", "Allow the first ask?"),
+        ("WebFetch", "Allow the second ask?"),
+    ]);
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let screen = screen_text(&terminal);
+    assert!(
+        screen.contains("Allow the first ask?") && !screen.contains("Allow the second ask?"),
+        "only the front of the queue renders: {screen}"
+    );
+    assert!(
+        screen.contains("1 more waiting"),
+        "the overlay must count what waits behind: {screen}"
+    );
+
+    assert!(app.handle_event(&plain(KeyCode::Char('y'))));
+    assert_eq!(
+        replies.remove(0).blocking_recv(),
+        Ok(true),
+        "the keypress answers the front request only"
+    );
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let screen = screen_text(&terminal);
+    assert!(
+        screen.contains("Allow the second ask?"),
+        "resolving the front reveals the next: {screen}"
+    );
+}
+
+#[test]
+fn run_end_clears_pending_requests() {
+    let (mut app, _tx, replies) = permission_app(&[
+        ("Bash", "Allow the first ask?"),
+        ("WebFetch", "Allow the second ask?"),
+    ]);
+    assert!(
+        app.tick_wake(std::time::Instant::now()),
+        "retiring prompts on an idle agent must request a redraw"
+    );
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let screen = screen_text(&terminal);
+    assert!(
+        !screen.contains("Allow the first ask?") && !screen.contains("Permission required"),
+        "no overlay survives the run's end: {screen}"
+    );
+    for reply in replies {
+        assert!(
+            reply.blocking_recv().is_err(),
+            "a retired request's reply channel must close, reading as a denial"
+        );
+    }
+}
+
+#[test]
+fn a_long_prompt_wraps_without_hiding_the_hints() {
+    // Long enough to need more rows than the overlay's cap, the way a
+    // long MCP tool name inside the gate's question can.
+    let prompt = format!(
+        "Allow '{}' (Unclassified) in AcceptEdits mode? And some more question \
+text so the string runs well past three wrapped rows of overlay body \
+and would push the hints out of a fixed-height box.",
+        "server__create_pull_request_review_from_template"
+    );
+    let (mut app, _tx, _replies) = permission_app(&[("WebFetch", prompt.as_str())]);
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let screen = screen_text(&terminal);
+    assert!(
+        screen.contains("[y] allow"),
+        "the hints must stay visible under a wrapping prompt: {screen}"
+    );
+    assert!(
+        screen.contains('…'),
+        "an over-long prompt is ellipsized, not hidden: {screen}"
+    );
+
+    // Narrow terminals re-wrap at their own inner width instead of
+    // re-flowing rows wrapped for a wider box: the prompt ellipsizes
+    // further and the keys stay on screen at mid and sub-hints widths.
+    for (width, height) in [(50u16, 30u16), (24, 20)] {
+        let (mut app, _tx, _replies) = permission_app(&[("WebFetch", prompt.as_str())]);
+        let terminal = render_to_buffer(&mut app, width, height);
+        let screen = screen_text(&terminal);
+        assert!(
+            screen.contains("[y] allow"),
+            "at {width}×{height} the keys must stay visible: {screen}"
+        );
+        assert!(
+            screen.contains("[n] deny"),
+            "at {width}×{height} the deny key must stay visible too: {screen}"
+        );
+        assert!(
+            screen.contains('…'),
+            "at {width}×{height} the prompt is ellipsized, not hidden: {screen}"
+        );
+    }
+}
+
+#[test]
+fn a_paste_behind_a_pending_prompt_lands_nowhere() {
+    let (mut app, _tx, _replies) = permission_app(&[("Bash", "allow bash?")]);
+    assert!(app.handle_event(&Event::Paste("pasted behind the overlay".to_string())));
+    assert_eq!(
+        app.input(),
+        "",
+        "a paste while a prompt is up must not reach the composer"
+    );
+
+    assert!(app.handle_event(&plain(KeyCode::Char('y'))));
+    assert!(app.handle_event(&Event::Paste("after".to_string())));
+    assert_eq!(
+        app.input(),
+        "after",
+        "with the prompt gone, paste reaches the composer again"
+    );
+}
+
+#[test]
+fn control_chords_stay_inert_behind_a_pending_prompt() {
+    // The composer's own control chords — Ctrl-Enter and Ctrl-M submit,
+    // Ctrl-W deletes a word — must not reach the hidden draft under the
+    // overlay; a natural confirm reflex must neither approve the ask
+    // nor consume the draft.
+    let mut app = app();
+    for c in ['d', 'r', 'a', 'f', 't'] {
+        app.handle_event(&plain(KeyCode::Char(c)));
+    }
+    assert_eq!(app.input(), "draft", "the draft is written before the ask");
+
+    let (submit_tx, mut submit_rx) = tokio::sync::mpsc::unbounded_channel();
+    app.set_submit_tx(submit_tx);
+    let (requests_tx, requests_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (reply, reply_rx) = tokio::sync::oneshot::channel();
+    requests_tx
+        .send(dch_tui::PermissionRequest {
+            tool_name: "Bash".to_string(),
+            prompt: "allow bash?".to_string(),
+            reply,
+        })
+        .expect("receiver alive");
+    app.set_permission_requests(requests_rx);
+    app.poll_permission_requests();
+
+    for chord in [
+        (KeyCode::Enter, KeyModifiers::CONTROL),
+        (KeyCode::Char('m'), KeyModifiers::CONTROL),
+        (KeyCode::Char('w'), KeyModifiers::CONTROL),
+    ] {
+        assert!(
+            !app.handle_event(&key(chord.0, chord.1)),
+            "{chord:?} is swallowed behind the prompt, redrawing nothing"
+        );
+    }
+    assert!(
+        submit_rx.try_recv().is_err(),
+        "no chord submitted the draft behind the overlay"
+    );
+    assert_eq!(app.input(), "draft", "no chord edited the draft");
+
+    assert!(app.handle_event(&plain(KeyCode::Char('y'))));
+    assert_eq!(
+        reply_rx.blocking_recv(),
+        Ok(true),
+        "the prompt still answers after the chords"
+    );
+}
+
+#[test]
+fn modifier_decorated_keys_do_not_answer_the_prompt() {
+    let (mut app, _tx, mut replies) = permission_app(&[("Bash", "allow bash?")]);
+    let mut reply = replies.remove(0);
+    assert!(!app.handle_event(&key(KeyCode::Char('y'), KeyModifiers::ALT)));
+    assert!(reply.try_recv().is_err(), "Alt+y must not answer the ask");
+    assert!(!app.handle_event(&key(KeyCode::Enter, KeyModifiers::ALT)));
+    assert!(
+        reply.try_recv().is_err(),
+        "Alt+Enter must not answer either"
+    );
+    assert!(app.handle_event(&plain(KeyCode::Char('y'))));
+    assert_eq!(
+        reply.blocking_recv(),
+        Ok(true),
+        "the plain key still answers"
+    );
+}
+
+#[test]
+fn ctrl_c_under_a_pending_prompt_serves_the_run_as_ever() {
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    let running = Arc::clone(&kept.agent_running);
+    running.store(true, std::sync::atomic::Ordering::SeqCst);
+    let cancels: Arc<std::sync::Mutex<Vec<()>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&cancels);
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    app.set_run_canceller(Box::new(move || {
+        sink.lock().expect("sink").push(());
+    }));
+
+    // A draft written while the run is in flight, before the ask
+    // lands — the chord's first press must clear it, cancel comes on
+    // the second, exactly as without a prompt.
+    for c in ['n', 'o', 't', 'e'] {
+        app.handle_event(&plain(KeyCode::Char(c)));
+    }
+    assert_eq!(app.input(), "note", "the draft predates the ask");
+
+    let (requests_tx, requests_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (reply, _reply_rx) = tokio::sync::oneshot::channel();
+    requests_tx
+        .send(dch_tui::PermissionRequest {
+            tool_name: "Bash".to_string(),
+            prompt: "allow bash?".to_string(),
+            reply,
+        })
+        .expect("receiver alive");
+    app.set_permission_requests(requests_rx);
+    app.poll_permission_requests();
+
+    assert!(app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+    assert_eq!(
+        cancels.lock().expect("sink").len(),
+        0,
+        "the first press clears the draft, cancelling nothing"
+    );
+    assert_eq!(app.input(), "", "the draft is gone");
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    assert!(
+        screen_text(&terminal).contains("allow bash?"),
+        "the prompt stays up for the second press"
+    );
+
+    assert!(app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+    assert_eq!(
+        cancels.lock().expect("sink").len(),
+        1,
+        "the second press passes through the prompt and cancels the run"
+    );
+    assert!(!app.is_quitting(), "a cancel never quits");
+
+    running.store(false, std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        app.tick_wake(std::time::Instant::now()),
+        "the run's landing retires the prompt with a redraw"
+    );
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    assert!(
+        !screen_text(&terminal).contains("Permission required"),
+        "no prompt outlives its run"
+    );
+}

@@ -11,6 +11,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use dch_tui::PermissionRequest;
 use dch_tui::TuiMessage;
 use dch_tui::{TerminalGuard, TuiApp, TuiObserverState};
 use tokio::sync::mpsc;
@@ -87,11 +88,13 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
         tokens.cumulative_input = outcome.tokens.cumulative_input;
         tokens.cumulative_output = outcome.tokens.cumulative_output;
     }
+    let (permission_resolver, permission_rx) = permission_bridge();
     let mut builder = dch_loop::Runner::builder(&config, &workdir)
         .with_observer(Arc::new(observer) as Arc<dyn loopctl::observer::LoopObserver>)
         .with_middleware(Arc::new(dch_tui::CapturingMiddleware::new(Arc::clone(
             &state.tool_captures,
-        ))));
+        ))))
+        .with_permission_resolver(permission_resolver);
     if let ResumeControl::Resumed(outcome) = &control {
         builder = builder.with_history(crate::resume::tui_messages_to_loopctl(
             &outcome.messages,
@@ -117,6 +120,7 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
     let mouse_capture = config.display.mouse_capture;
     let mut app = TuiApp::from_observer_state(config, state.clone());
     app.set_submit_tx(submit_tx);
+    app.set_permission_requests(permission_rx);
 
     // Seed the display from the control — the restored transcript, or
     // the note that a resume degraded to this fresh session — and take
@@ -418,6 +422,37 @@ impl Drop for TranscriptWorker {
             drop(handle.join());
         }
     }
+}
+
+/// Bridge the runner's permission gate to the app's overlay.
+///
+/// Returns the resolver the runner's `Ask` cells consult and the
+/// receiver end of the channel the resolver hands requests to: each
+/// consultation creates a oneshot reply, ships the request to the UI,
+/// and awaits the answer — a dropped request or a closed channel
+/// reads as a denial, and the gate itself races the run's cancel
+/// signal so a cancelled prompt never waits on the UI.
+fn permission_bridge() -> (
+    loopctl::middleware::AskResolverFn,
+    mpsc::UnboundedReceiver<PermissionRequest>,
+) {
+    let (requests_tx, requests_rx) = mpsc::unbounded_channel();
+    let resolver: loopctl::middleware::AskResolverFn = Arc::new(move |prompt: &str, tool: &str| {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let sent = requests_tx.send(PermissionRequest {
+            tool_name: tool.to_string(),
+            prompt: prompt.to_string(),
+            reply: reply_tx,
+        });
+        Box::pin(async move {
+            if sent.is_ok() {
+                reply_rx.await.unwrap_or(false)
+            } else {
+                false
+            }
+        })
+    });
+    (resolver, requests_rx)
 }
 
 /// Execute submitted tasks one at a time until the session ends.
@@ -922,5 +957,41 @@ mod tests {
             !path.exists(),
             "a dropped worker must not leave a writer behind to consume a late publish"
         );
+    }
+
+    #[tokio::test]
+    async fn the_bridge_delivers_requests_and_replies() {
+        let (resolver, mut requests_rx) = permission_bridge();
+        let pending = resolver("Allow 'Bash' (ShellExecute) in AcceptEdits mode?", "Bash");
+        let request = tokio::time::timeout(std::time::Duration::from_secs(1), requests_rx.recv())
+            .await
+            .expect("the request arrives")
+            .expect("the channel is open");
+        assert_eq!(request.tool_name, "Bash");
+        assert!(
+            request.prompt.contains("Bash") && request.prompt.contains("AcceptEdits"),
+            "the request carries the gate's prompt: {}",
+            request.prompt
+        );
+        request.reply.send(true).expect("the reply channel is live");
+        let answered = tokio::time::timeout(std::time::Duration::from_secs(1), pending)
+            .await
+            .expect("the resolver future settles once replied");
+        assert!(answered, "a reply of true resolves the ask as allow");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_request_resolves_as_a_denial() {
+        let (resolver, mut requests_rx) = permission_bridge();
+        let pending = resolver("Allow 'Bash'?", "Bash");
+        let request = tokio::time::timeout(std::time::Duration::from_secs(1), requests_rx.recv())
+            .await
+            .expect("the request arrives")
+            .expect("the channel is open");
+        drop(request);
+        let answered = tokio::time::timeout(std::time::Duration::from_secs(1), pending)
+            .await
+            .expect("a dropped request still settles the resolver");
+        assert!(!answered, "an unanswered request reads as a denial");
     }
 }

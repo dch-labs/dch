@@ -4,6 +4,7 @@
 
 pub mod console_observer;
 pub mod error;
+pub mod permission;
 pub mod project;
 pub mod prompt;
 pub mod provider;
@@ -13,6 +14,7 @@ pub use console_observer::ConsoleObserver;
 pub use dch_config::Verbosity;
 pub use dch_config::{ApiConfig, ApiType, DchConfigError, TechProfile};
 pub use error::RunnerError;
+pub use permission::permission_layer;
 pub use project::MessageAnalysis;
 pub use project::analyze_message;
 pub use project::detect_tech_stack;

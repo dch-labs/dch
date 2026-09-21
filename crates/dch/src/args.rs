@@ -172,6 +172,65 @@ pub struct Args {
         help_heading = "Mode"
     )]
     pub done_file: Option<PathBuf>,
+
+    /// Override the configured permission mode for this run.
+    ///
+    /// Sets how the permission gate treats side-effecting tools:
+    /// `auto` runs everything, `plan` allows read-only tools and blocks
+    /// the rest, `accept-edits` additionally auto-applies file edits,
+    /// and `interactive` asks before every action, reads included. The
+    /// TUI asks through an approval overlay; a headless run denies
+    /// whatever it cannot ask about. Overrides
+    /// `[runner] permission_mode`; without the flag the configured
+    /// value (default `auto`) stands.
+    #[arg(long, value_name = "MODE", value_enum, help_heading = "Mode")]
+    pub permission_mode: Option<CliPermissionMode>,
+}
+
+/// The `--permission-mode` value set, mapped onto the config mode.
+///
+/// A CLI-side enum so clap stays out of dch-config; the names are the
+/// kebab-case spellings of the config's `snake_case` values, and the
+/// mapping to [`dch_config::PermissionMode`] is variant-for-variant.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CliPermissionMode {
+    /// Run every side-effecting action without confirmation.
+    ///
+    /// The default posture when nothing overrides it: reads, edits,
+    /// shell, network, and unknown tools all execute as asked.
+    Auto,
+
+    /// Allow read-only tools; block every other category.
+    ///
+    /// The explore-only mode — writes, shell, network, meta, and
+    /// unknown tools come back to the model as denials naming this
+    /// mode, so it plans instead of acting.
+    Plan,
+
+    /// Allow file edits too; ask before the rest.
+    ///
+    /// Reads and edits run without interruption; shell, network,
+    /// meta, and unknown tools prompt, and each answer allows or
+    /// denies that one call.
+    AcceptEdits,
+
+    /// Ask before every action, reads included.
+    ///
+    /// The most conservative mode: every tool call waits on its own
+    /// approval, so nothing runs the user has not personally
+    /// released.
+    Interactive,
+}
+
+impl From<CliPermissionMode> for dch_config::PermissionMode {
+    fn from(mode: CliPermissionMode) -> Self {
+        match mode {
+            CliPermissionMode::Auto => Self::Auto,
+            CliPermissionMode::Plan => Self::Plan,
+            CliPermissionMode::AcceptEdits => Self::AcceptEdits,
+            CliPermissionMode::Interactive => Self::Interactive,
+        }
+    }
 }
 
 /// The config-facing switches, flattened into [`Args`].
@@ -437,6 +496,7 @@ mod tests {
             "--verbose",
             "--quiet",
             "--done-file",
+            "--permission-mode",
             "--version",
         ] {
             assert!(help.contains(flag), "help must mention {flag}:\n{help}");
@@ -450,6 +510,45 @@ mod tests {
         assert!(
             err.render().to_string().contains(env!("CARGO_PKG_VERSION")),
             "version output must carry the crate version: {err}"
+        );
+    }
+
+    #[test]
+    fn permission_mode_parses_all_four_values() {
+        assert_eq!(
+            parse(&["--permission-mode", "auto"])
+                .unwrap()
+                .permission_mode,
+            Some(CliPermissionMode::Auto)
+        );
+        assert_eq!(
+            parse(&["--permission-mode", "plan"])
+                .unwrap()
+                .permission_mode,
+            Some(CliPermissionMode::Plan)
+        );
+        assert_eq!(
+            parse(&["--permission-mode", "accept-edits"])
+                .unwrap()
+                .permission_mode,
+            Some(CliPermissionMode::AcceptEdits)
+        );
+        assert_eq!(
+            parse(&["--permission-mode", "interactive"])
+                .unwrap()
+                .permission_mode,
+            Some(CliPermissionMode::Interactive)
+        );
+        assert_eq!(parse(&[]).unwrap().permission_mode, None);
+    }
+
+    #[test]
+    fn permission_mode_rejects_unknown_values() {
+        let err = parse(&["--permission-mode", "yolo"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidValue);
+        assert!(
+            err.render().to_string().contains("accept-edits"),
+            "the error must list the valid spellings: {err}"
         );
     }
 }
