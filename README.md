@@ -194,6 +194,36 @@ Anywhere:
 | `Ctrl-C` | While a run is in flight: with text in the composer, clear it first; with an empty composer, cancel the run (submissions queued behind it are dropped). Otherwise: with text, clear it; with an empty composer, first press arms, second press quits |
 | `Ctrl-Shift-C` | Copy the selected transcript text (where the terminal reports the modifier) |
 
+While a permission prompt is on screen (see
+[Permissions](#permissions)), the prompt owns the keyboard:
+
+| Key | Action |
+| --- | --- |
+| `y` | Allow the pending tool call |
+| `Enter` | Swallowed — a queued submit press never lands as an approval |
+| `n` / `Esc` | Deny it |
+| `Ctrl-C` | Serves the run as ever — a draft clears first, then the press cancels the run; the cancelled prompt denies itself |
+
+## Permissions
+
+How aggressively the agent may act is a mode, set by
+`[runner] permission_mode` (default `auto`) or per-run with
+`--permission-mode <auto|plan|accept-edits|interactive>`:
+
+| Mode | Behavior |
+| --- | --- |
+| `auto` | Runs everything without confirmation |
+| `plan` | Read-only tools run; writes, shell, network, and meta tools are blocked |
+| `accept-edits` | Reads and file edits run; shell, network, and meta tools prompt |
+| `interactive` | Every tool prompts, reads included |
+
+In the TUI a prompt renders as a sheet over the prompt box,
+answered with `y`/`n` (see
+the key tables above); a headless run denies whatever it cannot ask
+about, so `plan` and `accept-edits` stay meaningful there too. Unknown
+tool names fail closed: only `auto` runs them without confirmation —
+every other mode asks or blocks.
+
 ## Configuration
 
 Configuration lives in `~/.dch/config.toml`; a
@@ -216,6 +246,7 @@ model = "qwen3.8:27b"
 [runner]
 max_turns = 200
 role = "general"                  # general | coding | refactor | debug | review | docs | tests
+# permission_mode = "auto"        # auto | plan | accept_edits | interactive (see Permissions)
 
 [display]
 theme = "transparent"
@@ -268,9 +299,9 @@ history, paste, and mouse-wheel scrolling, session auto-save (every
 completed turn is persisted under `~/.dch/sessions/`), session resume
 and listing (`--resume` / `--list-sessions`), single-run
 mode with exit codes and done-files, the tool set above, MCP
-attachment, roles, fallback models, signal handling. Not implemented
-yet: permission prompting (tools run without
-confirmation — treat `bash` accordingly).
+attachment, roles, fallback models, permission gating (mode ×
+category enforcement with the TUI approval overlay and
+`--permission-mode`), signal handling.
 
 ## License
 

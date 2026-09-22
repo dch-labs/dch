@@ -1270,4 +1270,144 @@ mod tests {
             "hello\n"
         );
     }
+
+    #[tokio::test]
+    async fn a_rewrite_without_an_intervening_read_is_not_a_conflict() {
+        // The guard exists for external changes, not the writer's own: a
+        // successful write records the post-write content, so the next
+        // write to the same file compares against what this session put
+        // there and sails through without a fresh Read.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("note.txt");
+        std::fs::write(&target, "original\n").unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let ctx = ctx_in(cwd);
+
+        let read = crate::read::ReadInput::default();
+        read.call(json!({ "file_path": "note.txt" }), &ctx)
+            .await
+            .unwrap();
+
+        let tool = WriteInput::default();
+        let first = tool
+            .call(json!({ "file_path": "note.txt", "content": "v1\n" }), &ctx)
+            .await
+            .unwrap();
+        assert!(!first.is_error, "{}", first.text_content());
+        let second = tool
+            .call(json!({ "file_path": "note.txt", "content": "v2\n" }), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            !second.is_error,
+            "the model's own write must not register as a later external change: {}",
+            second.text_content()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "v2\n",
+            "the rewrite lands"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_external_revert_back_to_the_read_bytes_rearms_the_write() {
+        // A refusal leaves the recorded baseline untouched, so the guard
+        // passes again the moment the disk returns to the bytes the model
+        // observed — the check compares content, not history.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("note.txt");
+        std::fs::write(&target, "original\n").unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let ctx = ctx_in(cwd);
+
+        let read = crate::read::ReadInput::default();
+        read.call(json!({ "file_path": "note.txt" }), &ctx)
+            .await
+            .unwrap();
+
+        std::fs::write(&target, "EXTERNAL\n").unwrap();
+        let tool = WriteInput::default();
+        let refused = tool
+            .call(
+                json!({ "file_path": "note.txt", "content": "clobber\n" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(refused.is_error, "{}", refused.text_content());
+
+        std::fs::write(&target, "original\n").unwrap();
+        let allowed = tool
+            .call(
+                json!({ "file_path": "note.txt", "content": "rewritten\n" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !allowed.is_error,
+            "a reverted file matches the observed bytes again: {}",
+            allowed.text_content()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "rewritten\n",
+            "the write lands after the revert"
+        );
+    }
+
+    #[tokio::test]
+    async fn relative_and_absolute_spellings_meet_at_one_baseline() {
+        // Both spellings resolve to the same contained path, so a Read
+        // through the relative spelling arms the guard an absolute-spelled
+        // Write consults — and refuses exactly as the relative spelling
+        // would.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target = tmp.path().join("note.txt");
+        std::fs::write(&target, "original\n").unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let ctx = ctx_in(cwd);
+
+        let read = crate::read::ReadInput::default();
+        read.call(json!({ "file_path": "note.txt" }), &ctx)
+            .await
+            .unwrap();
+
+        std::fs::write(&target, "EXTERNAL\n").unwrap();
+        let absolute = target.to_str().unwrap();
+        let tool = WriteInput::default();
+        let refused = tool
+            .call(
+                json!({ "file_path": absolute, "content": "clobber\n" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            refused.is_error,
+            "the changed file must refuse through either spelling: {}",
+            refused.text_content()
+        );
+        assert!(refused.text_content().contains("changed on disk"));
+
+        std::fs::write(&target, "original\n").unwrap();
+        let allowed = tool
+            .call(
+                json!({ "file_path": absolute, "content": "rewritten\n" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !allowed.is_error,
+            "the matching file must pass through either spelling: {}",
+            allowed.text_content()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "rewritten\n",
+            "the write lands through the absolute spelling"
+        );
+    }
 }

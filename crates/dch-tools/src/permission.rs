@@ -4,8 +4,9 @@
 //! The permission system classifies every tool into a [`ToolCategory`], and
 //! resolves a [`PermissionMode`] × category pair into a [`PermissionOutcome`]
 //! through [`decide`]. Both halves are pure and synchronous; the prompting
-//! I/O belongs to the enforcement hook that will consume them, which turns
-//! [`Ask`](PermissionOutcome::Ask) into a question for the user.
+//! I/O belongs to the enforcement layer that consumes them, which turns
+//! [`Ask`](PermissionOutcome::Ask) into a prompt for the user — or a denial
+//! when no one is there to ask.
 
 use tracing::warn;
 
@@ -83,8 +84,9 @@ pub enum ToolCategory {
     /// Mutates session or workflow state.
     ///
     /// `TodoWrite` replaces the shared todo list, `Submit` produces a patch
-    /// and may run tests, and `AskUserQuestion` blocks for user input. Never
-    /// read-only: the side-effects are at the session level, not the
+    /// and may run tests, `AskUserQuestion` blocks for user input, and
+    /// `Jobs` manages the background-job table — `cleanup_jobs` mutates it.
+    /// Never read-only: the side-effects are at the session level, not the
     /// filesystem, which is exactly why they evade file-based checks.
     Meta,
 
@@ -131,7 +133,7 @@ pub fn tool_category(name: &str) -> ToolCategory {
         "Write" | "Edit" | "MultiEdit" => ToolCategory::FileWrite,
         "Bash" => ToolCategory::ShellExecute,
         "WebFetch" => ToolCategory::Network,
-        "TodoWrite" | "Submit" | "AskUserQuestion" => ToolCategory::Meta,
+        "TodoWrite" | "Submit" | "AskUserQuestion" | "Jobs" => ToolCategory::Meta,
         _ => {
             warn!(tool = %name, "unclassified tool — failing closed");
             ToolCategory::Unclassified
@@ -142,9 +144,9 @@ pub fn tool_category(name: &str) -> ToolCategory {
 /// The synchronous decision for a given (mode, category) pair, reached
 /// before any user prompting.
 ///
-/// [`Ask`](PermissionOutcome::Ask) routes through the question channel; a
-/// headless host has no channel, so it becomes a block rather than a prompt
-/// that will never come.
+/// [`Ask`](PermissionOutcome::Ask) resolves through the enforcement
+/// layer's prompt resolver; a host that supplies no resolver (headless)
+/// sees it become a denial rather than a prompt that will never come.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermissionOutcome {
     /// Run the tool without confirmation.
@@ -160,8 +162,10 @@ pub enum PermissionOutcome {
 
     /// Ask the user before running the tool.
     ///
-    /// The consumer is expected to route through the question channel; a
-    /// host that cannot ask (headless) converts this outcome into a block.
+    /// The consumer is expected to resolve it through its prompt
+    /// resolver — running the tool on approval, denying on refusal; a
+    /// host that cannot ask (headless) converts this outcome into a
+    /// denial.
     Ask,
 }
 
@@ -214,6 +218,7 @@ mod tests {
         ("Edit", ToolCategory::FileWrite),
         ("MultiEdit", ToolCategory::FileWrite),
         ("Bash", ToolCategory::ShellExecute),
+        ("Jobs", ToolCategory::Meta),
         ("FileViewer", ToolCategory::FileRead),
         ("Glob", ToolCategory::FileRead),
         ("Grep", ToolCategory::FileRead),

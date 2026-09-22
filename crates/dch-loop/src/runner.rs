@@ -17,8 +17,8 @@
 //!   can all observe the same run.
 //! - **Middleware** ([`ToolMiddleware`]) — intercepts every tool dispatch
 //!   and may rewrite the context, the output, or the control flow. This is
-//!   where the runner installs its context injector and (unless disabled)
-//!   the secrets-redaction pass.
+//!   where the runner installs its context injector, the permission gate,
+//!   and (unless disabled) the secrets-redaction pass.
 //!
 //! Tools reach per-call state (the working directory, the todo list, the
 //! optional question channel) through a [`RunnerContext`] extension. The
@@ -50,6 +50,8 @@ use loopctl::mcp::CommandSpec;
 use loopctl::mcp::McpClient;
 use loopctl::mcp::McpToolProvider;
 use loopctl::message::Message;
+use loopctl::middleware::AskResolverFn;
+use loopctl::middleware::PermissionMiddleware;
 use loopctl::middleware::RedactingMiddleware;
 use loopctl::middleware::SecretPatternSet;
 use loopctl::middleware::ToolDispatchContext;
@@ -63,6 +65,8 @@ use crate::DchClient;
 use crate::RunnerError;
 use crate::detect_tech_stack;
 use crate::merge_by_language;
+use crate::permission::permission_layer;
+use crate::permission::tools_mode;
 use crate::with_context;
 
 /// The top-level agent: the single type the rest of the application holds.
@@ -132,6 +136,7 @@ impl Runner {
             middleware: Vec::new(),
             mcp_providers: Vec::new(),
             history: Vec::new(),
+            permission_resolver: None,
         }
     }
 
@@ -341,6 +346,15 @@ pub struct RunnerBuilder<'a> {
     /// [`RunnerBuilder::with_history`]); a `run` on the built runner
     /// continues from the restored point instead of an empty history.
     history: Vec<Message>,
+
+    /// Optional async resolver for the permission gate's `Ask` verdicts.
+    ///
+    /// Interactive hosts (the TUI) supply one so `Ask` cells prompt the
+    /// user; without it the gate denies asks outright, which is the
+    /// headless contract. The resolver runs on the dispatch task, so it
+    /// must not block — and a pending resolution races the run's cancel
+    /// signal, so a cancelled run denies rather than waits.
+    permission_resolver: Option<AskResolverFn>,
 }
 
 impl RunnerBuilder<'_> {
@@ -402,15 +416,29 @@ impl RunnerBuilder<'_> {
         self
     }
 
+    /// Register the resolver the permission gate consults on `Ask`.
+    ///
+    /// The gate is always installed — it enforces the configured
+    /// `[runner] permission_mode` matrix on every dispatch; the
+    /// resolver decides what an `Ask` cell does. Without one, `Ask`
+    /// denies (headless); with one, the resolver's `bool` answer
+    /// allows or denies the call. The same resolver serves every run
+    /// of the built runner.
+    #[must_use]
+    pub fn with_permission_resolver(mut self, resolver: AskResolverFn) -> Self {
+        self.permission_resolver = Some(resolver);
+        self
+    }
+
     /// Assemble the [`Runner`].
     ///
     /// Constructs the provider client, composes the system prompt (role,
     /// tech stack detected under the workdir merged with `[project]`
     /// overrides, per-tool fragments), builds the dispatch pipeline
-    /// (context injector → host middleware → secrets redaction when enabled
-    /// → builtin tools), and — when `api.fallback_model` is configured —
-    /// arms the model fallback breaker so a failing primary is routed
-    /// around automatically.
+    /// (context injector → permission gate → host middleware → secrets
+    /// redaction when enabled → builtin tools), and — when
+    /// `api.fallback_model` is configured — arms the model fallback
+    /// breaker so a failing primary is routed around automatically.
     ///
     /// # Errors
     ///
@@ -445,9 +473,14 @@ impl RunnerBuilder<'_> {
             managers =
                 managers.with_fallback(arm_fallback(&self.config.api.model, fallback_model)?);
         }
+        let gate = permission_layer(
+            tools_mode(self.config.runner.permission_mode),
+            self.permission_resolver,
+        );
         managers.set_pipeline(build_pipeline(
             &context,
             &self.middleware,
+            gate,
             self.config.security.redact_secrets,
             core_registry,
         )?);
@@ -651,12 +684,15 @@ fn build_session(
     session_config
 }
 
-/// Build the dispatch pipeline with the [`ContextInjector`] installed.
+/// Build the dispatch pipeline with the [`ContextInjector`] and the
+/// permission gate installed.
 ///
 /// Layering, outermost first: the context injector (every layer below — and
-/// the tool — sees the enriched context), the host middleware in
+/// the tool — sees the enriched context), the permission gate (denials
+/// short-circuit before any host work), the host middleware in
 /// registration order, the secrets-redaction pass when `redact` is set
-/// (everything above observes scrubbed output), and the builtin-tool core.
+/// (everything above observes scrubbed output), and the builtin-tool
+/// core.
 ///
 /// The pipeline's core holds its own registry instance for execution while the
 /// [`BareLoop`] holds the one it advertises to the model; the registry stores
@@ -673,12 +709,14 @@ fn build_session(
 fn build_pipeline(
     context: &Arc<RunnerContext>,
     middleware: &[Arc<dyn ToolMiddleware>],
+    permission: PermissionMiddleware,
     redact: bool,
     core_registry: ToolRegistry,
 ) -> Result<ToolPipeline, RunnerError> {
     let mut builder = ToolPipeline::builder().with_middleware(ContextInjector {
         context: Arc::clone(context),
     });
+    builder = builder.with_middleware(permission);
     for host_middleware in middleware {
         builder = builder.with_middleware_arc(Arc::clone(host_middleware));
     }
@@ -911,42 +949,52 @@ mod tests {
         let pipeline = build_pipeline(
             &sample_context("/tmp/probe-cwd"),
             &[],
+            permission_layer(dch_tools::permission::PermissionMode::Auto, None),
             false,
             builtin_registry(),
         )
         .expect("static composition builds");
         assert_eq!(
             pipeline.middleware_names(),
-            vec!["dch-context", "tool_call"],
-            "the injector must be the outermost layer over the tool-call core"
+            vec!["dch-context", "permission", "tool_call"],
+            "the injector must be the outermost layer, with the permission gate\
+             \ndirectly under it, over the tool-call core"
         );
     }
 
     #[test]
-    fn build_pipeline_layers_host_middleware_between_injector_and_redaction() {
+    fn build_pipeline_layers_host_middleware_between_gate_and_redaction() {
         let redacting = build_pipeline(
             &sample_context("/tmp/probe-cwd"),
             &[],
+            permission_layer(dch_tools::permission::PermissionMode::Auto, None),
             true,
             builtin_registry(),
         )
         .expect("static composition builds");
         assert_eq!(
             redacting.middleware_names(),
-            vec!["dch-context", "redaction", "tool_call"],
-            "redaction wraps the core under the injector"
+            vec!["dch-context", "permission", "redaction", "tool_call"],
+            "the gate wraps the core under the injector"
         );
         let layered = build_pipeline(
             &sample_context("/tmp/probe-cwd"),
             &[Arc::new(HostProbe)],
+            permission_layer(dch_tools::permission::PermissionMode::Auto, None),
             true,
             builtin_registry(),
         )
         .expect("static composition builds");
         assert_eq!(
             layered.middleware_names(),
-            vec!["dch-context", "host-probe", "redaction", "tool_call"],
-            "host middleware sit under the injector and above redaction"
+            vec![
+                "dch-context",
+                "permission",
+                "host-probe",
+                "redaction",
+                "tool_call"
+            ],
+            "host middleware sit under the gate and above redaction"
         );
     }
 
@@ -994,8 +1042,14 @@ mod tests {
     async fn redaction_scrubs_high_entropy_tokens_in_tool_output() {
         let mut registry = loopctl::tool::ToolRegistry::new();
         registry.register(HighEntropyEchoTool);
-        let pipeline = build_pipeline(&sample_context("/tmp/probe-cwd"), &[], true, registry)
-            .expect("static composition builds");
+        let pipeline = build_pipeline(
+            &sample_context("/tmp/probe-cwd"),
+            &[],
+            permission_layer(dch_tools::permission::PermissionMode::Auto, None),
+            true,
+            registry,
+        )
+        .expect("static composition builds");
         let mut ctx = probe_dispatch_context();
         ctx.tool_name = "HighEntropyEcho".to_string();
 
@@ -1709,6 +1763,172 @@ mod tests {
             .lock()
             .map(|reqs| reqs.clone())
             .unwrap_or_default()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plan_mode_blocks_a_write_end_to_end() {
+        let server = SseServer::start(vec![
+            sse_tool_call_turn(
+                "Write",
+                &serde_json::json!({"file_path": "note.txt", "content": "x"}),
+            ),
+            sse_text_turn("stopped"),
+        ])
+        .await;
+        let dir = TempDir::new().expect("tempdir");
+        let mut config = wire_config(server.port, 10);
+        config.runner.permission_mode = dch_config::PermissionMode::Plan;
+        let mut runner = Runner::builder(&config, dir.path())
+            .build()
+            .await
+            .expect("constructs");
+        let run = tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("write it"))
+            .await
+            .expect("run completes within timeout")
+            .expect("a denied tool is a soft error, not a run failure");
+        assert_eq!(run.output.as_deref(), Some("stopped"));
+        assert!(
+            !dir.path().join("note.txt").exists(),
+            "the blocked write must not touch the filesystem"
+        );
+        let requests = recorded_requests(&server);
+        assert_eq!(requests.len(), 2, "denied call, then the closing turn");
+        assert!(
+            requests[1].contains("denied by Plan mode") && requests[1].contains("Write"),
+            "the denial riding the second request must name the mode and the tool: {}",
+            requests[1]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn accept_edits_ask_resolves_through_the_builder_resolver_end_to_end() {
+        let server = SseServer::start(vec![
+            sse_tool_call_turn("Bash", &serde_json::json!({"command": "echo bridge-probe"})),
+            sse_text_turn("done"),
+        ])
+        .await;
+        let dir = TempDir::new().expect("tempdir");
+        let mut config = wire_config(server.port, 10);
+        config.runner.permission_mode = dch_config::PermissionMode::AcceptEdits;
+        let consultations = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+        let resolver: loopctl::middleware::AskResolverFn = {
+            let consultations = Arc::clone(&consultations);
+            Arc::new(move |prompt: &str, tool: &str| {
+                consultations
+                    .lock()
+                    .expect("consultations lock")
+                    .push((prompt.to_string(), tool.to_string()));
+                Box::pin(async { true })
+            })
+        };
+        let mut runner = Runner::builder(&config, dir.path())
+            .with_permission_resolver(resolver)
+            .build()
+            .await
+            .expect("constructs");
+        let run = tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("run it"))
+            .await
+            .expect("run completes within timeout")
+            .expect("the approved dispatch succeeds");
+        assert_eq!(run.output.as_deref(), Some("done"));
+        let recorded = consultations.lock().expect("consultations lock").clone();
+        assert_eq!(recorded.len(), 1, "exactly one Ask consults the resolver");
+        let (prompt, tool) = recorded.into_iter().next().expect("one consultation");
+        assert_eq!(tool, "Bash");
+        assert!(
+            prompt.contains("Bash") && prompt.contains("AcceptEdits"),
+            "the prompt must label the tool and the mode: {prompt}"
+        );
+        let requests = recorded_requests(&server);
+        assert_eq!(requests.len(), 2, "approved call, then the closing turn");
+        assert!(
+            requests[1].contains("bridge-probe") && !requests[1].contains("Permission denied"),
+            "the approved Bash call must have executed: {}",
+            requests[1]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_approved_write_still_refuses_a_target_changed_during_the_ask() {
+        // The approval window must not widen the conflict window: the
+        // gate parks the dispatch until the resolver answers, and the
+        // staleness check runs only after the release, so a change
+        // landing while the ask is pending still refuses the write.
+        let server = SseServer::start(vec![
+            sse_tool_call_turn("Read", &serde_json::json!({"file_path": "note.txt"})),
+            sse_tool_call_turn(
+                "Write",
+                &serde_json::json!({"file_path": "note.txt", "content": "clobber"}),
+            ),
+            sse_text_turn("done"),
+        ])
+        .await;
+        let dir = TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join("note.txt"), "original").expect("seed target");
+        let mut config = wire_config(server.port, 10);
+        config.runner.permission_mode = dch_config::PermissionMode::Interactive;
+        let consultations: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let parked: Arc<Mutex<Vec<tokio::sync::oneshot::Sender<bool>>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let resolver: loopctl::middleware::AskResolverFn = {
+            let consultations = Arc::clone(&consultations);
+            let parked = Arc::clone(&parked);
+            Arc::new(move |_prompt: &str, tool: &str| {
+                consultations
+                    .lock()
+                    .expect("consultations lock")
+                    .push(tool.to_string());
+                if tool == "Read" {
+                    Box::pin(async { true })
+                } else {
+                    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                    parked.lock().expect("parked lock").push(reply_tx);
+                    Box::pin(async move { reply_rx.await.unwrap_or(false) })
+                }
+            })
+        };
+        let mut runner = Runner::builder(&config, dir.path())
+            .with_permission_resolver(resolver)
+            .build()
+            .await
+            .expect("constructs");
+        let driving = tokio::spawn(async move { runner.run("go").await });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while parked.lock().expect("parked lock").is_empty() && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let release = parked
+            .lock()
+            .expect("parked lock")
+            .pop()
+            .expect("the write ask parked a reply");
+        assert_eq!(
+            consultations.lock().expect("consultations lock").as_slice(),
+            ["Read", "Write"],
+            "the read ask resolves immediately; only the write parks"
+        );
+        std::fs::write(dir.path().join("note.txt"), "externally changed")
+            .expect("mutate during the ask");
+        release.send(true).expect("the resolver still awaits");
+        let run = tokio::time::timeout(std::time::Duration::from_secs(10), driving)
+            .await
+            .expect("run settles within timeout")
+            .expect("the driving task joins")
+            .expect("a refused tool is a soft error, not a run failure");
+        assert_eq!(run.output.as_deref(), Some("done"));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("note.txt")).unwrap_or_default(),
+            "externally changed",
+            "the approved write must not clobber the change that landed during the ask"
+        );
+        let requests = recorded_requests(&server);
+        assert_eq!(requests.len(), 3, "read turn, refused write turn, close");
+        assert!(
+            requests[2].contains("changed on disk"),
+            "the conflict refusal must ride the closing request: {}",
+            requests[2]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

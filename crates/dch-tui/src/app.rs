@@ -19,7 +19,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use unicode_segmentation::UnicodeSegmentation as _;
 use unicode_width::UnicodeWidthChar as _;
 use unicode_width::UnicodeWidthStr as _;
@@ -32,6 +32,7 @@ use crate::input::{InputAction, InputEditor};
 use crate::markdown;
 use crate::message::{ActiveTool, ContentBlock, TokenCounts, TuiMessage};
 use crate::observer::{ToolResultDisplay, TuiObserverState};
+use crate::permission::PermissionRequest;
 use crate::theme::Theme;
 use crate::tool_render::SPINNER_FRAMES;
 use dch_config::Verbosity;
@@ -470,6 +471,33 @@ pub struct TuiApp {
     /// Valid for one buffer mutation at one width — see
     /// [`composer_wrap`](Self::composer_wrap).
     input_wrap_cache: Option<InputWrapCache>,
+
+    /// Permission asks waiting for the user's answer, oldest first.
+    ///
+    /// The gate resolves `Ask` cells by handing the UI one request per
+    /// pending tool call; the front of the queue is what the overlay
+    /// shows and what a keypress answers. A finished or cancelled run
+    /// empties it — the gate has already denied anything unanswered
+    /// against the cancel signal.
+    pending_permissions: std::collections::VecDeque<PermissionRequest>,
+
+    /// The channel permission requests arrive on, until `run` claims
+    /// it.
+    ///
+    /// Installed by the host before the run loop starts; the loop's
+    /// select arm moves requests into the queue, so between runs the
+    /// slot simply holds the receiver.
+    permission_rx: Option<tokio::sync::mpsc::UnboundedReceiver<PermissionRequest>>,
+
+    /// Whether the next frame must repaint in full.
+    ///
+    /// Set when the terminal regains focus: some terminals skip
+    /// painting while their window is hidden or occluded, so frames
+    /// drawn during that time leave stale cells that the incremental
+    /// diff cannot know about. The run loop claims the flag, clears
+    /// the screen, and lets the next draw repaint every cell — the
+    /// same full repaint a resize forces.
+    full_repaint_pending: bool,
 }
 
 impl TuiApp {
@@ -539,6 +567,9 @@ impl TuiApp {
             input_wrap_cache: None,
             session_id: None,
             transient_notice: None,
+            pending_permissions: std::collections::VecDeque::new(),
+            permission_rx: None,
+            full_repaint_pending: false,
             config,
         }
     }
@@ -711,6 +742,121 @@ impl TuiApp {
         self.submit_tx = Some(tx);
     }
 
+    /// Install the channel permission requests arrive on.
+    ///
+    /// The receiver half of the bridge the host builds around the
+    /// runner's permission resolver; once set, pending asks render as
+    /// an overlay and the run loop claims the channel into its select.
+    pub fn set_permission_requests(
+        &mut self,
+        rx: tokio::sync::mpsc::UnboundedReceiver<PermissionRequest>,
+    ) {
+        self.permission_rx = Some(rx);
+    }
+
+    /// Land one delivered request and any others already waiting
+    /// behind it.
+    ///
+    /// The run loop's select arm hands the request its wakeup
+    /// delivered plus the receiver it owns: the request enters the
+    /// queue and the receiver drains, so a burst of ready asks lands
+    /// together and the first frame's overlay reports the true
+    /// waiting count instead of admitting them one loop iteration at
+    /// a time.
+    pub fn land_permission_requests(
+        &mut self,
+        first: PermissionRequest,
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<PermissionRequest>,
+    ) {
+        self.pending_permissions.push_back(first);
+        while let Ok(request) = rx.try_recv() {
+            self.pending_permissions.push_back(request);
+        }
+    }
+
+    /// Move any waiting permission requests into the queue.
+    ///
+    /// The test seam for staging asks without the run loop:
+    /// production keeps its receiver in a local and lands bursts
+    /// through [`land_permission_requests`](Self::land_permission_requests)
+    /// instead — once `run` claims the channel, this slot is empty and
+    /// the method is a no-op.
+    pub fn poll_permission_requests(&mut self) {
+        while let Some(request) = self
+            .permission_rx
+            .as_mut()
+            .and_then(|rx| rx.try_recv().ok())
+        {
+            self.pending_permissions.push_back(request);
+        }
+    }
+
+    /// Answer the front permission request, if one is pending.
+    ///
+    /// Sends `allow` on its reply channel and drops it from the queue;
+    /// a send that finds no receiver (a resolver already cancelled
+    /// away) is silently fine — the gate denied that call on its own.
+    fn resolve_pending_permission(&mut self, allow: bool) {
+        if let Some(front) = self.pending_permissions.pop_front()
+            && front.reply.send(allow).is_err()
+        {
+            // The resolver stopped waiting (a cancelled dispatch); the
+            // gate denied that call on its own.
+            tracing::trace!("permission reply channel already closed");
+        }
+    }
+
+    /// Apply a key press to a pending permission ask.
+    ///
+    /// `Some(redraw)` when a request is pending — the overlay owns the
+    /// keyboard: plain `y` allows, plain `n`/Esc deny, and every
+    /// other key is swallowed — Enter among them, since a press
+    /// queued to submit the draft must never land as an approval — so
+    /// nothing reaches the composer, whose control chords would
+    /// otherwise submit or edit the hidden draft (Ctrl-Enter and
+    /// Ctrl-M submit, Ctrl-W deletes a word).
+    /// `None` only for the two `c` chords the app machinery owns —
+    /// cancel/quit and copy — so those survive under a prompt.
+    /// Modifier-decorated answers (Alt+y, Alt+Enter) do not answer:
+    /// the documented keys are the plain ones.
+    fn permission_key(&mut self, key: KeyEvent) -> Option<bool> {
+        self.pending_permissions.front()?;
+        let chord = key.code == KeyCode::Char('c')
+            && (key.modifiers == KeyModifiers::CONTROL
+                || key.modifiers == KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        if chord {
+            return None;
+        }
+        let bare = key.modifiers == KeyModifiers::NONE;
+        let shift = key.modifiers == KeyModifiers::SHIFT;
+        match key.code {
+            KeyCode::Char('y' | 'Y') if bare || shift => {
+                self.resolve_pending_permission(true);
+                Some(true)
+            }
+            KeyCode::Char('n' | 'N') if bare || shift => {
+                self.resolve_pending_permission(false);
+                Some(true)
+            }
+            KeyCode::Esc if bare => {
+                self.resolve_pending_permission(false);
+                Some(true)
+            }
+            _ => Some(false),
+        }
+    }
+
+    /// Claim the pending full repaint, if one is due.
+    ///
+    /// One-shot: the caller (the run loop) owns acting on the claim —
+    /// clearing the terminal so the next frame repaints every cell
+    /// instead of diffing against a buffer the visible screen never
+    /// matched.
+    #[must_use]
+    pub fn take_full_repaint(&mut self) -> bool {
+        std::mem::take(&mut self.full_repaint_pending)
+    }
+
     /// Replace the selection copier.
     ///
     /// The instrumentation seam for the selection pins: a recorder
@@ -785,11 +931,13 @@ impl TuiApp {
         let mut tick = tokio::time::interval(TICK_INTERVAL);
         let notify = Arc::clone(&self.state.render_notify);
         let mut listener = notify.listen();
+        let mut permission_rx = self.permission_rx.take();
+        let mut permission_closed = false;
 
         terminal.draw(|frame| self.render(frame))?;
 
         while !self.quit.requested {
-            let needs_redraw = tokio::select! {
+            let mut needs_redraw = tokio::select! {
                 maybe_event = events.recv() => {
                     match maybe_event {
                         Some(result) => match result {
@@ -805,7 +953,37 @@ impl TuiApp {
                 }
                 () = &mut listener => self.notify_wake(&notify, &mut listener),
                 _instant = tick.tick() => self.tick_wake(Instant::now()),
+                maybe_request = async {
+                    match permission_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(request) = maybe_request {
+                        match permission_rx.as_mut() {
+                            Some(rx) => self.land_permission_requests(request, rx),
+                            None => self.pending_permissions.push_back(request),
+                        }
+                        true
+                    } else {
+                        // The resolver side is gone (the runner was
+                        // dropped); latching the arm inert keeps the
+                        // closed channel from spinning the loop.
+                        permission_closed = true;
+                        false
+                    }
+                }
             };
+            if permission_closed {
+                permission_rx = None;
+                permission_closed = false;
+            }
+            if self.take_full_repaint() {
+                if let Err(err) = terminal.clear() {
+                    tracing::warn!("full repaint clear failed: {err}");
+                }
+                needs_redraw = true;
+            }
             if needs_redraw {
                 terminal.draw(|frame| self.render(frame))?;
             }
@@ -865,7 +1043,9 @@ impl TuiApp {
     /// Apply one terminal event to the app state.
     ///
     /// Returns whether the event requires a redraw. Key releases and
-    /// repeats are ignored so a held key fires once per press.
+    /// repeats are ignored so a held key fires once per press. While a
+    /// permission ask is pending, the overlay owns the keyboard —
+    /// keystrokes and pastes alike.
     pub fn handle_event(&mut self, event: &Event) -> bool {
         match event {
             Event::Key(key) => {
@@ -877,18 +1057,30 @@ impl TuiApp {
             }
             Event::Mouse(mouse) => self.handle_mouse(*mouse),
             Event::Paste(text) => {
+                if self.pending_permissions.front().is_some() {
+                    // The overlay owns the keyboard; a paste behind it
+                    // must not seed the composer invisibly.
+                    return true;
+                }
                 self.caret_blink.resolidify();
                 self.input.insert_str(&normalize_pasted_newlines(text));
                 true
             }
             Event::Resize(_, _) => true,
-            _ => false,
+            Event::FocusGained => {
+                self.full_repaint_pending = true;
+                true
+            }
+            Event::FocusLost => false,
         }
     }
 
     /// Apply one key press: the quit chord, copy chord, and
-    /// page-scroll keys stay app-level, everything else belongs to
-    /// the input editor.
+    /// page-scroll keys stay app-level, everything else belongs to the
+    /// input editor — unless a permission ask is pending, in which
+    /// case the overlay owns the keyboard first (`y` allows,
+    /// `n`/Esc deny, the rest swallowed) and only the two `c` chords
+    /// (cancel/quit, copy) pass through to the machinery below.
     ///
     /// Ctrl+C clears a non-empty buffer — arming nothing, so a
     /// cleared draft still takes two further presses to exit — and
@@ -913,6 +1105,9 @@ impl TuiApp {
             (KeyCode::Char('c'), KeyModifiers::CONTROL)
         ) {
             self.quit.disarm();
+        }
+        if let Some(resolved) = self.permission_key(key) {
+            return resolved;
         }
         match (key.code, key.modifiers) {
             (KeyCode::Char('c'), mods) if mods == KeyModifiers::CONTROL | KeyModifiers::SHIFT => {
@@ -996,8 +1191,17 @@ impl TuiApp {
     /// extending the selection — one line per movement report, and
     /// one per tick while the pointer stays parked there; a press
     /// over the composer pane places its caret where it landed.
-    /// Anything else is ignored.
+    /// Anything else is ignored. While a permission ask is pending,
+    /// the overlay owns the pointer as it owns the keyboard: every
+    /// report is swallowed and any parked drag is dropped.
     fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
+        if self.pending_permissions.front().is_some() {
+            // The overlay owns the pointer as it owns the keyboard: a
+            // click behind it must not move the hidden draft's caret,
+            // and a parked drag must not keep selecting behind the sheet.
+            self.drag_position = None;
+            return true;
+        }
         match mouse.kind {
             MouseEventKind::ScrollUp => {
                 self.scroll_offset = self.scroll_offset.saturating_add(WHEEL_SCROLL_LINES);
@@ -1564,7 +1768,8 @@ impl TuiApp {
     /// spinner one frame while tools run, steps the view while a
     /// drag is parked at the conversation pane's top or bottom row —
     /// the beat that keeps an edge push scrolling between movement
-    /// reports — and flips the composer caret's blink phase on its
+    /// reports — parked outright while a permission ask is pending —
+    /// and flips the composer caret's blink phase on its
     /// own beat. An idle tick between flips and away from all of the
     /// above draws nothing.
     pub fn tick_wake(&mut self, now: Instant) -> bool {
@@ -1577,7 +1782,15 @@ impl TuiApp {
                 next
             };
         }
-        let dragged = self.drag_autoscroll();
+        let dragged = if self.pending_permissions.front().is_some() {
+            // The overlay parks the pointer: an edge push that was live
+            // when the ask landed must neither scroll behind the sheet
+            // nor resume once the ask is answered.
+            self.drag_position = None;
+            false
+        } else {
+            self.drag_autoscroll()
+        };
         let blinked = self.caret_blink.tick();
         let notice_lapsed = self
             .transient_notice
@@ -1586,7 +1799,25 @@ impl TuiApp {
         if notice_lapsed {
             self.transient_notice = None;
         }
-        self.any_tools_running() || claimed || dragged || blinked || notice_lapsed
+        // No run, no prompts: a finished or cancelled run's dispatches
+        // are gone, so the gate already denied whatever went unanswered
+        // — the queue must not hold an overlay the run can no longer
+        // act on. Dropping the requests closes their reply channels,
+        // which reads as a denial on any resolver still parked on one.
+        let prompts_retired = !self.pending_permissions.is_empty()
+            && !self
+                .state
+                .agent_running
+                .load(std::sync::atomic::Ordering::SeqCst);
+        if prompts_retired {
+            self.pending_permissions.clear();
+        }
+        self.any_tools_running()
+            || claimed
+            || dragged
+            || blinked
+            || notice_lapsed
+            || prompts_retired
     }
 
     /// Whether a graduation is waiting to land.
@@ -1672,6 +1903,82 @@ impl TuiApp {
         self.input_wrap_width = wrap_width;
         self.render_input(frame, input_area, &rows, caret);
         self.render_status_bar(frame, pane(&chunks, 4, fallback), &rows, caret);
+        if let Some((prompt, more)) = self.pending_permissions.front().map(|request| {
+            (
+                request.prompt.clone(),
+                self.pending_permissions.len().saturating_sub(1),
+            )
+        }) {
+            self.render_permission_overlay(frame, area, &prompt, more);
+        }
+    }
+
+    /// Render the pending permission ask as a sheet over the prompt
+    /// box.
+    ///
+    /// Draws where the user's attention already is: anchored at the
+    /// bottom, directly above the status bar, covering the notice row,
+    /// the spacer, and the composer — the box the user would type in
+    /// is replaced by the question. The conversation above keeps
+    /// rendering behind it, so what the run is doing stays visible
+    /// while the ask waits. The prompt and the hints are each
+    /// pre-wrapped at the box's inner width (a block at most
+    /// `MAX_OVERLAY_ROWS` rows, the last ellipsized), so no rendered
+    /// line can re-flow inside the border and the hints always fit,
+    /// whatever the tool name's length or the terminal's width; only
+    /// a terminal shorter than the box clips, at the box's top. The
+    /// strings arrive cloned so this borrows nothing from the queue.
+    fn render_permission_overlay(&self, frame: &mut Frame, area: Rect, prompt: &str, more: usize) {
+        let hints = if more == 0 {
+            "[y] allow · [n] deny · ctrl+c cancels (a draft clears first)".to_string()
+        } else {
+            format!("[y] allow · [n] deny · ctrl+c cancels · {more} more waiting")
+        };
+        // The sheet spans the terminal, so its inner width is the full
+        // width minus the border pair — wrap every block there, and
+        // every rendered line fits the box whatever the terminal's
+        // width. The hints wrap too, so even they cannot re-flow past
+        // the height the box reserves for them.
+        let wrap_at = usize::from(area.width.saturating_sub(2));
+        let mut lines: Vec<Line<'_>> = wrap_prompt_rows(prompt, wrap_at, MAX_OVERLAY_ROWS)
+            .into_iter()
+            .map(|row| Line::styled(row, Style::default().fg(self.theme.ui.foreground)))
+            .collect();
+        lines.push(Line::default());
+        lines.extend(
+            wrap_prompt_rows(&hints, wrap_at, MAX_OVERLAY_ROWS)
+                .into_iter()
+                .map(|row| Line::styled(row, Style::default().fg(self.theme.ui.secondary))),
+        );
+        // The sheet owns every row above the status bar when it needs
+        // them, but never the status bar itself — the session line
+        // stays readable while an ask waits.
+        let sheet_area = Rect {
+            height: area.height.saturating_sub(STATUS_BAR_ROWS),
+            ..area
+        };
+        let height = u16::try_from(lines.len())
+            .unwrap_or(u16::MAX)
+            .saturating_add(2)
+            .min(sheet_area.height);
+        let overlay = bottom_sheet_rect(height, sheet_area);
+        if overlay.width == 0 || overlay.height == 0 {
+            return;
+        }
+        let accent = Style::default().fg(self.theme.ui.primary);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(accent)
+            .title(Span::styled(" Permission required ", accent));
+        frame.render_widget(Clear, overlay);
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(block)
+                .wrap(Wrap { trim: false })
+                .style(Style::default().bg(self.theme.ui.surface)),
+            overlay,
+        );
     }
 
     /// Render the conversation pane: the settled conversation, the
@@ -2413,9 +2720,22 @@ impl TuiApp {
                 u16::try_from(usize::from(caret_row).saturating_sub(start)).unwrap_or(0),
             )
             .min(area.bottom().saturating_sub(1));
-        if area.height > 0 && self.caret_blink.on {
+        if area.height > 0 && self.composer_caret_visible() {
             frame.set_cursor_position((caret_x, caret_y));
         }
+    }
+
+    /// Whether the composer's terminal cursor shows this frame.
+    ///
+    /// False while the blink phase has it off — and for the whole
+    /// time a permission ask is pending: the sheet owns the composer's
+    /// rows and its keys, and a cursor there would point at nothing
+    /// the user can edit. A frame that sets no cursor position hides
+    /// the terminal cursor, so this is the whole show-or-hide
+    /// decision.
+    #[must_use]
+    pub fn composer_caret_visible(&self) -> bool {
+        self.caret_blink.on && self.pending_permissions.front().is_none()
     }
 
     /// Render the one-line status bar.
@@ -3009,6 +3329,99 @@ fn visible_window<'a>(segments: [&'a [Line<'a>]; 4], skip: usize, height: usize)
 /// fallback keeps rendering total if a shorter split ever appears.
 fn pane(chunks: &[Rect], index: usize, fallback: Rect) -> Rect {
     chunks.get(index).copied().unwrap_or(fallback)
+}
+
+/// The most body rows any one block of the permission overlay shows
+/// before ellipsizing.
+///
+/// The cap keeps the box short enough to stay inside the border on
+/// every terminal tall enough to matter; the prompt is a question and
+/// the hints are one line, not a document.
+const MAX_OVERLAY_ROWS: usize = 3;
+
+/// Word-wrap `text` to `limit` display columns, hard-splitting any
+/// single word wider than `limit`, keeping at most `max_rows` rows
+/// (the last carries an ellipsis when truncation happens).
+///
+/// Rows never exceed `limit`, so a paragraph rendering them inside a
+/// border `limit + 2` wide cannot re-flow them.
+fn wrap_prompt_rows(text: &str, limit: usize, max_rows: usize) -> Vec<String> {
+    let limit = limit.max(1);
+    let mut rows: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+    for word in text.split(' ') {
+        let word_width = word.width();
+        if word_width > limit {
+            if !current.is_empty() {
+                rows.push(std::mem::take(&mut current));
+                current_width = 0;
+            }
+            for grapheme in word.graphemes(true) {
+                let grapheme_width = grapheme.width();
+                if current_width.saturating_add(grapheme_width) > limit {
+                    rows.push(std::mem::take(&mut current));
+                    current_width = 0;
+                }
+                current.push_str(grapheme);
+                current_width = current_width.saturating_add(grapheme_width);
+            }
+            continue;
+        }
+        let joined = if current.is_empty() {
+            word_width
+        } else {
+            current_width.saturating_add(1).saturating_add(word_width)
+        };
+        if joined <= limit && !current.is_empty() {
+            current.push(' ');
+            current.push_str(word);
+            current_width = joined;
+        } else {
+            if !current.is_empty() {
+                rows.push(std::mem::take(&mut current));
+            }
+            current.push_str(word);
+            current_width = word_width;
+        }
+    }
+    if !current.is_empty() {
+        rows.push(current);
+    }
+    if rows.len() > max_rows {
+        rows.truncate(max_rows);
+        if let Some(last) = rows.last_mut() {
+            let keep = last.width().saturating_sub(1);
+            let mut trimmed = String::new();
+            let mut kept = 0usize;
+            for grapheme in last.graphemes(true) {
+                let grapheme_width = grapheme.width();
+                if kept.saturating_add(grapheme_width) > keep {
+                    break;
+                }
+                trimmed.push_str(grapheme);
+                kept = kept.saturating_add(grapheme_width);
+            }
+            trimmed.push('…');
+            *last = trimmed;
+        }
+    }
+    rows
+}
+
+/// A full-width rectangle anchored at the bottom of `area`.
+///
+/// The permission sheet's geometry: it grows upward from just above
+/// the status bar over the rows the composer occupies, so the
+/// conversation above and the session line below both stay in view.
+fn bottom_sheet_rect(height: u16, area: Rect) -> Rect {
+    let height = height.min(area.height);
+    Rect {
+        x: area.x,
+        y: area.y.saturating_add(area.height).saturating_sub(height),
+        width: area.width,
+        height,
+    }
 }
 
 /// Split the conversation pane into its text area and scrollbar
