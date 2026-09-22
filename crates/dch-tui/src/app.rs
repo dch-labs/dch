@@ -809,10 +809,12 @@ impl TuiApp {
     /// Apply a key press to a pending permission ask.
     ///
     /// `Some(redraw)` when a request is pending — the overlay owns the
-    /// keyboard: plain `y`/Enter allow, plain `n`/Esc deny, and every
-    /// other key is swallowed so nothing reaches the composer — whose
-    /// control chords would otherwise submit or edit the hidden draft
-    /// (Ctrl-Enter and Ctrl-M submit, Ctrl-W deletes a word).
+    /// keyboard: plain `y` allows, plain `n`/Esc deny, and every
+    /// other key is swallowed — Enter among them, since a press
+    /// queued to submit the draft must never land as an approval — so
+    /// nothing reaches the composer, whose control chords would
+    /// otherwise submit or edit the hidden draft (Ctrl-Enter and
+    /// Ctrl-M submit, Ctrl-W deletes a word).
     /// `None` only for the two `c` chords the app machinery owns —
     /// cancel/quit and copy — so those survive under a prompt.
     /// Modifier-decorated answers (Alt+y, Alt+Enter) do not answer:
@@ -829,10 +831,6 @@ impl TuiApp {
         let shift = key.modifiers == KeyModifiers::SHIFT;
         match key.code {
             KeyCode::Char('y' | 'Y') if bare || shift => {
-                self.resolve_pending_permission(true);
-                Some(true)
-            }
-            KeyCode::Enter if bare => {
                 self.resolve_pending_permission(true);
                 Some(true)
             }
@@ -1080,7 +1078,7 @@ impl TuiApp {
     /// Apply one key press: the quit chord, copy chord, and
     /// page-scroll keys stay app-level, everything else belongs to the
     /// input editor — unless a permission ask is pending, in which
-    /// case the overlay owns the keyboard first (`y`/Enter allow,
+    /// case the overlay owns the keyboard first (`y` allows,
     /// `n`/Esc deny, the rest swallowed) and only the two `c` chords
     /// (cancel/quit, copy) pass through to the machinery below.
     ///

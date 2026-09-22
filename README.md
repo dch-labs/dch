@@ -199,7 +199,8 @@ While a permission prompt is on screen (see
 
 | Key | Action |
 | --- | --- |
-| `y` / `Enter` | Allow the pending tool call |
+| `y` | Allow the pending tool call |
+| `Enter` | Swallowed — a queued submit press never lands as an approval |
 | `n` / `Esc` | Deny it |
 | `Ctrl-C` | Serves the run as ever — a draft clears first, then the press cancels the run; the cancelled prompt denies itself |
 

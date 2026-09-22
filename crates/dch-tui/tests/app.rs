@@ -4545,7 +4545,7 @@ fn a_pending_permission_request_renders_the_overlay() {
 }
 
 #[test]
-fn y_and_enter_allow_the_pending_request() {
+fn y_allows_the_pending_request_and_enter_is_swallowed() {
     let (mut app, _tx, mut replies) = permission_app(&[("Bash", "allow bash?")]);
     assert!(app.handle_event(&plain(KeyCode::Char('y'))));
     assert_eq!(
@@ -4554,12 +4554,23 @@ fn y_and_enter_allow_the_pending_request() {
         "'y' must answer the ask with allow"
     );
 
+    // Enter is submit intent everywhere else in the composer; under
+    // the ask it must not resolve to an approval the user never made.
     let (mut app, _tx, mut replies) = permission_app(&[("Bash", "again?")]);
-    assert!(app.handle_event(&plain(KeyCode::Enter)));
+    let mut reply = replies.remove(0);
+    assert!(
+        !app.handle_event(&plain(KeyCode::Enter)),
+        "a swallowed Enter asks for no redraw"
+    );
+    assert!(
+        reply.try_recv().is_err(),
+        "Enter must not consume the reply — the ask stays pending"
+    );
+    assert!(app.handle_event(&plain(KeyCode::Char('y'))));
     assert_eq!(
-        replies.remove(0).blocking_recv(),
+        reply.blocking_recv(),
         Ok(true),
-        "Enter must answer the ask with allow"
+        "a later 'y' still answers the ask Enter left pending"
     );
 }
 
@@ -4593,7 +4604,7 @@ fn other_keys_are_inert_while_a_request_is_pending() {
     assert_eq!(app.input(), "draft", "the draft is written before the ask");
 
     let (requests_tx, requests_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (reply, reply_rx) = tokio::sync::oneshot::channel();
+    let (reply, mut reply_rx) = tokio::sync::oneshot::channel();
     requests_tx
         .send(dch_tui::PermissionRequest {
             tool_name: "Bash".to_string(),
@@ -4616,11 +4627,13 @@ fn other_keys_are_inert_while_a_request_is_pending() {
 
     let (submit_tx, mut submit_rx) = tokio::sync::mpsc::unbounded_channel();
     app.set_submit_tx(submit_tx);
-    assert!(app.handle_event(&plain(KeyCode::Enter)));
-    assert_eq!(
-        reply_rx.blocking_recv(),
-        Ok(true),
-        "Enter belongs to the prompt, allowing the ask"
+    assert!(
+        !app.handle_event(&plain(KeyCode::Enter)),
+        "a swallowed Enter asks for no redraw"
+    );
+    assert!(
+        reply_rx.try_recv().is_err(),
+        "Enter neither answers the ask nor consumes its reply"
     );
     assert!(
         submit_rx.try_recv().is_err(),
