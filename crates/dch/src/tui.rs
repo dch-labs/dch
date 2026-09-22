@@ -462,7 +462,14 @@ fn permission_bridge() -> (
 /// the next begins, preserving the order the user submitted in. A
 /// failed run records its error into the shared buffer the display
 /// drains and wakes the frame — the session continues, and the next
-/// submission still runs. The loop ends when the channel closes or
+/// submission still runs. A cancelled run is the exception: every
+/// submission queued behind it is dropped, so one cancel takes the
+/// whole backlog with it. That decision reads the run's own
+/// `LoopError::Cancelled` result, never the shared cancel signal —
+/// the engine clears the signal before the run future resolves, so
+/// by the time this task inspects it, the signal is quiet again
+/// even for a run that just ended cancelled.
+/// The loop ends when the channel closes or
 /// the shutdown flag is set: the engine clears its cancel signal at
 /// the end of every run, so the flag — raised before the cancel — is
 /// what keeps submissions queued behind a quitting user from ever
@@ -490,6 +497,10 @@ async fn drive_submissions(
         let result = runner.run(&text).await;
         state.agent_running.store(false, Ordering::SeqCst);
         let run_errored = result.is_err();
+        let run_cancelled = result
+            .as_ref()
+            .err()
+            .is_some_and(loopctl::error::LoopError::is_cancelled);
         if run_errored {
             state
                 .active_tools
@@ -504,7 +515,7 @@ async fn drive_submissions(
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(err.to_string());
         }
-        if cancel.is_cancelled() {
+        if run_cancelled {
             while receiver.try_recv().is_ok() {
                 state.queued.fetch_sub(1, Ordering::SeqCst);
             }
@@ -522,7 +533,9 @@ async fn drive_submissions(
     clippy::panic,
     clippy::missing_panics_doc,
     clippy::missing_errors_doc,
-    clippy::indexing_slicing
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::let_underscore_must_use
 )]
 mod tests {
     use super::*;
@@ -993,5 +1006,308 @@ mod tests {
             .await
             .expect("a dropped request still settles the resolver");
         assert!(!answered, "an unanswered request reads as a denial");
+    }
+
+    /// One canned SSE text turn, framed for the OpenAI streaming wire.
+    ///
+    /// Two `data:` chunks — the text delta, then the stop — plus the
+    /// terminal `[DONE]` sentinel, so a run that consumes one body
+    /// completes a single turn cleanly.
+    fn sse_text_turn(text: &str) -> String {
+        [
+            serde_json::json!({
+                "id": "c1", "model": "test-model",
+                "choices": [{"delta": {"content": text}, "finish_reason": null}]
+            }),
+            serde_json::json!({
+                "id": "c1", "model": "test-model",
+                "choices": [{"delta": null, "finish_reason": "stop"}]
+            }),
+        ]
+        .iter()
+        .map(|chunk| format!("data: {chunk}\n\n"))
+        .chain(std::iter::once("data: [DONE]\n\n".to_string()))
+        .collect()
+    }
+
+    /// A canned-SSE provider endpoint on an ephemeral local port.
+    ///
+    /// Serves the queued bodies one per accepted connection in order,
+    /// records each request it reads, and sleeps the given delay
+    /// before answering — long enough that a test can cancel a run
+    /// while its provider request is provably still in flight.
+    struct SseServer {
+        /// The port the canned endpoint listens on.
+        ///
+        /// Ephemeral, and bound before the first request is sent, so
+        /// the config can point straight at it.
+        port: u16,
+
+        /// Every request body the endpoint has read, in order.
+        ///
+        /// Shared with the accept task; a test reads the count to
+        /// prove how many runs actually reached a provider.
+        requests: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl SseServer {
+        /// Start the endpoint with one body per connection and the delay.
+        ///
+        /// The accept loop outlives the return; a connection past the
+        /// last queued body is answered with a bare 500 so an
+        /// unexpected extra run still settles instead of hanging.
+        async fn start_with_delay(responses: Vec<String>, delay: std::time::Duration) -> Self {
+            // Bind here (not inside the task) so the port is known
+            // before the first request is sent.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("ephemeral bind");
+            let port = listener
+                .local_addr()
+                .expect("bound socket has an address")
+                .port();
+            let requests: Arc<std::sync::Mutex<Vec<String>>> =
+                Arc::new(std::sync::Mutex::new(Vec::new()));
+            let task_requests = Arc::clone(&requests);
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt as _;
+                let mut queue: std::collections::VecDeque<String> = responses.into();
+                loop {
+                    let Ok((mut sock, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let body = queue.pop_front();
+                    if let (Some(req), Ok(mut recorded)) =
+                        (read_http_request(&mut sock).await, task_requests.lock())
+                    {
+                        recorded.push(req);
+                    }
+                    if delay > std::time::Duration::ZERO {
+                        tokio::time::sleep(delay).await;
+                    }
+                    let bytes = body.map_or_else(
+                        || {
+                            "HTTP/1.1 500 No canned response\r\nContent-Length: 0\r\n\
+                             Connection: close\r\n\r\n"
+                                .to_string()
+                        },
+                        |body| {
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            )
+                        },
+                    );
+                    let _ = sock.write_all(bytes.as_bytes()).await;
+                }
+            });
+            Self { port, requests }
+        }
+
+        /// How many requests have reached the endpoint so far.
+        ///
+        /// Each accepted connection records exactly once, so the
+        /// count is the number of provider requests runs have made.
+        fn request_count(&self) -> usize {
+            self.requests.lock().map_or(0, |reqs| reqs.len())
+        }
+    }
+
+    /// Read one HTTP request off the socket, headers plus body.
+    ///
+    /// Returns `None` on a truncated read; the caller then records
+    /// nothing for the connection.
+    async fn read_http_request(sock: &mut tokio::net::TcpStream) -> Option<String> {
+        use tokio::io::AsyncReadExt as _;
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let header_end = loop {
+            let n = sock.read(&mut chunk).await.ok()?;
+            if n == 0 {
+                return None;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(pos) = find_header_end(&buf) {
+                break pos;
+            }
+        };
+        let headers = String::from_utf8_lossy(&buf[..header_end]).to_string();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())?
+            })
+            .unwrap_or(0);
+        let total = header_end + 4 + content_length;
+        while buf.len() < total {
+            let n = sock.read(&mut chunk).await.ok()?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        Some(String::from_utf8_lossy(&buf).into_owned())
+    }
+
+    /// The offset of the header/body boundary, if the bytes hold one.
+    fn find_header_end(buf: &[u8]) -> Option<usize> {
+        buf.windows(4).position(|w| w == b"\r\n\r\n")
+    }
+
+    /// An OpenAI-wire config pointing at the canned endpoint's port.
+    ///
+    /// The same shape as [`unreachable_config`], but live: a run
+    /// against it issues a real request the endpoint answers on its
+    /// own held-back schedule.
+    fn sse_config(port: u16) -> dch_config::DchConfig {
+        dch_config::DchConfig {
+            api: dch_config::ApiConfig {
+                api_type: ApiType::OpenAi,
+                base_url: format!("http://127.0.0.1:{port}"),
+                api_key: Some("dummy".to_string()),
+                model: "test-model".to_string(),
+                request_timeout_secs: 10,
+                ..dch_config::ApiConfig::default()
+            },
+            ..dch_config::DchConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_run_drops_submissions_queued_behind_it() {
+        // The response is held back far longer than the test runs, so
+        // the first run is provably mid-request when the cancel lands.
+        let server = SseServer::start_with_delay(
+            vec![sse_text_turn("too late")],
+            std::time::Duration::from_secs(30),
+        )
+        .await;
+        let dir = tempfile::tempdir().expect("temp workdir");
+        let runner = dch_loop::Runner::builder(&sse_config(server.port), dir.path())
+            .build()
+            .await
+            .expect("offline runner construction");
+        let cancel = runner.cancel_signal();
+        let (_, state) = TuiObserverState::new().into_observer();
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send("slow".to_string()).unwrap();
+        state.queued.fetch_add(1, Ordering::SeqCst);
+        tx.send("queued behind the cancel".to_string()).unwrap();
+        state.queued.fetch_add(1, Ordering::SeqCst);
+        drop(tx);
+
+        let driver = tokio::spawn(drive_submissions(
+            runner,
+            rx,
+            state.clone(),
+            shutdown_flag(false),
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(10), driver)
+            .await
+            .expect("the cancelled run and the drain settle promptly")
+            .expect("the driver task itself does not panic");
+
+        assert_eq!(
+            server.request_count(),
+            1,
+            "only the cancelled run reaches the provider — the submission \
+             queued behind it must never start, or one cancel resurrects \
+             the session as a fresh run"
+        );
+        assert_eq!(
+            state.queued.load(Ordering::SeqCst),
+            0,
+            "the drained submission returns the queue depth to zero"
+        );
+        {
+            let errors = state.errors.lock().unwrap();
+            assert_eq!(
+                errors.len(),
+                1,
+                "exactly the cancelled run records a failure"
+            );
+            assert_eq!(
+                errors.first().map(String::as_str),
+                Some(loopctl::error::LoopError::Cancelled.to_string().as_str()),
+                "the recorded failure is the cancellation itself, not a \
+                 provider error racing the cancel"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_run_still_runs_submissions_queued_behind_it() {
+        let runner = unreachable_runner().await;
+        let (_, state) = TuiObserverState::new().into_observer();
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send("first".to_string()).unwrap();
+        state.queued.fetch_add(1, Ordering::SeqCst);
+        tx.send("second".to_string()).unwrap();
+        state.queued.fetch_add(1, Ordering::SeqCst);
+        drop(tx);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            drive_submissions(runner, rx, state.clone(), shutdown_flag(false)),
+        )
+        .await
+        .expect("two refused runs settle without hanging");
+
+        {
+            let errors = state.errors.lock().unwrap();
+            assert_eq!(
+                errors.len(),
+                2,
+                "a failed — not cancelled — run admits the submission queued behind it"
+            );
+        }
+        assert_eq!(
+            state.queued.load(Ordering::SeqCst),
+            0,
+            "both submissions are claimed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_cancel_trip_does_not_eat_the_next_submission() {
+        let runner = unreachable_runner().await;
+        let cancel = runner.cancel_signal();
+        let (_, state) = TuiObserverState::new().into_observer();
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        // Trip the signal while nothing is running — the shape of a
+        // cancel pressed just as a run was ending. The pre-run reset
+        // must clear it, or the next submission dies instantly.
+        cancel.cancel();
+        tx.send("still runs".to_string()).unwrap();
+        state.queued.fetch_add(1, Ordering::SeqCst);
+        drop(tx);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            drive_submissions(runner, rx, state.clone(), shutdown_flag(false)),
+        )
+        .await
+        .expect("the run settles without hanging");
+
+        {
+            let errors = state.errors.lock().unwrap();
+            assert_eq!(
+                errors.len(),
+                1,
+                "the submission runs rather than being eaten by the stale trip"
+            );
+            assert_ne!(
+                errors.first().map(String::as_str),
+                Some(loopctl::error::LoopError::Cancelled.to_string().as_str()),
+                "the run must reach its provider failure, not die on a \
+                 cancel nobody pressed for it"
+            );
+        }
     }
 }
