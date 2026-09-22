@@ -439,7 +439,7 @@ impl Tool for BashTool {
                 "properties": {
                     "command": {
                         "type": "string",
-                        "description": "The command to execute"
+                        "description": "The command to execute. Required unless `operation` is used instead."
                     },
                     "background": {
                         "type": "boolean",
@@ -448,7 +448,7 @@ impl Tool for BashTool {
                     },
                     "operation": {
                         "type": "string",
-                        "description": "Special operation (omit for normal command execution)",
+                        "description": "Background-job management action; replaces `command` entirely (send only operation [+ job_id], no command).",
                         "enum": ["jobs", "job_status", "cleanup_jobs"]
                     },
                     "job_id": {
@@ -463,11 +463,7 @@ impl Tool for BashTool {
                         "maximum": 600
                     }
                 },
-                "required": [],
-                "anyOf": [
-                    {"required": ["command"]},
-                    {"required": ["operation"]}
-                ]
+                "required": ["command"]
             }),
         }
     }
@@ -1089,20 +1085,22 @@ mod tests {
             .unwrap()
             .as_array()
             .unwrap();
-        // No field is universally required: `command` runs a command, while
-        // `operation` manages background jobs and short-circuits before
-        // `command` is read. The two are alternatives, enforced by anyOf.
-        assert!(
-            required.is_empty(),
-            "required should be empty: {required:?}"
+        // `command` is the single required field. Local/small models (and the
+        // JSON-schema-to-grammar conversion used by llama.cpp-style servers)
+        // do not honour `anyOf`, and an empty `required` lets them emit `{}`.
+        // `operation`-only calls still work at runtime: dispatch_operation
+        // short-circuits before `command` is read, and the operation/job_id
+        // descriptions steer models to omit `command` for job management.
+        assert_eq!(
+            required.len(),
+            1,
+            "command must be the single required field: {required:?}"
         );
-        let any_of = schema
-            .input_schema
-            .get("anyOf")
-            .unwrap()
-            .as_array()
-            .unwrap();
-        assert_eq!(any_of.len(), 2, "anyOf should require command or operation");
+        assert_eq!(required[0], "command");
+        assert!(
+            schema.input_schema.get("anyOf").is_none(),
+            "anyOf alternatives are not understood by local models; keep it out"
+        );
     }
 
     #[test]
