@@ -743,13 +743,33 @@ impl TuiApp {
         self.permission_rx = Some(rx);
     }
 
+    /// Land one delivered request and any others already waiting
+    /// behind it.
+    ///
+    /// The run loop's select arm hands the request its wakeup
+    /// delivered plus the receiver it owns: the request enters the
+    /// queue and the receiver drains, so a burst of ready asks lands
+    /// together and the first frame's overlay reports the true
+    /// waiting count instead of admitting them one loop iteration at
+    /// a time.
+    pub fn land_permission_requests(
+        &mut self,
+        first: PermissionRequest,
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<PermissionRequest>,
+    ) {
+        self.pending_permissions.push_back(first);
+        while let Ok(request) = rx.try_recv() {
+            self.pending_permissions.push_back(request);
+        }
+    }
+
     /// Move any waiting permission requests into the queue.
     ///
-    /// The run loop's select arm is the production caller — after it
-    /// delivers the first waiting request, this drains any others
-    /// already queued behind it; tests stage requests through it
-    /// directly. A channel with nothing ready leaves the queue
-    /// untouched.
+    /// The test seam for staging asks without the run loop:
+    /// production keeps its receiver in a local and lands bursts
+    /// through [`land_permission_requests`](Self::land_permission_requests)
+    /// instead — once `run` claims the channel, this slot is empty and
+    /// the method is a no-op.
     pub fn poll_permission_requests(&mut self) {
         while let Some(request) = self
             .permission_rx
@@ -920,8 +940,10 @@ impl TuiApp {
                     }
                 } => {
                     if let Some(request) = maybe_request {
-                        self.pending_permissions.push_back(request);
-                        self.poll_permission_requests();
+                        match permission_rx.as_mut() {
+                            Some(rx) => self.land_permission_requests(request, rx),
+                            None => self.pending_permissions.push_back(request),
+                        }
                         true
                     } else {
                         // The resolver side is gone (the runner was

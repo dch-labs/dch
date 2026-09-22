@@ -4612,6 +4612,33 @@ fn other_keys_are_inert_while_a_request_is_pending() {
 }
 
 #[test]
+fn a_burst_of_ready_requests_lands_together() {
+    // Two asks are already waiting when the loop's wakeup delivers the
+    // first: one landing step must queue both, so the first frame
+    // reports the true waiting count rather than one at a time.
+    let mut app = app();
+    let (requests_tx, mut requests_rx) = tokio::sync::mpsc::unbounded_channel();
+    for (tool, prompt) in [("Bash", "first ask?"), ("WebFetch", "second ask?")] {
+        let (reply, _reply_rx) = tokio::sync::oneshot::channel();
+        requests_tx
+            .send(dch_tui::PermissionRequest {
+                tool_name: tool.to_string(),
+                prompt: prompt.to_string(),
+                reply,
+            })
+            .expect("receiver alive");
+    }
+    let first = requests_rx.try_recv().expect("the wakeup's request");
+    app.land_permission_requests(first, &mut requests_rx);
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let screen = screen_text(&terminal);
+    assert!(
+        screen.contains("first ask?") && screen.contains("1 more waiting"),
+        "the burst lands together and the count reports it: {screen}"
+    );
+}
+
+#[test]
 fn queued_requests_render_front_first() {
     let (mut app, _tx, mut replies) = permission_app(&[
         ("Bash", "Allow the first ask?"),
