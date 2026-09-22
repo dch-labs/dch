@@ -4459,6 +4459,28 @@ fn screen_text(terminal: &Terminal<TestBackend>) -> String {
 }
 
 #[test]
+fn regaining_focus_requests_a_full_repaint() {
+    // A terminal that skipped painting while its window was hidden
+    // shows stale cells on reveal; the app must answer focus-regain
+    // with the full-repaint claim the run loop clears on.
+    let mut app = app();
+    assert!(!app.handle_event(&Event::FocusLost));
+    assert!(
+        !app.take_full_repaint(),
+        "losing focus repaints nothing — the window is not visible"
+    );
+    assert!(app.handle_event(&Event::FocusGained));
+    assert!(
+        app.take_full_repaint(),
+        "regaining focus must claim a full repaint"
+    );
+    assert!(
+        !app.take_full_repaint(),
+        "the claim is one-shot — one clear, one full frame"
+    );
+}
+
+#[test]
 fn no_terminal_cursor_while_a_permission_ask_is_pending() {
     // The caret's blink is forced on first (any keypress resolidifies
     // it), so the pin reads the pending ask alone.

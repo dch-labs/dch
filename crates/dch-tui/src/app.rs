@@ -488,6 +488,16 @@ pub struct TuiApp {
     /// select arm moves requests into the queue, so between runs the
     /// slot simply holds the receiver.
     permission_rx: Option<tokio::sync::mpsc::UnboundedReceiver<PermissionRequest>>,
+
+    /// Whether the next frame must repaint in full.
+    ///
+    /// Set when the terminal regains focus: some terminals skip
+    /// painting while their window is hidden or occluded, so frames
+    /// drawn during that time leave stale cells that the incremental
+    /// diff cannot know about. The run loop claims the flag, clears
+    /// the screen, and lets the next draw repaint every cell — the
+    /// same full repaint a resize forces.
+    full_repaint_pending: bool,
 }
 
 impl TuiApp {
@@ -559,6 +569,7 @@ impl TuiApp {
             transient_notice: None,
             pending_permissions: std::collections::VecDeque::new(),
             permission_rx: None,
+            full_repaint_pending: false,
             config,
         }
     }
@@ -837,6 +848,17 @@ impl TuiApp {
         }
     }
 
+    /// Claim the pending full repaint, if one is due.
+    ///
+    /// One-shot: the caller (the run loop) owns acting on the claim —
+    /// clearing the terminal so the next frame repaints every cell
+    /// instead of diffing against a buffer the visible screen never
+    /// matched.
+    #[must_use]
+    pub fn take_full_repaint(&mut self) -> bool {
+        std::mem::take(&mut self.full_repaint_pending)
+    }
+
     /// Replace the selection copier.
     ///
     /// The instrumentation seam for the selection pins: a recorder
@@ -917,7 +939,7 @@ impl TuiApp {
         terminal.draw(|frame| self.render(frame))?;
 
         while !self.quit.requested {
-            let needs_redraw = tokio::select! {
+            let mut needs_redraw = tokio::select! {
                 maybe_event = events.recv() => {
                     match maybe_event {
                         Some(result) => match result {
@@ -957,6 +979,12 @@ impl TuiApp {
             if permission_closed {
                 permission_rx = None;
                 permission_closed = false;
+            }
+            if self.take_full_repaint() {
+                if let Err(err) = terminal.clear() {
+                    tracing::warn!("full repaint clear failed: {err}");
+                }
+                needs_redraw = true;
             }
             if needs_redraw {
                 terminal.draw(|frame| self.render(frame))?;
@@ -1041,7 +1069,11 @@ impl TuiApp {
                 true
             }
             Event::Resize(_, _) => true,
-            _ => false,
+            Event::FocusGained => {
+                self.full_repaint_pending = true;
+                true
+            }
+            Event::FocusLost => false,
         }
     }
 

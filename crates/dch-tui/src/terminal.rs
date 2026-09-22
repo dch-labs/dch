@@ -14,8 +14,9 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -38,7 +39,10 @@ static ORIGINAL_BACKGROUND: OnceLock<(u8, u8, u8)> = OnceLock::new();
 /// Initialize the terminal for a full-screen TUI session.
 ///
 /// Enables raw mode and enters the alternate screen with bracketed
-/// paste armed — paste lands as one atomic event — asks the terminal for
+/// paste armed — paste lands as one atomic event — asks for focus
+/// reporting so a window regaining focus can trigger the full repaint
+/// (some terminals skip painting while hidden and show stale cells on
+/// reveal) — asks the terminal for
 /// a blinking block cursor, which many terminals do not offer by
 /// default (terminals that ignore the style request simply keep
 /// their own) — and asks for modified-key reporting through the
@@ -67,6 +71,7 @@ pub fn init_terminal(mouse_capture: bool) -> io::Result<Terminal<CrosstermBacken
             stdout,
             EnterAlternateScreen,
             EnableBracketedPaste,
+            EnableFocusChange,
             SetCursorStyle::BlinkingBlock,
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         )?;
@@ -378,6 +383,7 @@ pub fn restore_terminal() -> io::Result<()> {
         io::stdout(),
         DisableMouseCapture,
         DisableBracketedPaste,
+        DisableFocusChange,
         PopKeyboardEnhancementFlags,
         SetCursorStyle::DefaultUserShape,
         LeaveAlternateScreen
