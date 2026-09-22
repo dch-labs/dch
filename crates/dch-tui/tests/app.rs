@@ -4779,6 +4779,98 @@ fn a_paste_behind_a_pending_prompt_lands_nowhere() {
 }
 
 #[test]
+fn a_click_behind_a_pending_prompt_leaves_the_hidden_caret_alone() {
+    // The overlay hides the composer, but a click landing where the
+    // composer sits would still move its caret — the draft would come
+    // back edited in place once the ask is answered.
+    let mut app = app();
+    app.handle_event(&Event::Paste("hello world".to_string()));
+    let (requests_tx, requests_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (reply, reply_rx) = tokio::sync::oneshot::channel();
+    requests_tx
+        .send(dch_tui::PermissionRequest {
+            tool_name: "Bash".to_string(),
+            prompt: "allow bash?".to_string(),
+            reply,
+        })
+        .expect("receiver alive");
+    app.set_permission_requests(requests_rx);
+    app.poll_permission_requests();
+
+    assert!(app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        2 + 4,
+        20,
+    )));
+
+    assert!(app.handle_event(&plain(KeyCode::Char('y'))));
+    assert_eq!(
+        reply_rx.blocking_recv(),
+        Ok(true),
+        "the prompt still answers after the swallowed click"
+    );
+    let mut answered = render_to_buffer(&mut app, 80, 24);
+    let caret = answered.backend_mut().get_cursor_position().unwrap();
+    assert_eq!(
+        (caret.x, caret.y),
+        (2 + 11, 20),
+        "the click behind the overlay never moved the draft's caret"
+    );
+}
+
+#[test]
+fn a_parked_drag_does_not_scroll_behind_a_pending_prompt() {
+    // A drag pushed against the pane's edge scrolls on every tick; an
+    // ask landing mid-push parks it, and the push never resumes once
+    // the ask is gone.
+    let mut app = app();
+    let now = chrono::Utc::now();
+    for i in 0..30 {
+        app.push_message(TuiMessage::User {
+            text: format!("line{i:02}"),
+            timestamp: now,
+        });
+    }
+    let _ = render_to_buffer(&mut app, 80, 24);
+    for _ in 0..5 {
+        app.handle_event(&wheel_event(MouseEventKind::ScrollUp));
+    }
+    let _ = render_to_buffer(&mut app, 80, 24);
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        2,
+        3,
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+        2,
+        16,
+    ));
+
+    let (requests_tx, requests_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (reply, _reply_rx) = tokio::sync::oneshot::channel();
+    requests_tx
+        .send(dch_tui::PermissionRequest {
+            tool_name: "Bash".to_string(),
+            prompt: "allow bash?".to_string(),
+            reply,
+        })
+        .expect("receiver alive");
+    app.set_permission_requests(requests_rx);
+    app.poll_permission_requests();
+
+    let before = app.scroll_offset();
+    for _ in 0..5 {
+        let _ = app.tick_wake(std::time::Instant::now());
+    }
+    assert_eq!(
+        app.scroll_offset(),
+        before,
+        "no tick scrolls the view while the ask is up or after it retires"
+    );
+}
+
+#[test]
 fn control_chords_stay_inert_behind_a_pending_prompt() {
     // The composer's own control chords — Ctrl-Enter and Ctrl-M submit,
     // Ctrl-W deletes a word — must not reach the hidden draft under the

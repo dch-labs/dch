@@ -84,8 +84,9 @@ pub enum ToolCategory {
     /// Mutates session or workflow state.
     ///
     /// `TodoWrite` replaces the shared todo list, `Submit` produces a patch
-    /// and may run tests, and `AskUserQuestion` blocks for user input. Never
-    /// read-only: the side-effects are at the session level, not the
+    /// and may run tests, `AskUserQuestion` blocks for user input, and
+    /// `Jobs` manages the background-job table — `cleanup_jobs` mutates it.
+    /// Never read-only: the side-effects are at the session level, not the
     /// filesystem, which is exactly why they evade file-based checks.
     Meta,
 
@@ -132,7 +133,7 @@ pub fn tool_category(name: &str) -> ToolCategory {
         "Write" | "Edit" | "MultiEdit" => ToolCategory::FileWrite,
         "Bash" => ToolCategory::ShellExecute,
         "WebFetch" => ToolCategory::Network,
-        "TodoWrite" | "Submit" | "AskUserQuestion" => ToolCategory::Meta,
+        "TodoWrite" | "Submit" | "AskUserQuestion" | "Jobs" => ToolCategory::Meta,
         _ => {
             warn!(tool = %name, "unclassified tool — failing closed");
             ToolCategory::Unclassified
@@ -217,6 +218,7 @@ mod tests {
         ("Edit", ToolCategory::FileWrite),
         ("MultiEdit", ToolCategory::FileWrite),
         ("Bash", ToolCategory::ShellExecute),
+        ("Jobs", ToolCategory::Meta),
         ("FileViewer", ToolCategory::FileRead),
         ("Glob", ToolCategory::FileRead),
         ("Grep", ToolCategory::FileRead),

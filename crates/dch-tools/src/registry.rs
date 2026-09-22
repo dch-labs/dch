@@ -8,6 +8,7 @@ use crate::edit::EditInput;
 use crate::file_viewer::FileViewerInput;
 use crate::glob::GlobInput;
 use crate::grep::GrepInput;
+use crate::jobs::JobsTool;
 use crate::multi_edit::MultiEditTool;
 use crate::read::ReadInput;
 use crate::todo::TodoTool;
@@ -24,6 +25,7 @@ pub fn builtin_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.register(ReadInput::default());
     registry.register(BashTool);
+    registry.register(JobsTool);
     registry.register(WriteInput::default());
     registry.register(EditInput::default());
     registry.register(MultiEditTool);

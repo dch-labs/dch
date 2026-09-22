@@ -435,10 +435,10 @@ impl RunnerBuilder<'_> {
     /// Constructs the provider client, composes the system prompt (role,
     /// tech stack detected under the workdir merged with `[project]`
     /// overrides, per-tool fragments), builds the dispatch pipeline
-    /// (context injector → host middleware → secrets redaction when enabled
-    /// → builtin tools), and — when `api.fallback_model` is configured —
-    /// arms the model fallback breaker so a failing primary is routed
-    /// around automatically.
+    /// (context injector → permission gate → host middleware → secrets
+    /// redaction when enabled → builtin tools), and — when
+    /// `api.fallback_model` is configured — arms the model fallback
+    /// breaker so a failing primary is routed around automatically.
     ///
     /// # Errors
     ///

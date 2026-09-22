@@ -1193,8 +1193,17 @@ impl TuiApp {
     /// extending the selection — one line per movement report, and
     /// one per tick while the pointer stays parked there; a press
     /// over the composer pane places its caret where it landed.
-    /// Anything else is ignored.
+    /// Anything else is ignored. While a permission ask is pending,
+    /// the overlay owns the pointer as it owns the keyboard: every
+    /// report is swallowed and any parked drag is dropped.
     fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
+        if self.pending_permissions.front().is_some() {
+            // The overlay owns the pointer as it owns the keyboard: a
+            // click behind it must not move the hidden draft's caret,
+            // and a parked drag must not keep selecting behind the sheet.
+            self.drag_position = None;
+            return true;
+        }
         match mouse.kind {
             MouseEventKind::ScrollUp => {
                 self.scroll_offset = self.scroll_offset.saturating_add(WHEEL_SCROLL_LINES);
@@ -1761,7 +1770,8 @@ impl TuiApp {
     /// spinner one frame while tools run, steps the view while a
     /// drag is parked at the conversation pane's top or bottom row —
     /// the beat that keeps an edge push scrolling between movement
-    /// reports — and flips the composer caret's blink phase on its
+    /// reports — parked outright while a permission ask is pending —
+    /// and flips the composer caret's blink phase on its
     /// own beat. An idle tick between flips and away from all of the
     /// above draws nothing.
     pub fn tick_wake(&mut self, now: Instant) -> bool {
@@ -1774,7 +1784,15 @@ impl TuiApp {
                 next
             };
         }
-        let dragged = self.drag_autoscroll();
+        let dragged = if self.pending_permissions.front().is_some() {
+            // The overlay parks the pointer: an edge push that was live
+            // when the ask landed must neither scroll behind the sheet
+            // nor resume once the ask is answered.
+            self.drag_position = None;
+            false
+        } else {
+            self.drag_autoscroll()
+        };
         let blinked = self.caret_blink.tick();
         let notice_lapsed = self
             .transient_notice
