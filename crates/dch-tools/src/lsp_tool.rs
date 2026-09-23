@@ -1,6 +1,8 @@
 //! The LSP tool — hover and go-to-definition through a language server.
 
+use std::collections::HashMap;
 use std::future::Future;
+use std::path::Path;
 use std::pin::Pin;
 
 use loopctl::tool::Tool;
@@ -22,6 +24,7 @@ use crate::lsp::client::SpawnError;
 use crate::lsp::get_server_for_file;
 use crate::lsp::pool::evict_root;
 use crate::lsp::pool::pooled_client;
+use crate::util::ResolvePolicy;
 use crate::util::is_file_url;
 use crate::util::is_url;
 use crate::util::resolve_path;
@@ -222,9 +225,20 @@ impl LspTool {
                 let definition = client.goto_definition(&document_uri, position).await?;
                 match definition {
                     Some(d) => {
-                        let locations: Vec<Value> = extract_goto_definition_locations(d)
+                        let found = extract_goto_definition_locations(d);
+                        let foreign_texts =
+                            load_foreign_texts(&found, document_uri.as_str(), &cwd, policy).await;
+                        let locations: Vec<Value> = found
                             .iter()
-                            .map(|location| location_json(location, document_uri.as_str(), &text))
+                            .map(|location| {
+                                let location_text =
+                                    if location.uri.as_str() == document_uri.as_str() {
+                                        Some(text.as_str())
+                                    } else {
+                                        foreign_texts.get(location.uri.as_str()).map(String::as_str)
+                                    };
+                                location_json(location, location_text)
+                            })
                             .collect();
                         json!({
                             "operation": "goToDefinition",
@@ -305,41 +319,152 @@ fn to_wire_position(text: &str, line: u32, character: u32) -> Position {
 /// One definition location as the tool's output JSON, 1-indexed.
 ///
 /// Lines convert back with `+1`. Characters convert from the wire's
-/// UTF-8 byte offsets back to character counts when the location points
-/// into the queried file — its text is at hand; a location in another
-/// file reports the byte offset with `+1`, since the text to convert
-/// against is not.
-fn location_json(location: &lsp_types::Location, queried_uri: &str, text: &str) -> Value {
-    let same_file = location.uri.as_str() == queried_uri;
-    json!({
+/// UTF-8 byte offsets to character counts against `text` — the
+/// location's own file, which the caller loads. Without text (the file
+/// is not local, or its path fails [`ResolvePolicy`], or the read
+/// failed) both characters fall back to 1-indexed byte offsets and the
+/// location carries `character_units: "utf-8-bytes"`, so a byte offset
+/// is never reported under the character contract unmarked.
+fn location_json(location: &lsp_types::Location, text: Option<&str>) -> Value {
+    let start = display_character(text, location.range.start);
+    let end = display_character(text, location.range.end);
+    let mut value = json!({
         "uri": location.uri.as_str(),
         "range": {
             "start": {
                 "line": location.range.start.line.saturating_add(1),
-                "character": display_character(same_file, text, location.range.start)
+                "character": start.value(),
             },
             "end": {
                 "line": location.range.end.line.saturating_add(1),
-                "character": display_character(same_file, text, location.range.end)
+                "character": end.value(),
             }
         }
-    })
+    });
+    if (start.is_byte_fallback() || end.is_byte_fallback())
+        && let Some(object) = value.as_object_mut()
+    {
+        object.insert("character_units".to_string(), json!("utf-8-bytes"));
+    }
+    value
 }
 
-/// A wire position's character as a 1-indexed character count.
+/// A converted character position, carrying the unit it counts.
 ///
-/// Converts against `text` when the location is the queried file;
-/// otherwise the byte offset passes through with `+1`.
-fn display_character(same_file: bool, text: &str, position: lsp_types::Position) -> u32 {
-    if same_file && let Some(line_text) = text.lines().nth(position.line as usize) {
+/// [`CharacterPosition::Chars`] is the tool's contract — a 1-indexed
+/// Unicode character count. [`CharacterPosition::Bytes`] is the fallback
+/// for a location whose file text could not be loaded: the wire's UTF-8
+/// byte offset shifted to 1-indexed, reported only with its marker.
+#[derive(Debug, Clone, Copy)]
+enum CharacterPosition {
+    /// A position counted in Unicode characters.
+    ///
+    /// The count of Unicode scalar values before the position on its
+    /// line, plus one — the tool's advertised contract. Produced
+    /// whenever the location's file text was loaded, which is every row
+    /// unless the fallback marker says otherwise.
+    Chars(u32),
+
+    /// A position counted in UTF-8 bytes.
+    ///
+    /// The wire's byte offset shifted to 1-indexed, reported only when
+    /// the location's file text could not be loaded. The row carries
+    /// `character_units: "utf-8-bytes"` so the differing unit is
+    /// explicit rather than implied.
+    Bytes(u32),
+}
+
+impl CharacterPosition {
+    /// The 1-indexed number, in the position's own unit.
+    ///
+    /// Callers serialize the value directly; the unit travels separately
+    /// via [`Self::is_byte_fallback`] so only fallback rows are marked.
+    fn value(self) -> u32 {
+        match self {
+            Self::Chars(n) | Self::Bytes(n) => n,
+        }
+    }
+
+    /// Whether the value counts bytes rather than characters.
+    ///
+    /// Names the [`CharacterPosition::Bytes`] fallback so callers mark
+    /// exactly the rows that need it.
+    fn is_byte_fallback(self) -> bool {
+        matches!(self, Self::Bytes(_))
+    }
+}
+
+/// A wire position's character converted against its own file's text.
+///
+/// With text, the position's UTF-8 byte offset within its line becomes
+/// a 1-indexed character count; without it — or on a line the text does
+/// not contain — the byte offset shifts to 1-indexed as the fallback.
+fn display_character(text: Option<&str>, position: lsp_types::Position) -> CharacterPosition {
+    if let Some(text) = text
+        && let Some(line_text) = text.lines().nth(position.line as usize)
+    {
         let byte = usize::try_from(position.character).unwrap_or(line_text.len());
         let chars = line_text
             .char_indices()
             .take_while(|(offset, _)| *offset < byte)
             .count();
-        return u32::try_from(chars).unwrap_or(u32::MAX).saturating_add(1);
+        let count = u32::try_from(chars).unwrap_or(u32::MAX).saturating_add(1);
+        return CharacterPosition::Chars(count);
     }
-    position.character.saturating_add(1)
+    CharacterPosition::Bytes(position.character.saturating_add(1))
+}
+
+/// The distinct URIs among `locations` other than the queried file.
+///
+/// A definition batch commonly repeats a target (one trait method fanned
+/// out per implementation); each distinct URI is read once regardless of
+/// how many locations name it. Order-preserving.
+fn distinct_foreign_uris(locations: &[lsp_types::Location], queried_uri: &str) -> Vec<String> {
+    let mut seen: Vec<&str> = Vec::new();
+    for location in locations {
+        let uri = location.uri.as_str();
+        if uri != queried_uri && !seen.contains(&uri) {
+            seen.push(uri);
+        }
+    }
+    seen.into_iter().map(String::from).collect()
+}
+
+/// Load the text of every distinct foreign file a definition batch names.
+///
+/// Each URI becomes a path, resolves against `cwd` under `policy`, and
+/// reads once. A URI that is not a local `file://` path, escapes the
+/// workspace under [`ResolvePolicy::Contained`], or fails to read is
+/// simply absent from the map — its locations fall back to marked byte
+/// offsets instead of failing the call.
+async fn load_foreign_texts(
+    locations: &[lsp_types::Location],
+    queried_uri: &str,
+    cwd: &Path,
+    policy: ResolvePolicy,
+) -> HashMap<String, String> {
+    let mut texts = HashMap::new();
+    for uri in distinct_foreign_uris(locations, queried_uri) {
+        let Ok(url) = Url::parse(&uri) else {
+            continue;
+        };
+        if url.scheme() != "file" {
+            continue;
+        }
+        let Ok(path) = url.to_file_path() else {
+            continue;
+        };
+        let Some(path) = path.to_str() else {
+            continue;
+        };
+        let Ok(resolved) = resolve_path(path, cwd, policy) else {
+            continue;
+        };
+        if let Ok(text) = tokio::fs::read_to_string(&resolved).await {
+            texts.insert(uri, text);
+        }
+    }
+    texts
 }
 
 /// Flatten a hover response into displayable text.
@@ -595,7 +720,7 @@ mod tests {
     }
 
     #[test]
-    fn same_file_locations_report_character_counts() {
+    fn locations_report_character_counts_for_loaded_text() {
         use lsp_types::Range;
         use lsp_types::Uri;
         use std::str::FromStr;
@@ -606,13 +731,124 @@ mod tests {
             uri,
             range: Range::new(Position::new(0, 14), Position::new(0, 15)),
         };
-        let same = location_json(&location, "file:///work/a.rs", text);
-        assert_eq!(same.pointer("/range/start/character"), Some(&json!(14)));
-        assert_eq!(same.pointer("/range/end/character"), Some(&json!(15)));
+        let converted = location_json(&location, Some(text));
+        assert_eq!(
+            converted.pointer("/range/start/character"),
+            Some(&json!(14))
+        );
+        assert_eq!(converted.pointer("/range/end/character"), Some(&json!(15)));
+        assert!(
+            converted.get("character_units").is_none(),
+            "a converted row carries no unit marker"
+        );
+    }
 
-        let foreign = location_json(&location, "file:///elsewhere.rs", text);
-        assert_eq!(foreign.pointer("/range/start/character"), Some(&json!(15)));
-        assert_eq!(foreign.pointer("/uri"), Some(&json!("file:///work/a.rs")));
+    #[test]
+    fn locations_without_text_fall_back_to_marked_byte_offsets() {
+        use lsp_types::Range;
+        use lsp_types::Uri;
+        use std::str::FromStr;
+
+        let uri = Uri::from_str("file:///work/a.rs").unwrap();
+        let location = lsp_types::Location {
+            uri,
+            range: Range::new(Position::new(0, 14), Position::new(0, 15)),
+        };
+        let fallback = location_json(&location, None);
+        assert_eq!(
+            fallback.pointer("/range/start/character"),
+            Some(&json!(15)),
+            "the wire byte offset shifts to 1-indexed"
+        );
+        assert_eq!(fallback.pointer("/range/end/character"), Some(&json!(16)));
+        assert_eq!(
+            fallback.get("character_units"),
+            Some(&json!("utf-8-bytes")),
+            "a fallback row names its unit"
+        );
+    }
+
+    #[test]
+    fn distinct_foreign_uris_skip_the_queried_file_and_collapse_repeats() {
+        use lsp_types::Range;
+        use lsp_types::Uri;
+        use std::str::FromStr;
+
+        let queried = "file:///work/lib.rs";
+        let make = |uri: &str| lsp_types::Location {
+            uri: Uri::from_str(uri).unwrap(),
+            range: Range::default(),
+        };
+        let locations = vec![
+            make(queried),
+            make("file:///work/other.rs"),
+            make("untitled:Untitled-1"),
+            make("file:///work/other.rs"),
+        ];
+        let uris = distinct_foreign_uris(&locations, queried);
+        assert_eq!(
+            uris,
+            vec![
+                "file:///work/other.rs".to_string(),
+                "untitled:Untitled-1".to_string()
+            ],
+            "the queried file drops out and repeats collapse"
+        );
+    }
+
+    #[tokio::test]
+    async fn foreign_texts_load_under_the_run_policy() {
+        use lsp_types::Range;
+        use lsp_types::Uri;
+        use std::str::FromStr;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let inside_text = "/* café */ pub fn add() {}\n";
+        std::fs::write(workspace.path().join("other.rs"), inside_text).unwrap();
+        std::fs::write(outside.path().join("std.rs"), "pub fn map() {}\n").unwrap();
+        let inside_uri = Url::from_file_path(workspace.path().join("other.rs"))
+            .unwrap()
+            .to_string();
+        let outside_uri = Url::from_file_path(outside.path().join("std.rs"))
+            .unwrap()
+            .to_string();
+        let make = |uri: &str| lsp_types::Location {
+            uri: Uri::from_str(uri).unwrap(),
+            range: Range::default(),
+        };
+        let locations = vec![
+            make(&inside_uri),
+            make(&inside_uri),
+            make(&outside_uri),
+            make("untitled:Untitled-1"),
+        ];
+
+        let contained = load_foreign_texts(
+            &locations,
+            "file:///work/lib.rs",
+            workspace.path(),
+            ResolvePolicy::Contained,
+        )
+        .await;
+        assert_eq!(contained.len(), 1, "only the in-workspace file loads");
+        assert_eq!(
+            contained.get(&inside_uri).map(String::as_str),
+            Some(inside_text)
+        );
+
+        let unrestricted = load_foreign_texts(
+            &locations,
+            "file:///work/lib.rs",
+            workspace.path(),
+            ResolvePolicy::Unrestricted,
+        )
+        .await;
+        assert_eq!(
+            unrestricted.len(),
+            2,
+            "the policy alone gates the out-of-workspace read"
+        );
     }
 
     #[tokio::test]
@@ -756,6 +992,32 @@ mod tests {
         dir
     }
 
+    /// A crate whose definition target lives in a second file.
+    ///
+    /// The definition sits behind multibyte content in `src/other.rs`,
+    /// so a cross-file query observes whether foreign character
+    /// positions convert against the target file's own text.
+    fn fixture_crate_with_foreign_definition() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"lsp_fixture_foreign\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            "mod other;\n\npub fn uses_other() -> i32 {\n    other::add(1, 2)\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/other.rs"),
+            "/* café */ pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n",
+        )
+        .unwrap();
+        dir
+    }
+
     /// Drive one call per attempt until `ready` accepts the output or the
     /// attempts run out.
     ///
@@ -822,6 +1084,55 @@ mod tests {
             text.contains("\"result\":[") || text.contains("\"result\": ["),
             "non-empty locations: {text}"
         );
+    }
+
+    /// Whether a goToDefinition result carries the converted foreign
+    /// location.
+    ///
+    /// The definition of `add` in `src/other.rs` starts at character 19
+    /// — after `/* café */ pub fn `, where the é makes bytes and
+    /// characters disagree; the byte fallback would report 20.
+    fn foreign_target_reports_character_counts(text: &str) -> bool {
+        let Ok(value) = serde_json::from_str::<Value>(text) else {
+            return false;
+        };
+        let Some(result) = value.get("result").and_then(Value::as_array) else {
+            return false;
+        };
+        result.iter().any(|location| {
+            location
+                .get("uri")
+                .and_then(Value::as_str)
+                .is_some_and(|uri| uri.ends_with("other.rs"))
+                && location.pointer("/range/start/character") == Some(&json!(19))
+                && location.pointer("/range/start/line") == Some(&json!(1))
+                && location.get("character_units").is_none()
+        })
+    }
+
+    #[tokio::test]
+    async fn goto_definition_converts_a_foreign_multibyte_target() {
+        if !rust_analyzer_available() {
+            return;
+        }
+        let _guard = SPAWN_GATE.lock().await;
+        let dir = fixture_crate_with_foreign_definition();
+        // `other::add(1, 2)` on line 4; the call's `add` starts at
+        // character 12.
+        let mut input = lsp_input("src/lib.rs", 4, 12);
+        input["operation"] = json!("goToDefinition");
+        let ctx = ctx_in(dir.path());
+        eventually(
+            || async {
+                LspTool
+                    .call(input.clone(), &ctx)
+                    .await
+                    .unwrap()
+                    .text_content()
+            },
+            foreign_target_reports_character_counts,
+        )
+        .await;
     }
 
     #[tokio::test]
