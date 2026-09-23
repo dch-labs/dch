@@ -219,15 +219,27 @@ fn parse_timeout(input: &Value) -> Result<u64, ToolError> {
 
 /// Parse the `format` field, rejecting values outside the schema enum.
 ///
+/// A present-but-non-string value is rejected alongside an out-of-enum
+/// string — both are malformed input and must fail loudly rather than
+/// silently fall back to the default.
+///
 /// # Errors
 ///
-/// Returns [`ToolError::InvalidInput`] when the field is present but is not
-/// exactly `markdown` or `text`.
+/// Returns [`ToolError::InvalidInput`] when the field is present but is
+/// not a string, or is not exactly `markdown` or `text`.
 fn parse_format(input: &Value) -> Result<OutputFormat, ToolError> {
-    match input.get("format").and_then(Value::as_str) {
-        None | Some("markdown") => Ok(OutputFormat::Markdown),
-        Some("text") => Ok(OutputFormat::Text),
-        Some(other) => Err(ToolError::InvalidInput(format!(
+    let Some(value) = input.get("format") else {
+        return Ok(OutputFormat::Markdown);
+    };
+    let Some(value) = value.as_str() else {
+        return Err(ToolError::InvalidInput(
+            "'format' must be a string, one of: markdown, text".to_string(),
+        ));
+    };
+    match value {
+        "markdown" => Ok(OutputFormat::Markdown),
+        "text" => Ok(OutputFormat::Text),
+        other => Err(ToolError::InvalidInput(format!(
             "'format' must be one of: markdown, text (got '{other}')"
         ))),
     }
@@ -311,19 +323,17 @@ async fn read_body_capped(response: reqwest::Response) -> Result<CappedBody, Too
 /// Render a capped body as text, marking truncation.
 ///
 /// The cut lands at the byte cap — or the body's end, whichever comes
-/// first — and backs off to a UTF-8 char boundary before the lossy
-/// conversion, so a multi-byte sequence split by the cap does not surface
-/// as a replacement character; the conversion is still lossy because a
-/// body need not be UTF-8 at all.
+/// first. A truncated body whose cap split a multi-byte character drops
+/// the character's partial bytes rather than surfacing them as a
+/// replacement character in front of the marker; a *complete* transfer
+/// that ends mid-character is invalid UTF-8 from the server, and the
+/// lossy conversion renders that honestly. The conversion is lossy in
+/// general because a body need not be UTF-8 at all.
 fn capped_body_to_text(body: &CappedBody) -> String {
     let mut cut = body.bytes.len().min(MAX_BODY_BYTES);
-    while cut > 0
-        && body
-            .bytes
-            .get(cut)
-            .is_some_and(|byte| is_continuation(*byte))
-    {
-        cut = cut.saturating_sub(1);
+    if body.truncated {
+        let kept = body.bytes.get(..cut).unwrap_or(&body.bytes);
+        cut = cut.saturating_sub(trailing_partial_char_len(kept));
     }
     let kept = body.bytes.get(..cut).unwrap_or(&body.bytes);
     let mut text = String::from_utf8_lossy(kept).into_owned();
@@ -331,6 +341,50 @@ fn capped_body_to_text(body: &CappedBody) -> String {
         write!(text, "\n[response truncated at {MAX_BODY_BYTES} bytes]").ok();
     }
     text
+}
+
+/// Length of the incomplete UTF-8 character trailing `bytes`, if any.
+///
+/// Walks back over continuation bytes — at most three, the most a valid
+/// character can have — to the candidate lead byte, and returns the
+/// lead-plus-continuations span when the lead's declared width runs past
+/// the end: those bytes belong to a character the cap cut in half, so the
+/// renderer drops them instead of lossily replacing them. Well-formed and
+/// malformed-but-unsplit tails return zero.
+fn trailing_partial_char_len(bytes: &[u8]) -> usize {
+    let len = bytes.len();
+    let mut continuations: usize = 0;
+    while continuations < 3
+        && bytes
+            .get(len.saturating_sub(continuations.saturating_add(1)))
+            .is_some_and(|byte| is_continuation(*byte))
+    {
+        continuations = continuations.saturating_add(1);
+    }
+    let lead_position = len.saturating_sub(continuations.saturating_add(1));
+    match bytes.get(lead_position) {
+        Some(&lead) if utf8_width(lead) > continuations.saturating_add(1) => {
+            continuations.saturating_add(1)
+        }
+        _ => 0,
+    }
+}
+
+/// The UTF-8 character width a lead byte declares.
+///
+/// Continuation-range bytes are not valid leads; they report one so a
+/// malformed tail — already impossible to split further — never reads as
+/// wider than it is.
+fn utf8_width(lead: u8) -> usize {
+    if lead < 0xC0 {
+        1
+    } else if lead < 0xE0 {
+        2
+    } else if lead < 0xF0 {
+        3
+    } else {
+        4
+    }
 }
 
 /// Whether `byte` is a UTF-8 continuation byte.
@@ -551,12 +605,11 @@ mod tests {
 
     #[test]
     fn test_capped_body_over_cap_truncates_at_boundary() {
-        let core = "€".repeat(400_000);
-        let mut bytes = core.into_bytes();
-        bytes.push(b'x');
-        while bytes.len() < MAX_BODY_BYTES + 50_000 {
-            bytes.extend_from_slice(b"y");
-        }
+        // The production shape of a truncated body: exactly MAX bytes, the
+        // cap having split a multi-byte character (a lone 3-byte-euro lead).
+        let mut bytes = "€".repeat(333_333).into_bytes();
+        bytes.push(0xE2);
+        assert_eq!(bytes.len(), MAX_BODY_BYTES);
         let body = CappedBody {
             bytes,
             truncated: true,
@@ -567,8 +620,33 @@ mod tests {
             "marker appended: {}",
             &text[text.len().saturating_sub(80)..]
         );
-        assert!(text.len() < MAX_BODY_BYTES + 100, "output bounded");
-        assert!(!text.contains('\u{FFFD}'), "no replacement char");
+        assert!(
+            !text.contains('\u{FFFD}'),
+            "a split character is dropped, not replaced: {}",
+            &text[text.len().saturating_sub(120)..]
+        );
+        assert!(
+            text.len() < MAX_BODY_BYTES + 100,
+            "kept bytes plus marker stay at the cap: {}",
+            text.len()
+        );
+    }
+
+    #[test]
+    fn test_capped_body_complete_transfer_mid_char_is_lossy_not_cut() {
+        // The other side of the boundary: a complete (non-truncated) body
+        // ending mid-character is invalid UTF-8 from the server — the
+        // partial character renders as a replacement, and no truncation
+        // marker is implied.
+        let mut bytes = "€".repeat(333_333).into_bytes();
+        bytes.push(0xE2);
+        let body = CappedBody {
+            bytes,
+            truncated: false,
+        };
+        let text = capped_body_to_text(&body);
+        assert!(text.contains('\u{FFFD}'), "honest lossy render");
+        assert!(!text.contains("[response truncated"), "complete transfer");
     }
 
     #[tokio::test]
@@ -602,17 +680,19 @@ mod tests {
     #[tokio::test]
     async fn test_format_value_outside_enum_rejected() {
         let tool = WebFetchTool;
-        let err = tool
-            .call(
-                json!({ "url": "https://example.com", "format": "html" }),
-                &ToolContext::default(),
-            )
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, ToolError::InvalidInput(ref s) if s.contains("markdown") && s.contains("text")),
-            "valid values named: {err:?}"
-        );
+        for bad in [json!("html"), json!(3), json!(null), json!(["markdown"])] {
+            let err = tool
+                .call(
+                    json!({ "url": "https://example.com", "format": bad }),
+                    &ToolContext::default(),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, ToolError::InvalidInput(ref s) if s.contains("markdown") && s.contains("text")),
+                "malformed format rejected: {err:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -631,8 +711,16 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_streamed_body_over_cap_truncates_with_marker() {
+    /// Serve one raw HTTP/1.1 response with `body` on a loopback listener.
+    ///
+    /// The request is drained before the socket closes — a socket dropped
+    /// with unread receive data resets the connection, which would surface
+    /// as a mid-body `ConnectionReset` on the client instead of the clean
+    /// transfer the caller is arranging.
+    async fn serve_body(
+        content_type: &'static str,
+        body: Vec<u8>,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
         use tokio::io::AsyncReadExt;
         use tokio::io::AsyncWriteExt;
         use tokio::net::TcpListener;
@@ -641,9 +729,6 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            // Drain the request before closing: a socket dropped with unread
-            // receive data resets the connection and surfaces as a mid-body
-            // ConnectionReset on the client instead of a clean end.
             let mut request = Vec::new();
             let mut buf = [0u8; 1024];
             while !request.ends_with(b"\r\n\r\n") && request.len() < 16_384 {
@@ -653,18 +738,22 @@ mod tests {
                 }
                 request.extend_from_slice(&buf[..n]);
             }
-            let body = vec![b'a'; MAX_BODY_BYTES + 50_000];
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             );
             socket.write_all(response.as_bytes()).await.ok();
-            // The client abandons the transfer once it has its capped bytes,
-            // so the tail write may fail with a broken pipe — that is the
-            // behavior under test, not an error.
+            // A client that abandons the transfer at its byte cap breaks the
+            // pipe mid-write; that is the behavior under test, not an error.
             socket.write_all(&body).await.ok();
             socket.shutdown().await.ok();
         });
+        (addr, server)
+    }
+
+    #[tokio::test]
+    async fn test_streamed_body_over_cap_truncates_with_marker() {
+        let (addr, server) = serve_body("text/plain", vec![b'a'; MAX_BODY_BYTES + 50_000]).await;
 
         let tool = WebFetchTool;
         let out = tool
@@ -682,6 +771,35 @@ mod tests {
             &text[text.len().saturating_sub(80)..]
         );
         assert!(text.len() < MAX_BODY_BYTES + 200, "bounded: {}", text.len());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_streamed_body_exactly_at_cap_is_not_truncated() {
+        // Exactly the cap, ending mid-character: the transfer completes at
+        // the boundary, so nothing was left behind — no marker — and the
+        // partial character renders as an honest replacement.
+        let mut body = "€".repeat(333_333).into_bytes();
+        body.push(0xE2);
+        assert_eq!(body.len(), MAX_BODY_BYTES);
+        let (addr, server) = serve_body("text/plain", body).await;
+
+        let tool = WebFetchTool;
+        let out = tool
+            .call(
+                json!({ "url": format!("http://{addr}/exact") }),
+                &ToolContext::default(),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.text_content());
+        let text = out.text_content();
+        assert!(
+            !text.contains("[response truncated"),
+            "exactly-at-cap is a complete transfer: {}",
+            &text[text.len().saturating_sub(80)..]
+        );
+        assert!(text.contains('\u{FFFD}'), "invalid UTF-8 renders lossily");
         server.await.unwrap();
     }
 
