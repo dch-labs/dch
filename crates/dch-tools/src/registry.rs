@@ -13,6 +13,7 @@ use crate::multi_edit::MultiEditTool;
 use crate::read::ReadInput;
 use crate::todo::TodoTool;
 use crate::tree::TreeInput;
+use crate::webfetch::WebFetchTool;
 use crate::write::WriteInput;
 
 /// Build a [`ToolRegistry`] populated with every builtin tool.
@@ -35,6 +36,7 @@ pub fn builtin_registry() -> ToolRegistry {
     registry.register(CodeSearchInput::default());
     registry.register(TreeInput::default());
     registry.register(TodoTool);
+    registry.register(WebFetchTool);
     registry
 }
 
