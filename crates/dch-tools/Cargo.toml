@@ -22,8 +22,13 @@ regex      = { workspace = true }
 same-file  = "1.0.6"
 tracing    = { workspace = true }
 lru        = { workspace = true }
+reqwest    = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
+url        = "2"
+htmd       = "0.5"
+futures    = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["net"] }
 
 [lints]
 workspace = true

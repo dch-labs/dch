@@ -34,6 +34,7 @@ pub mod todo;
 pub mod tree;
 pub mod util;
 pub mod walk;
+pub mod webfetch;
 pub mod write;
 
 pub use bash::BashTool;
@@ -64,4 +65,5 @@ pub use todo::TodoStatus;
 pub use todo::TodoTool;
 pub use tree::TreeInput;
 pub use util::ResolvePolicy;
+pub use webfetch::WebFetchTool;
 pub use write::WriteInput;
