@@ -172,6 +172,25 @@ impl RunnerContext {
         self
     }
 
+    /// Install the channel tools use to ask the user interactive questions.
+    ///
+    /// Builder-style companion to [`new`](Self::new). The sender half goes
+    /// here, where the asking tool reaches it through the shared slot; the
+    /// receiver half stays with the UI, which renders the questions and
+    /// answers each one over its response channel. Replaces any channel a
+    /// previous call installed.
+    #[must_use]
+    pub fn with_question_tx(
+        self,
+        tx: std::sync::mpsc::Sender<crate::question::QuestionRequest>,
+    ) -> Self {
+        *self
+            .question_tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tx);
+        self
+    }
+
     /// Record an observation as the model's latest known state of `path`.
     ///
     /// `path` is normalized to the map's key form before storing (see

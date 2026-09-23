@@ -8,6 +8,7 @@
 
 #![warn(missing_docs)]
 
+pub mod ask;
 pub mod bash;
 pub mod code_search;
 pub(crate) mod conflict;
@@ -37,6 +38,7 @@ pub mod walk;
 pub mod webfetch;
 pub mod write;
 
+pub use ask::AskTool;
 pub use bash::BashTool;
 pub use code_search::CodeSearchInput;
 pub use context::RunnerContext;

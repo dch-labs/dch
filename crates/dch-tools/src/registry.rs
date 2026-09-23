@@ -2,6 +2,7 @@
 
 use loopctl::tool::ToolRegistry;
 
+use crate::ask::AskTool;
 use crate::bash::BashTool;
 use crate::code_search::CodeSearchInput;
 use crate::edit::EditInput;
@@ -37,6 +38,7 @@ pub fn builtin_registry() -> ToolRegistry {
     registry.register(TreeInput::default());
     registry.register(TodoTool);
     registry.register(WebFetchTool);
+    registry.register(AskTool);
     registry
 }
 
