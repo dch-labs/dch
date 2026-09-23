@@ -10,6 +10,7 @@ use crate::file_viewer::FileViewerInput;
 use crate::glob::GlobInput;
 use crate::grep::GrepInput;
 use crate::jobs::JobsTool;
+use crate::lsp_tool::LspTool;
 use crate::multi_edit::MultiEditTool;
 use crate::read::ReadInput;
 use crate::todo::TodoTool;
@@ -39,6 +40,7 @@ pub fn builtin_registry() -> ToolRegistry {
     registry.register(TodoTool);
     registry.register(WebFetchTool);
     registry.register(AskTool);
+    registry.register(LspTool);
     registry
 }
 
