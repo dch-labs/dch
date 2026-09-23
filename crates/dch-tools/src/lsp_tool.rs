@@ -17,10 +17,12 @@ use crate::context::RunnerContext;
 use crate::context::require_cwd;
 use crate::context::runner_ctx;
 use crate::input::get_u64;
+use crate::lsp::client::RequestError;
 use crate::lsp::client::SpawnError;
 use crate::lsp::get_server_for_file;
 use crate::lsp::pool::evict_root;
 use crate::lsp::pool::pooled_client;
+use crate::util::is_file_url;
 use crate::util::is_url;
 use crate::util::resolve_path;
 
@@ -113,10 +115,11 @@ impl LspTool {
     /// fields, a URL `file_path`, a zero position, or a path escaping
     /// the workspace under the contained policy;
     /// [`ToolError::Execution`] when no server is configured for the
-    /// file's extension or the server exchange fails — the failed client
-    /// is evicted from the pool so the next call cold-starts a fresh one.
-    /// A missing file, missing server binary, or unknown operation is a
-    /// soft `is_error` result instead.
+    /// file's extension or the server exchange fails — only a transport
+    /// failure evicts the pooled client (a JSON-RPC error reply means a
+    /// healthy server), so the next call cold-starts solely when the
+    /// stream is suspect. A missing file, missing server binary, or
+    /// unknown operation is a soft `is_error` result instead.
     async fn call_inner(
         &self,
         input: Value,
@@ -140,6 +143,12 @@ impl LspTool {
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::InvalidInput("Missing 'file_path'".to_string()))?
             .to_string();
+        if is_file_url(&file_path_str) {
+            return Err(ToolError::InvalidInput(
+                "file:// URLs are not supported by the LSP tool. Pass a filesystem path instead."
+                    .to_string(),
+            ));
+        }
         if is_url(&file_path_str) {
             return Err(ToolError::InvalidInput(
                 "URLs are not supported by the LSP tool. LSP requires local files.".to_string(),
@@ -240,10 +249,11 @@ impl LspTool {
         .await;
         match exchange {
             Ok(result) => Ok(ToolOutput::text(result.to_string())),
-            Err(e) => {
+            Err(RequestError::Transport(e)) => {
                 evict_root(&cwd, &client).await;
                 Err(e)
             }
+            Err(RequestError::Server(e)) => Err(e),
         }
     }
 }
@@ -613,6 +623,19 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidInput(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn file_url_spellings_ask_for_a_filesystem_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = LspTool
+            .call(lsp_input("file:///tmp/x.rs", 1, 1), &ctx_in(tmp.path()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidInput(ref s) if s.contains("Pass a filesystem path")),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]

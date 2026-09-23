@@ -37,6 +37,44 @@ use url::Url;
 
 use super::servers::LspServerConfig;
 
+/// Why a request failed, split by what it says about the pooled server.
+///
+/// The split is operational, not cosmetic: a caller that reuses a pooled
+/// client may only discard it for [`RequestError::Transport`] — the
+/// exchange broke, so the stream may be desynced or the process dead.
+/// A [`RequestError::Server`] means the transport delivered a
+/// well-formed reply, so the pooled client stays serviceable no matter
+/// how wrong the reply was.
+#[derive(Debug)]
+pub(crate) enum RequestError {
+    /// The exchange could not complete; the pooled client is suspect.
+    ///
+    /// Write, read, framing, UTF-8, and JSON-parse failures, timeouts,
+    /// and id mismatches (a desynced stream) all land here — the caller
+    /// should evict the client so the next call cold-starts.
+    Transport(ToolError),
+
+    /// The server answered with a JSON-RPC `error` member, or a
+    /// precondition failed before anything reached the wire.
+    ///
+    /// The transport is healthy; evicting here would throw away a live
+    /// server (and its indexing) over an ordinary per-request reply.
+    Server(ToolError),
+}
+
+impl RequestError {
+    /// The tool-facing error, regardless of class.
+    ///
+    /// Both variants carry the full error; this flattens them for
+    /// surfacing to the model once the eviction decision — which must
+    /// look at the variant, not the flattened error — has been made.
+    pub(crate) fn into_error(self) -> ToolError {
+        match self {
+            Self::Transport(e) | Self::Server(e) => e,
+        }
+    }
+}
+
 /// The cap on a single incoming message's declared `Content-Length`.
 ///
 /// The header is server-controlled; without a cap, a corrupt or hostile
@@ -217,6 +255,7 @@ pub struct LspClient {
     /// The server process, retained so its pipes stay open and so `Drop`
     /// can kill it.
     process: Child,
+
     /// The server's piped stdin — requests are written here.
     ///
     /// Owned by the client so the pipe stays open for the server's
@@ -235,6 +274,7 @@ pub struct LspClient {
     /// Atomic so every request gets a distinct id without borrowing the
     /// client; responses are matched against the sent id on read.
     request_id: AtomicU32,
+
     /// Documents published to this server, by URI string, with their
     /// version counter.
     ///
@@ -304,7 +344,7 @@ impl LspClient {
         client
             .initialize(root_uri)
             .await
-            .map_err(SpawnError::Failed)?;
+            .map_err(|e| SpawnError::Failed(e.into_error()))?;
         Ok(client)
     }
 
@@ -317,10 +357,11 @@ impl LspClient {
     ///
     /// # Errors
     ///
-    /// Returns [`ToolError::Execution`] on any write, read, parse, timeout,
-    /// or id-mismatch failure, or when the response carries an error
-    /// member.
-    async fn send_request(&mut self, method: String, params: Value) -> Result<Value, ToolError> {
+    /// Returns [`RequestError::Transport`] on any write, read, parse,
+    /// timeout, or id-mismatch failure — the pooled client is suspect —
+    /// and [`RequestError::Server`] when the response carries an error
+    /// member, which leaves the client serviceable.
+    async fn send_request(&mut self, method: String, params: Value) -> Result<Value, RequestError> {
         let id = self.request_id.fetch_add(1, Ordering::SeqCst);
         let request = json!({
             "jsonrpc": "2.0",
@@ -329,29 +370,31 @@ impl LspClient {
             "params": params
         });
         let exchange = async {
-            write_framed(&mut self.stdin, &request).await?;
-            self.read_response().await
+            write_framed(&mut self.stdin, &request)
+                .await
+                .map_err(RequestError::Transport)?;
+            self.read_response().await.map_err(RequestError::Transport)
         };
         let response = match tokio::time::timeout(request_timeout(), exchange).await {
             Ok(outcome) => outcome?,
             Err(_) => {
-                return Err(ToolError::Execution(format!(
+                return Err(RequestError::Transport(ToolError::Execution(format!(
                     "LSP request '{method}' timed out after {} seconds",
                     REQUEST_TIMEOUT_SECS.load(Ordering::SeqCst)
-                )));
+                ))));
             }
         };
         if response.id != id {
-            return Err(ToolError::Execution(format!(
+            return Err(RequestError::Transport(ToolError::Execution(format!(
                 "Response ID mismatch: expected {id}, got {}",
                 response.id
-            )));
+            ))));
         }
         response.result.ok_or_else(|| {
-            ToolError::Execution(match response.error {
+            RequestError::Server(ToolError::Execution(match response.error {
                 Some(e) => format!("LSP error: {} - {}", e.code, e.message),
                 None => "LSP returned error with no message".to_string(),
-            })
+            }))
         })
     }
 
@@ -422,9 +465,9 @@ impl LspClient {
     ///
     /// # Errors
     ///
-    /// Returns [`ToolError::Execution`] when the notification write
-    /// fails.
-    pub async fn open_document(&mut self, url: &Url, text: &str) -> Result<(), ToolError> {
+    /// Returns [`RequestError::Transport`] when the notification write
+    /// fails — a notification has no reply, so only the write can fail.
+    pub async fn open_document(&mut self, url: &Url, text: &str) -> Result<(), RequestError> {
         let version = if let Some(open) = self.documents.get(url.as_str()) {
             let version = open.saturating_add(1);
             self.did_change(url, text, version).await?;
@@ -441,8 +484,8 @@ impl LspClient {
     ///
     /// # Errors
     ///
-    /// Returns [`ToolError::Execution`] when the write fails.
-    async fn did_open(&mut self, url: &Url, text: &str) -> Result<(), ToolError> {
+    /// Returns [`RequestError::Transport`] when the write fails.
+    async fn did_open(&mut self, url: &Url, text: &str) -> Result<(), RequestError> {
         let params = json!({
             "textDocument": {
                 "uri": url.as_str(),
@@ -453,14 +496,20 @@ impl LspClient {
         });
         self.send_notification("textDocument/didOpen".to_string(), params)
             .await
+            .map_err(RequestError::Transport)
     }
 
     /// Send a full-text `textDocument/didChange` for an open document.
     ///
     /// # Errors
     ///
-    /// Returns [`ToolError::Execution`] when the write fails.
-    async fn did_change(&mut self, url: &Url, text: &str, version: u32) -> Result<(), ToolError> {
+    /// Returns [`RequestError::Transport`] when the write fails.
+    async fn did_change(
+        &mut self,
+        url: &Url,
+        text: &str,
+        version: u32,
+    ) -> Result<(), RequestError> {
         let params = json!({
             "textDocument": {
                 "uri": url.as_str(),
@@ -470,6 +519,7 @@ impl LspClient {
         });
         self.send_notification("textDocument/didChange".to_string(), params)
             .await
+            .map_err(RequestError::Transport)
     }
 
     /// Complete the LSP initialization handshake.
@@ -481,11 +531,18 @@ impl LspClient {
     /// delivers the `initialized` notification that lets the server begin
     /// background work.
     ///
+    /// The handshake disables the server's workspace code execution —
+    /// build scripts, proc-macro expansion, and check-on-save — so a
+    /// read-only query never runs the workspace's `build.rs` or
+    /// proc-macro code. The accepted tradeoff: hover and definition
+    /// fidelity degrades in proc-macro-heavy crates, since macro-generated
+    /// code is not expanded.
+    ///
     /// # Errors
     ///
-    /// Returns [`ToolError::Execution`] when either half of the handshake
-    /// fails or the server's chosen position encoding is not UTF-8.
-    async fn initialize(&mut self, root_uri: &Url) -> Result<(), ToolError> {
+    /// Returns [`RequestError`] when either half of the handshake fails or
+    /// the server's chosen position encoding is not UTF-8.
+    async fn initialize(&mut self, root_uri: &Url) -> Result<(), RequestError> {
         let init_params = json!({
             "processId": null,
             "rootUri": root_uri.as_str(),
@@ -494,14 +551,20 @@ impl LspClient {
                 "textDocument": {
                     "hover": {"contentFormat": ["markdown", "plaintext"]}
                 }
+            },
+            "initializationOptions": {
+                "cargo": {"buildScripts": {"enable": false}},
+                "procMacro": {"enable": false},
+                "checkOnSave": {"enable": false}
             }
         });
         let result = self
             .send_request("initialize".to_string(), init_params)
             .await?;
-        confirm_utf8_positions(&result)?;
+        confirm_utf8_positions(&result).map_err(RequestError::Server)?;
         self.send_notification("initialized".to_string(), json!({}))
-            .await?;
+            .await
+            .map_err(RequestError::Transport)?;
         Ok(())
     }
 
@@ -539,16 +602,18 @@ impl LspClient {
     ///
     /// # Errors
     ///
-    /// Returns [`ToolError::Execution`] when the request fails.
+    /// Returns [`RequestError`] — [`RequestError::Transport`] when the
+    /// request cannot complete, [`RequestError::Server`] when the reply
+    /// carries a JSON-RPC error member.
     pub async fn hover(
         &mut self,
         url: &Url,
         position: Position,
-    ) -> Result<Option<Hover>, ToolError> {
+    ) -> Result<Option<Hover>, RequestError> {
         let params = HoverParams {
             text_document_position_params: TextDocumentPositionParams {
                 text_document: TextDocumentIdentifier {
-                    uri: document_uri(url)?,
+                    uri: document_uri(url).map_err(RequestError::Server)?,
                 },
                 position,
             },
@@ -567,16 +632,18 @@ impl LspClient {
     ///
     /// # Errors
     ///
-    /// Returns [`ToolError::Execution`] when the request fails.
+    /// Returns [`RequestError`] — [`RequestError::Transport`] when the
+    /// request cannot complete, [`RequestError::Server`] when the reply
+    /// carries a JSON-RPC error member.
     pub async fn goto_definition(
         &mut self,
         url: &Url,
         position: Position,
-    ) -> Result<Option<GotoDefinitionResponse>, ToolError> {
+    ) -> Result<Option<GotoDefinitionResponse>, RequestError> {
         let params = GotoDefinitionParams {
             text_document_position_params: TextDocumentPositionParams {
                 text_document: TextDocumentIdentifier {
-                    uri: document_uri(url)?,
+                    uri: document_uri(url).map_err(RequestError::Server)?,
                 },
                 position,
             },
@@ -822,7 +889,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn initialize_disables_workspace_code_execution() {
+        let capture = tempfile::tempdir().unwrap();
+        let log = capture.path().join("wire.log");
+        let (home, config) = fake_server(&[init_frame()], &format!("cat > '{}'", log.display()));
+        let root = Url::from_file_path(home.path()).unwrap();
+        let _client = LspClient::start(&config, &root).await.unwrap();
+        for _ in 0..40 {
+            let captured = std::fs::read_to_string(&log).unwrap_or_default();
+            if captured.contains("initializationOptions") {
+                assert!(
+                    captured.contains("\"buildScripts\":{\"enable\":false}"),
+                    "build scripts must be disabled: {captured}"
+                );
+                assert!(
+                    captured.contains("\"procMacro\":{\"enable\":false}"),
+                    "proc macros must be disabled: {captured}"
+                );
+                assert!(
+                    captured.contains("\"checkOnSave\":{\"enable\":false}"),
+                    "check-on-save must be disabled: {captured}"
+                );
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        panic!("the initialize request never disabled workspace code execution");
+    }
+
+    #[tokio::test]
     async fn a_silent_server_times_out_the_request() {
+        let _gate = crate::lsp::pool::SPAWN_GATE.lock().await;
         REQUEST_TIMEOUT_SECS.store(1, Ordering::SeqCst);
         let (home, config) = fake_server(&[init_frame()], "sleep 30");
         let root = Url::from_file_path(home.path()).unwrap();
@@ -837,9 +934,10 @@ mod tests {
         let err = bounded
             .expect("hover must resolve inside the test bound")
             .unwrap_err();
+        let message = err.into_error().to_string();
         assert!(
-            err.to_string().contains("timed out"),
-            "the timeout must surface as a typed error: {err}"
+            message.contains("timed out"),
+            "the timeout must surface as a typed error: {message}"
         );
         assert!(
             started.elapsed() < Duration::from_secs(8),

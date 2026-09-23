@@ -193,6 +193,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_server_reply_error_keeps_the_pooled_client() {
+        let gate = SPAWN_GATE.lock().await;
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().to_path_buf();
+        let root_uri = url::Url::from_file_path(&root).unwrap();
+
+        let error_frame = frame(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "error": {"code": -32602, "message": "invalid params"}
+        }));
+        let (live_home, config) = fake_server(&[init_frame(), error_frame], "sleep 2");
+        let first = pooled_client(&root, &root_uri, &config).await.unwrap();
+        {
+            let mut client = first.lock().await;
+            let err = client
+                .hover(&root_uri, Position::new(0, 0))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    crate::lsp::client::RequestError::Server(ref e)
+                        if e.to_string().contains("-32602")
+                ),
+                "a JSON-RPC error reply classifies as Server: {err:?}"
+            );
+        }
+        let second = pooled_client(&root, &root_uri, &config).await.unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a server reply error must not cost the pooled server"
+        );
+        drop(live_home);
+        drop(gate);
+    }
+
+    #[tokio::test]
     async fn an_evicted_root_cold_starts_a_fresh_server() {
         let gate = SPAWN_GATE.lock().await;
         let home = tempfile::tempdir().unwrap();
