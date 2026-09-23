@@ -49,12 +49,12 @@ pub fn mime_type_from_path(path: &Path) -> Option<&'static str> {
         .and_then(mime_type_from_extension)
 }
 
-/// Whether a string looks like an HTTP(S) URL.
+/// Whether a string looks like an HTTP(S) or `file://` URL.
 ///
 /// Used by [`reject_url`] to refuse URLs where a filesystem path is required,
 /// so a model that sends `Read` against `https://…` gets a clear redirect
 /// instead of a confusing filesystem error. Case-insensitive (`HTTP://`,
-/// `Https://` also match). Returns `false` for `file://`, `ftp://`, bare
+/// `Https://`, `FILE://` also match). Returns `false` for `ftp://`, bare
 /// paths, and empty strings.
 #[must_use]
 pub fn is_url(path: &str) -> bool {
@@ -63,20 +63,43 @@ pub fn is_url(path: &str) -> bool {
         || path
             .get(..8)
             .is_some_and(|p| p.eq_ignore_ascii_case("https://"))
+        || path
+            .get(..7)
+            .is_some_and(|p| p.eq_ignore_ascii_case("file://"))
+}
+
+/// Whether a string looks like a `file://` URL.
+///
+/// The URL spelling of a local file, case-insensitive (`FILE://` also
+/// matches). Used by [`reject_url`] to give `file://` inputs their own
+/// redirect — pass a filesystem path — since the `WebFetch` pointer that
+/// answers remote URLs cannot fetch files.
+#[must_use]
+pub fn is_file_url(path: &str) -> bool {
+    path.get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case("file://"))
 }
 
 /// Reject a URL where a filesystem path is required.
 ///
-/// Every file-touching tool guards its path arguments with this check, so a
-/// model that sends `https://…` receives a consistent error naming the tool
-/// it called and redirecting it to the web-fetch tool, rather than a
-/// confusing filesystem error.
+/// Every file-touching tool guards its path arguments with this check, so
+/// a model that sends `https://…` receives a consistent error naming the
+/// tool it called and redirecting it to the web-fetch tool, rather than a
+/// confusing filesystem error. `file://` URIs get their own message —
+/// they are local files in the wrong spelling, so the redirect asks for a
+/// filesystem path instead of pointing at the web-fetch tool.
 ///
 /// # Errors
 ///
-/// Returns [`ToolError::InvalidInput`] naming `tool` and pointing at the
-/// web-fetch tool, when `path` parses as a URL (see [`is_url`]).
+/// Returns [`ToolError::InvalidInput`] naming `tool` — pointing at the
+/// web-fetch tool when `path` is a remote URL (see [`is_url`]), or asking
+/// for a filesystem path when it is a `file://` URI (see [`is_file_url`]).
 pub fn reject_url(tool: &str, path: &str) -> Result<(), ToolError> {
+    if is_file_url(path) {
+        return Err(ToolError::InvalidInput(format!(
+            "file:// URLs are not supported by the {tool} tool. Pass a filesystem path instead."
+        )));
+    }
     if is_url(path) {
         return Err(ToolError::InvalidInput(format!(
             "URLs are not supported by the {tool} tool. Use WebFetch for URLs."
@@ -571,8 +594,13 @@ mod tests {
     }
 
     #[test]
+    fn is_url_detects_file_urls() {
+        assert!(is_url("file:///tmp/x"));
+        assert!(is_url("file://host/share"));
+    }
+
+    #[test]
     fn is_url_rejects_non_urls() {
-        assert!(!is_url("file:///tmp/x"));
         assert!(!is_url("src/main.rs"));
         assert!(!is_url("ftp://example.com"));
         assert!(!is_url(""));
@@ -583,7 +611,7 @@ mod tests {
         assert!(is_url("HTTP://example.com"));
         assert!(is_url("Https://example.com/x"));
         assert!(is_url("HtTp://localhost"));
-        assert!(!is_url("FILE://x"));
+        assert!(is_url("FILE://x"));
     }
 
     #[test]
@@ -623,7 +651,18 @@ mod tests {
         assert!(reject_url("Read", "src/main.rs").is_ok());
         assert!(reject_url("Write", "/abs/path.txt").is_ok());
         assert!(reject_url("Tree", ".").is_ok());
-        assert!(reject_url("Grep", "file:///tmp/x").is_ok());
+    }
+
+    #[test]
+    fn reject_url_refuses_file_urls() {
+        let ToolError::InvalidInput(msg) = reject_url("Grep", "file:///tmp/x").unwrap_err() else {
+            panic!("expected InvalidInput");
+        };
+        assert_eq!(
+            msg,
+            "file:// URLs are not supported by the Grep tool. Pass a filesystem path instead."
+        );
+        assert!(reject_url("Read", "FILE://x").is_err());
     }
 
     #[test]
