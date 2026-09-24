@@ -74,7 +74,8 @@ const MAX_DIFF_BYTES: usize = 1_000_000;
 /// Generous enough for a cold `cargo test` build inside the run, bounded
 /// enough that a watch-mode `npm test` or a hung suite cannot stall the
 /// turn indefinitely; the expired run lands in the soft-failure path
-/// with its partial output, and the child is killed with the future.
+/// with its partial output, and the child — with its whole process
+/// group — dies with the future.
 const TEST_RUN_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Generate a clean git patch for submission/PR.
@@ -609,12 +610,12 @@ async fn git_numstat(cwd: &str, base: &str) -> Result<(usize, usize), ToolError>
 ///
 /// The command comes from `test_command` when given, otherwise from the
 /// marker probe, and runs under the [`TEST_RUN_TIMEOUT`] budget with
-/// the child tied to the future — a cancelled turn takes the test
-/// process with it, and an expired budget kills it from this side. A
-/// command that cannot be spawned or that outlives the budget renders
-/// as a zero-count, failing result whose summary says which — the patch
-/// still produces, because a broken test setup must not block reading
-/// the diff.
+/// the child tied to the future and its whole process group behind a
+/// kill guard — a cancelled turn and an expired budget both take the
+/// runner and anything it forked down together. A command that cannot
+/// be spawned or that outlives the budget renders as a zero-count,
+/// failing result whose summary says which — the patch still produces,
+/// because a broken test setup must not block reading the diff.
 ///
 /// # Errors
 ///
@@ -623,6 +624,95 @@ async fn git_numstat(cwd: &str, base: &str) -> Result<(usize, usize), ToolError>
 /// [`Result`] shape only to match the caller's fallibility.
 async fn run_tests(cwd: &str, test_command: Option<&str>) -> Result<TestResults, ToolError> {
     run_tests_with_budget(cwd, test_command, TEST_RUN_TIMEOUT).await
+}
+
+/// Kills the spawned test command's whole process group when dropped armed.
+///
+/// `kill_on_drop` reaches only the direct `bash` child; a watch-mode
+/// runner or a test binary it forked is re-parented and would keep
+/// running in the workspace after the run ends. Starting bash as its
+/// own group leader and killing the group on drop closes that: expiry,
+/// a wait failure, and cancellation (the tool future dropped mid-run)
+/// all tear down every descendant. A completed run disarms the guard,
+/// so descendants that outlive a clean exit are left alone.
+#[cfg(unix)]
+struct ProcessGroupGuard {
+    /// The process-group id the spawned bash and its descendants share.
+    ///
+    /// The `process_group(0)` spawn made the child its own group
+    /// leader, so this is the child's pid.
+    pgid: i32,
+
+    /// Whether dropping still kills the group.
+    armed: bool,
+}
+
+#[cfg(unix)]
+impl ProcessGroupGuard {
+    /// Arm the guard for the group the spawn created.
+    fn arm(pgid: i32) -> Self {
+        Self { pgid, armed: true }
+    }
+
+    /// Build a guard that will never kill.
+    ///
+    /// For a child whose pid is already gone — no group to speak of.
+    fn disarmed() -> Self {
+        Self {
+            pgid: 0,
+            armed: false,
+        }
+    }
+
+    /// Stop the guard from killing on drop.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            // SAFETY: killpg only signals the named group; the pgid
+            // belongs to this spawn's own group, and a group that died
+            // first answers ESRCH — the outcome either way.
+            unsafe {
+                libc::killpg(self.pgid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+/// The platform fallback where process groups do not exist.
+///
+/// Keeps the same arm/disarm surface so the run path reads alike
+/// everywhere; only the direct child is torn down on these platforms,
+/// through `kill_on_drop`.
+#[cfg(not(unix))]
+#[derive(Default)]
+struct ProcessGroupGuard;
+
+#[cfg(not(unix))]
+impl ProcessGroupGuard {
+    /// Arm the guard; a no-op where no process groups exist.
+    fn arm(_pgid: i32) -> Self {
+        Self
+    }
+
+    /// Build a guard that will never kill.
+    fn disarmed() -> Self {
+        Self
+    }
+
+    /// Stop the guard from killing on drop.
+    fn disarm(&mut self) {}
+}
+
+/// The spawned child's pid as a process-group id, when it still has one.
+#[cfg(unix)]
+fn child_pgid(child: &tokio::process::Child) -> Option<i32> {
+    i32::try_from(child.id()?).ok()
 }
 
 /// [`run_tests`] with an explicit budget, so a test can shrink it.
@@ -642,12 +732,32 @@ async fn run_tests_with_budget(
 ) -> Result<TestResults, ToolError> {
     let detected = detect_test_framework(cwd).await;
     let command = test_command.unwrap_or(detected.command);
-    let spawned = tokio::process::Command::new("bash")
+    let mut process = tokio::process::Command::new("bash");
+    process
         .args(["-c", command])
         .current_dir(cwd)
-        .kill_on_drop(true)
-        .output();
-    let output = match tokio::time::timeout(budget, spawned).await {
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    {
+        process.process_group(0);
+    }
+    let Ok(child) = process.spawn() else {
+        return Ok(TestResults::not_run(
+            detected.name,
+            "Tests could not be run".to_string(),
+        ));
+    };
+    #[cfg(unix)]
+    let mut guard = match child_pgid(&child) {
+        Some(pgid) => ProcessGroupGuard::arm(pgid),
+        None => ProcessGroupGuard::disarmed(),
+    };
+    #[cfg(not(unix))]
+    let mut guard = ProcessGroupGuard::disarmed();
+    let output = match tokio::time::timeout(budget, child.wait_with_output()).await {
         Ok(Ok(output)) => output,
         Ok(Err(_)) => {
             return Ok(TestResults::not_run(
@@ -665,6 +775,7 @@ async fn run_tests_with_budget(
             ));
         }
     };
+    guard.disarm();
     let command_ok = output.status.success();
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1204,17 +1315,13 @@ mod tests {
     #[tokio::test]
     async fn a_base_naming_a_tracked_file_is_rejected_as_a_revision() {
         let repo = init_repo();
-        let out = call(
-            submit_args(&[("base", json!("committed.txt"))]),
-            repo.path(),
-        )
-        .await;
+        let out = call(submit_args(&[("base", json!("base.txt"))]), repo.path()).await;
         assert!(
             out.is_error,
             "a tracked-file base must resolve as a revision, not a pathspec"
         );
         assert!(
-            out.text_content().contains("committed.txt"),
+            out.text_content().contains("base.txt"),
             "the message names the rejected base: {}",
             out.text_content()
         );
@@ -1666,6 +1773,88 @@ error: test failed, to rerun pass `--test it`
         assert!(
             !results.is_passing(),
             "a killed run reads as Failing whatever the zero counts say"
+        );
+    }
+
+    /// A test command whose grandchild beats a file until it dies.
+    ///
+    /// The loop appends a line every fifth of a second, so liveness is
+    /// observable without racing a killed-but-unreaped zombie: a dead
+    /// grandchild is one whose beat file stops growing.
+    #[cfg(unix)]
+    fn grandchild_heartbeat(beat_file: &std::path::Path) -> String {
+        format!(
+            "sh -c 'while :; do echo x >> {}; sleep 0.2; done'",
+            beat_file.display()
+        )
+    }
+
+    /// Whether the grandchild's beat file has stopped growing.
+    ///
+    /// Waits out one beat cycle, snapshots the length, waits out
+    /// several more — a live grandchild cannot miss them all.
+    #[cfg(unix)]
+    fn heartbeat_stopped(beat_file: &std::path::Path) -> bool {
+        let len_of = |path: &std::path::Path| std::fs::metadata(path).map_or(0, |meta| meta.len());
+        std::thread::sleep(Duration::from_millis(300));
+        let first = len_of(beat_file);
+        std::thread::sleep(Duration::from_millis(800));
+        len_of(beat_file) == first
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_expired_budget_takes_the_whole_process_group_down() {
+        let repo = init_repo();
+        let beats = repo.path().join("grandchild.beats");
+        let command = grandchild_heartbeat(&beats);
+        let results = run_tests_with_budget(
+            repo.path().to_str().unwrap(),
+            Some(&command),
+            Duration::from_millis(750),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !results.is_passing(),
+            "the expired run fails: {:?}",
+            results.output_summary
+        );
+        assert!(
+            beats.exists(),
+            "the grandchild ran and beat inside the budget window"
+        );
+        assert!(
+            heartbeat_stopped(&beats),
+            "the runner's grandchild died with the process group"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cancelled_test_run_takes_the_whole_process_group_down() {
+        let repo = init_repo();
+        let beats = repo.path().join("grandchild.beats");
+        let command = grandchild_heartbeat(&beats);
+        let cwd = repo.path().to_str().unwrap().to_string();
+        let run = tokio::spawn(async move {
+            run_tests_with_budget(&cwd, Some(&command), Duration::from_secs(300)).await
+        });
+        let started = std::time::Instant::now();
+        while !beats.exists() {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the grandchild started beating"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        run.abort();
+        // Give the runtime a beat to run the cancellation — the guard's
+        // kill fires when the aborted future drops, not inside abort.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            heartbeat_stopped(&beats),
+            "cancelling the run killed the runner's whole process group"
         );
     }
 
