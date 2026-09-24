@@ -13,6 +13,7 @@ use crate::jobs::JobsTool;
 use crate::lsp_tool::LspTool;
 use crate::multi_edit::MultiEditTool;
 use crate::read::ReadInput;
+use crate::submit::SubmitTool;
 use crate::todo::TodoTool;
 use crate::tree::TreeInput;
 use crate::webfetch::WebFetchTool;
@@ -41,6 +42,7 @@ pub fn builtin_registry() -> ToolRegistry {
     registry.register(WebFetchTool);
     registry.register(AskTool);
     registry.register(LspTool);
+    registry.register(SubmitTool);
     registry
 }
 
