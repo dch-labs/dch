@@ -50,7 +50,7 @@ nodefault:
 ## release-check: Run the automatable acceptance suite against a release build
 release-check:
 	$(CARGO) build --release --bin dch $(ALL_FEATURES)
-	DCH_BIN=$(CURDIR)/target/release/dch $(CARGO) test --test release_gate $(ALL_FEATURES)
+	DCH_BIN="$$(d="$${CARGO_TARGET_DIR:-$(CURDIR)/target}"; case "$$d" in /*) ;; *) d="$(CURDIR)/$$d";; esac; printf '%s' "$$d")/release/dch" $(CARGO) test --test release_gate $(ALL_FEATURES)
 
 ## smoke: Run the real-provider and PTY-driven smoke cases (needs DCH_E2E=1)
 smoke:

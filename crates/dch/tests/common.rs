@@ -203,6 +203,29 @@ fn read_request(stream: &mut TcpStream) -> Option<String> {
     Some(String::from_utf8_lossy(&body).to_string())
 }
 
+/// Resolve the `dch` binary a scenario drives from an optional override.
+///
+/// Pure on purpose: scenarios run in parallel inside one test process,
+/// so a test that mutated the environment to check the override would
+/// bleed into concurrently spawning scenarios. `None` yields the
+/// binary cargo built alongside the test — the debug-profile one under
+/// `cargo test` — and `Some` yields exactly the given path, which is
+/// how `make release-check` drives the acceptance suite against the
+/// freshly built release binary. An override must be an absolute path:
+/// a test's working directory is the package root, not the directory
+/// the variable was set from.
+pub fn resolve_binary(override_path: Option<std::ffi::OsString>) -> PathBuf {
+    override_path.map_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_dch")), PathBuf::from)
+}
+
+/// The binary this process's spawners drive.
+///
+/// Reads the `DCH_BIN` override, if any, once per spawn and hands it
+/// to [`resolve_binary`]; see that function for the contract.
+pub fn dch_binary() -> PathBuf {
+    resolve_binary(std::env::var_os("DCH_BIN"))
+}
+
 /// An isolated environment for one acceptance scenario.
 ///
 /// Owns the canned provider endpoint, a throwaway HOME (so session
@@ -211,20 +234,6 @@ fn read_request(stream: &mut TcpStream) -> Option<String> {
 /// their effects are the assertions. The config file written at
 /// construction points `[api]` at the canned endpoint; every spawner
 /// passes it, so the binary never reads a user config.
-/// Resolve the `dch` binary a scenario drives.
-///
-/// The default is the binary cargo builds alongside the test — the
-/// debug-profile one under `cargo test`. Setting `DCH_BIN` to another
-/// binary points every spawner at it, which is how `make release-check`
-/// drives the acceptance suite against the freshly built release
-/// binary. The value must be an absolute path: a test's working
-/// directory is the package root, not the directory the variable was
-/// set from.
-pub fn dch_binary() -> PathBuf {
-    std::env::var_os("DCH_BIN")
-        .map_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_dch")), PathBuf::from)
-}
-
 pub struct Sandbox {
     /// The scripted provider endpoint this scenario runs against.
     ///
@@ -687,6 +696,142 @@ pub fn rust_analyzer_available() -> bool {
         .is_ok_and(|status| status.success())
 }
 
+/// The first index `needle` occurs at inside `haystack`, if it does.
+///
+/// Slices have no stable subslice search, and the HTTP framing this
+/// module strips is all fixed byte sequences, so one tiny finder
+/// serves every split.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// One minimal HTTP GET, returning the response body.
+///
+/// Speaks just enough HTTP for the model-listing endpoints the smoke
+/// discovery reads, against plain-`http` endpoints; a non-200 status,
+/// a connection failure, or a body that never arrives is a `None` the
+/// caller treats as "not listed here". Chunked transfer encoding —
+/// what Ollama actually answers with — is stripped before the body
+/// returns.
+fn http_get_body(host: &str, port: u16, path: &str) -> Option<String> {
+    let mut stream = TcpStream::connect((host, port)).ok()?;
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+    )
+    .ok()?;
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).ok()?;
+    let head_end = find_subslice(&raw, b"\r\n\r\n")?;
+    let head = String::from_utf8_lossy(raw.get(..head_end)?).to_lowercase();
+    let body = raw.get(head_end.checked_add(4)?..)?;
+    if !(head.starts_with("http/1.1 200") || head.starts_with("http/1.0 200")) {
+        return None;
+    }
+    if head.contains("transfer-encoding: chunked") {
+        Some(String::from_utf8_lossy(&dechunk(body)).to_string())
+    } else {
+        Some(String::from_utf8_lossy(body).to_string())
+    }
+}
+
+/// Strip HTTP chunked-transfer framing from a response body.
+///
+/// Each chunk carries its byte length as a hex line ahead of the data,
+/// terminated by a zero-length chunk. The sizes are byte counts, so the
+/// strip runs on bytes — a chunk boundary may fall inside a multi-byte
+/// character, and only the joined result is decoded.
+fn dechunk(body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut rest = body;
+    while let Some(at) = find_subslice(rest, b"\r\n") {
+        let size_end = at.saturating_add(2);
+        let Some((size_line, remainder)) = rest.get(..at).zip(rest.get(size_end..)) else {
+            break;
+        };
+        let Ok(size) = usize::from_str_radix(String::from_utf8_lossy(size_line).trim(), 16) else {
+            break;
+        };
+        if size == 0 {
+            break;
+        }
+        let Some((data, tail)) = remainder.split_at_checked(size) else {
+            break;
+        };
+        out.extend_from_slice(data);
+        rest = tail.strip_prefix(b"\r\n").unwrap_or(tail);
+    }
+    out
+}
+
+/// Split a plain-`http` base URL into host, port, and path prefix.
+///
+/// The trailing `/v1` the provider config conventionally carries is
+/// dropped, so both `http://host:port` and `http://host:port/v1`
+/// address the same root; a URL without a port assumes 80. Anything
+/// not starting `http://` is not addressable here.
+fn parse_http_base(base_url: &str) -> Option<(String, u16, String)> {
+    let rest = base_url.strip_prefix("http://")?;
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => (host, port.parse().ok()?),
+        None => (authority, 80),
+    };
+    let path = path.trim_end_matches('/');
+    let prefix = if path.is_empty() || path == "v1" {
+        String::new()
+    } else {
+        format!("/{path}")
+    };
+    Some((host.to_string(), port, prefix))
+}
+
+/// Pull the model identifiers out of one listing shape.
+///
+/// Ollama's native listing carries them under `models` keyed by
+/// `name`; the OpenAI-compatible listing under `data` keyed by `id`.
+/// Any other shape reads as an empty list.
+fn model_names(listing: &serde_json::Value, array_key: &str, id_key: &str) -> Vec<String> {
+    listing
+        .get(array_key)
+        .and_then(|entries| entries.as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry.get(id_key))
+                .filter_map(|id| id.as_str())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Ask a provider endpoint which models it offers, preferring a coder build.
+///
+/// Reads Ollama's native `/api/tags` first, then the
+/// OpenAI-compatible `/models` listing, both derived from the base
+/// URL; a model whose name carries `coder` wins over the rest, and
+/// otherwise the first listed model is the answer. `None` means the
+/// endpoint offered nothing usable — the smoke case then fails fast
+/// and names `DCH_SMOKE_MODEL` as the remedy.
+pub fn discover_model(base_url: &str) -> Option<String> {
+    let (host, port, prefix) = parse_http_base(base_url)?;
+    let ollama = http_get_body(&host, port, &format!("{prefix}/api/tags"))
+        .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
+        .map(|listing| model_names(&listing, "models", "name"));
+    let openai = http_get_body(&host, port, &format!("{prefix}/models"))
+        .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
+        .map(|listing| model_names(&listing, "data", "id"));
+    let names = ollama.or(openai)?;
+    names
+        .iter()
+        .find(|name| name.contains("coder"))
+        .cloned()
+        .or_else(|| names.first().cloned())
+}
+
 /// Initialize a git repository in `dir` with two committed baselines and
 /// one staged-but-uncommitted change.
 ///
@@ -698,6 +843,8 @@ pub fn git_fixture(dir: &Path) {
         let status = std::process::Command::new("git")
             .args(args)
             .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
             .env("GIT_AUTHOR_NAME", "Fixture")
             .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
             .env("GIT_COMMITTER_NAME", "Fixture")

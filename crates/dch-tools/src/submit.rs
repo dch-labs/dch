@@ -3,6 +3,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::process::Output as ProcessOutput;
+use std::time::Duration;
 
 use loopctl::tool::Tool;
 use loopctl::tool::ToolContext;
@@ -67,6 +68,14 @@ const DEFAULT_BASE: &str = "HEAD~1";
 /// at the same budget the Bash tool gives a command's output, and the
 /// truncation marker keeps the cut visible rather than silent.
 const MAX_DIFF_BYTES: usize = 1_000_000;
+
+/// The budget one test run gets before it is killed.
+///
+/// Generous enough for a cold `cargo test` build inside the run, bounded
+/// enough that a watch-mode `npm test` or a hung suite cannot stall the
+/// turn indefinitely; the expired run lands in the soft-failure path
+/// with its partial output, and the child is killed with the future.
+const TEST_RUN_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Generate a clean git patch for submission/PR.
 ///
@@ -292,10 +301,18 @@ struct TestResults {
 
     /// Tests reported failing.
     ///
-    /// Every renderer's pass/fail verdict derives from this count
-    /// alone; the cargo parser's status-word fold guarantees a failing
-    /// target cannot leave it at zero.
+    /// Feeds the pass/fail verdict together with [`Self::command_ok`];
+    /// the cargo parser's status-word fold guarantees a failing target
+    /// cannot leave this count at zero when summaries are printed.
     failed: usize,
+
+    /// Whether the test command itself exited zero.
+    ///
+    /// A run whose command failed — a compile error before any test
+    /// ran, a missing binary, a suite that exited non-zero without
+    /// printing a parseable summary — is failing whatever the parsed
+    /// counts say, so the verdict reads this alongside `failed`.
+    command_ok: bool,
 
     /// Tests reported skipped.
     ///
@@ -315,6 +332,37 @@ struct TestResults {
     /// Rendered when the counts are zero and the output is not, so the
     /// evidence behind a numberless run stays visible.
     output_summary: String,
+}
+
+impl TestResults {
+    /// Whether the run's verdict reads Passing.
+    ///
+    /// Both halves must hold: the command exited zero, and no test
+    /// failed — a parse that saw no failures cannot rescue a command
+    /// that crashed before running them, and a clean exit cannot rescue
+    /// failures the parser did count.
+    fn is_passing(&self) -> bool {
+        self.command_ok && self.failed == 0
+    }
+
+    /// A zero-count result for a command that produced no output.
+    ///
+    /// Covers a command that could not be spawned and one that
+    /// outlived its budget and was killed; `summary` says which, and
+    /// [`Self::command_ok`] carries the failure so the verdict reads
+    /// Failing while the counts stay honestly at zero.
+    fn not_run(framework: &str, summary: String) -> Self {
+        Self {
+            framework: framework.to_string(),
+            total: 0,
+            passed: 0,
+            failed: 0,
+            skipped: 0,
+            command_ok: false,
+            failures: Vec::new(),
+            output_summary: summary,
+        }
+    }
 }
 
 /// The test runner a project's marker files imply.
@@ -380,7 +428,7 @@ async fn generate_patch(
     }
 
     let diff_content = git_diff_content(cwd, base_commit).await?;
-    let (additions, deletions) = parse_diff_stats(&diff_content);
+    let (additions, deletions) = git_numstat(cwd, base_commit).await?;
     let test_results = if include_tests {
         Some(run_tests(cwd, test_command).await?)
     } else {
@@ -440,7 +488,18 @@ enum GitFiles {
 /// Returns [`ToolError::Execution`] only when the `git` process itself
 /// cannot be spawned; git's own non-zero exits land in [`GitFiles`].
 async fn git_changed_files(cwd: &str, base: &str) -> Result<GitFiles, ToolError> {
-    let output = git_output(cwd, &["diff", "--name-only", base]).await?;
+    let output = git_output(
+        cwd,
+        &[
+            "diff",
+            "--name-only",
+            "--no-color",
+            "--no-ext-diff",
+            base,
+            "--",
+        ],
+    )
+    .await?;
     if !output.status.success() {
         return Ok(GitFiles::Failed(
             String::from_utf8_lossy(&output.stderr).trim().to_string(),
@@ -456,9 +515,13 @@ async fn git_changed_files(cwd: &str, base: &str) -> Result<GitFiles, ToolError>
 
 /// Read the diff `git diff <base>` produces, capped in size.
 ///
-/// A non-zero exit yields an empty body — the changed-files listing has
-/// already succeeded, so the rare failure here renders as a patch with no
-/// diff hunks rather than an error. A body larger than
+/// The invocation is config-independent — no colors, no external diff
+/// drivers — so what is parsed is what git itself computed, and the
+/// trailing `--` forces `base` to resolve as a revision: a base naming
+/// a tracked file errors instead of silently diffing that path against
+/// the index. A non-zero exit yields an empty body — the changed-files
+/// listing has already succeeded, so the rare failure here renders as a
+/// patch with no diff hunks rather than an error. A body larger than
 /// [`MAX_DIFF_BYTES`] is cut with a visible truncation marker so a
 /// lockfile-scale diff cannot flood the conversation.
 ///
@@ -467,7 +530,7 @@ async fn git_changed_files(cwd: &str, base: &str) -> Result<GitFiles, ToolError>
 /// Returns [`ToolError::Execution`] when the `git` binary cannot be
 /// spawned.
 async fn git_diff_content(cwd: &str, base: &str) -> Result<String, ToolError> {
-    let output = git_output(cwd, &["diff", base]).await?;
+    let output = git_output(cwd, &["diff", "--no-color", "--no-ext-diff", base, "--"]).await?;
     if !output.status.success() {
         return Ok(String::new());
     }
@@ -493,29 +556,65 @@ async fn git_output(cwd: &str, args: &[&str]) -> Result<ProcessOutput, ToolError
         .map_err(|e| ToolError::Execution(format!("Failed to run git {args:?}: {e}")))
 }
 
-/// Count added and removed lines in a unified diff.
+/// Sum added and removed lines from `git diff --numstat <base>`.
 ///
-/// `+++`/`---` file headers are excluded so only hunk content counts;
-/// any other line punctuation leaves both counters untouched.
-fn parse_diff_stats(diff: &str) -> (usize, usize) {
+/// The line totals come from git's own tabular count rather than the
+/// rendered body, so they are correct whatever the body's size cap cut
+/// away and whatever a hunk's content lines start with — a removed line
+/// beginning `--` counts as removed here, where body-derived counting
+/// would mistake it for a file header. Binary changes report `-` in
+/// both columns and contribute nothing, having no lines to count.
+///
+/// # Errors
+///
+/// Returns [`ToolError::Execution`] when the `git` binary cannot be
+/// spawned; git's own non-zero exits yield empty totals, matching the
+/// empty body [`git_diff_content`] produces for the same condition.
+async fn git_numstat(cwd: &str, base: &str) -> Result<(usize, usize), ToolError> {
+    let output = git_output(
+        cwd,
+        &[
+            "diff",
+            "--numstat",
+            "--no-color",
+            "--no-ext-diff",
+            base,
+            "--",
+        ],
+    )
+    .await?;
+    if !output.status.success() {
+        return Ok((0, 0));
+    }
     let mut additions: usize = 0;
     let mut deletions: usize = 0;
-    for line in diff.lines() {
-        if line.starts_with('+') && !line.starts_with("+++") {
-            additions = additions.saturating_add(1);
-        } else if line.starts_with('-') && !line.starts_with("---") {
-            deletions = deletions.saturating_add(1);
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut columns = line.split('\t');
+        let (Some(added), Some(removed), Some(_)) =
+            (columns.next(), columns.next(), columns.next())
+        else {
+            continue;
+        };
+        if let Ok(added) = added.parse::<usize>() {
+            additions = additions.saturating_add(added);
+        }
+        if let Ok(removed) = removed.parse::<usize>() {
+            deletions = deletions.saturating_add(removed);
         }
     }
-    (additions, deletions)
+    Ok((additions, deletions))
 }
 
 /// Run the project's tests and parse the output.
 ///
 /// The command comes from `test_command` when given, otherwise from the
-/// marker probe. A command that cannot even be spawned renders as a
-/// zero-count result carrying "Tests could not be run" — the patch still
-/// produces, because a broken test setup must not block reading the diff.
+/// marker probe, and runs under the [`TEST_RUN_TIMEOUT`] budget with
+/// the child tied to the future — a cancelled turn takes the test
+/// process with it, and an expired budget kills it from this side. A
+/// command that cannot be spawned or that outlives the budget renders
+/// as a zero-count, failing result whose summary says which — the patch
+/// still produces, because a broken test setup must not block reading
+/// the diff.
 ///
 /// # Errors
 ///
@@ -523,32 +622,56 @@ fn parse_diff_stats(diff: &str) -> (usize, usize) {
 /// the zero-count result instead, and the framework carries the
 /// [`Result`] shape only to match the caller's fallibility.
 async fn run_tests(cwd: &str, test_command: Option<&str>) -> Result<TestResults, ToolError> {
+    run_tests_with_budget(cwd, test_command, TEST_RUN_TIMEOUT).await
+}
+
+/// [`run_tests`] with an explicit budget, so a test can shrink it.
+///
+/// Same contract as [`run_tests`]; the production entry point always
+/// passes [`TEST_RUN_TIMEOUT`], and the tests pass a fraction of a
+/// second to drive the expiry path without waiting for it.
+///
+/// # Errors
+///
+/// Never fails in practice, matching [`run_tests`]: the spawn-failure
+/// and expiry paths produce results rather than errors.
+async fn run_tests_with_budget(
+    cwd: &str,
+    test_command: Option<&str>,
+    budget: Duration,
+) -> Result<TestResults, ToolError> {
     let detected = detect_test_framework(cwd).await;
     let command = test_command.unwrap_or(detected.command);
-    let output = tokio::process::Command::new("bash")
+    let spawned = tokio::process::Command::new("bash")
         .args(["-c", command])
         .current_dir(cwd)
-        .output()
-        .await;
-    let combined = match output {
-        Ok(output) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            format!("{stdout}\n{stderr}")
+        .kill_on_drop(true)
+        .output();
+    let output = match tokio::time::timeout(budget, spawned).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(_)) => {
+            return Ok(TestResults::not_run(
+                detected.name,
+                "Tests could not be run".to_string(),
+            ));
         }
         Err(_) => {
-            return Ok(TestResults {
-                framework: detected.name.to_string(),
-                total: 0,
-                passed: 0,
-                failed: 0,
-                skipped: 0,
-                failures: Vec::new(),
-                output_summary: "Tests could not be run".to_string(),
-            });
+            return Ok(TestResults::not_run(
+                detected.name,
+                format!(
+                    "Tests did not finish within {} seconds and were killed",
+                    budget.as_secs()
+                ),
+            ));
         }
     };
-    Ok(parse_test_results(&combined, detected.name))
+    let command_ok = output.status.success();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}\n{stderr}");
+    let mut results = parse_test_results(&combined, detected.name);
+    results.command_ok = command_ok;
+    Ok(results)
 }
 
 /// Probe the project's marker files for its test runner.
@@ -611,6 +734,7 @@ fn parse_test_results(output: &str, framework: &str) -> TestResults {
         passed: 0,
         failed: usize::from(output.contains("FAIL")),
         skipped: 0,
+        command_ok: true,
         failures: Vec::new(),
         output_summary: truncate_output(output, 500),
     }
@@ -665,6 +789,7 @@ fn parse_cargo_test_results(output: &str) -> Option<TestResults> {
         passed,
         failed,
         skipped,
+        command_ok: true,
         failures,
         output_summary: truncate_output(output, 500),
     })
@@ -716,6 +841,7 @@ fn parse_jest_results(output: &str) -> Option<TestResults> {
         passed,
         failed,
         skipped: 0,
+        command_ok: true,
         failures,
         output_summary: truncate_output(output, 500),
     })
@@ -784,7 +910,7 @@ fn format_github_patch(
         output.push('\n');
     }
     if let Some(results) = test_results {
-        let status = if results.failed == 0 {
+        let status = if results.is_passing() {
             "Passing"
         } else {
             "Failing"
@@ -858,6 +984,12 @@ fn format_git_patch(
         if !results.failures.is_empty() {
             write!(output, " ({})", results.failures.join(", ")).ok();
         }
+        write!(
+            output,
+            " [{}]",
+            if results.is_passing() { "ok" } else { "FAILED" }
+        )
+        .ok();
         output.push('\n');
     }
     output.push_str("\n---\n\n");
@@ -880,7 +1012,7 @@ fn format_summary(
     writeln!(output, "  Files: {}", files.len()).ok();
     writeln!(output, "  +{additions} / -{deletions}").ok();
     if let Some(results) = test_results {
-        let status = if results.failed == 0 {
+        let status = if results.is_passing() {
             "[PASS]"
         } else {
             "[FAIL]"
@@ -964,14 +1096,20 @@ mod tests {
         dir
     }
 
-    /// Run one `git` command in `dir` with a fixed identity.
+    /// Run one `git` command in `dir` with a fixed identity and no
+    /// inherited configuration.
     ///
-    /// The fixed author and committer keep fixture commits reproducible
-    /// across environments; a command that fails aborts the test.
+    /// Pointing the global and system config at `/dev/null` keeps the
+    /// fixture commits immune to the developer's real setup — a signing
+    /// requirement or a hooks path in the global config would otherwise
+    /// fail or hang these commits on some machines. A command that
+    /// fails aborts the test.
     fn git(dir: &std::path::Path, args: &[&str]) {
         let status = std::process::Command::new("git")
             .args(args)
             .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
             .env("GIT_AUTHOR_NAME", "Fixture")
             .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
             .env("GIT_COMMITTER_NAME", "Fixture")
@@ -979,6 +1117,26 @@ mod tests {
             .status()
             .expect("git spawns");
         assert!(status.success(), "git {args:?} failed: {status}");
+    }
+
+    #[tokio::test]
+    async fn fixture_git_ignores_the_developers_global_config() {
+        let guard = loopctl::testing::EnvGuard::acquire(&["GIT_CONFIG_GLOBAL"]);
+        let poison = tempfile::tempdir().unwrap();
+        std::fs::write(
+            poison.path().join("gitconfig"),
+            "[commit]\n\tgpgsign = true\n",
+        )
+        .unwrap();
+        guard.set(
+            "GIT_CONFIG_GLOBAL",
+            poison.path().join("gitconfig").to_str().unwrap(),
+        );
+        let repo = init_repo();
+        assert!(
+            repo.path().join(".git").join("HEAD").is_file(),
+            "the fixture commits landed despite a global config demanding signatures"
+        );
     }
 
     /// Call the tool once and unwrap the engine result.
@@ -1001,14 +1159,65 @@ mod tests {
         assert_eq!(DiffFormat::from_str(""), DiffFormat::Unified);
     }
 
-    #[test]
-    fn diff_stats_count_additions_and_deletions() {
-        let headers_only = "--- a/file.rs\n+++ b/file.rs\n";
-        assert_eq!(parse_diff_stats(headers_only), (0, 0));
-        let balanced = "--- a/f\n+++ b/f\n@@\n-old\n+new\n ctx\n";
-        assert_eq!(parse_diff_stats(balanced), (1, 1));
-        let skewed = "--- a/f\n+++ b/f\n@@\n+a\n+b\n+c\n+d\n+e\n-x\n-y\n-z\n";
-        assert_eq!(parse_diff_stats(skewed), (5, 3));
+    #[tokio::test]
+    async fn numstat_totals_come_from_the_full_diff_not_the_capped_body() {
+        let repo = init_repo();
+        std::fs::write(repo.path().join("large.txt"), "x".repeat(1_050_000)).unwrap();
+        std::fs::write(repo.path().join("small.txt"), "one line\n").unwrap();
+        git(repo.path(), &["add", "."]);
+        let github = call(submit_args(&[("base", json!("HEAD"))]), repo.path())
+            .await
+            .text_content();
+        assert!(
+            github.contains("(truncated)"),
+            "the rendered body is capped: {github}"
+        );
+        let (additions, deletions) = git_numstat(repo.path().to_str().unwrap(), "HEAD")
+            .await
+            .unwrap();
+        assert_eq!(
+            additions, 3,
+            "changed.txt, large.txt, and small.txt each count although the body lost the tail"
+        );
+        assert_eq!(deletions, 0);
+        assert!(
+            github.contains("**+3 additions / -0 deletions**"),
+            "the rendered statistics carry the full totals: {github}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_binary_change_contributes_no_line_counts() {
+        let repo = init_repo();
+        std::fs::write(repo.path().join("blob.bin"), [0u8, 159, 146, 150]).unwrap();
+        git(repo.path(), &["add", "blob.bin"]);
+        let (additions, deletions) = git_numstat(repo.path().to_str().unwrap(), "HEAD")
+            .await
+            .unwrap();
+        assert_eq!(
+            additions, 1,
+            "only changed.txt counts; the binary reports no lines"
+        );
+        assert_eq!(deletions, 0);
+    }
+
+    #[tokio::test]
+    async fn a_base_naming_a_tracked_file_is_rejected_as_a_revision() {
+        let repo = init_repo();
+        let out = call(
+            submit_args(&[("base", json!("committed.txt"))]),
+            repo.path(),
+        )
+        .await;
+        assert!(
+            out.is_error,
+            "a tracked-file base must resolve as a revision, not a pathspec"
+        );
+        assert!(
+            out.text_content().contains("committed.txt"),
+            "the message names the rejected base: {}",
+            out.text_content()
+        );
     }
 
     #[test]
@@ -1432,6 +1641,54 @@ error: test failed, to rerun pass `--test it`
             results.output_summary, "Tests could not be run",
             "the soft result says so in its summary"
         );
+        assert!(
+            !results.is_passing(),
+            "a command that never ran cannot read as Passing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_test_run_past_its_budget_is_killed_and_reports_failing() {
+        let repo = init_repo();
+        let results = run_tests_with_budget(
+            repo.path().to_str().unwrap(),
+            Some("sleep 30"),
+            Duration::from_millis(500),
+        )
+        .await
+        .unwrap();
+        assert_eq!(results.total, 0, "the expired run counts nothing");
+        assert!(
+            results.output_summary.contains("did not finish within"),
+            "the summary names the timeout: {}",
+            results.output_summary
+        );
+        assert!(
+            !results.is_passing(),
+            "a killed run reads as Failing whatever the zero counts say"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_command_reports_failing_even_when_no_counts_parse() {
+        let repo = init_repo();
+        let out = call(
+            submit_args(&[(
+                "test_command",
+                json!("echo 'error: could not compile `fixture`' ; exit 1"),
+            )]),
+            repo.path(),
+        )
+        .await;
+        let text = out.text_content();
+        assert!(
+            text.contains("**Status**: Failing"),
+            "the exit status decides when the parser saw nothing: {text}"
+        );
+        assert!(
+            text.contains("error: could not compile"),
+            "the raw output stays visible as the evidence: {text}"
+        );
     }
 
     #[tokio::test]
@@ -1484,6 +1741,7 @@ error: test failed, to rerun pass `--test it`
             passed: 0,
             failed: 12,
             skipped: 0,
+            command_ok: true,
             failures: names,
             output_summary: String::new(),
         };

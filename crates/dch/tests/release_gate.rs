@@ -365,26 +365,113 @@ fn at22_accept_edits_headless_denies_shell() {
 }
 
 #[test]
-fn the_scenario_binary_resolves_the_cargo_build_by_default() {
-    let env = loopctl::testing::EnvGuard::acquire(&["DCH_BIN"]);
-    env.remove("DCH_BIN");
+fn the_scenario_binary_resolves_the_cargo_build_without_an_override() {
     assert_eq!(
-        common::dch_binary(),
+        common::resolve_binary(None),
         std::path::PathBuf::from(env!("CARGO_BIN_EXE_dch")),
-        "without an override every scenario drives the cargo-built binary"
+        "no override drives the cargo-built binary"
     );
 }
 
 #[test]
-fn the_scenario_binary_honors_the_release_override() {
-    let env = loopctl::testing::EnvGuard::acquire(&["DCH_BIN"]);
-    // The override points at the same debug binary so concurrently
-    // running scenarios stay unaffected; only the resolution is pinned.
-    env.set("DCH_BIN", env!("CARGO_BIN_EXE_dch"));
+fn the_scenario_binary_yields_an_override_verbatim() {
     assert_eq!(
-        common::dch_binary(),
-        std::path::PathBuf::from(env!("CARGO_BIN_EXE_dch")),
-        "a set DCH_BIN redirects every spawner to that binary"
+        common::resolve_binary(Some(std::ffi::OsString::from("/opt/dch-release/dch"))),
+        std::path::PathBuf::from("/opt/dch-release/dch"),
+        "the override path reaches the spawners unchanged"
+    );
+}
+
+#[test]
+fn model_discovery_prefers_a_coder_build_from_the_listing() {
+    let server = common::CannedServer::sse(vec![
+        r#"{"models":[{"name":"llama4:8b"},{"name":"qwen3-coder:30b"},{"name":"gemma4:12b"}]}"#
+            .to_string(),
+    ]);
+    let model = common::discover_model(&format!("http://127.0.0.1:{}", server.port()))
+        .expect("the tags listing parses");
+    assert_eq!(
+        model, "qwen3-coder:30b",
+        "the coder build wins over the first-listed model"
+    );
+}
+
+#[test]
+fn model_discovery_falls_back_to_the_openai_listing() {
+    let server = common::CannedServer::sse(vec![
+        "not a tags listing".to_string(),
+        r#"{"data":[{"id":"mixtral-8x7b"},{"id":"small-coder"}]}"#.to_string(),
+    ]);
+    let model = common::discover_model(&format!("http://127.0.0.1:{}/v1", server.port()))
+        .expect("the fallback listing parses");
+    assert_eq!(
+        model, "small-coder",
+        "the OpenAI shape lists by id and still prefers a coder build"
+    );
+}
+
+#[test]
+fn model_discovery_reads_a_chunked_listing() {
+    use std::io::Read as _;
+    use std::io::Write as _;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
+    let port = listener.local_addr().expect("address").port();
+    let listing = r#"{"models":[{"name":"qwen9-coder:1b"}]}"#;
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("a discovery request");
+        let mut scratch = [0u8; 1024];
+        let mut request = Vec::new();
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let Ok(count) = stream.read(&mut scratch) else {
+                break;
+            };
+            if count == 0 {
+                break;
+            }
+            request.extend_from_slice(scratch.get(..count).unwrap_or_default());
+        }
+        assert!(
+            request.starts_with(b"GET /api/tags"),
+            "the discovery request fully arrived before the response closes the socket"
+        );
+        let half = listing.len() / 2;
+        let first = listing.get(..half).expect("first chunk");
+        let second = listing.get(half..).expect("second chunk");
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\
+             Connection: close\r\n\r\n{:x}\r\n{first}\r\n{:x}\r\n{second}\r\n0\r\n\r\n",
+            first.len(),
+            second.len()
+        );
+        stream.write_all(response.as_bytes()).expect("listing sent");
+    });
+    let model = common::discover_model(&format!("http://127.0.0.1:{port}"))
+        .expect("the chunked listing parses");
+    handle.join().expect("server thread finishes");
+    assert_eq!(
+        model, "qwen9-coder:1b",
+        "the chunk framing is stripped before the JSON parses"
+    );
+}
+
+#[test]
+fn git_fixture_ignores_the_developers_global_config() {
+    let sb = Sandbox::sse(vec![sse_text_turn("unused")]);
+    let env = loopctl::testing::EnvGuard::acquire(&["GIT_CONFIG_GLOBAL"]);
+    let poison = tempfile::tempdir().expect("poison dir");
+    std::fs::write(
+        poison.path().join("gitconfig"),
+        "[commit]\n\tgpgsign = true\n",
+    )
+    .expect("poison config written");
+    env.set(
+        "GIT_CONFIG_GLOBAL",
+        poison.path().join("gitconfig").to_str().expect("utf8 path"),
+    );
+    git_fixture(sb.workdir());
+    assert!(
+        sb.workdir().join(".git").join("HEAD").is_file(),
+        "the fixture commits landed despite a global config demanding signatures"
     );
 }
 

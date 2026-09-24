@@ -62,7 +62,10 @@ async fn at1_real_provider_answers() {
     }
     let base_url =
         std::env::var("DCH_SMOKE_BASE_URL").unwrap_or_else(|_| "http://localhost:11434/v1".into());
-    let model = std::env::var("DCH_SMOKE_MODEL").unwrap_or_else(|_| "qwen2.5-coder".into());
+    let model = std::env::var("DCH_SMOKE_MODEL").ok().unwrap_or_else(|| {
+        common::discover_model(&base_url)
+            .unwrap_or_else(|| panic!("no model discoverable at {base_url}; set DCH_SMOKE_MODEL"))
+    });
     let mut config = dch_config::DchConfig::default();
     config.api.api_type = dch_config::ApiType::OpenAi;
     config.api.base_url = base_url;
@@ -75,20 +78,17 @@ async fn at1_real_provider_answers() {
         .build()
         .await
         .expect("runner builds against the live provider");
-    let started = std::time::Instant::now();
-    let run = runner
-        .run("Reply with exactly the word: ready")
-        .await
-        .expect("the live provider answers");
+    let run = tokio::time::timeout(
+        Duration::from_secs(300),
+        runner.run("Reply with exactly the word: ready"),
+    )
+    .await
+    .expect("the live provider answers inside the 300-second boot deadline")
+    .expect("the run completes against the live provider");
     let answer = runner.session_turn_outputs().join("\n");
     assert!(
         answer.to_lowercase().contains("ready"),
         "the live answer arrived: {answer}"
-    );
-    assert!(
-        started.elapsed() < Duration::from_secs(120),
-        "a boot smoke must complete without hanging, took {:?}",
-        started.elapsed()
     );
     assert!(!run.turns.is_empty(), "at least one turn ran");
 }
