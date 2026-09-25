@@ -1481,6 +1481,29 @@ mod tests {
             "the leading rows survive the cut"
         );
         assert_eq!(omitted, 1);
+
+        let skipped_parent: lsp_types::DocumentSymbolResponse = serde_json::from_value(json!([{
+            "name": "outer",
+            "kind": 23,
+            "range": range,
+            "selectionRange": range,
+            "children": [{
+                "name": "mid",
+                "kind": 23,
+                "range": range,
+                "selectionRange": range,
+                "children": [
+                    {"name": "leaf", "kind": 8, "range": range, "selectionRange": range}
+                ]
+            }]
+        }]))
+        .unwrap();
+        let (rows, omitted) = normalize_symbols(skipped_parent, 1);
+        assert_eq!(rows.len(), 1, "the cap holds only the outermost row");
+        assert_eq!(
+            omitted, 2,
+            "a skipped parent's descendants still count toward the cut"
+        );
     }
 
     #[tokio::test]
@@ -2342,6 +2365,22 @@ mod tests {
         assert!(!lines.contains(&1), "the declaration drops out: {text}");
     }
 
+    /// The 1-indexed start lines of an implementations envelope's rows.
+    ///
+    /// A live implementations answer's row order is not guaranteed, so
+    /// the test compares line sets rather than sequences; `None` means
+    /// the envelope was empty or unparseable and the poll must
+    /// continue.
+    fn implementation_lines(text: &str) -> Option<Vec<u64>> {
+        let value: Value = serde_json::from_str(text).ok()?;
+        let rows = value.pointer("/result")?.as_array()?;
+        let mut lines = Vec::new();
+        for row in rows {
+            lines.push(row.pointer("/range/start/line")?.as_u64()?);
+        }
+        Some(lines)
+    }
+
     #[tokio::test]
     async fn implementations_list_the_trait_impl() {
         if !rust_analyzer_available() {
@@ -2358,14 +2397,16 @@ mod tests {
                 let query = input.clone();
                 LspTool.call(query, &ctx).await.unwrap().text_content()
             },
-            |text| {
-                text.contains("\"operation\":\"implementations\"")
-                    && (text.contains("\"result\":[") || text.contains("\"result\": ["))
-            },
+            |text| implementation_lines(text).is_some_and(|lines| lines.contains(&19)),
         )
         .await;
         let text = LspTool.call(input, &ctx).await.unwrap().text_content();
-        assert!(text.contains("lib.rs"), "the impl lives in lib.rs: {text}");
+        let lines = implementation_lines(&text).expect("parseable envelope");
+        assert!(!lines.is_empty(), "a live answer lists the impl: {text}");
+        assert!(
+            lines.contains(&19),
+            "`impl Shape for Unit` starts on line 19: {text}"
+        );
     }
 
     #[tokio::test]
