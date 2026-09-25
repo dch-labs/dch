@@ -767,11 +767,11 @@ fn document_symbol_envelope(
             "message": "No symbols found in this document",
         });
     };
-    let rows: Vec<Value> = normalize_symbols(response)
+    let (symbols, omitted) = cap_rows(normalize_symbols(response), MAX_DOCUMENT_SYMBOLS);
+    let rows: Vec<Value> = symbols
         .iter()
         .map(|symbol| symbol_row(symbol, text))
         .collect();
-    let (rows, omitted) = cap_rows(rows, MAX_DOCUMENT_SYMBOLS);
     let mut envelope = json!({
         "operation": "documentSymbol",
         "file_path": file_path,
@@ -1374,6 +1374,47 @@ mod tests {
             200
         );
         assert_eq!(exact.get("omitted"), None, "an at-cap outline is not cut");
+    }
+
+    #[test]
+    fn nested_outlines_count_descendants_toward_the_cap() {
+        let range = json!({
+            "start": {"line": 0, "character": 0},
+            "end": {"line": 0, "character": 3}
+        });
+        let children: Vec<Value> = (0..204)
+            .map(|index| {
+                json!({
+                    "name": format!("inner{index}"),
+                    "kind": 8,
+                    "range": range,
+                    "selectionRange": range
+                })
+            })
+            .collect();
+        let reply = json!([{
+            "name": "outer",
+            "kind": 23,
+            "range": range,
+            "selectionRange": range,
+            "children": children
+        }]);
+        let response: lsp_types::DocumentSymbolResponse = serde_json::from_value(reply).unwrap();
+        let envelope = document_symbol_envelope("src/lib.rs", Some(response), "fn add() {}\n");
+        assert_eq!(
+            envelope
+                .pointer("/result")
+                .and_then(Value::as_array)
+                .unwrap()
+                .len(),
+            200,
+            "one parent plus two hundred four children cap at two hundred"
+        );
+        assert_eq!(
+            envelope.get("omitted"),
+            Some(&json!(5)),
+            "the cut counts every flattened descendant, not top-level symbols: {envelope}"
+        );
     }
 
     #[tokio::test]
