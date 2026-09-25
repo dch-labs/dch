@@ -492,6 +492,8 @@ async fn git_changed_files(cwd: &str, base: &str) -> Result<GitFiles, ToolError>
     let output = git_output(
         cwd,
         &[
+            "-c",
+            "core.quotePath=false",
             "diff",
             "--name-only",
             "--no-color",
@@ -517,21 +519,34 @@ async fn git_changed_files(cwd: &str, base: &str) -> Result<GitFiles, ToolError>
 /// Read the diff `git diff <base>` produces, capped in size.
 ///
 /// The invocation is config-independent — no colors, no external diff
-/// drivers — so what is parsed is what git itself computed, and the
-/// trailing `--` forces `base` to resolve as a revision: a base naming
-/// a tracked file errors instead of silently diffing that path against
-/// the index. A non-zero exit yields an empty body — the changed-files
-/// listing has already succeeded, so the rare failure here renders as a
-/// patch with no diff hunks rather than an error. A body larger than
-/// [`MAX_DIFF_BYTES`] is cut with a visible truncation marker so a
-/// lockfile-scale diff cannot flood the conversation.
+/// drivers, no octal path quoting — so what is parsed is what git
+/// itself computed, and the trailing `--` forces `base` to resolve as a
+/// revision: a base naming a tracked file errors instead of silently
+/// diffing that path against the index. A non-zero exit yields an empty
+/// body — the changed-files listing has already succeeded, so the rare
+/// failure here renders as a patch with no diff hunks rather than an
+/// error. A body larger than [`MAX_DIFF_BYTES`] is cut with a visible
+/// truncation marker so a lockfile-scale diff cannot flood the
+/// conversation.
 ///
 /// # Errors
 ///
 /// Returns [`ToolError::Execution`] when the `git` binary cannot be
 /// spawned.
 async fn git_diff_content(cwd: &str, base: &str) -> Result<String, ToolError> {
-    let output = git_output(cwd, &["diff", "--no-color", "--no-ext-diff", base, "--"]).await?;
+    let output = git_output(
+        cwd,
+        &[
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            base,
+            "--",
+        ],
+    )
+    .await?;
     if !output.status.success() {
         return Ok(String::new());
     }
@@ -575,6 +590,8 @@ async fn git_numstat(cwd: &str, base: &str) -> Result<(usize, usize), ToolError>
     let output = git_output(
         cwd,
         &[
+            "-c",
+            "core.quotePath=false",
             "diff",
             "--numstat",
             "--no-color",
@@ -1324,6 +1341,27 @@ mod tests {
             out.text_content().contains("base.txt"),
             "the message names the rejected base: {}",
             out.text_content()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_ascii_file_name_renders_unquoted_in_the_patch() {
+        let repo = init_repo();
+        std::fs::write(repo.path().join("日本語.txt"), "first\n").unwrap();
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-m", "unicode name"]);
+        std::fs::write(repo.path().join("日本語.txt"), "second\n").unwrap();
+        git(repo.path(), &["add", "日本語.txt"]);
+        let github = call(submit_args(&[("base", json!("HEAD"))]), repo.path())
+            .await
+            .text_content();
+        assert!(
+            github.contains("日本語.txt"),
+            "the literal name reaches the reader: {github}"
+        );
+        assert!(
+            !github.contains("\\346"),
+            "no octal-escaped path bytes survive: {github}"
         );
     }
 
