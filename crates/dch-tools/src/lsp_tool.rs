@@ -652,7 +652,7 @@ fn hover_envelope(
 /// reported; over it, the leading rows survive and the count of the
 /// rest comes back for the caller's `omitted` field. Generic over the
 /// row type so location lists can bound before their foreign texts
-/// load and symbol lists can bound after formatting.
+/// load.
 fn cap_rows<T>(rows: Vec<T>, cap: usize) -> (Vec<T>, usize) {
     let omitted = rows.len().saturating_sub(cap);
     if omitted == 0 {
@@ -692,41 +692,56 @@ struct OutlineSymbol {
     container: Option<String>,
 }
 
-/// Normalize a documentSymbol reply into flat outline rows.
+/// Normalize a documentSymbol reply into capped flat outline rows.
 ///
 /// A flat reply passes through, keeping its `containerName`; a
 /// hierarchical reply flattens recursively with each row's container
 /// set to its parent's name. Both wire shapes produce identical rows,
 /// so the envelope never depends on which one the server chose.
-fn normalize_symbols(response: lsp_types::DocumentSymbolResponse) -> Vec<OutlineSymbol> {
+/// Traversal holds at most `cap` rows and counts every further symbol,
+/// so an oversized reply never allocates its full outline; the
+/// returned pair is the retained rows and the omitted count.
+fn normalize_symbols(
+    response: lsp_types::DocumentSymbolResponse,
+    cap: usize,
+) -> (Vec<OutlineSymbol>, usize) {
     use lsp_types::DocumentSymbolResponse;
     match response {
-        DocumentSymbolResponse::Flat(infos) => infos
-            .into_iter()
-            .map(|info| OutlineSymbol {
-                name: info.name,
-                kind: info.kind,
-                range: info.location.range,
-                container: info.container_name,
-            })
-            .collect(),
+        DocumentSymbolResponse::Flat(infos) => {
+            let omitted = infos.len().saturating_sub(cap);
+            let rows = infos
+                .into_iter()
+                .take(cap)
+                .map(|info| OutlineSymbol {
+                    name: info.name,
+                    kind: info.kind,
+                    range: info.location.range,
+                    container: info.container_name,
+                })
+                .collect();
+            (rows, omitted)
+        }
         DocumentSymbolResponse::Nested(symbols) => {
             let mut rows = Vec::new();
-            flatten_symbols(symbols, None, &mut rows);
-            rows
+            let mut omitted = 0;
+            flatten_symbols(symbols, None, cap, &mut rows, &mut omitted);
+            (rows, omitted)
         }
     }
 }
 
 /// Flatten hierarchical symbols into `rows`, naming each row's parent.
 ///
-/// Depth-first in document order: every symbol emits a row, then its
+/// Depth-first in document order: every symbol counts, then its
 /// children do, each child's container the name of the symbol that
-/// contains it.
+/// contains it. Rows accumulate only while fewer than `cap` are held;
+/// symbols past the cap add to `omitted` without being built.
 fn flatten_symbols(
     symbols: Vec<lsp_types::DocumentSymbol>,
     parent: Option<&str>,
+    cap: usize,
     rows: &mut Vec<OutlineSymbol>,
+    omitted: &mut usize,
 ) {
     for symbol in symbols {
         let lsp_types::DocumentSymbol {
@@ -736,24 +751,29 @@ fn flatten_symbols(
             children,
             ..
         } = symbol;
-        rows.push(OutlineSymbol {
-            container: parent.map(String::from),
-            name: name.clone(),
-            kind,
-            range,
-        });
+        if rows.len() < cap {
+            rows.push(OutlineSymbol {
+                container: parent.map(String::from),
+                name: name.clone(),
+                kind,
+                range,
+            });
+        } else {
+            *omitted = omitted.saturating_add(1);
+        }
         if let Some(children) = children {
-            flatten_symbols(children, Some(name.as_str()), rows);
+            flatten_symbols(children, Some(name.as_str()), cap, rows, omitted);
         }
     }
 }
 
 /// The envelope for a documentSymbol reply.
 ///
-/// Rows normalize through [`normalize_symbols`] and cap at
-/// [`MAX_DOCUMENT_SYMBOLS`]; a cut reports the dropped count as
-/// `omitted`. The position-free query carries no `line`/`character`
-/// echo.
+/// Rows normalize through [`normalize_symbols`] with the
+/// [`MAX_DOCUMENT_SYMBOLS`] cap applied mid-traversal — an oversized
+/// outline never allocates past the cap — and a cut reports the
+/// dropped count as `omitted`. The position-free query carries no
+/// `line`/`character` echo.
 fn document_symbol_envelope(
     file_path: &str,
     response: Option<lsp_types::DocumentSymbolResponse>,
@@ -767,7 +787,7 @@ fn document_symbol_envelope(
             "message": "No symbols found in this document",
         });
     };
-    let (symbols, omitted) = cap_rows(normalize_symbols(response), MAX_DOCUMENT_SYMBOLS);
+    let (symbols, omitted) = normalize_symbols(response, MAX_DOCUMENT_SYMBOLS);
     let rows: Vec<Value> = symbols
         .iter()
         .map(|symbol| symbol_row(symbol, text))
@@ -1417,6 +1437,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn symbol_normalization_holds_the_cap_while_counting_further_symbols() {
+        let range = json!({
+            "start": {"line": 0, "character": 0},
+            "end": {"line": 0, "character": 5}
+        });
+        let nested: lsp_types::DocumentSymbolResponse = serde_json::from_value(json!([{
+            "name": "outer",
+            "kind": 23,
+            "range": range,
+            "selectionRange": range,
+            "children": [
+                {"name": "first", "kind": 8, "range": range, "selectionRange": range},
+                {"name": "second", "kind": 8, "range": range, "selectionRange": range}
+            ]
+        }]))
+        .unwrap();
+        let (rows, omitted) = normalize_symbols(nested, 2);
+        assert_eq!(rows.len(), 2, "only the cap's worth of rows is held");
+        assert_eq!(rows[0].name, "outer");
+        assert_eq!(rows[1].name, "first");
+        assert_eq!(
+            rows[1].container.as_deref(),
+            Some("outer"),
+            "a retained descendant still names its parent"
+        );
+        assert_eq!(
+            omitted, 1,
+            "a symbol past the cap counts without becoming a row"
+        );
+
+        let flat: lsp_types::DocumentSymbolResponse = serde_json::from_value(json!([
+            {"name": "a", "kind": 12, "location": {"uri": "file:///work/lib.rs", "range": range}},
+            {"name": "b", "kind": 12, "location": {"uri": "file:///work/lib.rs", "range": range}},
+            {"name": "c", "kind": 12, "location": {"uri": "file:///work/lib.rs", "range": range}}
+        ]))
+        .unwrap();
+        let (rows, omitted) = normalize_symbols(flat, 2);
+        assert_eq!(
+            rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(),
+            ["a", "b"],
+            "the leading rows survive the cut"
+        );
+        assert_eq!(omitted, 1);
+    }
+
     #[tokio::test]
     async fn an_empty_location_list_and_an_absent_answer_render_differently() {
         let uri = Url::from_file_path("/work/lib.rs").unwrap();
@@ -1557,8 +1623,9 @@ mod tests {
             }]
         }]))
         .unwrap();
-        let rows = normalize_symbols(nested);
+        let (rows, omitted) = normalize_symbols(nested, MAX_DOCUMENT_SYMBOLS);
         assert_eq!(rows.len(), 3, "every level becomes a row");
+        assert_eq!(omitted, 0, "an under-cap outline omits nothing");
         assert_eq!(rows[0].name, "outer");
         assert_eq!(rows[0].container, None);
         assert_eq!(rows[1].container.as_deref(), Some("outer"));
@@ -1574,9 +1641,10 @@ mod tests {
             "containerName": "mod"
         }]))
         .unwrap();
-        let rows = normalize_symbols(flat);
+        let (rows, omitted) = normalize_symbols(flat, MAX_DOCUMENT_SYMBOLS);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].container.as_deref(), Some("mod"));
+        assert_eq!(omitted, 0);
     }
 
     #[test]
