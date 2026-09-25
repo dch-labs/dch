@@ -51,7 +51,10 @@ const MAX_DOCUMENT_SYMBOLS: usize = 200;
 /// alive per project root; other file types are not configured and fail
 /// with a clear error. Queries never mutate files, and calls against
 /// different roots are independent, so the tool is read-only and safe
-/// to run concurrently.
+/// to run concurrently. Result rows may name paths outside the
+/// workspace — the sysroot and registry behind library items — while
+/// the resolve policy still gates reading them: an out-of-policy
+/// target reports marked byte offsets and never its contents.
 pub struct LspTool;
 
 impl Tool for LspTool {
@@ -1084,9 +1087,10 @@ fn marked_string_text(marked: lsp_types::MarkedString) -> String {
 
 /// Flatten a definition response into plain locations.
 ///
-/// `LocationLink` responses carry their target range outside the
-/// `Location` shape; they map to the target URI with a default range,
-/// which preserves where the definition lives at the cost of the span.
+/// `LocationLink` responses carry their target outside the `Location`
+/// shape; they map to the target URI with the link's target selection
+/// range, which preserves both where the target lives and the span of
+/// its name.
 fn extract_goto_definition_locations(
     response: lsp_types::GotoDefinitionResponse,
 ) -> Vec<lsp_types::Location> {
@@ -1098,7 +1102,7 @@ fn extract_goto_definition_locations(
             .into_iter()
             .map(|link| lsp_types::Location {
                 uri: link.target_uri,
-                range: lsp_types::Range::default(),
+                range: link.target_selection_range,
             })
             .collect(),
     }
@@ -1448,6 +1452,45 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn an_out_of_policy_target_names_itself_but_never_loads() {
+        use lsp_types::Range;
+        use lsp_types::Uri;
+        use std::str::FromStr;
+
+        let queried = Url::from_file_path("/work/lib.rs").unwrap();
+        let foreign = lsp_types::Location {
+            uri: Uri::from_str("file:///elsewhere/other.rs").unwrap(),
+            range: Range::new(Position::new(0, 7), Position::new(0, 10)),
+        };
+        let envelope = location_envelope(
+            LocationQuery {
+                operation: "references",
+                file_path: "src/lib.rs",
+                line: 1,
+                character: 1,
+                empty_message: "none",
+                found: Some(vec![foreign]),
+            },
+            &queried,
+            "fn add() {}\n",
+            std::path::Path::new("/work"),
+            ResolvePolicy::Contained,
+        )
+        .await;
+        let row = envelope.pointer("/result/0").expect("one row");
+        assert_eq!(
+            row.get("uri"),
+            Some(&json!("file:///elsewhere/other.rs")),
+            "the row still names where the target lives: {envelope}"
+        );
+        assert_eq!(
+            row.get("character_units"),
+            Some(&json!("utf-8-bytes")),
+            "without the file's text the row falls back to marked bytes: {envelope}"
+        );
+    }
+
     #[test]
     fn hierarchical_symbols_flatten_with_container_names() {
         let range = json!({
@@ -1585,15 +1628,19 @@ mod tests {
         ]);
         assert_eq!(extract_goto_definition_locations(array).len(), 2);
 
+        let selection = Range::new(Position::new(2, 5), Position::new(2, 9));
         let link = GotoDefinitionResponse::Link(vec![LocationLink {
             origin_selection_range: None,
             target_uri: uri,
-            target_range: Range::default(),
-            target_selection_range: Range::default(),
+            target_range: Range::new(Position::new(1, 0), Position::new(3, 0)),
+            target_selection_range: selection,
         }]);
         let locations = extract_goto_definition_locations(link);
         assert_eq!(locations.len(), 1);
-        assert_eq!(locations[0].range, Range::default());
+        assert_eq!(
+            locations[0].range, selection,
+            "a link keeps its target selection range, not the enclosing range"
+        );
     }
 
     #[test]
