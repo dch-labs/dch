@@ -1,4 +1,4 @@
-//! The LSP tool — hover and go-to-definition through a language server.
+//! The LSP tool — code intelligence through a language server.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -29,13 +29,29 @@ use crate::util::is_file_url;
 use crate::util::is_url;
 use crate::util::resolve_path;
 
+/// The cap on a location-list result.
+///
+/// A hot symbol's reference list can reach hundreds of rows; every row
+/// is context the model pays for, so the envelope keeps the first
+/// [`MAX_LOCATION_RESULTS`] and reports the rest as an `omitted` count
+/// for the model to narrow against.
+const MAX_LOCATION_RESULTS: usize = 50;
+
+/// The cap on a documentSymbol outline.
+///
+/// An outline row is cheaper than a location row, but a large file's
+/// full outline is still context-hostile; the same cut-and-report
+/// contract applies at a wider bound.
+const MAX_DOCUMENT_SYMBOLS: usize = 200;
+
 /// Language Server Protocol operations for code intelligence.
 ///
-/// Provides hover and go-to-definition for Rust files through a
-/// rust-analyzer process kept alive per project root; other file types
-/// are not configured and fail with a clear error. Queries never mutate
-/// files, and calls against different roots are independent, so the tool
-/// is read-only and safe to run concurrently.
+/// Provides hover, go-to-definition, references, implementations, and
+/// document symbols for Rust files through a rust-analyzer process kept
+/// alive per project root; other file types are not configured and fail
+/// with a clear error. Queries never mutate files, and calls against
+/// different roots are independent, so the tool is read-only and safe
+/// to run concurrently.
 pub struct LspTool;
 
 impl Tool for LspTool {
@@ -45,8 +61,8 @@ impl Tool for LspTool {
 
     fn description(&self) -> &'static str {
         "Language Server Protocol for code intelligence. Provides \
-         go-to-definition and hover information for Rust files via \
-         rust-analyzer."
+         go-to-definition, hover, references, implementations, and \
+         document symbols for Rust files via rust-analyzer."
     }
 
     fn schema(&self) -> ToolSchema {
@@ -58,7 +74,13 @@ impl Tool for LspTool {
                 "properties": {
                     "operation": {
                         "type": "string",
-                        "enum": ["goToDefinition", "hover"],
+                        "enum": [
+                            "goToDefinition",
+                            "hover",
+                            "references",
+                            "implementations",
+                            "documentSymbol"
+                        ],
                         "description": "The LSP operation to perform"
                     },
                     "file_path": {
@@ -67,16 +89,20 @@ impl Tool for LspTool {
                     },
                     "line": {
                         "type": "integer",
-                        "description": "Line number (1-indexed)",
+                        "description": "Line number (1-indexed); required for goToDefinition, hover, references, and implementations, ignored by documentSymbol",
                         "minimum": 1
                     },
                     "character": {
                         "type": "integer",
-                        "description": "Character position within the line, counted in Unicode characters (1-indexed)",
+                        "description": "Character position within the line, counted in Unicode characters (1-indexed); required for goToDefinition, hover, references, and implementations, ignored by documentSymbol",
                         "minimum": 1
+                    },
+                    "include_declaration": {
+                        "type": "boolean",
+                        "description": "For references only: include the symbol's declaration site in the results. Defaults to true; ignored by other operations"
                     }
                 },
-                "required": ["operation", "file_path", "line", "character"]
+                "required": ["operation", "file_path"]
             }),
         }
     }
@@ -100,10 +126,15 @@ impl Tool for LspTool {
 
     fn system_prompt(&self) -> Option<String> {
         Some(
-            "Use the LSP tool for precise code navigation: goToDefinition to resolve \
-              a symbol's definition, hover to inspect its type and documentation. \
-              Only Rust files (rust-analyzer) are supported. Positions are \
-              1-indexed; characters are counted in Unicode characters."
+            "Use the LSP tool for precise code navigation: goToDefinition \
+              to resolve a symbol's definition, hover to inspect its type \
+              and documentation, references to list a symbol's usages \
+              (semantic hits — prefer it over Grep for call sites), \
+              implementations to list a trait or type's implementors, \
+              documentSymbol to outline a file's symbols and orient in a \
+              large file faster than reading it. Only Rust files \
+              (rust-analyzer) are supported. Positions are 1-indexed; \
+              characters are counted in Unicode characters."
                 .to_string(),
         )
     }
@@ -115,32 +146,28 @@ impl LspTool {
     /// # Errors
     ///
     /// Returns [`ToolError::InvalidInput`] for missing or malformed
-    /// fields, a URL `file_path`, a zero position, or a path escaping
-    /// the workspace under the contained policy;
-    /// [`ToolError::Execution`] when no server is configured for the
-    /// file's extension or the server exchange fails — only a transport
-    /// failure evicts the pooled client (a JSON-RPC error reply means a
-    /// healthy server), so the next call cold-starts solely when the
-    /// stream is suspect. A missing file, missing server binary, or
-    /// unknown operation is a soft `is_error` result instead.
+    /// fields — a missing operation, a URL `file_path`, a missing or
+    /// zero position on a position-bearing operation, a non-boolean
+    /// `include_declaration`, or a path escaping the workspace under
+    /// the contained policy; [`ToolError::Execution`] when no server is
+    /// configured for the file's extension or the server exchange
+    /// fails — only a transport failure evicts the pooled client (a
+    /// JSON-RPC error reply means a healthy server), so the next call
+    /// cold-starts solely when the stream is suspect. A missing file,
+    /// missing server binary, or unknown operation is a soft `is_error`
+    /// result instead.
     async fn call_inner(
         &self,
         input: Value,
         runner: Option<RunnerContext>,
     ) -> Result<ToolOutput, ToolError> {
-        let operation = input
-            .get("operation")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidInput("Missing 'operation'".to_string()))?
-            .to_string();
-        match operation.as_str() {
-            "hover" | "goToDefinition" => {}
-            other => {
-                return Ok(ToolOutput::error_text(format!(
-                    "Unknown operation: {other}"
-                )));
+        let operation = match parse_operation(&input) {
+            Ok(operation) => operation,
+            Err(OperationError::Unknown(name)) => {
+                return Ok(ToolOutput::error_text(format!("Unknown operation: {name}")));
             }
-        }
+            Err(OperationError::Structural(error)) => return Err(error),
+        };
         let file_path_str = input
             .get("file_path")
             .and_then(Value::as_str)
@@ -157,8 +184,6 @@ impl LspTool {
                 "URLs are not supported by the LSP tool. LSP requires local files.".to_string(),
             ));
         }
-        let line = parse_position(&input, "line")?;
-        let character = parse_position(&input, "character")?;
 
         let cwd = require_cwd(runner.clone())?;
         let policy = runner
@@ -198,64 +223,81 @@ impl LspTool {
         let text = tokio::fs::read_to_string(&full_path)
             .await
             .map_err(|e| ToolError::Execution(format!("Failed to read {file_path_str}: {e}")))?;
-        let position = to_wire_position(&text, line, character);
         let exchange = async {
             let mut client = client.lock().await;
             client.open_document(&document_uri, &text).await?;
-            let result = if operation.as_str() == "hover" {
-                let hover = client.hover(&document_uri, position).await?;
-                match hover {
-                    Some(h) => json!({
-                        "operation": "hover",
-                        "file_path": file_path_str,
-                        "line": line,
-                        "character": character,
-                        "result": extract_hover_content(h)
-                    }),
-                    None => json!({
-                        "operation": "hover",
-                        "file_path": file_path_str,
-                        "line": line,
-                        "character": character,
-                        "result": null,
-                        "message": "No hover information available at this location"
-                    }),
+            let result = match operation {
+                Operation::Hover { line, character } => {
+                    let position = to_wire_position(&text, line, character);
+                    let hover = client.hover(&document_uri, position).await?;
+                    hover_envelope(&file_path_str, line, character, hover)
                 }
-            } else {
-                let definition = client.goto_definition(&document_uri, position).await?;
-                match definition {
-                    Some(d) => {
-                        let found = extract_goto_definition_locations(d);
-                        let foreign_texts =
-                            load_foreign_texts(&found, document_uri.as_str(), &cwd, policy).await;
-                        let locations: Vec<Value> = found
-                            .iter()
-                            .map(|location| {
-                                let location_text =
-                                    if location.uri.as_str() == document_uri.as_str() {
-                                        Some(text.as_str())
-                                    } else {
-                                        foreign_texts.get(location.uri.as_str()).map(String::as_str)
-                                    };
-                                location_json(location, location_text)
-                            })
-                            .collect();
-                        json!({
-                            "operation": "goToDefinition",
-                            "file_path": file_path_str,
-                            "line": line,
-                            "character": character,
-                            "result": locations
-                        })
-                    }
-                    None => json!({
-                        "operation": "goToDefinition",
-                        "file_path": file_path_str,
-                        "line": line,
-                        "character": character,
-                        "result": null,
-                        "message": "No definition found at this location"
-                    }),
+                Operation::GoToDefinition { line, character } => {
+                    let position = to_wire_position(&text, line, character);
+                    let response = client.goto_definition(&document_uri, position).await?;
+                    location_envelope(
+                        LocationQuery {
+                            operation: "goToDefinition",
+                            file_path: &file_path_str,
+                            line,
+                            character,
+                            empty_message: "No definition found at this location",
+                            found: response.map(extract_goto_definition_locations),
+                        },
+                        &document_uri,
+                        &text,
+                        &cwd,
+                        policy,
+                    )
+                    .await
+                }
+                Operation::References {
+                    line,
+                    character,
+                    include_declaration,
+                } => {
+                    let position = to_wire_position(&text, line, character);
+                    let found = client
+                        .references(&document_uri, position, include_declaration)
+                        .await?;
+                    location_envelope(
+                        LocationQuery {
+                            operation: "references",
+                            file_path: &file_path_str,
+                            line,
+                            character,
+                            empty_message: "No references found at this location",
+                            found,
+                        },
+                        &document_uri,
+                        &text,
+                        &cwd,
+                        policy,
+                    )
+                    .await
+                }
+                Operation::Implementations { line, character } => {
+                    let position = to_wire_position(&text, line, character);
+                    let response = client.implementations(&document_uri, position).await?;
+                    location_envelope(
+                        LocationQuery {
+                            operation: "implementations",
+                            file_path: &file_path_str,
+                            line,
+                            character,
+                            empty_message: "No implementations found at this location",
+                            found: response.map(extract_goto_definition_locations),
+                        },
+                        &document_uri,
+                        &text,
+                        &cwd,
+                        policy,
+                    )
+                    .await
+                }
+                Operation::DocumentSymbol => {
+                    let response = client.document_symbol(&document_uri).await?;
+                    document_symbol_envelope(&file_path_str, response, &text)
                 }
             };
             Ok(result)
@@ -269,6 +311,535 @@ impl LspTool {
             }
             Err(RequestError::Server(e)) => Err(e),
         }
+    }
+}
+
+/// The operation named in the input, with its per-operation fields.
+///
+/// Parsing validates the schema's per-operation contract once — which
+/// operations require a position, what `references` reads — so dispatch
+/// matches a total enum instead of re-checking strings, and the
+/// contract has a single unit-testable seam.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Operation {
+    /// Hover markup for the symbol at a position.
+    ///
+    /// The query the server answers with type and documentation
+    /// markup; an empty answer keeps the envelope's standing message
+    /// instead of an empty list.
+    Hover {
+        /// The 1-indexed line the hover is requested at.
+        ///
+        /// Carried in the tool's input unit; the query converts it to
+        /// the wire's 0-indexed form in [`to_wire_position`].
+        line: u32,
+
+        /// The 1-indexed character the hover is requested at.
+        ///
+        /// Counted in Unicode characters per the tool's advertised
+        /// contract; the wire conversion shifts it to a byte offset
+        /// within the line.
+        character: u32,
+    },
+
+    /// The definition of the symbol at a position.
+    ///
+    /// Answered as a location list, so the envelope flows through
+    /// [`location_envelope`] with the shared cap and unit conversion.
+    GoToDefinition {
+        /// The 1-indexed line of the symbol being resolved.
+        ///
+        /// Carried in the tool's input unit; the query converts it to
+        /// the wire's 0-indexed form in [`to_wire_position`].
+        line: u32,
+
+        /// The 1-indexed character of the symbol being resolved.
+        ///
+        /// Counted in Unicode characters per the tool's advertised
+        /// contract; the wire conversion shifts it to a byte offset
+        /// within the line.
+        character: u32,
+    },
+
+    /// The usages of the symbol at a position.
+    ///
+    /// The semantic alternative to word-shaped Grep matches; the
+    /// envelope is the same location list [`Operation::GoToDefinition`]
+    /// produces, under the same cap.
+    References {
+        /// The 1-indexed line of the symbol whose usages are wanted.
+        ///
+        /// Carried in the tool's input unit; the query converts it to
+        /// the wire's 0-indexed form in [`to_wire_position`].
+        line: u32,
+
+        /// The 1-indexed character of the symbol whose usages are
+        /// wanted.
+        ///
+        /// Counted in Unicode characters per the tool's advertised
+        /// contract; the wire conversion shifts it to a byte offset
+        /// within the line.
+        character: u32,
+
+        /// Whether the declaration site joins the usage list.
+        ///
+        /// Absent input means `true` — the declaration is itself an
+        /// edit-relevant usage — and the value travels to the server
+        /// as the reference context's flag.
+        include_declaration: bool,
+    },
+
+    /// The implementors of the trait or type at a position.
+    ///
+    /// Answered as a location list, so the envelope flows through
+    /// [`location_envelope`] with the shared cap and unit conversion.
+    Implementations {
+        /// The 1-indexed line of the trait or type.
+        ///
+        /// Carried in the tool's input unit; the query converts it to
+        /// the wire's 0-indexed form in [`to_wire_position`].
+        line: u32,
+
+        /// The 1-indexed character of the trait or type.
+        ///
+        /// Counted in Unicode characters per the tool's advertised
+        /// contract; the wire conversion shifts it to a byte offset
+        /// within the line.
+        character: u32,
+    },
+
+    /// The file's symbol outline — a file-level query carrying no
+    /// position.
+    ///
+    /// The outline normalizes from either wire shape the server
+    /// answers with; see [`normalize_symbols`].
+    DocumentSymbol,
+}
+
+/// Why parsing the operation failed.
+///
+/// The two failures surface differently: a structural problem rejects
+/// the call, while an unknown operation name is the tool's soft error —
+/// the call ran, and the answer is that no such operation exists.
+#[derive(Debug)]
+enum OperationError {
+    /// A malformed field — surfaced as [`ToolError::InvalidInput`].
+    ///
+    /// A missing operation, a missing or zero position on a
+    /// position-bearing operation, or a present non-boolean
+    /// `include_declaration`; the call is rejected before any file or
+    /// server is touched.
+    Structural(ToolError),
+
+    /// A name outside the schema's enum — surfaced as a soft error.
+    ///
+    /// Carries the name as sent so the reply can quote it back; the
+    /// answer is a tool output rather than a rejected call, keeping
+    /// the model in the conversation.
+    Unknown(String),
+}
+
+/// Parse the operation and its per-operation fields from `input`.
+///
+/// `documentSymbol` is a file-level query and takes no position; every
+/// other operation requires both position fields, and `references`
+/// additionally reads its declaration toggle. The name classifies
+/// before any other field is read, so an unknown operation reports
+/// itself as the soft error even when the call omits the position a
+/// known operation would need.
+///
+/// # Errors
+///
+/// Returns [`OperationError::Structural`] for a missing operation, a
+/// missing or zero position on a position-bearing operation, or a
+/// present non-boolean `include_declaration`;
+/// [`OperationError::Unknown`] for a name outside the schema's enum.
+fn parse_operation(input: &Value) -> Result<Operation, OperationError> {
+    let name = input
+        .get("operation")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            OperationError::Structural(ToolError::InvalidInput("Missing 'operation'".to_string()))
+        })?;
+    match name {
+        "documentSymbol" => Ok(Operation::DocumentSymbol),
+        "hover" => Ok(Operation::Hover {
+            line: operation_position(input, "line")?,
+            character: operation_position(input, "character")?,
+        }),
+        "goToDefinition" => Ok(Operation::GoToDefinition {
+            line: operation_position(input, "line")?,
+            character: operation_position(input, "character")?,
+        }),
+        "references" => Ok(Operation::References {
+            line: operation_position(input, "line")?,
+            character: operation_position(input, "character")?,
+            include_declaration: parse_include_declaration(input)
+                .map_err(OperationError::Structural)?,
+        }),
+        "implementations" => Ok(Operation::Implementations {
+            line: operation_position(input, "line")?,
+            character: operation_position(input, "character")?,
+        }),
+        _ => Err(OperationError::Unknown(name.to_string())),
+    }
+}
+
+/// One position field of a position-bearing operation, wrapped for
+/// [`parse_operation`]'s error type.
+///
+/// A thin adapter over [`parse_position`] so each operation arm reads
+/// its fields with a single `?` instead of repeating the error
+/// conversion.
+///
+/// # Errors
+///
+/// Returns [`OperationError::Structural`] when the field is missing,
+/// malformed, or zero.
+fn operation_position(input: &Value, field: &str) -> Result<u32, OperationError> {
+    parse_position(input, field).map_err(OperationError::Structural)
+}
+
+/// The `references` declaration toggle.
+///
+/// Absent means `true` — the declaration site is itself an edit-relevant
+/// usage, so it joins the list unless the caller opts out. A present
+/// non-boolean is malformed input rather than a silent default.
+///
+/// # Errors
+///
+/// Returns [`ToolError::InvalidInput`] for a present non-boolean value.
+fn parse_include_declaration(input: &Value) -> Result<bool, ToolError> {
+    match input.get("include_declaration") {
+        None => Ok(true),
+        Some(value) => value.as_bool().ok_or_else(|| {
+            ToolError::InvalidInput("'include_declaration' must be a boolean".to_string())
+        }),
+    }
+}
+
+/// The inputs a location-list envelope needs beyond the locations.
+///
+/// Bundled so the shared formatter keeps a flat parameter list: the
+/// operation identity and echoed position, the empty-answer message,
+/// and the found locations.
+struct LocationQuery<'a> {
+    /// The wire operation name echoed into the envelope.
+    ///
+    /// `goToDefinition`, `references`, or `implementations`; the model
+    /// reads it to know which question the rows answer.
+    operation: &'a str,
+
+    /// The file path as the caller wrote it, echoed.
+    ///
+    /// Unresolved and unnormalized on purpose — the echo mirrors the
+    /// input so the model can match it against what it sent.
+    file_path: &'a str,
+
+    /// The echoed 1-indexed line.
+    ///
+    /// The line the query asked about, in the input's unit; the rows'
+    /// own ranges convert independently of it.
+    line: u32,
+
+    /// The echoed 1-indexed character.
+    ///
+    /// The other half of the queried position, counted in Unicode
+    /// characters per the tool's contract.
+    character: u32,
+
+    /// The message reported when the server found nothing.
+    ///
+    /// Names what was absent — definitions, references, or
+    /// implementations — so an empty answer stays actionable.
+    empty_message: &'a str,
+
+    /// The found locations, or `None` when the server had no answer.
+    ///
+    /// `Some` with an empty list and `None` stay distinct: the former
+    /// renders as an empty result, the latter takes the message path.
+    found: Option<Vec<lsp_types::Location>>,
+}
+
+/// The envelope for a location-list operation.
+///
+/// Rows flow through [`location_json`] with each location's file text —
+/// the queried file's, or a foreign file's loaded under the resolve
+/// policy — so the character-unit contract holds for every row. The
+/// list caps at [`MAX_LOCATION_RESULTS`] rows before foreign texts
+/// load — rows past the cap never render, so their files are never
+/// read — and a cut reports the dropped count as `omitted`.
+async fn location_envelope(
+    query: LocationQuery<'_>,
+    queried_uri: &Url,
+    text: &str,
+    cwd: &Path,
+    policy: ResolvePolicy,
+) -> Value {
+    let Some(found) = query.found else {
+        return json!({
+            "operation": query.operation,
+            "file_path": query.file_path,
+            "line": query.line,
+            "character": query.character,
+            "result": null,
+            "message": query.empty_message,
+        });
+    };
+    let (found, omitted) = cap_rows(found, MAX_LOCATION_RESULTS);
+    let foreign_texts = load_foreign_texts(&found, queried_uri.as_str(), cwd, policy).await;
+    let rows: Vec<Value> = found
+        .iter()
+        .map(|location| {
+            let location_text = if location.uri.as_str() == queried_uri.as_str() {
+                Some(text)
+            } else {
+                foreign_texts.get(location.uri.as_str()).map(String::as_str)
+            };
+            location_json(location, location_text)
+        })
+        .collect();
+    let mut envelope = json!({
+        "operation": query.operation,
+        "file_path": query.file_path,
+        "line": query.line,
+        "character": query.character,
+        "result": rows,
+    });
+    if omitted > 0
+        && let Some(object) = envelope.as_object_mut()
+    {
+        object.insert("omitted".to_string(), json!(omitted));
+    }
+    envelope
+}
+
+/// The envelope for a hover reply.
+///
+/// A present hover flattens through [`extract_hover_content`]; an
+/// absent one reports an empty result with the standing message.
+fn hover_envelope(
+    file_path: &str,
+    line: u32,
+    character: u32,
+    hover: Option<lsp_types::Hover>,
+) -> Value {
+    match hover {
+        Some(hover) => json!({
+            "operation": "hover",
+            "file_path": file_path,
+            "line": line,
+            "character": character,
+            "result": extract_hover_content(hover),
+        }),
+        None => json!({
+            "operation": "hover",
+            "file_path": file_path,
+            "line": line,
+            "character": character,
+            "result": null,
+            "message": "No hover information available at this location",
+        }),
+    }
+}
+
+/// Cap `rows` at `cap`, reporting how many were dropped.
+///
+/// At or under the cap the rows pass through untouched and nothing is
+/// reported; over it, the leading rows survive and the count of the
+/// rest comes back for the caller's `omitted` field. Generic over the
+/// row type so location lists can bound before their foreign texts
+/// load and symbol lists can bound after formatting.
+fn cap_rows<T>(rows: Vec<T>, cap: usize) -> (Vec<T>, usize) {
+    let omitted = rows.len().saturating_sub(cap);
+    if omitted == 0 {
+        return (rows, 0);
+    }
+    (rows.into_iter().take(cap).collect(), omitted)
+}
+
+/// One outline row, normalized from either documentSymbol wire shape.
+///
+/// Flat and hierarchical replies produce the same rows, so downstream
+/// formatting never branches on which shape the server chose.
+struct OutlineSymbol {
+    /// The symbol's name.
+    ///
+    /// The identifier the server reported, verbatim — for an impl
+    /// block the server names the whole `impl … for …` head.
+    name: String,
+
+    /// The symbol's kind.
+    ///
+    /// The wire's numeric kind, mapped to a lowercase name at
+    /// formatting time in [`symbol_kind_name`].
+    kind: lsp_types::SymbolKind,
+
+    /// Where the symbol sits in the document.
+    ///
+    /// The enclosing range the server reported, not a name range;
+    /// converted to 1-indexed endpoints in [`symbol_row`].
+    range: lsp_types::Range,
+
+    /// The name of the symbol containing this one, when the reply
+    /// carried hierarchy.
+    ///
+    /// A flat reply's `containerName` passed through, or the parent's
+    /// name assigned while flattening a nested reply.
+    container: Option<String>,
+}
+
+/// Normalize a documentSymbol reply into flat outline rows.
+///
+/// A flat reply passes through, keeping its `containerName`; a
+/// hierarchical reply flattens recursively with each row's container
+/// set to its parent's name. Both wire shapes produce identical rows,
+/// so the envelope never depends on which one the server chose.
+fn normalize_symbols(response: lsp_types::DocumentSymbolResponse) -> Vec<OutlineSymbol> {
+    use lsp_types::DocumentSymbolResponse;
+    match response {
+        DocumentSymbolResponse::Flat(infos) => infos
+            .into_iter()
+            .map(|info| OutlineSymbol {
+                name: info.name,
+                kind: info.kind,
+                range: info.location.range,
+                container: info.container_name,
+            })
+            .collect(),
+        DocumentSymbolResponse::Nested(symbols) => {
+            let mut rows = Vec::new();
+            flatten_symbols(symbols, None, &mut rows);
+            rows
+        }
+    }
+}
+
+/// Flatten hierarchical symbols into `rows`, naming each row's parent.
+///
+/// Depth-first in document order: every symbol emits a row, then its
+/// children do, each child's container the name of the symbol that
+/// contains it.
+fn flatten_symbols(
+    symbols: Vec<lsp_types::DocumentSymbol>,
+    parent: Option<&str>,
+    rows: &mut Vec<OutlineSymbol>,
+) {
+    for symbol in symbols {
+        let lsp_types::DocumentSymbol {
+            name,
+            kind,
+            range,
+            children,
+            ..
+        } = symbol;
+        rows.push(OutlineSymbol {
+            container: parent.map(String::from),
+            name: name.clone(),
+            kind,
+            range,
+        });
+        if let Some(children) = children {
+            flatten_symbols(children, Some(name.as_str()), rows);
+        }
+    }
+}
+
+/// The envelope for a documentSymbol reply.
+///
+/// Rows normalize through [`normalize_symbols`] and cap at
+/// [`MAX_DOCUMENT_SYMBOLS`]; a cut reports the dropped count as
+/// `omitted`. The position-free query carries no `line`/`character`
+/// echo.
+fn document_symbol_envelope(
+    file_path: &str,
+    response: Option<lsp_types::DocumentSymbolResponse>,
+    text: &str,
+) -> Value {
+    let Some(response) = response else {
+        return json!({
+            "operation": "documentSymbol",
+            "file_path": file_path,
+            "result": null,
+            "message": "No symbols found in this document",
+        });
+    };
+    let rows: Vec<Value> = normalize_symbols(response)
+        .iter()
+        .map(|symbol| symbol_row(symbol, text))
+        .collect();
+    let (rows, omitted) = cap_rows(rows, MAX_DOCUMENT_SYMBOLS);
+    let mut envelope = json!({
+        "operation": "documentSymbol",
+        "file_path": file_path,
+        "result": rows,
+    });
+    if omitted > 0
+        && let Some(object) = envelope.as_object_mut()
+    {
+        object.insert("omitted".to_string(), json!(omitted));
+    }
+    envelope
+}
+
+/// One outline row as JSON.
+///
+/// The range converts against the queried document's own text —
+/// outline rows never leave it — under the same character-unit
+/// contract as location rows, with the same byte-fallback marker.
+fn symbol_row(symbol: &OutlineSymbol, text: &str) -> Value {
+    let (range, byte_fallback) = range_json(Some(text), symbol.range);
+    let mut row = json!({
+        "name": symbol.name,
+        "kind": symbol_kind_name(symbol.kind),
+        "range": range,
+    });
+    if let Some(container) = &symbol.container
+        && let Some(object) = row.as_object_mut()
+    {
+        object.insert("container".to_string(), json!(container));
+    }
+    if byte_fallback && let Some(object) = row.as_object_mut() {
+        object.insert("character_units".to_string(), json!("utf-8-bytes"));
+    }
+    row
+}
+
+/// A symbol kind's lowercase name.
+///
+/// The wire carries an integer; the model reads a word. Kinds outside
+/// the named set — a server may send any number — report as `"symbol"`
+/// rather than failing the outline.
+fn symbol_kind_name(kind: lsp_types::SymbolKind) -> &'static str {
+    use lsp_types::SymbolKind;
+    match kind {
+        SymbolKind::FILE => "file",
+        SymbolKind::MODULE => "module",
+        SymbolKind::NAMESPACE => "namespace",
+        SymbolKind::PACKAGE => "package",
+        SymbolKind::CLASS => "class",
+        SymbolKind::METHOD => "method",
+        SymbolKind::PROPERTY => "property",
+        SymbolKind::FIELD => "field",
+        SymbolKind::CONSTRUCTOR => "constructor",
+        SymbolKind::ENUM => "enum",
+        SymbolKind::INTERFACE => "interface",
+        SymbolKind::FUNCTION => "function",
+        SymbolKind::VARIABLE => "variable",
+        SymbolKind::CONSTANT => "constant",
+        SymbolKind::STRING => "string",
+        SymbolKind::NUMBER => "number",
+        SymbolKind::BOOLEAN => "boolean",
+        SymbolKind::ARRAY => "array",
+        SymbolKind::OBJECT => "object",
+        SymbolKind::KEY => "key",
+        SymbolKind::NULL => "null",
+        SymbolKind::ENUM_MEMBER => "enum_member",
+        SymbolKind::STRUCT => "struct",
+        SymbolKind::EVENT => "event",
+        SymbolKind::OPERATOR => "operator",
+        SymbolKind::TYPE_PARAMETER => "type_parameter",
+        _ => "symbol",
     }
 }
 
@@ -326,27 +897,38 @@ fn to_wire_position(text: &str, line: u32, character: u32) -> Position {
 /// location carries `character_units: "utf-8-bytes"`, so a byte offset
 /// is never reported under the character contract unmarked.
 fn location_json(location: &lsp_types::Location, text: Option<&str>) -> Value {
-    let start = display_character(text, location.range.start);
-    let end = display_character(text, location.range.end);
+    let (range, byte_fallback) = range_json(text, location.range);
     let mut value = json!({
         "uri": location.uri.as_str(),
-        "range": {
-            "start": {
-                "line": location.range.start.line.saturating_add(1),
-                "character": start.value(),
-            },
-            "end": {
-                "line": location.range.end.line.saturating_add(1),
-                "character": end.value(),
-            }
-        }
+        "range": range,
     });
-    if (start.is_byte_fallback() || end.is_byte_fallback())
-        && let Some(object) = value.as_object_mut()
-    {
+    if byte_fallback && let Some(object) = value.as_object_mut() {
         object.insert("character_units".to_string(), json!("utf-8-bytes"));
     }
     value
+}
+
+/// A wire range as JSON endpoints, its characters converted.
+///
+/// Lines shift to 1-indexed; characters convert against `text` when it
+/// holds the endpoint's line, else fall back to the shifted byte
+/// offset. The returned flag says whether either endpoint fell back,
+/// so the caller marks its row in whatever shape it emits.
+fn range_json(text: Option<&str>, range: lsp_types::Range) -> (Value, bool) {
+    let start = display_character(text, range.start);
+    let end = display_character(text, range.end);
+    let byte_fallback = start.is_byte_fallback() || end.is_byte_fallback();
+    let value = json!({
+        "start": {
+            "line": range.start.line.saturating_add(1),
+            "character": start.value(),
+        },
+        "end": {
+            "line": range.end.line.saturating_add(1),
+            "character": end.value(),
+        }
+    });
+    (value, byte_fallback)
 }
 
 /// A converted character position, carrying the unit it counts.
@@ -568,15 +1150,21 @@ mod tests {
     }
 
     #[test]
-    fn schema_shape_is_snake_case_v1() {
+    fn schema_shape_is_snake_case() {
         let schema = LspTool.schema();
         let input = schema.input_schema;
         let properties = input
             .get("properties")
             .and_then(Value::as_object)
             .expect("properties");
-        assert_eq!(properties.len(), 4, "exactly four properties");
-        for key in ["operation", "file_path", "line", "character"] {
+        assert_eq!(properties.len(), 5, "exactly five properties");
+        for key in [
+            "operation",
+            "file_path",
+            "line",
+            "character",
+            "include_declaration",
+        ] {
             assert!(properties.contains_key(key), "{key} present");
         }
         assert!(
@@ -584,18 +1172,342 @@ mod tests {
             "the input field is snake_case, not camelCase"
         );
         let required = input.get("required").and_then(Value::as_array).unwrap();
-        assert_eq!(required.len(), 4);
+        assert_eq!(
+            required,
+            json!(["operation", "file_path"]).as_array().unwrap()
+        );
         let operations = input
             .pointer("/properties/operation/enum")
             .and_then(Value::as_array)
             .unwrap();
-        assert!(operations.contains(&json!("goToDefinition")));
-        assert!(operations.contains(&json!("hover")));
+        for name in [
+            "goToDefinition",
+            "hover",
+            "references",
+            "implementations",
+            "documentSymbol",
+        ] {
+            assert!(operations.contains(&json!(name)), "{name} in the enum");
+        }
+        assert!(
+            !operations.contains(&json!("rename")),
+            "the write-class exclusion stays excluded"
+        );
         assert_eq!(
             input
                 .pointer("/properties/line/minimum")
                 .and_then(Value::as_u64),
             Some(1)
+        );
+    }
+
+    #[test]
+    fn document_symbol_needs_no_position_and_the_rest_do() {
+        let document_symbol = parse_operation(&json!({
+            "operation": "documentSymbol",
+            "file_path": "src/lib.rs"
+        }))
+        .unwrap();
+        assert_eq!(document_symbol, Operation::DocumentSymbol);
+        for name in ["hover", "goToDefinition", "references", "implementations"] {
+            let error = parse_operation(&json!({
+                "operation": name,
+                "file_path": "src/lib.rs"
+            }))
+            .unwrap_err();
+            assert!(
+                matches!(error, OperationError::Structural(ref e)
+                    if matches!(e, ToolError::InvalidInput(field) if field.contains("line"))),
+                "{name} without a position is invalid input: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn include_declaration_defaults_to_true_and_rejects_non_booleans() {
+        let references_input = |value: Value| {
+            json!({
+                "operation": "references",
+                "file_path": "src/lib.rs",
+                "line": 1,
+                "character": 1,
+                "include_declaration": value
+            })
+        };
+        assert_eq!(
+            parse_operation(&json!({
+                "operation": "references",
+                "file_path": "src/lib.rs",
+                "line": 1,
+                "character": 1
+            }))
+            .unwrap(),
+            Operation::References {
+                line: 1,
+                character: 1,
+                include_declaration: true
+            }
+        );
+        assert_eq!(
+            parse_operation(&references_input(json!(false))).unwrap(),
+            Operation::References {
+                line: 1,
+                character: 1,
+                include_declaration: false
+            }
+        );
+        assert!(
+            matches!(
+                parse_operation(&references_input(json!("yes"))),
+                Err(OperationError::Structural(ToolError::InvalidInput(_)))
+            ),
+            "a non-boolean is malformed input"
+        );
+    }
+
+    #[tokio::test]
+    async fn location_lists_cap_at_fifty_with_an_omitted_count() {
+        use lsp_types::Range;
+        use lsp_types::Uri;
+        use std::str::FromStr;
+
+        let uri = Url::from_file_path("/work/lib.rs").unwrap();
+        let make = |line: u32| lsp_types::Location {
+            uri: Uri::from_str(uri.as_str()).unwrap(),
+            range: Range::new(Position::new(line, 0), Position::new(line, 1)),
+        };
+        let envelope = location_envelope(
+            LocationQuery {
+                operation: "references",
+                file_path: "src/lib.rs",
+                line: 1,
+                character: 1,
+                empty_message: "none",
+                found: Some((0..55).map(make).collect()),
+            },
+            &uri,
+            "fn add() {}\n",
+            std::path::Path::new("/work"),
+            ResolvePolicy::Unrestricted,
+        )
+        .await;
+        assert_eq!(
+            envelope
+                .pointer("/result")
+                .and_then(Value::as_array)
+                .unwrap()
+                .len(),
+            50,
+            "fifty-five locations cap at fifty"
+        );
+        assert_eq!(envelope.get("omitted"), Some(&json!(5)));
+        assert_eq!(envelope.get("line"), Some(&json!(1)));
+
+        let exact = location_envelope(
+            LocationQuery {
+                operation: "references",
+                file_path: "src/lib.rs",
+                line: 1,
+                character: 1,
+                empty_message: "none",
+                found: Some((0..50).map(make).collect()),
+            },
+            &uri,
+            "fn add() {}\n",
+            std::path::Path::new("/work"),
+            ResolvePolicy::Unrestricted,
+        )
+        .await;
+        assert_eq!(
+            exact
+                .pointer("/result")
+                .and_then(Value::as_array)
+                .unwrap()
+                .len(),
+            50
+        );
+        assert_eq!(exact.get("omitted"), None, "an at-cap list is not cut");
+    }
+
+    #[test]
+    fn document_symbols_cap_at_two_hundred_with_an_omitted_count() {
+        let range = json!({
+            "start": {"line": 0, "character": 0},
+            "end": {"line": 0, "character": 3}
+        });
+        let outline = |count: usize| {
+            let rows: Vec<Value> = (0..count)
+                .map(|index| {
+                    json!({
+                        "name": format!("sym{index}"),
+                        "kind": 12,
+                        "location": {"uri": "file:///work/lib.rs", "range": range}
+                    })
+                })
+                .collect();
+            let response: lsp_types::DocumentSymbolResponse =
+                serde_json::from_value(json!(rows)).unwrap();
+            document_symbol_envelope("src/lib.rs", Some(response), "fn add() {}\n")
+        };
+        let capped = outline(205);
+        assert_eq!(
+            capped
+                .pointer("/result")
+                .and_then(Value::as_array)
+                .unwrap()
+                .len(),
+            200,
+            "two hundred five symbols cap at two hundred"
+        );
+        assert_eq!(capped.get("omitted"), Some(&json!(5)));
+        let exact = outline(200);
+        assert_eq!(
+            exact
+                .pointer("/result")
+                .and_then(Value::as_array)
+                .unwrap()
+                .len(),
+            200
+        );
+        assert_eq!(exact.get("omitted"), None, "an at-cap outline is not cut");
+    }
+
+    #[tokio::test]
+    async fn an_empty_location_list_and_an_absent_answer_render_differently() {
+        let uri = Url::from_file_path("/work/lib.rs").unwrap();
+        let empty = location_envelope(
+            LocationQuery {
+                operation: "references",
+                file_path: "src/lib.rs",
+                line: 1,
+                character: 1,
+                empty_message: "No references found at this location",
+                found: Some(Vec::new()),
+            },
+            &uri,
+            "fn add() {}\n",
+            std::path::Path::new("/work"),
+            ResolvePolicy::Unrestricted,
+        )
+        .await;
+        assert_eq!(
+            empty
+                .pointer("/result")
+                .and_then(Value::as_array)
+                .unwrap()
+                .len(),
+            0,
+            "an empty list renders as an empty result: {empty}"
+        );
+        assert_eq!(
+            empty.get("message"),
+            None,
+            "an empty list carries no message: {empty}"
+        );
+        assert_eq!(empty.get("omitted"), None);
+
+        let absent = location_envelope(
+            LocationQuery {
+                operation: "references",
+                file_path: "src/lib.rs",
+                line: 1,
+                character: 1,
+                empty_message: "No references found at this location",
+                found: None,
+            },
+            &uri,
+            "fn add() {}\n",
+            std::path::Path::new("/work"),
+            ResolvePolicy::Unrestricted,
+        )
+        .await;
+        assert_eq!(
+            absent.get("result"),
+            Some(&json!(null)),
+            "an absent answer reports a null result: {absent}"
+        );
+        assert_eq!(
+            absent.get("message"),
+            Some(&json!("No references found at this location")),
+            "an absent answer takes the message path: {absent}"
+        );
+    }
+
+    #[test]
+    fn a_document_symbol_answer_of_none_reports_the_message() {
+        let envelope = document_symbol_envelope("src/lib.rs", None, "fn add() {}\n");
+        assert_eq!(
+            envelope.get("result"),
+            Some(&json!(null)),
+            "an absent answer reports a null result: {envelope}"
+        );
+        assert_eq!(
+            envelope.get("message"),
+            Some(&json!("No symbols found in this document")),
+            "the none path is the envelope's own standing message: {envelope}"
+        );
+    }
+
+    #[test]
+    fn hierarchical_symbols_flatten_with_container_names() {
+        let range = json!({
+            "start": {"line": 0, "character": 0},
+            "end": {"line": 0, "character": 5}
+        });
+        let nested: lsp_types::DocumentSymbolResponse = serde_json::from_value(json!([{
+            "name": "outer",
+            "kind": 23,
+            "range": range,
+            "selectionRange": range,
+            "children": [{
+                "name": "middle",
+                "kind": 6,
+                "range": range,
+                "selectionRange": range,
+                "children": [{
+                    "name": "leaf",
+                    "kind": 8,
+                    "range": range,
+                    "selectionRange": range
+                }]
+            }]
+        }]))
+        .unwrap();
+        let rows = normalize_symbols(nested);
+        assert_eq!(rows.len(), 3, "every level becomes a row");
+        assert_eq!(rows[0].name, "outer");
+        assert_eq!(rows[0].container, None);
+        assert_eq!(rows[1].container.as_deref(), Some("outer"));
+        assert_eq!(rows[2].container.as_deref(), Some("middle"));
+
+        let flat: lsp_types::DocumentSymbolResponse = serde_json::from_value(json!([{
+            "name": "add",
+            "kind": 12,
+            "location": {
+                "uri": "file:///work/lib.rs",
+                "range": range
+            },
+            "containerName": "mod"
+        }]))
+        .unwrap();
+        let rows = normalize_symbols(flat);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].container.as_deref(), Some("mod"));
+    }
+
+    #[test]
+    fn symbol_kinds_map_to_lowercase_names() {
+        use lsp_types::SymbolKind;
+        assert_eq!(symbol_kind_name(SymbolKind::FUNCTION), "function");
+        assert_eq!(symbol_kind_name(SymbolKind::STRUCT), "struct");
+        assert_eq!(symbol_kind_name(SymbolKind::INTERFACE), "interface");
+        assert_eq!(symbol_kind_name(SymbolKind::METHOD), "method");
+        assert_eq!(symbol_kind_name(SymbolKind::MODULE), "module");
+        let unnamed: SymbolKind = serde_json::from_value(json!(99)).unwrap();
+        assert_eq!(
+            symbol_kind_name(unnamed),
+            "symbol",
+            "a kind outside the named set still reports a name"
         );
     }
 
@@ -950,17 +1862,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unknown_operation_is_a_soft_error() {
+    async fn excluded_operations_stay_unknown() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut input = lsp_input("src/lib.rs", 1, 1);
-        input["operation"] = json!("references");
-        let out = LspTool.call(input, &ctx_in(tmp.path())).await.unwrap();
-        assert!(out.is_error, "soft error: {}", out.text_content());
-        assert!(
-            out.text_content().contains("Unknown operation: references"),
-            "{}",
-            out.text_content()
-        );
+        for name in ["rename", "diagnostics", "completion"] {
+            let mut input = lsp_input("src/lib.rs", 1, 1);
+            input["operation"] = json!(name);
+            let out = LspTool.call(input, &ctx_in(tmp.path())).await.unwrap();
+            assert!(out.is_error, "soft error: {}", out.text_content());
+            assert!(
+                out.text_content()
+                    .contains(&format!("Unknown operation: {name}")),
+                "{}",
+                out.text_content()
+            );
+
+            let bare = json!({
+                "operation": name,
+                "file_path": "src/lib.rs",
+            });
+            let out = LspTool.call(bare, &ctx_in(tmp.path())).await.unwrap();
+            assert!(
+                out.is_error,
+                "soft error without a position: {}",
+                out.text_content()
+            );
+            assert!(
+                out.text_content()
+                    .contains(&format!("Unknown operation: {name}")),
+                "a schema-faithful call omits the position: {}",
+                out.text_content()
+            );
+        }
     }
 
     /// Whether a rust-analyzer binary is reachable — the live tests skip
@@ -976,6 +1908,10 @@ mod tests {
 
     /// A minimal cargo crate whose `add` definition the live tests
     /// navigate.
+    ///
+    /// The appended `also_uses_add`, trait, and impl give the
+    /// references, implementations, and documentSymbol tests their
+    /// symbols without shifting the positions earlier tests pin.
     fn fixture_crate() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("src")).unwrap();
@@ -986,7 +1922,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             dir.path().join("src/lib.rs"),
-            "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n\npub fn uses_add() -> i32 {\n    add(1, 2)\n}\n",
+            "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n\npub fn uses_add() -> i32 {\n    add(1, 2)\n}\n\npub fn also_uses_add() -> i32 {\n    add(3, 4)\n}\n\npub trait Shape {\n    fn area(&self) -> i32;\n}\n\npub struct Unit;\n\nimpl Shape for Unit {\n    fn area(&self) -> i32 {\n        1\n    }\n}\n",
         )
         .unwrap();
         dir
@@ -1179,5 +2115,129 @@ mod tests {
         let text = out.text_content();
         assert!(text.contains("\"result\":null"), "{text}");
         assert!(text.contains("No hover information available"), "{text}");
+    }
+
+    /// The 1-indexed start lines of a references envelope's rows.
+    ///
+    /// A live references answer's row order is not guaranteed, so the
+    /// tests compare line sets rather than sequences; `None` means the
+    /// envelope was empty or unparseable and the poll must continue.
+    fn reference_lines(text: &str) -> Option<Vec<u64>> {
+        let value: Value = serde_json::from_str(text).ok()?;
+        let rows = value.pointer("/result")?.as_array()?;
+        let mut lines = Vec::new();
+        for row in rows {
+            lines.push(row.pointer("/range/start/line")?.as_u64()?);
+        }
+        Some(lines)
+    }
+
+    #[tokio::test]
+    async fn references_list_the_call_sites_and_honor_include_declaration() {
+        if !rust_analyzer_available() {
+            return;
+        }
+        let _guard = SPAWN_GATE.lock().await;
+        let dir = fixture_crate();
+        let ctx = ctx_in(dir.path());
+        // `add(1, 2)` on line 6; the call starts at character 5.
+        let mut input = lsp_input("src/lib.rs", 6, 5);
+        input["operation"] = json!("references");
+        input["include_declaration"] = json!(true);
+        eventually(
+            || async {
+                let query = input.clone();
+                LspTool.call(query, &ctx).await.unwrap().text_content()
+            },
+            |text| reference_lines(text).is_some_and(|lines| lines.len() == 3),
+        )
+        .await;
+        let text = LspTool
+            .call(input.clone(), &ctx)
+            .await
+            .unwrap()
+            .text_content();
+        let lines = reference_lines(&text).expect("parseable envelope");
+        assert!(
+            lines.contains(&1) && lines.contains(&6) && lines.contains(&10),
+            "declaration and both call sites listed: {text}"
+        );
+
+        let mut without_declaration = input;
+        without_declaration["include_declaration"] = json!(false);
+        eventually(
+            || async {
+                let query = without_declaration.clone();
+                LspTool.call(query, &ctx).await.unwrap().text_content()
+            },
+            |text| reference_lines(text).is_some_and(|lines| lines.len() == 2),
+        )
+        .await;
+        let text = LspTool
+            .call(without_declaration, &ctx)
+            .await
+            .unwrap()
+            .text_content();
+        let lines = reference_lines(&text).expect("parseable envelope");
+        assert!(
+            lines.contains(&6) && lines.contains(&10),
+            "both call sites listed: {text}"
+        );
+        assert!(!lines.contains(&1), "the declaration drops out: {text}");
+    }
+
+    #[tokio::test]
+    async fn implementations_list_the_trait_impl() {
+        if !rust_analyzer_available() {
+            return;
+        }
+        let _guard = SPAWN_GATE.lock().await;
+        let dir = fixture_crate();
+        let ctx = ctx_in(dir.path());
+        // `pub trait Shape` on line 13; `Shape` starts at character 11.
+        let mut input = lsp_input("src/lib.rs", 13, 11);
+        input["operation"] = json!("implementations");
+        eventually(
+            || async {
+                let query = input.clone();
+                LspTool.call(query, &ctx).await.unwrap().text_content()
+            },
+            |text| {
+                text.contains("\"operation\":\"implementations\"")
+                    && (text.contains("\"result\":[") || text.contains("\"result\": ["))
+            },
+        )
+        .await;
+        let text = LspTool.call(input, &ctx).await.unwrap().text_content();
+        assert!(text.contains("lib.rs"), "the impl lives in lib.rs: {text}");
+    }
+
+    #[tokio::test]
+    async fn document_symbol_outlines_the_file_without_a_position() {
+        if !rust_analyzer_available() {
+            return;
+        }
+        let _guard = SPAWN_GATE.lock().await;
+        let dir = fixture_crate();
+        let input = json!({
+            "operation": "documentSymbol",
+            "file_path": "src/lib.rs",
+        });
+        let out = LspTool.call(input, &ctx_in(dir.path())).await.unwrap();
+        assert!(!out.is_error, "{}", out.text_content());
+        let text = out.text_content();
+        assert!(!text.contains("Unknown operation"), "{text}");
+        assert!(text.contains("\"name\":\"add\""), "{text}");
+        assert!(text.contains("\"name\":\"uses_add\""), "{text}");
+        assert!(text.contains("\"name\":\"also_uses_add\""), "{text}");
+        assert!(text.contains("\"kind\":\"function\""), "{text}");
+        assert!(
+            text.contains("\"kind\":\"interface\""),
+            "the trait outlines as an interface: {text}"
+        );
+        assert!(
+            text.contains("\"container\""),
+            "the outline names containers: {text}"
+        );
     }
 }
