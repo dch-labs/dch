@@ -5,10 +5,20 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "A terminal-based agentic coding assistant built on loopctl"
+autotests = false
 
 [[bin]]
 name = "dch"
 path = "src/main.rs"
+
+[[test]]
+name = "force_quit"
+
+[[test]]
+name = "release_gate"
+
+[[test]]
+name = "smoke"
 
 [dependencies]
 dch-loop = { workspace = true }
@@ -27,7 +37,8 @@ tracing    = { workspace = true }
 tempfile   = { workspace = true }
 
 [dev-dependencies]
-libc     = { workspace = true }
+libc        = { workspace = true }
+portable-pty = { workspace = true }
 
 [lints]
 workspace = true

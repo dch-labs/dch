@@ -1,7 +1,7 @@
 CARGO          := cargo
 ALL_FEATURES   := --all-features
 
-.PHONY: build check test clippy fmt run lint docs examples boundary nodefault ci help
+.PHONY: build check test clippy fmt run lint docs examples boundary nodefault release-check smoke ci help
 
 ## build: Build the whole workspace (debug, all features)
 build:
@@ -46,6 +46,15 @@ boundary:
 ## nodefault: Prove the workspace compiles without default features
 nodefault:
 	$(CARGO) check --no-default-features
+
+## release-check: Run the automatable acceptance suite against a release build
+release-check:
+	$(CARGO) build --release --bin dch $(ALL_FEATURES)
+	DCH_BIN="$$(d="$${CARGO_TARGET_DIR:-$(CURDIR)/target}"; case "$$d" in /*) ;; *) d="$(CURDIR)/$$d";; esac; printf '%s' "$$d")/release/dch" $(CARGO) test --test release_gate $(ALL_FEATURES)
+
+## smoke: Run the real-provider and PTY-driven smoke cases (needs DCH_E2E=1)
+smoke:
+	DCH_E2E=1 $(CARGO) test --test smoke $(ALL_FEATURES) -- --ignored --test-threads=1
 
 ## ci: Run the full local CI gate (fmt, clippy, test, docs, examples, boundary, nodefault)
 ci: fmt clippy test docs examples boundary nodefault
