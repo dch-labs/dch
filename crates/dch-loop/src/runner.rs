@@ -944,6 +944,63 @@ mod tests {
         );
     }
 
+    struct PanicProbe;
+
+    impl Tool for PanicProbe {
+        fn name(&self) -> &'static str {
+            "PanicProbe"
+        }
+        fn description(&self) -> &'static str {
+            "panics on every call"
+        }
+        fn schema(&self) -> ToolSchema {
+            ToolSchema {
+                tool: "PanicProbe".to_string(),
+                description: "panics on every call".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }
+        }
+        fn call<'a>(
+            &'a self,
+            _input: Value,
+            _ctx: &ToolContext,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + 'a>> {
+            Box::pin(async move { panic!("probe panic") })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panicking_tool_surfaces_as_an_error_result_through_the_composed_pipeline() {
+        let mut registry = builtin_registry();
+        registry.register(PanicProbe);
+        let pipeline = build_pipeline(
+            &sample_context("/tmp/probe-cwd"),
+            &[],
+            permission_layer(dch_tools::permission::PermissionMode::Auto, None),
+            false,
+            registry,
+        )
+        .expect("static composition builds");
+        let mut ctx = loopctl::middleware::ToolDispatchContext {
+            tool_name: "PanicProbe".to_string(),
+            input: Value::Null,
+            call_id: "call_panic".to_string(),
+            turn_number: 0,
+            cancel: Arc::new(loopctl::cancel::CancelSignal::new()),
+            permission: loopctl::tool::PermissionCheck::Allow,
+            tool_context: loopctl::tool::ToolContext::default(),
+        };
+        let result = pipeline.dispatch(&mut ctx).await;
+        assert!(
+            result.is_error,
+            "a contained panic must surface as an error result, not a process death: {result:?}"
+        );
+        assert!(
+            result.output.to_string().contains("probe panic"),
+            "the error carries the panic payload for the model to react to: {result:?}"
+        );
+    }
+
     #[test]
     fn build_pipeline_places_the_injector_outermost_over_the_core() {
         let pipeline = build_pipeline(
