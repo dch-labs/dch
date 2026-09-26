@@ -127,7 +127,8 @@ check-macos-sdk:
 
 ## check-openssl: Fail if openssl-sys re-enters the dependency graph
 check-openssl:
-	@if $(CARGO) tree --locked -i openssl-sys >/dev/null 2>&1; then \
+	@$(CARGO) tree --locked --all-features >/dev/null
+	@if $(CARGO) tree --locked --all-features -i openssl-sys >/dev/null 2>&1; then \
 		echo "❌ openssl-sys is in the graph — the static build is rustls-only"; \
 		exit 1; \
 	fi
