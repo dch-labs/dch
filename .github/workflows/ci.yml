@@ -88,6 +88,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-features --locked
 
+  openssl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - run: cargo tree --locked --all-features > /dev/null
+      - run: "! cargo tree --locked --all-features -i openssl-sys"
+
   boundary:
     runs-on: ubuntu-latest
     steps:
