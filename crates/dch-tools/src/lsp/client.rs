@@ -1,9 +1,10 @@
 //! JSON-RPC client for a language-server process over stdio.
 //!
 //! Speaks the LSP wire format — `Content-Length`-framed JSON-RPC over the
-//! child's piped stdin/stdout — for the two operations the tool needs:
-//! hover and go-to-definition. Only the client side; the server is the
-//! spawned language-server binary.
+//! child's piped stdin/stdout — for the operations the tool needs:
+//! hover, go-to-definition, references, implementations, and document
+//! symbols. Only the client side; the server is the spawned
+//! language-server binary.
 
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -13,12 +14,16 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use loopctl::tool::ToolError;
+use lsp_types::DocumentSymbolParams;
+use lsp_types::DocumentSymbolResponse;
 use lsp_types::GotoDefinitionParams;
 use lsp_types::GotoDefinitionResponse;
 use lsp_types::Hover;
 use lsp_types::HoverParams;
 use lsp_types::PartialResultParams;
 use lsp_types::Position;
+use lsp_types::ReferenceContext;
+use lsp_types::ReferenceParams;
 use lsp_types::TextDocumentIdentifier;
 use lsp_types::TextDocumentPositionParams;
 use lsp_types::WorkDoneProgressParams;
@@ -640,6 +645,50 @@ impl LspClient {
         url: &Url,
         position: Position,
     ) -> Result<Option<GotoDefinitionResponse>, RequestError> {
+        self.definition_shaped_request("textDocument/definition", url, position)
+            .await
+    }
+
+    /// Implementor locations for the trait or type at a wire position.
+    ///
+    /// The wire reuses the definition request's shape — the same params
+    /// and the same Scalar/Array/Link reply — over the `implementation`
+    /// method, so a caller treats the two answers identically. `None`
+    /// means the server found no implementors (or nothing resolvable at
+    /// the position).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RequestError`] — [`RequestError::Transport`] when the
+    /// request cannot complete, [`RequestError::Server`] when the reply
+    /// carries a JSON-RPC error member.
+    pub async fn implementations(
+        &mut self,
+        url: &Url,
+        position: Position,
+    ) -> Result<Option<GotoDefinitionResponse>, RequestError> {
+        self.definition_shaped_request("textDocument/implementation", url, position)
+            .await
+    }
+
+    /// A definition-shaped request: position in, definition union out.
+    ///
+    /// `textDocument/definition` and `textDocument/implementation`
+    /// share this wire shape — identical params, identical reply — so
+    /// one helper serves both and the public methods differ only in the
+    /// method name they send.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RequestError`] — [`RequestError::Transport`] when the
+    /// request cannot complete, [`RequestError::Server`] when the reply
+    /// carries a JSON-RPC error member.
+    async fn definition_shaped_request(
+        &mut self,
+        method: &str,
+        url: &Url,
+        position: Position,
+    ) -> Result<Option<GotoDefinitionResponse>, RequestError> {
         let params = GotoDefinitionParams {
             text_document_position_params: TextDocumentPositionParams {
                 text_document: TextDocumentIdentifier {
@@ -650,8 +699,70 @@ impl LspClient {
             work_done_progress_params: WorkDoneProgressParams::default(),
             partial_result_params: PartialResultParams::default(),
         };
+        let result = self.send_request(method.to_string(), json!(params)).await?;
+        Ok(serde_json::from_value(result).ok())
+    }
+
+    /// References to the symbol at a wire position in `url`.
+    ///
+    /// `include_declaration` maps to the request's reference context, so
+    /// `true` adds the symbol's declaration site to its usages. `None`
+    /// means the server reported no references — or nothing resolvable
+    /// at the position.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RequestError`] — [`RequestError::Transport`] when the
+    /// request cannot complete, [`RequestError::Server`] when the reply
+    /// carries a JSON-RPC error member.
+    pub async fn references(
+        &mut self,
+        url: &Url,
+        position: Position,
+        include_declaration: bool,
+    ) -> Result<Option<Vec<lsp_types::Location>>, RequestError> {
+        let params = ReferenceParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: document_uri(url).map_err(RequestError::Server)?,
+                },
+                position,
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+            context: ReferenceContext {
+                include_declaration,
+            },
+        };
         let result = self
-            .send_request("textDocument/definition".to_string(), json!(params))
+            .send_request("textDocument/references".to_string(), json!(params))
+            .await?;
+        Ok(serde_json::from_value(result).ok())
+    }
+
+    /// The document's symbol outline.
+    ///
+    /// A file-level query — no position. The reply arrives as either
+    /// shape of the documentSymbol union; the caller normalizes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RequestError`] — [`RequestError::Transport`] when the
+    /// request cannot complete, [`RequestError::Server`] when the reply
+    /// carries a JSON-RPC error member.
+    pub async fn document_symbol(
+        &mut self,
+        url: &Url,
+    ) -> Result<Option<DocumentSymbolResponse>, RequestError> {
+        let params = DocumentSymbolParams {
+            text_document: TextDocumentIdentifier {
+                uri: document_uri(url).map_err(RequestError::Server)?,
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+        let result = self
+            .send_request("textDocument/documentSymbol".to_string(), json!(params))
             .await?;
         Ok(serde_json::from_value(result).ok())
     }
@@ -996,5 +1107,197 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         panic!("the reopened document was never synced with a didChange");
+    }
+
+    #[tokio::test]
+    async fn references_requests_carry_the_include_declaration_context() {
+        let capture = tempfile::tempdir().unwrap();
+        let log = capture.path().join("wire.log");
+        let (home, config) = fake_server(
+            &[
+                init_frame(),
+                frame(&json!({"jsonrpc": "2.0", "id": 2, "result": null})),
+                frame(&json!({"jsonrpc": "2.0", "id": 3, "result": null})),
+            ],
+            &format!("cat > '{}'", log.display()),
+        );
+        let root = Url::from_file_path(home.path()).unwrap();
+        let doc = Url::from_file_path(home.path().join("lib.rs")).unwrap();
+        let mut client = LspClient::start(&config, &root).await.unwrap();
+        client.open_document(&doc, "fn add() {}\n").await.unwrap();
+        assert!(
+            client
+                .references(&doc, Position::new(0, 3), true)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            client
+                .references(&doc, Position::new(0, 3), false)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        for _ in 0..40 {
+            let captured = std::fs::read_to_string(&log).unwrap_or_default();
+            if captured.contains("\"method\":\"textDocument/references\"") {
+                assert!(
+                    captured.contains("\"context\":{\"includeDeclaration\":true}"),
+                    "the toggle travels as given: {captured}"
+                );
+                assert!(
+                    captured.contains("\"context\":{\"includeDeclaration\":false}"),
+                    "the toggle travels as given: {captured}"
+                );
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        panic!("the references request never reached the wire");
+    }
+
+    #[tokio::test]
+    async fn references_decode_an_empty_array_as_an_empty_list() {
+        let (home, config) = fake_server(
+            &[
+                init_frame(),
+                frame(&json!({"jsonrpc": "2.0", "id": 2, "result": []})),
+            ],
+            "sleep 1",
+        );
+        let root = Url::from_file_path(home.path()).unwrap();
+        let doc = Url::from_file_path(home.path().join("lib.rs")).unwrap();
+        let mut client = LspClient::start(&config, &root).await.unwrap();
+        client.open_document(&doc, "fn add() {}\n").await.unwrap();
+        let found = client
+            .references(&doc, Position::new(0, 3), true)
+            .await
+            .unwrap()
+            .expect("an empty array is a present, empty list");
+        assert!(found.is_empty());
+    }
+
+    #[tokio::test]
+    async fn implementations_decode_a_location_array() {
+        let (home, config) = fake_server(
+            &[
+                init_frame(),
+                frame(&json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "result": [{
+                        "uri": "file:///work/lib.rs",
+                        "range": {
+                            "start": {"line": 7, "character": 17},
+                            "end": {"line": 7, "character": 24}
+                        }
+                    }]
+                })),
+            ],
+            "sleep 1",
+        );
+        let root = Url::from_file_path(home.path()).unwrap();
+        let doc = Url::from_file_path(home.path().join("lib.rs")).unwrap();
+        let mut client = LspClient::start(&config, &root).await.unwrap();
+        client.open_document(&doc, "fn one() {}\n").await.unwrap();
+        let impls = client
+            .implementations(&doc, Position::new(0, 3))
+            .await
+            .unwrap();
+        let Some(GotoDefinitionResponse::Array(locations)) = impls else {
+            panic!("a location-array reply decodes as the array variant");
+        };
+        assert_eq!(locations.len(), 1);
+        assert_eq!(
+            locations
+                .first()
+                .expect("one location")
+                .range
+                .start
+                .character,
+            17
+        );
+    }
+
+    #[tokio::test]
+    async fn document_symbol_decodes_a_flat_reply() {
+        let (home, config) = fake_server(
+            &[
+                init_frame(),
+                frame(&json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "result": [{
+                        "name": "add",
+                        "kind": 12,
+                        "location": {
+                            "uri": "file:///work/lib.rs",
+                            "range": {
+                                "start": {"line": 0, "character": 7},
+                                "end": {"line": 0, "character": 10}
+                            }
+                        },
+                        "containerName": "mod"
+                    }]
+                })),
+            ],
+            "sleep 1",
+        );
+        let root = Url::from_file_path(home.path()).unwrap();
+        let doc = Url::from_file_path(home.path().join("lib.rs")).unwrap();
+        let mut client = LspClient::start(&config, &root).await.unwrap();
+        client.open_document(&doc, "fn add() {}\n").await.unwrap();
+        let Some(DocumentSymbolResponse::Flat(infos)) = client.document_symbol(&doc).await.unwrap()
+        else {
+            panic!("a SymbolInformation reply decodes as the flat variant");
+        };
+        assert_eq!(infos.len(), 1);
+        let info = infos.first().expect("one symbol");
+        assert_eq!(info.name, "add");
+        assert_eq!(info.container_name.as_deref(), Some("mod"));
+    }
+
+    #[tokio::test]
+    async fn document_symbol_decodes_a_hierarchical_reply() {
+        let range = json!({
+            "start": {"line": 0, "character": 0},
+            "end": {"line": 0, "character": 5}
+        });
+        let (home, config) = fake_server(
+            &[
+                init_frame(),
+                frame(&json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "result": [{
+                        "name": "outer",
+                        "kind": 23,
+                        "range": range,
+                        "selectionRange": range,
+                        "children": [{
+                            "name": "inner",
+                            "kind": 6,
+                            "range": range,
+                            "selectionRange": range
+                        }]
+                    }]
+                })),
+            ],
+            "sleep 1",
+        );
+        let root = Url::from_file_path(home.path()).unwrap();
+        let doc = Url::from_file_path(home.path().join("lib.rs")).unwrap();
+        let mut client = LspClient::start(&config, &root).await.unwrap();
+        client.open_document(&doc, "fn outer() {}\n").await.unwrap();
+        let Some(DocumentSymbolResponse::Nested(symbols)) =
+            client.document_symbol(&doc).await.unwrap()
+        else {
+            panic!("a DocumentSymbol reply decodes as the nested variant");
+        };
+        let outer = symbols.first().expect("outer");
+        assert_eq!(outer.name, "outer");
+        let children = outer.children.as_ref().expect("children");
+        assert_eq!(children.first().expect("inner").name, "inner");
     }
 }
