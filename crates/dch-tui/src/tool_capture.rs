@@ -377,11 +377,11 @@ mod tests {
             "Emits colored text"
         }
         fn schema(&self) -> loopctl::tool::ToolSchema {
-            loopctl::tool::ToolSchema {
-                tool: "Dye".into(),
-                description: "Emits colored text".into(),
-                input_schema: serde_json::json!({"type": "object"}),
-            }
+            loopctl::tool::ToolSchema::new(
+                "Dye",
+                "Emits colored text",
+                serde_json::json!({"type": "object"}),
+            )
         }
         fn call(
             &self,
@@ -418,11 +418,11 @@ mod tests {
                 "Emits a bearer header"
             }
             fn schema(&self) -> loopctl::tool::ToolSchema {
-                loopctl::tool::ToolSchema {
-                    tool: "Leak".into(),
-                    description: "Emits a bearer header".into(),
-                    input_schema: serde_json::json!({"type": "object"}),
-                }
+                loopctl::tool::ToolSchema::new(
+                    "Leak",
+                    "Emits a bearer header",
+                    serde_json::json!({"type": "object"}),
+                )
             }
             fn call(
                 &self,

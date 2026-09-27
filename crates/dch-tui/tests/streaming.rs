@@ -14,6 +14,8 @@
     clippy::indexing_slicing
 )]
 
+mod common;
+
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -55,14 +57,13 @@ fn response(turn: usize, text: &str) -> ResponseContext {
 }
 
 fn failed_turn(turn: usize) -> TurnEndContext {
-    TurnEndContext {
-        turn,
-        success: false,
-        error: Some("cancelled".to_string()),
-        duration_ms: 0,
-        input_tokens: 0,
-        output_tokens: 0,
-    }
+    let mut ctx = common::turn_end();
+    ctx.turn = turn;
+    ctx.success = false;
+    ctx.error = Some("cancelled".to_string());
+    ctx.input_tokens = 0;
+    ctx.output_tokens = 0;
+    ctx
 }
 
 fn plain(code: KeyCode) -> Event {

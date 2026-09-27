@@ -766,12 +766,8 @@ mod tests {
         h.observer.on_run_start(&RunStartContext {
             session_id: Uuid::new_v4(),
         });
-        h.observer.on_run_end(&RunEndContext {
-            success: true,
-            error: None,
-            total_turns: 3,
-            duration_ms: 1500,
-        });
+        h.observer
+            .on_run_end(&RunEndContext::new(true, None, 3, 1500));
         let stderr = h.stderr();
         assert!(stderr.contains("finished in 1500ms"), "{stderr}");
         assert!(stderr.contains("3 turns"), "{stderr}");
@@ -786,12 +782,8 @@ mod tests {
         // the model's text and per-event errors, but no summary line.
         for verbosity in [Verbosity::Quiet, Verbosity::Normal] {
             let h = Harness::build(verbosity, false);
-            h.observer.on_run_end(&RunEndContext {
-                success: true,
-                error: None,
-                total_turns: 2,
-                duration_ms: 300,
-            });
+            h.observer
+                .on_run_end(&RunEndContext::new(true, None, 2, 300));
             assert!(
                 h.stderr().is_empty(),
                 "{verbosity:?}: the run summary is detail chrome: {:?}",

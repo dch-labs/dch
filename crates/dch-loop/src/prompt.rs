@@ -43,7 +43,7 @@ CORE CONDUCT
   guessing.
 
 IMAGES
-- Read detects image files (png, jpg, jpeg, webp, gif) and returns them as
+- read detects image files (png, jpg, jpeg, webp, gif) and returns them as
   structured image content. Do not call external or non-existent tools such as
   \"analyze_image\" — they do not exist.
 
@@ -188,11 +188,7 @@ mod tests {
             "test tool"
         }
         fn schema(&self) -> ToolSchema {
-            ToolSchema {
-                tool: self.name.to_string(),
-                description: self.description().to_string(),
-                input_schema: json!({}),
-            }
+            ToolSchema::new(self.name, self.description(), json!({}))
         }
         fn call(
             &self,

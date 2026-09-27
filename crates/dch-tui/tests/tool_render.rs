@@ -53,7 +53,7 @@ fn text_of(line: &ratatui::text::Line<'_>) -> String {
 #[test]
 fn each_tool_humanizes_to_its_verb() {
     let cases = [
-        ("Read", r#"{"file_path":"/a/b.rs"}"#, "Reading /a/b.rs…"),
+        ("read", r#"{"path":"/a/b.rs"}"#, "Reading /a/b.rs…"),
         ("Write", r#"{"file_path":"/a/b.rs"}"#, "Writing /a/b.rs…"),
         ("Edit", r#"{"file_path":"/a/b.rs"}"#, "Editing /a/b.rs…"),
         (

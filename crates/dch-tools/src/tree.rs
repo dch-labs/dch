@@ -743,7 +743,9 @@ mod tests {
         assert_eq!(tool.name(), "Tree");
         assert!(tool.is_read_only());
         assert!(tool.is_concurrency_safe());
-        let reg = crate::registry::builtin_registry();
+        let reg = crate::registry::builtin_registry(&loopctl::tool::builtin::fs::FileSession::new(
+            std::path::PathBuf::from("."),
+        ));
         assert!(reg.get("Tree").is_some(), "Tree registered");
     }
 }

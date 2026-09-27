@@ -60,6 +60,8 @@ use loopctl::middleware::ToolPipeline;
 use loopctl::observer::LoopObserver;
 use loopctl::tool::Tool;
 use loopctl::tool::ToolRegistry;
+use loopctl::tool::builtin::fs::FileSession;
+use loopctl::tool::builtin::fs::ResolvePolicy as FsResolvePolicy;
 
 use crate::DchClient;
 use crate::RunnerError;
@@ -108,6 +110,15 @@ pub struct Runner {
     /// [`Runner::set_question_tx`].
     context: Arc<RunnerContext>,
 
+    /// The filesystem session the builtin file family dispatches through.
+    ///
+    /// Built beside the context in [`RunnerBuilder::build`] and carried by
+    /// the context injector into every dispatch, so the advertised tools
+    /// and the executing tools share one baseline map and containment
+    /// policy. Exposed for the resume re-arm through
+    /// [`Runner::record_resumed_read`].
+    fs_session: FileSession,
+
     /// The session-default run policy (turn budget, dispatch policy).
     ///
     /// Mapped once from `DchConfig` in [`RunnerBuilder::build`] and used by
@@ -120,6 +131,17 @@ pub struct Runner {
 }
 
 impl Runner {
+    /// Re-arm the write guard for a file a restored transcript shows read.
+    ///
+    /// Delegates to the filesystem session's own re-arm: the file's
+    /// current bytes become the recorded baseline, marked as resumed —
+    /// the model never saw these bytes in this session, so the first
+    /// write still demands a fresh live read. Returns whether the path
+    /// resolved and could be read and recorded.
+    pub async fn record_resumed_read(&self, file_path: &str) -> bool {
+        self.fs_session.record_resumed_read(file_path).await
+    }
+
     /// Start building a runner for `config` operating within `workdir`.
     ///
     /// Returns a [`RunnerBuilder`]; register observers and dispatch
@@ -452,11 +474,13 @@ impl RunnerBuilder<'_> {
             RunnerContext::new(self.workdir.clone())
                 .with_resolve_policy(resolve_policy_for(&self.config.runner)),
         );
+        let fs_session = FileSession::new(self.workdir.clone())
+            .with_resolve_policy(fs_resolve_policy_for(&self.config.runner));
 
         let client = crate::create_client(&self.config.api)?;
         let connections = connect_mcp_servers(self.config, &context.cwd).await?;
-        let mut registry = compose_registry(&connections);
-        let mut core_registry = compose_registry(&connections);
+        let mut registry = compose_registry(&connections, &fs_session);
+        let mut core_registry = compose_registry(&connections, &fs_session);
         for provider in &self.mcp_providers {
             provider.register_into(&mut registry);
             provider.register_into(&mut core_registry);
@@ -479,6 +503,7 @@ impl RunnerBuilder<'_> {
         );
         managers.set_pipeline(build_pipeline(
             &context,
+            &fs_session,
             &self.middleware,
             gate,
             self.config.security.redact_secrets,
@@ -496,6 +521,7 @@ impl RunnerBuilder<'_> {
         Ok(Runner {
             inner,
             context,
+            fs_session,
             run_config,
         })
     }
@@ -607,6 +633,19 @@ fn resolve_policy_for(runner: &dch_config::RunnerConfig) -> ResolvePolicy {
     }
 }
 
+/// The resolve policy the filesystem session carries for the given config.
+///
+/// The same `unsafe_paths` switch mapped onto the filesystem family's own
+/// policy type, so the builtin read and writing tools judge containment by
+/// the identical setting the search tools see.
+fn fs_resolve_policy_for(runner: &dch_config::RunnerConfig) -> FsResolvePolicy {
+    if runner.unsafe_paths {
+        FsResolvePolicy::Unrestricted
+    } else {
+        FsResolvePolicy::Contained
+    }
+}
+
 /// Compose the full tool registry: the builtin tools plus every MCP server's.
 ///
 /// Each server contributes per its containment policy: a connection without
@@ -615,8 +654,8 @@ fn resolve_policy_for(runner: &dch_config::RunnerConfig) -> ResolvePolicy {
 /// registry and the dispatch pipeline's core cannot share boxed tools, so
 /// each gets its own composition from the same connections (an MCP tool
 /// clones into both, keeping the two positions identical by construction).
-fn compose_registry(connections: &[McpConnection]) -> ToolRegistry {
-    let mut registry = builtin_registry();
+fn compose_registry(connections: &[McpConnection], fs_session: &FileSession) -> ToolRegistry {
+    let mut registry = builtin_registry(fs_session);
     for connection in connections {
         match &connection.allowed {
             None => connection.provider.register_into(&mut registry),
@@ -708,6 +747,7 @@ fn build_session(
 ///   typed error rather than panicked on.
 fn build_pipeline(
     context: &Arc<RunnerContext>,
+    fs_session: &FileSession,
     middleware: &[Arc<dyn ToolMiddleware>],
     permission: PermissionMiddleware,
     redact: bool,
@@ -715,6 +755,7 @@ fn build_pipeline(
 ) -> Result<ToolPipeline, RunnerError> {
     let mut builder = ToolPipeline::builder().with_middleware(ContextInjector {
         context: Arc::clone(context),
+        fs_session: fs_session.clone(),
     });
     builder = builder.with_middleware(permission);
     for host_middleware in middleware {
@@ -747,6 +788,13 @@ struct ContextInjector {
     /// `Arc`-shared todo list and question channel slot) so tools always see
     /// the current runner state.
     context: Arc<RunnerContext>,
+
+    /// The filesystem session the builtin file family dispatches through.
+    ///
+    /// Attached to every dispatch's context beside the runner extension, so
+    /// read and the writing tools share one baseline map, containment
+    /// policy, and working directory by construction.
+    fs_session: FileSession,
 }
 
 impl ToolMiddleware for ContextInjector {
@@ -776,6 +824,7 @@ impl ToolMiddleware for ContextInjector {
             .is_some();
         ctx.tool_context.cwd = self.context.cwd.to_string_lossy().into_owned();
         ctx.tool_context.is_non_interactive = !has_channel;
+        self.fs_session.attach(&mut ctx.tool_context);
         ctx.tool_context.set_extension((*self.context).clone());
         Box::pin(async move { next.dispatch(ctx).await })
     }
@@ -820,11 +869,11 @@ mod tests {
             "reports the RunnerContext cwd"
         }
         fn schema(&self) -> ToolSchema {
-            ToolSchema {
-                tool: "Probe".to_string(),
-                description: "reports the RunnerContext cwd".to_string(),
-                input_schema: serde_json::json!({"type": "object"}),
-            }
+            ToolSchema::new(
+                "Probe",
+                "reports the RunnerContext cwd",
+                serde_json::json!({"type": "object"}),
+            )
         }
         fn call<'a>(
             &'a self,
@@ -912,6 +961,7 @@ mod tests {
             .with_core(Arc::new(registry))
             .with_middleware(ContextInjector {
                 context: Arc::clone(context),
+                fs_session: FileSession::new(PathBuf::from(".")),
             })
             .build()
             .expect("static composition builds")
@@ -954,11 +1004,11 @@ mod tests {
             "panics on every call"
         }
         fn schema(&self) -> ToolSchema {
-            ToolSchema {
-                tool: "PanicProbe".to_string(),
-                description: "panics on every call".to_string(),
-                input_schema: serde_json::json!({"type": "object"}),
-            }
+            ToolSchema::new(
+                "PanicProbe",
+                "panics on every call",
+                serde_json::json!({"type": "object"}),
+            )
         }
         fn call<'a>(
             &'a self,
@@ -971,10 +1021,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_panicking_tool_surfaces_as_an_error_result_through_the_composed_pipeline() {
-        let mut registry = builtin_registry();
+        let mut registry = builtin_registry(&FileSession::new(PathBuf::from(".")));
         registry.register(PanicProbe);
         let pipeline = build_pipeline(
             &sample_context("/tmp/probe-cwd"),
+            &FileSession::new(PathBuf::from(".")),
             &[],
             permission_layer(dch_tools::permission::PermissionMode::Auto, None),
             false,
@@ -1005,10 +1056,11 @@ mod tests {
     fn build_pipeline_places_the_injector_outermost_over_the_core() {
         let pipeline = build_pipeline(
             &sample_context("/tmp/probe-cwd"),
+            &FileSession::new(PathBuf::from(".")),
             &[],
             permission_layer(dch_tools::permission::PermissionMode::Auto, None),
             false,
-            builtin_registry(),
+            builtin_registry(&FileSession::new(PathBuf::from("."))),
         )
         .expect("static composition builds");
         assert_eq!(
@@ -1023,10 +1075,11 @@ mod tests {
     fn build_pipeline_layers_host_middleware_between_gate_and_redaction() {
         let redacting = build_pipeline(
             &sample_context("/tmp/probe-cwd"),
+            &FileSession::new(PathBuf::from(".")),
             &[],
             permission_layer(dch_tools::permission::PermissionMode::Auto, None),
             true,
-            builtin_registry(),
+            builtin_registry(&FileSession::new(PathBuf::from("."))),
         )
         .expect("static composition builds");
         assert_eq!(
@@ -1036,10 +1089,11 @@ mod tests {
         );
         let layered = build_pipeline(
             &sample_context("/tmp/probe-cwd"),
+            &FileSession::new(PathBuf::from(".")),
             &[Arc::new(HostProbe)],
             permission_layer(dch_tools::permission::PermissionMode::Auto, None),
             true,
-            builtin_registry(),
+            builtin_registry(&FileSession::new(PathBuf::from("."))),
         )
         .expect("static composition builds");
         assert_eq!(
@@ -1069,11 +1123,11 @@ mod tests {
         }
 
         fn schema(&self) -> loopctl::tool::ToolSchema {
-            loopctl::tool::ToolSchema {
-                tool: self.name().to_string(),
-                description: self.description().to_string(),
-                input_schema: serde_json::json!({"type": "object", "properties": {}}),
-            }
+            loopctl::tool::ToolSchema::new(
+                self.name(),
+                self.description(),
+                serde_json::json!({"type": "object", "properties": {}}),
+            )
         }
 
         fn call(
@@ -1101,6 +1155,7 @@ mod tests {
         registry.register(HighEntropyEchoTool);
         let pipeline = build_pipeline(
             &sample_context("/tmp/probe-cwd"),
+            &FileSession::new(PathBuf::from(".")),
             &[],
             permission_layer(dch_tools::permission::PermissionMode::Auto, None),
             true,
@@ -1136,13 +1191,19 @@ mod tests {
 
     #[test]
     fn unsafe_paths_config_wires_unrestricted_resolution() {
-        // The config switch maps onto the policy the runner context carries;
-        // anything the config leaves unset stays contained.
+        // The config switch maps onto both policy tracks the runner carries:
+        // the search tools' policy and the file family's own. Anything the
+        // config leaves unset stays contained on both.
         let config = dch_config::DchConfig::default();
         assert_eq!(
             resolve_policy_for(&config.runner),
             ResolvePolicy::Contained,
             "the default config keeps tools contained"
+        );
+        assert_eq!(
+            fs_resolve_policy_for(&config.runner),
+            FsResolvePolicy::Contained,
+            "the default config keeps the file family contained"
         );
         let mut opted_out = dch_config::DchConfig::default();
         opted_out.runner.unsafe_paths = true;
@@ -1150,6 +1211,41 @@ mod tests {
             resolve_policy_for(&opted_out.runner),
             ResolvePolicy::Unrestricted,
             "the opt-out must lift containment"
+        );
+        assert_eq!(
+            fs_resolve_policy_for(&opted_out.runner),
+            FsResolvePolicy::Unrestricted,
+            "the opt-out must lift the file family's containment too"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_contained_runner_refuses_a_read_that_escapes_the_workdir() {
+        // The file family judges containment by the session the runner
+        // attaches, so the contained default must refuse an escaping read
+        // through the real dispatch path — not merely by construction.
+        let server = SseServer::start(vec![
+            sse_tool_call_turn("read", &serde_json::json!({"path": "../secret.txt"})),
+            sse_text_turn("done"),
+        ])
+        .await;
+        let dir = TempDir::new().expect("tempdir");
+        let outside = TempDir::new().expect("outside tempdir");
+        std::fs::write(outside.path().join("secret.txt"), "SHOULD NOT BE READ")
+            .expect("seed outside target");
+        let mut runner = Runner::builder(&wire_config(server.port, 10), dir.path())
+            .build()
+            .await
+            .expect("constructs");
+        let run = tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("read it"))
+            .await
+            .expect("run settles within timeout")
+            .expect("a refused tool is a soft error, not a run failure");
+        assert_eq!(run.output.as_deref(), Some("done"));
+        let requests = recorded_requests(&server);
+        assert!(
+            requests.len() >= 2 && requests[1].contains("escapes the working directory"),
+            "the containment refusal must ride the follow-up request: {requests:?}"
         );
     }
 
@@ -1339,14 +1435,14 @@ mod tests {
                 "id": "c1", "model": "test-model",
                 "choices": [{"delta": {"tool_calls": [{
                     "index": 0, "id": "call_1",
-                    "function": {"name": "Read", "arguments": ""}
+                    "function": {"name": "read", "arguments": ""}
                 }]}, "finish_reason": null}]
             }),
             serde_json::json!({
                 "id": "c1", "model": "test-model",
                 "choices": [{"delta": {"tool_calls": [{
                     "index": 0,
-                    "function": {"arguments": "{\"file_path\":\"note.txt\"}"}}
+                    "function": {"arguments": "{\"path\":\"note.txt\"}"}}
                 ]}, "finish_reason": null}]
             }),
             serde_json::json!({
@@ -1420,7 +1516,7 @@ mod tests {
     #[test]
     fn build_session_composes_the_system_prompt_for_general_role() {
         let config = DchConfig::default();
-        let registry = dch_tools::builtin_registry();
+        let registry = dch_tools::builtin_registry(&FileSession::new(PathBuf::from(".")));
         let session = build_session(&config, &registry, Path::new("/tmp"));
         let prompt = session
             .system_prompt
@@ -1444,7 +1540,7 @@ mod tests {
             role: Role::Coding,
             prompt: "OVERRIDE MARKER: do the thing.".to_string(),
         }];
-        let registry = dch_tools::builtin_registry();
+        let registry = dch_tools::builtin_registry(&FileSession::new(PathBuf::from(".")));
         let session = build_session(&config, &registry, Path::new("/tmp"));
         let prompt = session.system_prompt.expect("composed");
         assert!(
@@ -1469,7 +1565,7 @@ mod tests {
         )
         .expect("write marker");
         let config = DchConfig::default();
-        let registry = dch_tools::builtin_registry();
+        let registry = dch_tools::builtin_registry(&FileSession::new(PathBuf::from(".")));
         let session = build_session(&config, &registry, dir.path());
         let prompt = session.system_prompt.expect("composed");
         assert!(
@@ -1487,7 +1583,7 @@ mod tests {
         // An empty tempdir yields no detected techs, so no PROJECT section.
         let dir = TempDir::new().expect("tempdir");
         let config = DchConfig::default();
-        let registry = dch_tools::builtin_registry();
+        let registry = dch_tools::builtin_registry(&FileSession::new(PathBuf::from(".")));
         let session = build_session(&config, &registry, dir.path());
         let prompt = session.system_prompt.expect("composed");
         assert!(
@@ -1552,7 +1648,7 @@ mod tests {
     }
 
     fn sse_read_tool_call_turn() -> String {
-        sse_tool_call_turn("Read", &serde_json::json!({"file_path": "note.txt"}))
+        sse_tool_call_turn("read", &serde_json::json!({"path": "note.txt"}))
     }
 
     fn sse_tool_call_turn(tool: &str, args: &serde_json::Value) -> String {
@@ -1906,13 +2002,55 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_resumed_read_rearm_guards_the_dispatching_write_tools() {
+        // The re-arm and the executing Write must share one session: the
+        // re-armed baseline is exactly what the dispatched Write consults,
+        // so a file changed after the re-arm refuses the clobber.
+        let server = SseServer::start(vec![
+            sse_tool_call_turn(
+                "Write",
+                &serde_json::json!({"file_path": "note.txt", "content": "clobber"}),
+            ),
+            sse_text_turn("done"),
+        ])
+        .await;
+        let dir = TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join("note.txt"), "original").expect("seed target");
+        let mut runner = Runner::builder(&wire_config(server.port, 10), dir.path())
+            .build()
+            .await
+            .expect("constructs");
+        assert!(
+            runner.record_resumed_read("note.txt").await,
+            "the readable in-reach file re-arms"
+        );
+        std::fs::write(dir.path().join("note.txt"), "externally changed")
+            .expect("mutate after the re-arm");
+        let run = tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("go"))
+            .await
+            .expect("run settles within timeout")
+            .expect("a refused tool is a soft error, not a run failure");
+        assert_eq!(run.output.as_deref(), Some("done"));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("note.txt")).unwrap_or_default(),
+            "externally changed",
+            "the re-armed guard held the write"
+        );
+        let requests = recorded_requests(&server);
+        assert!(
+            requests.len() >= 2 && requests[1].contains("last read in a previous session"),
+            "the re-arm's resumed-baseline refusal must ride the follow-up request: {requests:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_approved_write_still_refuses_a_target_changed_during_the_ask() {
         // The approval window must not widen the conflict window: the
         // gate parks the dispatch until the resolver answers, and the
         // staleness check runs only after the release, so a change
         // landing while the ask is pending still refuses the write.
         let server = SseServer::start(vec![
-            sse_tool_call_turn("Read", &serde_json::json!({"file_path": "note.txt"})),
+            sse_tool_call_turn("read", &serde_json::json!({"path": "note.txt"})),
             sse_tool_call_turn(
                 "Write",
                 &serde_json::json!({"file_path": "note.txt", "content": "clobber"}),
@@ -1935,7 +2073,7 @@ mod tests {
                     .lock()
                     .expect("consultations lock")
                     .push(tool.to_string());
-                if tool == "Read" {
+                if tool == "read" {
                     Box::pin(async { true })
                 } else {
                     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -1962,7 +2100,7 @@ mod tests {
             .expect("the write ask parked a reply");
         assert_eq!(
             consultations.lock().expect("consultations lock").as_slice(),
-            ["Read", "Write"],
+            ["read", "Write"],
             "the read ask resolves immediately; only the write parks"
         );
         std::fs::write(dir.path().join("note.txt"), "externally changed")
@@ -2141,7 +2279,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let registry = compose_registry(&[connection]);
+        let registry = compose_registry(&[connection], &FileSession::new(PathBuf::from(".")));
 
         assert!(
             registry.contains("demo__greet"),
@@ -2151,7 +2289,7 @@ mod tests {
             !registry.contains("demo__farewell"),
             "an unlisted tool must stay unregistered"
         );
-        let expected = builtin_registry().len() + 1;
+        let expected = builtin_registry(&FileSession::new(PathBuf::from("."))).len() + 1;
         assert_eq!(registry.len(), expected, "exactly one external tool joins");
     }
 
@@ -2362,7 +2500,7 @@ mod tests {
             "composed system prompt must reach the wire: {body}"
         );
         assert!(
-            body.contains("\"Read\""),
+            body.contains("\"read\""),
             "the registry's tool schemas must be advertised: {body}"
         );
     }

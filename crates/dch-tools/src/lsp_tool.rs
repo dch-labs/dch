@@ -69,10 +69,10 @@ impl Tool for LspTool {
     }
 
     fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            tool: self.name().to_string(),
-            description: self.description().to_string(),
-            input_schema: json!({
+        ToolSchema::new(
+            self.name(),
+            self.description(),
+            json!({
                 "type": "object",
                 "properties": {
                     "operation": {
@@ -107,7 +107,7 @@ impl Tool for LspTool {
                 },
                 "required": ["operation", "file_path"]
             }),
-        }
+        )
     }
 
     fn call(
@@ -1169,7 +1169,9 @@ mod tests {
         assert!(LspTool.is_read_only());
         assert!(LspTool.is_concurrency_safe());
         assert!(LspTool.system_prompt().is_some());
-        let reg = crate::registry::builtin_registry();
+        let reg = crate::registry::builtin_registry(&loopctl::tool::builtin::fs::FileSession::new(
+            std::path::PathBuf::from("."),
+        ));
         assert!(reg.get("LSP").is_some(), "registered");
     }
 

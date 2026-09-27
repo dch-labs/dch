@@ -42,10 +42,10 @@ impl Tool for AskTool {
     }
 
     fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            tool: self.name().to_string(),
-            description: self.description().to_string(),
-            input_schema: json!({
+        ToolSchema::new(
+            self.name(),
+            self.description(),
+            json!({
                 "type": "object",
                 "properties": {
                     "questions": {
@@ -95,7 +95,7 @@ impl Tool for AskTool {
                 },
                 "required": ["questions"]
             }),
-        }
+        )
     }
 
     fn call(

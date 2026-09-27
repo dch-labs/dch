@@ -55,7 +55,7 @@ pub enum ToolCategory {
     /// Reads files and directory structure; never mutates anything.
     ///
     /// The only category [`is_read_only`](ToolCategory::is_read_only)
-    /// accepts: `Read`, `FileViewer`, `Glob`, `Grep`, `CodeSearch`, `Tree`,
+    /// accepts: `read`, `FileViewer`, `Glob`, `Grep`, `CodeSearch`, `Tree`,
     /// and `LSP` all
     /// observe the workspace without changing it.
     FileRead,
@@ -118,8 +118,9 @@ impl ToolCategory {
 
 /// Map a tool's registered name to its [`ToolCategory`].
 ///
-/// Matching is exact and case-sensitive: the names are the registered tool
-/// names, in their `PascalCase` registry form. Unknown names — a
+/// Matching is exact and case-sensitive against the registered tool
+/// names — `PascalCase` for most, lowercase for loopctl's `read`.
+/// Unknown names — a
 /// misconfigured registry, a typo, a tool added before its entry —
 /// classify as [`ToolCategory::Unclassified`] and emit a warning so the gap
 /// is observable in logs. `Unclassified` fails closed: only `Auto` runs
@@ -127,7 +128,7 @@ impl ToolCategory {
 #[must_use]
 pub fn tool_category(name: &str) -> ToolCategory {
     match name {
-        "Read" | "Glob" | "Grep" | "CodeSearch" | "Tree" | "FileViewer" | "LSP" => {
+        "read" | "Glob" | "Grep" | "CodeSearch" | "Tree" | "FileViewer" | "LSP" => {
             ToolCategory::FileRead
         }
         "Write" | "Edit" | "MultiEdit" => ToolCategory::FileWrite,
@@ -213,7 +214,7 @@ mod tests {
     /// [`tool_category`], and the tests iterate this table so the two cannot
     /// drift.
     const TOOL_TABLE: &[(&str, ToolCategory)] = &[
-        ("Read", ToolCategory::FileRead),
+        ("read", ToolCategory::FileRead),
         ("Write", ToolCategory::FileWrite),
         ("Edit", ToolCategory::FileWrite),
         ("MultiEdit", ToolCategory::FileWrite),
@@ -247,7 +248,9 @@ mod tests {
         // The registry and the category table are linked only by convention;
         // this pins that a registered tool never silently falls to the
         // unknown-name default.
-        let registry = builtin_registry();
+        let registry = builtin_registry(&loopctl::tool::builtin::fs::FileSession::new(
+            std::path::PathBuf::from("."),
+        ));
         let registered: Vec<&str> = registry
             .all_tools()
             .into_iter()
@@ -277,7 +280,7 @@ mod tests {
 
     #[test]
     fn unknown_names_fail_closed_as_unclassified() {
-        for name in ["DefinitelyNotATool", "", "read", "Bash ", "TODO_WRITE"] {
+        for name in ["DefinitelyNotATool", "", "READS", "Bash ", "TODO_WRITE"] {
             assert_eq!(
                 tool_category(name),
                 ToolCategory::Unclassified,
