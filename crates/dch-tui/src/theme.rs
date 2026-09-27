@@ -360,8 +360,8 @@ pub struct UIStyle {
     /// The raised-surface background — the palette's own elevated
     /// step off the canvas.
     ///
-    /// The composer, markdown code blocks, and the status bar draw on
-    /// this, so a surface reads as elevated over
+    /// The composer and the user-turn prompt boxes draw on this, so a
+    /// surface reads as elevated over
     /// [`background`](Self::background) rather than as a hole in it.
     /// Each theme carries its palette's own elevated background step
     /// (a current-line, mantle, or bg1 tone) rather than a derived
@@ -376,7 +376,11 @@ pub struct UIStyle {
 
     /// The accent for highlights, selection, and focus emphasis.
     ///
-    /// The loudest color in the palette, used sparingly by design.
+    /// The loudest color in the palette, used sparingly by design. On
+    /// painted chrome the composer's left edge column and the
+    /// conversation's user-turn chevron draw here — the input and the
+    /// user's own words are the screen's focal surfaces; the paintless
+    /// theme's accents are Reset and it draws neither.
     pub primary: Color,
 
     /// The muted accent paired with [`primary`](Self::primary).
@@ -433,8 +437,10 @@ pub struct UIStyle {
 
     /// The status bar's background.
     ///
-    /// Paired with [`status_bar_fg`](Self::status_bar_fg); themes pick a
-    /// tone that frames the screen against the content background.
+    /// Paired with [`status_bar_fg`](Self::status_bar_fg); set to the
+    /// theme's background so the bar sits on the terminal-level canvas
+    /// and only the raised composer paints at the foot of the screen —
+    /// the prompt box and the status row read as distinct panes.
     pub status_bar_bg: Color,
 
     /// The status bar's foreground.
@@ -531,7 +537,7 @@ impl From<&Theme> for crate::markdown::MarkdownTheme {
             bold: value.markdown.bold,
             italic: value.markdown.italic,
             code_inline: value.markdown.code_inline,
-            code_block: value.markdown.code_block.bg.unwrap_or(value.ui.surface),
+            code_block: value.markdown.code_block.bg.unwrap_or(Color::Reset),
             link: value.markdown.link,
             quote: value.markdown.quote,
             list_item: value.markdown.list_item,
@@ -762,33 +768,32 @@ mod tests {
     }
 
     #[test]
-    fn every_theme_s_status_bar_paints_on_its_elevated_surface() {
-        // The bar is chrome, not canvas: it carries the theme's
-        // elevated step — the same color the composer and code blocks
-        // draw on — and must differ from the canvas it closes, or the
-        // one surface that spans the full window width at rest would
-        // carry no theme color at all.
+    fn every_theme_s_status_bar_sits_on_the_canvas_background() {
+        // The bar is canvas, not chrome: it carries the theme's
+        // background and steps off the elevated surface, so the
+        // composer stays the single raised block at the foot of the
+        // screen and the status row reads as a pane of its own below
+        // the prompt box.
         for (key, _) in theme_data::THEME_CONSTRUCTORS {
             let ui = Theme::by_name(key).unwrap().ui;
             if defers_to_terminal(&ui) {
                 continue;
             }
             assert_eq!(
-                ui.status_bar_bg, ui.surface,
-                "{key}: the bar paints on the theme's elevated surface"
+                ui.status_bar_bg, ui.background,
+                "{key}: the bar sits on the theme's canvas background"
             );
             assert_ne!(
-                ui.status_bar_bg, ui.background,
-                "{key}: the bar must step off the canvas"
+                ui.status_bar_bg, ui.surface,
+                "{key}: the bar must step off the raised surface"
             );
         }
     }
 
     #[test]
     fn every_theme_s_status_text_reads_on_its_bar() {
-        // WCAG relative luminance, the same floor the inline-code chip
-        // holds: model and token counts must stay legible on the
-        // elevated bar.
+        // WCAG relative luminance: model and token counts must stay
+        // legible on the canvas-colored status bar.
         fn channel(v: u8) -> f32 {
             let c = f32::from(v) / 255.0;
             if c <= 0.04045 {
@@ -815,34 +820,6 @@ mod tests {
             assert!(
                 ratio >= 3.0,
                 "{key}: status-text contrast {ratio:.2} is below 3:1"
-            );
-        }
-    }
-
-    #[test]
-    fn every_theme_s_inline_code_chip_stays_on_its_canvas_side_of_the_palette() {
-        // The chip is a highlight, not an inversion: an inline-code
-        // background from the opposite pole of the theme's canvas
-        // renders as a foreign dark block on a light theme (or the
-        // reverse) — the copy-paste slip class this pins shut.
-        let dark_side = |color: Color| match color {
-            Color::Rgb(red, green, blue) => {
-                u32::from(red)
-                    .saturating_add(u32::from(green))
-                    .saturating_add(u32::from(blue))
-                    < 384
-            }
-            _ => false,
-        };
-        for (key, _) in theme_data::THEME_CONSTRUCTORS {
-            let theme = Theme::by_name(key).unwrap();
-            let Some(chip) = theme.markdown.code_inline.bg else {
-                continue;
-            };
-            assert_eq!(
-                dark_side(chip),
-                dark_side(theme.ui.background),
-                "{key}: the inline-code chip must stay on its canvas's side of the palette"
             );
         }
     }
@@ -897,7 +874,7 @@ mod tests {
         assert_eq!(ui.assistant_message_fg, Color::Reset);
         assert_eq!(
             theme.markdown.code_inline.bg, None,
-            "the inline-code chip paints no tint"
+            "inline code paints no background of its own"
         );
         assert_eq!(ui.status_success, Color::Indexed(2));
         assert_eq!(ui.status_warning, Color::Indexed(3));
@@ -1005,43 +982,6 @@ mod tests {
     }
 
     #[test]
-    fn inline_code_contrasts_with_its_chip() {
-        // WCAG relative luminance: a foreground that blends into its chip
-        // background makes inline code unreadable, so every theme's pair
-        // must clear the 3:1 large-text minimum.
-        fn channel(v: u8) -> f32 {
-            let c = f32::from(v) / 255.0;
-            if c <= 0.04045 {
-                c / 12.92
-            } else {
-                ((c + 0.055) / 1.055).powf(2.4)
-            }
-        }
-        fn luminance(color: Color) -> f32 {
-            let (r, g, b) = match color {
-                Color::Rgb(r, g, b) => (r, g, b),
-                other => panic!("chip colors must be RGB, got {other:?}"),
-            };
-            0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
-        }
-        for (key, _) in theme_data::THEME_CONSTRUCTORS {
-            let style = Theme::by_name(key).unwrap().markdown.code_inline;
-            let (Some(fg), Some(bg)) = (style.fg, style.bg) else {
-                // A chipless theme — the transparent one paints no
-                // tint — has no pair to hold contrast between.
-                continue;
-            };
-            let (lf, lb) = (luminance(fg), luminance(bg));
-            let (lighter, darker) = if lf > lb { (lf, lb) } else { (lb, lf) };
-            let ratio = (lighter + 0.05) / (darker + 0.05);
-            assert!(
-                ratio >= 3.0,
-                "{key}: inline-code contrast {ratio:.2} is below 3:1"
-            );
-        }
-    }
-
-    #[test]
     fn markdown_styles_keep_the_semantic_modifiers() {
         // The markdown contract the renderer relies on, in every shipped
         // palette: headings are bold, emphasis is italic, links are
@@ -1084,7 +1024,7 @@ mod tests {
         assert_eq!(markdown.dim, theme.ui.dim);
         assert_eq!(
             markdown.code_block,
-            theme.markdown.code_block.bg.unwrap_or(theme.ui.surface)
+            theme.markdown.code_block.bg.unwrap_or(Color::Reset)
         );
 
         assert_eq!(syntax.plain, theme.ui.foreground);

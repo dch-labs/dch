@@ -87,6 +87,7 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         tokens.cumulative_input = outcome.tokens.cumulative_input;
         tokens.cumulative_output = outcome.tokens.cumulative_output;
+        tokens.input = outcome.tokens.last_input_tokens;
     }
     let (permission_resolver, permission_rx) = permission_bridge();
     let mut builder = dch_loop::Runner::builder(&config, &workdir)
@@ -147,30 +148,15 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
     };
     app.set_session_id(session_id.to_string());
 
-    // Save the transcript off the render thread whenever a turn
-    // ends: one ordered writer receives the snapshots, so the newest
-    // transcript lands last and teardown joins the final write.
     let saver = Arc::new(crate::session::SessionSaver::with_model(session_id, model));
     let (transcript_handle, transcript_worker) = TranscriptWorker::spawn(saver);
+    let initial_transcript = transcript_handle.clone();
     let hook_tokens = Arc::clone(&state.tokens);
     app.set_turn_end_hook(Box::new(move |conversation| {
-        let (cumulative_input, cumulative_output, last_input_tokens) =
-            hook_tokens.lock().map_or((0, 0, 0), |counts| {
-                (
-                    counts.cumulative_input,
-                    counts.cumulative_output,
-                    counts.input,
-                )
-            });
-        transcript_handle.send(
-            conversation.to_vec(),
-            crate::session::SessionTokens {
-                cumulative_input,
-                cumulative_output,
-                last_input_tokens,
-            },
-        );
+        transcript_handle.send(conversation.to_vec(), snapshot_tokens(&hook_tokens));
     }));
+
+    initial_transcript.send(app.conversation().to_vec(), snapshot_tokens(&state.tokens));
 
     TerminalGuard::install_panic_hook();
     let (guard, mut terminal) =
@@ -200,7 +186,40 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
     drop(driver.await);
     transcript_worker.join();
     drop(guard);
+    println!("{}", session_exit_line(session_id));
     session.map_err(|err| format!("terminal error: {err}"))
+}
+
+/// The session-file token totals for the live counters.
+///
+/// One mapping for both save sites — the turn-end hook and the
+/// pre-first-frame snapshot — so the file always carries the totals
+/// the status bar showed at the moment of the save, including the
+/// ones a resume restored; a poisoned lock records zeros rather than
+/// blocking a save.
+fn snapshot_tokens(
+    live: &Arc<std::sync::Mutex<dch_tui::TokenCounts>>,
+) -> crate::session::SessionTokens {
+    live.lock().map_or_else(
+        |_| crate::session::SessionTokens::default(),
+        |counts| crate::session::SessionTokens {
+            cumulative_input: counts.cumulative_input,
+            cumulative_output: counts.cumulative_output,
+            last_input_tokens: counts.input,
+        },
+    )
+}
+
+/// The two lines the TUI prints once a session ends.
+///
+/// A `Resume with:` label, then the copy-pasteable command on its own
+/// line — nothing else, so the exit leaves exactly the instruction
+/// behind. An initial snapshot persists before the first frame, so
+/// the file the command names exists however the session ended;
+/// printed after the transcript writer joins and the terminal is
+/// restored, on clean exits and failures alike.
+fn session_exit_line(session_id: uuid::Uuid) -> String {
+    format!("Resume with:\ndch --resume {session_id}")
 }
 
 /// The handle a turn-end hook uses to hand transcripts to the writer.
@@ -213,6 +232,20 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
 struct TranscriptHandle {
     slot: Arc<std::sync::Mutex<Option<TranscriptSnapshot>>>,
     signal: Arc<std::sync::Condvar>,
+}
+
+impl Clone for TranscriptHandle {
+    /// Clone the mailbox handle.
+    ///
+    /// Both halves are shared arcs, so a clone publishes through the
+    /// same one-slot mailbox the original does — the host keeps one to
+    /// seed the session file before the first frame.
+    fn clone(&self) -> Self {
+        Self {
+            slot: Arc::clone(&self.slot),
+            signal: Arc::clone(&self.signal),
+        }
+    }
 }
 
 impl TranscriptHandle {
@@ -773,6 +806,71 @@ mod tests {
         (saver, dir, id)
     }
 
+    #[test]
+    fn the_exit_lines_label_and_name_the_resume_command() {
+        let id = uuid::Uuid::new_v4();
+        let lines = session_exit_line(id);
+        let mut printed = lines.split('\n');
+        assert_eq!(
+            printed.next(),
+            Some("Resume with:"),
+            "the first line is the bare label"
+        );
+        let command = format!("dch --resume {id}");
+        assert_eq!(
+            printed.next(),
+            Some(command.as_str()),
+            "the second line is the copy-pasteable command"
+        );
+        assert_eq!(printed.next(), None, "the exit leaves exactly two lines");
+    }
+
+    #[test]
+    fn an_initial_snapshot_persists_a_loadable_session_file() {
+        // The exit line's promise holds from the first frame: the
+        // initial snapshot writes the session file even when no turn
+        // ever ends, so the printed command resumes something real.
+        let (saver, dir, id) = worker_saver();
+        let (handle, worker) = TranscriptWorker::spawn(saver);
+        handle.send(Vec::new(), crate::session::SessionTokens::default());
+        worker.join();
+        let messages = saved_messages(dir.path(), id);
+        assert!(
+            messages.is_empty(),
+            "the pre-first-frame snapshot loads back as the empty session"
+        );
+    }
+
+    #[test]
+    fn an_initial_snapshot_preserves_restored_token_totals() {
+        // A resume seeds all three counters before the first frame; an
+        // exit with no new turn must keep the triple in the file.
+        let (saver, dir, id) = worker_saver();
+        let (handle, worker) = TranscriptWorker::spawn(saver);
+        let state = TuiObserverState::new();
+        {
+            let mut tokens = state.tokens.lock().expect("the tokens lock");
+            tokens.cumulative_input = 9_999;
+            tokens.cumulative_output = 111;
+            tokens.input = 777;
+        }
+        handle.send(Vec::new(), snapshot_tokens(&state.tokens));
+        worker.join();
+        let tokens = saved_tokens(dir.path(), id);
+        assert_eq!(
+            tokens.cumulative_input, 9_999,
+            "the restored input total survives a turnless exit"
+        );
+        assert_eq!(
+            tokens.cumulative_output, 111,
+            "the restored output total survives a turnless exit"
+        );
+        assert_eq!(
+            tokens.last_input_tokens, 777,
+            "the restored last-turn figure survives a turnless exit"
+        );
+    }
+
     /// Read a worker-written transcript back from disk.
     ///
     /// Parses the envelope directly rather than going through the
@@ -789,6 +887,18 @@ mod tests {
                 .clone(),
         )
         .expect("the messages parse back")
+    }
+
+    /// Read a worker-written transcript's token totals back.
+    ///
+    /// Same direct-envelope parse as [`saved_messages`], so a pin
+    /// proves what the file itself records.
+    fn saved_tokens(dir: &std::path::Path, id: uuid::Uuid) -> crate::session::SessionTokens {
+        let path = dir.join(id.to_string()).join("session.json");
+        let json = std::fs::read_to_string(path).expect("the transcript file");
+        let envelope: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        serde_json::from_value(envelope.get("tokens").expect("the tokens field").clone())
+            .expect("the tokens parse back")
     }
 
     #[test]

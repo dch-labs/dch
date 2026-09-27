@@ -14,6 +14,8 @@
 
 use std::sync::Arc;
 
+use unicode_width::UnicodeWidthChar as _;
+
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
 };
@@ -311,11 +313,11 @@ fn scroll_keys_adjust_without_underflow() {
     assert!(app.handle_event(&plain(KeyCode::PageUp)));
     let scrolled = render_to_buffer(&mut app, 40, 10);
     let scrolled_view = view_text(&scrolled, 40, 10);
-    // Conversation is 4 rows at height 10 (spacer, padded two-row
-    // field, status bar); PageUp lifts the window ten lines off the
-    // bottom.
+    // Each user turn renders pad, text, pad — three lines — so at
+    // height 10 the pane's two content rows (under its own padding
+    // row) land inside turns after PageUp lifts ten lines.
     assert!(
-        !scrolled_view.contains("line 59") && scrolled_view.contains("line 47"),
+        !scrolled_view.contains("line 59") && scrolled_view.contains("line 56"),
         "scrolling up shifts the visible window: {scrolled_view:?}"
     );
 }
@@ -433,12 +435,12 @@ fn seeded_tool_blocks_stay_expandable_after_a_resume() {
     );
     app.handle_event(&mouse_event(
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
-        4,
+        5,
         u16::try_from(row).unwrap_or(0),
     ));
     app.handle_event(&mouse_event(
         MouseEventKind::Up(crossterm::event::MouseButton::Left),
-        4,
+        5,
         u16::try_from(row).unwrap_or(0),
     ));
     let open = render_to_buffer(&mut app, 80, 24);
@@ -611,8 +613,9 @@ fn ctrl_shift_c_copies_the_selection_without_quitting() {
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
-    app.set_selection_copier(Box::new(move |text| {
+    app.set_selection_copier(Box::new(move |_attempt, text| {
         sink.lock().expect("sink").push(text.to_string());
+        dch_tui::CopyAnswer::Verified
     }));
     let probe = render_to_buffer(&mut app, 80, 24);
     let rows = row_texts(&probe);
@@ -620,7 +623,7 @@ fn ctrl_shift_c_copies_the_selection_without_quitting() {
         .iter()
         .position(|r| r.contains("abcdefghij"))
         .unwrap_or(0);
-    let col = rows[row].find("abcdefghij").unwrap_or(0);
+    let col = cell_col(&rows[row], "abcdefghij");
     app.handle_event(&mouse_event(
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
         u16::try_from(col + 2).unwrap_or(0),
@@ -670,6 +673,35 @@ fn key_releases_are_ignored() {
 }
 
 #[test]
+fn the_status_bar_names_the_current_permission_mode() {
+    // The mode segment rides the left cluster with the model and the
+    // token counts, in the config's own spelling, so what the bar
+    // shows is exactly what the user set.
+    for (mode, segment) in [
+        (dch_config::PermissionMode::Auto, "mode: auto"),
+        (dch_config::PermissionMode::Plan, "mode: plan"),
+        (
+            dch_config::PermissionMode::AcceptEdits,
+            "mode: accept_edits",
+        ),
+        (dch_config::PermissionMode::Interactive, "mode: interactive"),
+    ] {
+        let mut config = config_with_theme("dracula");
+        config.runner.permission_mode = mode;
+        let mut app = TuiApp::new(config);
+        let terminal = render_to_buffer(&mut app, 80, 30);
+        let buffer = terminal.backend().buffer();
+        let status_row: String = (0..80)
+            .map(|x| buffer[(x, 29)].symbol().to_string())
+            .collect();
+        assert!(
+            status_row.contains(segment),
+            "the bar names `{segment}`: {status_row:?}"
+        );
+    }
+}
+
+#[test]
 fn layout_shows_three_panes() {
     let mut app = app();
     let terminal = render_to_buffer(&mut app, 80, 30);
@@ -715,13 +747,18 @@ fn layout_shows_three_panes() {
             "the field's vertical padding rows are pure blank tint: {row:?}"
         );
     }
-    // Square corners: the fill reaches every corner cell — the
-    // padding row's tint and its corner cell are one continuous
-    // rectangle, no clipping and no glyphs.
+    // Square corners: the fill reaches every corner cell — the tint runs
+    // to the pane's left edge, where the primary accent column opens
+    // the composer; no clipping and no glyphs.
+    assert_eq!(
+        buffer[(1, 25)].bg,
+        buffer[(2, 25)].bg,
+        "the fill beside the accent edge carries one continuous tint"
+    );
     assert_eq!(
         buffer[(0, 25)].bg,
-        buffer[(2, 25)].bg,
-        "the fill's corner cell carries the same tint as the padding row beside it"
+        app.theme.ui.primary,
+        "the corner cell opens the composer's primary edge column"
     );
     let first_text = field_row(26);
     assert!(
@@ -1002,6 +1039,18 @@ fn row_texts(terminal: &Terminal<TestBackend>) -> Vec<String> {
                 .collect()
         })
         .collect()
+}
+
+/// The cell column where `needle` starts in a rendered row.
+///
+/// Rendered rows carry chrome glyphs (the user-turn chevron) whose
+/// byte length differs from their cell width, and `str::find` answers
+/// in bytes while clicks address cells — this walks display width so a
+/// multibyte glyph before the text cannot skew a click's column.
+fn cell_col(row: &str, needle: &str) -> usize {
+    row.find(needle).map_or(0, |byte| {
+        row[..byte].chars().map(|c| c.width().unwrap_or(0)).sum()
+    })
 }
 
 #[test]
@@ -1425,8 +1474,9 @@ fn a_drag_selects_characters_and_copies_silently() {
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
-    app.set_selection_copier(Box::new(move |text| {
+    app.set_selection_copier(Box::new(move |_attempt, text| {
         sink.lock().expect("sink").push(text.to_string());
+        dch_tui::CopyAnswer::Verified
     }));
 
     let _ = render_to_buffer(&mut app, 80, 24);
@@ -1438,7 +1488,7 @@ fn a_drag_selects_characters_and_copies_silently() {
         .iter()
         .position(|r| r.contains("abcdefghij"))
         .unwrap_or(0);
-    let col = rows[row].find("abcdefghij").unwrap_or(0);
+    let col = cell_col(&rows[row], "abcdefghij");
 
     let press = mouse_event(
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
@@ -1446,22 +1496,27 @@ fn a_drag_selects_characters_and_copies_silently() {
         u16::try_from(row).unwrap_or(0),
     );
     app.handle_event(&press);
+    let second = rows
+        .iter()
+        .position(|r| r.contains("klmnopqrst"))
+        .unwrap_or(0);
     let drag = mouse_event(
         MouseEventKind::Drag(crossterm::event::MouseButton::Left),
         u16::try_from(col + 5).unwrap_or(0),
-        u16::try_from(row + 1).unwrap_or(0),
+        u16::try_from(second).unwrap_or(0),
     );
     app.handle_event(&drag);
     let up = mouse_event(
         MouseEventKind::Up(crossterm::event::MouseButton::Left),
         u16::try_from(col + 5).unwrap_or(0),
-        u16::try_from(row + 1).unwrap_or(0),
+        u16::try_from(second).unwrap_or(0),
     );
     app.handle_event(&up);
 
     let copied = copied.lock().expect("sink").clone();
     assert_eq!(copied.len(), 1, "exactly one silent copy");
-    let expected = "cdefghij\nklmnop".to_string();
+    // the turns' padding rows ride the span as blank content lines
+    let expected = "cdefghij\n\n\nklmnop".to_string();
     assert_eq!(
         copied[0], expected,
         "character-granular coverage, partial first and last lines"
@@ -1470,6 +1525,82 @@ fn a_drag_selects_characters_and_copies_silently() {
         app.conversation().len(),
         before,
         "the copy is silent — nothing joins the conversation"
+    );
+}
+
+#[test]
+fn a_user_turn_opens_with_the_primary_chevron() {
+    // The turn marker is chrome, not content: the chevron overlays a
+    // reserved gutter beside the user turn's first row in the theme's
+    // primary, so each agent answer starts where a marked block ends —
+    // and a copy never carries the glyph.
+    let mut app = app();
+    app.push_message(TuiMessage::User {
+        text: "first line of the question\nsecond line".to_string(),
+        timestamp: chrono::Utc::now(),
+    });
+    app.push_message(TuiMessage::Assistant {
+        blocks: vec![ContentBlock::Text {
+            text: "the answer".to_string(),
+        }],
+        timestamp: chrono::Utc::now(),
+        duration_ms: None,
+    });
+    let probe = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&probe);
+    let marked = rows
+        .iter()
+        .position(|r| r.contains("first line of the question"))
+        .expect("the user turn's first row");
+    let buffer = probe.backend().buffer();
+    let chevron = &buffer[(2, u16::try_from(marked).unwrap_or(0))];
+    assert_eq!(
+        chevron.symbol(),
+        "❯",
+        "the chevron rides the gutter beside the turn's first row"
+    );
+    assert_eq!(
+        chevron.fg, app.theme.ui.primary,
+        "the chevron takes the theme's primary accent"
+    );
+    let marked_row = u16::try_from(marked).unwrap_or(0);
+    let answer = rows
+        .iter()
+        .position(|r| r.contains("the answer"))
+        .expect("the answer row");
+    for (x, label) in [(5u16, "at the text"), (77, "at the box's right edge")] {
+        assert_eq!(
+            buffer[(x, marked_row)].bg,
+            app.theme.ui.surface,
+            "the user turn paints the prompt box's surface {label}"
+        );
+    }
+    assert_eq!(
+        buffer[(0, marked_row)].bg,
+        ratatui::style::Color::Reset,
+        "the box keeps its margin outside its left edge"
+    );
+    assert_eq!(
+        buffer[(78, marked_row)].bg,
+        ratatui::style::Color::Reset,
+        "the box keeps the same margin outside its right edge"
+    );
+    let answer_row = u16::try_from(answer).unwrap_or(0);
+    assert_eq!(
+        buffer[(40, answer_row)].bg,
+        ratatui::style::Color::Reset,
+        "assistant rows stay on the terminal's own background"
+    );
+
+    // The paintless chrome paints nothing: no surface block, the turn
+    // keeps the terminal's own background beside its chevron glyph.
+    let mut ruled = TuiApp::new(config_with_theme("transparent"));
+    let frame = render_to_buffer(&mut ruled, 80, 24);
+    let buffer = frame.backend().buffer();
+    assert_eq!(
+        buffer[(40, marked_row)].bg,
+        ratatui::style::Color::Reset,
+        "the paintless theme draws no user-turn surface"
     );
 }
 
@@ -1488,7 +1619,7 @@ fn a_drag_shows_the_highlight_before_release() {
         .iter()
         .position(|r| r.contains("abcdefghij"))
         .unwrap_or(0);
-    let col = rows[row].find("abcdefghij").unwrap_or(0);
+    let col = cell_col(&rows[row], "abcdefghij");
     app.handle_event(&mouse_event(
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
         u16::try_from(col).unwrap_or(0),
@@ -1558,6 +1689,62 @@ fn the_transparent_theme_underlines_its_composer() {
 }
 
 #[test]
+fn the_composer_carries_a_solid_primary_column_on_its_left_edge() {
+    // 24 rows put the composer pane on rows 19..=21 with the text
+    // window on row 20, starting two columns in — the edge column owns
+    // column 0 alone, thick by construction (paint, not glyphs).
+    let mut plain = app();
+    let frame = render_to_buffer(&mut plain, 80, 24);
+    let buffer = frame.backend().buffer();
+    for y in 19..=21u16 {
+        assert_eq!(
+            buffer[(0, y)].bg,
+            plain.theme.ui.primary,
+            "every composer row opens with the primary edge"
+        );
+    }
+    assert_eq!(
+        buffer[(1, 19)].bg,
+        plain.theme.ui.surface,
+        "the composer body beside the edge keeps the surface color"
+    );
+
+    // The status rows below sit on the plain background, so the raised
+    // composer — edge and all — ends where the prompt box ends.
+    assert_ne!(
+        plain.theme.ui.background, plain.theme.ui.surface,
+        "the palettes keep the bar's canvas distinct from the raised surface"
+    );
+    for y in 22..=23u16 {
+        assert_eq!(
+            buffer[(0, y)].bg,
+            plain.theme.ui.background,
+            "the status bar sits on the theme background below the composer"
+        );
+    }
+
+    // The paintless chrome stays paintless: no edge column, the pane
+    // keeps the terminal's own background down its whole left side
+    // (its primary is Reset — a bg of Reset would be the invisible
+    // null mark, so the theme opts out of the edge entirely).
+    let mut ruled = TuiApp::new(config_with_theme("transparent"));
+    let frame = render_to_buffer(&mut ruled, 80, 24);
+    let buffer = frame.backend().buffer();
+    for y in 19..=21u16 {
+        assert_eq!(
+            buffer[(0, y)].bg,
+            ratatui::style::Color::Reset,
+            "the paintless composer paints nothing, edge included"
+        );
+    }
+    assert_eq!(
+        buffer[(1, 19)].bg,
+        ratatui::style::Color::Reset,
+        "beside the absent edge the paintless composer stays unpainted"
+    );
+}
+
+#[test]
 fn a_press_in_the_composer_places_the_caret_where_it_landed() {
     // 24 rows put the composer pane on rows 19..=22 with its text
     // window on row 20, text starting two columns in.
@@ -1613,8 +1800,9 @@ fn a_released_selection_stays_highlighted_until_the_next_press() {
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
-    app.set_selection_copier(Box::new(move |text| {
+    app.set_selection_copier(Box::new(move |_attempt, text| {
         sink.lock().expect("sink").push(text.to_string());
+        dch_tui::CopyAnswer::Verified
     }));
 
     let probe = render_to_buffer(&mut app, 80, 24);
@@ -1623,7 +1811,7 @@ fn a_released_selection_stays_highlighted_until_the_next_press() {
         .iter()
         .position(|r| r.contains("abcdefghij"))
         .unwrap_or(0);
-    let col = rows[row].find("abcdefghij").unwrap_or(0);
+    let col = cell_col(&rows[row], "abcdefghij");
 
     app.handle_event(&mouse_event(
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
@@ -1676,6 +1864,391 @@ fn a_released_selection_stays_highlighted_until_the_next_press() {
 }
 
 #[test]
+fn a_released_selection_copy_confirms_on_the_notice_row() {
+    // The release hands the covered span to the clipboard and says so:
+    // the notice row above the composer carries the confirmation while
+    // its hold lasts.
+    let mut app = app();
+    let now = chrono::Utc::now();
+    app.push_message(TuiMessage::User {
+        text: "abcdefghij".to_string(),
+        timestamp: now,
+    });
+    let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&copied);
+    app.set_selection_copier(Box::new(move |_attempt, text| {
+        sink.lock().expect("sink").push(text.to_string());
+        dch_tui::CopyAnswer::Verified
+    }));
+
+    let probe = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&probe);
+    let row = rows
+        .iter()
+        .position(|r| r.contains("abcdefghij"))
+        .unwrap_or(0);
+    let col = cell_col(&rows[row], "abcdefghij");
+
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 2).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 5).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 5).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+
+    assert_eq!(
+        copied.lock().expect("sink").as_slice(),
+        ["cdef"],
+        "the release copied the covered span"
+    );
+    let noticed = render_to_buffer(&mut app, 80, 24);
+    assert!(
+        row_texts(&noticed)
+            .iter()
+            .any(|r| r.contains("selection copied")),
+        "the copy confirms on the notice row: {:?}",
+        row_texts(&noticed)
+    );
+}
+
+#[test]
+fn a_click_without_travel_copies_and_notices_nothing() {
+    // A click is a toggle, not a copy: the clipboard stays alone and
+    // the notice row stays blank.
+    let mut app = app();
+    let now = chrono::Utc::now();
+    app.push_message(TuiMessage::User {
+        text: "abcdefghij".to_string(),
+        timestamp: now,
+    });
+    let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&copied);
+    app.set_selection_copier(Box::new(move |_attempt, text| {
+        sink.lock().expect("sink").push(text.to_string());
+        dch_tui::CopyAnswer::Verified
+    }));
+
+    let probe = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&probe);
+    let row = rows
+        .iter()
+        .position(|r| r.contains("abcdefghij"))
+        .unwrap_or(0);
+    let col = cell_col(&rows[row], "abcdefghij");
+
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 2).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 2).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+
+    assert!(
+        copied.lock().expect("sink").is_empty(),
+        "a click without travel copies nothing"
+    );
+    let noticed = render_to_buffer(&mut app, 80, 24);
+    assert!(
+        !row_texts(&noticed)
+            .iter()
+            .any(|r| r.contains("selection copied")),
+        "the notice row stays blank without a copy: {:?}",
+        row_texts(&noticed)
+    );
+}
+
+#[test]
+fn a_copy_no_transport_delivers_notices_the_failure() {
+    // A copier that reports nothing delivered flips the wording to
+    // name the escape hatch instead of claiming success.
+    let mut app = app();
+    let now = chrono::Utc::now();
+    app.push_message(TuiMessage::User {
+        text: "abcdefghij".to_string(),
+        timestamp: now,
+    });
+    app.set_selection_copier(Box::new(|_attempt, _text| dch_tui::CopyAnswer::Failed));
+
+    let probe = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&probe);
+    let row = rows
+        .iter()
+        .position(|r| r.contains("abcdefghij"))
+        .unwrap_or(0);
+    let col = cell_col(&rows[row], "abcdefghij");
+
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 2).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 5).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 5).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+
+    let noticed = render_to_buffer(&mut app, 80, 24);
+    assert!(
+        row_texts(&noticed)
+            .iter()
+            .any(|r| r.contains("copy failed — set display.copy_command")),
+        "an undelivered copy names the escape hatch: {:?}",
+        row_texts(&noticed)
+    );
+    assert!(
+        !row_texts(&noticed)
+            .iter()
+            .any(|r| r.contains("selection copied")),
+        "it does not also claim success: {:?}",
+        row_texts(&noticed)
+    );
+}
+
+#[test]
+fn a_hanging_copy_command_never_blocks_the_render_task() {
+    // The release must not wait on the helper: the chain runs off the
+    // render path under a kill deadline, and the verdict lands as a
+    // follow-up notice through the frame drain — wording only the
+    // drain produces, so landing is presence, not optimism.
+    let mut config = config_with_theme("dracula");
+    config.display.copy_command = Some("sleep 30".to_string());
+    let mut app = TuiApp::new(config);
+    let now = chrono::Utc::now();
+    app.push_message(TuiMessage::User {
+        text: "abcdefghij".to_string(),
+        timestamp: now,
+    });
+
+    let probe = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&probe);
+    let row = rows
+        .iter()
+        .position(|r| r.contains("abcdefghij"))
+        .unwrap_or(0);
+    let col = cell_col(&rows[row], "abcdefghij");
+
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 2).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 5).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    let began = std::time::Instant::now();
+    app.handle_event(&mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 5).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    assert!(
+        began.elapsed() < std::time::Duration::from_secs(1),
+        "the release returns without waiting on the hanging helper"
+    );
+
+    let mut landed = false;
+    for _ in 0..100 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let frame = render_to_buffer(&mut app, 80, 24);
+        if row_texts(&frame)
+            .iter()
+            .any(|r| r.contains("selection copied (unconfirmed)"))
+        {
+            landed = true;
+            break;
+        }
+    }
+    assert!(
+        landed,
+        "the deadline lands the unconfirmed verdict on the notice row"
+    );
+}
+
+#[test]
+fn a_pending_transport_copy_shows_the_unconfirmed_wording_immediately() {
+    // Transports in flight never borrow the verified claim: from the
+    // release itself the notice reads unconfirmed, and the attempt's
+    // verdict can only agree with or upgrade it.
+    let mut config = config_with_theme("dracula");
+    config.display.copy_command = Some("sleep 30".to_string());
+    let mut app = TuiApp::new(config);
+    let now = chrono::Utc::now();
+    app.push_message(TuiMessage::User {
+        text: "abcdefghij".to_string(),
+        timestamp: now,
+    });
+
+    let probe = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&probe);
+    let row = rows
+        .iter()
+        .position(|r| r.contains("abcdefghij"))
+        .unwrap_or(0);
+    let col = cell_col(&rows[row], "abcdefghij");
+
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 2).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 5).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 5).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+
+    let frame = render_to_buffer(&mut app, 80, 24);
+    assert!(
+        row_texts(&frame)
+            .iter()
+            .any(|r| r.contains("selection copied (unconfirmed)")),
+        "the pending window says unconfirmed from the start: {:?}",
+        row_texts(&frame)
+    );
+}
+
+#[test]
+fn the_copy_chord_confirms_on_the_notice_row() {
+    // Ctrl+Shift+C delivers through the same funnel as the release,
+    // so its copy lands the same confirmation on the notice row.
+    let mut app = app();
+    let now = chrono::Utc::now();
+    app.push_message(TuiMessage::User {
+        text: "abcdefghij".to_string(),
+        timestamp: now,
+    });
+    let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&copied);
+    app.set_selection_copier(Box::new(move |_attempt, text| {
+        sink.lock().expect("sink").push(text.to_string());
+        dch_tui::CopyAnswer::Verified
+    }));
+
+    let probe = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&probe);
+    let row = rows
+        .iter()
+        .position(|r| r.contains("abcdefghij"))
+        .unwrap_or(0);
+    let col = cell_col(&rows[row], "abcdefghij");
+
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 2).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 5).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    assert!(
+        app.handle_event(&key(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT
+        )),
+        "the chord is handled"
+    );
+
+    assert_eq!(
+        copied.lock().expect("sink").as_slice(),
+        ["cdef"],
+        "the chord copied the covered span"
+    );
+    let noticed = render_to_buffer(&mut app, 80, 24);
+    assert!(
+        row_texts(&noticed)
+            .iter()
+            .any(|r| r.contains("selection copied")),
+        "the chord's copy confirms on the notice row: {:?}",
+        row_texts(&noticed)
+    );
+}
+
+#[test]
+fn a_shift_arrow_recopy_confirms_on_the_notice_row() {
+    // The keyboard walk re-copies as the head moves; each delivery
+    // refreshes the same confirmation row rather than stacking rows.
+    let mut app = app();
+    let now = chrono::Utc::now();
+    app.push_message(TuiMessage::User {
+        text: "abcdefghij".to_string(),
+        timestamp: now,
+    });
+    let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&copied);
+    app.set_selection_copier(Box::new(move |_attempt, text| {
+        sink.lock().expect("sink").push(text.to_string());
+        dch_tui::CopyAnswer::Verified
+    }));
+
+    let probe = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&probe);
+    let row = rows
+        .iter()
+        .position(|r| r.contains("abcdefghij"))
+        .unwrap_or(0);
+    let col = cell_col(&rows[row], "abcdefghij");
+
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        u16::try_from(col).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 2).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 2).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&key(KeyCode::Right, KeyModifiers::SHIFT));
+
+    assert_eq!(
+        copied.lock().expect("sink").as_slice(),
+        ["abc", "abcd"],
+        "the release and the walk's step each copied once"
+    );
+    let noticed = render_to_buffer(&mut app, 80, 24);
+    assert!(
+        row_texts(&noticed)
+            .iter()
+            .any(|r| r.contains("selection copied")),
+        "the walk's re-copy confirms on the notice row: {:?}",
+        row_texts(&noticed)
+    );
+}
+
+#[test]
 fn a_drag_running_past_the_bottom_edge_scrolls_with_the_selection() {
     // 24 rows put the conversation pane on rows 0..=16.
     let mut app = app();
@@ -1696,13 +2269,13 @@ fn a_drag_running_past_the_bottom_edge_scrolls_with_the_selection() {
 
     app.handle_event(&mouse_event(
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
-        2,
+        5,
         3,
     ));
     assert!(
         app.handle_event(&mouse_event(
             MouseEventKind::Drag(crossterm::event::MouseButton::Left),
-            2,
+            5,
             16,
         )),
         "the edge drag reports a redraw"
@@ -1740,12 +2313,12 @@ fn a_parked_edge_drag_keeps_scrolling_on_the_tick_until_the_document_ends() {
     let _ = render_to_buffer(&mut app, 80, 24);
     app.handle_event(&mouse_event(
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
-        2,
+        5,
         3,
     ));
     app.handle_event(&mouse_event(
         MouseEventKind::Drag(crossterm::event::MouseButton::Left),
-        2,
+        5,
         16,
     ));
     assert_eq!(
@@ -1773,7 +2346,7 @@ fn a_parked_edge_drag_keeps_scrolling_on_the_tick_until_the_document_ends() {
     assert!(app.auto_scroll(), "reaching the bottom re-arms stickiness");
     let settled = render_to_buffer(&mut app, 80, 24);
     assert!(
-        reversed_cells_on_row(&settled, 16) >= 1,
+        reversed_cells_on_row(&settled, 15) >= 1,
         "the selection follows the edge all the way down"
     );
     for _ in 0..6 {
@@ -1804,12 +2377,12 @@ fn buttonless_motion_ends_a_parked_edge_drag() {
     let _ = render_to_buffer(&mut app, 80, 24);
     app.handle_event(&mouse_event(
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
-        2,
+        5,
         3,
     ));
     app.handle_event(&mouse_event(
         MouseEventKind::Drag(crossterm::event::MouseButton::Left),
-        2,
+        5,
         0,
     ));
     assert_eq!(app.scroll_offset(), 1);
@@ -1848,13 +2421,13 @@ fn a_drag_running_past_the_top_edge_scrolls_upward() {
 
     app.handle_event(&mouse_event(
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
-        2,
+        5,
         5,
     ));
     assert!(
         app.handle_event(&mouse_event(
             MouseEventKind::Drag(crossterm::event::MouseButton::Left),
-            2,
+            5,
             0,
         )),
         "the edge drag reports a redraw"
@@ -1867,25 +2440,25 @@ fn a_drag_running_past_the_top_edge_scrolls_upward() {
     assert!(!app.auto_scroll(), "the upward edge drag detaches");
     let scrolled = render_to_buffer(&mut app, 80, 24);
     assert!(
-        reversed_cells_on_row(&scrolled, 0) >= 1,
-        "the selection reaches the pane's top line as the view moves"
+        reversed_cells_on_row(&scrolled, 1) >= 1,
+        "the selection reaches the pane's top content line as the view moves"
     );
     // the push parks: ticks carry it upward, bounded by the
-    // document's first line — 30 lines over an 18-row pane end at
-    // offset 12
+    // document's first line — 30 three-line turns over 16 content
+    // rows end at offset 74
     let mut ticks = 0;
     while app.tick_wake(std::time::Instant::now()) {
         ticks += 1;
         assert!(
-            ticks < 20,
+            ticks < 100,
             "the parked push reaches the document top in bounded ticks"
         );
         let _ = render_to_buffer(&mut app, 80, 24);
     }
-    assert_eq!(app.scroll_offset(), 13, "the walk ends pinned at the top");
+    assert_eq!(app.scroll_offset(), 74, "the walk ends pinned at the top");
     let settled = render_to_buffer(&mut app, 80, 24);
     assert!(
-        reversed_cells_on_row(&settled, 0) >= 1,
+        reversed_cells_on_row(&settled, 2) >= 1,
         "the selection follows the edge all the way up"
     );
 }
@@ -1908,8 +2481,9 @@ fn shift_arrows_extend_and_shrink_a_released_selection() {
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
-    app.set_selection_copier(Box::new(move |text| {
+    app.set_selection_copier(Box::new(move |_attempt, text| {
         sink.lock().expect("sink").push(text.to_string());
+        dch_tui::CopyAnswer::Verified
     }));
 
     let probe = render_to_buffer(&mut app, 80, 24);
@@ -1918,7 +2492,11 @@ fn shift_arrows_extend_and_shrink_a_released_selection() {
         .iter()
         .position(|r| r.contains("abcdefghij"))
         .unwrap_or(0);
-    let col = rows[row].find("abcdefghij").unwrap_or(0);
+    let col = cell_col(&rows[row], "abcdefghij");
+    let second = rows
+        .iter()
+        .position(|r| r.contains("klmnopqrst"))
+        .unwrap_or(0);
     app.handle_event(&mouse_event(
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
         u16::try_from(col + 2).unwrap_or(0),
@@ -1927,18 +2505,21 @@ fn shift_arrows_extend_and_shrink_a_released_selection() {
     app.handle_event(&mouse_event(
         MouseEventKind::Drag(crossterm::event::MouseButton::Left),
         u16::try_from(col + 5).unwrap_or(0),
-        u16::try_from(row + 1).unwrap_or(0),
+        u16::try_from(second).unwrap_or(0),
     ));
     app.handle_event(&mouse_event(
         MouseEventKind::Up(crossterm::event::MouseButton::Left),
         u16::try_from(col + 5).unwrap_or(0),
-        u16::try_from(row + 1).unwrap_or(0),
+        u16::try_from(second).unwrap_or(0),
     ));
 
-    // right extends the head's line; up pulls the head back a line,
-    // shrinking the selection onto its first line; left shrinks
-    // within the line
+    // right extends the head's line; three ups pull the head back
+    // onto the first line — copying the padding rows it crosses as
+    // the blank content lines they are — shrinking the selection
+    // onto it; left shrinks within the line
     app.handle_event(&key(KeyCode::Right, KeyModifiers::SHIFT));
+    app.handle_event(&key(KeyCode::Up, KeyModifiers::SHIFT));
+    app.handle_event(&key(KeyCode::Up, KeyModifiers::SHIFT));
     app.handle_event(&key(KeyCode::Up, KeyModifiers::SHIFT));
     app.handle_event(&key(KeyCode::Left, KeyModifiers::SHIFT));
 
@@ -1946,8 +2527,10 @@ fn shift_arrows_extend_and_shrink_a_released_selection() {
     assert_eq!(
         copied,
         vec![
-            "cdefghij\nklmnop".to_string(),
-            "cdefghij\nklmnopq".to_string(),
+            "cdefghij\n\n\nklmnop".to_string(),
+            "cdefghij\n\n\nklmnopq".to_string(),
+            "cdefghij\n\n".to_string(),
+            "cdefghij\n".to_string(),
             "cdefg".to_string(),
             "cdef".to_string(),
         ],
@@ -1975,17 +2558,17 @@ fn shift_arrows_walk_the_view_to_follow_the_head() {
     let _ = render_to_buffer(&mut app, 80, 24);
     app.handle_event(&mouse_event(
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
-        2,
+        5,
         3,
     ));
     app.handle_event(&mouse_event(
         MouseEventKind::Drag(crossterm::event::MouseButton::Left),
-        2,
+        5,
         4,
     ));
     app.handle_event(&mouse_event(
         MouseEventKind::Up(crossterm::event::MouseButton::Left),
-        2,
+        5,
         4,
     ));
     assert_eq!(app.scroll_offset(), 5);
@@ -2002,7 +2585,7 @@ fn shift_arrows_walk_the_view_to_follow_the_head() {
     assert!(app.auto_scroll(), "the walk re-arms at the bottom");
     let settled = render_to_buffer(&mut app, 80, 24);
     assert!(
-        reversed_cells_on_row(&settled, 16) >= 1,
+        reversed_cells_on_row(&settled, 15) >= 1,
         "the head sits on the document's last, visible line"
     );
 }
@@ -2022,23 +2605,24 @@ fn plain_arrows_still_scroll_while_a_selection_is_up() {
     }
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
-    app.set_selection_copier(Box::new(move |text| {
+    app.set_selection_copier(Box::new(move |_attempt, text| {
         sink.lock().expect("sink").push(text.to_string());
+        dch_tui::CopyAnswer::Verified
     }));
     let _ = render_to_buffer(&mut app, 80, 24);
     app.handle_event(&mouse_event(
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
-        2,
+        5,
         3,
     ));
     app.handle_event(&mouse_event(
         MouseEventKind::Drag(crossterm::event::MouseButton::Left),
-        2,
+        5,
         4,
     ));
     app.handle_event(&mouse_event(
         MouseEventKind::Up(crossterm::event::MouseButton::Left),
-        2,
+        5,
         4,
     ));
     assert_eq!(copied.lock().expect("sink").len(), 1);
@@ -2074,7 +2658,7 @@ fn a_rebuilt_line_space_forfeits_the_selection() {
         .iter()
         .position(|r| r.contains("abcdefghij"))
         .unwrap_or(0);
-    let col = rows[row].find("abcdefghij").unwrap_or(0);
+    let col = cell_col(&rows[row], "abcdefghij");
     app.handle_event(&mouse_event(
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
         u16::try_from(col).unwrap_or(0),
@@ -2111,7 +2695,7 @@ fn a_rebuilt_line_space_forfeits_the_selection() {
         .iter()
         .position(|r| r.contains("abcdefghij"))
         .unwrap_or(0);
-    let col = rows[row].find("abcdefghij").unwrap_or(0);
+    let col = cell_col(&rows[row], "abcdefghij");
     app.handle_event(&mouse_event(
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
         u16::try_from(col).unwrap_or(0),
@@ -2160,8 +2744,9 @@ fn a_press_on_a_running_tool_row_anchors_on_the_selectable_transcript() {
         });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
-    app.set_selection_copier(Box::new(move |text| {
+    app.set_selection_copier(Box::new(move |_attempt, text| {
         sink.lock().expect("sink").push(text.to_string());
+        dch_tui::CopyAnswer::Verified
     }));
 
     let probe = render_to_buffer(&mut app, 80, 24);
@@ -2170,7 +2755,7 @@ fn a_press_on_a_running_tool_row_anchors_on_the_selectable_transcript() {
         .iter()
         .position(|r| r.contains("abcdefghij"))
         .unwrap_or(0);
-    let col = rows[row].find("abcdefghij").unwrap_or(0);
+    let col = cell_col(&rows[row], "abcdefghij");
     let tool_row = rows.iter().position(|r| r.contains("Grep")).unwrap_or(0);
 
     app.handle_event(&mouse_event(
@@ -2192,8 +2777,8 @@ fn a_press_on_a_running_tool_row_anchors_on_the_selectable_transcript() {
     let copied = copied.lock().expect("sink").clone();
     assert_eq!(copied.len(), 1, "exactly one silent copy");
     assert_eq!(
-        copied[0], "abcd",
-        "the press clamps onto the message line, anchoring where a copy can walk"
+        copied[0], "defghij\n",
+        "the press clamps onto the turn's trailing pad, anchoring where a copy can walk"
     );
     let selected = render_to_buffer(&mut app, 80, 24);
     assert!(
@@ -2225,7 +2810,7 @@ fn a_press_with_nothing_selectable_starts_no_selection() {
     let _ = render_to_buffer(&mut app, 80, 24);
     let press = mouse_event(
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
-        4,
+        5,
         2,
     );
     assert!(
@@ -2246,8 +2831,9 @@ fn a_streaming_delta_forfeits_a_selection_reaching_into_the_live_region() {
     let mut app = app();
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
-    app.set_selection_copier(Box::new(move |text| {
+    app.set_selection_copier(Box::new(move |_attempt, text| {
         sink.lock().expect("sink").push(text.to_string());
+        dch_tui::CopyAnswer::Verified
     }));
     app.streaming_text()
         .lock()
@@ -2259,7 +2845,7 @@ fn a_streaming_delta_forfeits_a_selection_reaching_into_the_live_region() {
         .iter()
         .position(|r| r.contains("streaming reply"))
         .unwrap_or(0);
-    let col = rows[row].find("streaming reply").unwrap_or(0);
+    let col = cell_col(&rows[row], "streaming reply");
     app.handle_event(&mouse_event(
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
         u16::try_from(col).unwrap_or(0),
@@ -2313,8 +2899,9 @@ fn a_streaming_delta_preserves_a_selection_in_the_settled_transcript() {
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
-    app.set_selection_copier(Box::new(move |text| {
+    app.set_selection_copier(Box::new(move |_attempt, text| {
         sink.lock().expect("sink").push(text.to_string());
+        dch_tui::CopyAnswer::Verified
     }));
     app.streaming_text()
         .lock()
@@ -2326,7 +2913,7 @@ fn a_streaming_delta_preserves_a_selection_in_the_settled_transcript() {
         .iter()
         .position(|r| r.contains("abcdefghij"))
         .unwrap_or(0);
-    let col = rows[row].find("abcdefghij").unwrap_or(0);
+    let col = cell_col(&rows[row], "abcdefghij");
     app.handle_event(&mouse_event(
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
         u16::try_from(col).unwrap_or(0),
@@ -2383,8 +2970,9 @@ fn a_release_over_blank_cells_copies_nothing() {
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
-    app.set_selection_copier(Box::new(move |text| {
+    app.set_selection_copier(Box::new(move |_attempt, text| {
         sink.lock().expect("sink").push(text.to_string());
+        dch_tui::CopyAnswer::Verified
     }));
 
     let probe = render_to_buffer(&mut app, 80, 24);
@@ -2393,7 +2981,7 @@ fn a_release_over_blank_cells_copies_nothing() {
         .iter()
         .position(|r| r.contains("abcdefghij"))
         .unwrap_or(0);
-    let col = rows[row].find("abcdefghij").unwrap_or(0);
+    let col = cell_col(&rows[row], "abcdefghij");
     let krow = rows
         .iter()
         .position(|r| r.contains("klmnopqrst"))
@@ -2454,13 +3042,14 @@ fn combining_marks_carry_with_their_base_and_line_up_with_the_rendered_cells() {
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
-    app.set_selection_copier(Box::new(move |text| {
+    app.set_selection_copier(Box::new(move |_attempt, text| {
         sink.lock().expect("sink").push(text.to_string());
+        dch_tui::CopyAnswer::Verified
     }));
     let probe = render_to_buffer(&mut app, 80, 24);
     let rows = row_texts(&probe);
     let row = rows.iter().position(|r| r.contains('x')).unwrap_or(0);
-    let col = rows[row].find('e').unwrap_or(0);
+    let col = cell_col(&rows[row], "e");
 
     app.handle_event(&mouse_event(
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
@@ -2522,8 +3111,9 @@ fn a_press_outside_the_conversation_retires_the_selection_without_recopying() {
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
-    app.set_selection_copier(Box::new(move |text| {
+    app.set_selection_copier(Box::new(move |_attempt, text| {
         sink.lock().expect("sink").push(text.to_string());
+        dch_tui::CopyAnswer::Verified
     }));
     let probe = render_to_buffer(&mut app, 80, 24);
     let rows = row_texts(&probe);
@@ -2531,7 +3121,7 @@ fn a_press_outside_the_conversation_retires_the_selection_without_recopying() {
         .iter()
         .position(|r| r.contains("abcdefghij"))
         .unwrap_or(0);
-    let col = rows[row].find("abcdefghij").unwrap_or(0);
+    let col = cell_col(&rows[row], "abcdefghij");
     app.handle_event(&mouse_event(
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
         u16::try_from(col + 2).unwrap_or(0),
@@ -2594,8 +3184,9 @@ fn an_interior_blank_line_stays_in_a_multi_row_copy() {
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
-    app.set_selection_copier(Box::new(move |text| {
+    app.set_selection_copier(Box::new(move |_attempt, text| {
         sink.lock().expect("sink").push(text.to_string());
+        dch_tui::CopyAnswer::Verified
     }));
 
     let probe = render_to_buffer(&mut app, 80, 24);
@@ -2604,7 +3195,7 @@ fn an_interior_blank_line_stays_in_a_multi_row_copy() {
         .iter()
         .position(|r| r.contains("abcdefghij"))
         .unwrap_or(0);
-    let col = rows[row].find("abcdefghij").unwrap_or(0);
+    let col = cell_col(&rows[row], "abcdefghij");
     let krow = rows
         .iter()
         .position(|r| r.contains("klmnopqrst"))
@@ -2646,14 +3237,15 @@ fn a_selection_landing_on_a_wide_characters_second_cell_takes_it() {
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
-    app.set_selection_copier(Box::new(move |text| {
+    app.set_selection_copier(Box::new(move |_attempt, text| {
         sink.lock().expect("sink").push(text.to_string());
+        dch_tui::CopyAnswer::Verified
     }));
 
     let probe = render_to_buffer(&mut app, 80, 24);
     let rows = row_texts(&probe);
-    let row = rows.iter().position(|r| r.contains("日x")).unwrap_or(0);
-    let col = rows[row].find("日x").unwrap_or(0);
+    let row = rows.iter().position(|r| r.contains("日")).unwrap_or(0);
+    let col = cell_col(&rows[row], "日");
     app.handle_event(&mouse_event(
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
         u16::try_from(col + 1).unwrap_or(0),
@@ -2971,9 +3563,9 @@ fn the_conversation_pane_renders_on_the_terminal_s_own_background() {
     );
     let composer = composer_chunk(40, 10);
     assert_eq!(
-        buffer[(0, composer.y)].bg,
+        buffer[(1, composer.y)].bg,
         app.theme.ui.surface,
-        "the composer draws on the surface color"
+        "the composer body beside its primary edge draws on the surface color"
     );
     assert_eq!(
         buffer[(0, 9)].bg,
@@ -3126,14 +3718,14 @@ fn a_width_change_reflows_the_cached_conversation() {
     });
     let wide = render_to_buffer(&mut app, 60, 12);
     assert!(
-        row_texts(&wide)[0].contains("dddddddddd"),
-        "at width 60 the message fits one row"
+        row_texts(&wide)[1].contains("dddddddddd"),
+        "at width 60 the message fits the first content row"
     );
 
-    let narrow = render_to_buffer(&mut app, 20, 12);
+    let narrow = render_to_buffer(&mut app, 24, 12);
     let narrow_rows = row_texts(&narrow);
     assert!(
-        !narrow_rows[0].contains("dddddddddd")
+        !narrow_rows[1].contains("dddddddddd")
             && narrow_rows.iter().any(|row| row.contains("dddddddddd")),
         "a resize rebuilds the cache and the message reflows onto later rows"
     );
@@ -3486,12 +4078,12 @@ fn a_click_expands_a_completed_tool_block_and_clicking_again_collapses_it() {
 
     app.handle_event(&mouse_event(
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
-        4,
+        5,
         u16::try_from(row).unwrap_or(0),
     ));
     app.handle_event(&mouse_event(
         MouseEventKind::Up(crossterm::event::MouseButton::Left),
-        4,
+        5,
         u16::try_from(row).unwrap_or(0),
     ));
     let open = render_to_buffer(&mut app, 80, 30);
@@ -3516,12 +4108,12 @@ fn a_click_expands_a_completed_tool_block_and_clicking_again_collapses_it() {
 
     app.handle_event(&mouse_event(
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
-        4,
+        5,
         u16::try_from(row).unwrap_or(0),
     ));
     app.handle_event(&mouse_event(
         MouseEventKind::Up(crossterm::event::MouseButton::Left),
-        4,
+        5,
         u16::try_from(row).unwrap_or(0),
     ));
     let shut = render_to_buffer(&mut app, 80, 30);
@@ -3579,12 +4171,12 @@ fn a_running_tool_row_expands_to_its_captured_input() {
 
     app.handle_event(&mouse_event(
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
-        4,
+        5,
         u16::try_from(row).unwrap_or(0),
     ));
     app.handle_event(&mouse_event(
         MouseEventKind::Up(crossterm::event::MouseButton::Left),
-        4,
+        5,
         u16::try_from(row).unwrap_or(0),
     ));
     let open = render_to_buffer(&mut app, 80, 30);
@@ -3637,12 +4229,12 @@ fn an_expansion_opened_while_running_survives_the_calls_completion() {
         .unwrap_or(0);
     app.handle_event(&mouse_event(
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
-        4,
+        5,
         u16::try_from(row).unwrap_or(0),
     ));
     app.handle_event(&mouse_event(
         MouseEventKind::Up(crossterm::event::MouseButton::Left),
-        4,
+        5,
         u16::try_from(row).unwrap_or(0),
     ));
     let running = render_to_buffer(&mut app, 80, 30);
@@ -3720,12 +4312,12 @@ fn the_oldest_tool_details_retire_past_the_cap() {
     );
     app.handle_event(&mouse_event(
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
-        4,
+        5,
         u16::try_from(oldest).unwrap_or(0),
     ));
     app.handle_event(&mouse_event(
         MouseEventKind::Up(crossterm::event::MouseButton::Left),
-        4,
+        5,
         u16::try_from(oldest).unwrap_or(0),
     ));
     let clicked = render_to_buffer(&mut app, 80, 300);
@@ -3800,14 +4392,229 @@ fn long_user_lines_wrap_in_the_conversation_instead_of_clipping() {
         "the line's tail is visible past the pane width: {rows:?}"
     );
     assert!(
-        rows.iter().any(|row| row.starts_with('x')),
-        "the line's head starts the first row"
+        rows.iter().any(|row| row.starts_with("  ❯  x")),
+        "the line's head starts the turn's first row, behind the marker"
     );
     let spanned = rows.iter().filter(|row| row.contains('x')).count();
     assert!(
         spanned >= 2,
         "the line flows across rows instead of clipping: {spanned} rows, {rows:?}"
     );
+}
+
+#[test]
+fn a_pad_row_and_a_blank_line_breathe_between_user_turns_and_agent_material() {
+    // The boundary contract: a user turn's box ends on its own tinted
+    // pad row, one untinted blank line follows, and the agent
+    // material beside it starts after that — in either order. The
+    // agent side carries no tint of its own.
+    let mut app = app();
+    let now = chrono::Utc::now();
+    app.push_message(TuiMessage::User {
+        text: "the question".to_string(),
+        timestamp: now,
+    });
+    app.push_message(TuiMessage::Assistant {
+        blocks: vec![ContentBlock::Text {
+            text: "the answer".to_string(),
+        }],
+        timestamp: now,
+        duration_ms: None,
+    });
+    let terminal = render_to_buffer(&mut app, 40, 12);
+    let buffer = terminal.backend().buffer();
+    let rows = row_texts(&terminal);
+    let question = rows
+        .iter()
+        .position(|r| r.contains("the question"))
+        .expect("the question's row");
+    let answer = rows
+        .iter()
+        .position(|r| r.contains("the answer"))
+        .expect("the answer's row");
+    assert_eq!(
+        answer.saturating_sub(question),
+        3,
+        "the box's pad and one blank line sit between the turn and the reply: {rows:?}"
+    );
+    assert!(
+        rows[question + 1].trim().is_empty() && rows[question + 2].trim().is_empty(),
+        "the boundary rows are blank: {rows:?}"
+    );
+    assert_eq!(
+        buffer[(10, u16::try_from(question + 1).unwrap_or(0))].bg,
+        app.theme.ui.surface,
+        "the first boundary row is the box's own closing pad"
+    );
+    assert_eq!(
+        buffer[(10, u16::try_from(question + 2).unwrap_or(0))].bg,
+        ratatui::style::Color::Reset,
+        "the second boundary row stays untinted"
+    );
+    assert_eq!(
+        buffer[(10, u16::try_from(answer).unwrap_or(0))].bg,
+        ratatui::style::Color::Reset,
+        "the reply sits on the regular background"
+    );
+
+    app.push_message(TuiMessage::User {
+        text: "the follow-up".to_string(),
+        timestamp: now,
+    });
+    let follow_terminal = render_to_buffer(&mut app, 40, 16);
+    let follow_rows = row_texts(&follow_terminal);
+    let answer_now = follow_rows
+        .iter()
+        .position(|r| r.contains("the answer"))
+        .expect("the answer's row in the scrolled view");
+    let follow_up = follow_rows
+        .iter()
+        .position(|r| r.contains("the follow-up"))
+        .expect("the follow-up's row");
+    assert_eq!(
+        follow_up.saturating_sub(answer_now),
+        3,
+        "the blank line and the box's opening pad sit between the reply and the next turn: {follow_rows:?}"
+    );
+}
+
+#[test]
+fn an_agent_reply_s_code_block_sits_on_the_regular_background() {
+    // The prompt box owns the surface color; agent material never
+    // shares it. Code blocks frame their lines with painted space
+    // columns, and those columns fall back to the terminal's own
+    // background unless the theme names a panel color — so a reply's
+    // code reads as framed text on the regular background, not as a
+    // second prompt box.
+    let mut app = app();
+    app.push_message(TuiMessage::Assistant {
+        blocks: vec![ContentBlock::Text {
+            text: "intro\n\n```rust\nfn main() {}\n```\n".to_string(),
+        }],
+        timestamp: chrono::Utc::now(),
+        duration_ms: None,
+    });
+    let terminal = render_to_buffer(&mut app, 40, 12);
+    let buffer = terminal.backend().buffer();
+    let rows = row_texts(&terminal);
+    let code_row = rows
+        .iter()
+        .position(|r| r.contains("fn main()"))
+        .expect("the code row");
+    let code_row = u16::try_from(code_row).unwrap_or(0);
+    for x in 0..buffer.area.width {
+        assert_eq!(
+            buffer[(x, code_row)].bg,
+            ratatui::style::Color::Reset,
+            "column {x} of the code row stays on the regular background"
+        );
+    }
+}
+
+#[test]
+fn an_agent_sentence_s_inline_code_sits_on_the_regular_background() {
+    // The prompt box owns the surface color; agent prose never
+    // shares it. Inline code carries its accent in the foreground
+    // alone — no chip tint — so a sentence with a code span reads on
+    // the terminal's own background like the words around it.
+    let mut app = app();
+    app.push_message(TuiMessage::Assistant {
+        blocks: vec![ContentBlock::Text {
+            text: "run `make test` today".to_string(),
+        }],
+        timestamp: chrono::Utc::now(),
+        duration_ms: None,
+    });
+    let terminal = render_to_buffer(&mut app, 40, 12);
+    let buffer = terminal.backend().buffer();
+    let rows = row_texts(&terminal);
+    let sentence_row = rows
+        .iter()
+        .position(|r| r.contains("make test"))
+        .expect("the sentence's row");
+    let sentence_row = u16::try_from(sentence_row).unwrap_or(0);
+    for x in 0..buffer.area.width {
+        assert_eq!(
+            buffer[(x, sentence_row)].bg,
+            ratatui::style::Color::Reset,
+            "column {x} of the sentence stays on the regular background"
+        );
+    }
+    assert!(
+        (0..buffer.area.width).any(|x| buffer[(x, sentence_row)].symbol() != " "),
+        "the sentence carries its text"
+    );
+}
+
+#[test]
+fn the_conversation_opens_one_row_below_the_pane_s_top_edge() {
+    // Inner padding at the top: the transcript's first line sits one
+    // breathing row below the pane's edge, and a user turn adds its
+    // own tinted pad row before its text — the same convention the
+    // composer's text follows inside its fill.
+    let mut app = app();
+    app.push_message(TuiMessage::User {
+        text: "the first line".to_string(),
+        timestamp: chrono::Utc::now(),
+    });
+    let terminal = render_to_buffer(&mut app, 40, 12);
+    let buffer = terminal.backend().buffer();
+    for row in [0u16, 1] {
+        let text: String = (0..buffer.area.width)
+            .map(|x| buffer[(x, row)].symbol().to_string())
+            .collect();
+        assert!(
+            text.trim().is_empty(),
+            "row {row} above the text stays blank: {text:?}"
+        );
+    }
+    assert_eq!(
+        buffer[(10, 1)].bg,
+        app.theme.ui.surface,
+        "the row above the text carries the box's tint"
+    );
+    assert_eq!(
+        buffer[(10, 0)].bg,
+        ratatui::style::Color::Reset,
+        "the pane's own padding row stays on the terminal background"
+    );
+    let first: String = (0..buffer.area.width)
+        .map(|x| buffer[(x, 2)].symbol().to_string())
+        .collect();
+    assert!(
+        first.contains("the first line"),
+        "the transcript starts below the pane edge and the box pad: {first:?}"
+    );
+}
+
+#[test]
+fn wrapped_lines_keep_a_right_margin_before_the_scrollbar_gutter() {
+    // Inner padding on the right: a wrapped user row fills the pane's
+    // full text width and stops, leaving the pane-level blank columns
+    // before the gutter the scrollbar owns — the same margin every
+    // message shares, at any terminal width.
+    let mut app = app();
+    app.push_message(TuiMessage::User {
+        text: "x".repeat(120),
+        timestamp: chrono::Utc::now(),
+    });
+    let terminal = render_to_buffer(&mut app, 40, 12);
+    let buffer = terminal.backend().buffer();
+    let wrapped_row = (0..buffer.area.height)
+        .find(|&y| (0..buffer.area.width).any(|x| buffer[(x, y)].symbol() == "x"))
+        .expect("a row carrying the wrapped text");
+    assert_eq!(
+        buffer[(34, wrapped_row)].symbol(),
+        "x",
+        "the row fills the text width up to the box's inner padding on row {wrapped_row}"
+    );
+    for x in 35..40u16 {
+        assert_eq!(
+            buffer[(x, wrapped_row)].symbol(),
+            " ",
+            "column {x} stays blank through the box's padding and margin on row {wrapped_row}"
+        );
+    }
 }
 
 #[test]
@@ -3893,12 +4700,12 @@ fn a_captureless_completion_never_advertises_an_expansion() {
     );
     app.handle_event(&mouse_event(
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
-        4,
+        5,
         u16::try_from(row).unwrap_or(0),
     ));
     app.handle_event(&mouse_event(
         MouseEventKind::Up(crossterm::event::MouseButton::Left),
-        4,
+        5,
         u16::try_from(row).unwrap_or(0),
     ));
     let clicked = render_to_buffer(&mut app, 80, 24);
@@ -3917,12 +4724,12 @@ fn a_mouse_press_between_the_chord_disarms_it() {
     assert!(app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL)));
     app.handle_event(&mouse_event(
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
-        4,
+        5,
         4,
     ));
     app.handle_event(&mouse_event(
         MouseEventKind::Up(crossterm::event::MouseButton::Left),
-        4,
+        5,
         4,
     ));
     app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL));
@@ -3968,12 +4775,12 @@ fn a_block_without_retained_detail_is_not_expandable() {
 
     app.handle_event(&mouse_event(
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
-        4,
+        5,
         u16::try_from(row).unwrap_or(0),
     ));
     app.handle_event(&mouse_event(
         MouseEventKind::Up(crossterm::event::MouseButton::Left),
-        4,
+        5,
         u16::try_from(row).unwrap_or(0),
     ));
     let clicked = render_to_buffer(&mut app, 80, 30);
@@ -4013,8 +4820,9 @@ fn dragging_from_a_summary_row_still_selects_instead_of_toggling() {
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
-    app.set_selection_copier(Box::new(move |text| {
+    app.set_selection_copier(Box::new(move |_attempt, text| {
         sink.lock().expect("sink").push(text.to_string());
+        dch_tui::CopyAnswer::Verified
     }));
 
     let probe = render_to_buffer(&mut app, 80, 30);
@@ -4023,14 +4831,14 @@ fn dragging_from_a_summary_row_still_selects_instead_of_toggling() {
         .iter()
         .position(|r| r.contains("abcdefghij"))
         .unwrap_or(0);
-    let col = rows[user_row].find("abcdefghij").unwrap_or(0);
+    let col = cell_col(&rows[user_row], "abcdefghij");
     let tool_row = rows
         .iter()
         .position(|r| r.contains("Running: make"))
         .unwrap_or(0);
     app.handle_event(&mouse_event(
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
-        4,
+        5,
         u16::try_from(tool_row).unwrap_or(0),
     ));
     app.handle_event(&mouse_event(
@@ -4144,12 +4952,12 @@ fn a_click_on_any_row_of_an_expanded_block_collapses_it() {
 
     app.handle_event(&mouse_event(
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
-        4,
+        5,
         u16::try_from(row).unwrap_or(0),
     ));
     app.handle_event(&mouse_event(
         MouseEventKind::Up(crossterm::event::MouseButton::Left),
-        4,
+        5,
         u16::try_from(row).unwrap_or(0),
     ));
     let open = render_to_buffer(&mut app, 80, 24);
@@ -4165,12 +4973,12 @@ fn a_click_on_any_row_of_an_expanded_block_collapses_it() {
 
     app.handle_event(&mouse_event(
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
-        4,
+        5,
         u16::try_from(output_row).unwrap_or(0),
     ));
     app.handle_event(&mouse_event(
         MouseEventKind::Up(crossterm::event::MouseButton::Left),
-        4,
+        5,
         u16::try_from(output_row).unwrap_or(0),
     ));
     let shut = render_to_buffer(&mut app, 80, 24);
@@ -4216,25 +5024,28 @@ fn expanding_holds_the_clicked_row_steady_instead_of_chasing_the_tail() {
         .iter()
         .position(|r| r.contains("Running: make build"))
         .unwrap_or(0);
-    assert_eq!(row, 0, "sanity: the short document starts at the top");
+    assert_eq!(
+        row, 1,
+        "sanity: the short document starts at the top content row"
+    );
 
     app.handle_event(&mouse_event(
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
-        4,
+        5,
         u16::try_from(row).unwrap_or(0),
     ));
     app.handle_event(&mouse_event(
         MouseEventKind::Up(crossterm::event::MouseButton::Left),
-        4,
+        5,
         u16::try_from(row).unwrap_or(0),
     ));
     let open = render_to_buffer(&mut app, 80, 24);
     let open_rows = row_texts(&open);
     assert!(
         open_rows
-            .first()
+            .get(1)
             .is_some_and(|r| r.contains("Running: make build")),
-        "the clicked row stays at the top: {open_rows:?}"
+        "the clicked row stays at the pane's top content row: {open_rows:?}"
     );
     assert!(
         open_rows.iter().any(|r| r.contains("build line 00")),
@@ -4339,10 +5150,11 @@ fn the_scrollbar_owns_its_gutter_and_never_touches_text() {
     let buffer = terminal.backend().buffer();
     let thumb = app.theme.ui.scrollbar_thumb;
     let track = app.theme.ui.scrollbar_track;
-    // 12 rows: 5 for the conversation (notice row, spacer, padded
-    // two-row input field, status bar). thumb = 5 * 5 / 20 = 1 row
-    // flush with the track's bottom.
-    for y in 0..5u16 {
+    // 12 rows: 4 content rows for the conversation below its padding
+    // row (notice row, spacer, padded two-row input field, status
+    // bar). thumb = 4 * 4 / 20 clamps to 1 row, flush with the
+    // track's bottom.
+    for y in 1..5u16 {
         let cell = &buffer[(19, y)];
         let in_thumb = y >= 4;
         assert_eq!(
@@ -4356,7 +5168,19 @@ fn the_scrollbar_owns_its_gutter_and_never_touches_text() {
             "row {y}: the solid bar is the theme's thumb and rail colors as cell backgrounds"
         );
     }
-    for y in 0..5u16 {
+    let top_row: String = (0..20u16)
+        .map(|x| buffer[(x, 0)].symbol().to_string())
+        .collect();
+    assert!(
+        top_row.trim().is_empty(),
+        "the pane's padding row stays blank: {top_row:?}"
+    );
+    assert_eq!(
+        buffer[(19, 0)].bg,
+        ratatui::style::Color::Reset,
+        "the scrollbar track starts below the padding row"
+    );
+    for y in 1..5u16 {
         for x in 0..19u16 {
             let cell = &buffer[(x, y)];
             assert!(

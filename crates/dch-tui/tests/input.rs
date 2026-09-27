@@ -45,6 +45,143 @@ fn submit(editor: &mut InputEditor, text: &str) -> String {
 }
 
 #[test]
+fn the_caret_matches_the_last_row_for_every_typed_prefix() {
+    // First-fit keeps the sentinel wrap breaking where the rows break:
+    // for every prefix of a wrapping sentence, the caret sits on the
+    // rendered grid's last row at that row's width — never a column or
+    // a row off, which is the wrap-boundary drift the balanced
+    // algorithm used to produce while typing or deleting through the
+    // boundary. The corpus reaches the paths a plain sentence misses:
+    // an over-long word exercises `break_words` at the smallest
+    // widths, and wide glyphs exercise width-two columns against the
+    // width-one sentinel.
+    let corpora = [
+        "the quick brown fox jumps over the lazy dog again and again then more words follow here",
+        "short words then one outrageouslylongunbreakableword midsentence and a tail",
+        "wide 你好世界 glyphs mix with ascii words throughout",
+    ];
+    for corpus in corpora {
+        let chars: Vec<char> = corpus.chars().collect();
+        for width in [10_u16, 13, 16, 20] {
+            for end in 0..=chars.len() {
+                let mut editor = InputEditor::new();
+                let typed: String = chars[..end].iter().collect();
+                for c in typed.chars() {
+                    editor.handle_key(char(c), width);
+                }
+                let (rows, caret) = editor.display_rows_and_caret(width);
+                let (row, column) = caret.expect("a caret always exists");
+                let last = rows.last().map_or("", String::as_str);
+                let last_width = unicode_width::UnicodeWidthStr::width(last);
+                let ends_in_space = chars[..end].last().is_some_and(|c| c.is_whitespace());
+                if ends_in_space {
+                    assert_eq!(
+                        usize::from(row),
+                        rows.len() - 1,
+                        "space-typed prefix {typed:?} at width {width} keeps the caret on the last row"
+                    );
+                    assert!(
+                        usize::from(column) == last_width || usize::from(column) == last_width + 1,
+                        "prefix {typed:?} at width {width}: caret column {} sits on or one past the last row's width {last_width}",
+                        column
+                    );
+                } else {
+                    assert_eq!(
+                        (usize::from(row), usize::from(column)),
+                        (rows.len() - 1, last_width),
+                        "prefix {typed:?} at width {width} puts the caret at the last row's end, rows {rows:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_mid_word_caret_lands_on_its_wrapped_row() {
+    // The caret's cell must come from the full line's wrap breaks,
+    // not the prefix's: with the caret after `wor`, the prefix
+    // `hello wor` fits one row, but the line itself breaks after
+    // `hello` — the caret belongs to `world`'s row at column 3.
+    let mut editor = InputEditor::new();
+    for c in "hello world".chars() {
+        editor.handle_key(char(c), 10);
+    }
+    editor.handle_key(plain(KeyCode::Left), 10);
+    editor.handle_key(plain(KeyCode::Left), 10);
+    let (rows, caret) = editor.display_rows_and_caret(10);
+    assert_eq!(rows, ["hello", "world"], "the line breaks after hello");
+    assert_eq!(
+        caret,
+        Some((1, 3)),
+        "the caret sits inside world at column 3"
+    );
+    assert_eq!(editor.cursor_cell(10), Some((1, 3)), "cursor_cell agrees");
+}
+
+#[test]
+fn vertical_navigation_moves_the_mid_word_caret_by_row() {
+    // Up and Down map through the same cells the rows render: a caret
+    // inside `world` steps to the same column of `hello`'s row and
+    // back — the prefix-wrap bug put it on row 0 instead.
+    let mut editor = InputEditor::new();
+    for c in "hello world".chars() {
+        editor.handle_key(char(c), 10);
+    }
+    editor.handle_key(plain(KeyCode::Left), 10);
+    editor.handle_key(plain(KeyCode::Left), 10);
+    editor.handle_key(plain(KeyCode::Up), 10);
+    assert_eq!(
+        editor.cursor_cell(10),
+        Some((0, 3)),
+        "up keeps the column on the row above"
+    );
+    editor.handle_key(plain(KeyCode::Down), 10);
+    assert_eq!(
+        editor.cursor_cell(10),
+        Some((1, 3)),
+        "down returns to world's row"
+    );
+}
+
+#[test]
+fn the_caret_cell_round_trips_through_every_cursor_offset() {
+    // Click-to-caret and caret-to-cell are inverses wherever the
+    // caret sits: for every offset inside the corpus, positioning the
+    // caret there, mapping to its cell, and moving back to that cell
+    // lands the caret on the same cell again — the mid-buffer sweep
+    // the end-caret property pin never covered.
+    let corpora = [
+        "the quick brown fox jumps over the lazy dog again",
+        "short words then one outrageouslylongunbreakableword midsentence and a tail",
+        "wide 你好世界 glyphs mix with ascii words throughout",
+    ];
+    for corpus in corpora {
+        let total = corpus.chars().count();
+        for width in [10_u16, 16] {
+            for offset in 0..=total {
+                let mut editor = InputEditor::new();
+                for c in corpus.chars() {
+                    editor.handle_key(char(c), width);
+                }
+                for _ in offset..total {
+                    editor.handle_key(plain(KeyCode::Left), width);
+                }
+                let Some((row, column)) = editor.cursor_cell(width) else {
+                    continue;
+                };
+                editor.move_caret_to_cell(width, usize::from(row), usize::from(column));
+                assert_eq!(
+                    editor.cursor_cell(width),
+                    Some((row, column)),
+                    "offset {offset} of {corpus:?} at width {width} round-trips its cell"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn push_then_prev_returns_the_entry_and_stops_at_oldest() {
     let mut history = InputHistory::new(10);
     history.push("first".to_string());

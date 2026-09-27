@@ -15,7 +15,7 @@ pub mod theme;
 pub mod tool_capture;
 pub mod tool_render;
 
-pub use app::TuiApp;
+pub use app::{CopyAnswer, TuiApp};
 pub use events::TerminalEvents;
 pub use input::{InputAction, InputEditor, InputHistory};
 pub use message::{ActiveTool, ContentBlock, TokenCounts, TuiMessage};

@@ -279,10 +279,35 @@ pub struct TuiApp {
 
     /// Where a completed selection's text goes.
     ///
-    /// The default copies through OSC 52 and, where present,
-    /// `pbcopy`; tests install a recorder to observe the copy
-    /// without touching any clipboard.
-    copier: Box<dyn Fn(&str)>,
+    /// Receives the copy's attempt id beside the text — the same id
+    /// any later verdict lands under — and answers synchronously with
+    /// what the copy path knows: for the production chain
+    /// [`CopyAnswer::Unconfirmed`] while transports are in flight,
+    /// its verdict landing later through the copy-outcomes drain; a
+    /// test recorder reports its own delivery.
+    copier: SelectionCopier,
+
+    /// Verdicts from off-loaded copy transports, awaiting their notice.
+    ///
+    /// The default copier pushes here from its background task and
+    /// pings the render wake; the frame drain turns each verdict into
+    /// the definitive notice wording. Test-installed recorders report
+    /// synchronously and never touch it.
+    copy_outcomes: CopyOutcomes,
+
+    /// The monotonic id source for copy attempts.
+    ///
+    /// One counter per app: every copy — scheduled or settled on the
+    /// spot — takes its id here, so the immediate notice and any
+    /// later verdict for the same copy carry the same number.
+    copy_attempts: Arc<std::sync::atomic::AtomicU64>,
+
+    /// The attempt whose wording last took the notice row.
+    ///
+    /// Zero until a copy posts. A drained verdict older than this is
+    /// spent news about a copy the user has already walked past, so
+    /// the drain drops it instead of overwriting a newer copy.
+    posted_copy_attempt: u64,
 
     /// Rendered lines of the streaming buffer's frozen prefix.
     ///
@@ -393,6 +418,17 @@ pub struct TuiApp {
     /// the cache is stale exactly when the live count has moved
     /// past this stamp, whatever caused the bump.
     conversation_cache_generation: u64,
+
+    /// Conversation-cache line ranges spanned by user turns, as
+    /// `(tint_start, tint_end, mark_row)`.
+    ///
+    /// The render paints each range as a full-width raised block on the
+    /// theme's surface — the prompt box's own color — around the turn's
+    /// text, its padding rows included, and overlays the chevron at the
+    /// turn's first text row. Chrome beside and beneath the content,
+    /// never spans inside it, so selections and copies walk only the
+    /// text. Rebuilt together with the conversation cache.
+    user_turn_ranges: Vec<(usize, usize, usize)>,
 
     /// The quit lifecycle.
     ///
@@ -523,6 +559,11 @@ impl TuiApp {
             tracing::warn!("unknown theme '{}', using default", config.display.theme);
             Theme::default()
         };
+        let copy_command = config.display.copy_command.clone();
+        let copy_outcomes: CopyOutcomes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let copier_outcomes = Arc::clone(&copy_outcomes);
+        let copy_attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let copy_wake = Arc::clone(&state.render_notify);
         Self {
             theme,
             conversation: Vec::new(),
@@ -543,7 +584,18 @@ impl TuiApp {
             selection: None,
             last_view: None,
             drag_position: None,
-            copier: Box::new(copy_to_clipboard),
+            copier: Box::new(move |attempt, text| {
+                copy_via_transports(
+                    copy_command.as_deref(),
+                    attempt,
+                    text,
+                    &copier_outcomes,
+                    &copy_wake,
+                )
+            }),
+            copy_outcomes,
+            copy_attempts,
+            posted_copy_attempt: 0,
             frozen_lines: Vec::new(),
             frozen_upto: 0,
             frozen_separators: 0,
@@ -555,6 +607,7 @@ impl TuiApp {
             live_width: 0,
             conversation_cache: Vec::new(),
             conversation_cache_width: 0,
+            user_turn_ranges: Vec::new(),
             conversation_generation: 1,
             conversation_cache_generation: 0,
             quit: QuitState::default(),
@@ -861,8 +914,9 @@ impl TuiApp {
     ///
     /// The instrumentation seam for the selection pins: a recorder
     /// observes what a release copies without touching any real
-    /// clipboard. Production never calls this.
-    pub fn set_selection_copier(&mut self, copier: Box<dyn Fn(&str)>) {
+    /// clipboard, answering [`CopyAnswer::Verified`] so the notice
+    /// reads as delivered. Production never calls this.
+    pub fn set_selection_copier(&mut self, copier: SelectionCopier) {
         self.copier = copier;
     }
 
@@ -995,14 +1049,36 @@ impl TuiApp {
     ///
     /// The terminal-standard copy chord. A span that covered no
     /// characters leaves the clipboard alone — the same discipline
-    /// the release and the keyboard walk apply.
+    /// the release and the keyboard walk apply. A delivered copy
+    /// lands its confirmation on the notice row, like every path.
     fn copy_selection_now(&mut self) {
-        if let Some(selection) = self.selection.as_ref() {
-            let (text, covered_any) = self.selection_text(selection);
-            if covered_any {
-                (self.copier)(&text);
-            }
+        let covered = self
+            .selection
+            .as_ref()
+            .map(|selection| self.selection_text(selection));
+        if let Some((text, covered_any)) = covered
+            && covered_any
+        {
+            self.copy_selection_and_notice(&text);
         }
+    }
+
+    /// Hand a completed selection's text to the clipboard and say so.
+    ///
+    /// The funnel every copy path — the mouse release, the copy chord,
+    /// and the keyboard walk's re-copy — delivers through, so each one
+    /// posts from the same vocabulary on the notice row above the
+    /// composer. Every copy takes its attempt id here and records it
+    /// as the wording that holds the row; the immediate post answers
+    /// with what the copier knows right now, and when the production
+    /// chain has transports in flight, the frame drain replaces it
+    /// with the same attempt's verdict — never with one older than
+    /// what a newer copy already posted.
+    fn copy_selection_and_notice(&mut self, text: &str) {
+        let attempt = next_attempt(&self.copy_attempts);
+        let answer = (self.copier)(attempt, text);
+        self.posted_copy_attempt = attempt;
+        self.post_notice(copy_answer_notice(answer).to_string());
     }
 
     /// Handle the events already waiting behind the first one.
@@ -1184,9 +1260,10 @@ impl TuiApp {
     ///
     /// The wheel scrolls by [`WHEEL_SCROLL_LINES`]; a press-drag-
     /// release over the conversation pane selects rendered
-    /// characters — inside the app — and the release quietly hands
-    /// the covered text to the clipboard while the highlight stays
-    /// up until the next press. A drag pushed against the pane's
+    /// characters — inside the app — and the release hands the
+    /// covered text to the clipboard, confirmed on the notice row,
+    /// while the highlight stays up until the next press. A drag
+    /// pushed against the pane's
     /// top or bottom row scrolls the view in the drag's direction,
     /// extending the selection — one line per movement report, and
     /// one per tick while the pointer stays parked there; a press
@@ -1251,7 +1328,7 @@ impl TuiApp {
                         } else {
                             let (text, covered_any) = self.selection_text(&selection);
                             if covered_any {
-                                (self.copier)(&text);
+                                self.copy_selection_and_notice(&text);
                             }
                             self.selection = Some(selection);
                         }
@@ -1424,13 +1501,15 @@ impl TuiApp {
             selection.head = nudged;
         }
         self.follow_head(nudged.line);
-        if let Some(selection) = self.selection.as_ref()
-            && selection.anchor != selection.head
+        let covered = self
+            .selection
+            .as_ref()
+            .filter(|selection| selection.anchor != selection.head)
+            .map(|selection| self.selection_text(selection));
+        if let Some((text, covered_any)) = covered
+            && covered_any
         {
-            let (text, covered_any) = self.selection_text(selection);
-            if covered_any {
-                (self.copier)(&text);
-            }
+            self.copy_selection_and_notice(&text);
         }
     }
 
@@ -1988,38 +2067,59 @@ impl TuiApp {
     /// The gutter is one column off the pane's right edge, reserved
     /// whether or not the document scrolls, so wrapped text never
     /// collides with the scrollbar and the wrap width stays stable
-    /// as the document crosses the scrollability threshold. A
-    /// pinned view re-anchors to the newest line; a detached view
-    /// holds its place while content streams in below it or
-    /// collapses away.
+    /// as the document crosses the scrollability threshold. The
+    /// text also sits inside the pane's top and right edges — one
+    /// breathing row below the top, blank columns short of the
+    /// gutter — so the transcript never touches its container's
+    /// edges; the scrollbar track shares the inset, belonging to
+    /// the padded content window it measures. A pinned view
+    /// re-anchors to the newest line; a detached view holds its
+    /// place while content streams in below it or collapses away.
     fn render_conversation(&mut self, frame: &mut Frame, area: Rect) {
-        let (text_area, scrollbar_area) = split_scrollbar_gutter(area);
+        let padded = Rect {
+            y: area.y.saturating_add(CONVERSATION_TOP_INSET),
+            height: area.height.saturating_sub(CONVERSATION_TOP_INSET),
+            ..area
+        };
+        let (pane, scrollbar_area) = split_scrollbar_gutter(padded);
+        let mark_gutter = (pane.width
+            >= CONVERSATION_MARK_MIN_TEXT
+                .saturating_add(CONVERSATION_MARK_GUTTER)
+                .saturating_add(CONVERSATION_RIGHT_INSET)
+                .saturating_add(CONVERSATION_BOX_MARGIN))
+        .then_some(Rect {
+            width: CONVERSATION_MARK_GUTTER,
+            ..pane
+        });
+        let text_area = mark_gutter.as_ref().map_or(pane, |gutter| Rect {
+            x: gutter.right(),
+            width: pane.width.saturating_sub(CONVERSATION_MARK_GUTTER),
+            ..pane
+        });
+        let text_area = Rect {
+            width: text_area
+                .width
+                .saturating_sub(CONVERSATION_RIGHT_INSET)
+                .saturating_sub(CONVERSATION_BOX_MARGIN),
+            ..text_area
+        };
         let conversation_height = text_area.height as usize;
         let width = text_area.width.max(1);
         if self.conversation_cache_generation != self.conversation_generation
             || self.conversation_cache_width != width
         {
             let mut summary_lines = HashMap::new();
-            self.conversation_cache = self.conversation_lines(text_area, &mut summary_lines);
+            let mut user_turns = Vec::new();
+            self.conversation_cache =
+                self.conversation_lines(text_area, &mut summary_lines, &mut user_turns);
             self.tool_summary_lines = summary_lines;
+            self.user_turn_ranges = user_turns;
             self.conversation_cache_width = width;
             self.conversation_cache_generation = self.conversation_generation;
-            // A rebuilt line space — a new message graduating in, a
-            // verbosity switch, a resize — re-numbers every line under
-            // the selection's stored indexes, so the highlight would
-            // silently re-target other text; a re-flowed document
-            // forfeits the selection instead, the way a terminal's
-            // native one is lost on redraw.
             self.selection = None;
             self.drag_position = None;
         }
-        // The streaming region re-renders as its reply grows — a
-        // delta re-wraps the live lines, a freeze advances the frozen
-        // ones — re-numbering every line from the frozen prefix down.
-        // A selection reaching into that region is stored against the
-        // old numbering and forfeits, the same way a rebuilt
-        // conversation forfeits one; a selection entirely within the
-        // settled transcript keeps its indexes and survives.
+
         let conversation_len = self.conversation_cache.len();
         if self.refresh_streaming_region(width)
             && self
@@ -2064,6 +2164,7 @@ impl TuiApp {
         if let Some(selection) = &self.selection {
             reverse_selection(&mut visible, skip, selection);
         }
+        self.paint_user_turn_chrome(frame, pane, mark_gutter, skip, conversation_height);
         frame.render_widget(Paragraph::new(visible), text_area);
         if let Some(gutter) = scrollbar_area
             && let Some((thumb_pos, thumb_len)) =
@@ -2077,6 +2178,77 @@ impl TuiApp {
                 self.theme.ui.scrollbar_thumb,
                 self.theme.ui.scrollbar_track,
             );
+        }
+    }
+
+    /// Paint the settled user turns' chrome: each turn's raised box
+    /// and the chevron at its opening text row.
+    ///
+    /// The box keeps [`CONVERSATION_BOX_MARGIN`] of the pane's own
+    /// background outside itself on both sides and spans the turn's
+    /// padding rows and text; the chevron sits a column inside the
+    /// box's left edge. Both are painted from the cached turn ranges
+    /// against this frame's window, so turns off-screen paint
+    /// nothing.
+    fn paint_user_turn_chrome(
+        &self,
+        frame: &mut Frame,
+        pane: Rect,
+        mark_gutter: Option<Rect>,
+        skip: usize,
+        conversation_height: usize,
+    ) {
+        for &(start, end, _) in &self.user_turn_ranges {
+            let first_visible = start.max(skip);
+            let last_visible = end.min(skip.saturating_add(conversation_height));
+            if first_visible >= last_visible {
+                continue;
+            }
+            let Some(y) = first_visible
+                .checked_sub(skip)
+                .and_then(|offset| u16::try_from(offset).ok())
+            else {
+                continue;
+            };
+            let Some(h) = last_visible
+                .checked_sub(first_visible)
+                .and_then(|rows| u16::try_from(rows).ok())
+            else {
+                continue;
+            };
+            let block = Rect {
+                x: pane.x.saturating_add(CONVERSATION_BOX_MARGIN),
+                width: pane
+                    .width
+                    .saturating_sub(CONVERSATION_BOX_MARGIN.saturating_mul(2)),
+                y: pane.y.saturating_add(y),
+                height: h,
+            };
+            frame
+                .buffer_mut()
+                .set_style(block, Style::default().bg(self.theme.ui.surface));
+        }
+        let Some(gutter) = mark_gutter else {
+            return;
+        };
+        for &(_, _, mark) in &self.user_turn_ranges {
+            let Some(on_screen) = mark.checked_sub(skip) else {
+                continue;
+            };
+            let Ok(row) = u16::try_from(on_screen) else {
+                continue;
+            };
+            if row < gutter.height {
+                frame.buffer_mut()[(
+                    gutter
+                        .x
+                        .saturating_add(CONVERSATION_BOX_MARGIN)
+                        .saturating_add(1),
+                    gutter.y.saturating_add(row),
+                )]
+                    .set_symbol("❯")
+                    .set_fg(self.theme.ui.primary);
+            }
         }
     }
 
@@ -2186,6 +2358,16 @@ impl TuiApp {
                 timestamp: now,
             });
         }
+        let verdicts = take_locked(&self.copy_outcomes);
+        // Overlapping copies drain in attempt order, not arrival
+        // order: the newest verdict posts only when no newer copy's
+        // wording already holds the row.
+        if let Some(latest) = verdicts.into_iter().max_by_key(|verdict| verdict.attempt)
+            && latest.attempt >= self.posted_copy_attempt
+        {
+            self.posted_copy_attempt = latest.attempt;
+            self.post_notice(copy_verdict_notice(latest).to_string());
+        }
         if turn_ended && let Some(hook) = &self.turn_end_hook {
             hook(&self.conversation);
         }
@@ -2199,24 +2381,34 @@ impl TuiApp {
     /// at the pane width, so a long failure body stays readable
     /// instead of clipping at the right edge; a completed tool
     /// block renders its verbosity-shaped summary line(s) between
-    /// the text blocks around it. The live region (streaming text,
-    /// in-flight tools) is assembled by the caller.
+    /// the text blocks around it. A blank line separates a user
+    /// message from the agent material beside it, and each user
+    /// turn opens and closes with a padding row the caller tints as
+    /// part of its box — pad and blank together are the boundary's
+    /// breathing room. The live region
+    /// (streaming text, in-flight tools) is assembled by the caller.
     fn conversation_lines(
         &self,
         area: Rect,
         summary_lines: &mut HashMap<usize, String>,
+        user_turns: &mut Vec<(usize, usize, usize)>,
     ) -> Vec<Line<'static>> {
         let width = area.width.max(1);
         let markdown_theme = markdown::MarkdownTheme::from(&self.theme);
         let syntax_theme = markdown::SyntaxTheme::from(&self.theme);
         let mut lines: Vec<Line<'static>> = Vec::new();
+        let mut previous_was_user: Option<bool> = None;
         for message in &self.conversation {
+            let is_user = matches!(message, TuiMessage::User { .. });
+            if previous_was_user.is_some_and(|was_user| was_user != is_user) {
+                lines.push(Line::default());
+            }
+            previous_was_user = Some(is_user);
             match message {
                 TuiMessage::User { text, .. } => {
-                    // Wrapped, not clipped: pasted text routinely
-                    // runs lines past the pane's width, and a row
-                    // cut at the edge reads as text that never
-                    // arrived.
+                    let tint_start = lines.len();
+                    lines.push(Line::default());
+                    let mark_row = lines.len();
                     for segment in text.split('\n') {
                         lines.extend(plain_wrapped_lines(
                             segment,
@@ -2224,6 +2416,8 @@ impl TuiApp {
                             self.theme.ui.user_message_fg,
                         ));
                     }
+                    lines.push(Line::default());
+                    user_turns.push((tint_start, lines.len(), mark_row));
                 }
                 TuiMessage::Assistant { blocks, .. } => {
                     for block in blocks {
@@ -2636,7 +2830,12 @@ impl TuiApp {
 
     /// Render the input field: a fixed multi-row window onto the
     /// buffer, as a borderless composer drawn on the theme's surface
-    /// color and padded on all sides.
+    /// color and padded on all sides. On painted chrome the pane's
+    /// left edge is a solid one-cell accent column in the theme's
+    /// primary color — the composer is the screen's always-focused
+    /// surface, so its marker takes the focus accent — sitting inside
+    /// the side padding, clear of the text; the paintless theme keeps
+    /// its terminal-drawn hairlines and paints nothing, edge included.
     ///
     /// The field's shape is a pure background fill with square
     /// corners — solid by construction, like the scrollbar. Corners
@@ -2661,13 +2860,18 @@ impl TuiApp {
 
         let surface = self.theme.ui.surface;
         let text_style = if self.theme.ui.composer_border.is_some() {
-            // A bordered composer paints nothing — the hairline rules
-            // live in `render`, on the rows above and below this pane.
             Style::default().fg(self.theme.ui.input_text)
         } else {
             frame
                 .buffer_mut()
                 .set_style(area, Style::default().bg(surface));
+            let edge = Rect {
+                width: area.width.min(1),
+                ..area
+            };
+            frame
+                .buffer_mut()
+                .set_style(edge, Style::default().bg(self.theme.ui.primary));
             Style::default().fg(self.theme.ui.input_text).bg(surface)
         };
         let text_height = INPUT_TEXT_ROWS.min(area.height.saturating_sub(INPUT_VERTICAL_PADDING));
@@ -2683,9 +2887,6 @@ impl TuiApp {
                 .saturating_sub(INPUT_SIDE_INSET.saturating_mul(2)),
             height: text_height,
         };
-        // The window shows the caret's line and the lines above it —
-        // typing at the end sees the newest lines, browsing up
-        // scrolls with the caret.
         let visible_rows = usize::from(text_height);
         let start = usize::from(caret_row).saturating_sub(visible_rows.saturating_sub(1));
         self.input_view = Some(InputView {
@@ -2740,8 +2941,9 @@ impl TuiApp {
 
     /// Render the one-line status bar.
     ///
-    /// Names the configured model and the cumulative token totals on
-    /// the left; while the input holds state — submissions queued
+    /// Names the configured model, the cumulative token totals, and
+    /// the session's permission mode on the left; while the input
+    /// holds state — submissions queued
     /// behind the driver, or a buffer longer than the composer's
     /// window — a position tag sits right-aligned in the theme's
     /// input accent color. Both sit on the themed bar colors, and
@@ -2763,6 +2965,8 @@ impl TuiApp {
             },
         );
         let mut status_text = format!(" {}  │  CTX: {tokens}", self.config.api.model);
+        status_text.push_str("  │  mode: ");
+        status_text.push_str(self.config.runner.permission_mode.as_str());
         if let Some(id) = &self.session_id {
             status_text.push_str("  │  ");
             status_text.push_str(id);
@@ -3120,31 +3324,478 @@ struct ViewState {
     selectable: usize,
 }
 
-/// Hand `text` to the clipboard.
+/// How long all of one copy's process transports may run in total.
 ///
-/// Two transports, both attempted: OSC 52 — the terminal-side
-/// clipboard escape, honored by most modern terminals — and macOS's
-/// `pbcopy`, which is authoritative where it exists. Failures are
-/// silent: a copy that cannot be delivered is a nuisance, not an
-/// error worth interrupting a session for.
-fn copy_to_clipboard(text: &str) {
+/// One clock covers the configured command, the platform helper, and
+/// the environment-named transports alike, so a hanging helper costs
+/// at most this much before the chain kills it and reports.
+const COPY_DEADLINE: Duration = Duration::from_millis(1500);
+
+/// The poll step the bounded transport wait sleeps between checks.
+///
+/// Fine enough that a fast helper's exit is noticed within one step
+/// of finishing, coarse enough that the poll thread never competes
+/// with the render loop for the core.
+const COPY_POLL_STEP: Duration = Duration::from_millis(25);
+
+/// How long a finished transport's writer gets to land its write.
+///
+/// A well-behaved helper's write completes milliseconds after its
+/// exit; the grace covers only that drain, so a writer parked on a
+/// pipe some escaped descendant holds is abandoned instead of gating
+/// the verdict — the thread leaves whenever the pipe finally closes.
+const WRITER_GRACE: Duration = Duration::from_millis(250);
+
+/// What a copy path knows synchronously about a delivery.
+///
+/// The funnel's immediate phase answers with one of these, drawn from
+/// the same vocabulary the drained verdict uses, so the two phases can
+/// only agree or upgrade — never contradict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyAnswer {
+    /// A transport confirmed delivery synchronously.
+    ///
+    /// Earns the plain `selection copied` claim on the spot; the
+    /// injected test recorders report this.
+    Verified,
+
+    /// The escape's bytes left, and confirmation is still pending.
+    ///
+    /// Transports are in flight, so the honest immediate wording is
+    /// the unconfirmed one until a verdict lands.
+    Unconfirmed,
+
+    /// Nothing reported anything.
+    ///
+    /// No bytes left and nothing schedulable — the wording names the
+    /// escape hatch.
+    Failed,
+}
+
+/// The notice wording a synchronous copy answer earns.
+///
+/// Word-for-word the vocabulary [`copy_verdict_notice`] settles on, so
+/// the immediate phase never claims more than the phase after it.
+#[must_use]
+fn copy_answer_notice(answer: CopyAnswer) -> &'static str {
+    match answer {
+        CopyAnswer::Verified => "selection copied",
+        CopyAnswer::Unconfirmed => "selection copied (unconfirmed)",
+        CopyAnswer::Failed => "copy failed — set display.copy_command",
+    }
+}
+
+/// The synchronous answer once the escape write is known.
+///
+/// With nothing schedulable the escape is the whole story — its write
+/// settles the answer outright, keeping the no-transports host's
+/// immediate wording. With transports scheduled the answer is
+/// unconfirmed whatever the escape did: confirmation is theirs to
+/// deliver as a verdict.
+#[must_use]
+fn transport_answer(escape_written: bool, transports_scheduled: bool) -> CopyAnswer {
+    match (escape_written, transports_scheduled) {
+        (_, true) => CopyAnswer::Unconfirmed,
+        (true, false) => CopyAnswer::Verified,
+        (false, false) => CopyAnswer::Failed,
+    }
+}
+
+/// The definitive result of one off-loaded copy attempt.
+///
+/// The escape write carries no acceptance signal, so only a process
+/// transport that exited successfully counts as confirmation; the
+/// frame drain maps these facts onto the notice row's wording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CopyVerdict {
+    /// Which copy attempt this verdict belongs to.
+    ///
+    /// One monotonic counter per app stamps every copy at the funnel,
+    /// so overlapping attempts drain in attempt order — a late verdict
+    /// from an older copy cannot overwrite a newer one.
+    attempt: u64,
+
+    /// Whether the OSC 52 escape's bytes left stdout.
+    ///
+    /// True means the handoff happened, never that the receiving
+    /// terminal accepted it — the honest ceiling of an escape.
+    escape_written: bool,
+
+    /// Whether any process transport exited successfully.
+    ///
+    /// A transport that launched, consumed the text, and exited zero
+    /// is the only delivery the chain can actually confirm.
+    verified: bool,
+}
+
+/// The shared slot off-loaded copies report their verdicts into.
+///
+/// One slot per app: the default copier pushes from its background
+/// task and the frame drain empties it every frame, so nothing
+/// accumulates. Pushes land in whatever order the transports finish;
+/// the drain posts the newest attempt's verdict, and only when no
+/// newer copy already holds the notice row.
+type CopyOutcomes = Arc<std::sync::Mutex<Vec<CopyVerdict>>>;
+
+/// The seam a completed selection's text goes to.
+///
+/// Receives the copy's attempt id beside the text — the same id any
+/// later verdict lands under — and answers synchronously with what
+/// the copy path knows; the default answers from the transport chain
+/// and a test recorder from its own script.
+type SelectionCopier = Box<dyn Fn(u64, &str) -> CopyAnswer>;
+
+/// The notice wording a copy's verdict settles on.
+///
+/// A verified transport earned the plain claim; an escape that only
+/// left the process says so; nothing at all names the escape hatch.
+#[must_use]
+fn copy_verdict_notice(verdict: CopyVerdict) -> &'static str {
+    if verdict.verified {
+        "selection copied"
+    } else if verdict.escape_written {
+        "selection copied (unconfirmed)"
+    } else {
+        "copy failed — set display.copy_command"
+    }
+}
+
+/// Take the next copy-attempt id from the shared counter.
+///
+/// One counter per app, shared with the copier: the read-modify-write
+/// is a single atomic step, so copies stamping concurrently always
+/// take distinct ids, and the first stamp is 1.
+fn next_attempt(counter: &std::sync::atomic::AtomicU64) -> u64 {
+    counter
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .saturating_add(1)
+}
+
+/// Hand `text` to every clipboard transport the environment offers.
+///
+/// The terminal-side OSC 52 escape runs inline — one buffered write —
+/// and every process transport moves to a background task bounded by
+/// one shared kill deadline, so a hanging helper or a child that
+/// never reads its stdin cannot freeze input and rendering. The
+/// caller-stamped `attempt` rides onto the verdict unchanged. The
+/// transports' verdict lands as a follow-up notice through the render
+/// wake this pings; until then the returned escape result is all the
+/// caller can honestly claim. Failures stay silent per attempt: a
+/// copy that cannot be delivered is a nuisance, not an error worth
+/// interrupting a session for.
+fn copy_via_transports(
+    custom: Option<&str>,
+    attempt: u64,
+    text: &str,
+    outcomes: &CopyOutcomes,
+    wake: &Arc<event_listener::Event>,
+) -> CopyAnswer {
+    let escape_written = osc52_write(text);
+    let command_line = configured_copy_command(custom).map(str::to_string);
+    let transports_scheduled = command_line.is_some()
+        || cfg!(target_os = "macos")
+        || !host_transports(clipboard_env()).is_empty();
+    let answer = transport_answer(escape_written, transports_scheduled);
+    if !transports_scheduled {
+        return answer;
+    }
+    let outcomes = Arc::clone(outcomes);
+    let wake = Arc::clone(wake);
+    let text = text.to_string();
+    let job = move || {
+        let verified = run_process_transports(command_line.as_deref(), &text, COPY_DEADLINE);
+        let mut slot = outcomes.lock().unwrap_or_else(PoisonError::into_inner);
+        slot.push(CopyVerdict {
+            attempt,
+            escape_written,
+            verified,
+        });
+        wake.notify(1);
+    };
+    if tokio::runtime::Handle::try_current().is_ok() {
+        drop(tokio::task::spawn_blocking(job));
+    } else {
+        drop(std::thread::spawn(job));
+    }
+    answer
+}
+
+/// The configured copy command, blank values dropped.
+///
+/// A blank or whitespace-only `display.copy_command` is the one-input
+/// case of the chain's unset discipline: `sh -c ""` would exit
+/// successfully and count as a delivery that delivered nothing.
+fn configured_copy_command(custom: Option<&str>) -> Option<&str> {
+    custom.filter(|command| !command.trim().is_empty())
+}
+
+/// Write the OSC 52 clipboard escape for `text`.
+///
+/// Both terminator spellings are written — BEL and ST — because a few
+/// terminals accept only one of them. The write is the only signal
+/// available from this side: acceptance by the receiving terminal is
+/// unknowable, so success here means the bytes left and nothing more.
+fn osc52_write(text: &str) -> bool {
     use std::io::Write as _;
 
     use base64::Engine as _;
 
     let encoded = base64::engine::general_purpose::STANDARD.encode(text);
     let mut stdout = std::io::stdout();
-    drop(write!(stdout, "\x1b]52;c;{encoded}\x07"));
-    drop(stdout.flush());
-    if cfg!(target_os = "macos")
-        && let Ok(mut child) = std::process::Command::new("pbcopy")
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-    {
-        if let Some(stdin) = child.stdin.as_mut() {
-            drop(stdin.write_all(text.as_bytes()));
+    stdout
+        .write_all(format!("\x1b]52;c;{encoded}\x07").as_bytes())
+        .is_ok()
+        && stdout
+            .write_all(format!("\x1b]52;c;{encoded}\x1b\\").as_bytes())
+            .is_ok()
+        && stdout.flush().is_ok()
+}
+
+/// Which host clipboard transports the environment makes possible.
+///
+/// Snapshotted from the process environment once per copy; a helper
+/// that is installed but has no server to talk to (a Wayland tool
+/// with no Wayland session) is ruled out by its missing variable, so
+/// it never runs just to fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClipboardEnv {
+    /// Whether `$TMUX` is set: inside tmux, `set-buffer -w` reaches
+    /// tmux's own paste buffer and asks the outer terminal for its
+    /// clipboard.
+    in_tmux: bool,
+
+    /// Whether `$WAYLAND_DISPLAY` is set: a Wayland session can take
+    /// the copy through `wl-copy`.
+    wayland: bool,
+
+    /// Whether `$DISPLAY` is set: an X session can take the copy
+    /// through `xclip` or `xsel`.
+    x11: bool,
+}
+
+/// A host-side clipboard transport, in attempt order.
+///
+/// One spawned helper that takes the text on stdin; the variants name
+/// both the program and the order the chain tries them in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostTransport {
+    /// tmux's buffer, pushed onward to the system clipboard.
+    ///
+    /// `set-buffer -w` fills tmux's paste buffer and forwards to the
+    /// attached terminal's clipboard, covering both paste paths.
+    Tmux,
+
+    /// The Wayland clipboard helper.
+    ///
+    /// `wl-copy` owns the Wayland clipboard selection directly.
+    WlCopy,
+
+    /// The X11 clipboard helper, clipboard selection.
+    ///
+    /// `xclip -selection clipboard` targets the selection a paste
+    /// reads by default.
+    Xclip,
+
+    /// The X11 clipboard helper, alternate spelling.
+    ///
+    /// `xsel --clipboard --input` covers hosts that ship xsel rather
+    /// than xclip.
+    Xsel,
+}
+
+impl HostTransport {
+    /// The spawned command that carries this transport.
+    ///
+    /// Built with its fixed arguments; the caller pipes the text into
+    /// its stdin and waits out the exit.
+    fn command(self) -> std::process::Command {
+        match self {
+            Self::Tmux => {
+                let mut command = std::process::Command::new("tmux");
+                command.args(["set-buffer", "-w", "-"]);
+                command
+            }
+            Self::WlCopy => std::process::Command::new("wl-copy"),
+            Self::Xclip => {
+                let mut command = std::process::Command::new("xclip");
+                command.args(["-selection", "clipboard"]);
+                command
+            }
+            Self::Xsel => {
+                let mut command = std::process::Command::new("xsel");
+                command.args(["--clipboard", "--input"]);
+                command
+            }
         }
-        drop(child.wait());
+    }
+}
+
+/// Read the process environment into a [`ClipboardEnv`].
+///
+/// A variable that is unset or empty disables its transport: the
+/// helper would otherwise run against a display or server that does
+/// not exist.
+fn clipboard_env() -> ClipboardEnv {
+    ClipboardEnv {
+        in_tmux: non_empty("TMUX"),
+        wayland: non_empty("WAYLAND_DISPLAY"),
+        x11: non_empty("DISPLAY"),
+    }
+}
+
+/// Whether `name` is set to a non-empty value.
+///
+/// Empty-valued variables count as unset: an empty `$DISPLAY`, for
+/// instance, names no X server to reach.
+fn non_empty(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|value| !value.is_empty())
+}
+
+/// The host transports worth attempting for `env`, in order.
+///
+/// Selection is pure over the snapshot so the pins can drive it
+/// without touching the process environment; the order only matters
+/// for spawn cost, since every attempt carries the same text.
+fn host_transports(env: ClipboardEnv) -> Vec<HostTransport> {
+    let mut transports = Vec::new();
+    if env.in_tmux {
+        transports.push(HostTransport::Tmux);
+    }
+    if env.wayland {
+        transports.push(HostTransport::WlCopy);
+    }
+    if env.x11 {
+        transports.push(HostTransport::Xclip);
+        transports.push(HostTransport::Xsel);
+    }
+    transports
+}
+
+/// Run every process transport under one shared deadline.
+///
+/// The configured command, the platform helper, and the transports
+/// the environment names all draw on the same clock, so the whole
+/// chain costs at most the deadline whatever it contains. Returns
+/// whether any transport exited successfully; an empty chain returns
+/// false without spawning anything.
+fn run_process_transports(custom: Option<&str>, text: &str, deadline: Duration) -> bool {
+    let start = Instant::now();
+    let mut verified = false;
+    if let Some(command_line) = custom {
+        let mut command = std::process::Command::new("sh");
+        command.arg("-c").arg(command_line);
+        verified |= run_bounded(command, text, start, deadline);
+    }
+    if cfg!(target_os = "macos") {
+        verified |= run_bounded(std::process::Command::new("pbcopy"), text, start, deadline);
+    }
+    for transport in host_transports(clipboard_env()) {
+        verified |= run_bounded(transport.command(), text, start, deadline);
+    }
+    verified
+}
+
+/// Spawn one transport and bound its whole lifetime.
+///
+/// The text reaches the child through a writer thread, so a helper
+/// that ignores stdin cannot wedge the chain on a full pipe, and the
+/// poll loop kills the child's whole process tree once the deadline
+/// passes — the worst case is one bounded wait, never an open-ended
+/// one. Returns whether the child exited successfully inside the
+/// deadline.
+fn run_bounded(
+    mut command: std::process::Command,
+    text: &str,
+    start: Instant,
+    deadline: Duration,
+) -> bool {
+    // The group is what makes the deadline's kill reach descendants
+    // that inherited the pipe — killing the child alone strands them.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let Ok(mut child) = command.spawn() else {
+        return false;
+    };
+    let mut stdin = child.stdin.take();
+    let owned = text.to_string();
+    let (writer_done, writer_landed) = std::sync::mpsc::channel::<std::io::Result<()>>();
+    let writer = std::thread::spawn(move || {
+        use std::io::Write as _;
+
+        if let Some(pipe) = stdin.as_mut() {
+            drop(writer_done.send(pipe.write_all(owned.as_bytes())));
+        }
+    });
+    let Some(expiry) = start.checked_add(deadline) else {
+        kill_transport_tree(&mut child);
+        wait_writer_bounded(writer, &writer_landed);
+        return false;
+    };
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let succeeded = status.success();
+                wait_writer_bounded(writer, &writer_landed);
+                return succeeded;
+            }
+            Ok(None) => {}
+            Err(_) => {
+                kill_transport_tree(&mut child);
+                wait_writer_bounded(writer, &writer_landed);
+                return false;
+            }
+        }
+        if Instant::now() >= expiry {
+            kill_transport_tree(&mut child);
+            wait_writer_bounded(writer, &writer_landed);
+            return false;
+        }
+        std::thread::sleep(COPY_POLL_STEP);
+    }
+}
+
+/// Kill a transport's whole process tree.
+///
+/// The child runs as its own process-group leader, so a group signal
+/// reaches descendants that inherited the pipe — a backgrounded
+/// helper holding stdin dies with its parent and the writer
+/// unblocks. Away from Unix the direct child is all that can be
+/// reached.
+fn kill_transport_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    if let Ok(pgid) = i32::try_from(child.id()) {
+        // SAFETY: the pgid is the freshly spawned child's own id,
+        // not yet reaped, so no pid reuse can retarget the signal;
+        // killpg only delivers it.
+        unsafe { libc::killpg(pgid, libc::SIGKILL) };
+    }
+    drop(child.kill());
+}
+
+/// Wait out a transport's writer within its grace, then abandon it.
+///
+/// Every well-behaved transport's write lands inside the grace —
+/// normally in milliseconds — so an exit status is not reported
+/// before the write finished. A writer still parked on a pipe some
+/// escaped descendant holds cannot be waited out at all: the grace
+/// lapses, the join is dropped, and the thread leaves by itself
+/// whenever the pipe finally closes. The verdict is never held
+/// hostage to it.
+fn wait_writer_bounded(
+    writer: std::thread::JoinHandle<()>,
+    landed: &std::sync::mpsc::Receiver<std::io::Result<()>>,
+) {
+    if landed.recv_timeout(WRITER_GRACE).is_ok() {
+        drop(writer.join());
+    } else {
+        drop(writer);
     }
 }
 
@@ -3452,6 +4103,51 @@ fn split_scrollbar_gutter(area: Rect) -> (Rect, Option<Rect>) {
 /// Columns of tinted breathing room at each end of the input field's
 /// text, inside the fill's edge.
 const INPUT_SIDE_INSET: u16 = 2;
+
+/// Blank columns a user turn's box keeps outside itself, between its
+/// edges and the pane's.
+///
+/// The prompt box is a raised surface floating on the terminal's own
+/// background, not a band pinned to the pane's edges: this much
+/// regular background shows on the box's left and right alike, with
+/// the scrollbar's gutter beyond. The chevron sits a column inside
+/// the box's left edge, this margin in from the pane's.
+const CONVERSATION_BOX_MARGIN: u16 = 1;
+
+/// Columns the conversation reserves at its left edge before its
+/// text starts.
+///
+/// The marker is chrome drawn into the gutter, never span content, so
+/// selections and copies walk only the text. The width covers the
+/// box's left margin, a pad column, the chevron, and the gap before
+/// the text.
+const CONVERSATION_MARK_GUTTER: u16 = 5;
+
+/// The narrowest conversation text that still carries the marker
+/// gutter beside it.
+///
+/// Below this the pane keeps its full width and draws no chevrons — a
+/// marker that starves the text is worse than no marker.
+const CONVERSATION_MARK_MIN_TEXT: u16 = 8;
+
+/// Blank rows the conversation keeps between the pane's top edge and
+/// its first line of text.
+///
+/// The transcript opens this far below the pane's edge — the same
+/// breathing-room convention the composer and the status bar use — so
+/// the topmost line never touches whatever sits above the pane. The
+/// scrollbar track starts below the inset too: the track measures the
+/// padded content window, not the raw pane.
+const CONVERSATION_TOP_INSET: u16 = 1;
+
+/// Blank columns a user turn's box keeps between its wrapped text and
+/// its right edge, inside the box.
+///
+/// Wrapped user lines stop this far short of the box's edge, the
+/// padding the prompt surface carries around its text; agent lines
+/// share the stop so every message column aligns, leaving the box's
+/// margin and the scrollbar's gutter blank beyond.
+const CONVERSATION_RIGHT_INSET: u16 = 3;
 
 /// Rows of text the input field shows at its largest.
 ///
@@ -3879,6 +4575,317 @@ mod tests {
         assert!(
             !app.any_tools_running(),
             "a poisoned lock reads as no tools in flight"
+        );
+    }
+
+    #[test]
+    fn host_transports_follow_the_environment_snapshot() {
+        let none = host_transports(ClipboardEnv {
+            in_tmux: false,
+            wayland: false,
+            x11: false,
+        });
+        assert!(none.is_empty(), "a headless host offers no transports");
+
+        let tmux_only = host_transports(ClipboardEnv {
+            in_tmux: true,
+            wayland: false,
+            x11: false,
+        });
+        assert_eq!(tmux_only, [HostTransport::Tmux], "tmux is named first");
+
+        let wayland_only = host_transports(ClipboardEnv {
+            in_tmux: false,
+            wayland: true,
+            x11: false,
+        });
+        assert_eq!(
+            wayland_only,
+            [HostTransport::WlCopy],
+            "a wayland session names wl-copy"
+        );
+
+        let x11_only = host_transports(ClipboardEnv {
+            in_tmux: false,
+            wayland: false,
+            x11: true,
+        });
+        assert_eq!(
+            x11_only,
+            [HostTransport::Xclip, HostTransport::Xsel],
+            "an x session tries both spellings in order"
+        );
+
+        let everything = host_transports(ClipboardEnv {
+            in_tmux: true,
+            wayland: true,
+            x11: true,
+        });
+        assert_eq!(
+            everything,
+            [
+                HostTransport::Tmux,
+                HostTransport::WlCopy,
+                HostTransport::Xclip,
+                HostTransport::Xsel
+            ],
+            "the full environment keeps the attempt order"
+        );
+    }
+
+    #[test]
+    fn copy_verdict_wording_covers_all_three_states() {
+        assert_eq!(
+            copy_verdict_notice(CopyVerdict {
+                attempt: 1,
+                escape_written: false,
+                verified: true,
+            }),
+            "selection copied",
+            "a verified transport earns the plain claim"
+        );
+        assert_eq!(
+            copy_verdict_notice(CopyVerdict {
+                attempt: 1,
+                escape_written: true,
+                verified: false,
+            }),
+            "selection copied (unconfirmed)",
+            "an escape that only left the process says so"
+        );
+        assert_eq!(
+            copy_verdict_notice(CopyVerdict {
+                attempt: 1,
+                escape_written: false,
+                verified: false,
+            }),
+            "copy failed — set display.copy_command",
+            "nothing at all names the escape hatch"
+        );
+    }
+
+    #[test]
+    fn a_blank_copy_command_counts_as_unset() {
+        assert_eq!(configured_copy_command(None), None, "unset stays unset");
+        assert_eq!(configured_copy_command(Some("")), None, "empty is dropped");
+        assert_eq!(
+            configured_copy_command(Some("  \t ")),
+            None,
+            "whitespace-only is dropped"
+        );
+        assert_eq!(
+            configured_copy_command(Some("cat > /dev/null")),
+            Some("cat > /dev/null"),
+            "a real command passes through as authored"
+        );
+    }
+
+    #[test]
+    fn a_fast_copy_command_verifies_within_the_deadline() {
+        let began = std::time::Instant::now();
+        assert!(
+            run_process_transports(
+                Some("cat > /dev/null"),
+                "payload",
+                Duration::from_millis(500),
+            ),
+            "a command that consumes stdin and exits zero verifies"
+        );
+        assert!(
+            began.elapsed() < Duration::from_secs(2),
+            "the wait stays bounded"
+        );
+    }
+
+    #[test]
+    fn a_hanging_copy_command_is_killed_at_the_deadline() {
+        let began = std::time::Instant::now();
+        assert!(
+            !run_process_transports(Some("sleep 30"), "payload", Duration::from_millis(150)),
+            "a command that outlives the deadline reports no delivery"
+        );
+        assert!(
+            began.elapsed() < Duration::from_secs(2),
+            "the chain returns around the deadline, not the child's lifetime"
+        );
+    }
+
+    #[test]
+    fn a_descendant_holding_stdin_cannot_outlive_the_deadline() {
+        let began = std::time::Instant::now();
+        assert!(
+            !run_process_transports(
+                Some("cat > /dev/null & sleep 60"),
+                "payload",
+                Duration::from_millis(200),
+            ),
+            "a transport whose descendant holds the pipe reports no delivery"
+        );
+        assert!(
+            began.elapsed() < Duration::from_secs(2),
+            "the group kill plus the writer grace bound the whole chain"
+        );
+    }
+
+    #[test]
+    fn a_drained_verdict_replaces_the_notice_wording() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        app.post_notice("selection copied".to_string());
+        let mut slot = app.copy_outcomes.lock().expect("the outcomes slot");
+        slot.push(CopyVerdict {
+            attempt: 1,
+            escape_written: true,
+            verified: false,
+        });
+        drop(slot);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+        terminal.draw(|frame| app.render(frame)).expect("draw");
+        assert_eq!(
+            app.transient_notice.as_ref().map(|(text, _)| text.as_str()),
+            Some("selection copied (unconfirmed)"),
+            "the drain posts the verdict's definitive wording"
+        );
+    }
+
+    #[test]
+    fn a_late_verdict_from_an_older_copy_cannot_overwrite_a_newer_one() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        let mut slot = app.copy_outcomes.lock().expect("the outcomes slot");
+        slot.push(CopyVerdict {
+            attempt: 2,
+            escape_written: true,
+            verified: true,
+        });
+        slot.push(CopyVerdict {
+            attempt: 1,
+            escape_written: true,
+            verified: false,
+        });
+        drop(slot);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+        terminal.draw(|frame| app.render(frame)).expect("draw");
+        assert_eq!(
+            app.transient_notice.as_ref().map(|(text, _)| text.as_str()),
+            Some("selection copied"),
+            "the newest attempt's wording is the one that shows"
+        );
+    }
+
+    #[test]
+    fn an_older_verdict_cannot_overwrite_a_newer_synchronous_copy() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        app.set_selection_copier(Box::new(|_attempt, _text| CopyAnswer::Verified));
+        app.copy_selection_and_notice("first");
+        app.copy_selection_and_notice("second");
+        let mut slot = app.copy_outcomes.lock().expect("the outcomes slot");
+        slot.push(CopyVerdict {
+            attempt: 1,
+            escape_written: true,
+            verified: false,
+        });
+        drop(slot);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+        terminal.draw(|frame| app.render(frame)).expect("draw");
+        assert_eq!(
+            app.transient_notice.as_ref().map(|(text, _)| text.as_str()),
+            Some("selection copied"),
+            "the newest synchronous copy keeps its verified wording"
+        );
+    }
+
+    #[test]
+    fn a_verdict_still_upgrades_its_own_immediate_wording() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        app.set_selection_copier(Box::new(|_attempt, _text| CopyAnswer::Unconfirmed));
+        app.copy_selection_and_notice("pending");
+        let mut slot = app.copy_outcomes.lock().expect("the outcomes slot");
+        slot.push(CopyVerdict {
+            attempt: 1,
+            escape_written: true,
+            verified: true,
+        });
+        drop(slot);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+        terminal.draw(|frame| app.render(frame)).expect("draw");
+        assert_eq!(
+            app.transient_notice.as_ref().map(|(text, _)| text.as_str()),
+            Some("selection copied"),
+            "the same attempt's settled verdict replaces its immediate wording"
+        );
+    }
+
+    #[test]
+    fn concurrent_copies_stamp_one_distinct_attempt_each() {
+        let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let gate = Arc::new(std::sync::Barrier::new(8));
+        let stampers: Vec<_> = (0..8)
+            .map(|_| {
+                let counter = Arc::clone(&counter);
+                let gate = Arc::clone(&gate);
+                std::thread::spawn(move || {
+                    gate.wait();
+                    (0..1000)
+                        .map(|_| next_attempt(&counter))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut stamped = Vec::new();
+        for stamper in stampers {
+            stamped.extend(stamper.join().expect("the stamper survives"));
+        }
+        stamped.sort_unstable();
+        assert_eq!(
+            stamped,
+            (1..=8000).collect::<Vec<_>>(),
+            "overlapping copies never share an attempt id"
+        );
+    }
+
+    #[test]
+    fn the_copy_answer_wording_matches_the_verdict_vocabulary() {
+        assert_eq!(
+            copy_answer_notice(CopyAnswer::Verified),
+            "selection copied",
+            "verified delivery earns the plain claim"
+        );
+        assert_eq!(
+            copy_answer_notice(CopyAnswer::Unconfirmed),
+            "selection copied (unconfirmed)",
+            "a pending delivery says so"
+        );
+        assert_eq!(
+            copy_answer_notice(CopyAnswer::Failed),
+            "copy failed — set display.copy_command",
+            "nothing at all names the escape hatch"
+        );
+    }
+
+    #[test]
+    fn the_synchronous_answer_follows_what_is_schedulable() {
+        assert_eq!(
+            transport_answer(true, false),
+            CopyAnswer::Verified,
+            "an escape-only host keeps its immediate wording"
+        );
+        assert_eq!(
+            transport_answer(false, false),
+            CopyAnswer::Failed,
+            "nothing leaving and nothing schedulable fails outright"
+        );
+        assert_eq!(
+            transport_answer(true, true),
+            CopyAnswer::Unconfirmed,
+            "transports in flight hold the plain claim back"
+        );
+        assert_eq!(
+            transport_answer(false, true),
+            CopyAnswer::Unconfirmed,
+            "a failed escape still waits on the transports' verdict"
         );
     }
 }

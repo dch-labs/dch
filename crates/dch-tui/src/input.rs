@@ -16,6 +16,88 @@ use unicode_width::UnicodeWidthStr;
 /// input box matches the buffer's geometry exactly.
 const TAB_WIDTH: usize = 4;
 
+/// Wrap one logical line with the editor's first-fit options.
+///
+/// The editor maps carets onto these rows and — for a caret at the
+/// line's end — onto a sentinel-guarded wrap of the line itself,
+/// which stays honest only while the two wraps share their breaks.
+/// First-fit guarantees it: every row takes as many words as fit, so
+/// a line and its extension break at the same points. The crate
+/// default would be the balanced algorithm, which optimizes the whole
+/// line at once and drifts the caret off its row near the wrap
+/// boundary.
+fn wrap_greedy(line: &str, width: usize) -> Vec<std::borrow::Cow<'_, str>> {
+    textwrap::wrap(
+        line,
+        textwrap::Options::new(width)
+            .wrap_algorithm(textwrap::wrap_algorithms::WrapAlgorithm::FirstFit),
+    )
+}
+
+/// The end-of-line caret's cell within its line's wrap.
+///
+/// The sentinel keeps a trailing space attached through the wrap —
+/// textwrap right-trims it otherwise and the caret would report a
+/// column left of its true cell — and when the sentinel overflows an
+/// exactly-full row it drags the last word down instead, so the plain
+/// line wraps alongside it: one row more means the caret sits at the
+/// continuation row's start.
+fn end_of_line_caret(line: &str, cap: usize) -> (usize, usize) {
+    let plain = wrap_greedy(line, cap);
+    let guarded_text = format!("{line}x");
+    let guarded = wrap_greedy(&guarded_text, cap);
+    if guarded.len() > plain.len() {
+        (plain.len(), 0)
+    } else {
+        (
+            guarded.len().saturating_sub(1),
+            guarded
+                .last()
+                .map_or(0, |row| UnicodeWidthStr::width(row.as_ref()))
+                .saturating_sub(1),
+        )
+    }
+}
+
+/// The caret's cell for an offset inside one logical line's wrap.
+///
+/// The rows come from the full line's own wrap, so an in-progress
+/// word the line will later break at cannot misplace the caret: the
+/// containing row is the one whose byte span holds the offset, and
+/// the column is that row's display width up to it. An offset inside
+/// the whitespace a break consumed belongs to the row above, one
+/// cell per space — where the caret visually sits.
+fn caret_cell_in_line(
+    logical: &str,
+    wrapped: &[std::borrow::Cow<'_, str>],
+    offset: usize,
+) -> Option<(usize, usize)> {
+    let mut consumed = 0;
+    let mut above: Option<(usize, usize, usize)> = None;
+    for (index, row) in wrapped.iter().enumerate() {
+        let rest = logical.get(consumed..).unwrap_or("");
+        let found = rest.find(row.as_ref())?;
+        let row_start = consumed.saturating_add(found);
+        let row_end = row_start.saturating_add(row.len());
+        if offset >= row_start && offset <= row_end {
+            let column = UnicodeWidthStr::width(logical.get(row_start..offset).unwrap_or(""));
+            return Some((index, column));
+        }
+        if let Some((row_index, end, width)) = above
+            && offset < row_start
+        {
+            let extra = UnicodeWidthStr::width(logical.get(end..offset).unwrap_or(""));
+            return Some((row_index, width.saturating_add(extra)));
+        }
+        above = Some((index, row_end, UnicodeWidthStr::width(row.as_ref())));
+        consumed = row_end;
+    }
+    above.map(|(row_index, end, width)| {
+        let extra = UnicodeWidthStr::width(logical.get(end..offset).unwrap_or(""));
+        (row_index, width.saturating_add(extra))
+    })
+}
+
 /// What a key wants the app to do after the editor mutated itself.
 ///
 /// The editor performs no app-level work of its own — submitting,
@@ -471,7 +553,7 @@ impl InputEditor {
         let cap = usize::from(width.max(1));
         let mut rows = Vec::new();
         for logical in self.text.split('\n') {
-            let wrapped = textwrap::wrap(logical, cap);
+            let wrapped = wrap_greedy(logical, cap);
             if wrapped.is_empty() {
                 rows.push(String::new());
             } else {
@@ -505,9 +587,9 @@ impl InputEditor {
     /// [`cursor_cell`](Self::cursor_cell) both answer from this one
     /// pass, so a frame that needs the two — sizing, painting, the
     /// status tag — wraps the buffer once, not once per question.
-    /// The caret's column follows the same breaks the rows use,
-    /// including the sentinel-guarded prefix and the continuation
-    /// row a final-row-filling caret appends.
+    /// A caret inside its line lands on the row whose span holds it;
+    /// the end-of-line caret follows the sentinel-guarded wrap and
+    /// the continuation row a final-row-filling caret appends.
     #[must_use]
     pub fn display_rows_and_caret(&self, width: u16) -> (Vec<String>, Option<(u16, u16)>) {
         let cap = usize::from(width.max(1));
@@ -520,21 +602,15 @@ impl InputEditor {
         let mut caret: Option<(usize, usize)> = None;
         let mut row: usize = 0;
         for (index, logical) in self.text.split('\n').enumerate() {
+            let wrapped = wrap_greedy(logical, cap);
             if index == caret_line {
-                let prefix = logical.get(..caret_bytes).unwrap_or("");
-                // The sentinel keeps a trailing space attached through
-                // the wrap — textwrap right-trims it otherwise and the
-                // caret would report a column left of its true cell.
-                let guarded = format!("{prefix}x");
-                let partial = textwrap::wrap(&guarded, cap);
-                let row_in_line = partial.len().saturating_sub(1);
-                let column = partial
-                    .last()
-                    .map_or(0, |row| UnicodeWidthStr::width(row.as_ref()))
-                    .saturating_sub(1);
-                caret = Some((row.saturating_add(row_in_line), column));
+                let cell = if caret_bytes == logical.len() {
+                    end_of_line_caret(logical, cap)
+                } else {
+                    caret_cell_in_line(logical, &wrapped, caret_bytes).unwrap_or((0, 0))
+                };
+                caret = Some((row.saturating_add(cell.0), cell.1));
             }
-            let wrapped = textwrap::wrap(logical, cap);
             if wrapped.is_empty() {
                 rows.push(String::new());
             } else {
@@ -594,21 +670,15 @@ impl InputEditor {
             .map_or(offset, |i| offset.saturating_sub(i.saturating_add(1)));
         let mut row: usize = 0;
         for (index, logical) in self.text.split('\n').enumerate() {
-            let wrapped = textwrap::wrap(logical, cap);
+            let wrapped = wrap_greedy(logical, cap);
             let rows_here = wrapped.len().max(1);
             if index == line_index {
-                let prefix = logical.get(..line_col).unwrap_or("");
-                // The sentinel keeps a trailing space attached through
-                // the wrap — textwrap right-trims it otherwise and the
-                // caret would report a column left of its true cell.
-                let guarded = format!("{prefix}x");
-                let partial = textwrap::wrap(&guarded, cap);
-                let row_in_line = partial.len().saturating_sub(1);
-                let column = partial
-                    .last()
-                    .map_or(0, |row| UnicodeWidthStr::width(row.as_ref()))
-                    .saturating_sub(1);
-                return Some((row.saturating_add(row_in_line), column));
+                let cell = if line_col == logical.len() {
+                    end_of_line_caret(logical, cap)
+                } else {
+                    caret_cell_in_line(logical, &wrapped, line_col).unwrap_or((0, 0))
+                };
+                return Some((row.saturating_add(cell.0), cell.1));
             }
             row = row.saturating_add(rows_here);
         }
