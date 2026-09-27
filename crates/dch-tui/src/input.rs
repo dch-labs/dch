@@ -16,6 +16,24 @@ use unicode_width::UnicodeWidthStr;
 /// input box matches the buffer's geometry exactly.
 const TAB_WIDTH: usize = 4;
 
+/// Wrap one logical line with the editor's first-fit options.
+///
+/// The editor derives its caret cell by wrapping the text before the
+/// cursor — sentinel-guarded — separately from the rows it renders,
+/// and that derivation is sound only while a prefix wraps at exactly
+/// the points the full line wraps at. First-fit guarantees it: every
+/// row takes as many words as fit, so the two wraps share their
+/// breaks. The crate default would be the balanced algorithm, which
+/// optimizes the whole line at once and drifts the caret off its row
+/// near the wrap boundary.
+fn wrap_greedy(line: &str, width: usize) -> Vec<std::borrow::Cow<'_, str>> {
+    textwrap::wrap(
+        line,
+        textwrap::Options::new(width)
+            .wrap_algorithm(textwrap::wrap_algorithms::WrapAlgorithm::FirstFit),
+    )
+}
+
 /// What a key wants the app to do after the editor mutated itself.
 ///
 /// The editor performs no app-level work of its own — submitting,
@@ -471,7 +489,7 @@ impl InputEditor {
         let cap = usize::from(width.max(1));
         let mut rows = Vec::new();
         for logical in self.text.split('\n') {
-            let wrapped = textwrap::wrap(logical, cap);
+            let wrapped = wrap_greedy(logical, cap);
             if wrapped.is_empty() {
                 rows.push(String::new());
             } else {
@@ -522,19 +540,23 @@ impl InputEditor {
         for (index, logical) in self.text.split('\n').enumerate() {
             if index == caret_line {
                 let prefix = logical.get(..caret_bytes).unwrap_or("");
-                // The sentinel keeps a trailing space attached through
-                // the wrap — textwrap right-trims it otherwise and the
-                // caret would report a column left of its true cell.
-                let guarded = format!("{prefix}x");
-                let partial = textwrap::wrap(&guarded, cap);
-                let row_in_line = partial.len().saturating_sub(1);
-                let column = partial
-                    .last()
-                    .map_or(0, |row| UnicodeWidthStr::width(row.as_ref()))
-                    .saturating_sub(1);
+                let plain = wrap_greedy(prefix, cap);
+                let guarded_text = format!("{prefix}x");
+                let guarded = wrap_greedy(&guarded_text, cap);
+                let (row_in_line, column) = if guarded.len() > plain.len() {
+                    (plain.len(), 0)
+                } else {
+                    (
+                        guarded.len().saturating_sub(1),
+                        guarded
+                            .last()
+                            .map_or(0, |row| UnicodeWidthStr::width(row.as_ref()))
+                            .saturating_sub(1),
+                    )
+                };
                 caret = Some((row.saturating_add(row_in_line), column));
             }
-            let wrapped = textwrap::wrap(logical, cap);
+            let wrapped = wrap_greedy(logical, cap);
             if wrapped.is_empty() {
                 rows.push(String::new());
             } else {
@@ -594,20 +616,24 @@ impl InputEditor {
             .map_or(offset, |i| offset.saturating_sub(i.saturating_add(1)));
         let mut row: usize = 0;
         for (index, logical) in self.text.split('\n').enumerate() {
-            let wrapped = textwrap::wrap(logical, cap);
+            let wrapped = wrap_greedy(logical, cap);
             let rows_here = wrapped.len().max(1);
             if index == line_index {
                 let prefix = logical.get(..line_col).unwrap_or("");
-                // The sentinel keeps a trailing space attached through
-                // the wrap — textwrap right-trims it otherwise and the
-                // caret would report a column left of its true cell.
-                let guarded = format!("{prefix}x");
-                let partial = textwrap::wrap(&guarded, cap);
-                let row_in_line = partial.len().saturating_sub(1);
-                let column = partial
-                    .last()
-                    .map_or(0, |row| UnicodeWidthStr::width(row.as_ref()))
-                    .saturating_sub(1);
+                let plain = wrap_greedy(prefix, cap);
+                let guarded_text = format!("{prefix}x");
+                let guarded = wrap_greedy(&guarded_text, cap);
+                let (row_in_line, column) = if guarded.len() > plain.len() {
+                    (plain.len(), 0)
+                } else {
+                    (
+                        guarded.len().saturating_sub(1),
+                        guarded
+                            .last()
+                            .map_or(0, |row| UnicodeWidthStr::width(row.as_ref()))
+                            .saturating_sub(1),
+                    )
+                };
                 return Some((row.saturating_add(row_in_line), column));
             }
             row = row.saturating_add(rows_here);

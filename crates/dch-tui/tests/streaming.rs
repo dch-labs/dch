@@ -563,9 +563,10 @@ fn auto_scroll_pins_the_newest_line_while_streaming() {
         observer.on_text_delta(&delta(0, &format!("para{line}\n\n")));
         let terminal = render_to_buffer(&mut app, 40, 24);
         let rows = row_texts(&terminal);
-        // 24 rows: 17 for the conversation (notice row, spacer,
-        // padded two-row input field, status bar) — the pinned view
-        // keeps the newest line on the pane's last row.
+        // 24 rows: 16 content rows for the conversation below its
+        // padding row (notice row, spacer, padded two-row input
+        // field, status bar) — the pinned view keeps the newest line
+        // on the pane's last content row.
         assert!(
             rows[16].contains(&format!("para{line}")),
             "the newest buffered line stays visible: {}",
@@ -583,12 +584,13 @@ fn scrolling_up_during_a_stream_holds_the_viewport() {
 
     // PageUp alone lands the viewport's top on a blank paragraph
     // separator; arrow-ups sit it on content — one more than the
-    // wider pane needed, the notice row's row back.
+    // unpadded pane needed, the padding row's line back.
     app.handle_event(&plain(KeyCode::PageUp));
     app.handle_event(&plain(KeyCode::Up));
     app.handle_event(&plain(KeyCode::Up));
+    app.handle_event(&plain(KeyCode::Up));
     let held = render_to_buffer(&mut app, 40, 24);
-    let top_before = row_texts(&held)[0].clone();
+    let top_before = row_texts(&held)[1].clone();
     assert!(
         top_before.trim().starts_with("para"),
         "the viewport sits on a content row: {top_before:?}"
@@ -599,7 +601,7 @@ fn scrolling_up_during_a_stream_holds_the_viewport() {
     let still_held = render_to_buffer(&mut app, 40, 24);
     let rows = row_texts(&still_held);
     assert_eq!(
-        rows[0], top_before,
+        rows[1], top_before,
         "the top visible line does not move while tokens arrive below"
     );
     assert!(
@@ -623,11 +625,12 @@ fn a_detached_view_stays_anchored_when_the_layout_shrinks() {
 
     app.handle_event(&plain(KeyCode::PageUp));
     app.handle_event(&plain(KeyCode::PageUp));
+    app.handle_event(&plain(KeyCode::Up));
     assert!(!app.auto_scroll(), "the view is detached");
     let held = render_to_buffer(&mut app, 40, 24);
-    let top_before = row_texts(&held)[0].trim().to_string();
+    let top_before = row_texts(&held)[1].trim().to_string();
     assert!(
-        top_before.starts_with("line"),
+        top_before.starts_with("❯  line"),
         "the detached viewport sits on a conversation row: {top_before:?}"
     );
 
@@ -637,7 +640,7 @@ fn a_detached_view_stays_anchored_when_the_layout_shrinks() {
     let shrunk = render_to_buffer(&mut app, 40, 24);
     let rows = row_texts(&shrunk);
     assert_eq!(
-        rows[0].trim(),
+        rows[1].trim(),
         top_before,
         "the viewport holds its anchor when the streaming region collapses"
     );

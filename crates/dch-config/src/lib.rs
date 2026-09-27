@@ -653,6 +653,17 @@ pub struct DisplayConfig {
     /// supports alternate-scroll translation, and keyboard scrolling
     /// (PageUp/PageDown, arrows on an empty editor) covers the rest.
     pub mouse_capture: bool,
+
+    /// A custom clipboard command for the TUI's selection copy.
+    ///
+    /// When set, a completed selection's text is piped to this command's
+    /// stdin — run through `sh -c`, so arguments and pipes work — in
+    /// addition to the built-in transports: the terminal-side OSC 52
+    /// escape and whatever host clipboard tools the environment names
+    /// (`tmux set-buffer`, `wl-copy`, `xclip`, `xsel`, `pbcopy`). Set it
+    /// where none of the built-ins reach, e.g. a remote session whose
+    /// local terminal ignores OSC 52. Defaults to unset.
+    pub copy_command: Option<String>,
 }
 
 /// Runner runtime behavior.
@@ -897,6 +908,7 @@ impl Default for DisplayConfig {
             verbosity: Verbosity::default(),
             theme: "transparent".to_string(),
             mouse_capture: true,
+            copy_command: None,
         }
     }
 }

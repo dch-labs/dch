@@ -279,10 +279,12 @@ pub struct TuiApp {
 
     /// Where a completed selection's text goes.
     ///
-    /// The default copies through OSC 52 and, where present,
-    /// `pbcopy`; tests install a recorder to observe the copy
-    /// without touching any clipboard.
-    copier: Box<dyn Fn(&str)>,
+    /// Returns whether any transport reported delivery. The terminal
+    /// escape is fire-and-forget, so a `true` can mean only that the
+    /// bytes left, never that the receiving terminal accepted them;
+    /// tests install a recorder to observe the copy without touching
+    /// any clipboard.
+    copier: Box<dyn Fn(&str) -> bool>,
 
     /// Rendered lines of the streaming buffer's frozen prefix.
     ///
@@ -393,6 +395,17 @@ pub struct TuiApp {
     /// the cache is stale exactly when the live count has moved
     /// past this stamp, whatever caused the bump.
     conversation_cache_generation: u64,
+
+    /// Conversation-cache line ranges spanned by user turns, as
+    /// `(tint_start, tint_end, mark_row)`.
+    ///
+    /// The render paints each range as a full-width raised block on the
+    /// theme's surface — the prompt box's own color — around the turn's
+    /// text, its padding rows included, and overlays the chevron at the
+    /// turn's first text row. Chrome beside and beneath the content,
+    /// never spans inside it, so selections and copies walk only the
+    /// text. Rebuilt together with the conversation cache.
+    user_turn_ranges: Vec<(usize, usize, usize)>,
 
     /// The quit lifecycle.
     ///
@@ -523,6 +536,7 @@ impl TuiApp {
             tracing::warn!("unknown theme '{}', using default", config.display.theme);
             Theme::default()
         };
+        let copy_command = config.display.copy_command.clone();
         Self {
             theme,
             conversation: Vec::new(),
@@ -543,7 +557,7 @@ impl TuiApp {
             selection: None,
             last_view: None,
             drag_position: None,
-            copier: Box::new(copy_to_clipboard),
+            copier: Box::new(move |text| copy_via_transports(copy_command.as_deref(), text)),
             frozen_lines: Vec::new(),
             frozen_upto: 0,
             frozen_separators: 0,
@@ -555,6 +569,7 @@ impl TuiApp {
             live_width: 0,
             conversation_cache: Vec::new(),
             conversation_cache_width: 0,
+            user_turn_ranges: Vec::new(),
             conversation_generation: 1,
             conversation_cache_generation: 0,
             quit: QuitState::default(),
@@ -861,8 +876,9 @@ impl TuiApp {
     ///
     /// The instrumentation seam for the selection pins: a recorder
     /// observes what a release copies without touching any real
-    /// clipboard. Production never calls this.
-    pub fn set_selection_copier(&mut self, copier: Box<dyn Fn(&str)>) {
+    /// clipboard, reporting `true` so the notice reads as delivered.
+    /// Production never calls this.
+    pub fn set_selection_copier(&mut self, copier: Box<dyn Fn(&str) -> bool>) {
         self.copier = copier;
     }
 
@@ -995,14 +1011,36 @@ impl TuiApp {
     ///
     /// The terminal-standard copy chord. A span that covered no
     /// characters leaves the clipboard alone — the same discipline
-    /// the release and the keyboard walk apply.
+    /// the release and the keyboard walk apply. A delivered copy
+    /// lands its confirmation on the notice row, like every path.
     fn copy_selection_now(&mut self) {
-        if let Some(selection) = self.selection.as_ref() {
-            let (text, covered_any) = self.selection_text(selection);
-            if covered_any {
-                (self.copier)(&text);
-            }
+        let covered = self
+            .selection
+            .as_ref()
+            .map(|selection| self.selection_text(selection));
+        if let Some((text, covered_any)) = covered
+            && covered_any
+        {
+            self.copy_selection_and_notice(&text);
         }
+    }
+
+    /// Hand a completed selection's text to the clipboard and say so.
+    ///
+    /// The funnel every copy path — the mouse release, the copy chord,
+    /// and the keyboard walk's re-copy — delivers through, so each one
+    /// posts the same confirmation on the notice row above the
+    /// composer. A copier that reports nothing delivered flips the
+    /// wording to name the escape hatch, since a copy that reached no
+    /// transport is worth a word, not silence.
+    fn copy_selection_and_notice(&mut self, text: &str) {
+        let delivered = (self.copier)(text);
+        let wording = if delivered {
+            "selection copied"
+        } else {
+            "copy failed — set display.copy_command"
+        };
+        self.post_notice(wording.to_string());
     }
 
     /// Handle the events already waiting behind the first one.
@@ -1184,9 +1222,10 @@ impl TuiApp {
     ///
     /// The wheel scrolls by [`WHEEL_SCROLL_LINES`]; a press-drag-
     /// release over the conversation pane selects rendered
-    /// characters — inside the app — and the release quietly hands
-    /// the covered text to the clipboard while the highlight stays
-    /// up until the next press. A drag pushed against the pane's
+    /// characters — inside the app — and the release hands the
+    /// covered text to the clipboard, confirmed on the notice row,
+    /// while the highlight stays up until the next press. A drag
+    /// pushed against the pane's
     /// top or bottom row scrolls the view in the drag's direction,
     /// extending the selection — one line per movement report, and
     /// one per tick while the pointer stays parked there; a press
@@ -1251,7 +1290,7 @@ impl TuiApp {
                         } else {
                             let (text, covered_any) = self.selection_text(&selection);
                             if covered_any {
-                                (self.copier)(&text);
+                                self.copy_selection_and_notice(&text);
                             }
                             self.selection = Some(selection);
                         }
@@ -1424,13 +1463,15 @@ impl TuiApp {
             selection.head = nudged;
         }
         self.follow_head(nudged.line);
-        if let Some(selection) = self.selection.as_ref()
-            && selection.anchor != selection.head
+        let covered = self
+            .selection
+            .as_ref()
+            .filter(|selection| selection.anchor != selection.head)
+            .map(|selection| self.selection_text(selection));
+        if let Some((text, covered_any)) = covered
+            && covered_any
         {
-            let (text, covered_any) = self.selection_text(selection);
-            if covered_any {
-                (self.copier)(&text);
-            }
+            self.copy_selection_and_notice(&text);
         }
     }
 
@@ -1988,38 +2029,59 @@ impl TuiApp {
     /// The gutter is one column off the pane's right edge, reserved
     /// whether or not the document scrolls, so wrapped text never
     /// collides with the scrollbar and the wrap width stays stable
-    /// as the document crosses the scrollability threshold. A
-    /// pinned view re-anchors to the newest line; a detached view
-    /// holds its place while content streams in below it or
-    /// collapses away.
+    /// as the document crosses the scrollability threshold. The
+    /// text also sits inside the pane's top and right edges — one
+    /// breathing row below the top, blank columns short of the
+    /// gutter — so the transcript never touches its container's
+    /// edges; the scrollbar track shares the inset, belonging to
+    /// the padded content window it measures. A pinned view
+    /// re-anchors to the newest line; a detached view holds its
+    /// place while content streams in below it or collapses away.
     fn render_conversation(&mut self, frame: &mut Frame, area: Rect) {
-        let (text_area, scrollbar_area) = split_scrollbar_gutter(area);
+        let padded = Rect {
+            y: area.y.saturating_add(CONVERSATION_TOP_INSET),
+            height: area.height.saturating_sub(CONVERSATION_TOP_INSET),
+            ..area
+        };
+        let (pane, scrollbar_area) = split_scrollbar_gutter(padded);
+        let mark_gutter = (pane.width
+            >= CONVERSATION_MARK_MIN_TEXT
+                .saturating_add(CONVERSATION_MARK_GUTTER)
+                .saturating_add(CONVERSATION_RIGHT_INSET)
+                .saturating_add(CONVERSATION_BOX_MARGIN))
+        .then_some(Rect {
+            width: CONVERSATION_MARK_GUTTER,
+            ..pane
+        });
+        let text_area = mark_gutter.as_ref().map_or(pane, |gutter| Rect {
+            x: gutter.right(),
+            width: pane.width.saturating_sub(CONVERSATION_MARK_GUTTER),
+            ..pane
+        });
+        let text_area = Rect {
+            width: text_area
+                .width
+                .saturating_sub(CONVERSATION_RIGHT_INSET)
+                .saturating_sub(CONVERSATION_BOX_MARGIN),
+            ..text_area
+        };
         let conversation_height = text_area.height as usize;
         let width = text_area.width.max(1);
         if self.conversation_cache_generation != self.conversation_generation
             || self.conversation_cache_width != width
         {
             let mut summary_lines = HashMap::new();
-            self.conversation_cache = self.conversation_lines(text_area, &mut summary_lines);
+            let mut user_turns = Vec::new();
+            self.conversation_cache =
+                self.conversation_lines(text_area, &mut summary_lines, &mut user_turns);
             self.tool_summary_lines = summary_lines;
+            self.user_turn_ranges = user_turns;
             self.conversation_cache_width = width;
             self.conversation_cache_generation = self.conversation_generation;
-            // A rebuilt line space — a new message graduating in, a
-            // verbosity switch, a resize — re-numbers every line under
-            // the selection's stored indexes, so the highlight would
-            // silently re-target other text; a re-flowed document
-            // forfeits the selection instead, the way a terminal's
-            // native one is lost on redraw.
             self.selection = None;
             self.drag_position = None;
         }
-        // The streaming region re-renders as its reply grows — a
-        // delta re-wraps the live lines, a freeze advances the frozen
-        // ones — re-numbering every line from the frozen prefix down.
-        // A selection reaching into that region is stored against the
-        // old numbering and forfeits, the same way a rebuilt
-        // conversation forfeits one; a selection entirely within the
-        // settled transcript keeps its indexes and survives.
+
         let conversation_len = self.conversation_cache.len();
         if self.refresh_streaming_region(width)
             && self
@@ -2064,6 +2126,7 @@ impl TuiApp {
         if let Some(selection) = &self.selection {
             reverse_selection(&mut visible, skip, selection);
         }
+        self.paint_user_turn_chrome(frame, pane, mark_gutter, skip, conversation_height);
         frame.render_widget(Paragraph::new(visible), text_area);
         if let Some(gutter) = scrollbar_area
             && let Some((thumb_pos, thumb_len)) =
@@ -2077,6 +2140,77 @@ impl TuiApp {
                 self.theme.ui.scrollbar_thumb,
                 self.theme.ui.scrollbar_track,
             );
+        }
+    }
+
+    /// Paint the settled user turns' chrome: each turn's raised box
+    /// and the chevron at its opening text row.
+    ///
+    /// The box keeps [`CONVERSATION_BOX_MARGIN`] of the pane's own
+    /// background outside itself on both sides and spans the turn's
+    /// padding rows and text; the chevron sits a column inside the
+    /// box's left edge. Both are painted from the cached turn ranges
+    /// against this frame's window, so turns off-screen paint
+    /// nothing.
+    fn paint_user_turn_chrome(
+        &self,
+        frame: &mut Frame,
+        pane: Rect,
+        mark_gutter: Option<Rect>,
+        skip: usize,
+        conversation_height: usize,
+    ) {
+        for &(start, end, _) in &self.user_turn_ranges {
+            let first_visible = start.max(skip);
+            let last_visible = end.min(skip.saturating_add(conversation_height));
+            if first_visible >= last_visible {
+                continue;
+            }
+            let Some(y) = first_visible
+                .checked_sub(skip)
+                .and_then(|offset| u16::try_from(offset).ok())
+            else {
+                continue;
+            };
+            let Some(h) = last_visible
+                .checked_sub(first_visible)
+                .and_then(|rows| u16::try_from(rows).ok())
+            else {
+                continue;
+            };
+            let block = Rect {
+                x: pane.x.saturating_add(CONVERSATION_BOX_MARGIN),
+                width: pane
+                    .width
+                    .saturating_sub(CONVERSATION_BOX_MARGIN.saturating_mul(2)),
+                y: pane.y.saturating_add(y),
+                height: h,
+            };
+            frame
+                .buffer_mut()
+                .set_style(block, Style::default().bg(self.theme.ui.surface));
+        }
+        let Some(gutter) = mark_gutter else {
+            return;
+        };
+        for &(_, _, mark) in &self.user_turn_ranges {
+            let Some(on_screen) = mark.checked_sub(skip) else {
+                continue;
+            };
+            let Ok(row) = u16::try_from(on_screen) else {
+                continue;
+            };
+            if row < gutter.height {
+                frame.buffer_mut()[(
+                    gutter
+                        .x
+                        .saturating_add(CONVERSATION_BOX_MARGIN)
+                        .saturating_add(1),
+                    gutter.y.saturating_add(row),
+                )]
+                    .set_symbol("❯")
+                    .set_fg(self.theme.ui.primary);
+            }
         }
     }
 
@@ -2199,24 +2333,34 @@ impl TuiApp {
     /// at the pane width, so a long failure body stays readable
     /// instead of clipping at the right edge; a completed tool
     /// block renders its verbosity-shaped summary line(s) between
-    /// the text blocks around it. The live region (streaming text,
-    /// in-flight tools) is assembled by the caller.
+    /// the text blocks around it. A blank line separates a user
+    /// message from the agent material beside it, and each user
+    /// turn opens and closes with a padding row the caller tints as
+    /// part of its box — pad and blank together are the boundary's
+    /// breathing room. The live region
+    /// (streaming text, in-flight tools) is assembled by the caller.
     fn conversation_lines(
         &self,
         area: Rect,
         summary_lines: &mut HashMap<usize, String>,
+        user_turns: &mut Vec<(usize, usize, usize)>,
     ) -> Vec<Line<'static>> {
         let width = area.width.max(1);
         let markdown_theme = markdown::MarkdownTheme::from(&self.theme);
         let syntax_theme = markdown::SyntaxTheme::from(&self.theme);
         let mut lines: Vec<Line<'static>> = Vec::new();
+        let mut previous_was_user: Option<bool> = None;
         for message in &self.conversation {
+            let is_user = matches!(message, TuiMessage::User { .. });
+            if previous_was_user.is_some_and(|was_user| was_user != is_user) {
+                lines.push(Line::default());
+            }
+            previous_was_user = Some(is_user);
             match message {
                 TuiMessage::User { text, .. } => {
-                    // Wrapped, not clipped: pasted text routinely
-                    // runs lines past the pane's width, and a row
-                    // cut at the edge reads as text that never
-                    // arrived.
+                    let tint_start = lines.len();
+                    lines.push(Line::default());
+                    let mark_row = lines.len();
                     for segment in text.split('\n') {
                         lines.extend(plain_wrapped_lines(
                             segment,
@@ -2224,6 +2368,8 @@ impl TuiApp {
                             self.theme.ui.user_message_fg,
                         ));
                     }
+                    lines.push(Line::default());
+                    user_turns.push((tint_start, lines.len(), mark_row));
                 }
                 TuiMessage::Assistant { blocks, .. } => {
                     for block in blocks {
@@ -2636,7 +2782,12 @@ impl TuiApp {
 
     /// Render the input field: a fixed multi-row window onto the
     /// buffer, as a borderless composer drawn on the theme's surface
-    /// color and padded on all sides.
+    /// color and padded on all sides. On painted chrome the pane's
+    /// left edge is a solid one-cell accent column in the theme's
+    /// primary color — the composer is the screen's always-focused
+    /// surface, so its marker takes the focus accent — sitting inside
+    /// the side padding, clear of the text; the paintless theme keeps
+    /// its terminal-drawn hairlines and paints nothing, edge included.
     ///
     /// The field's shape is a pure background fill with square
     /// corners — solid by construction, like the scrollbar. Corners
@@ -2661,13 +2812,18 @@ impl TuiApp {
 
         let surface = self.theme.ui.surface;
         let text_style = if self.theme.ui.composer_border.is_some() {
-            // A bordered composer paints nothing — the hairline rules
-            // live in `render`, on the rows above and below this pane.
             Style::default().fg(self.theme.ui.input_text)
         } else {
             frame
                 .buffer_mut()
                 .set_style(area, Style::default().bg(surface));
+            let edge = Rect {
+                width: area.width.min(1),
+                ..area
+            };
+            frame
+                .buffer_mut()
+                .set_style(edge, Style::default().bg(self.theme.ui.primary));
             Style::default().fg(self.theme.ui.input_text).bg(surface)
         };
         let text_height = INPUT_TEXT_ROWS.min(area.height.saturating_sub(INPUT_VERTICAL_PADDING));
@@ -2683,9 +2839,6 @@ impl TuiApp {
                 .saturating_sub(INPUT_SIDE_INSET.saturating_mul(2)),
             height: text_height,
         };
-        // The window shows the caret's line and the lines above it —
-        // typing at the end sees the newest lines, browsing up
-        // scrolls with the caret.
         let visible_rows = usize::from(text_height);
         let start = usize::from(caret_row).saturating_sub(visible_rows.saturating_sub(1));
         self.input_view = Some(InputView {
@@ -3120,32 +3273,196 @@ struct ViewState {
     selectable: usize,
 }
 
-/// Hand `text` to the clipboard.
+/// Hand `text` to every clipboard transport the environment offers.
 ///
-/// Two transports, both attempted: OSC 52 — the terminal-side
-/// clipboard escape, honored by most modern terminals — and macOS's
-/// `pbcopy`, which is authoritative where it exists. Failures are
-/// silent: a copy that cannot be delivered is a nuisance, not an
-/// error worth interrupting a session for.
-fn copy_to_clipboard(text: &str) {
+/// The terminal-side OSC 52 escape goes out first — it is the only
+/// transport that crosses an SSH hop to the user's local terminal —
+/// then the configured custom command, macOS's `pbcopy`, and the host
+/// clipboard tools the environment names (`tmux set-buffer -w` inside
+/// tmux, `wl-copy` under Wayland, `xclip`/`xsel` under X11). Every
+/// attempt is best-effort and silent: a copy that cannot be delivered
+/// is a nuisance, not an error worth interrupting a session for.
+/// Returns whether any transport reported delivery — for the escape,
+/// that means the bytes were written, not that the terminal accepted
+/// them.
+fn copy_via_transports(custom: Option<&str>, text: &str) -> bool {
+    let mut delivered = osc52_write(text);
+    if let Some(command_line) = custom {
+        let mut command = std::process::Command::new("sh");
+        command.arg("-c").arg(command_line);
+        delivered |= pipe_text_and_wait(command, text);
+    }
+    if cfg!(target_os = "macos") {
+        delivered |= pipe_text_and_wait(std::process::Command::new("pbcopy"), text);
+    }
+    for transport in host_transports(clipboard_env()) {
+        delivered |= pipe_text_and_wait(transport.command(), text);
+    }
+    delivered
+}
+
+/// Write the OSC 52 clipboard escape for `text`.
+///
+/// Both terminator spellings are written — BEL and ST — because a few
+/// terminals accept only one of them. The write is the only signal
+/// available from this side: acceptance by the receiving terminal is
+/// unknowable, so success here means the bytes left and nothing more.
+fn osc52_write(text: &str) -> bool {
     use std::io::Write as _;
 
     use base64::Engine as _;
 
     let encoded = base64::engine::general_purpose::STANDARD.encode(text);
     let mut stdout = std::io::stdout();
-    drop(write!(stdout, "\x1b]52;c;{encoded}\x07"));
-    drop(stdout.flush());
-    if cfg!(target_os = "macos")
-        && let Ok(mut child) = std::process::Command::new("pbcopy")
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-    {
-        if let Some(stdin) = child.stdin.as_mut() {
-            drop(stdin.write_all(text.as_bytes()));
+    stdout
+        .write_all(format!("\x1b]52;c;{encoded}\x07").as_bytes())
+        .is_ok()
+        && stdout
+            .write_all(format!("\x1b]52;c;{encoded}\x1b\\").as_bytes())
+            .is_ok()
+        && stdout.flush().is_ok()
+}
+
+/// Which host clipboard transports the environment makes possible.
+///
+/// Snapshotted from the process environment once per copy; a helper
+/// that is installed but has no server to talk to (a Wayland tool
+/// with no Wayland session) is ruled out by its missing variable, so
+/// it never runs just to fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClipboardEnv {
+    /// Whether `$TMUX` is set: inside tmux, `set-buffer -w` reaches
+    /// tmux's own paste buffer and asks the outer terminal for its
+    /// clipboard.
+    in_tmux: bool,
+
+    /// Whether `$WAYLAND_DISPLAY` is set: a Wayland session can take
+    /// the copy through `wl-copy`.
+    wayland: bool,
+
+    /// Whether `$DISPLAY` is set: an X session can take the copy
+    /// through `xclip` or `xsel`.
+    x11: bool,
+}
+
+/// A host-side clipboard transport, in attempt order.
+///
+/// One spawned helper that takes the text on stdin; the variants name
+/// both the program and the order the chain tries them in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostTransport {
+    /// tmux's buffer, pushed onward to the system clipboard.
+    ///
+    /// `set-buffer -w` fills tmux's paste buffer and forwards to the
+    /// attached terminal's clipboard, covering both paste paths.
+    Tmux,
+
+    /// The Wayland clipboard helper.
+    ///
+    /// `wl-copy` owns the Wayland clipboard selection directly.
+    WlCopy,
+
+    /// The X11 clipboard helper, clipboard selection.
+    ///
+    /// `xclip -selection clipboard` targets the selection a paste
+    /// reads by default.
+    Xclip,
+
+    /// The X11 clipboard helper, alternate spelling.
+    ///
+    /// `xsel --clipboard --input` covers hosts that ship xsel rather
+    /// than xclip.
+    Xsel,
+}
+
+impl HostTransport {
+    /// The spawned command that carries this transport.
+    ///
+    /// Built with its fixed arguments; the caller pipes the text into
+    /// its stdin and waits out the exit.
+    fn command(self) -> std::process::Command {
+        match self {
+            Self::Tmux => {
+                let mut command = std::process::Command::new("tmux");
+                command.args(["set-buffer", "-w", "-"]);
+                command
+            }
+            Self::WlCopy => std::process::Command::new("wl-copy"),
+            Self::Xclip => {
+                let mut command = std::process::Command::new("xclip");
+                command.args(["-selection", "clipboard"]);
+                command
+            }
+            Self::Xsel => {
+                let mut command = std::process::Command::new("xsel");
+                command.args(["--clipboard", "--input"]);
+                command
+            }
         }
-        drop(child.wait());
     }
+}
+
+/// Read the process environment into a [`ClipboardEnv`].
+///
+/// A variable that is unset or empty disables its transport: the
+/// helper would otherwise run against a display or server that does
+/// not exist.
+fn clipboard_env() -> ClipboardEnv {
+    ClipboardEnv {
+        in_tmux: non_empty("TMUX"),
+        wayland: non_empty("WAYLAND_DISPLAY"),
+        x11: non_empty("DISPLAY"),
+    }
+}
+
+/// Whether `name` is set to a non-empty value.
+///
+/// Empty-valued variables count as unset: an empty `$DISPLAY`, for
+/// instance, names no X server to reach.
+fn non_empty(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|value| !value.is_empty())
+}
+
+/// The host transports worth attempting for `env`, in order.
+///
+/// Selection is pure over the snapshot so the pins can drive it
+/// without touching the process environment; the order only matters
+/// for spawn cost, since every attempt carries the same text.
+fn host_transports(env: ClipboardEnv) -> Vec<HostTransport> {
+    let mut transports = Vec::new();
+    if env.in_tmux {
+        transports.push(HostTransport::Tmux);
+    }
+    if env.wayland {
+        transports.push(HostTransport::WlCopy);
+    }
+    if env.x11 {
+        transports.push(HostTransport::Xclip);
+        transports.push(HostTransport::Xsel);
+    }
+    transports
+}
+
+/// Pipe `text` into `command`'s stdin and wait out its exit.
+///
+/// Returns whether the command launched and exited successfully; a
+/// spawn failure (the tool is absent) or a nonzero exit reads as no
+/// delivery, silently — the chain's other attempts still run.
+fn pipe_text_and_wait(mut command: std::process::Command, text: &str) -> bool {
+    use std::io::Write as _;
+
+    command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let Ok(mut child) = command.spawn() else {
+        return false;
+    };
+    if let Some(stdin) = child.stdin.as_mut() {
+        drop(stdin.write_all(text.as_bytes()));
+    }
+    drop(child.stdin.take());
+    child.wait().is_ok_and(|status| status.success())
 }
 
 /// The empty stand-in for the tool segment a selection never covers.
@@ -3452,6 +3769,51 @@ fn split_scrollbar_gutter(area: Rect) -> (Rect, Option<Rect>) {
 /// Columns of tinted breathing room at each end of the input field's
 /// text, inside the fill's edge.
 const INPUT_SIDE_INSET: u16 = 2;
+
+/// Blank columns a user turn's box keeps outside itself, between its
+/// edges and the pane's.
+///
+/// The prompt box is a raised surface floating on the terminal's own
+/// background, not a band pinned to the pane's edges: this much
+/// regular background shows on the box's left and right alike, with
+/// the scrollbar's gutter beyond. The chevron sits a column inside
+/// the box's left edge, this margin in from the pane's.
+const CONVERSATION_BOX_MARGIN: u16 = 1;
+
+/// Columns the conversation reserves at its left edge before its
+/// text starts.
+///
+/// The marker is chrome drawn into the gutter, never span content, so
+/// selections and copies walk only the text. The width covers the
+/// box's left margin, a pad column, the chevron, and the gap before
+/// the text.
+const CONVERSATION_MARK_GUTTER: u16 = 5;
+
+/// The narrowest conversation text that still carries the marker
+/// gutter beside it.
+///
+/// Below this the pane keeps its full width and draws no chevrons — a
+/// marker that starves the text is worse than no marker.
+const CONVERSATION_MARK_MIN_TEXT: u16 = 8;
+
+/// Blank rows the conversation keeps between the pane's top edge and
+/// its first line of text.
+///
+/// The transcript opens this far below the pane's edge — the same
+/// breathing-room convention the composer and the status bar use — so
+/// the topmost line never touches whatever sits above the pane. The
+/// scrollbar track starts below the inset too: the track measures the
+/// padded content window, not the raw pane.
+const CONVERSATION_TOP_INSET: u16 = 1;
+
+/// Blank columns a user turn's box keeps between its wrapped text and
+/// its right edge, inside the box.
+///
+/// Wrapped user lines stop this far short of the box's edge, the
+/// padding the prompt surface carries around its text; agent lines
+/// share the stop so every message column aligns, leaving the box's
+/// margin and the scrollbar's gutter blank beyond.
+const CONVERSATION_RIGHT_INSET: u16 = 3;
 
 /// Rows of text the input field shows at its largest.
 ///
@@ -3879,6 +4241,61 @@ mod tests {
         assert!(
             !app.any_tools_running(),
             "a poisoned lock reads as no tools in flight"
+        );
+    }
+
+    #[test]
+    fn host_transports_follow_the_environment_snapshot() {
+        let none = host_transports(ClipboardEnv {
+            in_tmux: false,
+            wayland: false,
+            x11: false,
+        });
+        assert!(none.is_empty(), "a headless host offers no transports");
+
+        let tmux_only = host_transports(ClipboardEnv {
+            in_tmux: true,
+            wayland: false,
+            x11: false,
+        });
+        assert_eq!(tmux_only, [HostTransport::Tmux], "tmux is named first");
+
+        let wayland_only = host_transports(ClipboardEnv {
+            in_tmux: false,
+            wayland: true,
+            x11: false,
+        });
+        assert_eq!(
+            wayland_only,
+            [HostTransport::WlCopy],
+            "a wayland session names wl-copy"
+        );
+
+        let x11_only = host_transports(ClipboardEnv {
+            in_tmux: false,
+            wayland: false,
+            x11: true,
+        });
+        assert_eq!(
+            x11_only,
+            [HostTransport::Xclip, HostTransport::Xsel],
+            "an x session tries both spellings in order"
+        );
+
+        let everything = host_transports(ClipboardEnv {
+            in_tmux: true,
+            wayland: true,
+            x11: true,
+        });
+        assert_eq!(
+            everything,
+            [
+                HostTransport::Tmux,
+                HostTransport::WlCopy,
+                HostTransport::Xclip,
+                HostTransport::Xsel
+            ],
+            "the full environment keeps the attempt order"
         );
     }
 }
