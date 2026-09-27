@@ -1,6 +1,7 @@
-//! `TuiObserver` tests — pure state mutation driven with hand-built
-//! contexts; no real loop, no terminal, no network. The completion
-//! path goes through the plain-args helper (the post context is not
+//! `TuiObserver` tests — pure state mutation driven with reshaped
+//! contexts; no terminal, no network. The engine-built context types
+//! arrive from one shared throwaway run each test binary harvests;
+//! the rest are still hand-built (the post context is not
 //! constructible outside its crate).
 
 #![allow(
@@ -11,6 +12,8 @@
     clippy::missing_panics_doc,
     clippy::missing_errors_doc
 )]
+
+mod common;
 
 use std::time::Duration;
 
@@ -44,11 +47,11 @@ fn received(call_id: &str, tool: &str, input: serde_json::Value) -> ToolCallRece
 }
 
 fn pre(call_id: &str, tool: &str) -> ToolPreContext {
-    ToolPreContext {
-        turn: 0,
-        tool: tool.to_string(),
-        tool_call_id: call_id.to_string(),
-    }
+    let mut ctx = common::tool_pre();
+    ctx.turn = 0;
+    ctx.tool = tool.to_string();
+    ctx.tool_call_id = call_id.to_string();
+    ctx
 }
 
 fn stream(turn: usize, input_tokens: u64, output_tokens: u64) -> StreamContext {
@@ -61,25 +64,18 @@ fn stream(turn: usize, input_tokens: u64, output_tokens: u64) -> StreamContext {
 }
 
 fn turn_end(turn: usize, input_tokens: u64, output_tokens: u64) -> TurnEndContext {
-    TurnEndContext {
-        turn,
-        success: true,
-        error: None,
-        duration_ms: 10,
-        input_tokens,
-        output_tokens,
-    }
+    let mut ctx = common::turn_end();
+    ctx.turn = turn;
+    ctx.input_tokens = input_tokens;
+    ctx.output_tokens = output_tokens;
+    ctx
 }
 
 fn failed_turn_end(turn: usize, input_tokens: u64, output_tokens: u64) -> TurnEndContext {
-    TurnEndContext {
-        turn,
-        success: false,
-        error: Some("the stream died mid-reply".to_string()),
-        duration_ms: 10,
-        input_tokens,
-        output_tokens,
-    }
+    let mut ctx = turn_end(turn, input_tokens, output_tokens);
+    ctx.success = false;
+    ctx.error = Some("the stream died mid-reply".to_string());
+    ctx
 }
 
 fn tokens_of(state: &TuiObserverState) -> TokenCounts {

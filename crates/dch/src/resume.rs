@@ -428,14 +428,12 @@ fn push_user_message(converted: &mut Vec<Message>, parts: Vec<MessagePart>) {
         Some(Message {
             role: Role::User,
             parts: existing,
+            ..
         }) => {
             existing.push(MessagePart::text("\n\n"));
             existing.extend(parts);
         }
-        _ => converted.push(Message {
-            role: Role::User,
-            parts,
-        }),
+        _ => converted.push(Message::new(Role::User, parts)),
     }
 }
 
@@ -467,16 +465,14 @@ fn push_assistant_message(converted: &mut Vec<Message>, parts: Vec<MessagePart>)
         Some(Message {
             role: Role::Assistant,
             parts: existing,
+            ..
         }) => {
             if holds_text(existing) && holds_text(&parts) {
                 existing.push(MessagePart::text("\n\n"));
             }
             existing.extend(parts);
         }
-        _ => converted.push(Message {
-            role: Role::Assistant,
-            parts,
-        }),
+        _ => converted.push(Message::new(Role::Assistant, parts)),
     }
 }
 
@@ -508,7 +504,7 @@ pub(crate) fn resumed_read_paths(messages: &[TuiMessage]) -> Vec<String> {
                     input_preview,
                     ..
                 } = block
-                    && name == "Read"
+                    && (name == "read" || name == "Read")
                     && !input_preview.trim().is_empty()
                 {
                     paths.push(input_preview.trim().to_string());
@@ -1097,6 +1093,7 @@ mod tests {
         let transcript = vec![
             user("look"),
             assistant(vec![
+                tool_block("read", true),
                 tool_block("Read", true),
                 tool_block("Bash", true),
                 text_block("done"),
@@ -1105,8 +1102,8 @@ mod tests {
         ];
         assert_eq!(
             resumed_read_paths(&transcript),
-            vec!["a.rs".to_string()],
-            "only Read previews are paths — other tools' previews are summaries"
+            vec!["a.rs".to_string(), "a.rs".to_string()],
+            "both the current and the legacy read spelling re-arm; other tools' previews are summaries"
         );
     }
 

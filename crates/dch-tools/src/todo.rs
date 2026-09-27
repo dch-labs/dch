@@ -587,10 +587,10 @@ impl Tool for TodoTool {
     }
 
     fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            tool: self.name().to_string(),
-            description: self.description().to_string(),
-            input_schema: json!({
+        ToolSchema::new(
+            self.name(),
+            self.description(),
+            json!({
                 "type": "object",
                 "properties": {
                     "todos": {
@@ -619,7 +619,7 @@ impl Tool for TodoTool {
                 },
                 "required": ["todos"]
             }),
-        }
+        )
     }
 
     fn call(
@@ -741,7 +741,11 @@ mod tests {
     #[test]
     fn todo_write_is_registered_under_its_name() {
         assert!(
-            builtin_registry().get("TodoWrite").is_some(),
+            builtin_registry(&loopctl::tool::builtin::fs::FileSession::new(
+                std::path::PathBuf::from(".")
+            ))
+            .get("TodoWrite")
+            .is_some(),
             "TodoWrite must ship in the builtin registry"
         );
     }

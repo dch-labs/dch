@@ -1,8 +1,8 @@
-//! Syntax-checking gate shared by Write, Edit, and `MultiEdit`.
+//! Syntax-checking gate shared by the writing tools.
 //!
 //! The entry point is [`lint_content`], which infers the language from the file
 //! extension and runs a synchronous in-process validator. Unsupported extensions
-//! always pass.
+//! always pass. `LintGate` adapts it onto the writing tools' validator seam.
 
 use std::path::Path;
 
@@ -103,6 +103,35 @@ impl LinterError {
             line: Some(line),
             message: message.into(),
         }
+    }
+}
+
+/// The syntax gate dch installs on the writing tools.
+///
+/// One adapter over [`lint_content`] on the writing tools' validator
+/// seam: each [`LinterError`] becomes a diagnostic carrying the same
+/// line and message verbatim, so the model reads the same refusal
+/// text the gate has always produced.
+pub(crate) struct LintGate;
+
+impl loopctl::tool::builtin::fs::ContentValidator for LintGate {
+    fn validate<'a>(
+        &'a self,
+        path: &'a Path,
+        content: &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = Vec<loopctl::tool::builtin::fs::ValidationDiagnostic>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            lint_content(path, content)
+                .errors
+                .into_iter()
+                .map(|error| loopctl::tool::builtin::fs::ValidationDiagnostic {
+                    line: error.line,
+                    message: error.message,
+                })
+                .collect()
+        })
     }
 }
 
@@ -651,6 +680,7 @@ fn skip_js_string(quote: char, chars: &mut std::iter::Peekable<std::str::Chars<'
 
 #[cfg(test)]
 #[allow(
+    clippy::unwrap_used,
     clippy::missing_panics_doc,
     clippy::missing_errors_doc,
     clippy::format_collect,
@@ -659,6 +689,7 @@ fn skip_js_string(quote: char, chars: &mut std::iter::Peekable<std::str::Chars<'
 )]
 mod tests {
     use super::*;
+    use loopctl::tool::Tool as _;
     use std::path::Path;
 
     #[test]
@@ -844,5 +875,57 @@ mod tests {
         let _ = lint_content(Path::new("a.rs"), &big);
         let braces = "{".repeat(100_000);
         let _ = lint_content(Path::new("a.json"), &braces);
+    }
+
+    #[tokio::test]
+    async fn the_gate_refuses_bad_syntax_through_the_write_tool() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let session = loopctl::tool::builtin::fs::FileSession::new(tmp.path().to_path_buf());
+        let mut ctx = loopctl::tool::ToolContext::default();
+        session.attach(&mut ctx);
+        let tool = loopctl::tool::builtin::fs::WriteTool::new()
+            .with_validator(std::sync::Arc::new(LintGate));
+        let output = tool
+            .call(
+                serde_json::json!({"file_path": "broken.rs", "content": "fn {"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            output.text_content().contains("broken.rs"),
+            "the refusal names the file: {}",
+            output.text_content()
+        );
+        assert!(
+            !tmp.path().join("broken.rs").exists(),
+            "a refused write moves no bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn skip_linter_bypasses_the_gate() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let session = loopctl::tool::builtin::fs::FileSession::new(tmp.path().to_path_buf());
+        let mut ctx = loopctl::tool::ToolContext::default();
+        session.attach(&mut ctx);
+        let tool = loopctl::tool::builtin::fs::WriteTool::new()
+            .with_validator(std::sync::Arc::new(LintGate));
+        let output = tool
+            .call(
+                serde_json::json!({
+                    "file_path": "broken.rs",
+                    "content": "fn {",
+                    "skip_linter": true
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!output.is_error, "the bypass writes");
+        assert!(
+            tmp.path().join("broken.rs").exists(),
+            "the bypassed gate still writes the file"
+        );
     }
 }

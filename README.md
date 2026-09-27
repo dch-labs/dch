@@ -114,7 +114,7 @@ A missing session id warns and starts fresh; a corrupt file warns
 loudly, starts fresh, and is never modified; a session file that
 cannot be read at all exits non-zero. Files the restored transcript
 shows being read are guarded for writes, but the first `Write` to one
-requires a fresh `Read` — the transcript cannot carry what the model
+requires a fresh `read` — the transcript cannot carry what the model
 originally saw, so a stale overwrite of externally-changed files is
 refused until the current bytes are read.
 

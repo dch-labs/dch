@@ -97,7 +97,9 @@ mod cases {
         assert_eq!(AskTool.name(), "AskUserQuestion");
         assert!(!AskTool.is_concurrency_safe());
         assert!(!AskTool.is_read_only());
-        let reg = dch_tools::builtin_registry();
+        let reg = dch_tools::builtin_registry(&loopctl::tool::builtin::fs::FileSession::new(
+            std::path::PathBuf::from("."),
+        ));
         assert!(reg.get("AskUserQuestion").is_some(), "registered");
     }
 

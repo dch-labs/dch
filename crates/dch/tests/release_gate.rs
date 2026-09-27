@@ -58,7 +58,7 @@ fn at1_boot_hello_answers() {
 #[test]
 fn at2_read_tool_serves_the_file() {
     let sb = Sandbox::sse(vec![
-        sse_tool_call_turn("Read", &json!({"file_path": "note.txt"})),
+        sse_tool_call_turn("read", &json!({"path": "note.txt"})),
         sse_text_turn("I read it."),
     ]);
     std::fs::write(sb.workdir().join("note.txt"), "garden wall\n").expect("note written");

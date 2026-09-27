@@ -183,10 +183,10 @@ impl Tool for BashTool {
     }
 
     fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            tool: self.name().to_string(),
-            description: self.description().to_string(),
-            input_schema: json!({
+        ToolSchema::new(
+            self.name(),
+            self.description(),
+            json!({
                 "type": "object",
                 "properties": {
                     "command": {
@@ -208,7 +208,7 @@ impl Tool for BashTool {
                 },
                 "required": ["command"]
             }),
-        }
+        )
     }
 
     fn call(
@@ -886,7 +886,9 @@ mod tests {
 
     #[test]
     fn bashtool_registered_in_builtin_registry() {
-        let reg = crate::registry::builtin_registry();
+        let reg = crate::registry::builtin_registry(&loopctl::tool::builtin::fs::FileSession::new(
+            std::path::PathBuf::from("."),
+        ));
         let tool = reg.get("Bash").expect("BashTool registered");
         assert!(!tool.is_read_only());
         // Dynamic concurrency: read-only input is safe, write is not.

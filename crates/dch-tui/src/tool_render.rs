@@ -79,7 +79,7 @@ pub fn display_input(name: &str, input: &serde_json::Value) -> String {
 
 /// Build a one-line, human-readable summary of a tool invocation.
 ///
-/// The verb comes from the registered tool name (Read→Reading,
+/// The verb comes from the registered tool name (read→Reading,
 /// Bash→Running, …) and the subject from the call's input — the
 /// primary value the observer extracted at dispatch or a JSON
 /// object. Unknown tools fall back to
@@ -89,7 +89,7 @@ pub fn display_input(name: &str, input: &serde_json::Value) -> String {
 pub fn humanize_tool_summary(name: &str, input: &str) -> String {
     let value = extract_primary_value(name, input);
     match name {
-        "Read" => format!("Reading {value}…"),
+        "read" | "Read" => format!("Reading {value}…"),
         "Write" => format!("Writing {value}…"),
         "Edit" | "MultiEdit" => {
             if value.ends_with('…') {
@@ -131,7 +131,9 @@ pub fn humanize_tool_summary(name: &str, input: &str) -> String {
 /// `"key: "` prefix. Empty when nothing string-valued exists.
 fn extract_primary_value(name: &str, input: &str) -> String {
     let preferred: &[&str] = match name {
-        "Read" | "Write" | "Edit" | "MultiEdit" | "FileViewer" | "Tree" => &["file_path", "path"],
+        "read" | "Read" | "Write" | "Edit" | "MultiEdit" | "FileViewer" | "Tree" => {
+            &["file_path", "path"]
+        }
         "Bash" => &["command"],
         "Glob" | "Grep" | "CodeSearch" => &["pattern", "query"],
         _ => &[],

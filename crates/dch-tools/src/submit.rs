@@ -98,10 +98,10 @@ impl Tool for SubmitTool {
     }
 
     fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            tool: self.name().to_string(),
-            description: self.description().to_string(),
-            input_schema: json!({
+        ToolSchema::new(
+            self.name(),
+            self.description(),
+            json!({
                 "type": "object",
                 "properties": {
                     "base": {
@@ -136,7 +136,7 @@ impl Tool for SubmitTool {
                 },
                 "required": []
             }),
-        }
+        )
     }
 
     fn call(
@@ -1589,7 +1589,9 @@ error: test failed, to rerun pass `--test it`
 
     #[test]
     fn submit_registers_in_the_builtin_registry() {
-        let registry = crate::registry::builtin_registry();
+        let registry = crate::registry::builtin_registry(
+            &loopctl::tool::builtin::fs::FileSession::new(std::path::PathBuf::from(".")),
+        );
         assert!(registry.get("Submit").is_some(), "registered");
         assert!(!SubmitTool.is_read_only());
         assert!(!SubmitTool.is_concurrency_safe());

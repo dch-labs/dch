@@ -333,10 +333,10 @@ impl Tool for JobsTool {
     }
 
     fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            tool: self.name().to_string(),
-            description: self.description().to_string(),
-            input_schema: json!({
+        ToolSchema::new(
+            self.name(),
+            self.description(),
+            json!({
                 "type": "object",
                 "properties": {
                     "operation": {
@@ -351,7 +351,7 @@ impl Tool for JobsTool {
                 },
                 "required": ["operation"]
             }),
-        }
+        )
     }
 
     fn call(
@@ -600,7 +600,9 @@ mod tests {
 
     #[test]
     fn jobstool_registered_in_builtin_registry() {
-        let reg = crate::registry::builtin_registry();
+        let reg = crate::registry::builtin_registry(&loopctl::tool::builtin::fs::FileSession::new(
+            std::path::PathBuf::from("."),
+        ));
         let tool = reg.get("Jobs").expect("JobsTool registered");
         assert!(!tool.is_read_only());
         assert!(

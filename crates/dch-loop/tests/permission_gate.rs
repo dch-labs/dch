@@ -54,11 +54,11 @@ impl Tool for Probe {
     }
 
     fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            tool: self.name.to_string(),
-            description: "test probe".to_string(),
-            input_schema: serde_json::json!({"type": "object"}),
-        }
+        ToolSchema::new(
+            self.name,
+            "test probe",
+            serde_json::json!({"type": "object"}),
+        )
     }
 
     fn call<'a>(
@@ -183,7 +183,7 @@ async fn auto_mode_passes_every_category_through() {
 
 #[tokio::test]
 async fn plan_allows_the_read_family() {
-    for name in ["Read", "Glob", "LSP"] {
+    for name in ["read", "Glob", "LSP"] {
         let pipeline = gated_pipeline(Plan, None, Probe { name });
         let result = pipeline.invoke(dispatch_for(name, fresh_cancel())).await;
         assert!(!result.is_error, "Plan must allow the read-only {name}");

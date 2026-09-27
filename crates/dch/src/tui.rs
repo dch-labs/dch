@@ -112,7 +112,7 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
     // resumed Write treats every previously-read file as never-read.
     if let ResumeControl::Resumed(outcome) = &control {
         for path in crate::resume::resumed_read_paths(&outcome.messages) {
-            let _recorded = runner.context().record_resumed_read(&path).await;
+            let _recorded = runner.record_resumed_read(&path).await;
         }
     }
 

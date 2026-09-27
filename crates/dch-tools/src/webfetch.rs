@@ -99,10 +99,10 @@ impl Tool for WebFetchTool {
     }
 
     fn schema(&self) -> ToolSchema {
-        ToolSchema {
-            tool: self.name().to_string(),
-            description: self.description().to_string(),
-            input_schema: json!({
+        ToolSchema::new(
+            self.name(),
+            self.description(),
+            json!({
                 "type": "object",
                 "properties": {
                     "url": {
@@ -125,7 +125,7 @@ impl Tool for WebFetchTool {
                 },
                 "required": ["url"]
             }),
-        }
+        )
     }
 
     fn call(
@@ -805,7 +805,9 @@ mod tests {
 
     #[test]
     fn test_webfetchtool_registered_in_builtin_registry() {
-        let reg = crate::registry::builtin_registry();
+        let reg = crate::registry::builtin_registry(&loopctl::tool::builtin::fs::FileSession::new(
+            std::path::PathBuf::from("."),
+        ));
         let tool = reg.get("WebFetch").expect("WebFetch registered");
         assert!(tool.is_read_only());
         assert!(!tool.is_concurrency_safe());
