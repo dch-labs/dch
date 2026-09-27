@@ -279,12 +279,19 @@ pub struct TuiApp {
 
     /// Where a completed selection's text goes.
     ///
-    /// Returns whether any transport reported delivery. The terminal
-    /// escape is fire-and-forget, so a `true` can mean only that the
-    /// bytes left, never that the receiving terminal accepted them;
-    /// tests install a recorder to observe the copy without touching
-    /// any clipboard.
+    /// Returns the synchronously known result — for the production
+    /// chain the escape write's outcome, for a test recorder its own
+    /// delivery report — while the process transports' verdict lands
+    /// later through the copy-outcomes drain.
     copier: Box<dyn Fn(&str) -> bool>,
+
+    /// Verdicts from off-loaded copy transports, awaiting their notice.
+    ///
+    /// The default copier pushes here from its background task and
+    /// pings the render wake; the frame drain turns each verdict into
+    /// the definitive notice wording. Test-installed recorders report
+    /// synchronously and never touch it.
+    copy_outcomes: CopyOutcomes,
 
     /// Rendered lines of the streaming buffer's frozen prefix.
     ///
@@ -537,6 +544,9 @@ impl TuiApp {
             Theme::default()
         };
         let copy_command = config.display.copy_command.clone();
+        let copy_outcomes: CopyOutcomes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let copier_outcomes = Arc::clone(&copy_outcomes);
+        let copy_wake = Arc::clone(&state.render_notify);
         Self {
             theme,
             conversation: Vec::new(),
@@ -557,7 +567,10 @@ impl TuiApp {
             selection: None,
             last_view: None,
             drag_position: None,
-            copier: Box::new(move |text| copy_via_transports(copy_command.as_deref(), text)),
+            copier: Box::new(move |text| {
+                copy_via_transports(copy_command.as_deref(), text, &copier_outcomes, &copy_wake)
+            }),
+            copy_outcomes,
             frozen_lines: Vec::new(),
             frozen_upto: 0,
             frozen_separators: 0,
@@ -1030,9 +1043,12 @@ impl TuiApp {
     /// The funnel every copy path — the mouse release, the copy chord,
     /// and the keyboard walk's re-copy — delivers through, so each one
     /// posts the same confirmation on the notice row above the
-    /// composer. A copier that reports nothing delivered flips the
-    /// wording to name the escape hatch, since a copy that reached no
-    /// transport is worth a word, not silence.
+    /// composer. The post is the optimistic phase from the copier's
+    /// synchronous result; when the production chain has process
+    /// transports in flight, the frame drain replaces it with the
+    /// definitive verdict wording once they land. A copier reporting
+    /// nothing delivered names the escape hatch, since a copy that
+    /// reached no transport is worth a word, not silence.
     fn copy_selection_and_notice(&mut self, text: &str) {
         let delivered = (self.copier)(text);
         let wording = if delivered {
@@ -2320,6 +2336,9 @@ impl TuiApp {
                 timestamp: now,
             });
         }
+        for verdict in take_locked(&self.copy_outcomes) {
+            self.post_notice(copy_verdict_notice(verdict).to_string());
+        }
         if turn_ended && let Some(hook) = &self.turn_end_hook {
             hook(&self.conversation);
         }
@@ -2893,8 +2912,9 @@ impl TuiApp {
 
     /// Render the one-line status bar.
     ///
-    /// Names the configured model and the cumulative token totals on
-    /// the left; while the input holds state — submissions queued
+    /// Names the configured model, the cumulative token totals, and
+    /// the session's permission mode on the left; while the input
+    /// holds state — submissions queued
     /// behind the driver, or a buffer longer than the composer's
     /// window — a position tag sits right-aligned in the theme's
     /// input accent color. Both sit on the themed bar colors, and
@@ -2916,6 +2936,8 @@ impl TuiApp {
             },
         );
         let mut status_text = format!(" {}  │  CTX: {tokens}", self.config.api.model);
+        status_text.push_str("  │  mode: ");
+        status_text.push_str(self.config.runner.permission_mode.as_str());
         if let Some(id) = &self.session_id {
             status_text.push_str("  │  ");
             status_text.push_str(id);
@@ -3273,32 +3295,122 @@ struct ViewState {
     selectable: usize,
 }
 
+/// How long all of one copy's process transports may run in total.
+///
+/// One clock covers the configured command, the platform helper, and
+/// the environment-named transports alike, so a hanging helper costs
+/// at most this much before the chain kills it and reports.
+const COPY_DEADLINE: Duration = Duration::from_millis(1500);
+
+/// The poll step the bounded transport wait sleeps between checks.
+///
+/// Fine enough that a fast helper's exit is noticed within one step
+/// of finishing, coarse enough that the poll thread never competes
+/// with the render loop for the core.
+const COPY_POLL_STEP: Duration = Duration::from_millis(25);
+
+/// How long a finished transport's writer gets to land its write.
+///
+/// A well-behaved helper's write completes milliseconds after its
+/// exit; the grace covers only that drain, so a writer parked on a
+/// pipe some escaped descendant holds is abandoned instead of gating
+/// the verdict — the thread leaves whenever the pipe finally closes.
+const WRITER_GRACE: Duration = Duration::from_millis(250);
+
+/// The definitive result of one off-loaded copy attempt.
+///
+/// The escape write carries no acceptance signal, so only a process
+/// transport that exited successfully counts as confirmation; the
+/// frame drain maps these two facts onto the notice row's wording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CopyVerdict {
+    /// Whether the OSC 52 escape's bytes left stdout.
+    ///
+    /// True means the handoff happened, never that the receiving
+    /// terminal accepted it — the honest ceiling of an escape.
+    escape_written: bool,
+
+    /// Whether any process transport exited successfully.
+    ///
+    /// A transport that launched, consumed the text, and exited zero
+    /// is the only delivery the chain can actually confirm.
+    verified: bool,
+}
+
+/// The shared slot off-loaded copies report their verdicts into.
+///
+/// One slot per app: the default copier pushes from its background
+/// task, the frame drain takes everything pending, so ordering
+/// between copies is arrival order and nothing accumulates.
+type CopyOutcomes = Arc<std::sync::Mutex<Vec<CopyVerdict>>>;
+
+/// The notice wording a copy's verdict settles on.
+///
+/// A verified transport earned the plain claim; an escape that only
+/// left the process says so; nothing at all names the escape hatch.
+#[must_use]
+fn copy_verdict_notice(verdict: CopyVerdict) -> &'static str {
+    if verdict.verified {
+        "selection copied"
+    } else if verdict.escape_written {
+        "selection copied (unconfirmed)"
+    } else {
+        "copy failed — set display.copy_command"
+    }
+}
+
 /// Hand `text` to every clipboard transport the environment offers.
 ///
-/// The terminal-side OSC 52 escape goes out first — it is the only
-/// transport that crosses an SSH hop to the user's local terminal —
-/// then the configured custom command, macOS's `pbcopy`, and the host
-/// clipboard tools the environment names (`tmux set-buffer -w` inside
-/// tmux, `wl-copy` under Wayland, `xclip`/`xsel` under X11). Every
-/// attempt is best-effort and silent: a copy that cannot be delivered
-/// is a nuisance, not an error worth interrupting a session for.
-/// Returns whether any transport reported delivery — for the escape,
-/// that means the bytes were written, not that the terminal accepted
-/// them.
-fn copy_via_transports(custom: Option<&str>, text: &str) -> bool {
-    let mut delivered = osc52_write(text);
-    if let Some(command_line) = custom {
-        let mut command = std::process::Command::new("sh");
-        command.arg("-c").arg(command_line);
-        delivered |= pipe_text_and_wait(command, text);
+/// The terminal-side OSC 52 escape runs inline — one buffered write —
+/// and every process transport moves to a background task bounded by
+/// one shared kill deadline, so a hanging helper or a child that
+/// never reads its stdin cannot freeze input and rendering. The
+/// transports' verdict lands as a follow-up notice through the render
+/// wake this pings; until then the returned escape result is all the
+/// caller can honestly claim. Failures stay silent per attempt: a
+/// copy that cannot be delivered is a nuisance, not an error worth
+/// interrupting a session for.
+fn copy_via_transports(
+    custom: Option<&str>,
+    text: &str,
+    outcomes: &CopyOutcomes,
+    wake: &Arc<event_listener::Event>,
+) -> bool {
+    let escape_written = osc52_write(text);
+    let command_line = configured_copy_command(custom).map(str::to_string);
+    let transports_scheduled = command_line.is_some()
+        || cfg!(target_os = "macos")
+        || !host_transports(clipboard_env()).is_empty();
+    if !transports_scheduled {
+        return escape_written;
     }
-    if cfg!(target_os = "macos") {
-        delivered |= pipe_text_and_wait(std::process::Command::new("pbcopy"), text);
+    let outcomes = Arc::clone(outcomes);
+    let wake = Arc::clone(wake);
+    let text = text.to_string();
+    let job = move || {
+        let verified = run_process_transports(command_line.as_deref(), &text, COPY_DEADLINE);
+        let mut slot = outcomes.lock().unwrap_or_else(PoisonError::into_inner);
+        slot.push(CopyVerdict {
+            escape_written,
+            verified,
+        });
+        wake.notify(1);
+    };
+    if tokio::runtime::Handle::try_current().is_ok() {
+        drop(tokio::task::spawn_blocking(job));
+    } else {
+        drop(std::thread::spawn(job));
     }
-    for transport in host_transports(clipboard_env()) {
-        delivered |= pipe_text_and_wait(transport.command(), text);
-    }
-    delivered
+    escape_written
+}
+
+/// The configured copy command, blank values dropped.
+///
+/// A blank or whitespace-only `display.copy_command` is the one-input
+/// case of the chain's unset discipline: `sh -c ""` would exit
+/// successfully and count as a delivery that delivered nothing.
+fn configured_copy_command(custom: Option<&str>) -> Option<&str> {
+    custom.filter(|command| !command.trim().is_empty())
 }
 
 /// Write the OSC 52 clipboard escape for `text`.
@@ -3443,14 +3555,51 @@ fn host_transports(env: ClipboardEnv) -> Vec<HostTransport> {
     transports
 }
 
-/// Pipe `text` into `command`'s stdin and wait out its exit.
+/// Run every process transport under one shared deadline.
 ///
-/// Returns whether the command launched and exited successfully; a
-/// spawn failure (the tool is absent) or a nonzero exit reads as no
-/// delivery, silently — the chain's other attempts still run.
-fn pipe_text_and_wait(mut command: std::process::Command, text: &str) -> bool {
-    use std::io::Write as _;
+/// The configured command, the platform helper, and the transports
+/// the environment names all draw on the same clock, so the whole
+/// chain costs at most the deadline whatever it contains. Returns
+/// whether any transport exited successfully; an empty chain returns
+/// false without spawning anything.
+fn run_process_transports(custom: Option<&str>, text: &str, deadline: Duration) -> bool {
+    let start = Instant::now();
+    let mut verified = false;
+    if let Some(command_line) = custom {
+        let mut command = std::process::Command::new("sh");
+        command.arg("-c").arg(command_line);
+        verified |= run_bounded(command, text, start, deadline);
+    }
+    if cfg!(target_os = "macos") {
+        verified |= run_bounded(std::process::Command::new("pbcopy"), text, start, deadline);
+    }
+    for transport in host_transports(clipboard_env()) {
+        verified |= run_bounded(transport.command(), text, start, deadline);
+    }
+    verified
+}
 
+/// Spawn one transport and bound its whole lifetime.
+///
+/// The text reaches the child through a writer thread, so a helper
+/// that ignores stdin cannot wedge the chain on a full pipe, and the
+/// poll loop kills the child's whole process tree once the deadline
+/// passes — the worst case is one bounded wait, never an open-ended
+/// one. Returns whether the child exited successfully inside the
+/// deadline.
+fn run_bounded(
+    mut command: std::process::Command,
+    text: &str,
+    start: Instant,
+    deadline: Duration,
+) -> bool {
+    // The group is what makes the deadline's kill reach descendants
+    // that inherited the pipe — killing the child alone strands them.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
     command
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
@@ -3458,11 +3607,80 @@ fn pipe_text_and_wait(mut command: std::process::Command, text: &str) -> bool {
     let Ok(mut child) = command.spawn() else {
         return false;
     };
-    if let Some(stdin) = child.stdin.as_mut() {
-        drop(stdin.write_all(text.as_bytes()));
+    let mut stdin = child.stdin.take();
+    let owned = text.to_string();
+    let (writer_done, writer_landed) = std::sync::mpsc::channel::<std::io::Result<()>>();
+    let writer = std::thread::spawn(move || {
+        use std::io::Write as _;
+
+        if let Some(pipe) = stdin.as_mut() {
+            drop(writer_done.send(pipe.write_all(owned.as_bytes())));
+        }
+    });
+    let Some(expiry) = start.checked_add(deadline) else {
+        kill_transport_tree(&mut child);
+        wait_writer_bounded(writer, &writer_landed);
+        return false;
+    };
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let succeeded = status.success();
+                wait_writer_bounded(writer, &writer_landed);
+                return succeeded;
+            }
+            Ok(None) => {}
+            Err(_) => {
+                kill_transport_tree(&mut child);
+                wait_writer_bounded(writer, &writer_landed);
+                return false;
+            }
+        }
+        if Instant::now() >= expiry {
+            kill_transport_tree(&mut child);
+            wait_writer_bounded(writer, &writer_landed);
+            return false;
+        }
+        std::thread::sleep(COPY_POLL_STEP);
     }
-    drop(child.stdin.take());
-    child.wait().is_ok_and(|status| status.success())
+}
+
+/// Kill a transport's whole process tree.
+///
+/// The child runs as its own process-group leader, so a group signal
+/// reaches descendants that inherited the pipe — a backgrounded
+/// helper holding stdin dies with its parent and the writer
+/// unblocks. Away from Unix the direct child is all that can be
+/// reached.
+fn kill_transport_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    if let Ok(pgid) = i32::try_from(child.id()) {
+        // SAFETY: the pgid is the freshly spawned child's own id,
+        // not yet reaped, so no pid reuse can retarget the signal;
+        // killpg only delivers it.
+        unsafe { libc::killpg(pgid, libc::SIGKILL) };
+    }
+    drop(child.kill());
+}
+
+/// Wait out a transport's writer within its grace, then abandon it.
+///
+/// Every well-behaved transport's write lands inside the grace —
+/// normally in milliseconds — so an exit status is not reported
+/// before the write finished. A writer still parked on a pipe some
+/// escaped descendant holds cannot be waited out at all: the grace
+/// lapses, the join is dropped, and the thread leaves by itself
+/// whenever the pipe finally closes. The verdict is never held
+/// hostage to it.
+fn wait_writer_bounded(
+    writer: std::thread::JoinHandle<()>,
+    landed: &std::sync::mpsc::Receiver<std::io::Result<()>>,
+) {
+    if landed.recv_timeout(WRITER_GRACE).is_ok() {
+        drop(writer.join());
+    } else {
+        drop(writer);
+    }
 }
 
 /// The empty stand-in for the tool segment a selection never covers.
@@ -4296,6 +4514,117 @@ mod tests {
                 HostTransport::Xsel
             ],
             "the full environment keeps the attempt order"
+        );
+    }
+
+    #[test]
+    fn copy_verdict_wording_covers_all_three_states() {
+        assert_eq!(
+            copy_verdict_notice(CopyVerdict {
+                escape_written: false,
+                verified: true,
+            }),
+            "selection copied",
+            "a verified transport earns the plain claim"
+        );
+        assert_eq!(
+            copy_verdict_notice(CopyVerdict {
+                escape_written: true,
+                verified: false,
+            }),
+            "selection copied (unconfirmed)",
+            "an escape that only left the process says so"
+        );
+        assert_eq!(
+            copy_verdict_notice(CopyVerdict {
+                escape_written: false,
+                verified: false,
+            }),
+            "copy failed — set display.copy_command",
+            "nothing at all names the escape hatch"
+        );
+    }
+
+    #[test]
+    fn a_blank_copy_command_counts_as_unset() {
+        assert_eq!(configured_copy_command(None), None, "unset stays unset");
+        assert_eq!(configured_copy_command(Some("")), None, "empty is dropped");
+        assert_eq!(
+            configured_copy_command(Some("  \t ")),
+            None,
+            "whitespace-only is dropped"
+        );
+        assert_eq!(
+            configured_copy_command(Some("cat > /dev/null")),
+            Some("cat > /dev/null"),
+            "a real command passes through as authored"
+        );
+    }
+
+    #[test]
+    fn a_fast_copy_command_verifies_within_the_deadline() {
+        let began = std::time::Instant::now();
+        assert!(
+            run_process_transports(
+                Some("cat > /dev/null"),
+                "payload",
+                Duration::from_millis(500),
+            ),
+            "a command that consumes stdin and exits zero verifies"
+        );
+        assert!(
+            began.elapsed() < Duration::from_secs(2),
+            "the wait stays bounded"
+        );
+    }
+
+    #[test]
+    fn a_hanging_copy_command_is_killed_at_the_deadline() {
+        let began = std::time::Instant::now();
+        assert!(
+            !run_process_transports(Some("sleep 30"), "payload", Duration::from_millis(150)),
+            "a command that outlives the deadline reports no delivery"
+        );
+        assert!(
+            began.elapsed() < Duration::from_secs(2),
+            "the chain returns around the deadline, not the child's lifetime"
+        );
+    }
+
+    #[test]
+    fn a_descendant_holding_stdin_cannot_outlive_the_deadline() {
+        let began = std::time::Instant::now();
+        assert!(
+            !run_process_transports(
+                Some("cat > /dev/null & sleep 60"),
+                "payload",
+                Duration::from_millis(200),
+            ),
+            "a transport whose descendant holds the pipe reports no delivery"
+        );
+        assert!(
+            began.elapsed() < Duration::from_secs(2),
+            "the group kill plus the writer grace bound the whole chain"
+        );
+    }
+
+    #[test]
+    fn a_drained_verdict_replaces_the_notice_wording() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        app.post_notice("selection copied".to_string());
+        let mut slot = app.copy_outcomes.lock().expect("the outcomes slot");
+        slot.push(CopyVerdict {
+            escape_written: true,
+            verified: false,
+        });
+        drop(slot);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+        terminal.draw(|frame| app.render(frame)).expect("draw");
+        assert_eq!(
+            app.transient_notice.as_ref().map(|(text, _)| text.as_str()),
+            Some("selection copied (unconfirmed)"),
+            "the drain posts the verdict's definitive wording"
         );
     }
 }

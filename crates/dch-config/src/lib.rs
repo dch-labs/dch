@@ -192,6 +192,23 @@ pub enum PermissionMode {
     Interactive,
 }
 
+impl PermissionMode {
+    /// The mode's config spelling.
+    ///
+    /// The `snake_case` name serde reads and writes — the same string
+    /// the TUI's status bar shows, so what the user configured and
+    /// what the display names never drift apart.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Plan => "plan",
+            Self::AcceptEdits => "accept_edits",
+            Self::Interactive => "interactive",
+        }
+    }
+}
+
 /// Which role the agent takes on — *who* it acts as for this session.
 ///
 /// Each variant selects a distinct body of guidance that shapes how the agent
@@ -1464,5 +1481,13 @@ redact_secrets = false
             c.runner.unsafe_paths,
             "the opt-out must parse through serde"
         );
+    }
+
+    #[test]
+    fn permission_mode_names_match_the_config_spelling() {
+        assert_eq!(PermissionMode::Auto.as_str(), "auto");
+        assert_eq!(PermissionMode::Plan.as_str(), "plan");
+        assert_eq!(PermissionMode::AcceptEdits.as_str(), "accept_edits");
+        assert_eq!(PermissionMode::Interactive.as_str(), "interactive");
     }
 }

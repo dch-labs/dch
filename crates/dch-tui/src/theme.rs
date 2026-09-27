@@ -360,8 +360,8 @@ pub struct UIStyle {
     /// The raised-surface background — the palette's own elevated
     /// step off the canvas.
     ///
-    /// The composer, markdown code blocks, and the status bar draw on
-    /// this, so a surface reads as elevated over
+    /// The composer and the user-turn prompt boxes draw on this, so a
+    /// surface reads as elevated over
     /// [`background`](Self::background) rather than as a hole in it.
     /// Each theme carries its palette's own elevated background step
     /// (a current-line, mantle, or bg1 tone) rather than a derived
@@ -792,9 +792,8 @@ mod tests {
 
     #[test]
     fn every_theme_s_status_text_reads_on_its_bar() {
-        // WCAG relative luminance, the same floor the inline-code chip
-        // holds: model and token counts must stay legible on the
-        // elevated bar.
+        // WCAG relative luminance: model and token counts must stay
+        // legible on the canvas-colored status bar.
         fn channel(v: u8) -> f32 {
             let c = f32::from(v) / 255.0;
             if c <= 0.04045 {
@@ -875,7 +874,7 @@ mod tests {
         assert_eq!(ui.assistant_message_fg, Color::Reset);
         assert_eq!(
             theme.markdown.code_inline.bg, None,
-            "the inline-code chip paints no tint"
+            "inline code paints no background of its own"
         );
         assert_eq!(ui.status_success, Color::Indexed(2));
         assert_eq!(ui.status_warning, Color::Indexed(3));

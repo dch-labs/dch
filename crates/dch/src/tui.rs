@@ -200,7 +200,19 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
     drop(driver.await);
     transcript_worker.join();
     drop(guard);
+    println!("{}", session_exit_line(session_id));
     session.map_err(|err| format!("terminal error: {err}"))
+}
+
+/// The two lines the TUI prints once a session ends.
+///
+/// A `Resume with:` label, then the copy-pasteable command on its own
+/// line — nothing else, so the exit leaves exactly the instruction
+/// behind. Printed after the transcript writer joins and the terminal
+/// is restored, on clean exits and failures alike, since the
+/// transcript exists either way.
+fn session_exit_line(session_id: uuid::Uuid) -> String {
+    format!("Resume with:\ndch --resume {session_id}")
 }
 
 /// The handle a turn-end hook uses to hand transcripts to the writer.
@@ -771,6 +783,25 @@ mod tests {
             dir.path().to_path_buf(),
         ));
         (saver, dir, id)
+    }
+
+    #[test]
+    fn the_exit_lines_label_and_name_the_resume_command() {
+        let id = uuid::Uuid::new_v4();
+        let lines = session_exit_line(id);
+        let mut printed = lines.split('\n');
+        assert_eq!(
+            printed.next(),
+            Some("Resume with:"),
+            "the first line is the bare label"
+        );
+        let command = format!("dch --resume {id}");
+        assert_eq!(
+            printed.next(),
+            Some(command.as_str()),
+            "the second line is the copy-pasteable command"
+        );
+        assert_eq!(printed.next(), None, "the exit leaves exactly two lines");
     }
 
     /// Read a worker-written transcript back from disk.

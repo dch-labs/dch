@@ -673,6 +673,35 @@ fn key_releases_are_ignored() {
 }
 
 #[test]
+fn the_status_bar_names_the_current_permission_mode() {
+    // The mode segment rides the left cluster with the model and the
+    // token counts, in the config's own spelling, so what the bar
+    // shows is exactly what the user set.
+    for (mode, segment) in [
+        (dch_config::PermissionMode::Auto, "mode: auto"),
+        (dch_config::PermissionMode::Plan, "mode: plan"),
+        (
+            dch_config::PermissionMode::AcceptEdits,
+            "mode: accept_edits",
+        ),
+        (dch_config::PermissionMode::Interactive, "mode: interactive"),
+    ] {
+        let mut config = config_with_theme("dracula");
+        config.runner.permission_mode = mode;
+        let mut app = TuiApp::new(config);
+        let terminal = render_to_buffer(&mut app, 80, 30);
+        let buffer = terminal.backend().buffer();
+        let status_row: String = (0..80)
+            .map(|x| buffer[(x, 29)].symbol().to_string())
+            .collect();
+        assert!(
+            status_row.contains(segment),
+            "the bar names `{segment}`: {status_row:?}"
+        );
+    }
+}
+
+#[test]
 fn layout_shows_three_panes() {
     let mut app = app();
     let terminal = render_to_buffer(&mut app, 80, 30);
@@ -1991,6 +2020,68 @@ fn a_copy_no_transport_delivers_notices_the_failure() {
             .any(|r| r.contains("selection copied")),
         "it does not also claim success: {:?}",
         row_texts(&noticed)
+    );
+}
+
+#[test]
+fn a_hanging_copy_command_never_blocks_the_render_task() {
+    // The release must not wait on the helper: the chain runs off the
+    // render path under a kill deadline, and the verdict lands as a
+    // follow-up notice through the frame drain — wording only the
+    // drain produces, so landing is presence, not optimism.
+    let mut config = config_with_theme("dracula");
+    config.display.copy_command = Some("sleep 30".to_string());
+    let mut app = TuiApp::new(config);
+    let now = chrono::Utc::now();
+    app.push_message(TuiMessage::User {
+        text: "abcdefghij".to_string(),
+        timestamp: now,
+    });
+
+    let probe = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&probe);
+    let row = rows
+        .iter()
+        .position(|r| r.contains("abcdefghij"))
+        .unwrap_or(0);
+    let col = cell_col(&rows[row], "abcdefghij");
+
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 2).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 5).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    let began = std::time::Instant::now();
+    app.handle_event(&mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 5).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    assert!(
+        began.elapsed() < std::time::Duration::from_secs(1),
+        "the release returns without waiting on the hanging helper"
+    );
+
+    let mut landed = false;
+    for _ in 0..100 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let frame = render_to_buffer(&mut app, 80, 24);
+        if row_texts(&frame)
+            .iter()
+            .any(|r| r.contains("selection copied (unconfirmed)"))
+        {
+            landed = true;
+            break;
+        }
+    }
+    assert!(
+        landed,
+        "the deadline lands the unconfirmed verdict on the notice row"
     );
 }
 
