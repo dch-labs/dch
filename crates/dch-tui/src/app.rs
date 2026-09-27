@@ -279,11 +279,13 @@ pub struct TuiApp {
 
     /// Where a completed selection's text goes.
     ///
-    /// Answers synchronously with what the copy path knows — for the
-    /// production chain [`CopyAnswer::Unconfirmed`] while transports
-    /// are in flight, its verdict landing later through the
-    /// copy-outcomes drain; a test recorder reports its own delivery.
-    copier: Box<dyn Fn(&str) -> CopyAnswer>,
+    /// Receives the copy's attempt id beside the text — the same id
+    /// any later verdict lands under — and answers synchronously with
+    /// what the copy path knows: for the production chain
+    /// [`CopyAnswer::Unconfirmed`] while transports are in flight,
+    /// its verdict landing later through the copy-outcomes drain; a
+    /// test recorder reports its own delivery.
+    copier: SelectionCopier,
 
     /// Verdicts from off-loaded copy transports, awaiting their notice.
     ///
@@ -292,6 +294,20 @@ pub struct TuiApp {
     /// the definitive notice wording. Test-installed recorders report
     /// synchronously and never touch it.
     copy_outcomes: CopyOutcomes,
+
+    /// The monotonic id source for copy attempts.
+    ///
+    /// One counter per app: every copy — scheduled or settled on the
+    /// spot — takes its id here, so the immediate notice and any
+    /// later verdict for the same copy carry the same number.
+    copy_attempts: Arc<std::sync::atomic::AtomicU64>,
+
+    /// The attempt whose wording last took the notice row.
+    ///
+    /// Zero until a copy posts. A drained verdict older than this is
+    /// spent news about a copy the user has already walked past, so
+    /// the drain drops it instead of overwriting a newer copy.
+    posted_copy_attempt: u64,
 
     /// Rendered lines of the streaming buffer's frozen prefix.
     ///
@@ -547,7 +563,6 @@ impl TuiApp {
         let copy_outcomes: CopyOutcomes = Arc::new(std::sync::Mutex::new(Vec::new()));
         let copier_outcomes = Arc::clone(&copy_outcomes);
         let copy_attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let copier_attempts = Arc::clone(&copy_attempts);
         let copy_wake = Arc::clone(&state.render_notify);
         Self {
             theme,
@@ -569,16 +584,18 @@ impl TuiApp {
             selection: None,
             last_view: None,
             drag_position: None,
-            copier: Box::new(move |text| {
+            copier: Box::new(move |attempt, text| {
                 copy_via_transports(
                     copy_command.as_deref(),
+                    attempt,
                     text,
                     &copier_outcomes,
                     &copy_wake,
-                    &copier_attempts,
                 )
             }),
             copy_outcomes,
+            copy_attempts,
+            posted_copy_attempt: 0,
             frozen_lines: Vec::new(),
             frozen_upto: 0,
             frozen_separators: 0,
@@ -899,7 +916,7 @@ impl TuiApp {
     /// observes what a release copies without touching any real
     /// clipboard, answering [`CopyAnswer::Verified`] so the notice
     /// reads as delivered. Production never calls this.
-    pub fn set_selection_copier(&mut self, copier: Box<dyn Fn(&str) -> CopyAnswer>) {
+    pub fn set_selection_copier(&mut self, copier: SelectionCopier) {
         self.copier = copier;
     }
 
@@ -1051,13 +1068,16 @@ impl TuiApp {
     /// The funnel every copy path — the mouse release, the copy chord,
     /// and the keyboard walk's re-copy — delivers through, so each one
     /// posts from the same vocabulary on the notice row above the
-    /// composer. The immediate post answers with what the copier knows
-    /// right now; when the production chain has transports in flight,
-    /// the frame drain replaces it with the attempt's verdict — the
-    /// two phases share their wordings, so a verdict can only agree
-    /// with or upgrade what came before it.
+    /// composer. Every copy takes its attempt id here and records it
+    /// as the wording that holds the row; the immediate post answers
+    /// with what the copier knows right now, and when the production
+    /// chain has transports in flight, the frame drain replaces it
+    /// with the same attempt's verdict — never with one older than
+    /// what a newer copy already posted.
     fn copy_selection_and_notice(&mut self, text: &str) {
-        let answer = (self.copier)(text);
+        let attempt = next_attempt(&self.copy_attempts);
+        let answer = (self.copier)(attempt, text);
+        self.posted_copy_attempt = attempt;
         self.post_notice(copy_answer_notice(answer).to_string());
     }
 
@@ -2340,8 +2360,12 @@ impl TuiApp {
         }
         let verdicts = take_locked(&self.copy_outcomes);
         // Overlapping copies drain in attempt order, not arrival
-        // order: only the newest attempt's verdict becomes the notice.
-        if let Some(latest) = verdicts.into_iter().max_by_key(|verdict| verdict.attempt) {
+        // order: the newest verdict posts only when no newer copy's
+        // wording already holds the row.
+        if let Some(latest) = verdicts.into_iter().max_by_key(|verdict| verdict.attempt)
+            && latest.attempt >= self.posted_copy_attempt
+        {
+            self.posted_copy_attempt = latest.attempt;
             self.post_notice(copy_verdict_notice(latest).to_string());
         }
         if turn_ended && let Some(hook) = &self.turn_end_hook {
@@ -3386,9 +3410,9 @@ fn transport_answer(escape_written: bool, transports_scheduled: bool) -> CopyAns
 struct CopyVerdict {
     /// Which copy attempt this verdict belongs to.
     ///
-    /// One monotonic counter per app, stamped when the transports are
-    /// scheduled; overlapping attempts drain in attempt order, so a
-    /// late verdict from an older copy cannot overwrite a newer one.
+    /// One monotonic counter per app stamps every copy at the funnel,
+    /// so overlapping attempts drain in attempt order — a late verdict
+    /// from an older copy cannot overwrite a newer one.
     attempt: u64,
 
     /// Whether the OSC 52 escape's bytes left stdout.
@@ -3407,9 +3431,19 @@ struct CopyVerdict {
 /// The shared slot off-loaded copies report their verdicts into.
 ///
 /// One slot per app: the default copier pushes from its background
-/// task, the frame drain takes everything pending, so ordering
-/// between copies is arrival order and nothing accumulates.
+/// task and the frame drain empties it every frame, so nothing
+/// accumulates. Pushes land in whatever order the transports finish;
+/// the drain posts the newest attempt's verdict, and only when no
+/// newer copy already holds the notice row.
 type CopyOutcomes = Arc<std::sync::Mutex<Vec<CopyVerdict>>>;
+
+/// The seam a completed selection's text goes to.
+///
+/// Receives the copy's attempt id beside the text — the same id any
+/// later verdict lands under — and answers synchronously with what
+/// the copy path knows; the default answers from the transport chain
+/// and a test recorder from its own script.
+type SelectionCopier = Box<dyn Fn(u64, &str) -> CopyAnswer>;
 
 /// The notice wording a copy's verdict settles on.
 ///
@@ -3426,12 +3460,24 @@ fn copy_verdict_notice(verdict: CopyVerdict) -> &'static str {
     }
 }
 
+/// Take the next copy-attempt id from the shared counter.
+///
+/// One counter per app, shared with the copier: the read-modify-write
+/// is a single atomic step, so copies stamping concurrently always
+/// take distinct ids, and the first stamp is 1.
+fn next_attempt(counter: &std::sync::atomic::AtomicU64) -> u64 {
+    counter
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .saturating_add(1)
+}
+
 /// Hand `text` to every clipboard transport the environment offers.
 ///
 /// The terminal-side OSC 52 escape runs inline — one buffered write —
 /// and every process transport moves to a background task bounded by
 /// one shared kill deadline, so a hanging helper or a child that
 /// never reads its stdin cannot freeze input and rendering. The
+/// caller-stamped `attempt` rides onto the verdict unchanged. The
 /// transports' verdict lands as a follow-up notice through the render
 /// wake this pings; until then the returned escape result is all the
 /// caller can honestly claim. Failures stay silent per attempt: a
@@ -3439,10 +3485,10 @@ fn copy_verdict_notice(verdict: CopyVerdict) -> &'static str {
 /// interrupting a session for.
 fn copy_via_transports(
     custom: Option<&str>,
+    attempt: u64,
     text: &str,
     outcomes: &CopyOutcomes,
     wake: &Arc<event_listener::Event>,
-    attempts: &Arc<std::sync::atomic::AtomicU64>,
 ) -> CopyAnswer {
     let escape_written = osc52_write(text);
     let command_line = configured_copy_command(custom).map(str::to_string);
@@ -3453,10 +3499,6 @@ fn copy_via_transports(
     if !transports_scheduled {
         return answer;
     }
-    let attempt = attempts
-        .load(std::sync::atomic::Ordering::Relaxed)
-        .saturating_add(1);
-    attempts.store(attempt, std::sync::atomic::Ordering::Relaxed);
     let outcomes = Arc::clone(outcomes);
     let wake = Arc::clone(wake);
     let text = text.to_string();
@@ -4728,6 +4770,79 @@ mod tests {
             app.transient_notice.as_ref().map(|(text, _)| text.as_str()),
             Some("selection copied"),
             "the newest attempt's wording is the one that shows"
+        );
+    }
+
+    #[test]
+    fn an_older_verdict_cannot_overwrite_a_newer_synchronous_copy() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        app.set_selection_copier(Box::new(|_attempt, _text| CopyAnswer::Verified));
+        app.copy_selection_and_notice("first");
+        app.copy_selection_and_notice("second");
+        let mut slot = app.copy_outcomes.lock().expect("the outcomes slot");
+        slot.push(CopyVerdict {
+            attempt: 1,
+            escape_written: true,
+            verified: false,
+        });
+        drop(slot);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+        terminal.draw(|frame| app.render(frame)).expect("draw");
+        assert_eq!(
+            app.transient_notice.as_ref().map(|(text, _)| text.as_str()),
+            Some("selection copied"),
+            "the newest synchronous copy keeps its verified wording"
+        );
+    }
+
+    #[test]
+    fn a_verdict_still_upgrades_its_own_immediate_wording() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        app.set_selection_copier(Box::new(|_attempt, _text| CopyAnswer::Unconfirmed));
+        app.copy_selection_and_notice("pending");
+        let mut slot = app.copy_outcomes.lock().expect("the outcomes slot");
+        slot.push(CopyVerdict {
+            attempt: 1,
+            escape_written: true,
+            verified: true,
+        });
+        drop(slot);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+        terminal.draw(|frame| app.render(frame)).expect("draw");
+        assert_eq!(
+            app.transient_notice.as_ref().map(|(text, _)| text.as_str()),
+            Some("selection copied"),
+            "the same attempt's settled verdict replaces its immediate wording"
+        );
+    }
+
+    #[test]
+    fn concurrent_copies_stamp_one_distinct_attempt_each() {
+        let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let gate = Arc::new(std::sync::Barrier::new(8));
+        let stampers: Vec<_> = (0..8)
+            .map(|_| {
+                let counter = Arc::clone(&counter);
+                let gate = Arc::clone(&gate);
+                std::thread::spawn(move || {
+                    gate.wait();
+                    (0..1000)
+                        .map(|_| next_attempt(&counter))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut stamped = Vec::new();
+        for stamper in stampers {
+            stamped.extend(stamper.join().expect("the stamper survives"));
+        }
+        stamped.sort_unstable();
+        assert_eq!(
+            stamped,
+            (1..=8000).collect::<Vec<_>>(),
+            "overlapping copies never share an attempt id"
         );
     }
 

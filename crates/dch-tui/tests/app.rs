@@ -613,7 +613,7 @@ fn ctrl_shift_c_copies_the_selection_without_quitting() {
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
-    app.set_selection_copier(Box::new(move |text| {
+    app.set_selection_copier(Box::new(move |_attempt, text| {
         sink.lock().expect("sink").push(text.to_string());
         dch_tui::CopyAnswer::Verified
     }));
@@ -1474,7 +1474,7 @@ fn a_drag_selects_characters_and_copies_silently() {
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
-    app.set_selection_copier(Box::new(move |text| {
+    app.set_selection_copier(Box::new(move |_attempt, text| {
         sink.lock().expect("sink").push(text.to_string());
         dch_tui::CopyAnswer::Verified
     }));
@@ -1800,7 +1800,7 @@ fn a_released_selection_stays_highlighted_until_the_next_press() {
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
-    app.set_selection_copier(Box::new(move |text| {
+    app.set_selection_copier(Box::new(move |_attempt, text| {
         sink.lock().expect("sink").push(text.to_string());
         dch_tui::CopyAnswer::Verified
     }));
@@ -1876,7 +1876,7 @@ fn a_released_selection_copy_confirms_on_the_notice_row() {
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
-    app.set_selection_copier(Box::new(move |text| {
+    app.set_selection_copier(Box::new(move |_attempt, text| {
         sink.lock().expect("sink").push(text.to_string());
         dch_tui::CopyAnswer::Verified
     }));
@@ -1932,7 +1932,7 @@ fn a_click_without_travel_copies_and_notices_nothing() {
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
-    app.set_selection_copier(Box::new(move |text| {
+    app.set_selection_copier(Box::new(move |_attempt, text| {
         sink.lock().expect("sink").push(text.to_string());
         dch_tui::CopyAnswer::Verified
     }));
@@ -1980,7 +1980,7 @@ fn a_copy_no_transport_delivers_notices_the_failure() {
         text: "abcdefghij".to_string(),
         timestamp: now,
     });
-    app.set_selection_copier(Box::new(|_text| dch_tui::CopyAnswer::Failed));
+    app.set_selection_copier(Box::new(|_attempt, _text| dch_tui::CopyAnswer::Failed));
 
     let probe = render_to_buffer(&mut app, 80, 24);
     let rows = row_texts(&probe);
@@ -2145,7 +2145,7 @@ fn the_copy_chord_confirms_on_the_notice_row() {
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
-    app.set_selection_copier(Box::new(move |text| {
+    app.set_selection_copier(Box::new(move |_attempt, text| {
         sink.lock().expect("sink").push(text.to_string());
         dch_tui::CopyAnswer::Verified
     }));
@@ -2203,7 +2203,7 @@ fn a_shift_arrow_recopy_confirms_on_the_notice_row() {
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
-    app.set_selection_copier(Box::new(move |text| {
+    app.set_selection_copier(Box::new(move |_attempt, text| {
         sink.lock().expect("sink").push(text.to_string());
         dch_tui::CopyAnswer::Verified
     }));
@@ -2481,7 +2481,7 @@ fn shift_arrows_extend_and_shrink_a_released_selection() {
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
-    app.set_selection_copier(Box::new(move |text| {
+    app.set_selection_copier(Box::new(move |_attempt, text| {
         sink.lock().expect("sink").push(text.to_string());
         dch_tui::CopyAnswer::Verified
     }));
@@ -2605,7 +2605,7 @@ fn plain_arrows_still_scroll_while_a_selection_is_up() {
     }
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
-    app.set_selection_copier(Box::new(move |text| {
+    app.set_selection_copier(Box::new(move |_attempt, text| {
         sink.lock().expect("sink").push(text.to_string());
         dch_tui::CopyAnswer::Verified
     }));
@@ -2744,7 +2744,7 @@ fn a_press_on_a_running_tool_row_anchors_on_the_selectable_transcript() {
         });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
-    app.set_selection_copier(Box::new(move |text| {
+    app.set_selection_copier(Box::new(move |_attempt, text| {
         sink.lock().expect("sink").push(text.to_string());
         dch_tui::CopyAnswer::Verified
     }));
@@ -2831,7 +2831,7 @@ fn a_streaming_delta_forfeits_a_selection_reaching_into_the_live_region() {
     let mut app = app();
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
-    app.set_selection_copier(Box::new(move |text| {
+    app.set_selection_copier(Box::new(move |_attempt, text| {
         sink.lock().expect("sink").push(text.to_string());
         dch_tui::CopyAnswer::Verified
     }));
@@ -2899,7 +2899,7 @@ fn a_streaming_delta_preserves_a_selection_in_the_settled_transcript() {
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
-    app.set_selection_copier(Box::new(move |text| {
+    app.set_selection_copier(Box::new(move |_attempt, text| {
         sink.lock().expect("sink").push(text.to_string());
         dch_tui::CopyAnswer::Verified
     }));
@@ -2970,7 +2970,7 @@ fn a_release_over_blank_cells_copies_nothing() {
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
-    app.set_selection_copier(Box::new(move |text| {
+    app.set_selection_copier(Box::new(move |_attempt, text| {
         sink.lock().expect("sink").push(text.to_string());
         dch_tui::CopyAnswer::Verified
     }));
@@ -3042,7 +3042,7 @@ fn combining_marks_carry_with_their_base_and_line_up_with_the_rendered_cells() {
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
-    app.set_selection_copier(Box::new(move |text| {
+    app.set_selection_copier(Box::new(move |_attempt, text| {
         sink.lock().expect("sink").push(text.to_string());
         dch_tui::CopyAnswer::Verified
     }));
@@ -3111,7 +3111,7 @@ fn a_press_outside_the_conversation_retires_the_selection_without_recopying() {
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
-    app.set_selection_copier(Box::new(move |text| {
+    app.set_selection_copier(Box::new(move |_attempt, text| {
         sink.lock().expect("sink").push(text.to_string());
         dch_tui::CopyAnswer::Verified
     }));
@@ -3184,7 +3184,7 @@ fn an_interior_blank_line_stays_in_a_multi_row_copy() {
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
-    app.set_selection_copier(Box::new(move |text| {
+    app.set_selection_copier(Box::new(move |_attempt, text| {
         sink.lock().expect("sink").push(text.to_string());
         dch_tui::CopyAnswer::Verified
     }));
@@ -3237,7 +3237,7 @@ fn a_selection_landing_on_a_wide_characters_second_cell_takes_it() {
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
-    app.set_selection_copier(Box::new(move |text| {
+    app.set_selection_copier(Box::new(move |_attempt, text| {
         sink.lock().expect("sink").push(text.to_string());
         dch_tui::CopyAnswer::Verified
     }));
@@ -4820,7 +4820,7 @@ fn dragging_from_a_summary_row_still_selects_instead_of_toggling() {
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
-    app.set_selection_copier(Box::new(move |text| {
+    app.set_selection_copier(Box::new(move |_attempt, text| {
         sink.lock().expect("sink").push(text.to_string());
         dch_tui::CopyAnswer::Verified
     }));
