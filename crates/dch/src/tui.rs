@@ -87,6 +87,7 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         tokens.cumulative_input = outcome.tokens.cumulative_input;
         tokens.cumulative_output = outcome.tokens.cumulative_output;
+        tokens.input = outcome.tokens.last_input_tokens;
     }
     let (permission_resolver, permission_rx) = permission_bridge();
     let mut builder = dch_loop::Runner::builder(&config, &workdir)
@@ -842,8 +843,8 @@ mod tests {
 
     #[test]
     fn an_initial_snapshot_preserves_restored_token_totals() {
-        // A resume seeds these counters before the first frame; an
-        // exit with no new turn must keep them in the file.
+        // A resume seeds all three counters before the first frame; an
+        // exit with no new turn must keep the triple in the file.
         let (saver, dir, id) = worker_saver();
         let (handle, worker) = TranscriptWorker::spawn(saver);
         let state = TuiObserverState::new();
@@ -851,6 +852,7 @@ mod tests {
             let mut tokens = state.tokens.lock().expect("the tokens lock");
             tokens.cumulative_input = 9_999;
             tokens.cumulative_output = 111;
+            tokens.input = 777;
         }
         handle.send(Vec::new(), snapshot_tokens(&state.tokens));
         worker.join();
@@ -864,8 +866,8 @@ mod tests {
             "the restored output total survives a turnless exit"
         );
         assert_eq!(
-            tokens.last_input_tokens, 0,
-            "no turn ran, so the last-turn figure stays zero"
+            tokens.last_input_tokens, 777,
+            "the restored last-turn figure survives a turnless exit"
         );
     }
 
