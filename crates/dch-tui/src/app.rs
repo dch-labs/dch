@@ -279,11 +279,11 @@ pub struct TuiApp {
 
     /// Where a completed selection's text goes.
     ///
-    /// Returns the synchronously known result — for the production
-    /// chain the escape write's outcome, for a test recorder its own
-    /// delivery report — while the process transports' verdict lands
-    /// later through the copy-outcomes drain.
-    copier: Box<dyn Fn(&str) -> bool>,
+    /// Answers synchronously with what the copy path knows — for the
+    /// production chain [`CopyAnswer::Unconfirmed`] while transports
+    /// are in flight, its verdict landing later through the
+    /// copy-outcomes drain; a test recorder reports its own delivery.
+    copier: Box<dyn Fn(&str) -> CopyAnswer>,
 
     /// Verdicts from off-loaded copy transports, awaiting their notice.
     ///
@@ -546,6 +546,8 @@ impl TuiApp {
         let copy_command = config.display.copy_command.clone();
         let copy_outcomes: CopyOutcomes = Arc::new(std::sync::Mutex::new(Vec::new()));
         let copier_outcomes = Arc::clone(&copy_outcomes);
+        let copy_attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let copier_attempts = Arc::clone(&copy_attempts);
         let copy_wake = Arc::clone(&state.render_notify);
         Self {
             theme,
@@ -568,7 +570,13 @@ impl TuiApp {
             last_view: None,
             drag_position: None,
             copier: Box::new(move |text| {
-                copy_via_transports(copy_command.as_deref(), text, &copier_outcomes, &copy_wake)
+                copy_via_transports(
+                    copy_command.as_deref(),
+                    text,
+                    &copier_outcomes,
+                    &copy_wake,
+                    &copier_attempts,
+                )
             }),
             copy_outcomes,
             frozen_lines: Vec::new(),
@@ -889,9 +897,9 @@ impl TuiApp {
     ///
     /// The instrumentation seam for the selection pins: a recorder
     /// observes what a release copies without touching any real
-    /// clipboard, reporting `true` so the notice reads as delivered.
-    /// Production never calls this.
-    pub fn set_selection_copier(&mut self, copier: Box<dyn Fn(&str) -> bool>) {
+    /// clipboard, answering [`CopyAnswer::Verified`] so the notice
+    /// reads as delivered. Production never calls this.
+    pub fn set_selection_copier(&mut self, copier: Box<dyn Fn(&str) -> CopyAnswer>) {
         self.copier = copier;
     }
 
@@ -1042,21 +1050,15 @@ impl TuiApp {
     ///
     /// The funnel every copy path — the mouse release, the copy chord,
     /// and the keyboard walk's re-copy — delivers through, so each one
-    /// posts the same confirmation on the notice row above the
-    /// composer. The post is the optimistic phase from the copier's
-    /// synchronous result; when the production chain has process
-    /// transports in flight, the frame drain replaces it with the
-    /// definitive verdict wording once they land. A copier reporting
-    /// nothing delivered names the escape hatch, since a copy that
-    /// reached no transport is worth a word, not silence.
+    /// posts from the same vocabulary on the notice row above the
+    /// composer. The immediate post answers with what the copier knows
+    /// right now; when the production chain has transports in flight,
+    /// the frame drain replaces it with the attempt's verdict — the
+    /// two phases share their wordings, so a verdict can only agree
+    /// with or upgrade what came before it.
     fn copy_selection_and_notice(&mut self, text: &str) {
-        let delivered = (self.copier)(text);
-        let wording = if delivered {
-            "selection copied"
-        } else {
-            "copy failed — set display.copy_command"
-        };
-        self.post_notice(wording.to_string());
+        let answer = (self.copier)(text);
+        self.post_notice(copy_answer_notice(answer).to_string());
     }
 
     /// Handle the events already waiting behind the first one.
@@ -2336,8 +2338,11 @@ impl TuiApp {
                 timestamp: now,
             });
         }
-        for verdict in take_locked(&self.copy_outcomes) {
-            self.post_notice(copy_verdict_notice(verdict).to_string());
+        let verdicts = take_locked(&self.copy_outcomes);
+        // Overlapping copies drain in attempt order, not arrival
+        // order: only the newest attempt's verdict becomes the notice.
+        if let Some(latest) = verdicts.into_iter().max_by_key(|verdict| verdict.attempt) {
+            self.post_notice(copy_verdict_notice(latest).to_string());
         }
         if turn_ended && let Some(hook) = &self.turn_end_hook {
             hook(&self.conversation);
@@ -3317,13 +3322,75 @@ const COPY_POLL_STEP: Duration = Duration::from_millis(25);
 /// the verdict — the thread leaves whenever the pipe finally closes.
 const WRITER_GRACE: Duration = Duration::from_millis(250);
 
+/// What a copy path knows synchronously about a delivery.
+///
+/// The funnel's immediate phase answers with one of these, drawn from
+/// the same vocabulary the drained verdict uses, so the two phases can
+/// only agree or upgrade — never contradict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyAnswer {
+    /// A transport confirmed delivery synchronously.
+    ///
+    /// Earns the plain `selection copied` claim on the spot; the
+    /// injected test recorders report this.
+    Verified,
+
+    /// The escape's bytes left, and confirmation is still pending.
+    ///
+    /// Transports are in flight, so the honest immediate wording is
+    /// the unconfirmed one until a verdict lands.
+    Unconfirmed,
+
+    /// Nothing reported anything.
+    ///
+    /// No bytes left and nothing schedulable — the wording names the
+    /// escape hatch.
+    Failed,
+}
+
+/// The notice wording a synchronous copy answer earns.
+///
+/// Word-for-word the vocabulary [`copy_verdict_notice`] settles on, so
+/// the immediate phase never claims more than the phase after it.
+#[must_use]
+fn copy_answer_notice(answer: CopyAnswer) -> &'static str {
+    match answer {
+        CopyAnswer::Verified => "selection copied",
+        CopyAnswer::Unconfirmed => "selection copied (unconfirmed)",
+        CopyAnswer::Failed => "copy failed — set display.copy_command",
+    }
+}
+
+/// The synchronous answer once the escape write is known.
+///
+/// With nothing schedulable the escape is the whole story — its write
+/// settles the answer outright, keeping the no-transports host's
+/// immediate wording. With transports scheduled the answer is
+/// unconfirmed whatever the escape did: confirmation is theirs to
+/// deliver as a verdict.
+#[must_use]
+fn transport_answer(escape_written: bool, transports_scheduled: bool) -> CopyAnswer {
+    match (escape_written, transports_scheduled) {
+        (_, true) => CopyAnswer::Unconfirmed,
+        (true, false) => CopyAnswer::Verified,
+        (false, false) => CopyAnswer::Failed,
+    }
+}
+
 /// The definitive result of one off-loaded copy attempt.
 ///
 /// The escape write carries no acceptance signal, so only a process
 /// transport that exited successfully counts as confirmation; the
-/// frame drain maps these two facts onto the notice row's wording.
+/// frame drain maps these facts onto the notice row's wording.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CopyVerdict {
+    /// Which copy attempt this verdict belongs to.
+    ///
+    /// One monotonic counter per app, stamped when the transports are
+    /// scheduled; overlapping attempts drain in attempt order, so a
+    /// late verdict from an older copy cannot overwrite a newer one.
+    attempt: u64,
+
     /// Whether the OSC 52 escape's bytes left stdout.
     ///
     /// True means the handoff happened, never that the receiving
@@ -3375,15 +3442,21 @@ fn copy_via_transports(
     text: &str,
     outcomes: &CopyOutcomes,
     wake: &Arc<event_listener::Event>,
-) -> bool {
+    attempts: &Arc<std::sync::atomic::AtomicU64>,
+) -> CopyAnswer {
     let escape_written = osc52_write(text);
     let command_line = configured_copy_command(custom).map(str::to_string);
     let transports_scheduled = command_line.is_some()
         || cfg!(target_os = "macos")
         || !host_transports(clipboard_env()).is_empty();
+    let answer = transport_answer(escape_written, transports_scheduled);
     if !transports_scheduled {
-        return escape_written;
+        return answer;
     }
+    let attempt = attempts
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .saturating_add(1);
+    attempts.store(attempt, std::sync::atomic::Ordering::Relaxed);
     let outcomes = Arc::clone(outcomes);
     let wake = Arc::clone(wake);
     let text = text.to_string();
@@ -3391,6 +3464,7 @@ fn copy_via_transports(
         let verified = run_process_transports(command_line.as_deref(), &text, COPY_DEADLINE);
         let mut slot = outcomes.lock().unwrap_or_else(PoisonError::into_inner);
         slot.push(CopyVerdict {
+            attempt,
             escape_written,
             verified,
         });
@@ -3401,7 +3475,7 @@ fn copy_via_transports(
     } else {
         drop(std::thread::spawn(job));
     }
-    escape_written
+    answer
 }
 
 /// The configured copy command, blank values dropped.
@@ -4521,6 +4595,7 @@ mod tests {
     fn copy_verdict_wording_covers_all_three_states() {
         assert_eq!(
             copy_verdict_notice(CopyVerdict {
+                attempt: 1,
                 escape_written: false,
                 verified: true,
             }),
@@ -4529,6 +4604,7 @@ mod tests {
         );
         assert_eq!(
             copy_verdict_notice(CopyVerdict {
+                attempt: 1,
                 escape_written: true,
                 verified: false,
             }),
@@ -4537,6 +4613,7 @@ mod tests {
         );
         assert_eq!(
             copy_verdict_notice(CopyVerdict {
+                attempt: 1,
                 escape_written: false,
                 verified: false,
             }),
@@ -4614,6 +4691,7 @@ mod tests {
         app.post_notice("selection copied".to_string());
         let mut slot = app.copy_outcomes.lock().expect("the outcomes slot");
         slot.push(CopyVerdict {
+            attempt: 1,
             escape_written: true,
             verified: false,
         });
@@ -4625,6 +4703,74 @@ mod tests {
             app.transient_notice.as_ref().map(|(text, _)| text.as_str()),
             Some("selection copied (unconfirmed)"),
             "the drain posts the verdict's definitive wording"
+        );
+    }
+
+    #[test]
+    fn a_late_verdict_from_an_older_copy_cannot_overwrite_a_newer_one() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        let mut slot = app.copy_outcomes.lock().expect("the outcomes slot");
+        slot.push(CopyVerdict {
+            attempt: 2,
+            escape_written: true,
+            verified: true,
+        });
+        slot.push(CopyVerdict {
+            attempt: 1,
+            escape_written: true,
+            verified: false,
+        });
+        drop(slot);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+        terminal.draw(|frame| app.render(frame)).expect("draw");
+        assert_eq!(
+            app.transient_notice.as_ref().map(|(text, _)| text.as_str()),
+            Some("selection copied"),
+            "the newest attempt's wording is the one that shows"
+        );
+    }
+
+    #[test]
+    fn the_copy_answer_wording_matches_the_verdict_vocabulary() {
+        assert_eq!(
+            copy_answer_notice(CopyAnswer::Verified),
+            "selection copied",
+            "verified delivery earns the plain claim"
+        );
+        assert_eq!(
+            copy_answer_notice(CopyAnswer::Unconfirmed),
+            "selection copied (unconfirmed)",
+            "a pending delivery says so"
+        );
+        assert_eq!(
+            copy_answer_notice(CopyAnswer::Failed),
+            "copy failed — set display.copy_command",
+            "nothing at all names the escape hatch"
+        );
+    }
+
+    #[test]
+    fn the_synchronous_answer_follows_what_is_schedulable() {
+        assert_eq!(
+            transport_answer(true, false),
+            CopyAnswer::Verified,
+            "an escape-only host keeps its immediate wording"
+        );
+        assert_eq!(
+            transport_answer(false, false),
+            CopyAnswer::Failed,
+            "nothing leaving and nothing schedulable fails outright"
+        );
+        assert_eq!(
+            transport_answer(true, true),
+            CopyAnswer::Unconfirmed,
+            "transports in flight hold the plain claim back"
+        );
+        assert_eq!(
+            transport_answer(false, true),
+            CopyAnswer::Unconfirmed,
+            "a failed escape still waits on the transports' verdict"
         );
     }
 }

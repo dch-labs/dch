@@ -147,11 +147,9 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
     };
     app.set_session_id(session_id.to_string());
 
-    // Save the transcript off the render thread whenever a turn
-    // ends: one ordered writer receives the snapshots, so the newest
-    // transcript lands last and teardown joins the final write.
     let saver = Arc::new(crate::session::SessionSaver::with_model(session_id, model));
     let (transcript_handle, transcript_worker) = TranscriptWorker::spawn(saver);
+    let initial_transcript = transcript_handle.clone();
     let hook_tokens = Arc::clone(&state.tokens);
     app.set_turn_end_hook(Box::new(move |conversation| {
         let (cumulative_input, cumulative_output, last_input_tokens) =
@@ -171,6 +169,11 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
             },
         );
     }));
+
+    initial_transcript.send(
+        app.conversation().to_vec(),
+        crate::session::SessionTokens::default(),
+    );
 
     TerminalGuard::install_panic_hook();
     let (guard, mut terminal) =
@@ -208,9 +211,10 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
 ///
 /// A `Resume with:` label, then the copy-pasteable command on its own
 /// line — nothing else, so the exit leaves exactly the instruction
-/// behind. Printed after the transcript writer joins and the terminal
-/// is restored, on clean exits and failures alike, since the
-/// transcript exists either way.
+/// behind. An initial snapshot persists before the first frame, so
+/// the file the command names exists however the session ended;
+/// printed after the transcript writer joins and the terminal is
+/// restored, on clean exits and failures alike.
 fn session_exit_line(session_id: uuid::Uuid) -> String {
     format!("Resume with:\ndch --resume {session_id}")
 }
@@ -225,6 +229,20 @@ fn session_exit_line(session_id: uuid::Uuid) -> String {
 struct TranscriptHandle {
     slot: Arc<std::sync::Mutex<Option<TranscriptSnapshot>>>,
     signal: Arc<std::sync::Condvar>,
+}
+
+impl Clone for TranscriptHandle {
+    /// Clone the mailbox handle.
+    ///
+    /// Both halves are shared arcs, so a clone publishes through the
+    /// same one-slot mailbox the original does — the host keeps one to
+    /// seed the session file before the first frame.
+    fn clone(&self) -> Self {
+        Self {
+            slot: Arc::clone(&self.slot),
+            signal: Arc::clone(&self.signal),
+        }
+    }
 }
 
 impl TranscriptHandle {
@@ -802,6 +820,22 @@ mod tests {
             "the second line is the copy-pasteable command"
         );
         assert_eq!(printed.next(), None, "the exit leaves exactly two lines");
+    }
+
+    #[test]
+    fn an_initial_snapshot_persists_a_loadable_session_file() {
+        // The exit line's promise holds from the first frame: the
+        // initial snapshot writes the session file even when no turn
+        // ever ends, so the printed command resumes something real.
+        let (saver, dir, id) = worker_saver();
+        let (handle, worker) = TranscriptWorker::spawn(saver);
+        handle.send(Vec::new(), crate::session::SessionTokens::default());
+        worker.join();
+        let messages = saved_messages(dir.path(), id);
+        assert!(
+            messages.is_empty(),
+            "the pre-first-frame snapshot loads back as the empty session"
+        );
     }
 
     /// Read a worker-written transcript back from disk.

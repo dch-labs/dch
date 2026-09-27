@@ -615,7 +615,7 @@ fn ctrl_shift_c_copies_the_selection_without_quitting() {
     let sink = Arc::clone(&copied);
     app.set_selection_copier(Box::new(move |text| {
         sink.lock().expect("sink").push(text.to_string());
-        true
+        dch_tui::CopyAnswer::Verified
     }));
     let probe = render_to_buffer(&mut app, 80, 24);
     let rows = row_texts(&probe);
@@ -1476,7 +1476,7 @@ fn a_drag_selects_characters_and_copies_silently() {
     let sink = Arc::clone(&copied);
     app.set_selection_copier(Box::new(move |text| {
         sink.lock().expect("sink").push(text.to_string());
-        true
+        dch_tui::CopyAnswer::Verified
     }));
 
     let _ = render_to_buffer(&mut app, 80, 24);
@@ -1802,7 +1802,7 @@ fn a_released_selection_stays_highlighted_until_the_next_press() {
     let sink = Arc::clone(&copied);
     app.set_selection_copier(Box::new(move |text| {
         sink.lock().expect("sink").push(text.to_string());
-        true
+        dch_tui::CopyAnswer::Verified
     }));
 
     let probe = render_to_buffer(&mut app, 80, 24);
@@ -1878,7 +1878,7 @@ fn a_released_selection_copy_confirms_on_the_notice_row() {
     let sink = Arc::clone(&copied);
     app.set_selection_copier(Box::new(move |text| {
         sink.lock().expect("sink").push(text.to_string());
-        true
+        dch_tui::CopyAnswer::Verified
     }));
 
     let probe = render_to_buffer(&mut app, 80, 24);
@@ -1934,7 +1934,7 @@ fn a_click_without_travel_copies_and_notices_nothing() {
     let sink = Arc::clone(&copied);
     app.set_selection_copier(Box::new(move |text| {
         sink.lock().expect("sink").push(text.to_string());
-        true
+        dch_tui::CopyAnswer::Verified
     }));
 
     let probe = render_to_buffer(&mut app, 80, 24);
@@ -1980,7 +1980,7 @@ fn a_copy_no_transport_delivers_notices_the_failure() {
         text: "abcdefghij".to_string(),
         timestamp: now,
     });
-    app.set_selection_copier(Box::new(|_text| false));
+    app.set_selection_copier(Box::new(|_text| dch_tui::CopyAnswer::Failed));
 
     let probe = render_to_buffer(&mut app, 80, 24);
     let rows = row_texts(&probe);
@@ -2086,6 +2086,54 @@ fn a_hanging_copy_command_never_blocks_the_render_task() {
 }
 
 #[test]
+fn a_pending_transport_copy_shows_the_unconfirmed_wording_immediately() {
+    // Transports in flight never borrow the verified claim: from the
+    // release itself the notice reads unconfirmed, and the attempt's
+    // verdict can only agree with or upgrade it.
+    let mut config = config_with_theme("dracula");
+    config.display.copy_command = Some("sleep 30".to_string());
+    let mut app = TuiApp::new(config);
+    let now = chrono::Utc::now();
+    app.push_message(TuiMessage::User {
+        text: "abcdefghij".to_string(),
+        timestamp: now,
+    });
+
+    let probe = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&probe);
+    let row = rows
+        .iter()
+        .position(|r| r.contains("abcdefghij"))
+        .unwrap_or(0);
+    let col = cell_col(&rows[row], "abcdefghij");
+
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 2).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 5).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 5).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+
+    let frame = render_to_buffer(&mut app, 80, 24);
+    assert!(
+        row_texts(&frame)
+            .iter()
+            .any(|r| r.contains("selection copied (unconfirmed)")),
+        "the pending window says unconfirmed from the start: {:?}",
+        row_texts(&frame)
+    );
+}
+
+#[test]
 fn the_copy_chord_confirms_on_the_notice_row() {
     // Ctrl+Shift+C delivers through the same funnel as the release,
     // so its copy lands the same confirmation on the notice row.
@@ -2099,7 +2147,7 @@ fn the_copy_chord_confirms_on_the_notice_row() {
     let sink = Arc::clone(&copied);
     app.set_selection_copier(Box::new(move |text| {
         sink.lock().expect("sink").push(text.to_string());
-        true
+        dch_tui::CopyAnswer::Verified
     }));
 
     let probe = render_to_buffer(&mut app, 80, 24);
@@ -2157,7 +2205,7 @@ fn a_shift_arrow_recopy_confirms_on_the_notice_row() {
     let sink = Arc::clone(&copied);
     app.set_selection_copier(Box::new(move |text| {
         sink.lock().expect("sink").push(text.to_string());
-        true
+        dch_tui::CopyAnswer::Verified
     }));
 
     let probe = render_to_buffer(&mut app, 80, 24);
@@ -2435,7 +2483,7 @@ fn shift_arrows_extend_and_shrink_a_released_selection() {
     let sink = Arc::clone(&copied);
     app.set_selection_copier(Box::new(move |text| {
         sink.lock().expect("sink").push(text.to_string());
-        true
+        dch_tui::CopyAnswer::Verified
     }));
 
     let probe = render_to_buffer(&mut app, 80, 24);
@@ -2559,7 +2607,7 @@ fn plain_arrows_still_scroll_while_a_selection_is_up() {
     let sink = Arc::clone(&copied);
     app.set_selection_copier(Box::new(move |text| {
         sink.lock().expect("sink").push(text.to_string());
-        true
+        dch_tui::CopyAnswer::Verified
     }));
     let _ = render_to_buffer(&mut app, 80, 24);
     app.handle_event(&mouse_event(
@@ -2698,7 +2746,7 @@ fn a_press_on_a_running_tool_row_anchors_on_the_selectable_transcript() {
     let sink = Arc::clone(&copied);
     app.set_selection_copier(Box::new(move |text| {
         sink.lock().expect("sink").push(text.to_string());
-        true
+        dch_tui::CopyAnswer::Verified
     }));
 
     let probe = render_to_buffer(&mut app, 80, 24);
@@ -2785,7 +2833,7 @@ fn a_streaming_delta_forfeits_a_selection_reaching_into_the_live_region() {
     let sink = Arc::clone(&copied);
     app.set_selection_copier(Box::new(move |text| {
         sink.lock().expect("sink").push(text.to_string());
-        true
+        dch_tui::CopyAnswer::Verified
     }));
     app.streaming_text()
         .lock()
@@ -2853,7 +2901,7 @@ fn a_streaming_delta_preserves_a_selection_in_the_settled_transcript() {
     let sink = Arc::clone(&copied);
     app.set_selection_copier(Box::new(move |text| {
         sink.lock().expect("sink").push(text.to_string());
-        true
+        dch_tui::CopyAnswer::Verified
     }));
     app.streaming_text()
         .lock()
@@ -2924,7 +2972,7 @@ fn a_release_over_blank_cells_copies_nothing() {
     let sink = Arc::clone(&copied);
     app.set_selection_copier(Box::new(move |text| {
         sink.lock().expect("sink").push(text.to_string());
-        true
+        dch_tui::CopyAnswer::Verified
     }));
 
     let probe = render_to_buffer(&mut app, 80, 24);
@@ -2996,7 +3044,7 @@ fn combining_marks_carry_with_their_base_and_line_up_with_the_rendered_cells() {
     let sink = Arc::clone(&copied);
     app.set_selection_copier(Box::new(move |text| {
         sink.lock().expect("sink").push(text.to_string());
-        true
+        dch_tui::CopyAnswer::Verified
     }));
     let probe = render_to_buffer(&mut app, 80, 24);
     let rows = row_texts(&probe);
@@ -3065,7 +3113,7 @@ fn a_press_outside_the_conversation_retires_the_selection_without_recopying() {
     let sink = Arc::clone(&copied);
     app.set_selection_copier(Box::new(move |text| {
         sink.lock().expect("sink").push(text.to_string());
-        true
+        dch_tui::CopyAnswer::Verified
     }));
     let probe = render_to_buffer(&mut app, 80, 24);
     let rows = row_texts(&probe);
@@ -3138,7 +3186,7 @@ fn an_interior_blank_line_stays_in_a_multi_row_copy() {
     let sink = Arc::clone(&copied);
     app.set_selection_copier(Box::new(move |text| {
         sink.lock().expect("sink").push(text.to_string());
-        true
+        dch_tui::CopyAnswer::Verified
     }));
 
     let probe = render_to_buffer(&mut app, 80, 24);
@@ -3191,7 +3239,7 @@ fn a_selection_landing_on_a_wide_characters_second_cell_takes_it() {
     let sink = Arc::clone(&copied);
     app.set_selection_copier(Box::new(move |text| {
         sink.lock().expect("sink").push(text.to_string());
-        true
+        dch_tui::CopyAnswer::Verified
     }));
 
     let probe = render_to_buffer(&mut app, 80, 24);
@@ -4774,7 +4822,7 @@ fn dragging_from_a_summary_row_still_selects_instead_of_toggling() {
     let sink = Arc::clone(&copied);
     app.set_selection_copier(Box::new(move |text| {
         sink.lock().expect("sink").push(text.to_string());
-        true
+        dch_tui::CopyAnswer::Verified
     }));
 
     let probe = render_to_buffer(&mut app, 80, 30);
