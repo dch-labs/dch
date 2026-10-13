@@ -5,6 +5,14 @@
 use std::path::Path;
 use std::path::PathBuf;
 
+/// The window assumed when neither the config nor the provider names one.
+///
+/// The stand-in every discovery failure lands on: large enough for a
+/// frontier-model session, small enough to keep a compaction threshold
+/// meaningful, and identical everywhere the fallback is needed so the
+/// config mapping and the runner agree on it.
+pub const FALLBACK_CONTEXT_WINDOW: u64 = 200_000;
+
 /// Which LLM provider to target.
 ///
 /// Selects the wire protocol and default [`ApiConfig::base_url`] used when
@@ -158,6 +166,116 @@ pub enum Verbosity {
     ///
     /// Adds lower-level diagnostic output on top of the normal level.
     Verbose,
+}
+
+/// Where the TUI's activity strip renders while the agent runs.
+///
+/// Selects the breathing bar's row: the spacer directly above the
+/// composer, or a dedicated first row of the terminal. Consumed from
+/// [`DisplayConfig::strip_position`] and (de)serialized as its
+/// lowercase name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StripPosition {
+    /// The spacer row directly above the composer.
+    ///
+    /// The default placement: the bar claims the row the composer's
+    /// hairline would otherwise paint, and stands the rule down while
+    /// it breathes.
+    #[default]
+    Composer,
+
+    /// A dedicated first row of the terminal.
+    ///
+    /// The bar claims screen row 0, full width, above the conversation
+    /// pane — which shrinks by one row — and the composer's spacer row
+    /// keeps its hairline.
+    Top,
+}
+
+/// The animation the TUI's activity strip plays while the agent runs.
+///
+/// Selects the breathing bar's motion. Consumed from
+/// [`DisplayConfig::strip_style`] and (de)serialized as its lowercase
+/// name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StripStyle {
+    /// Grows from the row's center out to both edges, then shrinks
+    /// back.
+    ///
+    /// The default motion: a triangle breath that never fully
+    /// disappears — its run keeps a one-cell floor.
+    #[default]
+    Breathe,
+
+    /// Fills from the left edge to the right end, then clears
+    /// left-to-right.
+    ///
+    /// The right edge stays pinned while the left edge chases it off,
+    /// the row blanking for an instant before the fill restarts from
+    /// a one-cell seed.
+    Sweep,
+
+    /// Sweeps each way in turn — fill and clear left-to-right, then
+    /// fill and clear right-to-left, repeating.
+    ///
+    /// The sweep's motion ping-ponging between the edges: each
+    /// direction pass fills from its edge and clears toward the
+    /// other, the row blanking for an instant at every turn.
+    Bounce,
+
+    /// Glides a short segment from edge to edge and back, repeating.
+    ///
+    /// The scanner's segment spans a quarter of the row (floored at
+    /// three cells) and travels continuously — one pass each way per
+    /// cycle, the motion never pausing or blanking.
+    Travel,
+
+    /// Circulates a short segment out the right edge and in the left,
+    /// one continuous lap after another.
+    ///
+    /// Travel's segment without the bounce: a quarter-row run
+    /// (floored at three cells) advances around the row, its head
+    /// entering the left edge while its tail still exits the right —
+    /// the row never blanking through the wrap.
+    Snake,
+
+    /// Crawls across the row in stretch-and-shrink beats, absorbed at
+    /// the far edge before reappearing at the left.
+    ///
+    /// The inchworm: a seed stretches left-anchored to the center,
+    /// shrinks as the tail catches up, stretches center-anchored to
+    /// the right edge, and shrinks once more until gone — one
+    /// traversal per period.
+    Worm,
+
+    /// Stretches from the seed across the whole row to the right
+    /// edge, then folds back into it.
+    ///
+    /// The large worm: the run grows from the left seed along the
+    /// worm's eased path until it spans the full row at the period's
+    /// half, then shrinks along the same path as the tail races from
+    /// the left edge and swallows it into the right; one traversal
+    /// per period.
+    #[serde(rename = "worm-large")]
+    WormLarge,
+
+    /// Draws no strip at all.
+    ///
+    /// The configured row stays empty for the whole run, the
+    /// composer's hairline returns in the spacer, and the animation
+    /// wake stands down entirely.
+    Off,
+
+    /// Holds a full-width bar that never moves, its color slowly
+    /// breathing.
+    ///
+    /// One full breath per period between the strip color and about
+    /// half its brightness — a static bar that slightly glows. A
+    /// theme whose strip color is a named color renders the bar
+    /// without the breath.
+    Glow,
 }
 
 /// When the runner prompts for permission before side-effecting actions.
@@ -458,6 +576,14 @@ pub enum DchConfigError {
     /// deserialize into [`DchConfig`].
     #[error("failed to parse config TOML: {0}")]
     Parse(#[from] toml::de::Error),
+
+    /// A present config file carried a value the loader rejects.
+    ///
+    /// Raised by post-parse validation for values whose silently-substituted
+    /// behavior would contradict the documented contract — the message names
+    /// the field, the rejected value, and the bound it violated.
+    #[error("invalid config: {0}")]
+    Invalid(String),
 }
 
 /// MCP tool-server settings, in the `[mcp]` config section.
@@ -608,10 +734,14 @@ pub struct ApiConfig {
 
     /// Context window size of the primary model, in tokens.
     ///
-    /// The full window the model can attend to per request. Defaults to
-    /// `200_000`; feeds into compaction decisions via
+    /// The full window one request may carry. Unset (the default) means
+    /// discover it from the provider when it starts — a local
+    /// OpenAI-compatible server is asked directly, and anything without
+    /// an answerable capability route falls back to
+    /// [`FALLBACK_CONTEXT_WINDOW`]. An explicit value always wins over
+    /// discovery. Feeds into compaction decisions via
     /// [`DchConfig::to_session_config`].
-    pub context_window: u64,
+    pub context_window: Option<u64>,
 
     /// Per-request timeout in seconds.
     ///
@@ -632,6 +762,31 @@ pub struct ApiConfig {
     /// for [`ApiType::Azure`]; falls back to the `AZURE_OPENAI_RESOURCE`
     /// environment variable when `None`.
     pub azure_resource: Option<String>,
+
+    /// Request-level thinking budget for reasoning-capable models.
+    ///
+    /// One of `low`, `medium`, `high`, or `max`, mapped at provider
+    /// construction onto the family's native dial — the Anthropic
+    /// `thinking.budget_tokens` ladder, the OpenAI `reasoning_effort`
+    /// parameter, the Gemini `thinkingConfig.thinkingBudget` budget.
+    /// Unset (the default) sends byte-identical requests
+    /// and the provider's own thinking defaults apply; an unrecognized
+    /// value fails client construction rather than silently defaulting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+
+    /// Whether Anthropic-protocol requests carry prompt-cache breakpoints.
+    ///
+    /// When `true` (the default), requests to `[api] api_type` `anthropic`
+    /// and `zai` mark the provider's prompt-cache breakpoints (tools,
+    /// system, and the trailing message blocks), so the stable
+    /// conversation prefix is served from cache across a session's turns
+    /// instead of re-processed every request. Set `false` for an
+    /// Anthropic-compatible endpoint that rejects the extra field.
+    /// OpenAI-protocol providers cache automatically server-side and
+    /// ignore this setting on the wire; the cached share is reported in
+    /// usage either way. Loaded from `[api] prompt_cache`.
+    pub prompt_cache: bool,
 }
 
 /// Display / rendering preferences.
@@ -656,8 +811,24 @@ pub struct DisplayConfig {
     /// Theme name (resolved by the TUI).
     ///
     /// A free-form name the TUI maps to a concrete color scheme. Defaults to
-    /// `"transparent"`.
+    /// `"default"`.
     pub theme: String,
+
+    /// Where the TUI's activity strip renders while the agent runs.
+    ///
+    /// `composer` (the default) places the breathing bar in the spacer row
+    /// directly above the prompt box; `top` gives it a dedicated first row
+    /// of the terminal, above the conversation pane. See
+    /// [`StripPosition`].
+    pub strip_position: StripPosition,
+
+    /// The animation the TUI's activity strip plays.
+    ///
+    /// `breathe` (the default) grows from the row's center out to
+    /// both edges and shrinks back; `sweep` fills from the left edge
+    /// to the right end and then clears left-to-right. See
+    /// [`StripStyle`].
+    pub strip_style: StripStyle,
 
     /// Let the TUI capture the mouse.
     ///
@@ -683,6 +854,46 @@ pub struct DisplayConfig {
     pub copy_command: Option<String>,
 }
 
+/// Which compaction strategy an automatically compacting session runs.
+///
+/// The runner installs the selected compactor when it assembles the loop,
+/// so every run mode compacts the same way from the same knob. The
+/// summarizer kinds spend model calls to keep the evicted conversation's
+/// facts reachable; truncation spends none and simply drops the oldest
+/// messages; rolling spends small calls continuously so no single pass
+/// grows large.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CompactorSelection {
+    /// Drop the oldest messages, preserving the recent tail verbatim.
+    ///
+    /// The zero-model-call strategy: no summarization prompts run, and the
+    /// information in the dropped messages is gone from the feed.
+    Truncating,
+
+    /// Summarize through a question/answer pass over the session's model.
+    ///
+    /// The dropped portion is summarized, the model is asked what the
+    /// summary is missing, and the answers are folded back in — decisions
+    /// and identifiers survive the pass instead of evaporating.
+    Qa,
+
+    /// Summarize into fixed sections through the session's model.
+    ///
+    /// The dropped portion becomes a structured summary with key facts,
+    /// decisions, pending tasks, and open questions as separate sections.
+    Structured,
+
+    /// Age turns into micro-summaries while the session runs.
+    ///
+    /// Each pass summarizes only the turns that have aged past the
+    /// rolling threshold — bounded input and output per call, so the
+    /// pass costs seconds instead of minutes — and the question/answer
+    /// chain stands behind it as the emergency floor for growth the
+    /// aging cannot keep up with.
+    Rolling,
+}
+
 /// Runner runtime behavior.
 ///
 /// Per-run and per-session execution knobs: turn budget, compaction, permission
@@ -696,6 +907,24 @@ pub struct RunnerConfig {
     /// Maximum number of turns a single run may take before stopping, in turns.
     /// Defaults to `200`.
     pub max_turns: usize,
+
+    /// Whole-request streaming budget for one model call, in seconds.
+    ///
+    /// The wall clock a single streaming model call may consume before the
+    /// runner abandons it — prompt processing plus the model's entire
+    /// generation, reasoning included. The prompt is provider-cached between
+    /// calls, so the budget is spent almost entirely on *generation*: a
+    /// reasoning-heavy model on a CPU backend can emit thousands of tokens
+    /// in one call, and the 300-second default kills such calls
+    /// mid-generation; raise it for slow local backends. Two bounds shape
+    /// the honest range: values below 120 fail the load (the stream handler
+    /// floors the total budget at its 120-second first-event window, so a
+    /// lower ask would be silently replaced), and the wait for the *first*
+    /// token is always capped at that same 120-second window — a backend
+    /// whose first token takes longer fails the attempt there whatever this
+    /// budget says. Defaults to `300`. Loaded from
+    /// `[runner] turn_timeout_secs`.
+    pub turn_timeout_secs: u64,
 
     /// Whether to auto-compact the conversation when it grows large.
     ///
@@ -711,11 +940,37 @@ pub struct RunnerConfig {
     /// above 100 to 100. The meaningful range is `0..=100`.
     pub compact_threshold: u8,
 
+    /// Which compaction strategy automatic compaction runs.
+    ///
+    /// Selects the compactor the runner installs for the session: `qa`
+    /// (the default) runs the question/answer summarizer, `structured`
+    /// the sectioned summarizer, `rolling` the bounded aging pass, and
+    /// `truncating` the plain oldest-drop that spends no model calls.
+    /// The selection is strict — no other compactor ever runs in the
+    /// chosen one's place: a stage whose model call fails fails its
+    /// pass, the engine defers while the payload fits the window, and
+    /// the next turn retries the same compactor. Loaded from
+    /// `[runner] compactor`.
+    pub compactor: CompactorSelection,
+
     /// When to prompt the user before side-effecting actions.
     ///
     /// Controls how autonomously the agent may act. Defaults to
     /// [`PermissionMode::Auto`]. See [`PermissionMode`].
     pub permission_mode: PermissionMode,
+
+    /// Whether independent tool calls in one response dispatch
+    /// concurrently.
+    ///
+    /// When `true` (the default), a response carrying several tool calls
+    /// runs its concurrency-safe subset at once — the engine's wave
+    /// planner still serializes every call that is not safe to overlap,
+    /// so turning this off only trades throughput for strictly
+    /// one-at-a-time execution. Loaded from `[runner]
+    /// parallel_tool_dispatch`; a section without the key keeps the
+    /// default via the container-level serde default, which reads this
+    /// struct's own [`Default`] impl rather than the type's.
+    pub parallel_tool_dispatch: bool,
 
     /// Which role the agent takes on for this session.
     ///
@@ -751,6 +1006,42 @@ pub struct RunnerConfig {
     /// session/run configuration — path containment is a tool-layer concern.
     #[serde(default)]
     pub unsafe_paths: bool,
+
+    /// Line ceiling one `Read` (or one file inside a `ReadFiles` batch)
+    /// may return.
+    ///
+    /// A file longer than this is cut with a marker naming the continuation
+    /// offset, so the model pages the remainder. The default of `1200`
+    /// covers a long documentation file in one call; raising it trades
+    /// context spend per read for fewer paging round-trips, lowering it
+    /// forces more, smaller windows. Values below 1 are floored to 1 by
+    /// the underlying tool builder. Loaded from `[runner] read_max_lines`.
+    pub read_max_lines: usize,
+
+    /// Byte ceiling on the joined, line-numbered output of one read.
+    ///
+    /// The real bound on a single file view — a single minified line or a
+    /// full window of wide lines cuts here even under the line ceiling,
+    /// on the last complete line, with the continuation offset in the
+    /// marker. The default is `49_152` bytes, which keeps one file view
+    /// inside [`max_tool_output_chars`](Self::max_tool_output_chars) so the
+    /// read's own continuation-naming marker is the one that fires. Values
+    /// below 1 are floored to 1 by the underlying tool builder. Loaded from
+    /// `[runner] read_max_bytes`.
+    pub read_max_bytes: usize,
+
+    /// Character ceiling on one dispatched tool result.
+    ///
+    /// The conversation-level bound a tool cannot exceed: installed as the
+    /// dispatch pipeline's outermost cap, so no single result can spend more
+    /// of the model's context than this whatever the tool returned. A result
+    /// over the ceiling keeps its leading characters plus a `[truncated]`
+    /// marker, so a cut reads as a cut rather than passing as the tool's
+    /// whole output. `0` disables the cap, which also lifts the ordering
+    /// requirement on
+    /// [`read_max_bytes`](Self::read_max_bytes). Loaded from `[runner]
+    /// max_tool_output_chars`.
+    pub max_tool_output_chars: usize,
 }
 
 /// A user-supplied replacement for one [`Role`]'s built-in prose.
@@ -910,10 +1201,12 @@ impl Default for ApiConfig {
             api_type: ApiType::default(),
             api_key: None,
             max_tokens: 32_000,
-            context_window: 200_000,
+            context_window: None,
             request_timeout_secs: 120,
             fallback_model: None,
             azure_resource: None,
+            reasoning_effort: None,
+            prompt_cache: true,
         }
     }
 }
@@ -923,7 +1216,9 @@ impl Default for DisplayConfig {
         Self {
             no_color: false,
             verbosity: Verbosity::default(),
-            theme: "transparent".to_string(),
+            theme: "default".to_string(),
+            strip_position: StripPosition::default(),
+            strip_style: StripStyle::default(),
             mouse_capture: true,
             copy_command: None,
         }
@@ -934,12 +1229,18 @@ impl Default for RunnerConfig {
     fn default() -> Self {
         Self {
             max_turns: 200,
+            turn_timeout_secs: 300,
             auto_compact: true,
             compact_threshold: 80,
+            compactor: CompactorSelection::Qa,
             permission_mode: PermissionMode::default(),
+            parallel_tool_dispatch: true,
             role: Role::default(),
             role_overrides: Vec::new(),
             unsafe_paths: false,
+            read_max_lines: 1200,
+            read_max_bytes: DEFAULT_READ_MAX_BYTES,
+            max_tool_output_chars: DEFAULT_MAX_TOOL_OUTPUT_CHARS,
         }
     }
 }
@@ -971,8 +1272,9 @@ impl DchConfig {
     ///
     /// # Errors
     ///
-    /// Returns an error only if a present config file is unreadable or
-    /// malformed. A missing config directory yields defaults.
+    /// Returns an error only if a present config file is unreadable,
+    /// malformed, or carries a value the loader rejects. A missing config
+    /// directory yields defaults.
     pub fn load() -> Result<Self, DchConfigError> {
         Self::load_from_dir(&config_dir())
     }
@@ -990,14 +1292,78 @@ impl DchConfig {
         let local = dir.join("config.local.toml");
         if local.exists() {
             let content = std::fs::read_to_string(&local)?;
-            return Ok(toml::from_str(&content)?);
+            return Self::from_toml_str(&content);
         }
         let main = dir.join("config.toml");
         if main.exists() {
             let content = std::fs::read_to_string(&main)?;
-            return Ok(toml::from_str(&content)?);
+            return Self::from_toml_str(&content);
         }
         Ok(Self::default())
+    }
+
+    /// Parse configuration from TOML text, rejecting values the runtime
+    /// would silently rewrite.
+    ///
+    /// The one entry from configuration text to a usable config: parsing
+    /// and validation are a single operation, so no loader can deserialize
+    /// a file and then forget to check it. Every route to a config — the
+    /// default directory search, an explicit `--config` file — arrives
+    /// here. The defaults and every accepted value pass through untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DchConfigError::Parse`] for malformed TOML and
+    /// [`DchConfigError::Invalid`] for a field below the bound its consumer
+    /// enforces.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use dch_config::DchConfig;
+    ///
+    /// let config = DchConfig::from_toml_str("[api]\nmodel = \"m\"\n").unwrap();
+    /// assert_eq!(config.api.model, "m");
+    /// ```
+    pub fn from_toml_str(text: &str) -> Result<Self, DchConfigError> {
+        let config: Self = toml::from_str(text)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Reject values whose silently-substituted behavior would contradict
+    /// the documented contract.
+    ///
+    /// Runs after deserialization on every load, so a value the runtime
+    /// would quietly rewrite surfaces as a startup error naming the field,
+    /// the value, and the bound it violated. Reached only through
+    /// [`from_toml_str`](Self::from_toml_str), which is what makes the
+    /// guarantee hold on every route a file takes to reach the runner.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DchConfigError::Invalid`] when a field sits below the floor
+    /// its consumer enforces, or when a read ceiling is set above the
+    /// dispatch output cap.
+    fn validate(&self) -> Result<(), DchConfigError> {
+        if self.runner.turn_timeout_secs < TURN_TIMEOUT_FLOOR_SECS {
+            return Err(DchConfigError::Invalid(format!(
+                "turn_timeout_secs = {} is below the {}-second floor: the stream handler \
+                 replaces a smaller whole-stream budget with its first-event window, so the \
+                 configured value would never run",
+                self.runner.turn_timeout_secs, TURN_TIMEOUT_FLOOR_SECS
+            )));
+        }
+        let cap = self.runner.max_tool_output_chars;
+        if cap != 0 && self.runner.read_max_bytes > cap {
+            return Err(DchConfigError::Invalid(format!(
+                "read_max_bytes = {} exceeds max_tool_output_chars = {cap}: a whole file view \
+                 could never be delivered, so the dispatch cap would always cut it before the \
+                 read's own continuation marker could name where reading continues",
+                self.runner.read_max_bytes
+            )));
+        }
+        Ok(())
     }
 
     /// Map the session-scoped fields to a [`loopctl::config::SessionConfig`].
@@ -1022,7 +1388,7 @@ impl DchConfig {
     /// use dch_config::DchConfig;
     ///
     /// let mut c = DchConfig::default();
-    /// c.api.context_window = 128_000;
+    /// c.api.context_window = Some(128_000);
     /// let sc = c.to_session_config();
     /// assert_eq!(sc.context_window, 128_000);
     /// ```
@@ -1030,7 +1396,7 @@ impl DchConfig {
     pub fn to_session_config(&self) -> loopctl::config::SessionConfig {
         loopctl::config::SessionConfig {
             system_prompt: None,
-            context_window: self.api.context_window,
+            context_window: self.api.context_window.unwrap_or(FALLBACK_CONTEXT_WINDOW),
             compact_threshold: self.runner.compact_threshold.min(100),
             auto_compact: self.runner.auto_compact,
         }
@@ -1038,9 +1404,11 @@ impl DchConfig {
 
     /// Map the per-run fields to a [`loopctl::engine::RunConfig`].
     ///
-    /// Carries `max_turns` — the per-run turn budget. Other `RunConfig` fields
-    /// (parallel dispatch, manager reset) are left at loopctl's defaults; they
-    /// have no equivalent in [`RunnerConfig`] today.
+    /// Carries `max_turns` — the per-run turn budget — and the dispatch
+    /// mode from [`RunnerConfig::parallel_tool_dispatch`] (mode only; the
+    /// concurrency cap stays loopctl's default). The remaining
+    /// `RunConfig` fields (manager reset) are left at loopctl's defaults;
+    /// they have no equivalent in [`RunnerConfig`] today.
     ///
     /// # Examples
     ///
@@ -1051,14 +1419,44 @@ impl DchConfig {
     /// c.runner.max_turns = 50;
     /// let rc = c.to_run_config();
     /// assert_eq!(rc.max_turns, 50);
+    /// assert!(matches!(
+    ///     rc.parallel_tool_dispatch.mode,
+    ///     loopctl::config::ParallelMode::Parallel
+    /// ));
     /// ```
     #[must_use]
     pub fn to_run_config(&self) -> loopctl::engine::RunConfig {
         let mut rc = loopctl::engine::RunConfig::default();
         rc.max_turns = self.runner.max_turns;
+        rc.parallel_tool_dispatch.mode = if self.runner.parallel_tool_dispatch {
+            loopctl::config::ParallelMode::Parallel
+        } else {
+            loopctl::config::ParallelMode::Sequential
+        };
         rc
     }
 }
+
+/// The smallest accepted `[runner] turn_timeout_secs` value, in seconds.
+///
+/// The stream handler floors a whole-stream budget at its first-event
+/// window of this length, so a configured total below the bound would be
+/// silently replaced rather than honored; the loader rejects it instead.
+const TURN_TIMEOUT_FLOOR_SECS: u64 = 120;
+
+/// Default byte ceiling on one read's joined output.
+///
+/// Sized to stay under [`DEFAULT_MAX_TOOL_OUTPUT_CHARS`], so a whole file
+/// view reaches the model carrying the read tool's own continuation marker
+/// rather than being cut by the dispatch cap's generic one.
+const DEFAULT_READ_MAX_BYTES: usize = 49_152;
+
+/// Default character ceiling on one dispatched tool result.
+///
+/// Roughly a sixteenth of a mid-sized context window: large enough that a
+/// legitimate documentation read lands whole, small enough that one flooded
+/// call cannot spend a model's whole conversation.
+const DEFAULT_MAX_TOOL_OUTPUT_CHARS: usize = 65_536;
 
 /// Resolve the config directory (`~/.dch`).
 ///
@@ -1093,6 +1491,342 @@ mod tests {
         );
     }
 
+    /// Collect the key names a serialized value carries, descending
+    /// tables and arrays of tables.
+    ///
+    /// Sections, their fields, and the fields inside each array entry
+    /// all count as knobs, so a nested field the surface walk never
+    /// saw is demanded like any other.
+    fn collect_knobs(value: &serde_json::Value, names: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(table) => {
+                for (key, inner) in table {
+                    names.push(key.clone());
+                    collect_knobs(inner, names);
+                }
+            }
+            serde_json::Value::Array(entries) => {
+                for entry in entries {
+                    collect_knobs(entry, names);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether the sample spells `name` as a configuration key.
+    ///
+    /// A line counts only where the knob appears in one of TOML's key
+    /// spellings — `name =`, a `[section]` header, or an
+    /// `[[array.entry]]` header — commented or not. A prose mention
+    /// satisfies none of them, which is the teeth the sweep exists
+    /// for.
+    fn sample_documents(sample: &str, name: &str) -> bool {
+        sample.lines().any(|line| {
+            let trimmed = line.trim();
+            let spelled = trimmed.strip_prefix("# ").unwrap_or(trimmed);
+            if let Some(header) = spelled.strip_prefix('[') {
+                return header
+                    .trim_end_matches(']')
+                    .trim_matches(['[', ']'])
+                    .split('.')
+                    .any(|segment| segment == name);
+            }
+            spelled.starts_with(&format!("{name} =")) || spelled.starts_with(&format!("{name}="))
+        })
+    }
+
+    /// Knobs of `config` the sample never spells as a key.
+    ///
+    /// The report drives the example-config sweep: an empty list is
+    /// the passing verdict, and each entry names a knob whose
+    /// documentation is missing or merely prose.
+    fn undocumented_knobs(sample: &str, config: &DchConfig) -> Vec<String> {
+        let mut names = Vec::new();
+        collect_knobs(
+            &serde_json::to_value(config).expect("the config serializes"),
+            &mut names,
+        );
+        names.sort();
+        names.dedup();
+        names
+            .into_iter()
+            .filter(|name| !sample_documents(sample, name))
+            .collect()
+    }
+
+    /// The default config plus one role override and one technology.
+    ///
+    /// The default's nested tables are empty, so a walk of it sees
+    /// `role_overrides` but never the fields inside an entry; the
+    /// fixture contributes those names mechanically.
+    fn config_with_nested_entries() -> DchConfig {
+        let mut config = DchConfig::default();
+        config.runner.role_overrides.push(RoleOverride {
+            role: Role::Coding,
+            prompt: "plan the work".to_string(),
+        });
+        config.project.techs.push(TechProfile {
+            language: "rust".to_string(),
+            build: Some("cargo build".to_string()),
+            test: None,
+            lint: None,
+            conventions: None,
+        });
+        config
+    }
+
+    #[test]
+    fn from_toml_str_rejects_a_turn_timeout_below_the_floor() {
+        let err = DchConfig::from_toml_str("[runner]\nturn_timeout_secs = 119\n").unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                DchConfigError::Invalid(message)
+                    if message.contains("turn_timeout_secs = 119") && message.contains("120")
+            ),
+            "the rejection names the value and the floor: {err:?}"
+        );
+    }
+
+    #[test]
+    fn from_toml_str_loads_a_turn_timeout_at_the_floor() {
+        let config = DchConfig::from_toml_str("[runner]\nturn_timeout_secs = 120\n").unwrap();
+        assert_eq!(
+            config.runner.turn_timeout_secs, 120,
+            "the floor itself is an accepted budget"
+        );
+    }
+
+    #[test]
+    fn the_output_cap_defaults_and_round_trips() {
+        assert_eq!(
+            DchConfig::default().runner.max_tool_output_chars,
+            DEFAULT_MAX_TOOL_OUTPUT_CHARS,
+            "the shipped default is the documented ceiling on one tool result"
+        );
+        let configured = DchConfig::from_toml_str("[runner]\nmax_tool_output_chars = 131072\n")
+            .expect("a configured cap loads");
+        assert_eq!(configured.runner.max_tool_output_chars, 131_072);
+        let disabled =
+            DchConfig::from_toml_str("[runner]\nmax_tool_output_chars = 0\n").expect("0 parses");
+        assert_eq!(
+            disabled.runner.max_tool_output_chars, 0,
+            "0 is the documented disable sentinel, not a rejected value"
+        );
+    }
+
+    #[test]
+    fn a_per_file_read_ceiling_above_the_output_cap_fails_the_load() {
+        let err = DchConfig::from_toml_str(
+            "[runner]\nread_max_bytes = 65537\nmax_tool_output_chars = 65536\n",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                DchConfigError::Invalid(message)
+                    if message.contains("read_max_bytes = 65537")
+                        && message.contains("65536")
+            ),
+            "the rejection names the value and the cap it contradicts: {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_per_file_read_ceiling_at_the_output_cap_loads() {
+        let config = DchConfig::from_toml_str(
+            "[runner]\nread_max_bytes = 4096\nmax_tool_output_chars = 4096\n",
+        )
+        .expect("a read ceiling exactly at the cap is coherent");
+        assert_eq!(config.runner.read_max_bytes, 4096);
+        assert_eq!(
+            config.runner.max_tool_output_chars, 4096,
+            "the rule orders the ceilings, it does not ban a whole-file view \
+             that fills one result exactly"
+        );
+    }
+
+    #[test]
+    fn a_zero_output_cap_skips_the_coherence_check() {
+        let config = DchConfig::from_toml_str(
+            "[runner]\nread_max_bytes = 4194304\nmax_tool_output_chars = 0\n",
+        )
+        .expect("with the cap off there is nothing to contradict");
+        assert_eq!(config.runner.read_max_bytes, 4_194_304);
+        assert_eq!(
+            config.runner.max_tool_output_chars, 0,
+            "a disabled cap imposes no ordering on the read ceiling"
+        );
+    }
+
+    #[test]
+    fn the_default_read_byte_ceiling_sits_under_the_output_cap() {
+        assert_eq!(
+            (DEFAULT_READ_MAX_BYTES, DEFAULT_MAX_TOOL_OUTPUT_CHARS),
+            (49152, 65536),
+            "the shipped default pair keeps the byte ceiling under the \
+             output cap the coherence check protects"
+        );
+        let config = DchConfig::default();
+        assert!(
+            config.runner.read_max_bytes <= config.runner.max_tool_output_chars,
+            "the default config itself satisfies the rule it enforces on users"
+        );
+    }
+
+    #[test]
+    fn the_knob_walk_descends_into_nested_tables() {
+        let fixture = config_with_nested_entries();
+        let without_nested = concat!(
+            "# [[runner.role_overrides]]\n",
+            "# role = \"coding\"\n",
+            "# [[project.techs]]\n",
+            "# language = \"rust\"\n",
+        );
+        let report = undocumented_knobs(without_nested, &fixture);
+        for nested in ["prompt", "build", "test", "lint", "conventions"] {
+            assert!(
+                report.iter().any(|name| name == nested),
+                "the walk demands the nested `{nested}` a flat sweep never saw: {report:?}"
+            );
+        }
+        let with_nested = concat!(
+            "# [[runner.role_overrides]]\n",
+            "# role = \"coding\"\n",
+            "# prompt = \"plan the work\"\n",
+            "# [[project.techs]]\n",
+            "# language = \"rust\"\n",
+            "# build = \"cargo build\"\n",
+            "# test = \"cargo test\"\n",
+            "# lint = \"cargo clippy\"\n",
+            "# conventions = \"none\"\n",
+        );
+        let report = undocumented_knobs(with_nested, &fixture);
+        for nested in ["prompt", "build", "test", "lint", "conventions"] {
+            assert!(
+                !report.iter().any(|name| name == nested),
+                "a key-shaped `{nested} =` line documents the nested knob: {report:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_prose_mention_does_not_count_as_documenting_a_knob() {
+        let prose = "# raise compact_threshold when sessions run long\n";
+        let report = undocumented_knobs(prose, &DchConfig::default());
+        assert!(
+            report.iter().any(|name| name == "compact_threshold"),
+            "a prose mention is not a key-shaped spelling: {report:?}"
+        );
+        let keyed = "# compact_threshold = 80\n";
+        let report = undocumented_knobs(keyed, &DchConfig::default());
+        assert!(
+            !report.iter().any(|name| name == "compact_threshold"),
+            "the key-shaped spelling documents the knob: {report:?}"
+        );
+    }
+
+    #[test]
+    fn the_example_config_documents_every_configured_knob() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../example.config");
+        let sample = std::fs::read_to_string(path).expect("example.config is readable");
+        toml::from_str::<DchConfig>(&sample).expect("example.config parses as a config");
+        let report = undocumented_knobs(&sample, &config_with_nested_entries());
+        assert!(
+            report.is_empty(),
+            "every knob the walk can see must appear in a key-shaped spelling: {report:?}"
+        );
+        // reasoning_effort skip-serializes when unset, so the walk
+        // cannot see it; its presence is asserted by name.
+        assert!(
+            sample_documents(&sample, "reasoning_effort"),
+            "example.config must document the `reasoning_effort` knob"
+        );
+    }
+
+    #[test]
+    fn strip_style_parses_with_a_breathe_default() {
+        let display: DisplayConfig = toml::from_str(r#"theme = "dracula""#).unwrap();
+        assert_eq!(
+            display.strip_style,
+            StripStyle::Breathe,
+            "a config without the field keeps the breathing animation"
+        );
+        let display: DisplayConfig = toml::from_str(r#"strip_style = "sweep""#).unwrap();
+        assert_eq!(
+            display.strip_style,
+            StripStyle::Sweep,
+            "the left-anchored fill parses from its lowercase name"
+        );
+        let display: DisplayConfig = toml::from_str(r#"strip_style = "bounce""#).unwrap();
+        assert_eq!(
+            display.strip_style,
+            StripStyle::Bounce,
+            "the two-way sweep parses from its lowercase name"
+        );
+        let display: DisplayConfig = toml::from_str(r#"strip_style = "travel""#).unwrap();
+        assert_eq!(
+            display.strip_style,
+            StripStyle::Travel,
+            "the gliding scanner parses from its lowercase name"
+        );
+        let display: DisplayConfig = toml::from_str(r#"strip_style = "snake""#).unwrap();
+        assert_eq!(
+            display.strip_style,
+            StripStyle::Snake,
+            "the circulating segment parses from its lowercase name"
+        );
+        let display: DisplayConfig = toml::from_str(r#"strip_style = "worm""#).unwrap();
+        assert_eq!(
+            display.strip_style,
+            StripStyle::Worm,
+            "the inchworm crawl parses from its lowercase name"
+        );
+        let display: DisplayConfig = toml::from_str(r#"strip_style = "worm-large""#).unwrap();
+        assert_eq!(
+            display.strip_style,
+            StripStyle::WormLarge,
+            "the full-row worm parses from its hyphenated name"
+        );
+        let display: DisplayConfig = toml::from_str(r#"strip_style = "off""#).unwrap();
+        assert_eq!(
+            display.strip_style,
+            StripStyle::Off,
+            "the absent strip parses from its lowercase name"
+        );
+        let display: DisplayConfig = toml::from_str(r#"strip_style = "glow""#).unwrap();
+        assert_eq!(
+            display.strip_style,
+            StripStyle::Glow,
+            "the breathing static bar parses from its lowercase name"
+        );
+        assert!(
+            toml::from_str::<DisplayConfig>(r#"strip_style = "spin""#).is_err(),
+            "an unknown style fails the load instead of falling back"
+        );
+    }
+
+    #[test]
+    fn strip_position_parses_with_a_composer_default() {
+        let display: DisplayConfig = toml::from_str(r#"theme = "dracula""#).unwrap();
+        assert_eq!(
+            display.strip_position,
+            StripPosition::Composer,
+            "a config without the field keeps the composer placement"
+        );
+        let display: DisplayConfig = toml::from_str(r#"strip_position = "top""#).unwrap();
+        assert_eq!(
+            display.strip_position,
+            StripPosition::Top,
+            "the dedicated top row parses from its lowercase name"
+        );
+        assert!(
+            toml::from_str::<DisplayConfig>(r#"strip_position = "middle""#).is_err(),
+            "an unknown placement fails the load instead of falling back"
+        );
+    }
+
     #[test]
     fn a_config_without_the_mouse_field_parses_to_capture() {
         let display: DisplayConfig = toml::from_str(r#"theme = "dracula""#).unwrap();
@@ -1110,6 +1844,7 @@ context_window = 128000
 request_timeout_secs = 60
 fallback_model = "glm-4.7-flash"
 azure_resource = "my-resource"
+reasoning_effort = "low"
 
 [[mcp.servers]]
 name = "docs"
@@ -1127,6 +1862,7 @@ theme = "dracula"
 
 [runner]
 max_turns = 100
+turn_timeout_secs = 600
 auto_compact = false
 compact_threshold = 75
 permission_mode = "accept_edits"
@@ -1158,12 +1894,37 @@ redact_secrets = false
         assert_eq!(c.api.max_tokens, 32_000);
         assert_eq!(c.api.request_timeout_secs, 120);
         assert_eq!(c.display.verbosity, Verbosity::Normal);
-        assert_eq!(c.display.theme, "transparent");
+        assert_eq!(c.display.theme, "default");
         assert_eq!(c.runner.max_turns, 200);
+        assert_eq!(c.runner.turn_timeout_secs, 300);
         assert_eq!(c.runner.compact_threshold, 80);
+        assert_eq!(c.runner.compactor, CompactorSelection::Qa);
         assert_eq!(c.runner.permission_mode, PermissionMode::Auto);
         assert_eq!(c.telemetry.level, "info");
         assert!(c.security.redact_secrets);
+    }
+
+    #[test]
+    fn the_default_compactor_is_qa_and_every_spelling_loads() {
+        assert_eq!(
+            RunnerConfig::default().compactor,
+            CompactorSelection::Qa,
+            "a config that never names a compactor runs the qa summarizer"
+        );
+        for (spelling, expected) in [
+            ("truncating", CompactorSelection::Truncating),
+            ("qa", CompactorSelection::Qa),
+            ("structured", CompactorSelection::Structured),
+            ("rolling", CompactorSelection::Rolling),
+        ] {
+            let parsed: RunnerConfig =
+                toml::from_str(&format!("compactor = \"{spelling}\"")).unwrap();
+            assert_eq!(parsed.compactor, expected);
+        }
+        assert!(
+            toml::from_str::<RunnerConfig>("compactor = \"beam\"").is_err(),
+            "an unknown spelling fails the load instead of silently compacting another way"
+        );
     }
 
     #[test]
@@ -1179,6 +1940,7 @@ redact_secrets = false
         assert_eq!(c.api.max_tokens, 8192);
         assert_eq!(c.api.request_timeout_secs, 60);
         assert_eq!(c.api.fallback_model.as_deref(), Some("glm-4.7-flash"));
+        assert_eq!(c.api.reasoning_effort.as_deref(), Some("low"));
         assert_eq!(c.api.azure_resource.as_deref(), Some("my-resource"));
         assert_eq!(c.mcp.servers.len(), 1);
         assert_eq!(c.mcp.servers[0].name, "docs");
@@ -1197,6 +1959,7 @@ redact_secrets = false
         assert_eq!(c.display.theme, "dracula");
 
         assert_eq!(c.runner.max_turns, 100);
+        assert_eq!(c.runner.turn_timeout_secs, 600);
         assert!(!c.runner.auto_compact);
         assert_eq!(c.runner.compact_threshold, 75);
         assert_eq!(c.runner.permission_mode, PermissionMode::AcceptEdits);
@@ -1249,7 +2012,7 @@ redact_secrets = false
         write_config(tmp.path(), "config.local.toml", "[api]\nmodel = \"B\"\n");
         let c = DchConfig::load_from_dir(tmp.path()).unwrap();
         assert_eq!(c.api.model, "B");
-        assert_eq!(c.display.theme, "transparent");
+        assert_eq!(c.display.theme, "default");
     }
 
     #[test]
@@ -1258,6 +2021,40 @@ redact_secrets = false
         write_config(tmp.path(), "config.toml", "[api model = \"x\"\n");
         let err = DchConfig::load_from_dir(tmp.path()).unwrap_err();
         assert!(matches!(err, DchConfigError::Parse(_)));
+    }
+
+    #[test]
+    fn a_turn_timeout_below_the_first_event_floor_fails_the_load() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_config(
+            tmp.path(),
+            "config.toml",
+            "[runner]\nturn_timeout_secs = 119\n",
+        );
+        let err = DchConfig::load_from_dir(tmp.path()).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                DchConfigError::Invalid(message)
+                    if message.contains("turn_timeout_secs = 119") && message.contains("120")
+            ),
+            "the rejection names the value and the floor: {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_turn_timeout_at_the_first_event_floor_loads() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_config(
+            tmp.path(),
+            "config.toml",
+            "[runner]\nturn_timeout_secs = 120\n",
+        );
+        let c = DchConfig::load_from_dir(tmp.path()).unwrap();
+        assert_eq!(
+            c.runner.turn_timeout_secs, 120,
+            "the floor itself is an accepted budget"
+        );
     }
 
     #[test]
@@ -1286,6 +2083,48 @@ redact_secrets = false
         let c = DchConfig::load_from_dir(tmp.path()).unwrap();
         let rc = c.to_run_config();
         assert_eq!(rc.max_turns, 100);
+    }
+
+    #[test]
+    fn parallel_dispatch_defaults_to_parallel_at_loopctl_concurrency() {
+        let rc = DchConfig::default().to_run_config();
+        assert!(
+            matches!(
+                rc.parallel_tool_dispatch.mode,
+                loopctl::config::ParallelMode::Parallel
+            ),
+            "the default config must turn the wave planner on"
+        );
+        assert_eq!(
+            rc.parallel_tool_dispatch.max_concurrency, 8,
+            "the concurrency cap stays loopctl's default"
+        );
+    }
+
+    #[test]
+    fn a_parallel_dispatch_opt_out_parses_and_maps_to_sequential() {
+        let c: DchConfig = toml::from_str("[runner]\nparallel_tool_dispatch = false\n").unwrap();
+        assert!(!c.runner.parallel_tool_dispatch);
+        let rc = c.to_run_config();
+        assert!(matches!(
+            rc.parallel_tool_dispatch.mode,
+            loopctl::config::ParallelMode::Sequential
+        ));
+    }
+
+    #[test]
+    fn unknown_runner_keys_still_load() {
+        let c: DchConfig = toml::from_str("[runner]\nmystery_knob = \"x\"\n").unwrap();
+        assert_eq!(c.runner.max_turns, 200);
+    }
+
+    #[test]
+    fn a_runner_section_without_the_dispatch_key_stays_parallel() {
+        let c: DchConfig = toml::from_str("[runner]\nmax_turns = 50\n").unwrap();
+        assert!(
+            c.runner.parallel_tool_dispatch,
+            "a missing key must keep the default, not fall to the bool default"
+        );
     }
 
     #[test]
@@ -1382,7 +2221,7 @@ redact_secrets = false
         let c = DchConfig::default();
         let _sc = c.to_session_config();
         assert_eq!(c.api.base_url, "");
-        assert_eq!(c.display.theme, "transparent");
+        assert_eq!(c.display.theme, "default");
         assert_eq!(c.runner.permission_mode, PermissionMode::Auto);
         assert_eq!(c.telemetry.level, "info");
     }
