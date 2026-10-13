@@ -17,8 +17,9 @@
 //!   can all observe the same run.
 //! - **Middleware** ([`ToolMiddleware`]) — intercepts every tool dispatch
 //!   and may rewrite the context, the output, or the control flow. This is
-//!   where the runner installs its context injector, the permission gate,
-//!   and (unless disabled) the secrets-redaction pass.
+//!   where the runner installs its context injector, the whole-result
+//!   output cap, the permission gate, and (unless disabled) the
+//!   secrets-redaction pass.
 //!
 //! Tools reach per-call state (the working directory, the todo list, the
 //! optional question channel) through a [`RunnerContext`] extension. The
@@ -38,6 +39,15 @@ use std::sync::Arc;
 use dch_tools::ResolvePolicy;
 use dch_tools::RunnerContext;
 use dch_tools::builtin_registry;
+use loopctl::compact::ContextCompactor;
+use loopctl::compact::ContextManager;
+use loopctl::compact::TruncatingCompactor;
+use loopctl::compact::qa_summarizer::QaSummarizer;
+use loopctl::compact::qa_summarizer::QaSummarizerConfig;
+use loopctl::compact::rolling::RollingCompactor;
+use loopctl::compact::rolling::RollingConfig;
+use loopctl::compact::structured_summarizer::StructuredSummarizer;
+use loopctl::compact::structured_summarizer::StructuredSummaryConfig;
 use loopctl::engine::BareLoop;
 use loopctl::engine::Loop;
 use loopctl::engine::LoopMachine;
@@ -51,13 +61,14 @@ use loopctl::mcp::McpClient;
 use loopctl::mcp::McpToolProvider;
 use loopctl::message::Message;
 use loopctl::middleware::AskResolverFn;
+use loopctl::middleware::OutputLimitMiddleware;
 use loopctl::middleware::PermissionMiddleware;
-use loopctl::middleware::RedactingMiddleware;
-use loopctl::middleware::SecretPatternSet;
 use loopctl::middleware::ToolDispatchContext;
 use loopctl::middleware::ToolMiddleware;
 use loopctl::middleware::ToolPipeline;
 use loopctl::observer::LoopObserver;
+use loopctl::stream::handler::StreamHandler;
+use loopctl::stream::handler::StreamTimeoutConfig;
 use loopctl::tool::Tool;
 use loopctl::tool::ToolRegistry;
 use loopctl::tool::builtin::fs::FileSession;
@@ -69,6 +80,7 @@ use crate::detect_tech_stack;
 use crate::merge_by_language;
 use crate::permission::permission_layer;
 use crate::permission::tools_mode;
+use crate::question_bridge::QuestionPath;
 use crate::with_context;
 
 /// The top-level agent: the single type the rest of the application holds.
@@ -100,14 +112,22 @@ pub struct Runner {
     /// statically dispatched.
     inner: BareLoop<DchClient>,
 
+    /// The window one request may carry, as this runner resolved it.
+    ///
+    /// The explicit config value, the provider's answer, or the
+    /// fallback — in that precedence — captured once at construction
+    /// so the display's context bar and any consumer can read the
+    /// same denominator the thresholds enforce.
+    context_window: u64,
+
     /// The shared per-runner context, cloned into every tool dispatch.
     ///
     /// Built from `workdir` in [`RunnerBuilder::build`] and carried by the
     /// private context-injector middleware in the dispatch pipeline, so every
     /// builtin tool reaches `cwd`, the todo list, and the question channel
     /// slot through the `ToolContext` extension. Exposed via
-    /// [`Runner::context`] for host wiring, and mutated by
-    /// [`Runner::set_question_tx`].
+    /// [`Runner::context`] for host wiring, and mutated by the asking path
+    /// [`Runner::question_path`] hands out.
     context: Arc<RunnerContext>,
 
     /// The filesystem session the builtin file family dispatches through.
@@ -275,28 +295,49 @@ impl Runner {
     ///
     /// The returned `RunnerContext` exposes the shared todo list (behind an
     /// `Arc<Mutex<…>>`, so callers can mutate it) and the question channel
-    /// slot. Intended for host wiring and inspection — install the question
-    /// channel with [`Runner::set_question_tx`] rather than through this
-    /// accessor.
+    /// slot. Intended for host wiring and inspection — a host that asks the
+    /// user installs its channel through [`Runner::question_path`], or
+    /// through [`install_question_tx`](RunnerContext::install_question_tx) on
+    /// a clone when the installing task outlives this borrow.
     #[must_use]
     pub fn context(&self) -> &RunnerContext {
         &self.context
     }
 
-    /// Install the channel tools use to ask the user questions.
+    /// The engine's committed history, for snapshotting.
     ///
-    /// Intended for interactive hosts (a TUI) to plug in their question
-    /// receiver; a headless runner leaves the slot empty and the asking tool
-    /// errors rather than blocking. Every tool dispatch reads the slot live,
-    /// so the channel may also be installed or replaced between runs — a
-    /// later installation flips subsequent dispatches to interactive
-    /// immediately.
-    pub fn set_question_tx(&self, tx: std::sync::mpsc::Sender<dch_tools::QuestionRequest>) {
-        *self
-            .context
-            .question_tx
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tx);
+    /// The messages the loop has fully committed — never an in-flight
+    /// turn's partials — which is exactly the working set a resume
+    /// must seed from to continue this session process-identically.
+    /// Read after a run resolves, so the snapshot carries every turn
+    /// the completed submission produced.
+    #[must_use]
+    pub fn committed_history(&self) -> Vec<Message> {
+        self.inner.machine().history().to_vec()
+    }
+
+    /// The context window this runner's thresholds divide by.
+    ///
+    /// The resolved value — explicit config over provider discovery
+    /// over the fallback — as fed into the session config at
+    /// construction.
+    #[must_use]
+    pub fn context_window(&self) -> u64 {
+        self.context_window
+    }
+
+    /// This runner's handle on the path its tools ask questions through.
+    ///
+    /// An interactive host calls [`supervise`](QuestionPath::supervise) on
+    /// the returned handle to put its prompt stream in place and keep it
+    /// there for the session's whole life; a headless host asks for nothing,
+    /// leaving the slot empty so the asking tool refuses rather than
+    /// blocking. The handle shares this runner's context, and every tool
+    /// dispatch reads the asking slot live, so an installation takes effect
+    /// on the next call.
+    #[must_use]
+    pub fn question_path(&self) -> QuestionPath {
+        QuestionPath::new(Arc::clone(&self.context))
     }
 }
 
@@ -457,8 +498,14 @@ impl RunnerBuilder<'_> {
     /// Constructs the provider client, composes the system prompt (role,
     /// tech stack detected under the workdir merged with `[project]`
     /// overrides, per-tool fragments), builds the dispatch pipeline
-    /// (context injector → permission gate → host middleware → secrets
-    /// redaction when enabled → builtin tools), and — when
+    /// (context injector → whole-result output cap → permission gate →
+    /// host middleware → secrets redaction when enabled → builtin tools),
+    /// installs the compactor
+    /// `[runner] compactor` selects (the qa summarizer by default, bound
+    /// to the same client the conversation itself uses), installs the
+    /// resilient stream handler (retry ladder with jittered backoff,
+    /// rate-limit backoff, non-streaming transport fallback — a transient
+    /// stream failure retries instead of failing the run), and — when
     /// `api.fallback_model` is configured — arms the model fallback
     /// breaker so a failing primary is routed around automatically.
     ///
@@ -477,19 +524,44 @@ impl RunnerBuilder<'_> {
         let fs_session = FileSession::new(self.workdir.clone())
             .with_resolve_policy(fs_resolve_policy_for(&self.config.runner));
 
-        let client = crate::create_client(&self.config.api)?;
+        let client = Arc::new(crate::create_client(&self.config.api)?);
         let connections = connect_mcp_servers(self.config, &context.cwd).await?;
-        let mut registry = compose_registry(&connections, &fs_session);
-        let mut core_registry = compose_registry(&connections, &fs_session);
+        let read_windows = read_windows_for(&self.config.runner);
+        let mut registry = compose_registry(&connections, &fs_session, read_windows);
+        let mut core_registry = compose_registry(&connections, &fs_session, read_windows);
         for provider in &self.mcp_providers {
             provider.register_into(&mut registry);
             provider.register_into(&mut core_registry);
         }
 
-        let session_config = build_session(self.config, &registry, &self.workdir);
+        let mut session_config = build_session(self.config, &registry, &self.workdir);
+        let mut resolved_window = session_config.context_window;
+        if self.config.api.context_window.is_none()
+            && let Some(discovered) =
+                crate::context_probe::discover_window(&self.config.api, client.as_ref()).await
+        {
+            tracing::debug!(
+                window = discovered,
+                "context window discovered from the provider"
+            );
+            session_config.context_window = discovered;
+            resolved_window = discovered;
+        }
         let run_config = self.config.to_run_config();
 
-        let mut managers = LoopManagers::new();
+        let timeout_config = StreamTimeoutConfig {
+            total_stream_timeout: std::time::Duration::from_secs(
+                self.config.runner.turn_timeout_secs,
+            ),
+            ..StreamTimeoutConfig::default()
+        };
+        let mut managers = LoopManagers::new()
+            .with_stream_handler(StreamHandler::new().with_timeout_config(timeout_config))
+            .with_context_manager(Arc::new(context_manager_for(
+                self.config.runner.compactor,
+                &Arc::new(crate::provider::create_compactor_client(&self.config.api)?),
+                &session_config,
+            )));
         for observer in self.observers {
             managers.register_observer(observer);
         }
@@ -507,18 +579,20 @@ impl RunnerBuilder<'_> {
             &self.middleware,
             gate,
             self.config.security.redact_secrets,
+            self.config.runner.max_tool_output_chars,
             core_registry,
         )?);
 
         let inner = BareLoop::<DchClient>::from_machine_with_managers(
             LoopMachine::from_history(self.history),
             session_config,
-            Arc::new(client),
+            client,
             registry,
             managers,
         );
 
         Ok(Runner {
+            context_window: resolved_window,
             inner,
             context,
             fs_session,
@@ -563,9 +637,13 @@ async fn connect_mcp_servers(
     Ok(connections)
 }
 
-/// Connect an already-running MCP `client` as `server` and snapshot its
+/// Connect an already-running MCP `client` as `server` and snapshot
+/// its tools under the server's allowlist.
 ///
-/// tools under the server's allowlist.
+/// The provider is connected first; each allowlisted name is then
+/// checked against what the server actually exposed, so a listed
+/// name the server does not offer fails construction rather than
+/// silently dropping a tool.
 ///
 /// # Errors
 ///
@@ -603,9 +681,12 @@ async fn adopt_mcp_server(
     Ok(McpConnection { provider, allowed })
 }
 
-/// One connected MCP server and its containment policy.
+/// One connected MCP server, adapted into the registry alongside its
+/// containment policy.
 ///
-/// One connected MCP server and its containment policy.
+/// Built by [`adopt_mcp_server`] and consumed by [`compose_registry`]:
+/// the provider carries the discovered tools, the allowlist decides
+/// which of them a composition registers.
 struct McpConnection {
     /// The connected provider.
     ///
@@ -654,8 +735,12 @@ fn fs_resolve_policy_for(runner: &dch_config::RunnerConfig) -> FsResolvePolicy {
 /// registry and the dispatch pipeline's core cannot share boxed tools, so
 /// each gets its own composition from the same connections (an MCP tool
 /// clones into both, keeping the two positions identical by construction).
-fn compose_registry(connections: &[McpConnection], fs_session: &FileSession) -> ToolRegistry {
-    let mut registry = builtin_registry(fs_session);
+fn compose_registry(
+    connections: &[McpConnection],
+    fs_session: &FileSession,
+    windows: dch_tools::ReadWindows,
+) -> ToolRegistry {
+    let mut registry = builtin_registry(fs_session, windows);
     for connection in connections {
         match &connection.allowed {
             None => connection.provider.register_into(&mut registry),
@@ -669,6 +754,21 @@ fn compose_registry(connections: &[McpConnection], fs_session: &FileSession) -> 
         }
     }
     registry
+}
+
+/// The read-family window ceilings the config's `[runner]` section selects.
+///
+/// Maps the config fields straight onto dch-tools' [`ReadWindows`], keeping
+/// the runner the only place config becomes tool construction. The
+/// conversation's ceiling on one tool result doubles as the `ReadFiles`
+/// batch budget, so the per-file ceiling, the batch budget, and the
+/// dispatched-result cap come from one place and cannot drift apart.
+fn read_windows_for(runner: &dch_config::RunnerConfig) -> dch_tools::ReadWindows {
+    dch_tools::ReadWindows {
+        max_lines: runner.read_max_lines,
+        max_bytes: runner.read_max_bytes,
+        max_batch_bytes: runner.max_tool_output_chars,
+    }
 }
 
 /// Arm the model-fallback breaker for a primary/fallback pair.
@@ -691,6 +791,45 @@ fn arm_fallback(primary: &str, fallback: &str) -> Result<FallbackManager, Runner
     Ok(manager)
 }
 
+/// Build the context manager around exactly the compactor the
+/// configuration names.
+///
+/// The selection is the whole contract: `qa` runs the question/answer
+/// summarizer, `structured` the sectioned summarizer, `rolling` the
+/// bounded aging pass, and `truncating` the oldest-drop — each bound to
+/// the session's own client, the same conversation model, no second
+/// endpoint to configure. No other compactor ever runs in the selected
+/// one's place: a stage whose model call fails fails its pass, the
+/// engine's threshold machinery defers while the payload fits the
+/// window and retries on the next turn, and the emergency line ends the
+/// run honestly rather than silently swapping strategy. The manager
+/// carries the session's window and threshold exactly as the engine's
+/// implicit default would have, so the selection changes only the
+/// compactor, never the policy.
+fn context_manager_for(
+    selection: dch_config::CompactorSelection,
+    client: &Arc<DchClient>,
+    session_config: &loopctl::config::SessionConfig,
+) -> ContextManager {
+    let shared = Arc::clone(client) as loopctl::api::SharedApiClient;
+    let compactor: Arc<dyn ContextCompactor> = match selection {
+        dch_config::CompactorSelection::Truncating => Arc::new(TruncatingCompactor::default()),
+        dch_config::CompactorSelection::Qa => {
+            Arc::new(QaSummarizer::new(shared, QaSummarizerConfig::default()))
+        }
+        dch_config::CompactorSelection::Structured => Arc::new(StructuredSummarizer::new(
+            shared,
+            StructuredSummaryConfig::default(),
+        )),
+        dch_config::CompactorSelection::Rolling => {
+            Arc::new(RollingCompactor::new(shared, RollingConfig::default()))
+        }
+    };
+    ContextManager::new(compactor)
+        .with_context_window(session_config.context_window)
+        .with_threshold(session_config.compact_threshold)
+}
+
 /// Compose the session config — including the system prompt — for `config`.
 ///
 /// Maps the runner settings onto a [`loopctl::config::SessionConfig`], detects
@@ -701,8 +840,8 @@ fn arm_fallback(primary: &str, fallback: &str) -> Result<FallbackManager, Runner
 /// `session_config.system_prompt` before the [`BareLoop`] reads it.
 ///
 /// Extracted as a free function (rather than inlined in
-/// [`RunnerBuilder::build`]) so the
-/// composition can be unit-tested without constructing a provider client.
+/// [`RunnerBuilder::build`]) so the composition can be unit-tested without
+/// constructing a provider client.
 fn build_session(
     config: &dch_config::DchConfig,
     registry: &ToolRegistry,
@@ -723,15 +862,29 @@ fn build_session(
     session_config
 }
 
-/// Build the dispatch pipeline with the [`ContextInjector`] and the
-/// permission gate installed.
+/// Build the dispatch pipeline with the [`ContextInjector`], the whole-result
+/// output cap, and the permission gate installed.
 ///
 /// Layering, outermost first: the context injector (every layer below — and
-/// the tool — sees the enriched context), the permission gate (denials
-/// short-circuit before any host work), the host middleware in
-/// registration order, the secrets-redaction pass when `redact` is set
-/// (everything above observes scrubbed output), and the builtin-tool
-/// core.
+/// the tool — sees the enriched context), the whole-result output cap (a
+/// middleware's post-processing runs on the way back out, so sitting directly
+/// under the injector makes the cap the last word on any result a permission
+/// verdict allowed through, while a denied call never pays for it), the
+/// permission gate (denials short-circuit before any host work), the host
+/// middleware in registration order, then the write-protection layers installed by
+/// [`with_redaction`](crate::redaction_guard::with_redaction) when `redact`
+/// is set (the guard refuses whole-file writes over content the redactor
+/// hides; everything above them observes scrubbed output), and the
+/// builtin-tool core.
+///
+/// A `max_output_chars` of `0` skips the cap layer entirely rather than
+/// installing a no-op, so `middleware_names()` reports what actually runs.
+///
+/// A host's own capture middleware registers above the cap and therefore
+/// records the tool's pre-cap bytes, not the cut the model receives — the
+/// capture's own retention bound is the only ceiling the transcript
+/// honors, and a host that wants the delivered shape recorded must cap
+/// inside its capture rather than rely on this layer's position.
 ///
 /// The pipeline's core holds its own registry instance for execution while the
 /// [`BareLoop`] holds the one it advertises to the model; the registry stores
@@ -751,19 +904,22 @@ fn build_pipeline(
     middleware: &[Arc<dyn ToolMiddleware>],
     permission: PermissionMiddleware,
     redact: bool,
+    max_output_chars: usize,
     core_registry: ToolRegistry,
 ) -> Result<ToolPipeline, RunnerError> {
     let mut builder = ToolPipeline::builder().with_middleware(ContextInjector {
         context: Arc::clone(context),
         fs_session: fs_session.clone(),
     });
+    if max_output_chars != 0 {
+        builder = builder.with_middleware(OutputLimitMiddleware::new(max_output_chars));
+    }
     builder = builder.with_middleware(permission);
     for host_middleware in middleware {
         builder = builder.with_middleware_arc(Arc::clone(host_middleware));
     }
     if redact {
-        builder =
-            builder.with_middleware(RedactingMiddleware::new(SecretPatternSet::default_common()));
+        builder = crate::redaction_guard::with_redaction(builder);
     }
     builder
         .with_core(Arc::new(core_registry))
@@ -771,9 +927,8 @@ fn build_pipeline(
         .map_err(|e| RunnerError::Config(format!("dispatch pipeline: {e}")))
 }
 
-/// A dispatch middleware that populates the per-call tool context with the
-///
-/// shared [`RunnerContext`] before the tool runs.
+/// A dispatch middleware that populates the per-call tool context with
+/// the shared [`RunnerContext`] before the tool runs.
 ///
 /// The engine builds each dispatch's [`ToolContext`](loopctl::tool::ToolContext)
 /// with only the session id — no working directory, no interactivity flag, no
@@ -808,22 +963,27 @@ impl ToolMiddleware for ContextInjector {
     /// Augment the dispatch context, then continue down the pipeline.
     ///
     /// Installs the [`RunnerContext`] extension and the native `cwd` /
-    /// `is_non_interactive` fields (interactivity read live from the question
-    /// channel slot), then delegates via `next` — the injector adds no control
-    /// flow of its own and never short-circuits.
+    /// `is_non_interactive` fields, then delegates via `next` — the injector
+    /// adds no control flow of its own and never short-circuits.
+    /// Interactivity is read live off the question channel slot on every
+    /// dispatch, and it follows the sender's liveness rather than its
+    /// presence: a slot still holding a sender whose reader is gone answers
+    /// non-interactive, so a retired generation cannot advertise an asking
+    /// path the dispatches behind it cannot use.
     fn dispatch<'a>(
         &'a self,
         ctx: &'a mut ToolDispatchContext,
         next: &'a ToolPipeline,
     ) -> Pin<Box<dyn Future<Output = loopctl::middleware::ToolDispatchResult> + Send + 'a>> {
-        let has_channel = self
+        let asks_live = self
             .context
             .question_tx
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some();
+            .as_ref()
+            .is_some_and(|sender| !sender.is_closed());
         ctx.tool_context.cwd = self.context.cwd.to_string_lossy().into_owned();
-        ctx.tool_context.is_non_interactive = !has_channel;
+        ctx.tool_context.is_non_interactive = !asks_live;
         self.fs_session.attach(&mut ctx.tool_context);
         ctx.tool_context.set_extension((*self.context).clone());
         Box::pin(async move { next.dispatch(ctx).await })
@@ -1021,7 +1181,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_panicking_tool_surfaces_as_an_error_result_through_the_composed_pipeline() {
-        let mut registry = builtin_registry(&FileSession::new(PathBuf::from(".")));
+        let mut registry = builtin_registry(
+            &FileSession::new(PathBuf::from(".")),
+            dch_tools::ReadWindows::default(),
+        );
         registry.register(PanicProbe);
         let pipeline = build_pipeline(
             &sample_context("/tmp/probe-cwd"),
@@ -1029,6 +1192,7 @@ mod tests {
             &[],
             permission_layer(dch_tools::permission::PermissionMode::Auto, None),
             false,
+            0,
             registry,
         )
         .expect("static composition builds");
@@ -1060,31 +1224,48 @@ mod tests {
             &[],
             permission_layer(dch_tools::permission::PermissionMode::Auto, None),
             false,
-            builtin_registry(&FileSession::new(PathBuf::from("."))),
+            dch_config::RunnerConfig::default().max_tool_output_chars,
+            builtin_registry(
+                &FileSession::new(PathBuf::from(".")),
+                dch_tools::ReadWindows::default(),
+            ),
         )
         .expect("static composition builds");
         assert_eq!(
             pipeline.middleware_names(),
-            vec!["dch-context", "permission", "tool_call"],
-            "the injector must be the outermost layer, with the permission gate\
-             \ndirectly under it, over the tool-call core"
+            vec!["dch-context", "output_limit", "permission", "tool_call"],
+            "the injector must be the outermost layer, with the cap and the\n\
+             permission gate directly under it, over the tool-call core"
         );
     }
 
     #[test]
     fn build_pipeline_layers_host_middleware_between_gate_and_redaction() {
+        let cap = dch_config::RunnerConfig::default().max_tool_output_chars;
         let redacting = build_pipeline(
             &sample_context("/tmp/probe-cwd"),
             &FileSession::new(PathBuf::from(".")),
             &[],
             permission_layer(dch_tools::permission::PermissionMode::Auto, None),
             true,
-            builtin_registry(&FileSession::new(PathBuf::from("."))),
+            cap,
+            builtin_registry(
+                &FileSession::new(PathBuf::from(".")),
+                dch_tools::ReadWindows::default(),
+            ),
         )
         .expect("static composition builds");
         assert_eq!(
             redacting.middleware_names(),
-            vec!["dch-context", "permission", "redaction", "tool_call"],
+            vec![
+                "dch-context",
+                "output_limit",
+                "permission",
+                "write-target-gate",
+                "redaction-guard",
+                "redaction",
+                "tool_call"
+            ],
             "the gate wraps the core under the injector"
         );
         let layered = build_pipeline(
@@ -1093,19 +1274,26 @@ mod tests {
             &[Arc::new(HostProbe)],
             permission_layer(dch_tools::permission::PermissionMode::Auto, None),
             true,
-            builtin_registry(&FileSession::new(PathBuf::from("."))),
+            cap,
+            builtin_registry(
+                &FileSession::new(PathBuf::from(".")),
+                dch_tools::ReadWindows::default(),
+            ),
         )
         .expect("static composition builds");
         assert_eq!(
             layered.middleware_names(),
             vec![
                 "dch-context",
+                "output_limit",
                 "permission",
                 "host-probe",
+                "write-target-gate",
+                "redaction-guard",
                 "redaction",
                 "tool_call"
             ],
-            "host middleware sit under the gate and above redaction"
+            "host middleware sit under the gate and above the write-protection layers"
         );
     }
 
@@ -1159,6 +1347,7 @@ mod tests {
             &[],
             permission_layer(dch_tools::permission::PermissionMode::Auto, None),
             true,
+            0,
             registry,
         )
         .expect("static composition builds");
@@ -1174,6 +1363,217 @@ mod tests {
         assert!(
             text.contains("aaaaaaaa"),
             "low-entropy padding survives untouched: {text}"
+        );
+    }
+
+    /// A tool whose one result is far larger than any sensible cap, for
+    /// driving the pipeline's whole-result output ceiling.
+    struct FloodingEchoTool;
+
+    impl Tool for FloodingEchoTool {
+        fn name(&self) -> &'static str {
+            "FloodingEcho"
+        }
+
+        fn description(&self) -> &'static str {
+            "Test probe: returns a payload far larger than the output cap."
+        }
+
+        fn schema(&self) -> ToolSchema {
+            ToolSchema::new(
+                self.name(),
+                self.description(),
+                serde_json::json!({"type": "object", "properties": {}}),
+            )
+        }
+
+        fn call(
+            &self,
+            _input: Value,
+            _ctx: &ToolContext,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send + '_>> {
+            Box::pin(async { Ok(ToolOutput::text("z".repeat(5_000))) })
+        }
+    }
+
+    /// A pipeline over `output_limit` dispatching only [`FloodingEchoTool`].
+    fn capped_pipeline(output_limit: usize) -> ToolPipeline {
+        let mut registry = ToolRegistry::new();
+        registry.register(FloodingEchoTool);
+        build_pipeline(
+            &sample_context("/tmp/probe-cwd"),
+            &FileSession::new(PathBuf::from(".")),
+            &[],
+            permission_layer(dch_tools::permission::PermissionMode::Auto, None),
+            false,
+            output_limit,
+            registry,
+        )
+        .expect("static composition builds")
+    }
+
+    #[test]
+    fn build_pipeline_places_the_output_cap_directly_under_the_injector() {
+        let pipeline = build_pipeline(
+            &sample_context("/tmp/probe-cwd"),
+            &FileSession::new(PathBuf::from(".")),
+            &[],
+            permission_layer(dch_tools::permission::PermissionMode::Auto, None),
+            false,
+            dch_config::RunnerConfig::default().max_tool_output_chars,
+            builtin_registry(
+                &FileSession::new(PathBuf::from(".")),
+                dch_tools::ReadWindows::default(),
+            ),
+        )
+        .expect("static composition builds");
+        assert_eq!(
+            pipeline.middleware_names(),
+            vec!["dch-context", "output_limit", "permission", "tool_call"],
+            "the injector stays outermost, the cap sits directly under it, and\n\
+             the permission gate under the cap so a denied call never pays for it"
+        );
+    }
+
+    #[test]
+    fn a_zero_output_cap_installs_no_cap_layer() {
+        let pipeline = build_pipeline(
+            &sample_context("/tmp/probe-cwd"),
+            &FileSession::new(PathBuf::from(".")),
+            &[],
+            permission_layer(dch_tools::permission::PermissionMode::Auto, None),
+            false,
+            0,
+            builtin_registry(
+                &FileSession::new(PathBuf::from(".")),
+                dch_tools::ReadWindows::default(),
+            ),
+        )
+        .expect("static composition builds");
+        assert!(
+            !pipeline.middleware_names().contains(&"output_limit"),
+            "a disabled cap is absent from the report, not present and inert: {:?}",
+            pipeline.middleware_names()
+        );
+    }
+
+    #[test]
+    fn read_windows_for_carries_the_output_cap_into_the_batch_budget() {
+        let runner = dch_config::RunnerConfig {
+            max_tool_output_chars: 4096,
+            read_max_bytes: 2048,
+            ..dch_config::RunnerConfig::default()
+        };
+        let windows = read_windows_for(&runner);
+        assert_eq!(
+            (windows.max_bytes, windows.max_batch_bytes),
+            (2048, 4096),
+            "the per-file ceiling and the batch budget come from the same config\n\
+             pair as the dispatched-result cap, so the three cannot drift"
+        );
+        let disabled = dch_config::RunnerConfig {
+            max_tool_output_chars: 0,
+            ..dch_config::RunnerConfig::default()
+        };
+        assert_eq!(
+            read_windows_for(&disabled).max_batch_bytes,
+            0,
+            "the disable sentinel maps through rather than collapsing to a default"
+        );
+    }
+
+    /// A capture middleware recording what crossed its layer.
+    struct RecordingCapture {
+        /// The output text the layer observed, whole.
+        recorded: Arc<std::sync::Mutex<String>>,
+    }
+
+    impl loopctl::middleware::ToolMiddleware for RecordingCapture {
+        fn name(&self) -> &'static str {
+            "recording-capture"
+        }
+
+        fn dispatch<'a>(
+            &'a self,
+            ctx: &'a mut loopctl::middleware::ToolDispatchContext,
+            next: &'a ToolPipeline,
+        ) -> Pin<Box<dyn Future<Output = loopctl::middleware::ToolDispatchResult> + Send + 'a>>
+        {
+            Box::pin(async move {
+                let result = next.dispatch(ctx).await;
+                *self.recorded.lock().expect("the capture slot") = result.output.to_string();
+                result
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_host_capture_above_the_cap_records_pre_cut_bytes() {
+        // The composition places host middleware above the output
+        // cap, so a capture there observes the tool's whole output
+        // while the model receives the cut — the retention bound the
+        // capture itself sets is the transcript's only ceiling.
+        let recorded = Arc::new(std::sync::Mutex::new(String::new()));
+        let mut registry = ToolRegistry::new();
+        registry.register(FloodingEchoTool);
+        let pipeline = build_pipeline(
+            &sample_context("/tmp/probe-cwd"),
+            &FileSession::new(PathBuf::from(".")),
+            &[Arc::new(RecordingCapture {
+                recorded: Arc::clone(&recorded),
+            })],
+            permission_layer(dch_tools::permission::PermissionMode::Auto, None),
+            false,
+            200,
+            registry,
+        )
+        .expect("static composition builds");
+        let mut ctx = probe_dispatch_context();
+        ctx.tool_name = "FloodingEcho".to_string();
+
+        let result = pipeline.dispatch(&mut ctx).await;
+        assert_eq!(
+            result.output.to_string().chars().count(),
+            200,
+            "the model receives the cut result"
+        );
+        assert_eq!(
+            recorded.lock().expect("the capture slot").chars().count(),
+            5_000,
+            "the capture above the cap recorded the tool's whole output"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_flooded_tool_result_reaches_the_model_cut_to_the_cap() {
+        let pipeline = capped_pipeline(200);
+        let mut ctx = probe_dispatch_context();
+        ctx.tool_name = "FloodingEcho".to_string();
+
+        let result = pipeline.dispatch(&mut ctx).await;
+        let text = result.output.to_string();
+        assert_eq!(
+            text.chars().count(),
+            200,
+            "the delivered result lands on the configured ceiling"
+        );
+        assert!(
+            text.ends_with("[truncated]"),
+            "a cut result says so rather than passing as the tool's whole output"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_zero_output_cap_leaves_an_oversized_result_whole() {
+        let pipeline = capped_pipeline(0);
+        let mut ctx = probe_dispatch_context();
+        ctx.tool_name = "FloodingEcho".to_string();
+
+        let result = pipeline.dispatch(&mut ctx).await;
+        assert_eq!(
+            result.output.to_string().chars().count(),
+            5_000,
+            "the documented disable keeps the tool's output verbatim"
         );
     }
 
@@ -1220,12 +1620,76 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reasoning_content_deltas_reach_the_observer_through_the_engine() {
+        // The canned stream's `reasoning_content` deltas parse as
+        // thinking parts, the engine forwards them as
+        // `on_thinking_delta`, and the reply still graduates — all
+        // offline against the local SSE server.
+        struct ThinkingRecorder {
+            deltas: Arc<Mutex<Vec<String>>>,
+        }
+        impl LoopObserver for ThinkingRecorder {
+            fn name(&self) -> &'static str {
+                "thinking-recorder"
+            }
+            fn on_thinking_delta(&self, ctx: &loopctl::observer::ThinkingDeltaContext) {
+                self.deltas
+                    .lock()
+                    .expect("the deltas lock")
+                    .push(ctx.delta.clone());
+            }
+        }
+        let turn = [
+            serde_json::json!({
+                "id": "c1", "model": "test-model",
+                "choices": [{"delta": {"reasoning_content": "step one, "}, "finish_reason": null}]
+            }),
+            serde_json::json!({
+                "id": "c1", "model": "test-model",
+                "choices": [{"delta": {"reasoning_content": "step two"}, "finish_reason": null}]
+            }),
+            serde_json::json!({
+                "id": "c1", "model": "test-model",
+                "choices": [{"delta": {"content": "the answer"}, "finish_reason": null}]
+            }),
+            serde_json::json!({
+                "id": "c1", "model": "test-model",
+                "choices": [{"delta": null, "finish_reason": "stop"}]
+            }),
+        ]
+        .iter()
+        .map(|chunk| format!("data: {chunk}\n\n"))
+        .chain(std::iter::once("data: [DONE]\n\n".to_string()))
+        .collect();
+        let server = SseServer::start(vec![turn]).await;
+        let dir = TempDir::new().expect("tempdir");
+        let recorder = Arc::new(ThinkingRecorder {
+            deltas: Arc::new(Mutex::new(Vec::new())),
+        });
+        let mut runner = Runner::builder(&wire_config(server.port, 10), dir.path())
+            .with_observer(Arc::clone(&recorder) as Arc<dyn LoopObserver>)
+            .build()
+            .await
+            .expect("constructs");
+        let run = tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("think"))
+            .await
+            .expect("run settles within timeout")
+            .expect("the run succeeds");
+        assert_eq!(run.output.as_deref(), Some("the answer"));
+        assert_eq!(
+            recorder.deltas.lock().expect("the deltas lock").as_slice(),
+            ["step one, ", "step two"],
+            "the reasoning deltas arrive in order through the engine"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_contained_runner_refuses_a_read_that_escapes_the_workdir() {
         // The file family judges containment by the session the runner
         // attaches, so the contained default must refuse an escaping read
         // through the real dispatch path — not merely by construction.
         let server = SseServer::start(vec![
-            sse_tool_call_turn("read", &serde_json::json!({"path": "../secret.txt"})),
+            sse_tool_call_turn("Read", &serde_json::json!({"path": "../secret.txt"})),
             sse_text_turn("done"),
         ])
         .await;
@@ -1262,7 +1726,7 @@ mod tests {
             first.tool_context.is_non_interactive,
             "empty slot must dispatch non-interactive"
         );
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         *context.question_tx.lock().expect("slot lock") = Some(tx);
         let mut second = probe_dispatch_context();
         let _ = pipeline.dispatch(&mut second).await;
@@ -1274,23 +1738,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_question_tx_installs_the_channel_into_the_shared_context() {
+    async fn a_dead_sender_in_the_slot_dispatches_non_interactive() {
+        // A generation handoff can leave the slot holding a sender after its
+        // reader is gone; reading presence alone would keep advertising an
+        // asking path every later dispatch cannot actually use.
+        let context = sample_context("/tmp/probe-cwd");
+        let pipeline = probe_pipeline_with(&context);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(rx);
+        *context.question_tx.lock().expect("slot lock") = Some(tx);
+        let mut dispatch = probe_dispatch_context();
+        let _ = pipeline.dispatch(&mut dispatch).await;
+        assert!(
+            dispatch.tool_context.is_non_interactive,
+            "a sender whose reader is gone is not an asking path"
+        );
+    }
+
+    /// Send one question through the slot's channel, as a dispatch would.
+    ///
+    /// Performs the same live slot read a tool call performs and drops the
+    /// answer channel, since these pins assert on the prompt side.
+    fn ask_through_the_slot(runner: &Runner, question: &str) {
+        let sender = runner
+            .context()
+            .question_tx
+            .lock()
+            .expect("slot lock")
+            .clone()
+            .expect("an installed channel is what every dispatch reads");
+        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+        sender
+            .send(dch_tools::QuestionRequest {
+                questions: vec![dch_tools::Question {
+                    question: question.to_string(),
+                    header: None,
+                    options: Vec::new(),
+                    multi_select: false,
+                    response_tx,
+                }],
+            })
+            .expect("the asking channel's receiver is alive");
+    }
+
+    #[tokio::test]
+    async fn question_path_installs_the_channel_into_the_shared_context() {
         let dir = TempDir::new().expect("tempdir");
         let runner = Runner::builder(&offline_config(), dir.path())
             .build()
             .await
             .expect("Runner::new constructs");
-        let (tx, _rx) = std::sync::mpsc::channel();
-        runner.set_question_tx(tx);
-        assert!(
-            runner
-                .context()
-                .question_tx
-                .lock()
-                .expect("slot lock")
-                .is_some(),
-            "the sender must land in the shared slot tools read"
-        );
+        let mut prompts = runner.question_path().install();
+        ask_through_the_slot(&runner, "wired?");
+        let prompt = tokio::time::timeout(std::time::Duration::from_secs(5), prompts.recv())
+            .await
+            .expect("the installed stream carries the request")
+            .expect("the bridge stays alive");
+        assert_eq!(prompt.question, "wired?");
     }
 
     #[tokio::test]
@@ -1435,7 +1939,7 @@ mod tests {
                 "id": "c1", "model": "test-model",
                 "choices": [{"delta": {"tool_calls": [{
                     "index": 0, "id": "call_1",
-                    "function": {"name": "read", "arguments": ""}
+                    "function": {"name": "Read", "arguments": ""}
                 }]}, "finish_reason": null}]
             }),
             serde_json::json!({
@@ -1481,42 +1985,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_question_tx_replaces_an_existing_channel() {
+    async fn question_path_replaces_an_existing_channel() {
         let dir = TempDir::new().expect("tempdir");
         let runner = Runner::builder(&offline_config(), dir.path())
             .build()
             .await
             .expect("Runner::new constructs");
-        let (first_tx, first_rx) = std::sync::mpsc::channel();
-        runner.set_question_tx(first_tx);
-        let (second_tx, second_rx) = std::sync::mpsc::channel();
-        runner.set_question_tx(second_tx);
-        let sender = runner
-            .context()
-            .question_tx
-            .lock()
-            .expect("slot lock")
-            .clone()
-            .expect("sender set");
-        sender
-            .send(dch_tools::QuestionRequest {
-                questions: Vec::new(),
-            })
-            .expect("receiver alive");
-        assert!(
-            second_rx.try_recv().is_ok(),
-            "the replacement channel must receive"
-        );
-        assert!(
-            first_rx.try_recv().is_err(),
-            "the replaced channel must no longer receive"
-        );
+        let mut retired = runner.question_path().install();
+        let mut current = runner.question_path().install();
+        ask_through_the_slot(&runner, "second?");
+        let prompt = tokio::time::timeout(std::time::Duration::from_secs(5), current.recv())
+            .await
+            .expect("the replacement stream receives")
+            .expect("the replacement bridge stays alive");
+        assert_eq!(prompt.question, "second?");
+        let retired_closed =
+            tokio::time::timeout(std::time::Duration::from_secs(5), retired.recv())
+                .await
+                .expect("the replaced stream closes")
+                .is_none();
+        assert!(retired_closed, "the replaced generation no longer receives");
     }
 
     #[test]
     fn build_session_composes_the_system_prompt_for_general_role() {
         let config = DchConfig::default();
-        let registry = dch_tools::builtin_registry(&FileSession::new(PathBuf::from(".")));
+        let registry = dch_tools::builtin_registry(
+            &FileSession::new(PathBuf::from(".")),
+            dch_tools::ReadWindows::default(),
+        );
         let session = build_session(&config, &registry, Path::new("/tmp"));
         let prompt = session
             .system_prompt
@@ -1540,7 +2037,10 @@ mod tests {
             role: Role::Coding,
             prompt: "OVERRIDE MARKER: do the thing.".to_string(),
         }];
-        let registry = dch_tools::builtin_registry(&FileSession::new(PathBuf::from(".")));
+        let registry = dch_tools::builtin_registry(
+            &FileSession::new(PathBuf::from(".")),
+            dch_tools::ReadWindows::default(),
+        );
         let session = build_session(&config, &registry, Path::new("/tmp"));
         let prompt = session.system_prompt.expect("composed");
         assert!(
@@ -1565,7 +2065,10 @@ mod tests {
         )
         .expect("write marker");
         let config = DchConfig::default();
-        let registry = dch_tools::builtin_registry(&FileSession::new(PathBuf::from(".")));
+        let registry = dch_tools::builtin_registry(
+            &FileSession::new(PathBuf::from(".")),
+            dch_tools::ReadWindows::default(),
+        );
         let session = build_session(&config, &registry, dir.path());
         let prompt = session.system_prompt.expect("composed");
         assert!(
@@ -1583,7 +2086,10 @@ mod tests {
         // An empty tempdir yields no detected techs, so no PROJECT section.
         let dir = TempDir::new().expect("tempdir");
         let config = DchConfig::default();
-        let registry = dch_tools::builtin_registry(&FileSession::new(PathBuf::from(".")));
+        let registry = dch_tools::builtin_registry(
+            &FileSession::new(PathBuf::from(".")),
+            dch_tools::ReadWindows::default(),
+        );
         let session = build_session(&config, &registry, dir.path());
         let prompt = session.system_prompt.expect("composed");
         assert!(
@@ -1648,7 +2154,41 @@ mod tests {
     }
 
     fn sse_read_tool_call_turn() -> String {
-        sse_tool_call_turn("read", &serde_json::json!({"path": "note.txt"}))
+        sse_tool_call_turn("Read", &serde_json::json!({"path": "note.txt"}))
+    }
+
+    /// A canned turn carrying several complete tool calls at once.
+    ///
+    /// Emits every call fully formed in a single delta (distinct indices
+    /// and ids, arguments complete), then the `tool_calls` stop — the
+    /// wire shape of a model that batches independent calls into one
+    /// response instead of spending a round-trip per call.
+    fn sse_batched_tool_calls_turn(calls: &[(&str, &serde_json::Value)]) -> String {
+        let entries: Vec<serde_json::Value> = calls
+            .iter()
+            .enumerate()
+            .map(|(i, (tool, args))| {
+                serde_json::json!({
+                    "index": i,
+                    "id": format!("call_{}", i + 1),
+                    "function": {"name": tool, "arguments": args.to_string()}
+                })
+            })
+            .collect();
+        [
+            serde_json::json!({
+                "id": "c1", "model": "test-model",
+                "choices": [{"delta": {"tool_calls": entries}, "finish_reason": null}]
+            }),
+            serde_json::json!({
+                "id": "c1", "model": "test-model",
+                "choices": [{"delta": null, "finish_reason": "tool_calls"}]
+            }),
+        ]
+        .iter()
+        .map(|chunk| format!("data: {chunk}\n\n"))
+        .chain(std::iter::once("data: [DONE]\n\n".to_string()))
+        .collect()
     }
 
     fn sse_tool_call_turn(tool: &str, args: &serde_json::Value) -> String {
@@ -1679,6 +2219,33 @@ mod tests {
         .collect()
     }
 
+    /// A one-text-part Gemini streaming turn that finishes with STOP.
+    ///
+    /// Gemini's SSE shape: each `data:` line is a complete JSON object
+    /// carrying `candidates[0].content.parts[]` fragments, and the
+    /// terminal chunk carries `finishReason` plus `usageMetadata`. No
+    /// `[DONE]` sentinel exists on this wire — the stream simply ends.
+    fn gemini_sse_text_turn(text: &str) -> String {
+        let chunks = [
+            serde_json::json!({
+                "candidates": [{
+                    "content": {"parts": [{"text": text}], "role": "model"}
+                }]
+            }),
+            serde_json::json!({
+                "candidates": [{"finishReason": "STOP"}],
+                "usageMetadata": {"promptTokenCount": 4, "candidatesTokenCount": 6}
+            }),
+        ];
+        let mut body = String::new();
+        for chunk in chunks {
+            body.push_str("data: ");
+            body.push_str(&chunk.to_string());
+            body.push_str("\n\n");
+        }
+        body
+    }
+
     /// A canned-SSE provider endpoint on an ephemeral local port.
     ///
     /// Serves one response body per accepted connection (in order), records
@@ -1694,6 +2261,7 @@ mod tests {
     /// The server consumes these one per connection, in order, so a
     /// test scripts a whole multi-request conversation — including
     /// its failures — by stacking them.
+    #[derive(Clone)]
     struct CannedResponse {
         /// HTTP status the server answers with.
         ///
@@ -1728,6 +2296,60 @@ mod tests {
             responses: Vec<CannedResponse>,
             delay: std::time::Duration,
         ) -> Self {
+            Self::start_canned_with_completion(responses, delay, None).await
+        }
+
+        /// Serve `streamed` to streaming requests and `completion` to the rest.
+        ///
+        /// Compaction summarizers issue plain JSON completion calls alongside
+        /// the conversation's SSE turns; serving one fixed body to every
+        /// non-streaming request lets a test drive a compacting session
+        /// without knowing how many summarizer calls a pass makes — the
+        /// recorded requests still show each one.
+        async fn start_with_completion(streamed: Vec<String>, completion: String) -> Self {
+            let canned = streamed
+                .into_iter()
+                .map(|body| CannedResponse { status: 200, body })
+                .collect();
+            Self::start_canned_with_completion(
+                canned,
+                std::time::Duration::ZERO,
+                Some(CannedResponse {
+                    status: 200,
+                    body: completion,
+                }),
+            )
+            .await
+        }
+
+        /// Serve `streamed` to streaming requests; refuse every other one.
+        ///
+        /// The mirror of [`Self::start_with_completion`]: each
+        /// non-streaming request — a compaction summarizer's call — draws a
+        /// 500, so a test can pin the fallback floor carrying the pass when
+        /// the summarizer endpoint is down.
+        async fn start_with_failing_completion(streamed: Vec<String>) -> Self {
+            let canned = streamed
+                .into_iter()
+                .map(|body| CannedResponse { status: 200, body })
+                .collect();
+            Self::start_canned_with_completion(
+                canned,
+                std::time::Duration::ZERO,
+                Some(CannedResponse {
+                    status: 500,
+                    body: "{\"error\":{\"message\":\"summarizer endpoint unavailable\"}}"
+                        .to_string(),
+                }),
+            )
+            .await
+        }
+
+        async fn start_canned_with_completion(
+            responses: Vec<CannedResponse>,
+            delay: std::time::Duration,
+            completion: Option<CannedResponse>,
+        ) -> Self {
             // Bind here (not inside the task) so the port is known before the
             // first request is sent; the listener moves into the accept loop.
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1746,15 +2368,22 @@ mod tests {
                     let Ok((mut sock, _)) = listener.accept().await else {
                         break;
                     };
-                    let canned = queue.pop_front();
+                    let mut request_text = None;
                     if let (Some(req), Ok(mut recorded)) =
                         (read_http_request(&mut sock).await, task_requests.lock())
                     {
-                        recorded.push(req);
+                        recorded.push(req.clone());
+                        request_text = Some(req);
                     }
                     if delay > std::time::Duration::ZERO {
                         tokio::time::sleep(delay).await;
                     }
+                    let canned = match (&completion, request_text.as_deref()) {
+                        (Some(completion), Some(req)) if req.contains("\"stream\":false") => {
+                            Some(completion.clone())
+                        }
+                        _ => queue.pop_front(),
+                    };
                     let bytes = canned.map_or_else(
                         || {
                             "HTTP/1.1 500 No canned response\r\nContent-Length: 0\r\n\
@@ -1892,20 +2521,35 @@ mod tests {
         fn on_compaction(&self, _: &loopctl::observer::CompactedContext) {
             self.record("compaction");
         }
+        fn on_compaction_failed(&self, _: &loopctl::observer::CompactionFailedContext) {
+            self.record("compaction_failed");
+        }
+        fn on_pre_compaction(&self, _: &loopctl::observer::PreCompactionContext) {
+            self.record("pre_compaction");
+        }
     }
 
     fn wire_config(port: u16, max_turns: usize) -> DchConfig {
+        wire_config_for(dch_config::ApiType::OpenAi, port, max_turns)
+    }
+
+    /// The Gemini twin of [`wire_config`], for goldens over the Gemini wire.
+    fn gemini_wire_config(port: u16, max_turns: usize) -> DchConfig {
+        wire_config_for(dch_config::ApiType::Gemini, port, max_turns)
+    }
+
+    fn wire_config_for(api_type: dch_config::ApiType, port: u16, max_turns: usize) -> DchConfig {
         use dch_config::ApiConfig;
-        use dch_config::ApiType;
         let mut config = DchConfig::default();
         config.api = ApiConfig {
-            api_type: ApiType::OpenAi,
+            api_type,
             base_url: format!("http://127.0.0.1:{port}"),
             api_key: Some("dummy".to_string()),
             model: "test-model".to_string(),
             request_timeout_secs: 10,
             ..ApiConfig::default()
         };
+        config.api.context_window = Some(dch_config::FALLBACK_CONTEXT_WINDOW);
         config.runner.max_turns = max_turns;
         config
     }
@@ -2002,6 +2646,209 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_set_reasoning_effort_rides_the_request_wire() {
+        let server = SseServer::start(vec![sse_text_turn("done")]).await;
+        let dir = TempDir::new().expect("tempdir");
+        let mut config = wire_config(server.port, 5);
+        config.api.reasoning_effort = Some("low".to_string());
+        let mut runner = Runner::builder(&config, dir.path())
+            .build()
+            .await
+            .expect("constructs");
+        let run = tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("hi"))
+            .await
+            .expect("run settles within timeout")
+            .expect("the effort-level request succeeds");
+        assert_eq!(run.output.as_deref(), Some("done"));
+        let requests = recorded_requests(&server);
+        let body = requests.first().expect("the request was recorded");
+        assert!(
+            body.contains("\"reasoning_effort\":\"low\""),
+            "the effort level must ride the wire: {body}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unset_reasoning_effort_leaves_the_wire_untouched() {
+        let server = SseServer::start(vec![sse_text_turn("done")]).await;
+        let dir = TempDir::new().expect("tempdir");
+        let mut runner = Runner::builder(&wire_config(server.port, 5), dir.path())
+            .build()
+            .await
+            .expect("constructs");
+        let run = tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("hi"))
+            .await
+            .expect("run settles within timeout")
+            .expect("the plain request succeeds");
+        assert_eq!(run.output.as_deref(), Some("done"));
+        let requests = recorded_requests(&server);
+        let body = requests.first().expect("the request was recorded");
+        assert!(
+            !body.contains("reasoning_effort"),
+            "the inert default must not add a field: {body}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_gemini_effort_rides_the_wire_as_a_thinking_budget() {
+        // The Gemini family has no reasoning_effort field: its effort
+        // seam is the thinkingBudget the client must inject under
+        // generationConfig.thinkingConfig — low maps to 1024 on the
+        // provider's fixed ladder.
+        let server = SseServer::start(vec![gemini_sse_text_turn("done")]).await;
+        let dir = TempDir::new().expect("tempdir");
+        let mut config = gemini_wire_config(server.port, 5);
+        config.api.reasoning_effort = Some("low".to_string());
+        let mut runner = Runner::builder(&config, dir.path())
+            .build()
+            .await
+            .expect("constructs");
+        let run = tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("hi"))
+            .await
+            .expect("run settles within timeout")
+            .expect("the gemini effort-level request succeeds");
+        assert_eq!(run.output.as_deref(), Some("done"));
+        let requests = recorded_requests(&server);
+        let body = requests.first().expect("the request was recorded");
+        assert!(
+            body.contains("\"generationConfig\":{\"thinkingConfig\":{\"thinkingBudget\":1024}}"),
+            "the effort level must ride the wire as a thinking budget: {body}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_retryable_stream_failure_is_retried_and_the_turn_completes() {
+        // The runner installs loopctl's resilient stream handler, so a
+        // 500 on the first stream attempt is one retryable failure,
+        // not the end of the run: the ladder re-requests and the
+        // canned second attempt serves the turn.
+        let server = SseServer::start_canned(vec![
+            CannedResponse {
+                status: 500,
+                body: "{\"error\": \"transient\"}".to_string(),
+            },
+            CannedResponse {
+                status: 200,
+                body: sse_text_turn("done"),
+            },
+        ])
+        .await;
+        let dir = TempDir::new().expect("tempdir");
+        let mut runner = Runner::builder(&wire_config(server.port, 5), dir.path())
+            .build()
+            .await
+            .expect("constructs");
+        let run = tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("hi"))
+            .await
+            .expect("run settles within timeout")
+            .expect("the retried stream succeeds");
+        assert_eq!(run.output.as_deref(), Some("done"));
+        let requests = recorded_requests(&server);
+        assert_eq!(
+            requests.len(),
+            2,
+            "exactly two requests: the failed attempt and its retry"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prior_turn_reasoning_rides_the_next_request() {
+        // The amnesia fix, end to end: turn one streams reasoning and
+        // text; turn two's request must carry that reasoning back on
+        // the wire (the OpenAI family's native `reasoning_content`
+        // lane), so the model's working memory survives the replay
+        // boundary.
+        let reasoning_then_call = || {
+            [
+                serde_json::json!({
+                    "id": "c1", "model": "test-model",
+                    "choices": [{"delta": {"reasoning_content": "the candidate list is settled: "}, "finish_reason": null}]
+                }),
+                serde_json::json!({
+                    "id": "c1", "model": "test-model",
+                    "choices": [{"delta": {"reasoning_content": "findings one and two verified"}, "finish_reason": null}]
+                }),
+                serde_json::json!({
+                    "id": "c1", "model": "test-model",
+                    "choices": [{"delta": {"tool_calls": [{
+                        "index": 0, "id": "call_1",
+                        "function": {"name": "Bash", "arguments": "{\"command\":\"echo checkpoint\"}"}
+                    }]}, "finish_reason": null}]
+                }),
+                serde_json::json!({
+                    "id": "c1", "model": "test-model",
+                    "choices": [{"delta": null, "finish_reason": "tool_calls"}]
+                }),
+            ]
+            .iter()
+            .map(|chunk| format!("data: {chunk}\n\n"))
+            .chain(std::iter::once("data: [DONE]\n\n".to_string()))
+            .collect()
+        };
+        let server = SseServer::start(vec![reasoning_then_call(), sse_text_turn("done")]).await;
+        let dir = TempDir::new().expect("tempdir");
+        let mut runner = Runner::builder(&wire_config(server.port, 5), dir.path())
+            .build()
+            .await
+            .expect("constructs");
+        let run = tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("go"))
+            .await
+            .expect("run settles within timeout")
+            .expect("both turns succeed");
+        assert_eq!(run.output.as_deref(), Some("done"));
+        let requests = recorded_requests(&server);
+        assert_eq!(requests.len(), 2, "reasoning turn, then the closing turn");
+        let second = requests.last().expect("closing request recorded");
+        assert!(
+            second.contains("findings one and two verified"),
+            "the prior turn's reasoning must ride the next request: {second}"
+        );
+        assert!(
+            second.contains("reasoning_content"),
+            "the replay rides the native lane: {second}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_two_call_batch_dispatches_both_in_one_round_trip() {
+        // Both calls are read-only-safe echoes, so parallel dispatch runs
+        // them as one wave; the pin is the round-trip economics either
+        // way — one provider request carries both calls, and both results
+        // ride the next request in input order.
+        let server = SseServer::start(vec![
+            sse_batched_tool_calls_turn(&[
+                ("Bash", &serde_json::json!({"command": "echo first-probe"})),
+                ("Bash", &serde_json::json!({"command": "echo second-probe"})),
+            ]),
+            sse_text_turn("done"),
+        ])
+        .await;
+        let dir = TempDir::new().expect("tempdir");
+        let mut runner = Runner::builder(&wire_config(server.port, 10), dir.path())
+            .build()
+            .await
+            .expect("constructs");
+        let run = tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("go"))
+            .await
+            .expect("run settles within timeout")
+            .expect("both dispatched calls succeed");
+        assert_eq!(run.output.as_deref(), Some("done"));
+        let requests = recorded_requests(&server);
+        assert_eq!(
+            requests.len(),
+            2,
+            "the whole batch costs one round-trip, then the closing turn"
+        );
+        let follow_up = requests.last().expect("closing request recorded");
+        let first = follow_up.find("first-probe").expect("first result rides");
+        let second = follow_up.find("second-probe").expect("second result rides");
+        assert!(
+            first < second,
+            "results must ride in input order: {follow_up}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_resumed_read_rearm_guards_the_dispatching_write_tools() {
         // The re-arm and the executing Write must share one session: the
         // re-armed baseline is exactly what the dispatched Write consults,
@@ -2050,7 +2897,7 @@ mod tests {
         // staleness check runs only after the release, so a change
         // landing while the ask is pending still refuses the write.
         let server = SseServer::start(vec![
-            sse_tool_call_turn("read", &serde_json::json!({"path": "note.txt"})),
+            sse_tool_call_turn("Read", &serde_json::json!({"path": "note.txt"})),
             sse_tool_call_turn(
                 "Write",
                 &serde_json::json!({"file_path": "note.txt", "content": "clobber"}),
@@ -2073,7 +2920,7 @@ mod tests {
                     .lock()
                     .expect("consultations lock")
                     .push(tool.to_string());
-                if tool == "read" {
+                if tool == "Read" {
                     Box::pin(async { true })
                 } else {
                     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
@@ -2100,7 +2947,7 @@ mod tests {
             .expect("the write ask parked a reply");
         assert_eq!(
             consultations.lock().expect("consultations lock").as_slice(),
-            ["read", "Write"],
+            ["Read", "Write"],
             "the read ask resolves immediately; only the write parks"
         );
         std::fs::write(dir.path().join("note.txt"), "externally changed")
@@ -2126,6 +2973,966 @@ mod tests {
         );
     }
 
+    /// A dispatch context for one named tool call, for pipeline-seam drives.
+    ///
+    /// The stress scenarios below exercise the real dispatch pipeline —
+    /// injector, gate, core registry — without an engine or a provider:
+    /// each drives tool calls through the same middleware stack a live
+    /// run dispatches through.
+    fn tool_dispatch(name: &str, input: Value) -> loopctl::middleware::ToolDispatchContext {
+        loopctl::middleware::ToolDispatchContext {
+            tool_name: name.to_string(),
+            input,
+            call_id: format!("call_{name}"),
+            turn_number: 0,
+            cancel: Arc::new(loopctl::cancel::CancelSignal::new()),
+            permission: loopctl::tool::PermissionCheck::Allow,
+            tool_context: loopctl::tool::ToolContext::default(),
+        }
+    }
+
+    /// A real dispatch pipeline over `dir`: injector → Auto gate → core.
+    ///
+    /// The session the injector attaches per dispatch is a clone of the
+    /// one the core registry's file family was built over, so reads and
+    /// writes driven through this pipeline share one baseline map — the
+    /// production wiring's exact shape, minus the engine.
+    fn fs_pipeline(dir: &Path, redact: bool) -> ToolPipeline {
+        let context = sample_context(&dir.to_string_lossy());
+        let session = FileSession::new(dir.to_path_buf());
+        build_pipeline(
+            &context,
+            &session,
+            &[],
+            permission_layer(dch_tools::permission::PermissionMode::Auto, None),
+            redact,
+            dch_config::RunnerConfig::default().max_tool_output_chars,
+            builtin_registry(&session, dch_tools::ReadWindows::default()),
+        )
+        .expect("static composition builds")
+    }
+
+    /// Drive one tool call through `pipeline` and return its result.
+    async fn drive(
+        pipeline: &ToolPipeline,
+        name: &str,
+        input: Value,
+    ) -> loopctl::middleware::ToolDispatchResult {
+        let mut ctx = tool_dispatch(name, input);
+        pipeline.dispatch(&mut ctx).await
+    }
+
+    #[tokio::test]
+    async fn a_read_then_own_write_then_follow_up_write_needs_no_reread() {
+        // read → write → write again with no intervening read: the model's
+        // own write refreshes the recorded baseline, so the follow-up clears
+        // the staleness guard — the session the injector attaches is the one
+        // the dispatched tools share.
+        let dir = TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join("note.txt"), "v1").expect("seed target");
+        let pipeline = fs_pipeline(dir.path(), false);
+
+        let read = drive(&pipeline, "Read", serde_json::json!({"path": "note.txt"})).await;
+        assert!(!read.is_error, "{}", read.output);
+
+        let first = drive(
+            &pipeline,
+            "Write",
+            serde_json::json!({"file_path": "note.txt", "content": "v2"}),
+        )
+        .await;
+        assert!(!first.is_error, "{}", first.output);
+
+        let second = drive(
+            &pipeline,
+            "Write",
+            serde_json::json!({"file_path": "note.txt", "content": "v3"}),
+        )
+        .await;
+        assert!(
+            !second.is_error,
+            "the model's own write must refresh the baseline: {}",
+            second.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("note.txt")).unwrap_or_default(),
+            "v3",
+            "the follow-up write lands its content"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_byte_identical_external_revert_releases_the_guard() {
+        // read → external change → byte-identical revert → write: the guard
+        // is keyed on content, not on modification events, so a file whose
+        // bytes are back to what the model last saw accepts the write —
+        // the model's knowledge is accurate again.
+        let dir = TempDir::new().expect("tempdir");
+        let target = dir.path().join("watched.txt");
+        std::fs::write(&target, "v1").expect("seed target");
+        let pipeline = fs_pipeline(dir.path(), false);
+
+        let read = drive(
+            &pipeline,
+            "Read",
+            serde_json::json!({"path": "watched.txt"}),
+        )
+        .await;
+        assert!(!read.is_error, "{}", read.output);
+
+        std::fs::write(&target, "external").expect("external change");
+        std::fs::write(&target, "v1").expect("byte-identical revert");
+
+        let reverted = drive(
+            &pipeline,
+            "Write",
+            serde_json::json!({"file_path": "watched.txt", "content": "ours"}),
+        )
+        .await;
+        assert!(
+            !reverted.is_error,
+            "a byte-identical revert must read as unchanged: {}",
+            reverted.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap_or_default(),
+            "ours",
+            "the write lands over the reverted content"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_conflict_on_the_second_write_leaves_the_first_write_landed() {
+        // Two writes in one model turn: the fresh file lands, the stale one
+        // is held. Dispatches are independent — one call's refusal never
+        // rolls back a sibling that already executed.
+        let dir = TempDir::new().expect("tempdir");
+        let watched = dir.path().join("watched.rs");
+        std::fs::write(&watched, "fn main() {}\n").expect("seed target");
+        let pipeline = fs_pipeline(dir.path(), false);
+
+        let read = drive(&pipeline, "Read", serde_json::json!({"path": "watched.rs"})).await;
+        assert!(!read.is_error, "{}", read.output);
+        std::fs::write(&watched, "fn main() { /* external */ }\n").expect("external change");
+
+        let fresh = drive(
+            &pipeline,
+            "Write",
+            serde_json::json!({"file_path": "fresh.txt", "content": "new"}),
+        )
+        .await;
+        assert!(!fresh.is_error, "{}", fresh.output.to_string());
+        assert!(dir.path().join("fresh.txt").exists());
+
+        let stale = drive(
+            &pipeline,
+            "Write",
+            serde_json::json!({"file_path": "watched.rs", "content": "fn main() { ours }\n"}),
+        )
+        .await;
+        assert!(
+            stale.is_error && stale.output.to_string().contains("changed on disk"),
+            "the second write must refuse against its stale baseline: {}",
+            stale.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(&watched).unwrap_or_default(),
+            "fn main() { /* external */ }\n",
+            "the held write moves no bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_first_write_to_a_never_read_existing_file_overwrites_it() {
+        // No recorded baseline → no staleness guard: the first write to an
+        // existing file the session never read overwrites it. Intended
+        // semantics — a guard here would demand a read before every fresh
+        // session's first write — pinned so a silent tightening or loosening
+        // is caught.
+        let dir = TempDir::new().expect("tempdir");
+        let target = dir.path().join("existing.txt");
+        std::fs::write(&target, "before").expect("seed target");
+        let pipeline = fs_pipeline(dir.path(), false);
+
+        let overwrite = drive(
+            &pipeline,
+            "Write",
+            serde_json::json!({"file_path": "existing.txt", "content": "after"}),
+        )
+        .await;
+        assert!(
+            !overwrite.is_error,
+            "a no-baseline write is allowed by design: {}",
+            overwrite.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap_or_default(),
+            "after",
+            "the overwrite lands"
+        );
+
+        // The overwrite itself arms the guard: a follow-up against a file
+        // changed externally since is held.
+        std::fs::write(&target, "external").expect("external change");
+        let held = drive(
+            &pipeline,
+            "Write",
+            serde_json::json!({"file_path": "existing.txt", "content": "again"}),
+        )
+        .await;
+        assert!(
+            held.is_error,
+            "the model's own write armed the baseline it is now held against: {}",
+            held.output
+        );
+    }
+
+    #[tokio::test]
+    async fn a_multiedit_batch_refreshes_the_baselines_a_later_write_consults() {
+        // The batch tool shares the session the injector attaches, so a
+        // landed MultiEdit must refresh every touched file's baseline the
+        // same way a landed Write does — otherwise the model's own batch
+        // registers as an external change against its follow-up write.
+        let dir = TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join("a.txt"), "alpha\n").expect("seed a");
+        std::fs::write(dir.path().join("b.txt"), "beta\n").expect("seed b");
+        let pipeline = fs_pipeline(dir.path(), false);
+
+        let batch = drive(
+            &pipeline,
+            "MultiEdit",
+            serde_json::json!({
+                "edits": [
+                    {"file_path": "a.txt", "old_text": "alpha", "new_text": "ALPHA"},
+                    {"file_path": "b.txt", "old_text": "beta", "new_text": "BETA"}
+                ]
+            }),
+        )
+        .await;
+        assert!(!batch.is_error, "{}", batch.output);
+
+        let follow_up = drive(
+            &pipeline,
+            "Write",
+            serde_json::json!({"file_path": "b.txt", "content": "rewritten\n"}),
+        )
+        .await;
+        assert!(
+            !follow_up.is_error,
+            "the model's own batch must not read as an external change: {}",
+            follow_up.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("b.txt")).unwrap_or_default(),
+            "rewritten\n",
+            "the follow-up write lands its content"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_backgrounded_redirection_over_a_redacted_target_is_refused_too() {
+        // The guard sits above the shell tool, so it judges the command
+        // before the background branch ever spawns the detached job: the
+        // backgrounded spelling of a refused redirection is refused the
+        // same way, and no job is started for it.
+        let dir = TempDir::new().expect("tempdir");
+        std::fs::write(
+            dir.path().join("env.conf"),
+            format!("api_key = {}\nport = 8080\n", "K".repeat(20)),
+        )
+        .expect("seed the secret-bearing file");
+        let pipeline = fs_pipeline(dir.path(), true);
+
+        let bash = drive(
+            &pipeline,
+            "Bash",
+            serde_json::json!({
+                "command": "printf overwritten > env.conf",
+                "background": true
+            }),
+        )
+        .await;
+        assert!(
+            bash.is_error,
+            "the backgrounded spelling earns the same refusal: {bash:?}"
+        );
+        assert!(
+            !bash.output.to_string().contains("Started background job"),
+            "no job may be spawned for a refused redirection: {}",
+            bash.output
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let after = std::fs::read_to_string(dir.path().join("env.conf")).unwrap_or_default();
+        assert!(
+            after.contains("api_key = ") && !after.contains("overwritten"),
+            "the true bytes survive the refused background redirection: {after:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_secret_target_meets_the_overwrite_guard_before_the_linter() {
+        // The guard is dispatch-layer and the linter is tool-layer,
+        // so broken content against a secret-bearing target refuses
+        // at the guard with its own wording — and against a clean
+        // target the same content flows on to the tool's syntax gate.
+        // Pinning the pair keeps a future reorder of the two layers
+        // from silently swapping which refusal the model reads.
+        let dir = TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join("env.conf"), "api_key=abcdefghijklmnop\n")
+            .expect("seed the secret-bearing target");
+        std::fs::write(dir.path().join("plain.rs"), "fn main() {}\n").expect("seed clean target");
+        let pipeline = fs_pipeline(dir.path(), true);
+
+        let guarded = drive(
+            &pipeline,
+            "Write",
+            serde_json::json!({"file_path": "env.conf", "content": "fn broken {"}),
+        )
+        .await;
+        assert!(
+            guarded.is_error && guarded.output.to_string().contains("redactor hides"),
+            "the guard refuses before the linter ever runs: {}",
+            guarded.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("env.conf")).unwrap_or_default(),
+            "api_key=abcdefghijklmnop\n",
+            "the guarded write moves no bytes"
+        );
+
+        let linted = drive(
+            &pipeline,
+            "Write",
+            serde_json::json!({"file_path": "plain.rs", "content": "fn broken {"}),
+        )
+        .await;
+        assert!(
+            linted.is_error && !linted.output.to_string().contains("redactor hides"),
+            "a clean target passes the guard and meets the tool's syntax gate: {}",
+            linted.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("plain.rs")).unwrap_or_default(),
+            "fn main() {}\n",
+            "the linted write moves no bytes either"
+        );
+    }
+
+    #[tokio::test]
+    async fn skip_linter_true_does_not_bypass_the_staleness_guard() {
+        // The bypass lifts only the syntax gate: `skip_linter: true` against
+        // a stale baseline must still refuse. The two gates are independent,
+        // and the conflict check is the later one — a bypass that also
+        // skipped it would clobber external changes with broken syntax.
+        let dir = TempDir::new().expect("tempdir");
+        let target = dir.path().join("watched.rs");
+        std::fs::write(&target, "fn main() {}\n").expect("seed target");
+        let pipeline = fs_pipeline(dir.path(), false);
+
+        let read = drive(&pipeline, "Read", serde_json::json!({"path": "watched.rs"})).await;
+        assert!(!read.is_error, "{}", read.output);
+        std::fs::write(&target, "fn main() { /* external */ }\n").expect("external change");
+
+        let bypassed = drive(
+            &pipeline,
+            "Write",
+            serde_json::json!({
+                "file_path": "watched.rs",
+                "content": "fn broken {",
+                "skip_linter": true
+            }),
+        )
+        .await;
+        assert!(
+            bypassed.is_error && bypassed.output.to_string().contains("changed on disk"),
+            "the linter bypass must not widen past the conflict check: {}",
+            bypassed.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap_or_default(),
+            "fn main() { /* external */ }\n",
+            "the bypassed-but-conflicted write moves no bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_baseline_recorded_through_a_relative_spelling_guards_an_absolute_write() {
+        // Relative and absolute spellings of one file must meet at the same
+        // baseline key: a read of "note.txt" arms the guard for a write
+        // spelled with the workspace's absolute path — the spelling the
+        // tools' own error messages print, so a model echoing it back must
+        // not slip past the armed guard.
+        let dir = TempDir::new().expect("tempdir");
+        let target = dir.path().join("note.txt");
+        std::fs::write(&target, "v1").expect("seed target");
+        let pipeline = fs_pipeline(dir.path(), false);
+
+        let read = drive(&pipeline, "Read", serde_json::json!({"path": "note.txt"})).await;
+        assert!(!read.is_error, "{}", read.output);
+        std::fs::write(&target, "external").expect("external change");
+
+        let absolute = drive(
+            &pipeline,
+            "Write",
+            serde_json::json!({
+                "file_path": target.to_string_lossy(),
+                "content": "ours"
+            }),
+        )
+        .await;
+        assert!(
+            absolute.is_error && absolute.output.to_string().contains("changed on disk"),
+            "the absolute spelling must resolve to the read's baseline key: {}",
+            absolute.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap_or_default(),
+            "external",
+            "the cross-spelling write moves no bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_only_viewed_never_arms_the_staleness_guard() {
+        // FileViewer serves bounded windows over the same session but
+        // records no baseline — arming is the file source's job, and a
+        // preview is not the model's whole-file knowledge. So a file the
+        // session only viewed stays in the never-read class: the first
+        // write lands even after an external change. Pinned as the
+        // intended reading of the shared-session claim — the registry
+        // doc's "one baseline map" is about which map the family shares,
+        // not about every reader recording into it.
+        let dir = TempDir::new().expect("tempdir");
+        let target = dir.path().join("viewed.txt");
+        std::fs::write(&target, "v1\n").expect("seed target");
+        let pipeline = fs_pipeline(dir.path(), false);
+
+        let view = drive(
+            &pipeline,
+            "FileViewer",
+            serde_json::json!({"file_path": "viewed.txt"}),
+        )
+        .await;
+        assert!(!view.is_error, "{}", view.output);
+
+        std::fs::write(&target, "external\n").expect("external change");
+        let write = drive(
+            &pipeline,
+            "Write",
+            serde_json::json!({"file_path": "viewed.txt", "content": "ours\n"}),
+        )
+        .await;
+        assert!(
+            !write.is_error,
+            "a viewer-only session holds no baseline to hold the write with: {}",
+            write.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap_or_default(),
+            "ours\n",
+            "the write lands over the externally changed bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_readers_share_one_baseline_map_whichever_armed_a_file() {
+        // ReadFiles and Read may fly together (both are concurrency-safe) and
+        // they write the same session's baseline map through the one injector
+        // the pipeline attaches. Whichever call armed a file, the guard judges
+        // that file by its own bytes at write time: the externally changed one
+        // holds, the ones nobody touched land. The newest-observation-wins
+        // stamping is what makes an overlapping Read/ReadFiles pair on one
+        // file resolve to one baseline instead of last-insert-wins.
+        let dir = TempDir::new().expect("tempdir");
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(dir.path().join(name), format!("{name} v1\n")).expect("seed target");
+        }
+        let pipeline = fs_pipeline(dir.path(), false);
+
+        let batch = drive(
+            &pipeline,
+            "ReadFiles",
+            serde_json::json!({"files": ["a.txt", "b.txt", "c.txt"]}),
+        );
+        let single_b = drive(&pipeline, "Read", serde_json::json!({"path": "b.txt"}));
+        let (r_batch, r_single) = tokio::join!(batch, single_b);
+        assert!(!r_batch.is_error, "{}", r_batch.output);
+        assert!(!r_single.is_error, "{}", r_single.output);
+
+        std::fs::write(dir.path().join("b.txt"), "external\n").expect("external change");
+
+        let write_a = drive(
+            &pipeline,
+            "Write",
+            serde_json::json!({"file_path": "a.txt", "content": "ours a\n"}),
+        )
+        .await;
+        let write_b = drive(
+            &pipeline,
+            "Write",
+            serde_json::json!({"file_path": "b.txt", "content": "ours b\n"}),
+        )
+        .await;
+        assert!(
+            !write_a.is_error,
+            "a file only the batch read must land when untouched: {}",
+            write_a.output
+        );
+        assert!(
+            write_b.is_error && write_b.output.to_string().contains("changed on disk"),
+            "the file both readers armed must hold against its change: {}",
+            write_b.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("b.txt")).unwrap_or_default(),
+            "external\n",
+            "the held write moves no bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_engine_and_core_registries_agree_on_every_concurrency_verdict() {
+        // The engine plans parallel waves from its own registry while the
+        // pipeline executes through the core's. The two constructions must
+        // agree on every tool's identity and concurrency verdict — a drift
+        // would let a plan serialize or parallelize calls the executor
+        // disagrees with, while the schemas alone still matched. Both
+        // compositions carry an in-process MCP server's tool beside the
+        // builtin set, so the walk covers the external registration path
+        // too: a provider that joined only one side fails the twin lookup
+        // outright.
+        let client = loopctl::mcp::McpClient::in_process(GreetServer::new())
+            .await
+            .expect("mcp handshake");
+        let connection = adopt_mcp_server(&demo_server_config(None), client)
+            .await
+            .expect("adopt the demo server");
+        let session = FileSession::new(PathBuf::from("."));
+        let engine = compose_registry(
+            std::slice::from_ref(&connection),
+            &session,
+            dch_tools::ReadWindows::default(),
+        );
+        let core = compose_registry(
+            std::slice::from_ref(&connection),
+            &session,
+            dch_tools::ReadWindows::default(),
+        );
+        for registry in [&engine, &core] {
+            assert!(
+                registry.contains("demo__greet"),
+                "both composed registries carry the external tool"
+            );
+        }
+
+        let inputs = [
+            Value::Null,
+            serde_json::json!({"command": "echo hi"}),
+            serde_json::json!({"files": ["a.rs"]}),
+            serde_json::json!({"todos": []}),
+            serde_json::json!({"file_path": "a.rs", "content": "x"}),
+        ];
+        for tool in engine.all_tools() {
+            let name = tool.name();
+            let twin = core
+                .get(name)
+                .unwrap_or_else(|| panic!("the core registry must carry {name}"));
+            assert_eq!(
+                tool.is_concurrency_safe(),
+                twin.is_concurrency_safe(),
+                "{name} must share its static concurrency verdict"
+            );
+            for input in &inputs {
+                assert_eq!(
+                    tool.is_safe_for_concurrent_execution(input),
+                    twin.is_safe_for_concurrent_execution(input),
+                    "{name} must share its verdict for {input}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_write_over_a_redacted_read_is_refused_and_the_true_bytes_survive() {
+        // The confirmed destruction path: redaction rewrites the read's
+        // output while the staleness baseline keys on the true bytes, so
+        // an unguarded Write would land the placeholder text over the
+        // real secret. The overwrite guard must refuse it and leave the
+        // file untouched.
+        let dir = TempDir::new().expect("tempdir");
+        std::fs::write(
+            dir.path().join("env.conf"),
+            "api_key=abcdefghijklmnop\nport = 8080\n",
+        )
+        .expect("seed the secret-bearing file");
+        let pipeline = fs_pipeline(dir.path(), true);
+
+        let read = drive(&pipeline, "Read", serde_json::json!({"path": "env.conf"})).await;
+        assert!(!read.is_error, "{}", read.output);
+        assert!(
+            read.output.to_string().contains("[REDACTED:"),
+            "the redaction layer must be scrubbing the read: {read:?}"
+        );
+
+        let write = drive(
+            &pipeline,
+            "Write",
+            serde_json::json!({
+                "file_path": "env.conf",
+                "content": "api_key=[REDACTED:api_key_kv]\nport = 8080\n"
+            }),
+        )
+        .await;
+        assert!(
+            write.is_error,
+            "a whole-file write over redacted content is refused: {write:?}"
+        );
+        let refusal = write.output.to_string();
+        assert!(
+            refusal.contains("env.conf") && refusal.contains("Edit"),
+            "the refusal names the target and points at the surgical path: {refusal}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("env.conf")).unwrap_or_default(),
+            "api_key=abcdefghijklmnop\nport = 8080\n",
+            "the true bytes survive the refused write"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_write_to_a_file_the_redactor_does_not_match_still_lands_under_redaction() {
+        let dir = TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join("plain.conf"), "port = 8080\n").expect("seed plain file");
+        let pipeline = fs_pipeline(dir.path(), true);
+
+        let read = drive(&pipeline, "Read", serde_json::json!({"path": "plain.conf"})).await;
+        assert!(!read.is_error, "{}", read.output);
+
+        let write = drive(
+            &pipeline,
+            "Write",
+            serde_json::json!({"file_path": "plain.conf", "content": "port = 9090\n"}),
+        )
+        .await;
+        assert!(
+            !write.is_error,
+            "a target redaction serves verbatim stays writable: {}",
+            write.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("plain.conf")).unwrap_or_default(),
+            "port = 9090\n",
+            "the write lands"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_edit_avoiding_the_secret_region_still_lands_on_a_redacted_read() {
+        // The refusal's release path: an edit's anchor runs against the
+        // file's true bytes, so a clean-region old_text the model did
+        // see verbatim matches and the edit lands — the secret line
+        // untouched beside it.
+        let dir = TempDir::new().expect("tempdir");
+        std::fs::write(
+            dir.path().join("env.conf"),
+            "api_key=abcdefghijklmnop\nport = 8080\n",
+        )
+        .expect("seed the secret-bearing file");
+        let pipeline = fs_pipeline(dir.path(), true);
+
+        let read = drive(&pipeline, "Read", serde_json::json!({"path": "env.conf"})).await;
+        assert!(!read.is_error, "{}", read.output);
+
+        let edit = drive(
+            &pipeline,
+            "Edit",
+            serde_json::json!({
+                "file_path": "env.conf",
+                "old_text": "port = 8080",
+                "new_text": "port = 9090"
+            }),
+        )
+        .await;
+        assert!(
+            !edit.is_error,
+            "a surgical edit over a clean region is the documented path forward: {}",
+            edit.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("env.conf")).unwrap_or_default(),
+            "api_key=abcdefghijklmnop\nport = 9090\n",
+            "the edit lands with the secret region intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bash_redirect_over_a_redacted_target_is_refused_and_the_true_bytes_survive() {
+        // The shell is the Write tool's escape hatch: a redirection is a
+        // whole-file write in operator spelling, and the probe that
+        // established the gap clobbered the secret exactly this way. The
+        // guard names every redirection target the command carries, so
+        // the refusal arrives before the shell runs anything.
+        let dir = TempDir::new().expect("tempdir");
+        std::fs::write(
+            dir.path().join("env.conf"),
+            "api_key=abcdefghijklmnop\nport = 8080\n",
+        )
+        .expect("seed the secret-bearing file");
+        let pipeline = fs_pipeline(dir.path(), true);
+
+        let bash = drive(
+            &pipeline,
+            "Bash",
+            serde_json::json!({
+                "command": "printf 'api_key=[REDACTED:api_key_kv]\nport = 8080\n' > env.conf"
+            }),
+        )
+        .await;
+        assert!(
+            bash.is_error,
+            "a shell redirection over redacted content is refused: {bash:?}"
+        );
+        let refusal = bash.output.to_string();
+        assert!(
+            refusal.contains("env.conf") && refusal.contains("redaction off"),
+            "the refusal names the target and the release path: {refusal}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("env.conf")).unwrap_or_default(),
+            "api_key=abcdefghijklmnop\nport = 8080\n",
+            "the true bytes survive the refused redirection"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bash_redirect_to_a_clean_target_still_lands_under_redaction() {
+        let dir = TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join("plain.conf"), "port = 8080\n").expect("seed plain file");
+        let pipeline = fs_pipeline(dir.path(), true);
+
+        let bash = drive(
+            &pipeline,
+            "Bash",
+            serde_json::json!({"command": "printf 'port = 9090\n' > plain.conf"}),
+        )
+        .await;
+        assert!(
+            !bash.is_error,
+            "a redirection the patterns do not match stays runnable: {}",
+            bash.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("plain.conf")).unwrap_or_default(),
+            "port = 9090\n",
+            "the shell's write lands"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stdout_redirect_over_a_redacted_target_is_refused_and_the_true_bytes_survive() {
+        // `>&file` is the whole-file write wearing bash's duplicate
+        // spelling: bash opens the file for it exactly as it does for
+        // `>file`, so the guard's refusal has to reach this spelling too.
+        let dir = TempDir::new().expect("tempdir");
+        std::fs::write(
+            dir.path().join("env.conf"),
+            "api_key=quartzgmpbankfyle6\nport = 8080\n",
+        )
+        .expect("seed the secret-bearing file");
+        let pipeline = fs_pipeline(dir.path(), true);
+
+        let bash = drive(
+            &pipeline,
+            "Bash",
+            serde_json::json!({"command": "printf x >& env.conf"}),
+        )
+        .await;
+        assert!(
+            bash.is_error,
+            "the duplicate spelling of a whole-file redirection is refused: {bash:?}"
+        );
+        assert!(
+            bash.output.to_string().contains("env.conf"),
+            "the refusal names the target: {}",
+            bash.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("env.conf")).unwrap_or_default(),
+            "api_key=quartzgmpbankfyle6\nport = 8080\n",
+            "the true bytes survive the refused redirection"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stdout_redirect_to_a_clean_target_still_lands_under_redaction() {
+        let dir = TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join("plain.conf"), "port = 8080\n").expect("seed plain file");
+        let pipeline = fs_pipeline(dir.path(), true);
+
+        let bash = drive(
+            &pipeline,
+            "Bash",
+            serde_json::json!({"command": "printf 'port = 9090\n' 1>& plain.conf"}),
+        )
+        .await;
+        assert!(
+            !bash.is_error,
+            "the newly armed spelling stays runnable on a target the patterns miss: {}",
+            bash.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("plain.conf")).unwrap_or_default(),
+            "port = 9090\n",
+            "the shell's descriptor-spelled write lands"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bash_command_without_redirection_still_runs_under_redaction() {
+        let dir = TempDir::new().expect("tempdir");
+        std::fs::write(
+            dir.path().join("env.conf"),
+            "api_key=abcdefghijklmnop\nport = 8080\n",
+        )
+        .expect("seed the secret-bearing file");
+        let pipeline = fs_pipeline(dir.path(), true);
+
+        let bash = drive(
+            &pipeline,
+            "Bash",
+            serde_json::json!({"command": "grep -c port env.conf"}),
+        )
+        .await;
+        assert!(
+            !bash.is_error,
+            "a command that only reads the guarded file stays runnable: {}",
+            bash.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("env.conf")).unwrap_or_default(),
+            "api_key=abcdefghijklmnop\nport = 8080\n",
+            "a read-only shell command never touches the file"
+        );
+    }
+
+    #[tokio::test]
+    async fn redaction_off_leaves_the_write_path_unguarded() {
+        // The guard exists only under redaction: with the scrubber
+        // absent the model receives faithful file content, so the
+        // ordinary staleness rules alone govern writes.
+        let dir = TempDir::new().expect("tempdir");
+        std::fs::write(
+            dir.path().join("env.conf"),
+            "api_key=abcdefghijklmnop\nport = 8080\n",
+        )
+        .expect("seed the secret-bearing file");
+        let pipeline = fs_pipeline(dir.path(), false);
+
+        let read = drive(&pipeline, "Read", serde_json::json!({"path": "env.conf"})).await;
+        assert!(!read.is_error, "{}", read.output);
+        assert!(
+            !read.output.to_string().contains("[REDACTED:"),
+            "redaction is off: the read serves the true bytes"
+        );
+
+        let write = drive(
+            &pipeline,
+            "Write",
+            serde_json::json!({"file_path": "env.conf", "content": "port = 9090\n"}),
+        )
+        .await;
+        assert!(
+            !write.is_error,
+            "without redaction the whole-file write follows the ordinary rules: {}",
+            write.output
+        );
+    }
+
+    #[tokio::test]
+    async fn a_redacted_read_then_write_back_is_refused_and_the_secret_survives() {
+        // The pipeline-seam pin of the redaction overwrite guard: the read's
+        // output is scrubbed while the file's true bytes hold a matched
+        // secret, so a whole-file Write of the placeholder text the model
+        // saw must be refused at dispatch — the staleness guard alone
+        // would clear it, and the write would destroy the secret.
+        let dir = TempDir::new().expect("tempdir");
+        let target = dir.path().join("env.conf");
+        std::fs::write(&target, "api_key=abcdefghijklmnopqrstuvwxyz12\nport=8080\n")
+            .expect("seed target");
+        let pipeline = fs_pipeline(dir.path(), true);
+
+        let read = drive(&pipeline, "Read", serde_json::json!({"path": "env.conf"})).await;
+        assert!(
+            read.output.to_string().contains("[REDACTED"),
+            "the redaction pass scrubs the read the model sees: {}",
+            read.output
+        );
+
+        let write_back = drive(
+            &pipeline,
+            "Write",
+            serde_json::json!({
+                "file_path": "env.conf",
+                "content": "api_key=[REDACTED:key_value]\nport=8080\n"
+            }),
+        )
+        .await;
+        assert!(
+            write_back.is_error
+                && write_back
+                    .output
+                    .to_string()
+                    .contains("values the secrets redactor hides"),
+            "the whole-file write over hidden content must refuse: {}",
+            write_back.output
+        );
+        assert!(
+            std::fs::read_to_string(&target)
+                .unwrap_or_default()
+                .contains("abcdefghijklmnopqrstuvwxyz12"),
+            "the refused write leaves the true secret on disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_plain_file_stays_whole_file_writable_under_redaction() {
+        // The guard's inverse: a file no pattern matches crosses the
+        // redactor verbatim, so the model's context is faithful and the
+        // whole-file write proceeds — the guard refuses only what
+        // redaction actually hides.
+        let dir = TempDir::new().expect("tempdir");
+        let target = dir.path().join("plain.conf");
+        std::fs::write(&target, "port = 8080\nhost = localhost\n").expect("seed target");
+        let pipeline = fs_pipeline(dir.path(), true);
+
+        let read = drive(&pipeline, "Read", serde_json::json!({"path": "plain.conf"})).await;
+        assert!(
+            read.output.to_string().contains("port = 8080"),
+            "a plain file crosses the redactor verbatim: {}",
+            read.output
+        );
+
+        let written = drive(
+            &pipeline,
+            "Write",
+            serde_json::json!({
+                "file_path": "plain.conf",
+                "content": "port = 9090\nhost = localhost\n"
+            }),
+        )
+        .await;
+        assert!(
+            !written.is_error,
+            "a faithful-context write must proceed: {}",
+            written.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap_or_default(),
+            "port = 9090\nhost = localhost\n",
+            "the write lands"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_completes_with_the_session_default_policy() {
         let server = SseServer::start(vec![sse_text_turn("probe says hello")]).await;
@@ -2144,29 +3951,219 @@ mod tests {
         assert_eq!(run.config.max_turns, 7, "session default policy is used");
     }
 
+    /// One canned non-streaming completion body.
+    ///
+    /// Any assistant text serves the summarizers' calls in tests — the
+    /// passes are pinned by their requests arriving and the run continuing,
+    /// not by the summary's wording.
+    fn canned_completion_body() -> String {
+        "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion\",\"choices\":[{\"index\":0,\
+         \"message\":{\"role\":\"assistant\",\"content\":\"compact summary\"},\
+         \"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\
+         \"completion_tokens\":1,\"total_tokens\":2}}"
+            .to_string()
+    }
+
+    /// Records every turn-end snapshot fact the publishing rides on.
+    struct TurnEndProbe {
+        /// One (turn, success, history length) per turn end, in order.
+        facts: Mutex<Vec<(usize, bool, usize)>>,
+    }
+
+    impl TurnEndProbe {
+        /// An observer with an empty fact log.
+        fn new() -> Self {
+            Self {
+                facts: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl LoopObserver for TurnEndProbe {
+        fn name(&self) -> &'static str {
+            "turn-end-probe"
+        }
+
+        fn on_turn_end(&self, ctx: &loopctl::observer::TurnEndContext) {
+            if let Ok(mut facts) = self.facts.lock() {
+                facts.push((ctx.turn, ctx.success, ctx.history.len()));
+            }
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn default_compaction_fires_when_the_context_crosses_the_threshold() {
+    async fn every_successful_turn_end_carries_a_growing_history() {
+        // The machine-half publishing rides turn-end snapshots: each
+        // successful turn must carry a history at least as long as the
+        // last, or the snapshot freezes and a resume silently amneses
+        // everything after the freeze point.
+        let dir = TempDir::new().expect("tempdir");
+        let chunk = "payload line for the context budget\n".repeat(20);
+        std::fs::write(dir.path().join("chunk-a.txt"), &chunk).expect("write fixture");
+        std::fs::write(dir.path().join("chunk-b.txt"), &chunk).expect("write fixture");
+        let mut script = Vec::new();
+        for turn in 0..130u32 {
+            let offset = turn;
+            if turn % 2 == 0 {
+                script.push(sse_tool_call_turn(
+                    "Read",
+                    &serde_json::json!({"path": "chunk-a.txt", "offset": offset}),
+                ));
+            } else {
+                script.push(sse_tool_call_turn(
+                    "Read",
+                    &serde_json::json!({"path": "chunk-b.txt", "offset": offset}),
+                ));
+            }
+        }
+        script.push(sse_text_turn("all done"));
+        let server = SseServer::start(script).await;
+        let config = wire_config(server.port, 200);
+        let probe = Arc::new(TurnEndProbe::new());
+        // A seeded history, the resume path's shape: the engine starts
+        // from a restored set and must snapshot seed-plus-growth, never
+        // the seed alone.
+        let mut seed = vec![Message::user("restored context")];
+        for index in 0..9u32 {
+            let call_id = format!("seed-{index}");
+            seed.push(Message::new(
+                loopctl::message::Role::Assistant,
+                vec![loopctl::message::MessagePart::tool_call(
+                    call_id.clone(),
+                    "Read",
+                    serde_json::json!({ "path": "chunk-a.txt" }),
+                )],
+            ));
+            seed.push(Message::new(
+                loopctl::message::Role::User,
+                vec![loopctl::message::MessagePart::tool_result(
+                    call_id,
+                    "Read",
+                    chunk.clone(),
+                    false,
+                )],
+            ));
+        }
+        let mut runner = Runner::builder(&config, dir.path())
+            .with_observer(Arc::clone(&probe) as Arc<dyn LoopObserver>)
+            .with_history(seed)
+            .build()
+            .await
+            .expect("constructs");
+        tokio::time::timeout(std::time::Duration::from_secs(30), runner.run("grow"))
+            .await
+            .expect("run completes")
+            .expect("run succeeds");
+
+        let facts = probe.facts.lock().expect("the probe lock").clone();
+        assert!(
+            facts.len() >= 130,
+            "the fixture drove every turn end: {} facts",
+            facts.len()
+        );
+        let mut longest = 0usize;
+        for (turn, success, len) in facts {
+            if success {
+                assert!(
+                    len >= longest,
+                    "turn {turn} carried a shrunken history ({len} after {longest})"
+                );
+                longest = longest.max(len);
+            }
+        }
+        assert!(
+            longest >= 260,
+            "the final snapshot holds the whole exchange set ({longest})"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_settled_compaction_counts_for_the_headless_save_path() {
+        // The headless machine snapshot persists its compaction count
+        // from the console observer's counter; a real settled pass —
+        // the truncating selection spends no model call — must land
+        // in both the observer and the handle construction hands the
+        // save path.
+        let dir = TempDir::new().expect("tempdir");
+        let chunk = "payload line for the context budget\n".repeat(400);
+        std::fs::write(dir.path().join("chunk-a.txt"), &chunk).expect("write fixture");
+        std::fs::write(dir.path().join("chunk-b.txt"), &chunk).expect("write fixture");
+        let mut script = Vec::new();
+        for index in 0..18 {
+            let name = if index % 2 == 0 {
+                "chunk-a.txt"
+            } else {
+                "chunk-b.txt"
+            };
+            script.push(sse_tool_call_turn(
+                "Read",
+                &serde_json::json!({"path": name}),
+            ));
+        }
+        script.push(sse_text_turn("recovered"));
+        let server = SseServer::start(script).await;
+        let mut config = wire_config(server.port, 22);
+        config.api.context_window = Some(90_000);
+        config.runner.compactor = dch_config::CompactorSelection::Truncating;
+        let observer = Arc::new(crate::console_observer::ConsoleObserver::with_sinks(
+            dch_config::Verbosity::Quiet,
+            false,
+            Box::new(std::io::sink()),
+            Box::new(std::io::sink()),
+        ));
+        let counter = observer.compaction_counter();
+        let mut runner = Runner::builder(&config, dir.path())
+            .with_observer(Arc::clone(&observer) as Arc<dyn LoopObserver>)
+            .build()
+            .await
+            .expect("constructs");
+        let run = tokio::time::timeout(std::time::Duration::from_secs(20), runner.run("grow"))
+            .await
+            .expect("the run completes")
+            .expect("the run compacts and finishes");
+        assert_eq!(run.output.as_deref(), Some("recovered"));
+        assert_eq!(
+            observer.compaction_count(),
+            1,
+            "the settled pass lands in the count the snapshot saves"
+        );
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the save path's handle reads the same total"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_truncating_selection_compacts_by_dropping_messages() {
         // Several tool turns of medium results accumulate past the compact
         // threshold; the next request must be preceded by a compaction pass
         // that drops the older exchanges instead of serving over-window.
-        // The loop seeds a default compactor from the session config, so the
-        // threshold is enforced machinery.
+        // The growth rides on the read tool — Bash's own viewing path
+        // answers with a refusal, not file contents. The window leaves the
+        // deep default landing (30% of the threshold) enough room for the
+        // terminal's preserved-tail floor — a window whose floor cannot
+        // fit the landing is the truncator's documented refusal shape,
+        // not this pin's claim.
         let dir = TempDir::new().expect("tempdir");
-        let chunk = "payload line for the context budget\n".repeat(170);
-        std::fs::write(dir.path().join("chunk.txt"), &chunk).expect("write fixture");
-        let cat_turn =
-            || sse_tool_call_turn("Bash", &serde_json::json!({"command": "cat chunk.txt"}));
-        let server = SseServer::start(vec![
-            cat_turn(),
-            cat_turn(),
-            cat_turn(),
-            cat_turn(),
-            cat_turn(),
-            sse_text_turn("recovered"),
-        ])
-        .await;
-        let mut config = wire_config(server.port, 10);
-        config.api.context_window = 12_000;
+        let chunk = "payload line for the context budget\n".repeat(400);
+        std::fs::write(dir.path().join("chunk-a.txt"), &chunk).expect("write fixture");
+        std::fs::write(dir.path().join("chunk-b.txt"), &chunk).expect("write fixture");
+        let read_a = || sse_tool_call_turn("Read", &serde_json::json!({"path": "chunk-a.txt"}));
+        let read_b = || sse_tool_call_turn("Read", &serde_json::json!({"path": "chunk-b.txt"}));
+        let mut script = Vec::new();
+        for index in 0..18 {
+            if index % 2 == 0 {
+                script.push(read_a());
+            } else {
+                script.push(read_b());
+            }
+        }
+        script.push(sse_text_turn("recovered"));
+        let server = SseServer::start(script).await;
+        let mut config = wire_config(server.port, 22);
+        config.api.context_window = Some(90_000);
+        config.runner.compactor = dch_config::CompactorSelection::Truncating;
         let observer = Arc::new(RecordingObserver::new());
         let mut runner = Runner::builder(&config, dir.path())
             .with_observer(Arc::clone(&observer) as Arc<dyn LoopObserver>)
@@ -2183,10 +4180,691 @@ mod tests {
             "the over-threshold request must compact first: {:?}",
             observer.snapshot()
         );
+        let requests = recorded_requests(&server);
         assert_eq!(
-            recorded_requests(&server).len(),
-            6,
-            "five tool turns plus the final text turn, no extras"
+            requests.len(),
+            19,
+            "eighteen tool turns plus the final text turn, no extras"
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.contains("\"stream\":false")),
+            "truncation spends no model calls"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn compactor_calls_leave_the_session_reasoning_effort_behind() {
+        // The compaction chain speaks to the same endpoint through its
+        // own client: a summarizer reasoning at the session's `high`
+        // effort burns minutes and its output budget on thinking, so
+        // the chain's requests carry no effort while the conversation
+        // turns keep it.
+        let dir = TempDir::new().expect("tempdir");
+        let chunk = "payload line for the context budget\n".repeat(400);
+        let names = [
+            "chunk-a.txt",
+            "chunk-b.txt",
+            "chunk-c.txt",
+            "chunk-d.txt",
+            "chunk-e.txt",
+            "chunk-f.txt",
+            "chunk-g.txt",
+            "chunk-h.txt",
+        ];
+        for name in names {
+            std::fs::write(dir.path().join(name), &chunk).expect("write fixture");
+        }
+        let mut script = Vec::new();
+        for name in names {
+            script.push(sse_tool_call_turn(
+                "Read",
+                &serde_json::json!({"path": name}),
+            ));
+        }
+        script.push(sse_text_turn("checkpoint"));
+        for round in 0..7u32 {
+            for name in names {
+                script.push(sse_tool_call_turn(
+                    "Read",
+                    &serde_json::json!({"path": name, "offset": round}),
+                ));
+            }
+        }
+        script.push(sse_text_turn("recovered"));
+        let server = SseServer::start_with_completion(script, canned_completion_body()).await;
+        let mut config = wire_config(server.port, 70);
+        config.api.context_window = Some(130_000);
+        config.api.reasoning_effort = Some("high".to_string());
+        config.runner.compactor = dch_config::CompactorSelection::Qa;
+        let observer = Arc::new(RecordingObserver::new());
+        let mut runner = Runner::builder(&config, dir.path())
+            .with_observer(Arc::clone(&observer) as Arc<dyn LoopObserver>)
+            .build()
+            .await
+            .expect("constructs");
+        let first = tokio::time::timeout(std::time::Duration::from_secs(20), runner.run("grow"))
+            .await
+            .expect("the growth run completes")
+            .expect("the growth run succeeds");
+        assert_eq!(first.output.as_deref(), Some("checkpoint"));
+        let run = tokio::time::timeout(std::time::Duration::from_secs(20), runner.run("more"))
+            .await
+            .expect("run completes")
+            .expect("run succeeds across the compaction boundary");
+        assert_eq!(run.output.as_deref(), Some("recovered"));
+        assert!(
+            observer.snapshot().contains(&"compaction"),
+            "the pass ran: {:?}",
+            observer.snapshot()
+        );
+        let requests = recorded_requests(&server);
+        let summarizer_requests: Vec<&String> = requests
+            .iter()
+            .filter(|request| request.contains("\"stream\":false"))
+            .collect();
+        assert!(
+            !summarizer_requests.is_empty(),
+            "the summarizer called through the chain's own client"
+        );
+        assert!(
+            summarizer_requests
+                .iter()
+                .all(|request| !request.contains("reasoning_effort")),
+            "no compactor request carries the session's effort"
+        );
+        assert!(
+            requests.iter().any(|request| {
+                request.contains("\"stream\":true") && request.contains("reasoning_effort")
+            }),
+            "the conversation turns keep the configured effort"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_qa_selection_compacts_through_the_summarizer_and_the_run_continues() {
+        let dir = TempDir::new().expect("tempdir");
+        let chunk = "payload line for the context budget\n".repeat(400);
+        let names = [
+            "chunk-a.txt",
+            "chunk-b.txt",
+            "chunk-c.txt",
+            "chunk-d.txt",
+            "chunk-e.txt",
+            "chunk-f.txt",
+        ];
+        for name in names {
+            std::fs::write(dir.path().join(name), &chunk).expect("write fixture");
+        }
+        let mut script = Vec::new();
+        for name in names {
+            script.push(sse_tool_call_turn(
+                "Read",
+                &serde_json::json!({"path": name}),
+            ));
+        }
+        script.push(sse_text_turn("checkpoint"));
+        for _ in 0..8 {
+            for name in names {
+                script.push(sse_tool_call_turn(
+                    "Read",
+                    &serde_json::json!({"path": name}),
+                ));
+            }
+        }
+        script.push(sse_text_turn("recovered"));
+        let server = SseServer::start_with_completion(script, canned_completion_body()).await;
+        let mut config = wire_config(server.port, 70);
+        config.api.context_window = Some(130_000);
+        config.runner.compactor = dch_config::CompactorSelection::Qa;
+        let observer = Arc::new(RecordingObserver::new());
+        let mut runner = Runner::builder(&config, dir.path())
+            .with_observer(Arc::clone(&observer) as Arc<dyn LoopObserver>)
+            .build()
+            .await
+            .expect("constructs");
+        let first = tokio::time::timeout(std::time::Duration::from_secs(20), runner.run("grow"))
+            .await
+            .expect("the growth run completes")
+            .expect("the growth run succeeds");
+        assert_eq!(first.output.as_deref(), Some("checkpoint"));
+        let run = tokio::time::timeout(std::time::Duration::from_secs(20), runner.run("more"))
+            .await
+            .expect("run completes")
+            .expect("run succeeds across the compaction boundary");
+        assert_eq!(run.output.as_deref(), Some("recovered"));
+        assert!(
+            observer.snapshot().contains(&"compaction"),
+            "the over-threshold request must compact first: {:?}",
+            observer.snapshot()
+        );
+        let summarizer_calls = recorded_requests(&server)
+            .iter()
+            .filter(|request| request.contains("\"stream\":false"))
+            .count();
+        assert!(
+            summarizer_calls >= 1,
+            "the qa pass runs through the session's own client"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_structured_selection_compacts_through_the_structured_summarizer() {
+        let dir = TempDir::new().expect("tempdir");
+        let chunk = "payload line for the context budget\n".repeat(400);
+        let names = [
+            "chunk-a.txt",
+            "chunk-b.txt",
+            "chunk-c.txt",
+            "chunk-d.txt",
+            "chunk-e.txt",
+            "chunk-f.txt",
+        ];
+        for name in names {
+            std::fs::write(dir.path().join(name), &chunk).expect("write fixture");
+        }
+        let mut script = Vec::new();
+        for name in names {
+            script.push(sse_tool_call_turn(
+                "Read",
+                &serde_json::json!({"path": name}),
+            ));
+        }
+        script.push(sse_text_turn("checkpoint"));
+        for _ in 0..8 {
+            for name in names {
+                script.push(sse_tool_call_turn(
+                    "Read",
+                    &serde_json::json!({"path": name}),
+                ));
+            }
+        }
+        script.push(sse_text_turn("recovered"));
+        let server = SseServer::start_with_completion(script, canned_completion_body()).await;
+        let mut config = wire_config(server.port, 70);
+        config.api.context_window = Some(130_000);
+        config.runner.compactor = dch_config::CompactorSelection::Structured;
+        let observer = Arc::new(RecordingObserver::new());
+        let mut runner = Runner::builder(&config, dir.path())
+            .with_observer(Arc::clone(&observer) as Arc<dyn LoopObserver>)
+            .build()
+            .await
+            .expect("constructs");
+        let first = tokio::time::timeout(std::time::Duration::from_secs(20), runner.run("grow"))
+            .await
+            .expect("the growth run completes")
+            .expect("the growth run succeeds");
+        assert_eq!(first.output.as_deref(), Some("checkpoint"));
+        let run = tokio::time::timeout(std::time::Duration::from_secs(20), runner.run("more"))
+            .await
+            .expect("run completes")
+            .expect("run succeeds across the compaction boundary");
+        assert_eq!(run.output.as_deref(), Some("recovered"));
+        assert!(
+            observer.snapshot().contains(&"compaction"),
+            "the over-threshold request must compact first: {:?}",
+            observer.snapshot()
+        );
+        let summarizer_calls = recorded_requests(&server)
+            .iter()
+            .filter(|request| request.contains("\"stream\":false"))
+            .count();
+        assert!(
+            summarizer_calls >= 1,
+            "the structured pass runs through the session's own client"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rolling_selection_compacts_through_the_aging_pass() {
+        let dir = TempDir::new().expect("tempdir");
+        let chunk = "payload line for the context budget\n".repeat(120);
+        // Ten grow runs, each closing in its own text seam: the rolling
+        // pass ages only past its tenth boundary, and mid-run text
+        // cannot serve (a text-only turn completes the run), so the
+        // boundaries come from run seams. Unique paths per run keep the
+        // repeated-call loop guard out of the picture.
+        let names_for = |round: usize| {
+            (0..6)
+                .map(|file| format!("chunk-r{round}-{file}.txt"))
+                .collect::<Vec<String>>()
+        };
+        for round in 0..10 {
+            for name in names_for(round) {
+                std::fs::write(dir.path().join(name), &chunk).expect("write fixture");
+            }
+        }
+        let mut script = Vec::new();
+        for name in names_for(0) {
+            script.push(sse_tool_call_turn(
+                "Read",
+                &serde_json::json!({"path": name}),
+            ));
+        }
+        script.push(sse_text_turn("checkpoint"));
+        for round in 1..10 {
+            for name in names_for(round) {
+                script.push(sse_tool_call_turn(
+                    "Read",
+                    &serde_json::json!({"path": name}),
+                ));
+            }
+            script.push(sse_text_turn(&format!("round {round} done")));
+        }
+        script.push(sse_text_turn("recovered"));
+        let server = SseServer::start_with_completion(script, canned_completion_body()).await;
+        let mut config = wire_config(server.port, 70);
+        config.api.context_window = Some(130_000);
+        config.runner.compact_threshold = 40;
+        config.runner.compactor = dch_config::CompactorSelection::Rolling;
+        let observer = Arc::new(RecordingObserver::new());
+        let mut runner = Runner::builder(&config, dir.path())
+            .with_observer(Arc::clone(&observer) as Arc<dyn LoopObserver>)
+            .build()
+            .await
+            .expect("constructs");
+        let first = tokio::time::timeout(std::time::Duration::from_secs(20), runner.run("grow"))
+            .await
+            .expect("the growth run completes")
+            .expect("the growth run succeeds");
+        assert_eq!(first.output.as_deref(), Some("checkpoint"));
+        for round in 1..10 {
+            let grown = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                runner.run(&format!("grow {round}")),
+            )
+            .await
+            .expect("the grow run completes")
+            .expect("the grow run succeeds");
+            assert_eq!(
+                grown.output.as_deref(),
+                Some(format!("round {round} done").as_str())
+            );
+        }
+        let run = tokio::time::timeout(std::time::Duration::from_secs(20), runner.run("more"))
+            .await
+            .expect("run completes")
+            .expect("run succeeds across the compaction boundary");
+        assert_eq!(run.output.as_deref(), Some("recovered"));
+        assert!(
+            observer.snapshot().contains(&"compaction"),
+            "the over-threshold request must compact first: {:?}",
+            observer.snapshot()
+        );
+        let rolling_calls = recorded_requests(&server)
+            .iter()
+            .filter(|request| request.contains("\"stream\":false"))
+            .count();
+        assert!(
+            rolling_calls >= 1,
+            "the aging pass summarizes through the session's own client"
+        );
+    }
+
+    /// The strict-selection pin body, shared by the qa, structured, and
+    /// rolling variants: the configured compactor is the only one that
+    /// ever runs, so when its model call fails the pass fails — nothing
+    /// truncates in its place, the history rides the deferral intact,
+    /// and the run proceeds while the payload fits the window.
+    async fn a_failing_stage_never_substitutes(selection: dch_config::CompactorSelection) {
+        let dir = TempDir::new().expect("tempdir");
+        let chunk = "payload line for the context budget\n".repeat(120);
+        // Each run reads its own six files — the same path eleven times
+        // would trip the engine's repeated-call loop guard — and every
+        // completed run leaves the assistant-text seam the rolling pass
+        // counts as an aging boundary; mid-run text cannot serve (a
+        // text-only turn completes the run), so the boundaries come
+        // from run seams and rolling's ten-boundary gate opens only
+        // once the fixture genuinely has ten of them.
+        let names_for = |round: usize| {
+            (0..6)
+                .map(|file| format!("chunk-r{round}-{file}.txt"))
+                .collect::<Vec<String>>()
+        };
+        for round in 0..10 {
+            for name in names_for(round) {
+                std::fs::write(dir.path().join(name), &chunk).expect("write fixture");
+            }
+        }
+        let mut script = Vec::new();
+        for name in names_for(0) {
+            script.push(sse_tool_call_turn(
+                "Read",
+                &serde_json::json!({"path": name}),
+            ));
+        }
+        script.push(sse_text_turn("checkpoint"));
+        for round in 1..10 {
+            for name in names_for(round) {
+                script.push(sse_tool_call_turn(
+                    "Read",
+                    &serde_json::json!({"path": name}),
+                ));
+            }
+            script.push(sse_text_turn(&format!("round {round} done")));
+        }
+        script.push(sse_text_turn("recovered"));
+        let server = SseServer::start_with_failing_completion(script).await;
+        let mut config = wire_config(server.port, 60);
+        config.api.context_window = Some(130_000);
+        config.runner.compact_threshold = 40;
+        config.runner.compactor = selection;
+        let observer = Arc::new(RecordingObserver::new());
+        let mut runner = Runner::builder(&config, dir.path())
+            .with_observer(Arc::clone(&observer) as Arc<dyn LoopObserver>)
+            .build()
+            .await
+            .expect("constructs");
+        let first = tokio::time::timeout(std::time::Duration::from_secs(20), runner.run("grow"))
+            .await
+            .expect("the growth run completes")
+            .expect("the growth run succeeds");
+        assert_eq!(first.output.as_deref(), Some("checkpoint"));
+        for round in 1..10 {
+            let grown = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                runner.run(&format!("grow {round}")),
+            )
+            .await
+            .expect("the grow run completes")
+            .expect("the failed passes defer and the run proceeds");
+            assert_eq!(
+                grown.output.as_deref(),
+                Some(format!("round {round} done").as_str())
+            );
+        }
+        let run = tokio::time::timeout(std::time::Duration::from_secs(20), runner.run("more"))
+            .await
+            .expect("run completes")
+            .expect("the failed passes defer and the run proceeds");
+        assert_eq!(run.output.as_deref(), Some("recovered"));
+        let requests = recorded_requests(&server);
+        let summarizer_attempts = requests
+            .iter()
+            .filter(|request| request.contains("\"stream\":false"))
+            .count();
+        assert!(
+            summarizer_attempts >= 1,
+            "the configured stage genuinely tries its model call"
+        );
+        let snapshot = observer.snapshot();
+        assert!(
+            snapshot.contains(&"compaction_failed"),
+            "the failed pass surfaces as a compaction failure: {snapshot:?}"
+        );
+        assert!(
+            !snapshot.contains(&"compaction"),
+            "no other compactor landed in the configured stage's place: {snapshot:?}"
+        );
+        let streaming: Vec<&String> = requests
+            .iter()
+            .filter(|request| !request.contains("\"stream\":false"))
+            .collect();
+        let occurrences = |request: &str| {
+            request
+                .matches("payload line for the context budget")
+                .count()
+        };
+        let peak = streaming.iter().map(|request| occurrences(request)).max();
+        let final_count = streaming.last().map(|request| occurrences(request));
+        assert!(
+            matches!((peak, final_count), (Some(peak), Some(end)) if end == peak),
+            "the history rides the deferral intact — no silent truncation: \
+             peak {peak:?} vs final {final_count:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failing_qa_stage_never_substitutes_another_compactor() {
+        a_failing_stage_never_substitutes(dch_config::CompactorSelection::Qa).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failing_structured_stage_never_substitutes_another_compactor() {
+        a_failing_stage_never_substitutes(dch_config::CompactorSelection::Structured).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failing_rolling_stage_never_substitutes_another_compactor() {
+        a_failing_stage_never_substitutes(dch_config::CompactorSelection::Rolling).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tool_loop_history_compacts_through_the_qa_chain() {
+        // The shape that wedged before the engine's compaction fixes:
+        // every assistant message is a tool call and every result opens
+        // the next user message, so no pair-safe split boundary exists
+        // anywhere in the restored history. The qa selection must still
+        // compact — through its own slid split — and the resumed run
+        // must proceed.
+        let server = SseServer::start_with_completion(
+            vec![sse_text_turn("recovered")],
+            canned_completion_body(),
+        )
+        .await;
+        let dir = TempDir::new().expect("tempdir");
+        let chunk = "payload line for the context budget\n".repeat(170);
+        let mut history = vec![Message::new(
+            loopctl::message::Role::User,
+            vec![loopctl::message::MessagePart::text("grow the context")],
+        )];
+        for index in 0..150u32 {
+            let call_id = format!("seed-{index}");
+            history.push(Message::new(
+                loopctl::message::Role::Assistant,
+                vec![loopctl::message::MessagePart::tool_call(
+                    call_id.clone(),
+                    "Read",
+                    serde_json::json!({ "path": "chunk.txt" }),
+                )],
+            ));
+            history.push(Message::new(
+                loopctl::message::Role::User,
+                vec![loopctl::message::MessagePart::tool_result(
+                    call_id,
+                    "Read",
+                    chunk.clone(),
+                    false,
+                )],
+            ));
+        }
+        let mut config = wire_config(server.port, 60);
+        config.api.context_window = Some(350_000);
+        config.runner.compact_threshold = 60;
+        config.runner.compactor = dch_config::CompactorSelection::Qa;
+        let observer = Arc::new(RecordingObserver::new());
+        let mut runner = Runner::builder(&config, dir.path())
+            .with_observer(Arc::clone(&observer) as Arc<dyn LoopObserver>)
+            .with_history(history)
+            .build()
+            .await
+            .expect("constructs");
+        let run = tokio::time::timeout(std::time::Duration::from_secs(20), runner.run("more"))
+            .await
+            .expect("the resumed run completes")
+            .expect("the run succeeds through the compaction boundary");
+        assert_eq!(run.output.as_deref(), Some("recovered"));
+        assert!(
+            observer.snapshot().contains(&"compaction"),
+            "the over-threshold tool-loop history must compact: {:?}",
+            observer.snapshot()
+        );
+        assert!(
+            observer.snapshot().contains(&"pre_compaction"),
+            "the pass announces its start before it runs: {:?}",
+            observer.snapshot()
+        );
+        let seeded_lines = 12_usize.saturating_mul(170);
+        let carried = recorded_requests(&server).first().map_or(0, |request| {
+            request
+                .matches("payload line for the context budget")
+                .count()
+        });
+        assert!(
+            carried < seeded_lines,
+            "the follow-up request carries the compacted history: \
+             {carried} of {seeded_lines} payload lines survived"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_seeded_history_resumes_without_recompaction() {
+        let server = SseServer::start(vec![sse_text_turn("continued")]).await;
+        let dir = TempDir::new().expect("tempdir");
+        let config = wire_config(server.port, 7);
+        let observer = Arc::new(RecordingObserver::new());
+        let mut runner = Runner::builder(&config, dir.path())
+            .with_observer(Arc::clone(&observer) as Arc<dyn LoopObserver>)
+            .with_history(vec![
+                Message::new(
+                    loopctl::message::Role::User,
+                    vec![loopctl::message::MessagePart::text("seed marker fa1")],
+                ),
+                Message::new(
+                    loopctl::message::Role::Assistant,
+                    vec![loopctl::message::MessagePart::text("prior answer")],
+                ),
+            ])
+            .build()
+            .await
+            .expect("constructs");
+        let run = tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("next"))
+            .await
+            .expect("run completes")
+            .expect("run succeeds");
+        assert_eq!(run.output.as_deref(), Some("continued"));
+        assert!(
+            !observer.snapshot().contains(&"compaction"),
+            "a resumed working set under the threshold must not recompact: {:?}",
+            observer.snapshot()
+        );
+        assert!(
+            recorded_requests(&server)
+                .first()
+                .is_some_and(|request| request.contains("seed marker fa1")),
+            "the seeded working set reaches the wire verbatim"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn committed_history_pairs_every_tool_call_with_its_result() {
+        let server = SseServer::start(vec![sse_read_tool_call_turn(), sse_text_turn("done")]).await;
+        let dir = TempDir::new().expect("tempdir");
+        std::fs::write(
+            dir.path().join("note.txt"),
+            "probe payload
+",
+        )
+        .expect("write fixture");
+        let config = wire_config(server.port, 7);
+        let mut runner = Runner::builder(&config, dir.path())
+            .build()
+            .await
+            .expect("constructs");
+        tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("read"))
+            .await
+            .expect("run completes")
+            .expect("run succeeds");
+        let history = runner.committed_history();
+        let calls: std::collections::HashSet<String> = history
+            .iter()
+            .flat_map(|message| &message.parts)
+            .filter_map(|part| match part {
+                loopctl::message::MessagePart::ToolCall { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        let results: std::collections::HashSet<String> = history
+            .iter()
+            .flat_map(|message| &message.parts)
+            .filter_map(|part| match part {
+                loopctl::message::MessagePart::ToolResult { call_id, .. } => Some(call_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(!calls.is_empty(), "the tool turn committed its call");
+        assert_eq!(
+            calls, results,
+            "a completed run leaves every call paired with its result"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_explicit_window_beats_the_probe() {
+        let server = SseServer::start(vec![
+            r#"{"n_ctx": 262144, "total_slots": 4}"#.to_string(),
+            sse_text_turn("answer"),
+        ])
+        .await;
+        let dir = TempDir::new().expect("tempdir");
+        let mut config = wire_config(server.port, 7);
+        config.api.context_window = Some(90_000);
+        let mut runner = Runner::builder(&config, dir.path())
+            .build()
+            .await
+            .expect("constructs");
+        assert_eq!(
+            runner.context_window(),
+            90_000,
+            "a deliberate config override wins over discovery"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("hi"))
+            .await
+            .expect("run completes")
+            .expect("run succeeds");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unset_window_adopts_the_discovered_one() {
+        let props = r#"{"n_ctx": 520000, "total_slots": 4}"#.to_string();
+        let chunk = "payload line for the context budget\n".repeat(400);
+        let dir = TempDir::new().expect("tempdir");
+        let names = [
+            "chunk-a.txt",
+            "chunk-b.txt",
+            "chunk-c.txt",
+            "chunk-d.txt",
+            "chunk-e.txt",
+            "chunk-f.txt",
+        ];
+        for name in names {
+            std::fs::write(dir.path().join(name), &chunk).expect("write fixture");
+        }
+        let mut script = vec![props];
+        for _ in 0..8 {
+            for name in names {
+                script.push(sse_tool_call_turn(
+                    "Read",
+                    &serde_json::json!({"path": name}),
+                ));
+            }
+        }
+        script.push(sse_text_turn("recovered"));
+        let server = SseServer::start(script).await;
+        let mut config = wire_config(server.port, 60);
+        config.api.context_window = None;
+        config.runner.compactor = dch_config::CompactorSelection::Truncating;
+        let observer = Arc::new(RecordingObserver::new());
+        let mut runner = Runner::builder(&config, dir.path())
+            .with_observer(Arc::clone(&observer) as Arc<dyn LoopObserver>)
+            .build()
+            .await
+            .expect("constructs");
+        assert_eq!(
+            runner.context_window(),
+            130_000,
+            "the provider's per-request share becomes the window"
+        );
+        let run = tokio::time::timeout(std::time::Duration::from_secs(20), runner.run("grow"))
+            .await
+            .expect("run completes")
+            .expect("run succeeds across the discovered boundary");
+        assert_eq!(run.output.as_deref(), Some("recovered"));
+        assert!(
+            observer.snapshot().contains(&"compaction"),
+            "the discovered window's threshold is enforced — the fallback default would never cross: {:?}",
+            observer.snapshot()
         );
     }
 
@@ -2279,7 +4957,11 @@ mod tests {
         )
         .await
         .unwrap();
-        let registry = compose_registry(&[connection], &FileSession::new(PathBuf::from(".")));
+        let registry = compose_registry(
+            &[connection],
+            &FileSession::new(PathBuf::from(".")),
+            dch_tools::ReadWindows::default(),
+        );
 
         assert!(
             registry.contains("demo__greet"),
@@ -2289,7 +4971,12 @@ mod tests {
             !registry.contains("demo__farewell"),
             "an unlisted tool must stay unregistered"
         );
-        let expected = builtin_registry(&FileSession::new(PathBuf::from("."))).len() + 1;
+        let expected = builtin_registry(
+            &FileSession::new(PathBuf::from(".")),
+            dch_tools::ReadWindows::default(),
+        )
+        .len()
+            + 1;
         assert_eq!(registry.len(), expected, "exactly one external tool joins");
     }
 
@@ -2500,7 +5187,7 @@ mod tests {
             "composed system prompt must reach the wire: {body}"
         );
         assert!(
-            body.contains("\"read\""),
+            body.contains("\"Read\""),
             "the registry's tool schemas must be advertised: {body}"
         );
     }
@@ -2572,7 +5259,7 @@ mod tests {
             requests[1].contains(&cwd) && requests[1].contains("non_interactive=true"),
             "run 1 must see the extension and an empty (non-interactive) slot: {requests:?}"
         );
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         *context.question_tx.lock().expect("slot lock") = Some(tx);
         let second = engine
             .run("again", &policy)

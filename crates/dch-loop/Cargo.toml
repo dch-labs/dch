@@ -17,6 +17,10 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 rmcp = { version = "3", default-features = false, features = ["server", "macros"] }

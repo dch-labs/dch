@@ -131,15 +131,22 @@ impl AskTool {
     ///
     /// # Errors
     ///
-    /// Returns [`ToolError::InvalidInput`] for structurally malformed input
-    /// and [`ToolError::Execution`] when the question channel closed after
-    /// construction. Mode-level outcomes (non-interactive, no UI,
-    /// dismissal) are soft `is_error` results, not errors.
+    /// Returns [`ToolError::InvalidInput`] for structurally malformed input.
+    /// Every other outcome the model can act on is a soft `is_error` result
+    /// rather than an error: non-interactive mode, no UI installed, a
+    /// question dismissed before an answer, and a channel whose reader is
+    /// already gone — a send that cannot land is that same dismissal, since
+    /// no user was ever shown the question. An answer wait also ends on the
+    /// asking channel's own liveness: once the receiver is gone no answer
+    /// can arrive, and the vanished reader answers with that same dismissal
+    /// rather than a hung turn. A host that keeps the receiver alive without
+    /// ever polling it keeps the question waiting too — the display being
+    /// alive and reading is the contract a wait depends on.
     async fn call_inner(
         &self,
         input: Value,
         interactive: bool,
-        question_tx: Option<std::sync::mpsc::Sender<QuestionRequest>>,
+        question_tx: Option<tokio::sync::mpsc::UnboundedSender<QuestionRequest>>,
     ) -> Result<ToolOutput, ToolError> {
         let parsed = match parse_questions(&input)? {
             ParseOutcome::Parsed(parsed) => parsed,
@@ -160,28 +167,40 @@ impl AskTool {
             ));
         };
 
-        question_tx.send(parsed.request).map_err(|_| {
-            ToolError::Execution("Question UI channel closed unexpectedly".to_string())
-        })?;
+        if question_tx.send(parsed.request).is_err() {
+            return Ok(dismissed());
+        }
 
         let mut lines = Vec::with_capacity(parsed.responses.len());
         for response in parsed.responses {
-            match response.await {
-                Ok(resp) if resp.answers.is_empty() => {
-                    return Ok(ToolOutput::error_text(
-                        "The question was dismissed before the user answered.",
-                    ));
-                }
+            let answered = tokio::select! {
+                // Priority order is load-bearing: an answer that has
+                // arrived and a channel that has closed can be ready
+                // in the same poll, and the answer must win — the
+                // model's context loses the answer, not the turn.
+                biased;
+                outcome = response => outcome,
+                () = question_tx.closed() => return Ok(dismissed()),
+            };
+            match answered {
+                Ok(resp) if resp.answers.is_empty() => return Ok(dismissed()),
                 Ok(resp) => lines.push(format_response(&resp)),
-                Err(_) => {
-                    return Ok(ToolOutput::error_text(
-                        "The question was dismissed before the user answered.",
-                    ));
-                }
+                Err(_) => return Ok(dismissed()),
             }
         }
         Ok(ToolOutput::text(lines.join("\n\n")))
     }
+}
+
+/// The soft answer for every way a question can end without one.
+///
+/// Every dismissal path — the host's `Esc`, a retired prompt, a reply
+/// channel dropped unanswered, a send that could not land, an asking
+/// channel whose receiver vanished mid-wait — reads the same to the
+/// model however it arrived: the question went unanswered, and the
+/// sound move is to proceed without asking.
+fn dismissed() -> ToolOutput {
+    ToolOutput::error_text("The question was dismissed before the user answered.")
 }
 
 /// The outcome of parsing the input's `questions` array.

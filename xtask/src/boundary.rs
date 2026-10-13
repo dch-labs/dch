@@ -10,30 +10,73 @@
 use std::process::Command;
 use std::process::ExitCode;
 
-/// One package as seen in `cargo metadata` output — the only fields we need.
+/// One package as `cargo metadata` reports it, narrowed to what the rules read.
+///
+/// The metadata document carries far more per package than the boundary
+/// needs; name, runtime dependency names, and the two facts saying where
+/// the package came from are enough, which lets [`Checker`] stay pure
+/// over a slice of these rather than over the raw document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Package {
-    /// Crate name (e.g. `"dch-tools"`, `"loopctl"`).
+    /// The crate name, spelled as its manifest spells it.
+    ///
+    /// The rules address packages by name alone. Should a resolved graph
+    /// carry two versions of one crate, [`find`] inspects the first — the
+    /// rules read declared edges, which any version of a crate states the
+    /// same way.
     pub name: String,
-    /// Declared dependency names (workspace and external alike).
+    /// The runtime dependency names, workspace crates and externals alike.
+    ///
+    /// Dev- and build-dependencies are dropped before this view is built:
+    /// they are not edges a shipped binary carries, so no rule may count
+    /// them as a coupling.
     pub deps: Vec<String>,
+
+    /// Where the crate resolves from, as `cargo metadata` reports it.
+    ///
+    /// `Some` for anything fetched — `"registry+…"` or `"git+…"`.
+    /// `None` marks a crate read off the local filesystem, which a
+    /// clean checkout has no way to obtain.
+    pub source: Option<String>,
+
+    /// Whether the crate belongs to this workspace.
+    ///
+    /// Members are read from disk by design; a non-member carrying no
+    /// [`Package::source`] is a foreign path dependency.
+    pub workspace_member: bool,
 }
 
-/// A single boundary-rule violation.
+/// One boundary-rule violation, attributed to the crate that caused it.
+///
+/// Rules accumulate rather than fail fast, so a single run reports every
+/// boundary problem in the manifest at once.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Violation {
-    /// The crate whose dependency list violates a rule.
+    /// The crate whose own dependency list tripped the rule.
+    ///
+    /// Names where the fix belongs; [`Violation::detail`] names the edge
+    /// that is wrong about it.
     pub crate_name: String,
-    /// Human-readable description of the violation.
+    /// What the rule required and what the manifest actually declares.
+    ///
+    /// Printed verbatim by `check-boundary`, so a developer sees the
+    /// expected shape beside the found one instead of a bare refusal.
     pub detail: String,
 }
 
-/// Returns true iff `dep` names a dch workspace crate (`dch`, `dch-config`, …).
+/// Whether `dep` names a crate of this workspace (`dch`, `dch-config`, …).
+///
+/// The naming convention is the only discriminator needed: every crate
+/// published from this repository carries the prefix, and nothing fetched
+/// from outside it does.
 fn is_dch_crate(dep: &str) -> bool {
     dep == "dch" || dep.starts_with("dch-")
 }
 
-/// Selects only the dch-* dependencies of `pkg`.
+/// The `dch-*` subset of a package's declared dependencies.
+///
+/// Sorted and de-duplicated so a rule can compare the result against an
+/// expected set without caring about declaration order or repeats.
 fn dch_deps_of(pkg: &Package) -> Vec<String> {
     let mut v: Vec<String> = pkg
         .deps
@@ -46,33 +89,53 @@ fn dch_deps_of(pkg: &Package) -> Vec<String> {
     v
 }
 
-/// Looks up a package by name in the slice.
+/// The first package in `pkgs` carrying `name`, if any.
+///
+/// A rule that cannot find its package reports it as absent from the
+/// metadata rather than passing quietly, so a renamed crate fails loudly.
 fn find<'a>(pkgs: &'a [Package], name: &str) -> Option<&'a Package> {
     pkgs.iter().find(|p| p.name == name)
 }
 
-/// Pure boundary checker. Owns no I/O — testable with synthetic packages.
+/// The boundary checker, pure over a slice of packages.
+///
+/// Holding no I/O lets every rule be driven with synthetic packages in
+/// the unit tests, so a rule's verdict is pinned without a misbehaving
+/// manifest or a `cargo metadata` invocation.
 pub struct Checker<'a> {
     pkgs: &'a [Package],
 }
 
 impl<'a> Checker<'a> {
-    /// Construct a checker over a slice of packages.
+    /// A checker borrowing the packages it will inspect.
+    ///
+    /// The slice is normally the whole resolved graph: the rules select
+    /// from it by name rather than the caller pre-filtering it.
     pub fn new(pkgs: &'a [Package]) -> Self {
         Self { pkgs }
     }
 
-    /// Run all four rules, collecting every violation. Empty Vec = pass.
+    /// Run all five rules, collecting every violation.
+    ///
+    /// The rules are independent, so one pass reports every boundary
+    /// problem in the manifest rather than stopping at the first; an
+    /// empty return is the verdict `check-boundary` prints as a pass.
     pub fn check(&self) -> Vec<Violation> {
         let mut out = Vec::new();
         out.extend(self.rule_dch_tools_loopctl_only());
         out.extend(self.rule_dch_tui_dch_config_only());
         out.extend(self.rule_loopctl_no_dch());
         out.extend(self.rule_exact_dch_dep_sets());
+        out.extend(self.rule_no_foreign_path_deps());
         out
     }
 
-    /// Rule 1: `dch-tools` depends only on `loopctl` (no `dch-*` crate).
+    /// Rule 1: `dch-tools` depends on `loopctl` and on no `dch-*` crate.
+    ///
+    /// The tool layer is the crate meant to be reusable beyond this
+    /// product, so it may not reach back into configuration or the loop
+    /// wiring — any `dch-*` edge there turns a library-shaped crate into a
+    /// component of one binary.
     fn rule_dch_tools_loopctl_only(&self) -> Vec<Violation> {
         let Some(pkg) = find(self.pkgs, "dch-tools") else {
             return vec![Violation {
@@ -93,7 +156,11 @@ impl<'a> Checker<'a> {
         }]
     }
 
-    /// Rule 2: `dch-tui`'s dch-* deps == `{dch-config}` exactly.
+    /// Rule 2: `dch-tui`'s `dch-*` dependencies are exactly `dch-config`.
+    ///
+    /// The display layer reads configuration and nothing else from inside
+    /// the workspace — neither the tool implementations nor the agent
+    /// loop — which is what keeps a transcript renderable on its own.
     fn rule_dch_tui_dch_config_only(&self) -> Vec<Violation> {
         let Some(pkg) = find(self.pkgs, "dch-tui") else {
             return vec![Violation {
@@ -115,11 +182,15 @@ impl<'a> Checker<'a> {
         }]
     }
 
-    /// Rule 3: `loopctl` depends on no `dch-*` crate (one-way boundary, P1).
+    /// Rule 3: `loopctl` declares no dependency on any `dch-*` crate.
+    ///
+    /// The dependency between the framework and this product runs one
+    /// way; an edge in the other direction would make the framework
+    /// unbuildable without the product sitting beside it.
     fn rule_loopctl_no_dch(&self) -> Vec<Violation> {
         let Some(pkg) = find(self.pkgs, "loopctl") else {
-            // loopctl is a path dep; with full metadata it must appear. If it
-            // doesn't, that's a separate problem worth surfacing.
+            // `cargo metadata` walks the resolved graph, so loopctl shows up
+            // whatever its source. Absence is a separate problem.
             return vec![Violation {
                 crate_name: "loopctl".into(),
                 detail: "package not present in cargo metadata (one-way rule P1 unverifiable)"
@@ -139,7 +210,12 @@ impl<'a> Checker<'a> {
         }]
     }
 
-    /// Rule 4: exact dch-* dep-sets for `dch-loop` and the `dch` binary.
+    /// Rule 4: the exact `dch-*` dependency sets of `dch-loop` and `dch`.
+    ///
+    /// These two are the composition points, so their edges are fixed
+    /// rather than merely constrained — configuration and tools beneath
+    /// the loop, the three assembled crates beneath the binary. Anything
+    /// else violates this rule even where rules 1 to 3 would allow it.
     fn rule_exact_dch_dep_sets(&self) -> Vec<Violation> {
         let mut out = Vec::new();
         let dch_loop_expected = vec!["dch-config".to_string(), "dch-tools".to_string()];
@@ -185,17 +261,57 @@ impl<'a> Checker<'a> {
         }
         out
     }
+
+    /// Rule 5: every package resolves from a fetched source or is a
+    /// member of this workspace.
+    ///
+    /// A dependency declared by path outside the workspace builds only
+    /// where the sibling checkout happens to sit: `Cargo.lock` records
+    /// neither a source nor a checksum for it, so a clean checkout, a
+    /// release build, and a container image that copies just the
+    /// workspace all fail to resolve it, and the lockfile stops being a
+    /// reproducible record of what was built.
+    fn rule_no_foreign_path_deps(&self) -> Vec<Violation> {
+        self.pkgs
+            .iter()
+            .filter(|pkg| !pkg.workspace_member && pkg.source.is_none())
+            .map(|pkg| Violation {
+                crate_name: pkg.name.clone(),
+                detail: "resolves by path from outside the workspace; a clean \
+                         checkout cannot fetch it"
+                    .to_string(),
+            })
+            .collect()
+    }
 }
 
-/// Shape of the subset of `cargo metadata` JSON we deserialize.
+/// The part of the `cargo metadata` document this check reads.
+///
+/// Declaring only these fields keeps an unrelated metadata format change
+/// harmless; the two listed are the ones the rules cannot be derived
+/// without.
 #[derive(Debug, serde::Deserialize)]
 struct MetadataDoc {
     packages: Vec<MetadataPackage>,
+    workspace_members: Vec<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
 struct MetadataPackage {
     name: String,
+    /// The `cargo metadata` id of this package.
+    ///
+    /// The membership list the same document carries is expressed in
+    /// this form, so deciding whether a package belongs to the
+    /// workspace is a direct id comparison.
+    id: String,
+    /// Where the package is fetched from, when it is fetched at all.
+    ///
+    /// `cargo metadata` reports `null` for a crate read off the local
+    /// filesystem, which is the fact that separates a workspace member
+    /// and a foreign path dependency from a published crate.
+    #[serde(default)]
+    source: Option<String>,
     #[serde(default)]
     dependencies: Vec<MetadataDep>,
 }
@@ -203,7 +319,11 @@ struct MetadataPackage {
 #[derive(Debug, serde::Deserialize)]
 struct MetadataDep {
     name: String,
-    /// `null` for normal deps, `"dev"` for dev-deps, `"build"` for build-deps.
+    /// The dependency kind, `None` for a runtime dependency.
+    ///
+    /// `"dev"` and `"build"` mark edges that do not ship; they are
+    /// filtered out while the [`Package`] view is built, so a dev-only
+    /// coupling never reads as a boundary violation.
     #[serde(default)]
     kind: Option<String>,
 }
@@ -211,7 +331,11 @@ struct MetadataDep {
 /// Converts the parsed `cargo metadata` document into the [`Package`] view the
 /// [`Checker`] consumes, dropping dev- and build-dependencies.
 fn packages_from_metadata(doc: MetadataDoc) -> Vec<Package> {
-    doc.packages
+    let MetadataDoc {
+        packages,
+        workspace_members,
+    } = doc;
+    packages
         .into_iter()
         .map(|p| Package {
             name: p.name,
@@ -221,11 +345,19 @@ fn packages_from_metadata(doc: MetadataDoc) -> Vec<Package> {
                 .filter(|d| d.kind.is_none())
                 .map(|d| d.name)
                 .collect(),
+            source: p.source,
+            workspace_member: workspace_members.contains(&p.id),
         })
         .collect()
 }
 
-/// Runs `cargo metadata`, parses it, and prints violations. Exit 0 on pass.
+/// Runs the boundary check over this workspace and reports the verdict.
+///
+/// Asks `cargo metadata` for the graph, converts it into the [`Package`]
+/// view the rules read, and prints every violation to stderr. Exits `0`
+/// on a clean workspace, `1` when a rule is violated, and `3` when the
+/// metadata could not be obtained — a broken toolchain should not look
+/// like a broken manifest.
 pub fn run_check() -> ExitCode {
     let output = Command::new("cargo")
         .arg("metadata")
@@ -257,7 +389,7 @@ pub fn run_check() -> ExitCode {
     let violations = Checker::new(&pkgs).check();
 
     if violations.is_empty() {
-        println!("xtask: boundary check passed (4 rules, 0 violations)");
+        println!("xtask: boundary check passed (5 rules, 0 violations)");
         ExitCode::SUCCESS
     } else {
         eprintln!(
@@ -276,10 +408,32 @@ pub fn run_check() -> ExitCode {
 mod tests {
     use super::*;
 
+    /// The `source` string a published crate carries in metadata output.
+    ///
+    /// Used by [`pkg`] so the fixture's non-members read as fetched
+    /// rather than as the foreign path dependencies rule 5 reports.
+    const REGISTRY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
+
     fn pkg(name: &str, deps: &[&str]) -> Package {
+        let member = is_dch_crate(name);
         Package {
             name: name.into(),
             deps: deps.iter().map(|s| (*s).to_string()).collect(),
+            source: (!member).then(|| REGISTRY_SOURCE.to_string()),
+            workspace_member: member,
+        }
+    }
+
+    /// A dependency declared by path outside the workspace.
+    ///
+    /// The shape rule 5 exists to catch, and the one a sibling checkout
+    /// invites: it resolves only on the machine holding that checkout.
+    fn path_pkg(name: &str, deps: &[&str]) -> Package {
+        Package {
+            name: name.into(),
+            deps: deps.iter().map(|s| (*s).to_string()).collect(),
+            source: None,
+            workspace_member: false,
         }
     }
 
@@ -298,7 +452,7 @@ mod tests {
             .collect()
     }
 
-    /// A workspace that satisfies all four rules.
+    /// A workspace that satisfies all five rules.
     fn good_workspace() -> Vec<Package> {
         vec![
             pkg(
@@ -322,6 +476,32 @@ mod tests {
     fn passes_on_clean_workspace() {
         let v = Checker::new(&good_workspace()).check();
         assert!(v.is_empty(), "expected no violations, got {v:?}");
+    }
+
+    #[test]
+    fn an_external_path_dependency_violates_the_source_rule() {
+        let sibling = path_pkg("loopctl", &["serde", "tokio"]);
+        let ws = with_pkg(&good_workspace(), "loopctl", &sibling);
+        let v = Checker::new(&ws).check();
+        assert!(
+            has_violation(&v, "loopctl", "outside the workspace"),
+            "a sibling path dependency is reported: {v:?}"
+        );
+    }
+
+    #[test]
+    fn a_fetched_dependency_satisfies_the_source_rule() {
+        let fetched = pkg("loopctl", &["serde", "tokio"]);
+        assert!(
+            fetched.source.is_some(),
+            "the fixture models a crate resolved from a published source"
+        );
+        let ws = with_pkg(&good_workspace(), "loopctl", &fetched);
+        let v = Checker::new(&ws).check();
+        assert!(
+            v.is_empty(),
+            "the same dependency fetched passes all rules: {v:?}"
+        );
     }
 
     #[test]
@@ -394,13 +574,15 @@ mod tests {
             "packages": [
                 {
                     "name": "fake",
+                    "id": "path+file:///tmp/fake#0.1.0",
                     "dependencies": [
                         {"name": "dch-config"},
                         {"name": "dch-tools", "kind": "dev"},
                         {"name": "dch-tui",   "kind": "build"}
                     ]
                 }
-            ]
+            ],
+            "workspace_members": []
         }"#;
         let doc: MetadataDoc = serde_json::from_str(json)?;
         let pkgs = packages_from_metadata(doc);
@@ -411,6 +593,8 @@ mod tests {
             [Package {
                 name: "fake".to_string(),
                 deps: vec!["dch-config".to_string()],
+                source: None,
+                workspace_member: false,
             }]
         );
         Ok(())

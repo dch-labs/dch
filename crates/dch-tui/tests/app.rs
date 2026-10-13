@@ -39,6 +39,12 @@ fn config_with_theme(name: &str) -> DchConfig {
     config
 }
 
+fn config_with_strip_top() -> DchConfig {
+    let mut config = config_with_theme("dracula");
+    config.display.strip_position = dch_config::StripPosition::Top;
+    config
+}
+
 fn app() -> TuiApp {
     TuiApp::new(config_with_theme("dracula"))
 }
@@ -501,31 +507,21 @@ fn ctrl_c_cancels_a_running_agent_without_touching_the_quit_chord() {
 }
 
 #[test]
-fn the_status_bar_shows_the_context_and_the_session_id() {
-    // One status line, three facts: the model, the session's token
-    // accounting labeled as context, and which session this is —
-    // the id a later `--resume` wants, readable straight off the
-    // bar.
+fn the_status_bar_shows_the_model_and_the_session_id() {
+    // One status line, two stable facts: which model answers and
+    // which session this is — the id a later `--resume` wants,
+    // readable straight off the bar.
     let state = dch_tui::TuiObserverState::new();
     let (observer, kept) = state.into_observer();
     drop(observer);
-    {
-        let mut tokens = kept.tokens.lock().expect("tokens");
-        tokens.cumulative_input = 4_494;
-        tokens.cumulative_output = 156;
-    }
     let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
     app.set_session_id("f005d097-c4ce-477a-88c0-2fc2cec5a466".to_string());
     let bar = render_to_buffer(&mut app, 100, 24);
     let rows = row_texts(&bar);
     let status = rows
         .iter()
-        .find(|r| r.contains("CTX:"))
+        .find(|r| r.contains("testmodel"))
         .expect("the bar renders");
-    assert!(
-        status.contains("CTX: 4650"),
-        "the accounting reads as context: {status:?}"
-    );
     assert!(
         status.contains("f005d097-c4ce-477a-88c0-2fc2cec5a466"),
         "the session id rides the bar: {status:?}"
@@ -699,6 +695,185 @@ fn the_status_bar_names_the_current_permission_mode() {
             "the bar names `{segment}`: {status_row:?}"
         );
     }
+}
+
+#[test]
+fn the_status_bar_omits_the_turn_counter() {
+    // The engine's turn count is budget bookkeeping, not something
+    // the driver needs in view — the bar carries no turn segment
+    // even mid-run, and no context-size segment either: the usage
+    // dch receives carries only the uncached input slice, which is
+    // not the conversation size, so no honest number exists.
+    let state = dch_tui::TuiObserverState::new();
+    *state.current_turn.lock().unwrap() = Some(36);
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), state);
+    let terminal = render_to_buffer(&mut app, 100, 30);
+    let buffer = terminal.backend().buffer();
+    let status_row: String = (0..100)
+        .map(|x| buffer[(x, 29)].symbol().to_string())
+        .collect();
+    assert!(
+        !status_row.contains("turn "),
+        "no turn segment rides the bar: {status_row:?}"
+    );
+    assert!(
+        !status_row.contains("CTX:"),
+        "no context segment renders without honest data: {status_row:?}"
+    );
+}
+
+#[test]
+fn clicking_the_session_id_segment_copies_it() {
+    // The id segment in the status bar is a click target: a plain
+    // click inside it routes the id through the selection transport
+    // and posts the copy notice, exactly as a text selection would.
+    // The span is pinned at both boundaries — its final cell copies,
+    // the separator cell just before it does not.
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    let id = "f005d097-c4ce-477a-88c0-2fc2cec5a466";
+    app.set_session_id(id.to_string());
+    let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&copied);
+    app.set_selection_copier(Box::new(move |_attempt, text| {
+        sink.lock().expect("sink").push(text.to_string());
+        dch_tui::CopyAnswer::Verified
+    }));
+    let probe = render_to_buffer(&mut app, 100, 24);
+    let rows = row_texts(&probe);
+    let status = rows
+        .iter()
+        .find(|r| r.contains("f005d097"))
+        .expect("the bar renders the id");
+    let id_start = cell_col(status, id);
+    let id_width: usize = id.chars().map(|c| c.width().unwrap_or(0)).sum();
+    let last_cell = u16::try_from(id_start.saturating_add(id_width).saturating_sub(1)).unwrap_or(0);
+    let separator_cell = u16::try_from(id_start.saturating_sub(1)).unwrap_or(0);
+    let row = rows
+        .iter()
+        .position(|r| r.contains("f005d097"))
+        .unwrap_or(0);
+    let row = u16::try_from(row).unwrap_or(0);
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        last_cell,
+        row,
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        last_cell,
+        row,
+    ));
+    let recorded = copied.lock().expect("sink").clone();
+    assert_eq!(
+        recorded,
+        vec![id.to_string()],
+        "the click on the segment's final cell copies the id"
+    );
+
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        separator_cell,
+        row,
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        separator_cell,
+        row,
+    ));
+    let recorded = copied.lock().expect("sink").clone();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "a click on the separator before the id copies nothing"
+    );
+}
+
+#[test]
+fn the_status_bar_parenthesizes_the_reasoning_effort_beside_the_model() {
+    // The model segment carries the effort — one glance, one fact —
+    // with the level capitalized beside the model name and `Auto`
+    // standing in when no level is configured: the provider's own
+    // thinking defaults apply then, not none.
+    for (level, label) in [
+        ("low", "Low"),
+        ("medium", "Medium"),
+        ("high", "High"),
+        ("max", "Max"),
+    ] {
+        let mut config = config_with_theme("dracula");
+        config.api.reasoning_effort = Some(level.to_string());
+        let mut app = TuiApp::new(config);
+        let terminal = render_to_buffer(&mut app, 80, 30);
+        let buffer = terminal.backend().buffer();
+        let status_row: String = (0..80)
+            .map(|x| buffer[(x, 29)].symbol().to_string())
+            .collect();
+        assert!(
+            status_row.contains(&format!("testmodel ({label})")),
+            "the model names its effort `({label})`: {status_row:?}"
+        );
+    }
+    let config = config_with_theme("dracula");
+    let mut app = TuiApp::new(config);
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let buffer = terminal.backend().buffer();
+    let status_row: String = (0..80)
+        .map(|x| buffer[(x, 29)].symbol().to_string())
+        .collect();
+    assert!(
+        status_row.contains("testmodel (Auto)"),
+        "an unset effort reads as `(Auto)`: {status_row:?}"
+    );
+}
+
+#[test]
+fn the_status_bar_names_the_working_folder_and_its_branch() {
+    // The directory rides the bar between the mode and the session
+    // id as its own name — the leaf alone, never the path — with
+    // the git branch in parentheses when the host named one.
+    let mut app = app();
+    let unset = render_to_buffer(&mut app, 100, 24);
+    assert!(
+        !row_texts(&unset).iter().any(|row| row.contains("repos")),
+        "no folder renders until the host names one"
+    );
+
+    app.set_session_id("f005d097-c4ce-477a-88c0-2fc2cec5a466".to_string());
+    app.set_working_dir(std::path::Path::new("/home/tester/repos/dch"));
+    app.set_git_branch(Some("master".to_string()));
+    let bar = render_to_buffer(&mut app, 100, 24);
+    let rows = row_texts(&bar);
+    let status = rows
+        .iter()
+        .find(|row| row.contains("testmodel"))
+        .expect("the status bar renders");
+    assert!(
+        status.contains("dch (master)"),
+        "the folder names its branch: {status:?}"
+    );
+    assert!(
+        !status.contains("/home/tester"),
+        "the path never shows, only the folder: {status:?}"
+    );
+    let mode_at = status.find("mode: ").expect("the mode segment");
+    let dir_at = status.find("dch (master)").expect("the directory segment");
+    let id_at = status.find("f005d097").expect("the session id segment");
+    assert!(
+        mode_at < dir_at && dir_at < id_at,
+        "mode, then folder, then session id: {status:?}"
+    );
+
+    app.set_git_branch(None);
+    let bare = render_to_buffer(&mut app, 100, 24);
+    assert!(
+        row_texts(&bare)
+            .iter()
+            .any(|row| row.contains("  │  dch  │")),
+        "no branch renders as the bare folder"
+    );
 }
 
 #[test]
@@ -1275,12 +1450,16 @@ fn a_turn_end_hook_receives_the_graduated_reply() {
     kept.graduations
         .lock()
         .expect("the queue lock")
-        .push(dch_tui::Graduation::Reply("the finished reply".to_string()));
+        .push(dch_tui::Graduation::Reply {
+            text: "the finished reply".to_string(),
+            thinking: None,
+        });
     let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
     let snapshots: Arc<std::sync::Mutex<Snapshots>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&snapshots);
-    app.set_turn_end_hook(Box::new(move |conversation| {
+    app.set_turn_end_hook(Box::new(move |conversation, machine| {
         snapshots_lock(&sink).push(conversation.to_vec());
+        assert!(machine.is_none(), "no turn-end history rides this drain");
     }));
     drop(render_to_buffer(&mut app, 80, 30));
     let seen = snapshots_lock(&snapshots);
@@ -1302,6 +1481,69 @@ fn a_turn_end_hook_receives_the_graduated_reply() {
 }
 
 #[test]
+fn a_turn_end_hook_receives_the_newest_turn_end_history() {
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    kept.graduations
+        .lock()
+        .expect("the queue lock")
+        .push(dch_tui::Graduation::Reply {
+            text: "mid-run reply".to_string(),
+            thinking: None,
+        });
+    let older = Arc::new(vec![loopctl::message::Message::user("the prompt")]);
+    let newer = Arc::new(vec![
+        loopctl::message::Message::user("the prompt"),
+        loopctl::message::Message::assistant("mid-run reply"),
+    ]);
+    kept.turn_histories
+        .lock()
+        .expect("the histories lock")
+        .extend([older, newer]);
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    let histories: Arc<std::sync::Mutex<Vec<usize>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&histories);
+    app.set_turn_end_hook(Box::new(move |_conversation, machine| {
+        let length = machine.map_or(usize::MAX, |history| history.len());
+        sink.lock().expect("the sink lock").push(length);
+    }));
+    drop(render_to_buffer(&mut app, 80, 30));
+    let seen = histories.lock().expect("the sink lock").clone();
+    assert_eq!(
+        *seen,
+        vec![2],
+        "the hook fired once, with the newest turn-end history: {seen:?}"
+    );
+}
+
+#[test]
+fn a_history_without_display_events_still_fires_the_hook() {
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    kept.turn_histories
+        .lock()
+        .expect("the histories lock")
+        .push(Arc::new(vec![loopctl::message::Message::user(
+            "the prompt",
+        )]));
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    let snapshots: Arc<std::sync::Mutex<Snapshots>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&snapshots);
+    app.set_turn_end_hook(Box::new(move |conversation, machine| {
+        snapshots_lock(&sink).push(conversation.to_vec());
+        assert!(machine.is_some(), "the history reaches the host");
+    }));
+    drop(render_to_buffer(&mut app, 80, 30));
+    assert_eq!(
+        snapshots_lock(&snapshots).len(),
+        1,
+        "a turn end with nothing to graduate still publishes its history"
+    );
+}
+
+#[test]
 fn a_turn_end_hook_fires_for_surfaced_errors() {
     let state = dch_tui::TuiObserverState::new();
     let (observer, kept) = state.into_observer();
@@ -1313,8 +1555,9 @@ fn a_turn_end_hook_fires_for_surfaced_errors() {
     let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
     let snapshots: Arc<std::sync::Mutex<Snapshots>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&snapshots);
-    app.set_turn_end_hook(Box::new(move |conversation| {
+    app.set_turn_end_hook(Box::new(move |conversation, machine| {
         snapshots_lock(&sink).push(conversation.to_vec());
+        assert!(machine.is_none(), "no turn-end history rides this drain");
     }));
     drop(render_to_buffer(&mut app, 80, 30));
     let seen = snapshots_lock(&snapshots);
@@ -1339,8 +1582,9 @@ fn a_quiet_frame_does_not_fire_the_turn_end_hook() {
     let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept.clone());
     let snapshots: Arc<std::sync::Mutex<Snapshots>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&snapshots);
-    app.set_turn_end_hook(Box::new(move |conversation| {
+    app.set_turn_end_hook(Box::new(move |conversation, machine| {
         snapshots_lock(&sink).push(conversation.to_vec());
+        assert!(machine.is_none(), "no turn-end history rides this drain");
     }));
     drop(render_to_buffer(&mut app, 80, 30));
     assert!(
@@ -1351,7 +1595,10 @@ fn a_quiet_frame_does_not_fire_the_turn_end_hook() {
     kept.graduations
         .lock()
         .expect("the queue lock")
-        .push(dch_tui::Graduation::Reply("a late reply".to_string()));
+        .push(dch_tui::Graduation::Reply {
+            text: "a late reply".to_string(),
+            thinking: None,
+        });
     drop(render_to_buffer(&mut app, 80, 30));
     assert_eq!(
         snapshots_lock(&snapshots).len(),
@@ -2026,9 +2273,9 @@ fn a_copy_no_transport_delivers_notices_the_failure() {
 #[test]
 fn a_hanging_copy_command_never_blocks_the_render_task() {
     // The release must not wait on the helper: the chain runs off the
-    // render path under a kill deadline, and the verdict lands as a
-    // follow-up notice through the frame drain — wording only the
-    // drain produces, so landing is presence, not optimism.
+    // render path under a kill deadline, and the unverified verdict
+    // posts nothing — an escape whose delivery nothing confirmed is
+    // silence, not a claim.
     let mut config = config_with_theme("dracula");
     config.display.copy_command = Some("sleep 30".to_string());
     let mut app = TuiApp::new(config);
@@ -2067,29 +2314,28 @@ fn a_hanging_copy_command_never_blocks_the_render_task() {
         "the release returns without waiting on the hanging helper"
     );
 
-    let mut landed = false;
+    let mut silenced = true;
     for _ in 0..100 {
         std::thread::sleep(std::time::Duration::from_millis(50));
         let frame = render_to_buffer(&mut app, 80, 24);
         if row_texts(&frame)
             .iter()
-            .any(|r| r.contains("selection copied (unconfirmed)"))
+            .any(|r| r.contains("copied") || r.contains("copy failed"))
         {
-            landed = true;
+            silenced = false;
             break;
         }
     }
     assert!(
-        landed,
-        "the deadline lands the unconfirmed verdict on the notice row"
+        silenced,
+        "a killed-helper verdict that nothing confirmed never claims the notice row"
     );
 }
 
 #[test]
-fn a_pending_transport_copy_shows_the_unconfirmed_wording_immediately() {
-    // Transports in flight never borrow the verified claim: from the
-    // release itself the notice reads unconfirmed, and the attempt's
-    // verdict can only agree with or upgrade it.
+fn a_pending_transport_copy_posts_no_row_until_the_verdict() {
+    // Transports in flight owe a verdict: the release posts no
+    // wording of its own, so nothing flashes ahead of the outcome.
     let mut config = config_with_theme("dracula");
     config.display.copy_command = Some("sleep 30".to_string());
     let mut app = TuiApp::new(config);
@@ -2125,10 +2371,10 @@ fn a_pending_transport_copy_shows_the_unconfirmed_wording_immediately() {
 
     let frame = render_to_buffer(&mut app, 80, 24);
     assert!(
-        row_texts(&frame)
+        !row_texts(&frame)
             .iter()
-            .any(|r| r.contains("selection copied (unconfirmed)")),
-        "the pending window says unconfirmed from the start: {:?}",
+            .any(|r| r.contains("copied") || r.contains("copy failed")),
+        "the pending window posts nothing: {:?}",
         row_texts(&frame)
     );
 }
@@ -4018,8 +4264,9 @@ fn a_tool_graduation_fires_the_turn_end_hook() {
     let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
     let snapshots: Arc<std::sync::Mutex<Snapshots>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&snapshots);
-    app.set_turn_end_hook(Box::new(move |conversation| {
+    app.set_turn_end_hook(Box::new(move |conversation, machine| {
         snapshots_lock(&sink).push(conversation.to_vec());
+        assert!(machine.is_none(), "no turn-end history rides this drain");
     }));
     drop(render_to_buffer(&mut app, 80, 30));
     let seen = snapshots_lock(&snapshots);
@@ -4126,6 +4373,56 @@ fn a_click_expands_a_completed_tool_block_and_clicking_again_collapses_it() {
     assert!(
         rows.iter().any(|r| r.contains("▸")),
         "the marker returns to closed: {rows:?}"
+    );
+}
+
+#[test]
+fn a_selectionless_release_still_toggles_a_tool_row_and_reports_the_redraw() {
+    // A release arrives with no selection in play when the app never saw
+    // the press — it was claimed by another surface or landed before the
+    // loop listened. The release still runs the click handlers, and its
+    // verdict must fold every one of them: a toggle that redraws but
+    // reports false leaves the block's open state sitting undrawn until
+    // some later event happens to force a frame.
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    kept.graduations
+        .lock()
+        .expect("the queue lock")
+        .push(dch_tui::Graduation::Tool(dch_tui::ToolResultDisplay {
+            call_id: "call-9".to_string(),
+            name: "Bash".to_string(),
+            is_error: false,
+            duration: std::time::Duration::from_millis(25),
+            input_summary: r#"{"command":"make test"}"#.to_string(),
+            output_preview: String::new(),
+            full_input: "{\n  \"command\": \"make test\"\n}".to_string(),
+            full_output: "running 74 tests\nfailures: 0".to_string(),
+        }));
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+
+    let probe = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&probe);
+    let row = rows
+        .iter()
+        .position(|r| r.contains("Running: make test"))
+        .unwrap_or(0);
+
+    let released = app.handle_event(&mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        5,
+        u16::try_from(row).unwrap_or(0),
+    ));
+    assert!(
+        released,
+        "the toggle's redraw verdict must survive the selectionless release"
+    );
+    let open = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&open);
+    assert!(
+        rows.iter().any(|r| r.contains("▾")),
+        "the marker flips open: {rows:?}"
     );
 }
 
@@ -5105,9 +5402,10 @@ fn a_reply_graduates_below_the_tool_that_preceded_it() {
     kept.graduations
         .lock()
         .expect("the queue lock")
-        .push(dch_tui::Graduation::Reply(
-            "here is what I found".to_string(),
-        ));
+        .push(dch_tui::Graduation::Reply {
+            text: "here is what I found".to_string(),
+            thinking: None,
+        });
     let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
     drop(render_to_buffer(&mut app, 80, 30));
     let kinds: Vec<&str> = app
@@ -5248,6 +5546,53 @@ fn permission_app(
     (app, tx, receivers)
 }
 
+/// An app with staged question prompts already landed in the queue.
+///
+/// One prompt per entry, each with its own answer receiver; the
+/// options follow the `(label, description)` pairs of the entry.
+/// One staged question's shape for [`question_app`].
+struct StagedQuestion {
+    /// The question text the prompt carries.
+    question: &'static str,
+    /// The option rows, each a label with an optional description.
+    options: &'static [(&'static str, Option<&'static str>)],
+    /// Whether the prompt allows several answers.
+    multi_select: bool,
+}
+
+/// An app with staged question prompts already landed in the queue.
+///
+/// One prompt per entry, each with its own answer receiver.
+fn question_app(
+    questions: &[StagedQuestion],
+) -> (TuiApp, Vec<tokio::sync::oneshot::Receiver<Vec<String>>>) {
+    let mut app = app();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut receivers = Vec::new();
+    for staged in questions {
+        let (reply, reply_rx) = tokio::sync::oneshot::channel();
+        tx.send(dch_tui::QuestionPrompt {
+            question: staged.question.to_string(),
+            header: Some("Ask".to_string()),
+            options: staged
+                .options
+                .iter()
+                .map(|(label, description)| dch_tui::QuestionChoice {
+                    label: (*label).to_string(),
+                    description: description.map(std::string::ToString::to_string),
+                })
+                .collect(),
+            multi_select: staged.multi_select,
+            reply,
+        })
+        .expect("receiver alive");
+        receivers.push(reply_rx);
+    }
+    app.set_question_requests(rx);
+    app.poll_question_requests();
+    (app, receivers)
+}
+
 /// The first row index whose rendered text contains `needle`.
 ///
 /// Panics when `needle` is nowhere on screen — the position pins read
@@ -5341,7 +5686,7 @@ fn the_permission_sheet_sits_over_the_prompt_box() {
         title_row >= 30 - 2 - 7,
         "the sheet must sit in the prompt-box region, not mid-conversation ({title_row})"
     );
-    let status_row = row_of(&terminal, "CTX:");
+    let status_row = row_of(&terminal, "mode:");
     assert!(
         status_row > title_row,
         "the status bar must stay visible below the sheet ({status_row} vs {title_row})"
@@ -5553,6 +5898,251 @@ fn run_end_clears_pending_requests() {
 }
 
 #[test]
+fn a_pending_question_renders_the_overlay() {
+    let (mut app, _replies) = question_app(&[StagedQuestion {
+        question: "Deploy the release now?",
+        options: &[
+            ("yes", Some("ships immediately")),
+            ("no", None),
+            ("later", Some("asks again tomorrow")),
+        ],
+        multi_select: false,
+    }]);
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let screen = screen_text(&terminal);
+    assert!(screen.contains("Question"), "the title renders: {screen}");
+    assert!(
+        screen.contains("[Ask]"),
+        "the header chip renders: {screen}"
+    );
+    assert!(
+        screen.contains("Deploy the release now?"),
+        "the question text renders: {screen}"
+    );
+    assert!(screen.contains("yes"), "the first option renders: {screen}");
+    assert!(
+        screen.contains("later"),
+        "the third option renders: {screen}"
+    );
+    assert!(
+        screen.contains("asks again tomorrow"),
+        "an option's description renders: {screen}"
+    );
+    assert!(
+        screen.contains("[enter] confirm"),
+        "the key hints render: {screen}"
+    );
+}
+
+#[test]
+fn arrows_space_and_enter_answer_a_multi_select_question() {
+    let (mut app, mut replies) = question_app(&[StagedQuestion {
+        question: "Which checks run?",
+        options: &[("lint", None), ("tests", None), ("fmt", None)],
+        multi_select: true,
+    }]);
+    assert!(app.handle_event(&plain(KeyCode::Char(' '))));
+    assert!(app.handle_event(&plain(KeyCode::Down)));
+    assert!(app.handle_event(&plain(KeyCode::Char(' '))));
+    assert!(app.handle_event(&plain(KeyCode::Down)));
+    assert!(app.handle_event(&plain(KeyCode::Char(' '))));
+    let reply = replies.remove(0);
+    assert!(app.handle_event(&plain(KeyCode::Enter)));
+    assert_eq!(
+        reply.blocking_recv(),
+        Ok(vec![
+            "lint".to_string(),
+            "tests".to_string(),
+            "fmt".to_string()
+        ]),
+        "Enter confirms the toggled set in option order"
+    );
+}
+
+#[test]
+fn toggling_a_row_twice_returns_it_to_untoggled() {
+    let (mut app, mut replies) = question_app(&[StagedQuestion {
+        question: "Which checks run?",
+        options: &[("lint", None), ("tests", None)],
+        multi_select: true,
+    }]);
+    assert!(app.handle_event(&plain(KeyCode::Char(' '))));
+    assert!(app.handle_event(&plain(KeyCode::Char(' '))));
+    let reply = replies.remove(0);
+    assert!(app.handle_event(&plain(KeyCode::Enter)));
+    assert_eq!(
+        reply.blocking_recv(),
+        Ok(Vec::<String>::new()),
+        "a toggled-then-untoggled row confirms no answer"
+    );
+}
+
+#[test]
+fn enter_confirms_the_cursor_row_for_a_single_select_question() {
+    let (mut app, mut replies) = question_app(&[StagedQuestion {
+        question: "Deploy now?",
+        options: &[("yes", None), ("no", None)],
+        multi_select: false,
+    }]);
+    assert!(app.handle_event(&plain(KeyCode::Down)));
+    let reply = replies.remove(0);
+    assert!(app.handle_event(&plain(KeyCode::Enter)));
+    assert_eq!(
+        reply.blocking_recv(),
+        Ok(vec!["no".to_string()]),
+        "Enter confirms the row the cursor moved to"
+    );
+}
+
+#[test]
+fn esc_dismisses_the_pending_question_with_no_answers() {
+    let (mut app, mut replies) = question_app(&[StagedQuestion {
+        question: "Deploy now?",
+        options: &[("yes", None)],
+        multi_select: false,
+    }]);
+    let reply = replies.remove(0);
+    assert!(app.handle_event(&plain(KeyCode::Esc)));
+    assert_eq!(
+        reply.blocking_recv(),
+        Ok(Vec::<String>::new()),
+        "a dismissal answers with no labels"
+    );
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    assert!(
+        !screen_text(&terminal).contains("Question"),
+        "the overlay leaves with the question: {}",
+        screen_text(&terminal)
+    );
+}
+
+#[test]
+fn a_batch_of_questions_advances_one_at_a_time() {
+    let (mut app, mut replies) = question_app(&[
+        StagedQuestion {
+            question: "First: continue?",
+            options: &[("yes", None)],
+            multi_select: false,
+        },
+        StagedQuestion {
+            question: "Second: really?",
+            options: &[("ok", None)],
+            multi_select: false,
+        },
+    ]);
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let screen = screen_text(&terminal);
+    assert!(
+        screen.contains("First: continue?") && !screen.contains("Second: really?"),
+        "only the first question of a batch shows: {screen}"
+    );
+    assert!(screen.contains("1 more"), "the count renders: {screen}");
+
+    let first = replies.remove(0);
+    assert!(app.handle_event(&plain(KeyCode::Enter)));
+    assert_eq!(
+        first.blocking_recv(),
+        Ok(vec!["yes".to_string()]),
+        "the first question answers"
+    );
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let screen = screen_text(&terminal);
+    assert!(
+        screen.contains("Second: really?") && !screen.contains("First: continue?"),
+        "answering advances to the next question: {screen}"
+    );
+    let second = replies.remove(0);
+    assert!(app.handle_event(&plain(KeyCode::Enter)));
+    assert_eq!(
+        second.blocking_recv(),
+        Ok(vec!["ok".to_string()]),
+        "the second question answers"
+    );
+}
+
+#[test]
+fn the_question_sheet_owns_the_composer() {
+    let mut app = app();
+    for c in ['d', 'r', 'a', 'f', 't'] {
+        app.handle_event(&plain(KeyCode::Char(c)));
+    }
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (reply, reply_rx) = tokio::sync::oneshot::channel();
+    tx.send(dch_tui::QuestionPrompt {
+        question: "Answer me?".to_string(),
+        header: None,
+        options: vec![dch_tui::QuestionChoice {
+            label: "yes".to_string(),
+            description: None,
+        }],
+        multi_select: false,
+        reply,
+    })
+    .expect("receiver alive");
+    app.set_question_requests(rx);
+    app.poll_question_requests();
+    assert!(
+        !app.composer_caret_visible(),
+        "the sheet owns the composer — no cursor under it"
+    );
+
+    let (submit_tx, mut submit_rx) = tokio::sync::mpsc::unbounded_channel();
+    app.set_submit_tx(submit_tx);
+    assert!(!app.handle_event(&plain(KeyCode::Char('x'))));
+    assert!(app.handle_event(&plain(KeyCode::Enter)));
+    assert!(
+        submit_rx.try_recv().is_err(),
+        "Enter must not submit a drafted composer while a question is up"
+    );
+    assert_eq!(
+        reply_rx.blocking_recv(),
+        Ok(vec!["yes".to_string()]),
+        "Enter answers the pending question, never the composer"
+    );
+    assert_eq!(
+        app.input(),
+        "draft",
+        "the draft survives the question untouched"
+    );
+    assert!(
+        app.composer_caret_visible(),
+        "the caret returns once the question is answered"
+    );
+}
+
+#[test]
+fn run_end_clears_pending_questions() {
+    let (mut app, replies) = question_app(&[
+        StagedQuestion {
+            question: "First: continue?",
+            options: &[("yes", None)],
+            multi_select: false,
+        },
+        StagedQuestion {
+            question: "Second: really?",
+            options: &[("ok", None)],
+            multi_select: false,
+        },
+    ]);
+    assert!(
+        app.tick_wake(std::time::Instant::now()),
+        "retiring questions on an idle agent must request a redraw"
+    );
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    assert!(
+        !screen_text(&terminal).contains("Question"),
+        "no overlay survives the run's end: {}",
+        screen_text(&terminal)
+    );
+    for reply in replies {
+        assert!(
+            reply.blocking_recv().is_err(),
+            "a retired question's reply channel must close, reading as a dismissal"
+        );
+    }
+}
+
+#[test]
 fn a_long_prompt_wraps_without_hiding_the_hints() {
     // Long enough to need more rows than the overlay's cap, the way a
     // long MCP tool name inside the gate's question can.
@@ -5612,6 +6202,33 @@ fn a_paste_behind_a_pending_prompt_lands_nowhere() {
         app.input(),
         "after",
         "with the prompt gone, paste reaches the composer again"
+    );
+}
+
+#[test]
+fn a_paste_behind_a_pending_question_lands_nowhere() {
+    // The question overlay owns the composer exactly as the permission
+    // overlay does — the caret is hidden and the draft invisible — so
+    // a paste while it is up must not seed text the user finds later.
+    let (mut app, _replies) = question_app(&[StagedQuestion {
+        question: "Deploy the release now?",
+        options: &[("yes", None), ("no", None)],
+        multi_select: false,
+    }]);
+    assert!(app.handle_event(&Event::Paste("pasted behind the question".to_string())));
+    assert_eq!(
+        app.input(),
+        "",
+        "a paste while a question is up must not reach the composer"
+    );
+
+    // Answer the question — the overlay retires — and pasting works.
+    assert!(app.handle_event(&plain(KeyCode::Enter)));
+    assert!(app.handle_event(&Event::Paste("after the answer".to_string())));
+    assert_eq!(
+        app.input(),
+        "after the answer",
+        "with the question gone, paste reaches the composer again"
     );
 }
 
@@ -5840,5 +6457,895 @@ fn ctrl_c_under_a_pending_prompt_serves_the_run_as_ever() {
     assert!(
         !screen_text(&terminal).contains("Permission required"),
         "no prompt outlives its run"
+    );
+}
+
+/// A state-split app for the thinking-lane pins.
+///
+/// The tests below drive the observer directly — deltas and responses —
+/// and render through the real frame path, so the lane's capture,
+/// graduation, and interaction all exercise the shipped wiring.
+fn thinking_app() -> (dch_tui::TuiObserver, TuiApp) {
+    let (observer, state) = dch_tui::TuiObserverState::new().into_observer();
+    (
+        observer,
+        TuiApp::from_observer_state(config_with_theme("dracula"), state),
+    )
+}
+
+/// A thinking app whose agent run is live.
+///
+/// Live reasoning renders only while the run does — the flag this
+/// helper sets before the app takes the state.
+fn live_thinking_app() -> (dch_tui::TuiObserver, TuiApp) {
+    let (observer, state) = dch_tui::TuiObserverState::new().into_observer();
+    state
+        .agent_running
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    (
+        observer,
+        TuiApp::from_observer_state(config_with_theme("dracula"), state),
+    )
+}
+
+fn thinking_delta(turn: usize, delta: &str) -> loopctl::observer::ThinkingDeltaContext {
+    loopctl::observer::ThinkingDeltaContext {
+        turn,
+        delta: delta.to_string(),
+    }
+}
+
+fn responded(turn: usize, text: &str) -> loopctl::observer::ResponseContext {
+    loopctl::observer::ResponseContext {
+        turn,
+        text: text.to_string(),
+        usage: None,
+    }
+}
+
+fn click(app: &mut TuiApp, column: u16, row: u16) {
+    app.handle_event(&mouse_event(
+        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column,
+        row,
+    ));
+    app.handle_event(&mouse_event(
+        crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        column,
+        row,
+    ));
+}
+
+#[test]
+fn an_empty_reply_text_never_becomes_an_empty_text_block() {
+    let (observer, mut app) = thinking_app();
+    observer.on_thinking_delta(&thinking_delta(0, "tool deliberation"));
+    observer.on_response(&responded(0, ""));
+    let terminal = render_to_buffer(&mut app, 80, 24);
+    drop(terminal);
+    let TuiMessage::Assistant { blocks, .. } = app.conversation().last().expect("a reply message")
+    else {
+        panic!("the graduated reply must land as an assistant message");
+    };
+    assert!(
+        blocks
+            .iter()
+            .all(|block| !matches!(block, ContentBlock::Text { text } if text.is_empty())),
+        "an empty reply text must not record a Text block — the wire rejects it"
+    );
+    assert!(
+        blocks
+            .iter()
+            .any(|block| matches!(block, ContentBlock::Thinking { .. })),
+        "the turn's reasoning still graduates onto the message"
+    );
+}
+
+#[test]
+fn the_expanded_live_body_caps_rendered_lines() {
+    let (observer, mut app) = live_thinking_app();
+    // One logical line, far wider than the pane: it wraps into far
+    // more rendered rows than the cap, so only the cap's tail may
+    // render while the stream is live.
+    let wall = "word ".repeat(4000);
+    observer.on_thinking_delta(&thinking_delta(0, &wall));
+    let terminal = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&terminal);
+    let body = rows.iter().filter(|row| row.contains("word")).count();
+    assert!(
+        body <= 500,
+        "the live body renders at most the cap's wrapped lines, got {body}"
+    );
+}
+
+#[test]
+fn redacted_reasoning_renders_a_placeholder_body() {
+    let (observer, mut app) = live_thinking_app();
+    observer.on_thinking_delta(&thinking_delta(0, ""));
+    let terminal = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&terminal);
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("reasoning withheld by the provider")),
+        "withheld reasoning shows its placeholder, not blanks: {rows:?}"
+    );
+}
+
+#[test]
+fn a_live_thinking_stream_renders_expanded_and_collapses_at_graduation() {
+    let (observer, mut app) = live_thinking_app();
+    observer.on_thinking_delta(&thinking_delta(0, "pondering the thing"));
+    let terminal = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&terminal);
+    assert!(
+        rows.iter().any(|row| row.contains("▾ Thinking")),
+        "Follow renders the live stream expanded: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.contains("pondering the thing")),
+        "the live body is on display: {rows:?}"
+    );
+    drop(terminal);
+    observer.on_response(&responded(0, "the answer"));
+    let terminal = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&terminal);
+    assert!(
+        rows.iter().any(|row| row.contains("▸ Thinking")),
+        "graduation auto-collapses the section: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.contains("the answer")),
+        "the reply renders beside its reasoning: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row.contains("pondering the thing")),
+        "the folded body is gone from the frame: {rows:?}"
+    );
+}
+
+#[test]
+fn collapsing_a_live_thinking_stream_suppresses_the_next() {
+    let (observer, mut app) = live_thinking_app();
+    observer.on_thinking_delta(&thinking_delta(0, "first thoughts"));
+    let terminal = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&terminal);
+    let row = rows
+        .iter()
+        .position(|row| row.contains("▾ Thinking"))
+        .expect("the live row renders in Follow");
+    let column = cell_col(&rows[row], "Thinking");
+    drop(terminal);
+    click(
+        &mut app,
+        u16::try_from(column).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    );
+    observer.on_response(&responded(0, "answer one"));
+    observer.on_thinking_delta(&thinking_delta(1, "second thoughts"));
+    let terminal = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&terminal);
+    assert!(
+        rows.iter().any(|row| row.contains("▸ Thinking")),
+        "a suppressed session renders the next stream collapsed from its first delta: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row.contains("second thoughts")),
+        "the suppressed stream's body never shows: {rows:?}"
+    );
+}
+
+#[test]
+fn expanding_a_live_thinking_stream_returns_to_follow() {
+    let (observer, mut app) = live_thinking_app();
+    observer.on_thinking_delta(&thinking_delta(0, "first thoughts"));
+    let terminal = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&terminal);
+    let row = rows
+        .iter()
+        .position(|row| row.contains("▾ Thinking"))
+        .expect("the live row renders in Follow");
+    let column = cell_col(&rows[row], "Thinking");
+    drop(terminal);
+    click(
+        &mut app,
+        u16::try_from(column).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    );
+    click(
+        &mut app,
+        u16::try_from(column).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    );
+    observer.on_response(&responded(0, "answer one"));
+    observer.on_thinking_delta(&thinking_delta(1, "second thoughts"));
+    let terminal = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&terminal);
+    assert!(
+        rows.iter().any(|row| row.contains("▾ Thinking"))
+            && rows.iter().any(|row| row.contains("second thoughts")),
+        "a live expand returns the session to Follow: {rows:?}"
+    );
+    drop(terminal);
+    observer.on_response(&responded(1, "answer two"));
+    let terminal = render_to_buffer(&mut app, 80, 24);
+    assert!(
+        !row_texts(&terminal)
+            .iter()
+            .any(|row| row.contains("second thoughts")),
+        "back in Follow, graduation auto-collapses again"
+    );
+}
+
+#[test]
+fn completed_thinking_clicks_toggle_only_that_section() {
+    let (observer, mut app) = live_thinking_app();
+    observer.on_thinking_delta(&thinking_delta(0, "first thoughts"));
+    observer.on_response(&responded(0, "answer one"));
+    let terminal = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&terminal);
+    let row = rows
+        .iter()
+        .position(|row| row.contains("▸ Thinking"))
+        .expect("the graduated section renders collapsed");
+    let column = cell_col(&rows[row], "Thinking");
+    drop(terminal);
+    click(
+        &mut app,
+        u16::try_from(column).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    );
+    let rows = row_texts(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        rows.iter().any(|row| row.contains("▾ Thinking")),
+        "the completed section expands on its own click: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.contains("first thoughts")),
+        "the completed section's body shows on expand: {rows:?}"
+    );
+    observer.on_thinking_delta(&thinking_delta(1, "live thoughts"));
+    let rows = row_texts(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        rows.iter().any(|row| row.contains("live thoughts")),
+        "the completed click left the session in Follow — the live stream still expands: {rows:?}"
+    );
+    click(
+        &mut app,
+        u16::try_from(column).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    );
+    let rows = row_texts(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        !rows.iter().any(|row| row.contains("first thoughts")),
+        "the second completed click folds the same section back, locally: {rows:?}"
+    );
+}
+
+#[test]
+fn the_pulse_strip_sits_above_the_composer_in_the_border_color() {
+    let (observer, mut app) = live_thinking_app();
+    observer.on_thinking_delta(&thinking_delta(0, "mulling"));
+    let terminal = render_to_buffer(&mut app, 80, 24);
+    let theme = dch_tui::theme::Theme::by_name("dracula").expect("the theme exists");
+    let edge = theme.ui.primary;
+    let buffer = terminal.backend().buffer();
+    // The composer announces itself by its left border strip: the
+    // leftmost cells of its rows carry the border color; the strip
+    // renders one row above the run's top.
+    let mut composer_bottom = None;
+    for row in (1..24).rev() {
+        if let Some(cell) = buffer.cell((0, row))
+            && cell.bg == edge
+        {
+            composer_bottom = Some(row);
+            break;
+        }
+    }
+    let mut composer_top = composer_bottom.expect("the composer's edge renders");
+    while composer_top > 0
+        && let Some(cell) = buffer.cell((0, composer_top.saturating_sub(1)))
+        && cell.bg == edge
+    {
+        composer_top = composer_top.saturating_sub(1);
+    }
+    let strip_row = composer_top.saturating_sub(1);
+    let mut saw_run = false;
+    for column in 0..80u16 {
+        if let Some(cell) = buffer.cell((column, strip_row))
+            && cell.symbol() == "─"
+        {
+            assert_eq!(
+                cell.fg, edge,
+                "the strip paints in the prompt-box border color"
+            );
+            saw_run = true;
+        }
+    }
+    assert!(saw_run, "the breathing bar renders in the strip row");
+}
+
+#[test]
+fn an_idle_frame_draws_no_pulse_strip() {
+    let (_observer, mut app) = thinking_app();
+    let terminal = render_to_buffer(&mut app, 80, 24);
+    let theme = dch_tui::theme::Theme::by_name("dracula").expect("the theme exists");
+    let buffer = terminal.backend().buffer();
+    for row in 0..24u16 {
+        for column in 0..80u16 {
+            if let Some(cell) = buffer.cell((column, row))
+                && cell.symbol() == "─"
+                && cell.fg == theme.ui.primary
+            {
+                panic!("no strip cell paints while no reasoning streams, at {column},{row}");
+            }
+        }
+    }
+}
+
+#[test]
+fn the_animation_wake_runs_only_while_the_agent_runs() {
+    let (_observer, state) = dch_tui::TuiObserverState::new().into_observer();
+    let idle = TuiApp::from_observer_state(config_with_theme("dracula"), state.clone());
+    assert!(
+        !idle.pulse_animation_living(),
+        "an idle session never pays the animation cadence"
+    );
+    drop(idle);
+    state
+        .agent_running
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let running = TuiApp::from_observer_state(config_with_theme("dracula"), state);
+    assert!(
+        running.pulse_animation_living(),
+        "a running agent drives the fast frame cadence, reasoning or not"
+    );
+}
+
+#[test]
+fn a_stale_living_buffer_after_the_run_draws_nothing() {
+    let (observer, state) = dch_tui::TuiObserverState::new().into_observer();
+    state
+        .agent_running
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), state.clone());
+    observer.on_thinking_delta(&thinking_delta(
+        0,
+        "orphaned by a cancel that fired no event",
+    ));
+    state
+        .agent_running
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    let terminal = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&terminal);
+    assert!(
+        rows.iter().all(|row| !row.contains("Thinking")),
+        "no phantom thinking row after the run ends, even with a living buffer"
+    );
+    let theme = dch_tui::theme::Theme::by_name("dracula").expect("the theme exists");
+    let edge = theme.ui.primary;
+    let buffer = terminal.backend().buffer();
+    let mut strip_cells = 0;
+    for row in 1..23u16 {
+        for column in 0..80u16 {
+            if let Some(cell) = buffer.cell((column, row))
+                && cell.symbol() == "─"
+                && cell.fg == edge
+            {
+                strip_cells += 1;
+            }
+        }
+    }
+    assert_eq!(
+        strip_cells, 0,
+        "no phantom pulse strip after the run ends, even with a living buffer"
+    );
+}
+
+#[test]
+fn the_pulse_strip_shows_while_the_agent_runs_without_thinking() {
+    let (_observer, state) = dch_tui::TuiObserverState::new().into_observer();
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), state.clone());
+    state
+        .agent_running
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let terminal = render_to_buffer(&mut app, 80, 24);
+    let theme = dch_tui::theme::Theme::by_name("dracula").expect("the theme exists");
+    let edge = theme.ui.primary;
+    let buffer = terminal.backend().buffer();
+    let mut saw_run = false;
+    for row in 1..23u16 {
+        for column in 0..80u16 {
+            if let Some(cell) = buffer.cell((column, row))
+                && cell.symbol() == "─"
+                && cell.fg == edge
+            {
+                saw_run = true;
+            }
+        }
+    }
+    assert!(
+        saw_run,
+        "the strip breathes for the whole run, reasoning or not"
+    );
+}
+
+#[test]
+fn the_strip_padding_carries_no_style() {
+    let (observer, mut app) = live_thinking_app();
+    observer.on_thinking_delta(&thinking_delta(0, "mulling"));
+    let terminal = render_to_buffer(&mut app, 80, 24);
+    let theme = dch_tui::theme::Theme::by_name("dracula").expect("the theme exists");
+    let edge = theme.ui.primary;
+    let buffer = terminal.backend().buffer();
+    let mut strip_row = None;
+    for row in 1..23u16 {
+        for column in 0..80u16 {
+            if let Some(cell) = buffer.cell((column, row))
+                && cell.symbol() == "─"
+                && cell.fg == edge
+            {
+                strip_row = Some(row);
+            }
+        }
+    }
+    let Some(strip_row) = strip_row else {
+        panic!("the strip must be on screen to pin its padding");
+    };
+    for column in 0..80u16 {
+        if let Some(cell) = buffer.cell((column, strip_row))
+            && cell.symbol() == " "
+            && (cell.fg != ratatui::prelude::Color::Reset
+                || cell.bg != ratatui::prelude::Color::Reset)
+        {
+            panic!(
+                "strip padding stays unstyled — styled spaces read as a tinted band: \
+                 ({column},{strip_row}) fg {:?} bg {:?}",
+                cell.fg, cell.bg
+            );
+        }
+    }
+}
+
+#[test]
+fn the_strip_owns_the_very_top_row_when_configured() {
+    let (_observer, state) = dch_tui::TuiObserverState::new().into_observer();
+    state
+        .agent_running
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut app = TuiApp::from_observer_state(config_with_strip_top(), state);
+    let terminal = render_to_buffer(&mut app, 80, 24);
+    let theme = dch_tui::theme::Theme::by_name("dracula").expect("the theme exists");
+    let edge = theme.ui.primary;
+    let buffer = terminal.backend().buffer();
+    let mut top_bar = 0;
+    for column in 0..80u16 {
+        if let Some(cell) = buffer.cell((column, 0))
+            && cell.symbol() == "─"
+            && cell.fg == edge
+        {
+            top_bar += 1;
+        }
+    }
+    assert!(
+        top_bar > 0,
+        "the strip owns the terminal's first row when configured to the top"
+    );
+    let mut composer_top = None;
+    for row in (1..24).rev() {
+        if let Some(cell) = buffer.cell((0, row))
+            && cell.bg == edge
+        {
+            composer_top = Some(row);
+            break;
+        }
+    }
+    let composer_top = composer_top.expect("the composer's edge renders");
+    let spacer_row = composer_top.saturating_sub(1);
+    let mut spacer_bar = 0;
+    for column in 0..80u16 {
+        if let Some(cell) = buffer.cell((column, spacer_row))
+            && cell.symbol() == "─"
+        {
+            spacer_bar += 1;
+        }
+    }
+    assert_eq!(
+        spacer_bar, 0,
+        "the row above the composer carries no bar in top mode"
+    );
+}
+
+#[test]
+fn an_idle_top_frame_draws_no_strip() {
+    let (_observer, state) = dch_tui::TuiObserverState::new().into_observer();
+    let mut app = TuiApp::from_observer_state(config_with_strip_top(), state);
+    let terminal = render_to_buffer(&mut app, 80, 24);
+    let buffer = terminal.backend().buffer();
+    for column in 0..80u16 {
+        if let Some(cell) = buffer.cell((column, 0))
+            && cell.symbol() == "─"
+        {
+            panic!("no strip cell paints in the top row while the session idles, at {column},0");
+        }
+    }
+}
+
+#[test]
+fn the_folded_thinking_row_rides_a_running_tool_phase() {
+    let (observer, mut app) = live_thinking_app();
+    observer.on_thinking_delta(&thinking_delta(0, "working through the search"));
+    observer.on_text_delta(&loopctl::observer::TextDeltaContext {
+        turn: 0,
+        delta: "checking the tree now".to_string(),
+    });
+    app.active_tools()
+        .lock()
+        .expect("the tools lock")
+        .push(ActiveTool {
+            call_id: "call_1".to_string(),
+            name: "Grep".to_string(),
+            input_summary: "\"pattern\"".to_string(),
+            start: std::time::Instant::now(),
+        });
+    let rows = row_texts(&render_to_buffer(&mut app, 80, 30));
+    let folded = rows
+        .iter()
+        .position(|row| row.contains("▸ Thinking"))
+        .expect("the folded row rides the tool phase");
+    let tool = rows
+        .iter()
+        .position(|row| row.contains("Grep \"pattern\""))
+        .expect("the running tool renders its row");
+    assert!(
+        folded < tool,
+        "the folded block sits above the tool rows: {rows:?}"
+    );
+    let column = cell_col(&rows[folded], "Thinking");
+    click(
+        &mut app,
+        u16::try_from(column).unwrap_or(0),
+        u16::try_from(folded).unwrap_or(0),
+    );
+    let rows = row_texts(&render_to_buffer(&mut app, 80, 30));
+    assert!(
+        rows.iter().any(|row| row.contains("▸ Thinking"))
+            && !rows
+                .iter()
+                .any(|row| row.contains("working through the search")),
+        "a click on the folded row changes nothing — the transcript's \
+         graduated block owns the toggle: {rows:?}"
+    );
+}
+
+#[test]
+fn the_folded_thinking_row_sits_above_the_streaming_reply() {
+    // The live lane reads in conversation order: the reasoning
+    // arrived before the reply it introduced, so the folded row
+    // renders above the streaming text, not below it.
+    let (observer, state) = dch_tui::TuiObserverState::new().into_observer();
+    state
+        .agent_running
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), state);
+    observer.on_thinking_delta(&thinking_delta(0, "reasoning phase"));
+    observer.on_text_delta(&loopctl::observer::TextDeltaContext {
+        turn: 0,
+        delta: "the reply streams now".to_string(),
+    });
+    let rows = row_texts(&render_to_buffer(&mut app, 80, 24));
+    let thinking = rows
+        .iter()
+        .position(|row| row.contains("▸ Thinking"))
+        .expect("the folded row renders");
+    let reply = rows
+        .iter()
+        .position(|row| row.contains("the reply streams now"))
+        .expect("the streaming reply renders");
+    assert!(
+        thinking < reply,
+        "the folded thinking row sits above the reply it precedes: {rows:?}"
+    );
+}
+
+#[test]
+fn the_graduated_duration_matches_the_frozen_live_span() {
+    // The live row freezes at the fold and the graduated section
+    // measures the same instant, so the number does not visibly
+    // rewrite when the reply settles into the conversation.
+    let (observer, state) = dch_tui::TuiObserverState::new().into_observer();
+    state
+        .agent_running
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let thinking = Arc::clone(&state.thinking);
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), state);
+    observer.on_thinking_delta(&thinking_delta(0, "reasoning phase"));
+    observer.on_text_delta(&loopctl::observer::TextDeltaContext {
+        turn: 0,
+        delta: "the reply".to_string(),
+    });
+    {
+        let mut stream = thinking.lock().expect("the thinking lock");
+        stream.began = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(10));
+        stream.text_began_at =
+            std::time::Instant::now().checked_sub(std::time::Duration::from_secs(5));
+    }
+    let live = row_texts(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        live.iter().any(|row| row.contains("▸ Thinking · 5s")),
+        "the frozen live span reads five seconds: {live:?}"
+    );
+    observer.on_response(&responded(0, "the reply"));
+    let settled = row_texts(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        settled.iter().any(|row| row.contains("Thinking · 5s")),
+        "the graduated section carries the same five-second span: {settled:?}"
+    );
+}
+
+#[test]
+fn the_folded_thinking_timer_freezes_at_the_fold() {
+    // The folded row measures the thinking phase, which ended when
+    // the reply began: the displayed span freezes at that instant and
+    // no longer runs on beside the streaming text.
+    let (observer, state) = dch_tui::TuiObserverState::new().into_observer();
+    state
+        .agent_running
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), state.clone());
+    observer.on_thinking_delta(&thinking_delta(0, "reasoning phase"));
+    observer.on_text_delta(&loopctl::observer::TextDeltaContext {
+        turn: 0,
+        delta: "the reply takes over".to_string(),
+    });
+    {
+        let mut stream = state.thinking.lock().expect("the thinking lock");
+        stream.began = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(10));
+        stream.text_began_at =
+            std::time::Instant::now().checked_sub(std::time::Duration::from_secs(5));
+    }
+    let first = row_texts(&render_to_buffer(&mut app, 80, 24));
+    let row = first
+        .iter()
+        .find(|row| row.contains("▸ Thinking"))
+        .expect("the folded row renders");
+    assert!(
+        row.contains("· 5s"),
+        "the folded timer shows the frozen thinking-phase span, not the elapsed \
+         since the stream began: {row:?}"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let second = row_texts(&render_to_buffer(&mut app, 80, 24));
+    let row = second
+        .iter()
+        .find(|row| row.contains("▸ Thinking"))
+        .expect("the folded row still renders");
+    assert!(
+        row.contains("· 5s"),
+        "the frozen span does not grow while the reply streams: {row:?}"
+    );
+}
+
+#[test]
+fn the_live_lane_folds_when_the_replys_text_begins() {
+    let (observer, mut app) = live_thinking_app();
+    observer.on_thinking_delta(&thinking_delta(0, "first stretch of reasoning"));
+    let rows = row_texts(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        rows.iter().any(|row| row.contains("▾ Thinking")),
+        "the lane renders while only reasoning streams: {rows:?}"
+    );
+    observer.on_text_delta(&loopctl::observer::TextDeltaContext {
+        turn: 0,
+        delta: "the answer takes shape".to_string(),
+    });
+    let rows = row_texts(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        rows.iter().any(|row| row.contains("▸ Thinking")),
+        "the lane folds to its collapsed row at the reply's first text delta: {rows:?}"
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row.contains("first stretch of reasoning")),
+        "the folded lane shows no body: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("the answer takes shape")),
+        "the reply streams on beside the folded lane: {rows:?}"
+    );
+    observer.on_thinking_delta(&thinking_delta(0, " and a late interleave"));
+    let rows = row_texts(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        rows.iter().any(|row| row.contains("▸ Thinking")),
+        "the collapsed row rides the lane for the rest of the turn: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row.contains("and a late interleave")),
+        "late interleaved deltas keep accruing off-display: {rows:?}"
+    );
+    observer.on_response(&responded(0, "the answer takes shape"));
+    let rows = row_texts(&render_to_buffer(&mut app, 80, 24));
+    let row = rows
+        .iter()
+        .position(|row| row.contains("▸ Thinking"))
+        .expect("the section graduates folded");
+    let column = cell_col(&rows[row], "Thinking");
+    click(
+        &mut app,
+        u16::try_from(column).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    );
+    let rows = row_texts(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("first stretch of reasoning"))
+            && rows.iter().any(|row| row.contains("and a late interleave")),
+        "reasoning from both sides of the fold graduates intact: {rows:?}"
+    );
+}
+
+#[test]
+fn a_stale_stream_folds_when_a_new_reply_streams() {
+    let (observer, mut app) = live_thinking_app();
+    observer.on_thinking_delta(&thinking_delta(0, "orphaned by a cancel"));
+    let rows = row_texts(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        rows.iter().any(|row| row.contains("Thinking")),
+        "the orphan renders until something supersedes it: {rows:?}"
+    );
+    observer.on_text_delta(&loopctl::observer::TextDeltaContext {
+        turn: 1,
+        delta: "a fresh reply".to_string(),
+    });
+    let rows = row_texts(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        !rows.iter().any(|row| row.contains("Thinking")),
+        "a stale stream leaves the display the moment a new reply streams: {rows:?}"
+    );
+}
+
+#[test]
+fn a_body_click_collapses_a_live_thinking_stream() {
+    let (observer, mut app) = live_thinking_app();
+    observer.on_thinking_delta(&thinking_delta(0, "reasoning laid bare"));
+    let terminal = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&terminal);
+    let marker = rows
+        .iter()
+        .position(|row| row.contains("▾ Thinking"))
+        .expect("the live row renders in Follow");
+    let body = marker.saturating_add(1);
+    let body_row = rows
+        .get(body)
+        .expect("the body row sits directly under the marker");
+    assert!(
+        body_row.contains("reasoning laid bare"),
+        "the live body is on display: {rows:?}"
+    );
+    let column = cell_col(body_row, "reasoning");
+    drop(terminal);
+    click(
+        &mut app,
+        u16::try_from(column).unwrap_or(0),
+        u16::try_from(body).unwrap_or(0),
+    );
+    let rows = row_texts(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        rows.iter().any(|row| row.contains("▸ Thinking")),
+        "a body click collapses the live stream: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row.contains("reasoning laid bare")),
+        "the body leaves the frame on collapse: {rows:?}"
+    );
+}
+
+#[test]
+fn a_body_click_folds_a_completed_section_locally() {
+    let (observer, mut app) = live_thinking_app();
+    observer.on_thinking_delta(&thinking_delta(0, "the recorded reasoning"));
+    observer.on_response(&responded(0, "the answer"));
+    let terminal = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&terminal);
+    let summary = rows
+        .iter()
+        .position(|row| row.contains("▸ Thinking"))
+        .expect("the graduated section renders collapsed");
+    let column = cell_col(&rows[summary], "Thinking");
+    drop(terminal);
+    click(
+        &mut app,
+        u16::try_from(column).unwrap_or(0),
+        u16::try_from(summary).unwrap_or(0),
+    );
+    let terminal = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&terminal);
+    let body = rows
+        .iter()
+        .position(|row| row.contains("the recorded reasoning"))
+        .expect("the expanded body shows");
+    let column = cell_col(&rows[body], "recorded");
+    drop(terminal);
+    click(
+        &mut app,
+        u16::try_from(column).unwrap_or(0),
+        u16::try_from(body).unwrap_or(0),
+    );
+    let rows = row_texts(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row.contains("the recorded reasoning")),
+        "a body click folds the completed section: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.contains("▸ Thinking")),
+        "the section's summary row returns collapsed: {rows:?}"
+    );
+    observer.on_thinking_delta(&thinking_delta(1, "later live thoughts"));
+    let rows = row_texts(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        rows.iter().any(|row| row.contains("later live thoughts")),
+        "the body click left the session in Follow — later streams still expand: {rows:?}"
+    );
+}
+
+#[test]
+fn the_strip_and_live_row_survive_a_graduation_and_new_stream() {
+    let (observer, mut app) = live_thinking_app();
+    observer.on_thinking_delta(&thinking_delta(0, "the first stretch"));
+    observer.on_response(&responded(0, "the reply"));
+    observer.on_thinking_delta(&thinking_delta(1, "the second stretch"));
+    let terminal = render_to_buffer(&mut app, 80, 24);
+    let theme = dch_tui::theme::Theme::by_name("dracula").expect("the theme exists");
+    let edge = theme.ui.primary;
+    let buffer = terminal.backend().buffer();
+    let mut strip_cells = 0;
+    for row in 1..23u16 {
+        for column in 0..80u16 {
+            if let Some(cell) = buffer.cell((column, row))
+                && cell.symbol() == "─"
+                && cell.fg == edge
+            {
+                strip_cells += 1;
+            }
+        }
+    }
+    assert!(
+        strip_cells > 0,
+        "the strip keeps breathing after a graduation and across a new stream"
+    );
+    let rows = row_texts(&terminal);
+    assert!(
+        rows.iter().any(|row| row.contains("▾ Thinking")),
+        "the new stream's live row renders after the previous one graduated"
+    );
+}
+
+#[test]
+fn thinking_rows_render_in_the_theme_dim_tone() {
+    let (observer, mut app) = live_thinking_app();
+    observer.on_thinking_delta(&thinking_delta(0, "dim thoughts"));
+    let terminal = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&terminal);
+    let row = rows
+        .iter()
+        .position(|row| row.contains("Thinking ·"))
+        .expect("the live row renders");
+    let column = cell_col(&rows[row], "Thinking");
+    let dim = dch_tui::theme::Theme::by_name("dracula")
+        .expect("the theme exists")
+        .ui
+        .dim;
+    let buffer = terminal.backend().buffer();
+    let column_u16 = u16::try_from(column).unwrap_or(0);
+    let row_u16 = u16::try_from(row).unwrap_or(0);
+    let cell = buffer
+        .cell((column_u16, row_u16))
+        .expect("the probed cell renders");
+    assert_eq!(
+        cell.fg, dim,
+        "the thinking row carries the theme's dim tone, not the assistant color"
     );
 }

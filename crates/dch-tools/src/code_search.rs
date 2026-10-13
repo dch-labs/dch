@@ -35,27 +35,39 @@ use crate::util::reject_url;
 use crate::util::resolve_path;
 
 /// Default total match cap across all files when the caller omits `max_results`.
+///
+/// Keeps a broad search from flooding the model's context in one
+/// call; a caller wanting more asks explicitly and is still bounded
+/// by [`RESULTS_CAP`].
 const DEFAULT_MAX_RESULTS: usize = 50;
 
 /// Hard ceiling `max_results` is clamped to, regardless of what the caller asks.
+///
+/// Bounds the worst-case context spend per call — even an explicit
+/// huge request stops here, and the excess matches stay unlisted
+/// rather than silently admitted.
 const RESULTS_CAP: usize = 200;
 
 /// Hard ceiling `context_lines` is clamped to, regardless of what the caller asks.
+///
+/// Window snippets stay narrow so each match's output remains
+/// token-cheap; a wider window is what `Read` is for.
 const MAX_CONTEXT_LINES: usize = 5;
 
 /// Input for the `CodeSearch` tool.
 ///
 /// Token-efficient regex code search: same engine as `Grep`, but returns the
-/// smallest useful answer — `file` headers with collapsed consecutive-line
-/// ranges by default, and matched-content snippets only when
-/// `context_lines > 0`.
+/// smallest useful answer — per file, every match as `  {line}: {text}` by
+/// default, and `±context_lines` window snippets (with `>` on the matched
+/// line) when `context_lines > 0`.
 #[derive(Default, Deserialize, Serialize, Tool)]
 #[tool(
     name = "CodeSearch",
     read_only,
     concurrency_safe,
-    description = "Search code with succinct, token-efficient results. Returns file:line \
-         format by default. Use context_lines > 0 to include matched content."
+    description = "Search code with succinct, token-efficient results: every match \
+         returns its content as `line: text` under a file header. Use \
+         context_lines > 0 to widen each match with surrounding lines."
 )]
 pub struct CodeSearchInput {
     /// The regular expression to search file contents for.
@@ -96,11 +108,12 @@ pub struct CodeSearchInput {
     #[serde(skip_serializing_if = "Option::is_none")]
     case_insensitive: Option<bool>,
 
-    /// Lines of context shown around each match (default: 0, cap: 5).
+    /// Surrounding lines rendered beyond each match's own line (default: 0,
+    /// cap: 5).
     ///
-    /// At 0 the output is the succinct form: file headers with collapsed line
-    /// ranges and no content. Above 0, each match also renders a
-    /// `±context_lines` snippet with `>` marking the matched line.
+    /// At 0 the output is one `line: text` row per match under its file
+    /// header. Above 0, each match instead renders a `±context_lines`
+    /// snippet with `>` marking the matched line.
     #[serde(skip_serializing_if = "Option::is_none")]
     context_lines: Option<usize>,
 
@@ -196,7 +209,7 @@ impl CodeSearchInput {
 /// stopping once `limit` are collected. When `context_lines > 0`, each
 /// match's `content` is a rendered snippet of the `±context_lines` window
 /// with `>` marking the matched line; otherwise `content` is the matched
-/// line's text (unused by the succinct renderer).
+/// line's text, which the succinct renderer prints.
 fn scan_file(
     regex: &Regex,
     content: &str,
@@ -253,11 +266,11 @@ fn render_snippet(lines: &[&str], line_num: usize, context_lines: usize) -> Stri
 /// Render the collected matches in one of two modes keyed on `context_lines`.
 ///
 /// `context_lines == 0` → grouped: `Found N match(es) for "{pattern}":` header,
-/// a blank line, then per file the path and collapsed line ranges
-/// (`  {N}` or `  {A}-{B}`). `context_lines > 0` → the same header followed by
-/// `file:line` per match and its snippet (the first snippet line indented).
-/// Output spills to a temp
-/// file via the shared helper if it exceeds the inline limit.
+/// a blank line, then per file the path and one `  {line}: {text}` row per
+/// match. `context_lines > 0` → the same header followed by `file:line` per
+/// match and its `±context_lines` snippet (the first snippet line indented).
+/// Output spills to a temp file via the shared helper if it exceeds the
+/// inline limit.
 fn render(matches: &[Match], pattern: &str, context_lines: usize, temp_dir: &Path) -> ToolOutput {
     let mut out = Vec::with_capacity(matches.len().saturating_add(2));
     let match_word = if matches.len() == 1 {
@@ -272,21 +285,15 @@ fn render(matches: &[Match], pattern: &str, context_lines: usize, temp_dir: &Pat
     out.push(String::new());
 
     if context_lines == 0 {
-        let mut by_file: std::collections::BTreeMap<&str, Vec<usize>> =
-            std::collections::BTreeMap::new();
-
-        for m in matches {
-            by_file.entry(m.file.as_str()).or_default().push(m.line);
-        }
-
-        for (file, lines) in by_file {
-            out.push(file.to_string());
-            for range in group_consecutive(lines) {
-                match range {
-                    LineRange::Single(n) => out.push(format!("  {n}")),
-                    LineRange::Range(s, e) => out.push(format!("  {s}-{e}")),
-                }
+        let mut sorted: Vec<&Match> = matches.iter().collect();
+        sorted.sort_by(|a, b| a.file.cmp(&b.file).then_with(|| a.line.cmp(&b.line)));
+        let mut current_file: Option<&str> = None;
+        for m in sorted {
+            if current_file != Some(m.file.as_str()) {
+                out.push(m.file.clone());
+                current_file = Some(m.file.as_str());
             }
+            out.push(format!("  {}: {}", m.line, m.content));
         }
     } else {
         let mut sorted: Vec<&Match> = matches.iter().collect();
@@ -300,73 +307,6 @@ fn render(matches: &[Match], pattern: &str, context_lines: usize, temp_dir: &Pat
     }
     let text = out.join("\n");
     truncate_or_write_to_temp(text, "code_search", temp_dir, MAX_INLINE_OUTPUT_BYTES)
-}
-
-/// A display form for a (possibly collapsed) run of consecutive line numbers.
-///
-/// Produced by [`group_consecutive`] from a `Vec<usize>` of raw line numbers.
-/// The succinct renderer formats each variant as either `  {N}` (single) or
-/// `  {A}-{B}` (range) — the two-space indent and the hyphen syntax are the
-/// shape the model has been trained to read and act on.
-#[derive(Debug, PartialEq, Eq)]
-enum LineRange {
-    /// A single, isolated line number with no immediate neighbors in the set.
-    ///
-    /// Rendered as `  {N}`. Produced when a line has no adjacent matches —
-    /// e.g. line 5 alone in a set of `[5, 7, 8]`.
-    Single(usize),
-
-    /// An inclusive run of two or more consecutive line numbers, `start..=end`.
-    ///
-    /// Rendered as `  {start}-{end}`. Produced when [`group_consecutive`]
-    /// walks a run of adjacent lines — e.g. `[7, 8]` becomes
-    /// `Range(7, 8)` rendered as `  7-8`. A run of length 1 is always a
-    /// [`Single`](Self::Single), never a degenerate `Range(n, n)`.
-    Range(usize, usize),
-}
-
-/// Sort, dedup, and collapse consecutive line numbers into [`LineRange`]s.
-///
-/// Sorts ascending, drops duplicates, then walks the run emitting
-/// [`LineRange::Single`] for isolated lines and [`LineRange::Range`] for
-/// two-or-more consecutive. A single line never becomes a degenerate
-/// `Range(n, n)` — it stays a `Single`.
-///
-/// Used only by the succinct renderer to turn a file's match line numbers
-/// into the compact `5` / `7-8` display form.
-fn group_consecutive(mut lines: Vec<usize>) -> Vec<LineRange> {
-    lines.sort_unstable();
-    lines.dedup();
-    let mut ranges = Vec::new();
-    let mut iter = lines.into_iter();
-    let Some(mut start) = iter.next() else {
-        return ranges;
-    };
-    let mut prev = start;
-    for line in iter {
-        if line == prev.saturating_add(1) {
-            prev = line;
-        } else {
-            push_range(&mut ranges, start, prev);
-            start = line;
-            prev = line;
-        }
-    }
-    push_range(&mut ranges, start, prev);
-    ranges
-}
-
-/// Append the appropriate [`LineRange`] variant for a finalized run.
-///
-/// Helper for [`group_consecutive`]: once a run of consecutive lines ends (or
-/// the input ends), this decides whether the run was a single line (`start ==
-/// end` → `Single`) or a real range (`start < end` → `Range`) and pushes it.
-fn push_range(out: &mut Vec<LineRange>, start: usize, end: usize) {
-    if start == end {
-        out.push(LineRange::Single(start));
-    } else {
-        out.push(LineRange::Range(start, end));
-    }
 }
 
 #[cfg(test)]
@@ -400,45 +340,6 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(path, contents).unwrap();
-    }
-
-    #[test]
-    fn group_consecutive_empty() {
-        assert!(group_consecutive(vec![]).is_empty());
-    }
-
-    #[test]
-    fn group_consecutive_single() {
-        assert_eq!(group_consecutive(vec![5]), vec![LineRange::Single(5)]);
-    }
-
-    #[test]
-    fn group_consecutive_one_run() {
-        assert_eq!(
-            group_consecutive(vec![5, 6, 7, 8]),
-            vec![LineRange::Range(5, 8)]
-        );
-    }
-
-    #[test]
-    fn group_consecutive_multiple_runs() {
-        assert_eq!(
-            group_consecutive(vec![1, 2, 3, 5, 7, 8, 10]),
-            vec![
-                LineRange::Range(1, 3),
-                LineRange::Single(5),
-                LineRange::Range(7, 8),
-                LineRange::Single(10),
-            ]
-        );
-    }
-
-    #[test]
-    fn group_consecutive_dedup() {
-        assert_eq!(
-            group_consecutive(vec![1, 1, 2, 2, 3]),
-            vec![LineRange::Range(1, 3)]
-        );
     }
 
     #[test]
@@ -598,37 +499,37 @@ mod tests {
     }
 
     #[test]
-    fn render_succinct_groups_and_collapses() {
+    fn render_succinct_shows_each_match_with_its_text() {
         let matches = vec![
             Match {
                 file: "a.rs".into(),
                 line: 5,
-                content: "x".into(),
+                content: "alpha".into(),
             },
             Match {
                 file: "a.rs".into(),
                 line: 6,
-                content: "x".into(),
+                content: "beta".into(),
             },
             Match {
                 file: "a.rs".into(),
                 line: 7,
-                content: "x".into(),
+                content: "gamma".into(),
             },
             Match {
                 file: "b.rs".into(),
                 line: 10,
-                content: "x".into(),
+                content: "delta".into(),
             },
         ];
         let tmp = tempfile::TempDir::new().unwrap();
         let out = render(&matches, "x", 0, tmp.path());
         let text = out.text_content();
         assert!(text.contains("Found 4 matches for \"x\":"), "{text}");
-        assert!(text.contains("a.rs\n  5-7"), "{text}");
-        assert!(text.contains("b.rs\n  10"), "{text}");
-        // Succinct mode: no matched content.
-        assert!(!text.contains("\nx\n"), "no content: {text}");
+        assert!(text.contains("a.rs\n  5: alpha"), "{text}");
+        assert!(text.contains("  6: beta"), "{text}");
+        assert!(text.contains("  7: gamma"), "{text}");
+        assert!(text.contains("b.rs\n  10: delta"), "{text}");
     }
 
     #[test]
@@ -751,14 +652,15 @@ mod tests {
         assert!(text.contains("a.rs"), "{text}");
         assert!(text.contains("b.txt"), "{text}");
         assert!(
-            !text.contains("fn foo()"),
-            "no content in succinct mode: {text}"
+            text.contains("fn foo()"),
+            "the succinct default shows the matched line: {text}"
         );
+        assert!(text.contains("foo bar"), "{text}");
         assert_eq!(out.display_hint, Some(DisplayHint::Json));
     }
 
     #[tokio::test]
-    async fn consecutive_lines_collapse_to_range() {
+    async fn consecutive_matches_render_line_by_line() {
         let tmp = tempfile::TempDir::new().unwrap();
         let body = "foo\nfoo\nfoo\n";
         write_file(tmp.path(), "a.rs", body);
@@ -766,7 +668,10 @@ mod tests {
         let ctx = ctx_in(tmp.path());
         let out = tool.call(json!({"pattern": "foo"}), &ctx).await.unwrap();
         let text = out.text_content();
-        assert!(text.contains("1-3"), "collapsed to a range: {text}");
+        assert!(text.contains("  1: foo"), "{text}");
+        assert!(text.contains("  2: foo"), "{text}");
+        assert!(text.contains("  3: foo"), "{text}");
+        assert!(!text.contains("1-3"), "no collapsed range: {text}");
     }
 
     #[tokio::test]
@@ -1014,9 +919,10 @@ mod tests {
         assert!(tool.is_read_only());
         assert!(tool.is_concurrency_safe());
         assert_eq!(tool.name(), "CodeSearch");
-        let reg = crate::registry::builtin_registry(&loopctl::tool::builtin::fs::FileSession::new(
-            std::path::PathBuf::from("."),
-        ));
+        let reg = crate::registry::builtin_registry(
+            &loopctl::tool::builtin::fs::FileSession::new(std::path::PathBuf::from(".")),
+            crate::registry::ReadWindows::default(),
+        );
         assert!(reg.get("CodeSearch").is_some(), "CodeSearch registered");
     }
 }

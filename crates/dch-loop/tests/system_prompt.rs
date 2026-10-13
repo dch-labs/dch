@@ -9,6 +9,7 @@
 #![allow(clippy::missing_panics_doc, clippy::missing_errors_doc)]
 
 use dch_loop::build_system_prompt;
+use dch_tools::ReadWindows;
 use dch_tools::builtin_registry;
 
 #[test]
@@ -16,6 +17,7 @@ use dch_tools::builtin_registry;
 fn builtin_registry_emits_documented_fragment_headers() {
     let prompt = build_system_prompt(&builtin_registry(
         &loopctl::tool::builtin::fs::FileSession::new(std::path::PathBuf::from(".")),
+        ReadWindows::default(),
     ));
     for header in ["## Bash", "## read", "## Write", "## Edit", "## TodoWrite"] {
         assert!(

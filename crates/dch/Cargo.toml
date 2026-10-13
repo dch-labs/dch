@@ -18,7 +18,31 @@ name = "force_quit"
 name = "release_gate"
 
 [[test]]
+name = "resume_exactness"
+
+[[test]]
 name = "smoke"
+
+[[test]]
+name = "tui_signal_restore"
+
+[[test]]
+name = "tui_compaction_notice"
+
+[[test]]
+name = "tui_machine_snapshot"
+
+[[test]]
+name = "compaction_context_bar"
+
+[[test]]
+name = "tui_final_answer"
+
+[[test]]
+name = "resume_stale_real"
+
+[[test]]
+name = "tui_final_settle"
 
 [dependencies]
 dch-loop = { workspace = true }

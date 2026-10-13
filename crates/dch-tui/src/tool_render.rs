@@ -43,10 +43,10 @@ pub const ERR_GLYPH: &str = "✗";
 
 /// The display-column budget tool summaries truncate to.
 ///
-/// Wide enough for a real path or command, narrow enough that the
-/// summary stays the one glanceable line the conversation view is
-/// built around, whatever the input's size.
-const SUMMARY_WIDTH: usize = 48;
+/// Wide enough for a real path or command on a modern pane, narrow
+/// enough that the summary stays the one glanceable line the
+/// conversation view is built around, whatever the input's size.
+const SUMMARY_WIDTH: usize = 96;
 
 /// The primary value of a tool call's input, from the full JSON.
 ///
@@ -54,8 +54,8 @@ const SUMMARY_WIDTH: usize = 48;
 /// taken before any capping — the observer stashes the result at
 /// dispatch time, so a capped stash never loses a parseability it
 /// never had. Batch tools carry their count in the value ("a.rs (3
-/// edits)", "12 items"): the count lives in the full JSON, so it is
-/// decided here or not at all.
+/// edits)", "a.rs (2 more)", "12 items"): the count lives in the
+/// full JSON, so it is decided here or not at all.
 #[must_use]
 pub fn display_input(name: &str, input: &serde_json::Value) -> String {
     let compact = input.to_string();
@@ -126,8 +126,10 @@ pub fn humanize_tool_summary(name: &str, input: &str) -> String {
 ///
 /// Parses the input as JSON and prefers the field the tool's
 /// summary is about (`file_path` for the file tools, `command` for
-/// Bash, `pattern` for the search tools); otherwise takes the
-/// first string field; a non-JSON input loses any leading
+/// Bash, `pattern` for the search tools); a batch names its targets
+/// in an array — `edits` or `files` — and reads as the first entry
+/// with the count the whole JSON carries; otherwise the function
+/// takes the first string field. A non-JSON input loses any leading
 /// `"key: "` prefix. Empty when nothing string-valued exists.
 fn extract_primary_value(name: &str, input: &str) -> String {
     let preferred: &[&str] = match name {
@@ -158,6 +160,17 @@ fn extract_primary_value(name: &str, input: &str) -> String {
         .and_then(serde_json::Value::as_str)
     {
         return truncate(value);
+    }
+    // A file batch is one array of paths: the line names the first and
+    // counts the rest, so a multi-file read reads as a batch instead of
+    // a bare tool name.
+    if let Some(subject) = parsed
+        .get("files")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|files| files.split_first())
+        .and_then(|(first, rest)| first.as_str().map(|path| batch_subject(path, rest.len())))
+    {
+        return subject;
     }
     let first_string = object
         .values()
@@ -219,6 +232,25 @@ fn truncate_width(value: &str, budget: usize) -> String {
 /// delegating here.
 fn truncate(value: &str) -> String {
     truncate_width(value, SUMMARY_WIDTH)
+}
+
+/// The summary subject for a file batch: its first path, then how many
+/// paths follow it.
+///
+/// A batch's first path alone would read as a single-file call, so the
+/// count rides the subject whenever the call carries more than one path.
+/// The suffix is reserved out of the summary width before the path is
+/// cut, so a path longer than the budget loses only its own middle and
+/// the reader still sees that the call was a batch.
+fn batch_subject(first: &str, rest: usize) -> String {
+    match rest {
+        0 => truncate(first),
+        more => {
+            let suffix = format!(" ({more} more)");
+            let budget = SUMMARY_WIDTH.saturating_sub(suffix.width());
+            format!("{}{suffix}", truncate_width(first, budget))
+        }
+    }
 }
 
 /// The lines for a tool currently in flight.

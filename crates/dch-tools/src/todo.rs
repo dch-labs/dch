@@ -88,9 +88,10 @@ pub enum TodoStatus {
 
     /// Currently being worked on.
     ///
-    /// The agent is actively executing this entry. Only one entry should be
-    /// `InProgress` at a time (enforced by convention at the tool layer).
-    /// Transitions to [`Completed`](Self::Completed) when done, or back to
+    /// The agent is actively executing this entry. Only one entry may
+    /// be `InProgress` at a time — a submitted list carrying two is
+    /// refused at the tool layer. Transitions to
+    /// [`Completed`](Self::Completed) when done, or back to
     /// [`Pending`](Self::Pending) if deferred.
     InProgress,
 
@@ -406,31 +407,65 @@ fn stored_entries(todos: &[TodoEntryInput]) -> Vec<TodoEntry> {
 
 /// The rejection for a status change outside the allowed set, carrying the
 /// remedy that fits the rejected pair.
+///
+/// The message names the rejected edge, states the one-rung rule, and
+/// gives the exact resent-list recipe, so the model repairs its call in
+/// one round trip instead of retrying the same illegal transition.
 fn illegal_transition_error(entry: &TodoEntry, previous: TodoStatus) -> ToolError {
-    let remedy = if (previous, entry.status) == (TodoStatus::Completed, TodoStatus::Pending) {
-        "restart a completed task via in progress"
+    let (rule, remedy) = if (previous, entry.status) == (TodoStatus::Completed, TodoStatus::Pending)
+    {
+        (
+            "completed work reopens via in_progress",
+            "Resend the list with this entry as \"in_progress\"; from there it can \
+                 return to pending.",
+        )
     } else {
-        "move it through in progress"
+        (
+            "statuses advance one rung at a time \
+                 (pending → in_progress → completed)",
+            "Resend the whole list with this entry as \"in_progress\", then mark it \
+                 \"completed\" in a follow-up TodoWrite call.",
+        )
     };
     ToolError::InvalidInput(format!(
-        "Todo '{}' cannot move from {} to {} ({}).",
+        "Todo '{}' cannot move from {} to {} — {}; {}",
         entry.id,
         status_name(previous),
         status_name(entry.status),
+        rule,
         remedy
     ))
 }
 
-/// Validate every status change and replace the stored list.
+/// The rejection for a submission carrying more than one in-progress
+/// entry.
+///
+/// Names every offending id so the model can demote all but one in a
+/// single repair round trip; the remedy matches the one-at-a-time
+/// contract the system prompt already states.
+fn duplicate_in_progress_error(ids: &[&str]) -> ToolError {
+    let quoted: Vec<String> = ids.iter().map(|id| format!("'{id}'")).collect();
+    ToolError::InvalidInput(format!(
+        "Only one todo may be in progress at a time — entries {} are in progress. \
+         Keep one \"in_progress\" and resend the others as \"pending\" or \"completed\"",
+        quoted.join(", ")
+    ))
+}
+
+/// Validate every status change and the one-in-progress bound, then
+/// replace the stored list.
 ///
 /// Validation and replacement share one lock section: no other writer can
 /// observe a half-validated store, and a rejected call leaves the previous
-/// list byte-identical.
+/// list byte-identical. The bound holds a submitted list to a single
+/// `InProgress` entry — the convention the system prompt teaches, refused
+/// here rather than trusted.
 ///
 /// # Errors
 ///
 /// Returns [`ToolError::InvalidInput`] when an entry's status change is
-/// not in the allowed transition set.
+/// not in the allowed transition set, or when the submitted list carries
+/// more than one `InProgress` entry.
 fn store_validated(
     todos: &Arc<std::sync::Mutex<Vec<TodoEntry>>>,
     entries: Vec<TodoEntry>,
@@ -445,6 +480,14 @@ fn store_validated(
                 return Err(illegal_transition_error(entry, previous));
             }
         }
+    }
+    let in_progress: Vec<&str> = entries
+        .iter()
+        .filter(|entry| entry.status == TodoStatus::InProgress)
+        .map(|entry| entry.id.as_str())
+        .collect();
+    if in_progress.len() > 1 {
+        return Err(duplicate_in_progress_error(&in_progress));
     }
     *store = entries;
     Ok(())
@@ -463,6 +506,9 @@ fn status_icon(status: TodoStatus) -> &'static str {
 }
 
 /// Sort position of a status: in-progress work leads, completed trails.
+///
+/// The render walks entries in this order so the rung the agent is
+/// currently on is the first thing it reads back.
 fn display_order(status: TodoStatus) -> u8 {
     match status {
         TodoStatus::InProgress => 0,
@@ -472,6 +518,9 @@ fn display_order(status: TodoStatus) -> u8 {
 }
 
 /// How many entries in the submission carry the given status.
+///
+/// Feeds the summary line, which reports the pending, in-progress, and
+/// completed counts of the submitted list.
 fn count_in_status(todos: &[TodoEntryInput], status: TodoStatus) -> usize {
     todos.iter().filter(|todo| todo.status == status).count()
 }
@@ -583,7 +632,10 @@ impl Tool for TodoTool {
         "Track progress with a structured task list. Use this for complex multi-step tasks. \
          This helps track progress, organize work, and demonstrates thoroughness. \
          Create tasks with clear, actionable subjects in imperative form \
-         (e.g., \"Fix bug\", \"Add feature\")."
+         (e.g., \"Fix bug\", \"Add feature\"). Statuses move one rung at a time — \
+         pending → in_progress → completed — and skipped rungs are rejected; \
+         at most one entry is in progress at a time, and a second is rejected. \
+         Reopen completed work via in_progress."
     }
 
     fn schema(&self) -> ToolSchema {
@@ -605,7 +657,7 @@ impl Tool for TodoTool {
                                 "status": {
                                     "type": "string",
                                     "enum": ["pending", "in_progress", "completed"],
-                                    "description": "Current status",
+                                    "description": "Lifecycle status; moves one rung at a time (pending → in_progress → completed; reopen via in_progress). Skipped rungs are rejected. At most one entry is in progress at a time.",
                                     "default": "pending"
                                 },
                                 "active_form": { "type": "string", "description": "Present continuous form for display (e.g., \"Running tests\")" },
@@ -642,7 +694,13 @@ impl Tool for TodoTool {
     fn system_prompt(&self) -> Option<String> {
         Some(
             "For multi-step tasks, maintain a todo list and mark items \
-             in_progress one at a time."
+             in_progress one at a time. Statuses advance one rung per call — \
+             pending → in_progress → completed — and a skipped rung is \
+             rejected: send a pending entry as in_progress first, then mark \
+             it completed in a follow-up call. The list survives context \
+             compaction: it is the durable record of what is done and what \
+             remains, so a compacted session knows where it stood — keep it \
+             current."
                 .to_string(),
         )
     }
@@ -741,9 +799,10 @@ mod tests {
     #[test]
     fn todo_write_is_registered_under_its_name() {
         assert!(
-            builtin_registry(&loopctl::tool::builtin::fs::FileSession::new(
-                std::path::PathBuf::from(".")
-            ))
+            builtin_registry(
+                &loopctl::tool::builtin::fs::FileSession::new(std::path::PathBuf::from(".")),
+                crate::registry::ReadWindows::default()
+            )
             .get("TodoWrite")
             .is_some(),
             "TodoWrite must ship in the builtin registry"
@@ -872,16 +931,19 @@ mod tests {
     #[tokio::test]
     async fn allowed_status_transitions_are_accepted() {
         let (ctx, todos) = todo_context();
+        // Seeded store-side: three entries already in progress, so the
+        // first submission must drain two of them to hold the
+        // one-in-progress bound.
         seed(&todos, "c", TodoStatus::Completed);
         seed(&todos, "p", TodoStatus::Pending);
         seed(&todos, "f", TodoStatus::InProgress);
         seed(&todos, "b", TodoStatus::InProgress);
         seed(&todos, "s", TodoStatus::InProgress);
-        let out = TodoTool
+        let first = TodoTool
             .call(
                 json!({"todos": [
-                    {"id": "c", "subject": "Seed c", "status": "in_progress"},
-                    {"id": "p", "subject": "Seed p", "status": "in_progress"},
+                    {"id": "c", "subject": "Seed c", "status": "completed"},
+                    {"id": "p", "subject": "Seed p", "status": "pending"},
                     {"id": "f", "subject": "Seed f", "status": "completed"},
                     {"id": "b", "subject": "Seed b", "status": "pending"},
                     {"id": "s", "subject": "Seed s", "status": "in_progress"},
@@ -891,11 +953,34 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(!out.is_error, "{}", out.text_content());
-        // The five accepted edges: completed → in progress, pending → in
-        // progress, in progress → completed, in progress → pending, and the
-        // same-status resend that is the model's every-turn case. New ids
-        // ("n") may start at any status.
+        assert!(!first.is_error, "{}", first.text_content());
+        let second = TodoTool
+            .call(
+                json!({"todos": [
+                    {"id": "c", "subject": "Seed c", "status": "in_progress"},
+                    {"id": "s", "subject": "Seed s", "status": "completed"}
+                ]}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!second.is_error, "{}", second.text_content());
+        let third = TodoTool
+            .call(
+                json!({"todos": [
+                    {"id": "c", "subject": "Seed c", "status": "completed"},
+                    {"id": "p", "subject": "Seed p", "status": "in_progress"}
+                ]}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!third.is_error, "{}", third.text_content());
+        // The five accepted edges across three calls, each holding the
+        // one-in-progress bound: completed → in progress, pending → in
+        // progress, in progress → completed, in progress → pending, and
+        // the same-status resend that is the model's every-turn case.
+        // New ids ("n") may start at any status.
     }
 
     #[tokio::test]
@@ -914,12 +999,48 @@ mod tests {
             message.contains("cannot move from completed to pending"),
             "{message}"
         );
-        assert!(message.contains("restart a completed task"), "{message}");
+        assert!(message.contains("reopens via in_progress"), "{message}");
         assert!(message.contains('1'), "{message}");
         assert_eq!(
             todos.lock().unwrap().first().unwrap().status,
             TodoStatus::Completed,
             "a rejected call must leave the stored list untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_in_progress_entry_is_refused() {
+        let (ctx, todos) = todo_context();
+        seed(&todos, "1", TodoStatus::InProgress);
+        let err = TodoTool
+            .call(
+                json!({"todos": [
+                    {"id": "1", "subject": "Seed 1", "status": "in_progress"},
+                    {"id": "2", "subject": "Rival work", "status": "in_progress"}
+                ]}),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("Only one todo may be in progress"),
+            "{message}"
+        );
+        assert!(
+            message.contains("'1'") && message.contains("'2'"),
+            "the refusal names both entries: {message}"
+        );
+        let store = todos.lock().unwrap();
+        assert_eq!(
+            store.len(),
+            1,
+            "a rejected call must leave the stored list untouched"
+        );
+        assert_eq!(
+            store.first().unwrap().status,
+            TodoStatus::InProgress,
+            "the seeded entry keeps its status"
         );
     }
 
@@ -939,7 +1060,47 @@ mod tests {
             message.contains("cannot move from pending to completed"),
             "{message}"
         );
-        assert!(message.contains("move it through in progress"), "{message}");
+        assert!(message.contains("one rung at a time"), "{message}");
+        assert!(message.contains("follow-up TodoWrite call"), "{message}");
+    }
+
+    #[test]
+    fn todo_write_teaches_the_transition_rule_on_every_surface() {
+        let description = TodoTool.description();
+        assert!(
+            description.contains("one rung at a time"),
+            "tool description must state the rule: {description}"
+        );
+        let schema = serde_json::to_string(&TodoTool.schema()).expect("schema serializes");
+        assert!(
+            schema.contains("one rung at a time"),
+            "schema status description must state the rule: {schema}"
+        );
+        let fragment = TodoTool.system_prompt().expect("fragment present");
+        assert!(
+            fragment.contains("one rung per call"),
+            "fragment must state the per-call rule: {fragment}"
+        );
+        assert!(
+            fragment.contains("a skipped rung is rejected"),
+            "fragment must state the consequence: {fragment}"
+        );
+        assert!(
+            fragment.contains("one at a time"),
+            "fragment must state the one-at-a-time rule: {fragment}"
+        );
+        assert!(
+            fragment.contains("survives context compaction"),
+            "fragment must state the list's compaction survival: {fragment}"
+        );
+        assert!(
+            description.contains("at most one entry is in progress"),
+            "tool description must state the one-at-a-time rule: {description}"
+        );
+        assert!(
+            schema.contains("At most one entry is in progress"),
+            "schema status description must state the one-at-a-time rule: {schema}"
+        );
     }
 
     #[tokio::test]
@@ -1191,17 +1352,16 @@ mod tests {
     #[test]
     fn illegal_transition_errors_carry_the_pair_matching_remedy() {
         let restarted = entry(TodoStatus::Pending, None);
+        let reopened = illegal_transition_error(&restarted, TodoStatus::Completed).to_string();
+        assert!(reopened.contains("reopens via in_progress"), "{reopened}");
         assert!(
-            illegal_transition_error(&restarted, TodoStatus::Completed)
-                .to_string()
-                .contains("restart a completed task")
+            reopened.contains("from there it can return to pending"),
+            "{reopened}"
         );
         let skipped = entry(TodoStatus::Completed, None);
-        assert!(
-            illegal_transition_error(&skipped, TodoStatus::Pending)
-                .to_string()
-                .contains("move it through in progress")
-        );
+        let skip = illegal_transition_error(&skipped, TodoStatus::Pending).to_string();
+        assert!(skip.contains("one rung at a time"), "{skip}");
+        assert!(skip.contains("follow-up TodoWrite call"), "{skip}");
     }
 
     #[test]

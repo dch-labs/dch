@@ -291,7 +291,7 @@ fn long_summaries_truncate_to_the_width() {
     let summary = humanize_tool_summary("Read", &format!(r#"{{"file_path":"{long_path}"}}"#));
     assert!(summary.ends_with('…'), "the cut is marked: {summary:?}");
     assert!(
-        summary.width() <= 48 + "Reading …".width(),
+        summary.width() <= 96 + "Reading …".width(),
         "the truncated summary stays near the budget: {}",
         summary.width()
     );
@@ -299,10 +299,10 @@ fn long_summaries_truncate_to_the_width() {
 
 #[test]
 fn a_capped_stash_still_humanizes() {
-    // The observer caps the stashed value at 60 chars with an
+    // The observer caps the stashed value at 120 chars with an
     // ellipsis; a capped bare value must render as itself, not as
     // an unparseable JSON fragment.
-    let capped = format!("{}…", "cargo test --all-features --workspace".repeat(3));
+    let capped = format!("{}…", "cargo test --all-features --workspace".repeat(5));
     let summary = humanize_tool_summary("Bash", &capped);
     assert!(
         summary.starts_with("Running: cargo test"),
@@ -352,7 +352,7 @@ fn a_long_multiedit_path_keeps_its_edit_count() {
         "the count suffix survives a path that alone exceeds the budget: {value:?}"
     );
     assert!(
-        value.width() <= 48,
+        value.width() <= 96,
         "the combined value stays inside the summary budget: {}",
         value.width()
     );
@@ -364,13 +364,49 @@ fn a_long_multiedit_path_keeps_its_edit_count() {
 
 #[test]
 fn a_wide_value_truncates_by_display_columns() {
-    // Thirty CJK glyphs occupy sixty terminal columns.
-    let wide = "漢".repeat(30);
+    // Sixty CJK glyphs occupy one hundred twenty terminal columns.
+    let wide = "漢".repeat(60);
     let summary = humanize_tool_summary("Read", &format!(r#"{{"file_path":"{wide}"}}"#));
     assert!(
-        summary.width() <= 48 + "Reading ".width(),
+        summary.width() <= 96 + "Reading ".width(),
         "a wide value's summary stays inside the column budget: {}",
         summary.width()
     );
     assert!(summary.ends_with('…'), "the cut is marked: {summary:?}");
+}
+
+#[test]
+fn a_readfiles_batch_names_its_first_path_and_counts_the_rest() {
+    assert_eq!(
+        humanize_tool_summary("ReadFiles", r#"{"files":["a.rs","b.rs","c.rs"]}"#),
+        "ReadFiles: a.rs (2 more)",
+        "a batch names the file it opens and counts the ones behind it"
+    );
+    assert_eq!(
+        humanize_tool_summary("ReadFiles", r#"{"files":["solo.rs"]}"#),
+        "ReadFiles: solo.rs",
+        "a one-path batch carries no count"
+    );
+}
+
+#[test]
+fn a_long_readfiles_path_keeps_its_batch_count() {
+    let long_path = format!("/very/long/path/{}.rs", "x".repeat(80));
+    let value = dch_tui::tool_render::display_input(
+        "ReadFiles",
+        &serde_json::json!({"files": [long_path, "other.rs", "third.rs"]}),
+    );
+    assert!(
+        value.ends_with("(2 more)"),
+        "the count survives a path that alone exceeds the budget: {value:?}"
+    );
+    assert!(
+        value.width() <= 96,
+        "the combined value stays inside the summary budget: {}",
+        value.width()
+    );
+    assert!(
+        humanize_tool_summary("ReadFiles", &value).contains("(2 more)"),
+        "the humanized summary keeps the count"
+    );
 }

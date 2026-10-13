@@ -73,9 +73,7 @@ const READ_ONLY_PREFIXES: &[&str] = &[
     "git status",
     "git diff",
     "git log",
-    "git branch",
     "git show",
-    "git remote",
     "cargo check",
     "cargo test --no-run",
     "cargo clippy --no-deps",
@@ -86,8 +84,9 @@ const READ_ONLY_PREFIXES: &[&str] = &[
 ///
 /// Any one of these disqualifies a command from concurrent execution
 /// regardless of the words around it — a pipeline or redirection can
-/// have side effects even when every word looks read-only.
-const SHELL_OPERATORS: &[&str] = &["&&", "||", ";", "|", "`", "$(", ">", ">>", "<"];
+/// have side effects even when every word looks read-only, and a bare
+/// `&` backgrounds the command, whose lifetime then escapes the call.
+const SHELL_OPERATORS: &[&str] = &["&&", "||", ";", "|", "`", "$(", ">", ">>", "<", "&"];
 
 /// Substrings that make an otherwise-allowlisted command unsafe.
 ///
@@ -179,7 +178,11 @@ impl Tool for BashTool {
     fn description(&self) -> &'static str {
         "Execute a bash command. Supports background jobs, timeout enforcement, \
          and a dynamic concurrency check (read-only commands are safe to run \
-         concurrently)."
+         concurrently). Prefer the Read tools for file contents — Read for one \
+         file, ReadFiles for up to ten, each at Read's own window — a \
+         whole-file dump here lands in context at its full size; bounded \
+         peeks (`sed -n '10,20p'`, `head`, `tail`) are the bash way to \
+         look."
     }
 
     fn schema(&self) -> ToolSchema {
@@ -231,7 +234,10 @@ impl Tool for BashTool {
     fn system_prompt(&self) -> Option<String> {
         Some(
             "Run commands via the Bash tool. Prefer specific commands over \
-              scripts. Never run destructive commands (`rm -rf /`, force-push) \
+              scripts. For reading files prefer the Read tools — Read for one \
+              file, ReadFiles for up to ten, each at Read's own window; a \
+              whole-file cat here lands in context at its full size. \
+              Never run destructive commands (`rm -rf /`, force-push) \
               without stating intent first. Background jobs you expect to \
               outlast ten minutes cannot finish — the timeout bounds them at \
               600 seconds; split the work or checkpoint and resume. Manage \
@@ -446,11 +452,18 @@ pub(crate) fn truncate_string(s: &mut String, max_bytes: usize) {
 /// Compound commands (containing shell operators), shell redirections, and
 /// destructive subcommands are always unsafe. Otherwise the command is checked
 /// against the read-only prefix allowlist with boundary-aware matching so
-/// `cargo check` matches but `cargo checkout` does not.
+/// `cargo check` matches but `cargo checkout` does not. A command carrying
+/// a newline or any other control character besides tab is unsafe outright:
+/// the normalizer collapses those away, but the shell that runs the command
+/// honors a newline as a statement separator, so the matched text is not the
+/// whole story of what would execute.
 fn is_read_only_command(input: &Value) -> bool {
     let Some(command) = input.get("command").and_then(Value::as_str) else {
         return false;
     };
+    if has_control_separator(command) {
+        return false;
+    }
     let normalized = shell_normalized(command);
     if normalized.is_empty() {
         return false;
@@ -487,6 +500,18 @@ fn shell_normalized(command: &str) -> String {
         .split_whitespace()
         .collect::<Vec<&str>>()
         .join(" ")
+}
+
+/// Whether the raw command carries a control character other than tab.
+///
+/// A newline is a statement separator in the shell that runs the
+/// command, and the other control characters have no honest business
+/// in one — but the normalizer erases them all the same, so any
+/// command bearing one must be treated as not matching the text it
+/// normalizes to. Tab is exempt: it is an ordinary word separator the
+/// normalizer folds like a space.
+fn has_control_separator(command: &str) -> bool {
+    command.chars().any(|c| c != '\t' && c.is_control())
 }
 
 /// Shared fixtures for the Bash and Jobs tool tests.
@@ -572,9 +597,7 @@ mod tests {
             "git status",
             "git diff",
             "git log",
-            "git branch",
             "git show",
-            "git remote",
             "cargo check",
             "cargo test --no-run",
             "cargo clippy --no-deps",
@@ -631,10 +654,29 @@ mod tests {
             "echo x | tee y",
             "ls ; rm z",
             "echo $(whoami)",
+            "cat f &",
         ] {
             assert!(
                 !is_read_only_command(&json!({ "command": cmd })),
                 "'{cmd}' should NOT be read-only (compound)"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrency_check_control_bearing_commands_unsafe() {
+        // A newline separates statements in the shell that runs the
+        // command, and the normalizer erases it; the matched prefix is
+        // then not the whole story of what would execute.
+        for cmd in [
+            "git status\ncargo build",
+            "cat f\nrm g",
+            "ls\r\npwd",
+            "echo a\u{b}b",
+        ] {
+            assert!(
+                !is_read_only_command(&json!({ "command": cmd })),
+                "'{cmd}' carries a control character and must not be read-only"
             );
         }
     }
@@ -731,14 +773,37 @@ mod tests {
     }
 
     #[test]
-    fn concurrency_check_safe_git_still_allowed() {
-        // Read-only git subcommands remain safe after the denylist.
-        assert!(is_read_only_command(&json!({ "command": "git branch" })));
-        assert!(is_read_only_command(
-            &json!({ "command": "git branch --list" })
-        ));
-        assert!(is_read_only_command(&json!({ "command": "git remote" })));
-        assert!(is_read_only_command(&json!({ "command": "git remote -v" })));
+    fn concurrency_check_remote_forms_run_sequential() {
+        // `git remote`'s subcommand alone decides read versus write —
+        // `prune` deletes remote-tracking refs, `update` fetches,
+        // `set-head` rewrites a ref — and no prefix can tell them
+        // apart, so every remote form stays off the parallel wave,
+        // the bare listing and `-v` with it.
+        for cmd in [
+            "git remote",
+            "git remote -v",
+            "git remote prune origin",
+            "git remote update",
+            "git remote set-head origin master",
+        ] {
+            assert!(
+                !is_read_only_command(&json!({ "command": cmd })),
+                "'{cmd}' writes or could write refs and must run sequential"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrency_check_branch_forms_run_sequential() {
+        // `git branch <name>` creates a ref, and no prefix can tell a
+        // list-shaped argument from a branch name, so every branch
+        // form stays off the parallel wave — the bare listing with it.
+        for cmd in ["git branch", "git branch --list", "git branch feature-x"] {
+            assert!(
+                !is_read_only_command(&json!({ "command": cmd })),
+                "'{cmd}' creates or could create a ref and must run sequential"
+            );
+        }
     }
 
     #[test]
@@ -886,9 +951,10 @@ mod tests {
 
     #[test]
     fn bashtool_registered_in_builtin_registry() {
-        let reg = crate::registry::builtin_registry(&loopctl::tool::builtin::fs::FileSession::new(
-            std::path::PathBuf::from("."),
-        ));
+        let reg = crate::registry::builtin_registry(
+            &loopctl::tool::builtin::fs::FileSession::new(std::path::PathBuf::from(".")),
+            crate::registry::ReadWindows::default(),
+        );
         let tool = reg.get("Bash").expect("BashTool registered");
         assert!(!tool.is_read_only());
         // Dynamic concurrency: read-only input is safe, write is not.
@@ -901,6 +967,56 @@ mod tests {
         let prompt = BashTool.system_prompt();
         assert!(prompt.is_some());
         assert!(prompt.unwrap().contains("Bash"));
+    }
+
+    #[test]
+    fn bash_fragment_points_file_viewing_at_read() {
+        let prompt = BashTool.system_prompt().expect("fragment present");
+        assert!(
+            prompt.contains("Read tool"),
+            "the fragment must steer file viewing at the Read tool: {prompt}"
+        );
+    }
+    #[tokio::test]
+    async fn a_whole_file_cat_dumps_reach_the_shell() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        std::fs::write(tmp.path().join("dumped.txt"), "dumped-body\n").unwrap();
+        let tool = BashTool;
+        let ctx = ctx_in(cwd);
+        let input = json!({ "command": "cat dumped.txt" });
+        let out = tool.call(input, &ctx).await.unwrap();
+        assert!(
+            !out.is_error && out.text_content().contains("dumped-body"),
+            "bash is never blocked from reading — the dump must run: {}",
+            out.text_content()
+        );
+    }
+
+    #[tokio::test]
+    async fn tilde_and_home_variable_viewing_reaches_the_shell() {
+        // The expanded spellings must actually work: with HOME pointing
+        // at a directory holding the file, both `cat $HOME/…` and
+        // `cat ~/…` return the file's contents.
+        let guard = loopctl::testing::EnvGuard::acquire(&["HOME"]);
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::write(home.path().join("viewed.txt"), "home-viewed\n").unwrap();
+        guard.set("HOME", home.path().to_str().unwrap());
+        let work = tempfile::TempDir::new().unwrap();
+        let cwd = work.path().to_str().unwrap();
+        let tool = BashTool;
+        let ctx = ctx_in(cwd);
+        for command in ["cat $HOME/viewed.txt", "cat ~/viewed.txt"] {
+            let out = tool
+                .call(json!({ "command": command }), &ctx)
+                .await
+                .unwrap();
+            assert!(
+                !out.is_error && out.text_content().contains("home-viewed"),
+                "`{command}` must run and view the file: {}",
+                out.text_content()
+            );
+        }
     }
 
     #[tokio::test]

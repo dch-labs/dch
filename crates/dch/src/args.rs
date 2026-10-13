@@ -252,6 +252,21 @@ pub struct ConfigArgs {
     )]
     pub config_path: Option<PathBuf>,
 
+    /// Override the configured thinking budget for this run.
+    ///
+    /// One of `low`, `medium`, `high`, or `max`, riding the provider's
+    /// native effort parameter — the Anthropic `budget_tokens` ladder,
+    /// the OpenAI `reasoning_effort`. Overrides
+    /// `[api] reasoning_effort`; without the flag the configured value
+    /// (default unset, provider defaults) stands.
+    #[arg(
+        long,
+        value_name = "LEVEL",
+        value_parser = ["low", "medium", "high", "max"],
+        help_heading = "Config"
+    )]
+    pub reasoning_effort: Option<String>,
+
     /// Let file tools reach paths outside the working directory for this
     /// run.
     ///
@@ -264,6 +279,15 @@ pub struct ConfigArgs {
     /// directory.
     #[arg(long, help_heading = "Config")]
     pub unsafe_paths: bool,
+
+    /// Disable secrets redaction for this run.
+    ///
+    /// Overrides a `true` (or absent) config value: tool output and tool
+    /// input summaries keep any credentials the redacting pass would mask,
+    /// on screen and in the saved session file. The flag cannot turn
+    /// redaction back on when the config disables it — re-enable there.
+    #[arg(long, help_heading = "Config")]
+    pub no_redact: bool,
 }
 
 /// Parse the process's command-line arguments into [`Args`].
@@ -286,6 +310,7 @@ pub fn parse_args() -> Args {
 )]
 mod tests {
     use super::*;
+    use clap::CommandFactory as _;
     use clap::error::ErrorKind;
 
     fn parse(args: &[&str]) -> Result<Args, clap::Error> {
@@ -400,6 +425,40 @@ mod tests {
     }
 
     #[test]
+    fn every_long_flag_is_documented_in_the_readme() {
+        let readme =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../README.md"))
+                .expect("README.md is readable");
+        let mut flags = Vec::new();
+        for arg in Args::command().get_arguments() {
+            if let Some(long) = arg.get_long()
+                && !matches!(long, "help" | "version")
+            {
+                flags.push(format!("--{long}"));
+            }
+        }
+        assert!(!flags.is_empty(), "the sweep must cover the flag surface");
+        for flag in &flags {
+            assert!(
+                readme.contains(flag.as_str()),
+                "README.md must document the `{flag}` flag"
+            );
+        }
+    }
+
+    #[test]
+    fn reasoning_effort_flag_parses_each_level_and_refuses_junk() {
+        for level in ["low", "medium", "high", "max"] {
+            let args = parse(&["--reasoning-effort", level]).unwrap();
+            assert_eq!(args.config.reasoning_effort.as_deref(), Some(level));
+        }
+        assert!(
+            parse(&["--reasoning-effort", "turbo"]).is_err(),
+            "an unknown level is refused at the CLI, not at construction"
+        );
+    }
+
+    #[test]
     fn model_parses_via_both_spellings() {
         let long = parse(&["--model", "gpt-4o"]).unwrap();
         let short = parse(&["-m", "gpt-4o"]).unwrap();
@@ -417,6 +476,12 @@ mod tests {
     fn unsafe_paths_flag_parses_and_defaults_absent() {
         assert!(!parse(&[]).unwrap().config.unsafe_paths);
         assert!(parse(&["--unsafe-paths"]).unwrap().config.unsafe_paths);
+    }
+
+    #[test]
+    fn no_redact_flag_parses_and_defaults_absent() {
+        assert!(!parse(&[]).unwrap().config.no_redact);
+        assert!(parse(&["--no-redact"]).unwrap().config.no_redact);
     }
 
     #[test]

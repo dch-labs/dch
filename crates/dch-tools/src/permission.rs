@@ -55,9 +55,9 @@ pub enum ToolCategory {
     /// Reads files and directory structure; never mutates anything.
     ///
     /// The only category [`is_read_only`](ToolCategory::is_read_only)
-    /// accepts: `read`, `FileViewer`, `Glob`, `Grep`, `CodeSearch`, `Tree`,
-    /// and `LSP` all
-    /// observe the workspace without changing it.
+    /// accepts: `Read`, `ReadFiles`, `FileViewer`, `Glob`, `Grep`,
+    /// `CodeSearch`, `Tree`, and `LSP` all observe the workspace
+    /// without changing it.
     FileRead,
 
     /// Creates, overwrites, or edits files.
@@ -119,16 +119,16 @@ impl ToolCategory {
 /// Map a tool's registered name to its [`ToolCategory`].
 ///
 /// Matching is exact and case-sensitive against the registered tool
-/// names — `PascalCase` for most, lowercase for loopctl's `read`.
-/// Unknown names — a
-/// misconfigured registry, a typo, a tool added before its entry —
-/// classify as [`ToolCategory::Unclassified`] and emit a warning so the gap
-/// is observable in logs. `Unclassified` fails closed: only `Auto` runs
-/// it, every other mode asks or blocks.
+/// names as the dependency tree builds them: every builtin, dch's own
+/// and the framework's file reader alike, is `PascalCase`. Unknown
+/// names — a misconfigured registry, a typo, a tool added before its
+/// entry — classify as [`ToolCategory::Unclassified`] and emit a warning
+/// so the gap is observable in logs. `Unclassified` fails closed: only
+/// `Auto` runs it, every other mode asks or blocks.
 #[must_use]
 pub fn tool_category(name: &str) -> ToolCategory {
     match name {
-        "read" | "Glob" | "Grep" | "CodeSearch" | "Tree" | "FileViewer" | "LSP" => {
+        "Read" | "ReadFiles" | "Glob" | "Grep" | "CodeSearch" | "Tree" | "FileViewer" | "LSP" => {
             ToolCategory::FileRead
         }
         "Write" | "Edit" | "MultiEdit" => ToolCategory::FileWrite,
@@ -214,7 +214,8 @@ mod tests {
     /// [`tool_category`], and the tests iterate this table so the two cannot
     /// drift.
     const TOOL_TABLE: &[(&str, ToolCategory)] = &[
-        ("read", ToolCategory::FileRead),
+        ("Read", ToolCategory::FileRead),
+        ("ReadFiles", ToolCategory::FileRead),
         ("Write", ToolCategory::FileWrite),
         ("Edit", ToolCategory::FileWrite),
         ("MultiEdit", ToolCategory::FileWrite),
@@ -248,9 +249,10 @@ mod tests {
         // The registry and the category table are linked only by convention;
         // this pins that a registered tool never silently falls to the
         // unknown-name default.
-        let registry = builtin_registry(&loopctl::tool::builtin::fs::FileSession::new(
-            std::path::PathBuf::from("."),
-        ));
+        let registry = builtin_registry(
+            &loopctl::tool::builtin::fs::FileSession::new(std::path::PathBuf::from(".")),
+            crate::registry::ReadWindows::default(),
+        );
         let registered: Vec<&str> = registry
             .all_tools()
             .into_iter()

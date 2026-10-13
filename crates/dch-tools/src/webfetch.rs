@@ -805,9 +805,10 @@ mod tests {
 
     #[test]
     fn test_webfetchtool_registered_in_builtin_registry() {
-        let reg = crate::registry::builtin_registry(&loopctl::tool::builtin::fs::FileSession::new(
-            std::path::PathBuf::from("."),
-        ));
+        let reg = crate::registry::builtin_registry(
+            &loopctl::tool::builtin::fs::FileSession::new(std::path::PathBuf::from(".")),
+            crate::registry::ReadWindows::default(),
+        );
         let tool = reg.get("WebFetch").expect("WebFetch registered");
         assert!(tool.is_read_only());
         assert!(!tool.is_concurrency_safe());

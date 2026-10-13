@@ -72,7 +72,14 @@ pub fn render_markdown(
                     })
                     .unwrap_or_default();
                 let code = component.content_as_lines().join("\n");
-                render_code_block(&code, &language, markdown_theme, syntax_theme, &mut lines);
+                render_code_block(
+                    &code,
+                    &language,
+                    markdown_theme,
+                    syntax_theme,
+                    wrap_width,
+                    &mut lines,
+                );
                 prev_emitted = true;
             }
             TextNode::Quote => {
@@ -218,11 +225,23 @@ fn word_to_spans(word: &Word, base_style: Style, theme: &MarkdownTheme) -> Vec<S
     }
 }
 
+/// The continuation marker a soft-wrapped code row opens with.
+///
+/// A code line wider than the panel splits onto continuation rows; each
+/// one keeps the panel background and opens with this glyph in the dim
+/// tone, so a reflowed row reads as the tail of the line above rather
+/// than a new source line.
+const CODE_CONTINUATION_MARKER: &str = "↪ ";
+
 /// Render a code block, one framed line per source line.
 ///
 /// Every line is wrapped in a leading and trailing space column
 /// painted in the code-block background so the block reads as a solid
-/// panel. With the `syntax-highlight` feature the tree-sitter
+/// panel. A line wider than the panel soft-wraps onto continuation
+/// rows that keep the panel background and open with
+/// [`CODE_CONTINUATION_MARKER`]; source characters are never dropped
+/// or reordered, and a span the break cuts in two keeps its style on
+/// both sides. With the `syntax-highlight` feature the tree-sitter
 /// highlighter runs here over the block's source; without it every
 /// line renders plain.
 fn render_code_block(
@@ -230,6 +249,7 @@ fn render_code_block(
     language: &str,
     markdown_theme: &MarkdownTheme,
     syntax_theme: &SyntaxTheme,
+    wrap_width: u16,
     lines: &mut Vec<Line<'static>>,
 ) {
     let panel_bg = markdown_theme.code_block;
@@ -243,8 +263,8 @@ fn render_code_block(
             HighlightInfo::Highlighted(events) => {
                 let emit_colors = syntax_theme.emit_order_colors();
                 let source = code.as_bytes();
-                let leading = || Span::styled(" ", Style::default().bg(panel_bg));
-                let mut current_line: Vec<Span<'static>> = vec![leading()];
+                let mut rows: Vec<Vec<Span<'static>>> = Vec::new();
+                let mut current_row: Vec<Span<'static>> = Vec::new();
                 let mut highlight_stack: Vec<Color> = vec![plain_fg];
 
                 for event in &events {
@@ -258,13 +278,10 @@ fn render_code_block(
                                 let style = Style::default().fg(color).bg(panel_bg);
                                 for (i, line_str) in chunk.split('\n').enumerate() {
                                     if i > 0 {
-                                        current_line.push(leading());
-                                        lines.push(Line::from(std::mem::take(&mut current_line)));
-                                        current_line = vec![leading()];
+                                        rows.push(std::mem::take(&mut current_row));
                                     }
                                     if !line_str.is_empty() {
-                                        current_line
-                                            .push(Span::styled(line_str.to_string(), style));
+                                        current_row.push(Span::styled(line_str.to_string(), style));
                                     }
                                 }
                             }
@@ -283,20 +300,20 @@ fn render_code_block(
                     }
                 }
 
-                if current_line.len() > 1 {
-                    current_line.push(leading());
-                    lines.push(Line::from(current_line));
+                if !current_row.is_empty() {
+                    rows.push(current_row);
                 }
+                wrap_code_rows(rows, wrap_width, panel_bg, markdown_theme.dim, lines);
             }
             HighlightInfo::Unhighlighted => {
-                render_plain_code_block(code, panel_bg, plain_fg, lines);
+                render_plain_code_block(code, panel_bg, plain_fg, wrap_width, lines);
             }
         }
     }
     #[cfg(not(feature = "syntax-highlight"))]
     {
         let _ = language;
-        render_plain_code_block(code, panel_bg, plain_fg, lines);
+        render_plain_code_block(code, panel_bg, plain_fg, wrap_width, lines);
     }
 }
 
@@ -304,23 +321,90 @@ fn render_code_block(
 ///
 /// The fallback every unhighlighted path converges on: unknown
 /// language, missing grammar, highlighting failure, or the feature
-/// turned off.
+/// turned off. Wrapping follows [`render_code_block`]'s panel
+/// contract.
 fn render_plain_code_block(
     code: &str,
     panel_bg: Color,
     plain_fg: Color,
+    wrap_width: u16,
     lines: &mut Vec<Line<'static>>,
 ) {
-    for code_line in code.lines() {
-        let mut spans = vec![Span::styled(" ", Style::default().bg(panel_bg))];
-        if !code_line.is_empty() {
-            spans.push(Span::styled(
-                code_line.to_string(),
-                Style::default().fg(plain_fg).bg(panel_bg),
-            ));
+    let mut rows: Vec<Vec<Span<'static>>> = code
+        .split('\n')
+        .map(|code_line| {
+            if code_line.is_empty() {
+                Vec::new()
+            } else {
+                vec![Span::styled(
+                    code_line.to_string(),
+                    Style::default().fg(plain_fg).bg(panel_bg),
+                )]
+            }
+        })
+        .collect();
+    if rows.last().is_some_and(Vec::is_empty) {
+        rows.pop();
+    }
+    wrap_code_rows(rows, wrap_width, panel_bg, plain_fg, lines);
+}
+
+/// Soft-wrap styled code rows into framed panel lines.
+///
+/// Each source row renders inside the panel's padding columns — one
+/// leading and one trailing space on the block background. A row wider
+/// than that budget breaks at a display-width boundary onto
+/// continuation rows that open with [`CODE_CONTINUATION_MARKER`] in
+/// the dim tone; the marker's columns come out of the continuation
+/// budget so every row's trailing padding lands on the same terminal
+/// column. A span the break cuts in two keeps its style on both
+/// pieces, and a single glyph wider than the whole budget owns its row
+/// unsplittably — the same carve-out character splitting applies
+/// elsewhere in this module's layout.
+fn wrap_code_rows(
+    rows: Vec<Vec<Span<'static>>>,
+    wrap_width: u16,
+    panel_bg: Color,
+    dim: Color,
+    lines: &mut Vec<Line<'static>>,
+) {
+    let first_budget = usize::from(wrap_width).saturating_sub(2).max(1);
+    let continuation_budget = first_budget
+        .saturating_sub(UnicodeWidthStr::width(CODE_CONTINUATION_MARKER))
+        .max(1);
+    let pad = Style::default().bg(panel_bg);
+    let marker = Span::styled(
+        CODE_CONTINUATION_MARKER,
+        Style::default().fg(dim).bg(panel_bg),
+    );
+    for row in rows {
+        let mut budget = first_budget;
+        let mut used: usize = 0;
+        let mut out: Vec<Span<'static>> = vec![Span::styled(" ", pad)];
+        for span in row {
+            let style = span.style;
+            let mut piece = String::new();
+            for ch in span.content.chars() {
+                let ch_width = ch.width().unwrap_or(0);
+                if used.saturating_add(ch_width) > budget && used > 0 {
+                    if !piece.is_empty() {
+                        out.push(Span::styled(std::mem::take(&mut piece), style));
+                    }
+                    out.push(Span::styled(" ", pad));
+                    lines.push(Line::from(std::mem::take(&mut out)));
+                    out = vec![Span::styled(" ", pad), marker.clone()];
+                    budget = continuation_budget;
+                    used = 0;
+                }
+                piece.push(ch);
+                used = used.saturating_add(ch_width);
+            }
+            if !piece.is_empty() {
+                out.push(Span::styled(piece, style));
+            }
         }
-        spans.push(Span::styled(" ", Style::default().bg(panel_bg)));
-        lines.push(Line::from(spans));
+        out.push(Span::styled(" ", pad));
+        lines.push(Line::from(out));
     }
 }
 
@@ -523,6 +607,10 @@ fn clip_line(line: Line<'static>, max_width: usize) -> Line<'static> {
 }
 
 /// Whether a line carries no visible content.
+///
+/// Padding-only spans and an empty span list both count, so a blank
+/// row between blocks reads the same as an absent one to the callers
+/// trimming edges.
 fn is_blank(line: &Line<'_>) -> bool {
     line.spans.iter().all(|span| span.content.trim().is_empty())
 }
@@ -567,5 +655,44 @@ mod tests {
         let clipped = clip_line(line, 3);
         let width = UnicodeWidthStr::width(clipped.spans[0].content.as_ref());
         assert!(width <= 3, "clipped width {width} exceeds 3");
+    }
+
+    #[test]
+    fn a_span_boundary_wraps_on_the_first_glyph_of_the_next_span() {
+        // Highlighted code splits one source row into many spans, so
+        // the overflow lands on a span boundary, not inside one span:
+        // a span that fills the row exactly must not buy its
+        // successor a free first glyph — the wrap fires on that
+        // glyph, not on the one after it.
+        let rows = vec![vec![Span::raw("abcdef"), Span::raw("gh")]];
+        let mut lines = Vec::new();
+        wrap_code_rows(rows, 8, Color::Reset, Color::Reset, &mut lines);
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.to_string())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            rendered.len(),
+            2,
+            "the successor span starts a continuation row: {rendered:?}"
+        );
+        assert!(
+            rendered[0].trim() == "abcdef",
+            "the filled span rides the first row: {rendered:?}"
+        );
+        assert!(
+            rendered[1].contains('g') && !rendered[1].contains('f'),
+            "the boundary glyph leads the continuation: {rendered:?}"
+        );
+        let first_width = UnicodeWidthStr::width(rendered[0].as_str());
+        assert!(
+            first_width <= 8,
+            "the first row stays inside its frame budget: {rendered:?}"
+        );
     }
 }

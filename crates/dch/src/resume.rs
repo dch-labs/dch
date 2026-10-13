@@ -3,10 +3,12 @@
 //!
 //! [`resolve_resume`] turns the `--resume` flag into one
 //! [`ResumeControl`] both run modes consume: a loaded session seeds
-//! the display and the agent's conversation history, reuses its id so
-//! further auto-saves land in the same file, and keeps its model
-//! unless the CLI overrides it; a load that fails degrade-able ways
-//! starts a fresh session carrying a warning for the mode to render.
+//! the display and the agent's conversation history and reuses its id
+//! so further auto-saves land in the same file, while the engine runs
+//! on the current configuration's model and provider — the saved
+//! model is provenance for the listing, never an override; a load
+//! that fails degrade-able ways starts a fresh session carrying a
+//! warning for the mode to render.
 //! `--list-sessions` prints the saved-session table and exits. The
 //! data layer lives in [`crate::session`]; this module owns dispatch,
 //! presentation, and the display-to-history conversion.
@@ -78,22 +80,34 @@ pub(crate) struct ResumeOutcome {
 
     /// The saved conversation in display form, verbatim.
     ///
-    /// Seeds the TUI's conversation or the headless transcript
-    /// prefix; no conversion happens at the consumers.
+    /// What was saved is what renders; the agent history is seeded from
+    /// the machine snapshot when one is fresh, and only derived from
+    /// this transcript otherwise.
     pub(crate) messages: Vec<TuiMessage>,
 
-    /// The model the saved session ran, from the envelope.
+    /// The engine's committed history, when the sibling snapshot was
+    /// fresh.
     ///
-    /// Applied by the modes only when the CLI does not override the
-    /// model, so a resumed session keeps running what it started
-    /// with unless the user says otherwise.
-    pub(crate) model: String,
+    /// Seeding a runner from this continues the session exactly where
+    /// the process left off; `None` — an old session without a
+    /// snapshot, or a stale or unreadable pair — falls back to the
+    /// lossy derive walk over the display transcript.
+    pub(crate) machine: Option<Vec<Message>>,
 
     /// The session's cumulative token totals, from the envelope.
     ///
     /// Seeds the resumed display's running count so it continues
     /// the session's accounting instead of restarting at zero.
     pub(crate) tokens: crate::session::SessionTokens,
+
+    /// How many compaction passes the adopted machine snapshot
+    /// records.
+    ///
+    /// Zero whenever no snapshot was adopted; the staleness guard
+    /// reads it beside the transcript's Compacted rows, because a
+    /// headless session's transcript carries none and the snapshot's
+    /// count is its only witness of a legitimate shrink.
+    pub(crate) machine_compactions: u32,
 }
 
 /// Why a resume could not load a session.
@@ -176,7 +190,53 @@ pub(crate) fn resolve_resume_in(args: &Args, base: &Path) -> ResumeControl {
         }
     };
     match load_for_resume_in(id, base) {
-        Ok(outcome) => ResumeControl::Resumed(outcome),
+        Ok(mut outcome) => {
+            // A snapshot can be stamped fresh yet hold far less than
+            // the transcript beside it — a mid-run publish freeze
+            // stamps the stale half with every save. When the engine
+            // half is implausibly behind a long transcript that shows
+            // no compaction (the one legitimate way a snapshot
+            // shrinks), adopting it would silently amneses everything
+            // after the freeze; deriving from the transcript instead
+            // loses formatting, never content.
+            if let Some(machine) = &outcome.machine {
+                let exchanges = outcome
+                    .messages
+                    .iter()
+                    .filter(|message| {
+                        matches!(
+                            message,
+                            TuiMessage::User { .. } | TuiMessage::Assistant { .. }
+                        )
+                    })
+                    .count();
+                let compacted = outcome.machine_compactions > 0
+                    || outcome
+                        .messages
+                        .iter()
+                        .any(|message| matches!(message, TuiMessage::Compacted { .. }));
+                let frozen =
+                    machine.len().saturating_mul(3) < exchanges && exchanges >= 12 && !compacted;
+                if frozen {
+                    tracing::warn!(
+                        session = %id,
+                        machine_messages = machine.len(),
+                        transcript_exchanges = exchanges,
+                        "machine history implausibly behind the transcript; deriving \
+                         the resume from the display transcript"
+                    );
+                    outcome.machine = None;
+                    outcome.messages.push(TuiMessage::System {
+                        text: "the session's engine snapshot was stale; the resume \
+                               derived its context from the transcript — formatting \
+                               was lost, content was not"
+                            .to_string(),
+                        timestamp: chrono::Utc::now(),
+                    });
+                }
+            }
+            ResumeControl::Resumed(outcome)
+        }
         Err(ResumeError::NotFound(missing)) => ResumeControl::Fresh {
             session_id: None,
             warn: Some(format!(
@@ -237,24 +297,6 @@ fn io_exit_report(
     (message, marker)
 }
 
-/// Point `config` at the model the resumed session ran, unless the
-/// CLI overrides the model.
-///
-/// The precedence both run modes share: `--model` (already applied
-/// to the config by the CLI overrides before this runs) beats the
-/// envelope's model, which beats the config file's. A resumed
-/// session keeps running what it started with unless the user says
-/// otherwise.
-pub(crate) fn apply_resumed_model(
-    config: &mut dch_config::DchConfig,
-    args: &Args,
-    outcome: &ResumeOutcome,
-) {
-    if args.model.is_none() {
-        config.api.model.clone_from(&outcome.model);
-    }
-}
-
 /// The most recently saved session under `base`, if any.
 ///
 /// What `--continue` resolves to: the session whose last completed
@@ -267,25 +309,123 @@ fn latest_session_in(base: &Path) -> Option<uuid::Uuid> {
         .map(|summary| summary.id)
 }
 
-/// Load a session by id under `base` into everything resume needs.
+/// The history a resumed runner seeds from.
 ///
-/// One read yields the messages and the envelope's model; the
-/// session id is echoed from the request, making the reuse a property
-/// of the outcome rather than a second decision at the consumer.
+/// Prefers the machine snapshot — process-identical continuation, the
+/// real tool-call ids and full tool results included — and falls back
+/// to the lossy derive walk over the display transcript when no fresh
+/// snapshot exists. One selection shared by both run modes, so the
+/// TUI and headless resumes can never diverge in fidelity. Under the
+/// current redaction policy both halves of the snapshot's tool
+/// exchanges are scrubbed with the same curated patterns the
+/// dispatch-time pair uses: a session saved before redaction was
+/// enabled must not re-admit the raw secret bytes its transcript
+/// captured, whatever route the resume takes.
+pub(crate) fn history_for_resume(outcome: &ResumeOutcome, redact: bool) -> Vec<Message> {
+    match outcome.machine.clone() {
+        Some(mut machine) => {
+            if redact {
+                scrub_machine_history(&mut machine);
+            }
+            machine
+        }
+        None => tui_messages_to_loopctl(&outcome.messages, redact),
+    }
+}
+
+/// Scrub secret-shaped bytes out of a snapshot history's tool exchanges.
+///
+/// The one place a machine snapshot's fidelity is deliberately
+/// narrowed: when the current policy hides these shapes from the
+/// model, replaying the saved bytes verbatim would hand the provider
+/// what the pipeline would have redacted. Both halves of an exchange
+/// go — the result's output (the plain variant's text and every text
+/// part of a multipart result) and every string leaf of the call's
+/// arguments — because a session resumed onto a different provider
+/// otherwise replays argument bytes that provider was never shown. The
+/// derive path applies the same policy to the same two halves, so the
+/// routes cannot disagree about what a resumed secret is.
+///
+/// The snapshot this narrows is a copy: the read-before-write re-arm
+/// in [`resumed_read_paths_with_machine`] reads the caller's own
+/// history, so a scrubbed path argument can never reach a baseline.
+fn scrub_machine_history(messages: &mut [Message]) {
+    let patterns = loopctl::middleware::SecretPatternSet::default_common();
+    for message in messages {
+        for part in &mut message.parts {
+            match part {
+                MessagePart::ToolResult { output, .. } => match output {
+                    loopctl::message::ToolContent::Text(text) => {
+                        patterns.scrub(text);
+                    }
+                    loopctl::message::ToolContent::Multipart(parts) => {
+                        for part in parts {
+                            if let loopctl::message::ToolContentPart::Text { text } = part {
+                                patterns.scrub(text);
+                            }
+                        }
+                    }
+                },
+                MessagePart::ToolCall { input, .. } => scrub_json_strings(&patterns, input),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Scrub every string leaf of a tool call's argument tree.
+///
+/// Arguments are arbitrary JSON, so a secret hides as readily in a
+/// nested `edits` entry as in a top-level string; the walk descends
+/// arrays and objects to each leaf rather than stopping at the
+/// surface. Leaves that are not strings carry no text to hide.
+fn scrub_json_strings(
+    patterns: &loopctl::middleware::SecretPatternSet,
+    value: &mut serde_json::Value,
+) {
+    match value {
+        serde_json::Value::String(text) => {
+            patterns.scrub(text);
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                scrub_json_strings(patterns, item);
+            }
+        }
+        serde_json::Value::Object(entries) => {
+            for item in entries.values_mut() {
+                scrub_json_strings(patterns, item);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Load a session for resume, preferring its machine snapshot when
+/// the pair is fresh.
+///
+/// One resolution over both files: the display transcript always
+/// loads, and the machine-history sibling seeds the outcome when it
+/// is at least as new as the display file — otherwise the outcome
+/// carries `None` and the caller derives.
 ///
 /// # Errors
 ///
-/// [`ResumeError::NotFound`] when no session exists under `id`;
-/// [`ResumeError::Corrupt`] when the file is not a readable
-/// `dch.v1` transcript; [`ResumeError::Io`] when the medium fails
-/// underneath the read.
+/// Propagates [`ResumeError`] when neither file is readable — the
+/// same conditions the session loader reports, mapped once for the
+/// resume flow.
 pub(crate) fn load_for_resume_in(id: Uuid, base: &Path) -> Result<ResumeOutcome, ResumeError> {
-    let (messages, model, tokens) = crate::session::load_with_meta_in(id, base)?;
+    let (messages, _model, tokens, saved_at) = crate::session::load_with_meta_in(id, base)?;
+    let (machine, machine_compactions) = match crate::session::load_machine_in(id, base, saved_at) {
+        Some((messages, compactions)) => (Some(messages), compactions),
+        None => (None, 0),
+    };
     Ok(ResumeOutcome {
         session_id: id,
         messages,
-        model,
         tokens,
+        machine,
+        machine_compactions,
     })
 }
 
@@ -308,8 +448,13 @@ pub(crate) fn load_for_resume_in(id: Uuid, base: &Path) -> Result<ResumeOutcome,
 ///   each tool call and each reply text as separate one-block
 ///   records, where the live engine recorded one message per model
 ///   response; coalescing restores that shape and keeps each tool
-///   call adjacent to the user message that carries its result.
-///   Each tool call's arguments are its retained input parsed back
+///   call adjacent to the user message that carries its result. An
+///   assistant record that arrives with tool results outstanding
+///   first closes the previous reply's exchange — the pending results
+///   flush as their own user message — so a transcript with no user
+///   texts between its replies (a tool marathon) still reconstructs
+///   the alternating shape providers and compaction work on. Each
+///   tool call's arguments are its retained input parsed back
 ///   to the object the model sent — or, for blocks saved before the
 ///   capture, a scrubbed `{"preview": …}` wrapper carrying the
 ///   one-line summary.
@@ -359,11 +504,33 @@ pub(crate) fn tui_messages_to_loopctl(
                 push_user_message(&mut converted, parts);
             }
             TuiMessage::Assistant { blocks, .. } => {
+                if !pending_results.is_empty() {
+                    // An assistant record arriving with results outstanding
+                    // is a response boundary — the results returned and the
+                    // model spoke again. Flushing here keeps a transcript
+                    // with no user texts between its replies (a tool
+                    // marathon) alternating at message granularity instead
+                    // of piling every exchange into one uncompactable
+                    // assistant run.
+                    push_user_message(&mut converted, std::mem::take(&mut pending_results));
+                }
                 let mut parts = Vec::new();
                 for block in blocks {
                     match block {
+                        ContentBlock::Thinking { .. } => {
+                            // Display-only: reasoning never re-enters the
+                            // API-shape history — an unsigned thinking part
+                            // is a wire error on Anthropic and forbidden
+                            // echo elsewhere.
+                        }
                         ContentBlock::Text { text } => {
-                            parts.push(MessagePart::text(text.clone()));
+                            // An empty text part is a wire error waiting
+                            // to happen (Anthropic rejects it); the drain
+                            // no longer records one, and an older session
+                            // that did must not re-send it.
+                            if !text.is_empty() {
+                                parts.push(MessagePart::text(text.clone()));
+                            }
                         }
                         ContentBlock::Tool {
                             name,
@@ -403,7 +570,8 @@ pub(crate) fn tui_messages_to_loopctl(
                 }
                 push_assistant_message(&mut converted, parts);
             }
-            TuiMessage::System { .. } | TuiMessage::Error { .. } => {}
+            TuiMessage::System { .. } | TuiMessage::Error { .. } | TuiMessage::Compacted { .. } => {
+            }
         }
     }
     if !pending_results.is_empty() {
@@ -456,6 +624,9 @@ fn push_user_message(converted: &mut Vec<Message>, parts: Vec<MessagePart>) {
 /// structural — a text/tool boundary needs no break, which is why
 /// the common call-then-reply merge gains none.
 fn push_assistant_message(converted: &mut Vec<Message>, parts: Vec<MessagePart>) {
+    if parts.is_empty() {
+        return;
+    }
     let holds_text = |parts: &[MessagePart]| {
         parts
             .iter()
@@ -508,6 +679,41 @@ pub(crate) fn resumed_read_paths(messages: &[TuiMessage]) -> Vec<String> {
                     && !input_preview.trim().is_empty()
                 {
                     paths.push(input_preview.trim().to_string());
+                }
+            }
+        }
+    }
+    paths
+}
+
+/// The paths a resume re-arms as read, from the freshest record.
+///
+/// Single reads come from the transcript's previews — a `Read` call's
+/// preview is its path. Batch reads come from the machine snapshot
+/// when one exists, because the transcript's `ReadFiles` preview is a
+/// truncated one-line summary that cannot carry the whole files array;
+/// the snapshot carries the full call input verbatim. A resume with
+/// no snapshot arms only what the previews can name.
+pub(crate) fn resumed_read_paths_with_machine(
+    messages: &[TuiMessage],
+    machine: Option<&[Message]>,
+) -> Vec<String> {
+    let mut paths = resumed_read_paths(messages);
+    if let Some(history) = machine {
+        for message in history {
+            for part in &message.parts {
+                let MessagePart::ToolCall { name, input, .. } = part else {
+                    continue;
+                };
+                if name != "ReadFiles" {
+                    continue;
+                }
+                if let Some(files) = input.get("files").and_then(|value| value.as_array()) {
+                    for file in files {
+                        if let Some(path) = file.as_str() {
+                            paths.push(path.to_string());
+                        }
+                    }
                 }
             }
         }
@@ -976,9 +1182,12 @@ mod tests {
     fn the_shape_the_tui_saves_alternates_roles_and_keeps_results_adjacent() {
         // The transcript a tool-using TUI turn actually saves: the
         // display layer graduates the tool call and the reply text
-        // as two consecutive assistant records. The reconstruction
-        // must coalesce them — anything else puts the reply between
-        // a tool call and its result and breaks role alternation.
+        // as two consecutive assistant records — two model responses,
+        // the reply arriving after the result returned. The
+        // reconstruction closes the exchange at that boundary: the
+        // result rides its own user message, the reply follows as the
+        // next assistant message, and role alternation plus
+        // call-to-result adjacency both hold.
         let transcript = vec![
             user("fix the bug"),
             assistant(vec![tool_block("Read", true)]),
@@ -988,42 +1197,41 @@ mod tests {
         let converted = tui_messages_to_loopctl(&transcript, false);
         assert_eq!(
             roles(&converted),
-            vec![Role::User, Role::Assistant, Role::User],
-            "one assistant message per model response, as the live engine records"
+            vec![
+                Role::User,
+                Role::Assistant,
+                Role::User,
+                Role::Assistant,
+                Role::User
+            ],
+            "the reply after the result is its own response, in alternation"
         );
         match (&converted[1].parts[..], &converted[2].parts[..]) {
-            (
-                [
-                    MessagePart::ToolCall { id, .. },
-                    MessagePart::Text { text: reply },
-                ],
-                [
-                    MessagePart::ToolResult { call_id, .. },
-                    MessagePart::Text { text: prompt },
-                ],
-            ) => {
+            ([MessagePart::ToolCall { id, .. }], [MessagePart::ToolResult { call_id, .. }]) => {
                 assert_eq!(
                     id, call_id,
                     "the result message immediately follows the assistant message carrying its call"
                 );
-                assert_eq!(reply, "I fixed it");
-                assert_eq!(prompt, "next prompt");
             }
             parts => panic!(
-                "call and text in one assistant message, result then prompt in one user message: {parts:?}"
+                "the call's exchange closes with its result as its own user message: {parts:?}"
             ),
         }
+        assert!(
+            matches!(&converted[3].parts[..], [MessagePart::Text { text }, ..] if text == "I fixed it"),
+            "the reply follows the result as the next assistant message"
+        );
     }
 
     #[test]
     fn a_narrate_then_call_turn_keeps_its_text_boundary() {
         // A turn whose responses narrate around the call — text,
         // then the tool, then the closing text — saves as three
-        // assistant records. Coalescing them without a break would
-        // glue the two texts into one run of words on every
-        // provider (text parts serialize with no separator), while
-        // the call-then-reply merge must not gain a stray leading
-        // break — the shape pin above matches its parts exactly.
+        // assistant records. The leading narration and its call were
+        // one response and coalesce; the closing narration arrived
+        // after the result returned, so the exchange closes first and
+        // the narration follows as its own assistant message — the
+        // two texts can never glue into one run of words.
         let transcript = vec![
             user("fix it"),
             assistant(vec![text_block("Let me check the file first")]),
@@ -1034,28 +1242,31 @@ mod tests {
         let converted = tui_messages_to_loopctl(&transcript, false);
         assert_eq!(
             roles(&converted),
-            vec![Role::User, Role::Assistant, Role::User]
+            vec![
+                Role::User,
+                Role::Assistant,
+                Role::User,
+                Role::Assistant,
+                Role::User
+            ]
         );
         match &converted[1].parts[..] {
             [
                 MessagePart::Text { text: before },
                 MessagePart::ToolCall { .. },
-                MessagePart::Text { text: separator },
-                MessagePart::Text { text: after },
             ] => {
-                assert_eq!(
-                    (before.as_str(), after.as_str()),
-                    ("Let me check the file first", "Done")
-                );
-                assert_eq!(
-                    separator, "\n\n",
-                    "the two narrations serialize joined with no separator — a break must sit between"
-                );
+                assert_eq!(before, "Let me check the file first");
             }
-            parts => {
-                panic!("narration, call, break, closing text in one assistant message: {parts:?}")
-            }
+            parts => panic!("narration and its call share one assistant message: {parts:?}"),
         }
+        assert!(
+            matches!(&converted[2].parts[..], [MessagePart::ToolResult { .. }]),
+            "the exchange's result rides its own user message"
+        );
+        assert!(
+            matches!(&converted[3].parts[..], [MessagePart::Text { text }, ..] if text == "Done"),
+            "the closing narration follows the result"
+        );
     }
 
     #[test]
@@ -1085,6 +1296,396 @@ mod tests {
         assert!(
             verbatim.contains(&token),
             "without the flag the previews pass through verbatim: {verbatim}"
+        );
+    }
+
+    #[test]
+    fn missing_machine_json_falls_back_to_derive() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.keep();
+        let id = uuid::Uuid::new_v4();
+        crate::session::SessionSaver::with_base_dir(id, "m".to_string(), root.clone())
+            .save_at(
+                &[user("hi"), assistant(vec![text_block("hello")])],
+                crate::session::SessionTokens::default(),
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        let outcome = load_for_resume_in(id, &root).unwrap();
+        assert!(outcome.machine.is_none(), "no sibling means no snapshot");
+        assert_eq!(
+            serde_json::to_value(history_for_resume(&outcome, false)).unwrap(),
+            serde_json::to_value(tui_messages_to_loopctl(&outcome.messages, false)).unwrap(),
+            "without a snapshot the derive walk is the history"
+        );
+    }
+
+    #[test]
+    fn a_fresh_machine_snapshot_wins_over_the_derive_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.keep();
+        let id = uuid::Uuid::new_v4();
+        let stamp = chrono::Utc::now();
+        crate::session::SessionSaver::with_base_dir(id, "m".to_string(), root.clone())
+            .save_at(
+                &[user("hi"), assistant(vec![text_block("hello")])],
+                crate::session::SessionTokens::default(),
+                stamp,
+            )
+            .unwrap();
+        crate::session::SessionSaver::with_base_dir(id, "m".to_string(), root.clone())
+            .save_machine(
+                &[loopctl::message::Message::new(
+                    loopctl::message::Role::User,
+                    vec![loopctl::message::MessagePart::text("exact marker fa1")],
+                )],
+                stamp,
+                0,
+            )
+            .unwrap();
+        let outcome = load_for_resume_in(id, &root).unwrap();
+        let history = history_for_resume(&outcome, false);
+        assert_eq!(
+            history.len(),
+            1,
+            "the snapshot is the history verbatim, not a derivation"
+        );
+        assert!(
+            history[0].text_content().contains("exact marker fa1"),
+            "the snapshot's content reaches the runner untouched"
+        );
+    }
+
+    #[test]
+    fn the_derive_walk_skips_compaction_notices() {
+        let notice = TuiMessage::Compacted {
+            tokens_before: 100,
+            tokens_after: 40,
+            reason: "threshold".to_string(),
+            evicted: 3,
+            duration_ms: 12,
+            compactor: Some("qa".to_string()),
+            compression_ratio: Some(2.5),
+            timestamp: chrono::Utc::now(),
+        };
+        let without = vec![user("hi"), assistant(vec![text_block("hello")])];
+        let with = vec![user("hi"), notice, assistant(vec![text_block("hello")])];
+        assert_eq!(
+            serde_json::to_value(tui_messages_to_loopctl(&with, false)).unwrap(),
+            serde_json::to_value(tui_messages_to_loopctl(&without, false)).unwrap(),
+            "a notice about the engine's context is never itself conversation"
+        );
+    }
+
+    #[test]
+    fn a_tool_marathon_reconstructs_as_alternating_exchanges() {
+        // The shape a long agent run saves: one user task, then tool
+        // and text records with no user texts between the replies.
+        // Each new reply closes the previous exchange — its results
+        // flush as their own user message — so the history alternates
+        // at exchange granularity instead of coalescing into one
+        // uncompactable assistant run.
+        let mut transcript = vec![TuiMessage::User {
+            text: "review the branch".to_string(),
+            timestamp: now(),
+        }];
+        for _round in 0..4 {
+            transcript.push(assistant(vec![
+                tool_block("Read", true),
+                tool_block("Bash", true),
+            ]));
+            transcript.push(assistant(vec![text_block("round done")]));
+        }
+        let converted = tui_messages_to_loopctl(&transcript, false);
+        assert_eq!(
+            converted.len(),
+            10,
+            "one task message, then an assistant/user pair per exchange plus the closing reply"
+        );
+        for pair in converted.windows(2) {
+            assert_ne!(
+                pair[0].role, pair[1].role,
+                "the reconstructed history strictly alternates: {converted:?}"
+            );
+        }
+        let call_ids: Vec<String> = converted
+            .iter()
+            .flat_map(|message| &message.parts)
+            .filter_map(|part| match part {
+                MessagePart::ToolCall { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        let result_ids: Vec<String> = converted
+            .iter()
+            .flat_map(|message| &message.parts)
+            .filter_map(|part| match part {
+                MessagePart::ToolResult { call_id, .. } => Some(call_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            call_ids, result_ids,
+            "every call keeps its result, in emission order"
+        );
+    }
+
+    #[test]
+    fn tui_messages_to_loopctl_strips_thinking_blocks() {
+        let transcript = vec![assistant(vec![
+            ContentBlock::Thinking {
+                text: "secret reasoning".to_string(),
+                redacted: false,
+                duration_ms: 1_000,
+            },
+            text_block("the reply"),
+        ])];
+        let converted = tui_messages_to_loopctl(&transcript, false);
+        let Some(Message {
+            role: Role::Assistant,
+            parts,
+            ..
+        }) = converted.first()
+        else {
+            panic!("the assistant message converts: {converted:?}");
+        };
+        assert_eq!(parts.len(), 1, "only the text part rides the wire");
+        assert!(
+            !format!("{parts:?}").contains("secret reasoning"),
+            "display-only reasoning never re-enters the API-shape history"
+        );
+    }
+
+    #[test]
+    fn empty_text_parts_never_reach_the_wire() {
+        let legacy = assistant(vec![
+            ContentBlock::Thinking {
+                text: "tool deliberation".to_string(),
+                redacted: false,
+                duration_ms: 10,
+            },
+            text_block(""),
+            text_block("real reply"),
+        ]);
+        let converted = tui_messages_to_loopctl(std::slice::from_ref(&legacy), false);
+        let Some(Message {
+            role: Role::Assistant,
+            parts,
+            ..
+        }) = converted.first()
+        else {
+            panic!("the assistant message converts: {converted:?}");
+        };
+        assert!(
+            !parts
+                .iter()
+                .any(|part| matches!(part, MessagePart::Text { text } if text.is_empty())),
+            "an empty text part — recorded by an older build — must not ride the wire"
+        );
+    }
+
+    #[test]
+    fn a_thinking_only_record_converts_to_no_message() {
+        let thinking_only = assistant(vec![ContentBlock::Thinking {
+            text: "all reasoning, no reply".to_string(),
+            redacted: false,
+            duration_ms: 10,
+        }]);
+        let converted = tui_messages_to_loopctl(std::slice::from_ref(&thinking_only), false);
+        assert!(
+            converted.is_empty(),
+            "a record whose every part strips has no wire shape at all: {converted:?}"
+        );
+    }
+
+    #[test]
+    fn readfiles_batches_re_arm_every_file_from_the_machine_history() {
+        // The transcript's ReadFiles preview is a truncated one-line
+        // summary, so the batch's paths come from the machine
+        // snapshot's full call input — every file, not the preview's
+        // first fragment.
+        let transcript = vec![
+            user("look"),
+            assistant(vec![ContentBlock::Tool {
+                call_id: String::new(),
+                name: "ReadFiles".to_string(),
+                input_preview: "a.rs, b.rs, c.rs and 9 more…".to_string(),
+                success: true,
+                elapsed_secs: 0.25,
+                output_preview: "batch lines…".to_string(),
+                retained_input: String::new(),
+            }]),
+        ];
+        let machine = vec![Message::new(
+            Role::Assistant,
+            vec![MessagePart::tool_call(
+                "call_1",
+                "ReadFiles",
+                serde_json::json!({"files": ["a.rs", "b.rs", "c.rs", "deep/nested/path.rs"]}),
+            )],
+        )];
+        assert_eq!(
+            resumed_read_paths_with_machine(&transcript, Some(&machine)),
+            vec![
+                "a.rs".to_string(),
+                "b.rs".to_string(),
+                "c.rs".to_string(),
+                "deep/nested/path.rs".to_string()
+            ],
+            "the snapshot's full files array re-arms every file the batch read"
+        );
+        assert!(
+            resumed_read_paths_with_machine(&transcript, None).is_empty(),
+            "without a snapshot the truncated preview arms nothing it cannot name"
+        );
+    }
+
+    #[test]
+    fn a_machine_snapshot_replays_scrubbed_under_redaction() {
+        // A session saved before redaction was enabled carries raw
+        // secret bytes in its tool results; the snapshot route must
+        // not re-admit them when the current policy hides them — the
+        // same scrubbing the derive route applies.
+        let machine = vec![
+            Message::user("read the config"),
+            Message::new(
+                Role::Assistant,
+                vec![MessagePart::tool_call(
+                    "call_1",
+                    "Read",
+                    serde_json::json!({"file_path": "env.conf"}),
+                )],
+            ),
+            Message::new(
+                Role::User,
+                vec![MessagePart::tool_result(
+                    "call_1",
+                    "Read",
+                    loopctl::message::ToolContent::Text(
+                        "api_key=abcdefghijklmnop\nport = 8080\n".to_string(),
+                    ),
+                    false,
+                )],
+            ),
+        ];
+        let outcome = ResumeOutcome {
+            session_id: Uuid::nil(),
+            messages: Vec::new(),
+            machine: Some(machine),
+            tokens: crate::session::SessionTokens::default(),
+            machine_compactions: 0,
+        };
+        let redacted = history_for_resume(&outcome, true);
+        let raw = redacted
+            .iter()
+            .flat_map(|message| &message.parts)
+            .any(|part| {
+                matches!(part, MessagePart::ToolResult { output, .. }
+                if matches!(output, loopctl::message::ToolContent::Text(text)
+                    if text.contains("abcdefghijklmnop")))
+            });
+        assert!(
+            !raw,
+            "the snapshot's secret bytes are scrubbed before replay"
+        );
+        let verbatim = history_for_resume(&outcome, false);
+        let kept = verbatim
+            .iter()
+            .flat_map(|message| &message.parts)
+            .any(|part| {
+                matches!(part, MessagePart::ToolResult { output, .. }
+                if matches!(output, loopctl::message::ToolContent::Text(text)
+                    if text.contains("abcdefghijklmnop")))
+            });
+        assert!(kept, "redaction off replays the snapshot byte-identically");
+    }
+
+    #[test]
+    fn a_secret_inside_a_multipart_tool_result_scrubs_before_replay() {
+        // A tool that returns mixed content carries its text in the
+        // multipart variant's parts; the scrub must reach inside each
+        // text part exactly as it reaches the plain variant, or the
+        // snapshot path replays the secret the dispatch pipeline would
+        // have hidden.
+        let machine = vec![Message::new(
+            Role::User,
+            vec![MessagePart::tool_result(
+                "call_9",
+                "Bash",
+                loopctl::message::ToolContent::Multipart(vec![
+                    loopctl::message::ToolContentPart::Text {
+                        text: "stdout:\napi_key=abcdefghijklmnop\n".to_string(),
+                    },
+                ]),
+                false,
+            )],
+        )];
+        let outcome = ResumeOutcome {
+            session_id: Uuid::nil(),
+            messages: Vec::new(),
+            machine: Some(machine),
+            tokens: crate::session::SessionTokens::default(),
+            machine_compactions: 0,
+        };
+        let replayed = serde_json::to_string(&history_for_resume(&outcome, true)).unwrap();
+        assert!(
+            !replayed.contains("abcdefghijklmnop"),
+            "the multipart part's secret bytes are scrubbed before replay: {replayed}"
+        );
+        let verbatim = serde_json::to_string(&history_for_resume(&outcome, false)).unwrap();
+        assert!(
+            verbatim.contains("abcdefghijklmnop"),
+            "redaction off replays the multipart bytes byte-identically"
+        );
+    }
+
+    #[test]
+    fn a_secret_nested_in_a_tool_calls_arguments_scrubs_before_replay() {
+        // The write family carries whatever bytes the model asked to put
+        // in a file, nested below the argument surface; a snapshot
+        // resumed onto a different provider must not replay bytes that
+        // provider was never shown. The token is composed to the shape
+        // the scrubber matches — the prefix plus 36 token characters —
+        // rather than stored as a credential-shaped literal.
+        let token = format!("ghp_{}", "a".repeat(36));
+        let machine = vec![
+            Message::user("point the client at my account"),
+            Message::new(
+                Role::Assistant,
+                vec![MessagePart::tool_call(
+                    "call_2",
+                    "MultiEdit",
+                    serde_json::json!({
+                        "file_path": "src/client.rs",
+                        "edits": [{
+                            "old_text": "let token = String::new();",
+                            "new_text": format!("let token = \"{token}\";"),
+                        }],
+                    }),
+                )],
+            ),
+        ];
+        let outcome = ResumeOutcome {
+            session_id: Uuid::nil(),
+            messages: Vec::new(),
+            machine: Some(machine.clone()),
+            tokens: crate::session::SessionTokens::default(),
+            machine_compactions: 0,
+        };
+        let replayed = serde_json::to_string(&history_for_resume(&outcome, true)).unwrap();
+        assert!(
+            !replayed.contains(&token),
+            "the nested argument bytes are scrubbed before replay: {replayed}"
+        );
+        assert!(
+            replayed.contains("[REDACTED:"),
+            "the scrub leaves its placeholder inside the arguments: {replayed}"
+        );
+        let verbatim = serde_json::to_string(&history_for_resume(&outcome, false)).unwrap();
+        assert_eq!(
+            verbatim,
+            serde_json::to_string(&machine).unwrap(),
+            "redaction off replays the snapshot byte-identically"
         );
     }
 
@@ -1153,9 +1754,9 @@ mod tests {
         let converted = tui_messages_to_loopctl(&transcript, false);
         assert_eq!(
             roles(&converted),
-            vec![Role::User, Role::Assistant, Role::User],
-            "adjacent assistant records coalesce into one message and the unmergeable \
-             result rider closes the conversation — determinism must not paper over the shape"
+            vec![Role::User, Role::Assistant, Role::User, Role::Assistant],
+            "the reply after the call closes the exchange — the result rides its own \
+             user message — and determinism must not paper over the shape"
         );
         let first = format!("{:?}", tui_messages_to_loopctl(&transcript, false));
         let second = format!("{:?}", tui_messages_to_loopctl(&transcript, false));
@@ -1168,6 +1769,194 @@ mod tests {
             tui_messages_to_loopctl(&[], false).is_empty(),
             "nothing in, nothing out"
         );
+    }
+
+    /// Save a transcript plus a machine half stamped at the same moment.
+    fn save_pair(
+        dir: &std::path::Path,
+        id: Uuid,
+        messages: &[TuiMessage],
+        machine: &[loopctl::message::Message],
+    ) {
+        // The engine half saves last so the pair rule sees it as at
+        // least as new — the shape a publishing freeze produces, where
+        // both halves carry fresh stamps but one stopped growing.
+        let saver =
+            crate::session::SessionSaver::with_base_dir(id, "m".to_string(), dir.to_path_buf());
+        saver
+            .save(messages, crate::session::SessionTokens::default())
+            .expect("save the display half");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let stamp = chrono::Utc::now();
+        saver
+            .save_machine(machine, stamp, 0)
+            .expect("save the engine half");
+    }
+
+    /// A long transcript with no compaction record, in exchange pairs.
+    fn marathon_transcript(turns: usize) -> Vec<TuiMessage> {
+        let mut messages = Vec::new();
+        for turn in 0..turns {
+            messages.push(user(&format!("turn {turn}")));
+            messages.push(assistant(vec![tool_block("Read", true)]));
+            messages.push(assistant(vec![text_block(&format!("step {turn} done"))]));
+        }
+        messages
+    }
+
+    #[test]
+    fn a_stale_machine_half_degrades_to_the_derive_with_a_warning() {
+        // The freeze shape: the engine half stopped growing mid-run
+        // while the transcript kept landing, and both halves share a
+        // stamp because the writer stamps them together. Adopting the
+        // stale half silently amneses everything after the freeze; the
+        // guard degrades to the derive walk and says so in the
+        // transcript itself.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let id = Uuid::new_v4();
+        let transcript = marathon_transcript(10);
+        let frozen: Vec<loopctl::message::Message> = (0..4)
+            .map(|step| loopctl::message::Message::user(format!("frozen {step}")))
+            .collect();
+        save_pair(dir.path(), id, &transcript, &frozen);
+
+        let mut args = parse(&[]);
+        args.continue_session = Some(true);
+        match resolve_resume_in(&args, dir.path()) {
+            ResumeControl::Resumed(outcome) => {
+                assert!(
+                    outcome.machine.is_none(),
+                    "the frozen half is refused, not adopted"
+                );
+                assert!(
+                    outcome.messages.iter().any(|m| matches!(m,
+                        TuiMessage::System { text, .. }
+                            if text.contains("engine snapshot was stale"))),
+                    "the degradation is visible in the transcript: {:?}",
+                    outcome.messages.len()
+                );
+            }
+            ResumeControl::Fresh { .. } => panic!("the session resumes, degraded"),
+        }
+    }
+
+    #[test]
+    fn a_compacted_machine_half_is_adopted_despite_the_gap() {
+        // Compaction legitimately shrinks the engine half far below
+        // the transcript beside it; the guard keys on the compaction
+        // record, not the raw gap, so the snapshot rides.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let id = Uuid::new_v4();
+        let mut transcript = marathon_transcript(10);
+        transcript.push(TuiMessage::Compacted {
+            tokens_before: 210_000,
+            tokens_after: 40_000,
+            reason: "threshold exceeded".to_string(),
+            evicted: 120,
+            duration_ms: 300_000,
+            compactor: Some("qa".to_string()),
+            compression_ratio: Some(5.2),
+            timestamp: now(),
+        });
+        let compacted: Vec<loopctl::message::Message> = (0..5)
+            .map(|step| loopctl::message::Message::user(format!("kept {step}")))
+            .collect();
+        save_pair(dir.path(), id, &transcript, &compacted);
+
+        let mut args = parse(&[]);
+        args.continue_session = Some(true);
+        match resolve_resume_in(&args, dir.path()) {
+            ResumeControl::Resumed(outcome) => {
+                assert!(
+                    outcome.machine.is_some(),
+                    "the compacted half is adopted — the record explains the gap"
+                );
+                assert!(
+                    !outcome.messages.iter().any(|m| matches!(m,
+                        TuiMessage::System { text, .. }
+                            if text.contains("engine snapshot was stale"))),
+                    "no degradation row for a legitimate compaction gap"
+                );
+            }
+            ResumeControl::Fresh { .. } => panic!("the session resumes"),
+        }
+    }
+
+    #[test]
+    fn a_counted_compaction_exempts_a_headless_machine_half() {
+        // A headless session's display transcript never carries a
+        // Compacted row — its builder sees no compaction events — so
+        // the snapshot's own compaction count is the guard's only
+        // witness that the engine half's gap is a legitimate
+        // compaction rather than a publishing freeze.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let id = Uuid::new_v4();
+        let transcript = marathon_transcript(10);
+        let compacted: Vec<loopctl::message::Message> = (0..5)
+            .map(|step| loopctl::message::Message::user(format!("kept {step}")))
+            .collect();
+        let saver = crate::session::SessionSaver::with_base_dir(
+            id,
+            "m".to_string(),
+            dir.path().to_path_buf(),
+        );
+        saver
+            .save(&transcript, crate::session::SessionTokens::default())
+            .expect("save the display half");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let envelope = serde_json::json!({
+            "format": "dch.machine.v1",
+            "saved_at": chrono::Utc::now(),
+            "messages": compacted,
+            "compactions": 2,
+        });
+        let machine_path = dir.path().join(id.to_string()).join("machine.json");
+        std::fs::create_dir_all(machine_path.parent().expect("the session dir"))
+            .expect("session dir");
+        std::fs::write(&machine_path, envelope.to_string()).expect("machine half");
+
+        let mut args = parse(&[]);
+        args.continue_session = Some(true);
+        match resolve_resume_in(&args, dir.path()) {
+            ResumeControl::Resumed(outcome) => {
+                assert!(
+                    outcome.machine.is_some(),
+                    "the counted half is adopted — the count explains the gap"
+                );
+                assert!(
+                    !outcome.messages.iter().any(|m| matches!(m,
+                        TuiMessage::System { text, .. }
+                            if text.contains("engine snapshot was stale"))),
+                    "no degradation row for a counted compaction gap"
+                );
+            }
+            ResumeControl::Fresh { .. } => panic!("the session resumes"),
+        }
+    }
+
+    #[test]
+    fn a_short_session_never_trips_the_staleness_guard() {
+        // Small transcripts sit under the guard's floor; a fresh
+        // session's few rows must adopt their snapshot untouched.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let id = Uuid::new_v4();
+        let transcript = marathon_transcript(2);
+        let machine: Vec<loopctl::message::Message> = (0..3)
+            .map(|step| loopctl::message::Message::user(format!("seen {step}")))
+            .collect();
+        save_pair(dir.path(), id, &transcript, &machine);
+
+        let mut args = parse(&[]);
+        args.continue_session = Some(true);
+        match resolve_resume_in(&args, dir.path()) {
+            ResumeControl::Resumed(outcome) => {
+                assert!(
+                    outcome.machine.is_some(),
+                    "short sessions adopt their snapshot"
+                );
+            }
+            ResumeControl::Fresh { .. } => panic!("the session resumes"),
+        }
     }
 
     #[test]
@@ -1245,6 +2034,7 @@ mod tests {
             cumulative_input: 9_999,
             cumulative_output: 111,
             last_input_tokens: 9_999,
+            context_tokens: 9_876,
         };
         crate::session::SessionSaver::with_base_dir(id, "m".to_string(), dir.path().to_path_buf())
             .save(&[user("hi")], totals)
@@ -1300,18 +2090,6 @@ mod tests {
         assert!(
             matches!(err, ResumeError::Corrupt(_)),
             "garbage is typed Corrupt, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn the_model_comes_from_the_envelope() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let id = Uuid::new_v4();
-        save_session(dir.path(), id, "glm-4.7", &[user("hi")]);
-        let outcome = load_for_resume_in(id, dir.path()).expect("load");
-        assert_eq!(
-            outcome.model, "glm-4.7",
-            "the envelope's model travels with the outcome"
         );
     }
 
@@ -1479,34 +2257,6 @@ mod tests {
             ),
             control => panic!("an unreachable id degrades to Fresh: {control:?}"),
         }
-    }
-
-    #[test]
-    fn the_resumed_model_applies_only_without_a_cli_override() {
-        let outcome = ResumeOutcome {
-            session_id: Uuid::new_v4(),
-            messages: Vec::new(),
-            model: "resume-model".to_string(),
-            tokens: crate::session::SessionTokens::default(),
-        };
-        let mut config = dch_config::DchConfig::default();
-        config.api.model = "config-model".to_string();
-        crate::headless::apply_cli_overrides(&mut config, &parse(&[]));
-        apply_resumed_model(&mut config, &parse(&[]), &outcome);
-        assert_eq!(
-            config.api.model, "resume-model",
-            "with no --model, the envelope's model beats the config file's"
-        );
-
-        let mut config = dch_config::DchConfig::default();
-        config.api.model = "config-model".to_string();
-        let cli = parse(&["--model", "cli-model"]);
-        crate::headless::apply_cli_overrides(&mut config, &cli);
-        apply_resumed_model(&mut config, &cli, &outcome);
-        assert_eq!(
-            config.api.model, "cli-model",
-            "a --model flag beats both the envelope and the config file"
-        );
     }
 
     #[test]

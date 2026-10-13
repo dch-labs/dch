@@ -42,6 +42,46 @@ CORE CONDUCT
   files, read config and build manifests) and follow what you find rather than
   guessing.
 
+TOOL USE
+- When several independent reads, searches, or checks would advance the
+  task, issue them as multiple tool calls in a single response — each
+  response is a full round-trip.
+- View files through the Read tool, not through Bash windows. A Read
+  returns a bounded window and names where reading continues — page a
+  long file with offset, and reach a known section through Grep first
+  instead of reading whole files. When a task, protocol, or orientation
+  list names several files to read, pass all of them to ReadFiles in
+  one call — never spend a response per file. A batch shares one byte
+  budget, so a file past it comes back as a marker naming how to page
+  it rather than content.
+- Read a file before editing it: edits are staleness-guarded against
+  the session's last observation of the file, so a change made after
+  your last Read refuses the edit until you Read again — and a resumed
+  session holds its first write on every file it had read until a
+  fresh Read re-arms it. Copy old_text exactly from the Read output —
+  it must match one place in the file, whitespace included. MultiEdit
+  applies edits across several files in one call; give every edit its
+  complete file_path, old_text, and new_text.
+- Search with the dedicated tools — Grep for file contents, Glob for
+  file names, CodeSearch for symbol queries — instead of running grep,
+  ls, or find through Bash. Bash is for running commands, not viewing
+  or listing files.
+- TodoWrite statuses move one rung at a time: pending → in_progress →
+  completed. To complete an entry, send it as in_progress first, then
+  mark it completed in a follow-up call; skipped rungs are rejected.
+- Narrate the work as you do it: one short sentence before each
+  tool call saying what you are about to check and why, and a short
+  text response the moment a finding lands. A silent tool-only crawl
+  leaves the user blind and loses conclusions between turns.
+- Reasoning from your earlier turns replays into later requests, but
+  compaction replaces it with a summary: after a compaction you will
+  not remember what you already verified, and re-reading work you
+  already covered is the failure that stalls long tasks. Externalize
+  working state as you go — append each verified finding to a running
+  findings file the moment it is verified, and keep the task list
+  current; both survive compaction, memory does not. Finalizing means
+  assembling that file, never re-deriving results from memory.
+
 IMAGES
 - read detects image files (png, jpg, jpeg, webp, gif) and returns them as
   structured image content. Do not call external or non-existent tools such as
@@ -129,9 +169,9 @@ pub fn with_context(
 ///
 /// Sections are appended in alphabetical order by tool name; tools whose
 /// [`Tool::system_prompt`] returns `None` are skipped — they contribute
-/// nothing to the prompt. The local re-sort keeps the ordering contract
-/// owned by this module, so a future loopctl change to
-/// [`ToolRegistry::all_tools`] ordering cannot silently reorder fragments.
+/// nothing to the prompt. The ordering contract is owned here: the
+/// fragment order is settled by this module's own sort, whatever order
+/// [`ToolRegistry::all_tools`] hands it.
 fn append_fragments(out: &mut String, tools: &ToolRegistry) {
     let mut fragments: Vec<(String, String)> = tools
         .all_tools()
@@ -271,6 +311,96 @@ mod tests {
             assert!(
                 !prompt.contains("DEFAULT FILE SEARCH PATTERNS"),
                 "role {role:?} leaked language globs into shared discipline"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_batching_and_read_preference_present_for_every_role() {
+        for role in [
+            Role::General,
+            Role::Coding,
+            Role::Refactor,
+            Role::Debug,
+            Role::Review,
+            Role::Docs,
+            Role::Tests,
+        ] {
+            let prompt = with_role(role, &ToolRegistry::new());
+            assert!(
+                prompt.contains("multiple tool calls in a single response"),
+                "role {role:?} missing the batching discipline"
+            );
+            assert!(
+                prompt.contains("View files through the Read tool"),
+                "role {role:?} missing the read discipline"
+            );
+            assert!(
+                prompt.contains("bounded window and names where reading continues"),
+                "role {role:?} missing the windowed-read mechanics"
+            );
+            assert!(
+                prompt.contains("Narrate the work as you do it"),
+                "role {role:?} missing the narration contract"
+            );
+            assert!(
+                prompt.contains("replays into later requests"),
+                "role {role:?} missing the reasoning-replay truth"
+            );
+            assert!(
+                prompt.contains("assembling that file, never re-deriving"),
+                "role {role:?} missing the finalize-from-file mechanic"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_discipline_teaches_edit_search_and_todo_contracts() {
+        for role in [
+            Role::General,
+            Role::Coding,
+            Role::Refactor,
+            Role::Debug,
+            Role::Review,
+            Role::Docs,
+            Role::Tests,
+        ] {
+            let prompt = with_role(role, &ToolRegistry::new());
+            assert!(
+                prompt.contains("Read a file before editing it"),
+                "role {role:?} missing the read-before-edit contract"
+            );
+            assert!(
+                prompt.contains("staleness-guarded"),
+                "role {role:?} states the enforced guard, not an unconditional read gate"
+            );
+            assert!(
+                !prompt.contains("accept only files this session has already read"),
+                "role {role:?} must not promise a read gate no code enforces"
+            );
+            assert!(
+                !prompt.contains("one file per call"),
+                "role {role:?} must not steer away from MultiEdit's batching"
+            );
+            assert!(
+                prompt.contains("whitespace included"),
+                "role {role:?} missing the exact-match old_text rule"
+            );
+            assert!(
+                prompt.contains("holds its first write on every file it had read"),
+                "role {role:?} missing the resume re-read rule"
+            );
+            assert!(
+                prompt.contains("Grep for file contents"),
+                "role {role:?} missing the dedicated-search routing"
+            );
+            assert!(
+                prompt.contains("one rung at a time"),
+                "role {role:?} missing the todo one-rung rule"
+            );
+            assert!(
+                prompt.contains("both survive compaction, memory does not"),
+                "role {role:?} missing the compaction-survival rule"
             );
         }
     }

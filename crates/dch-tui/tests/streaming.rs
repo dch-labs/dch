@@ -26,7 +26,11 @@ use dch_tui::message::{ActiveTool, ContentBlock, TuiMessage};
 use dch_tui::theme::Theme;
 use dch_tui::{TuiApp, TuiObserver, TuiObserverState};
 use event_listener::Listener as _;
-use loopctl::observer::{LoopObserver as _, ResponseContext, TextDeltaContext, TurnEndContext};
+use loopctl::error::LoopError;
+use loopctl::observer::{
+    AttemptResetContext, LoopObserver as _, ResponseContext, StreamContext, StreamFailureContext,
+    TextDeltaContext, ToolCallReceivedContext, TurnEndContext,
+};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
@@ -68,6 +72,36 @@ fn failed_turn(turn: usize) -> TurnEndContext {
 
 fn plain(code: KeyCode) -> Event {
     Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+}
+
+fn stream_failure(turn: usize) -> StreamFailureContext {
+    StreamFailureContext {
+        turn,
+        model: "testmodel".to_string(),
+        error: LoopError::FallbackExhausted,
+    }
+}
+
+fn attempt_reset(turn: usize, attempt: usize) -> AttemptResetContext {
+    AttemptResetContext { turn, attempt }
+}
+
+fn stream_success(turn: usize) -> StreamContext {
+    StreamContext {
+        turn,
+        model: "testmodel".to_string(),
+        input_tokens: 0,
+        output_tokens: 0,
+    }
+}
+
+fn tool_call(call_id: &str, tool: &str) -> ToolCallReceivedContext {
+    ToolCallReceivedContext {
+        turn: 0,
+        tool: tool.to_string(),
+        call_id: call_id.to_string(),
+        input: serde_json::Value::Null,
+    }
 }
 
 fn paras(from: usize, to: usize) -> String {
@@ -670,6 +704,109 @@ fn end_rearms_stickiness_and_snaps_to_the_newest_line() {
     assert!(
         row_texts(&terminal)[16].contains("para35"),
         "the next render snaps to the newest line"
+    );
+}
+
+#[test]
+fn home_detaches_and_snaps_to_the_oldest_line() {
+    let (_, mut app) = streaming_app();
+    seed(&app, &paras(1, 35));
+    render_to_buffer(&mut app, 40, 24);
+
+    assert!(app.handle_event(&plain(KeyCode::Home)));
+    assert!(!app.auto_scroll(), "Home drops stickiness");
+    let terminal = render_to_buffer(&mut app, 40, 24);
+    assert!(
+        row_texts(&terminal)[1].contains("para1"),
+        "the next render snaps to the oldest line"
+    );
+    assert!(
+        !row_texts(&terminal)
+            .iter()
+            .any(|row| row.contains("para35")),
+        "the newest line leaves the viewport"
+    );
+}
+
+#[test]
+fn home_with_a_typed_draft_moves_the_caret_instead_of_scrolling() {
+    let (_, mut app) = streaming_app();
+    seed(&app, &paras(1, 35));
+    render_to_buffer(&mut app, 40, 24);
+    app.handle_event(&plain(KeyCode::Char('h')));
+    app.handle_event(&plain(KeyCode::Char('i')));
+
+    assert!(app.handle_event(&plain(KeyCode::Home)));
+    assert_eq!(
+        app.scroll_offset(),
+        0,
+        "a typed draft keeps Home in the editor"
+    );
+    assert!(
+        app.auto_scroll(),
+        "the view stays pinned to the newest line"
+    );
+}
+
+#[test]
+fn a_stream_failure_raises_a_retry_notice_the_attempt_cue_refines() {
+    let (observer, mut app) = streaming_app();
+    observer.on_stream_failure(&stream_failure(0));
+    let raised = render_to_buffer(&mut app, 40, 24);
+    assert!(
+        !view_text(&raised, 40, 24).contains("reconnection attempt"),
+        "the failure alone names nothing — the attempt cue raises the row"
+    );
+
+    observer.on_attempt_reset(&attempt_reset(0, 2));
+    let refined = render_to_buffer(&mut app, 40, 24);
+    let refined_text = view_text(&refined, 40, 24);
+    assert!(
+        refined_text.contains("⟳ connection lost") && refined_text.contains("1/3"),
+        "the attempt cue raises the named row: {refined_text:?}"
+    );
+
+    observer.on_stream_success(&stream_success(0));
+    let recovered = render_to_buffer(&mut app, 40, 24);
+    let text = view_text(&recovered, 40, 24);
+    assert!(text.contains("reconnected"), "recovery shows: {text:?}");
+    assert!(
+        !text.contains("retrying"),
+        "the transient retry line is gone — the rows live in the transcript: {text:?}"
+    );
+}
+
+#[test]
+fn a_dead_turn_clears_the_retry_notice() {
+    let (observer, mut app) = streaming_app();
+    observer.on_stream_failure(&stream_failure(0));
+    observer.on_turn_end(&failed_turn(0));
+    let settled = render_to_buffer(&mut app, 40, 24);
+    assert!(
+        !view_text(&settled, 40, 24).contains("retrying"),
+        "no retry line outlives its turn"
+    );
+}
+
+#[test]
+fn a_failed_tool_graduates_without_a_notice_row() {
+    let (observer, mut app) = streaming_app();
+    observer.on_tool_call_received(&tool_call("c1", "Bash"));
+    observer.finish_tool("c1", "Bash", true, Duration::from_millis(5));
+    observer.on_tool_call_received(&tool_call("c2", "Bash"));
+    let rendered = render_to_buffer(&mut app, 40, 24);
+    let text = view_text(&rendered, 40, 24);
+    assert!(
+        text.contains('✗'),
+        "the failed call still shows in the transcript: {text:?}"
+    );
+    assert!(
+        !text.contains("Bash failed"),
+        "no failure notice rides above the prompt box: {text:?}"
+    );
+    assert!(
+        !text.contains("retrying"),
+        "a recall of the failed tool raises no notice either: {text:?}"
     );
 }
 

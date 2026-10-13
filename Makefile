@@ -8,7 +8,7 @@ BUILD_DIR_MACOS := target/$(TARGET_MACOS)/release
 ZIG            ?= zig
 MACOS_SDK_PATH ?= /home/dch/MacOSX-SDKs/MacOSX14.5.sdk
 
-.PHONY: build check test clippy fmt run lint docs examples boundary nodefault release-check smoke ci help static macos strip macos-strip install check-zig check-target check-macos-target check-macos-sdk check-openssl
+.PHONY: build check test clippy fmt run lint docs examples boundary hygiene nodefault release-check smoke ci help static macos strip macos-strip install check-zig check-target check-macos-target check-macos-sdk check-openssl
 
 ## build: Build the whole workspace (debug, all features)
 build:
@@ -49,6 +49,10 @@ examples:
 ## boundary: Enforce the crate-boundary rules
 boundary:
 	$(CARGO) run -p xtask -- check-boundary
+
+## hygiene: Enforce the repository-hygiene rules over the git index
+hygiene:
+	$(CARGO) run -p xtask -- check-hygiene
 
 ## nodefault: Prove the workspace compiles without default features
 nodefault:
@@ -134,8 +138,8 @@ check-openssl:
 	fi
 	@echo "✅ no openssl-sys in the dependency graph"
 
-## ci: Run the full local CI gate (fmt, clippy, test, docs, examples, boundary, nodefault, openssl)
-ci: fmt clippy test docs examples boundary nodefault check-openssl
+## ci: Run the full local CI gate (fmt, clippy, test, docs, examples, boundary, hygiene, nodefault, openssl)
+ci: fmt clippy test docs examples boundary hygiene nodefault check-openssl
 	@echo "✅ CI passed locally"
 
 ## help: Show this help

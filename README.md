@@ -10,8 +10,9 @@ A terminal-based agentic coding assistant written in Rust, built on the
 - **Single-run mode** — run one task non-interactively (as an argument
   or piped on stdin), exit with a meaningful shell status, optionally
   write a JSON completion report for CI and orchestration.
-- **Built-in tools** — file reads and paginated viewing, single and
-  atomic multi-file edits, writes behind a linter gate, `bash` with
+- **Built-in tools** — file reads and paginated viewing, batched
+  multi-file reads (`ReadFiles`) under one byte budget, single and atomic
+  multi-file edits, writes behind a linter gate, `bash` with
   timeouts and background jobs, `glob` / `grep` / `tree` /
   code-search, and per-session todos.
 - **Providers** — Ollama (local, the default), OpenAI, Anthropic,
@@ -81,8 +82,10 @@ with `--list-sessions`.
 Resume a saved session — the restored conversation seeds the display
 and the agent's context (tool blocks carry their retained command
 and output, so the model remembers what its tools returned),
-further auto-saves keep writing the same session file, and the saved
-model applies unless `--model` overrides it:
+further auto-saves keep writing the same session file, and the run
+uses the current configuration's model and provider (the model the
+session was saved under is provenance for `--list-sessions`;
+`--model` overrides the configuration):
 
 ```bash
 dch --resume 01234567-89ab-cdef-0123-456789abcdef   # in the TUI
@@ -106,9 +109,10 @@ dch --list-sessions all      # everything
 ```
 
 The MSGS column counts your messages — your submissions, with tool
-calls and replies left out. CONTEXT is the session's size in
-tokens — its cumulative input-plus-output accounting, exactly the
-figure the status bar shows, and shows again on resume.
+calls and replies left out. CONTEXT is the session's cumulative
+input-plus-output spend in tokens — the whole conversation's
+accounting, not the live-context estimate the TUI's context bar
+tracks while a run is going.
 
 A missing session id warns and starts fresh; a corrupt file warns
 loudly, starts fresh, and is never modified; a session file that
@@ -128,10 +132,13 @@ Common options:
 | `--theme NAME` | Override the configured theme |
 | `--config PATH` | Use an alternate config file |
 | `--unsafe-paths` | Let file tools reach paths outside the working directory |
+| `--reasoning-effort LEVEL` | Override the configured thinking budget for this run |
+| `--no-redact` | Disable secrets redaction for this run |
 | `--done-file PATH` | Write a JSON completion status to PATH (single-run mode) |
 | `-v, --verbose` / `-q, --quiet` | Adjust verbosity |
 
-Themes: `transparent` (default), `dracula`, `nord`, `tokyo_night`,
+Themes: `default` (near-black, derived from OpenCode's dark palette),
+`transparent`, `dracula`, `nord`, `tokyo_night`,
 `gruvbox_dark`, `gruvbox_light`, `solarized_dark`, `solarized_light`,
 `catppuccin_latte`, `catppuccin_frappe`, `catppuccin_macchiato`,
 `catppuccin_mocha`, `one_dark`, `monokai`, `github_dark`,
@@ -139,9 +146,10 @@ Themes: `transparent` (default), `dracula`, `nord`, `tokyo_night`,
 The transparent theme defers to the terminal's own colors, so the
 terminal's background (transparency included) shows through; hairline
 rules in the terminal's own dim tone mark the composer's top and
-bottom, and only the scrollbar and the success/warning/error
-indicators carry colors of their own. An unknown name falls back to
-the default.
+bottom, de-emphasized text (thinking, timestamps, system rows)
+renders in a fixed mid gray so it greys out on every terminal, and
+only the scrollbar and the success/warning/error indicators carry
+colors of their own. An unknown name falls back to the default.
 
 ### Exit codes and the done-file
 
@@ -178,6 +186,7 @@ Conversation:
 | Mouse click (composer) | Place the caret where the press landed, clamped to the text |
 | Mouse click (tool row) | Expand a tool call's block to its full command and output — pretty-printed input, then the (redacted) output; click any row of the open block to fold it back. Long output scrolls with the transcript. The last 256 tool calls stay expandable |
 | `Shift` + arrows | Move the selection head — extend or shrink the current selection; the view follows and each step refreshes the clipboard copy |
+| `Home` | Snap to the oldest line (only while the input is empty) |
 | `End` | Snap to the newest line (only while the input is empty) |
 
 The mouse and selection rows need `mouse_capture = true` (the
@@ -227,8 +236,9 @@ every other mode asks or blocks.
 ## Configuration
 
 Configuration lives in `~/.dch/config.toml`; a
-`~/.dch/config.local.toml`, when present, overrides it field by
-field. Every field has a default — an unconfigured `dch` works
+`~/.dch/config.local.toml`, when present, is loaded instead of it —
+a complete replacement, not a field-level merge. Every field has a
+default — an unconfigured `dch` works
 against a local Ollama server. [`example.config`](./example.config)
 documents every option with its possible values and defaults.
 
@@ -241,15 +251,18 @@ model = "qwen3.8:27b"
 # api_key = "…"                   # optional; provider env vars also work
 # fallback_model = "…"            # takes over when the primary fails repeatedly
 # max_tokens = 32000              # output cap per model response
-# context_window = 200000         # window used for accounting and compaction
+# context_window = 200000         # unset = discover from the provider
+#                                 # (per-request share on local servers;
+#                                 #  falls back to 200000); explicit wins
 
 [runner]
 max_turns = 200
+turn_timeout_secs = 300            # per-model-call streaming budget; ≥120 s, and the first-token wait is separately capped at 120 s
 role = "general"                  # general | coding | refactor | debug | review | docs | tests
 # permission_mode = "auto"        # auto | plan | accept_edits | interactive (see Permissions)
 
 [display]
-theme = "transparent"
+theme = "default"
 # mouse_capture = true            # the wheel scrolls dch; false hands
                                   # selection back to the terminal
 verbosity = "normal"              # quiet | normal | verbose

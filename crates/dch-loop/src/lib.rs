@@ -3,12 +3,16 @@
 #![warn(missing_docs)]
 
 pub mod console_observer;
+pub mod context_probe;
 pub mod error;
 pub mod permission;
 pub mod project;
 pub mod prompt;
 pub mod provider;
+pub mod question_bridge;
+pub mod redaction_guard;
 pub mod runner;
+pub(crate) mod write_target_gate;
 
 pub use console_observer::ConsoleObserver;
 pub use dch_config::Verbosity;
@@ -25,4 +29,6 @@ pub use prompt::with_context;
 pub use prompt::with_role;
 pub use provider::DchClient;
 pub use provider::create_client;
+pub use question_bridge::QuestionPath;
+pub use question_bridge::{PromptOption, PromptedQuestion, spawn_question_bridge};
 pub use runner::Runner;

@@ -42,7 +42,7 @@ pub const HIGHLIGHT_NAMES: [&str; 18] = [
 /// A complete color theme: syntax highlighting, markdown rendering, and UI
 /// chrome.
 ///
-/// Construct via [`Theme::by_name`] or [`Theme::default`]; every field is
+/// Construct via [`Theme::by_name`] or [`Default::default`]; every field is
 /// public, so a custom palette can also be assembled as a plain struct
 /// literal. Themes are value types with no behavior beyond
 /// [`SyntaxTheme::syntax_colors`]; rendering logic lives with the
@@ -496,12 +496,12 @@ impl Theme {
     /// `gruvbox_dark`), matched case-insensitively with whitespace runs
     /// folding to underscores — so the display spelling (`"Gruvbox Dark"`)
     /// resolves the same as the identifier, however it is spaced or cased.
-    /// The `"default"` key aliases [`Theme::default`]. Every constructor is
+    /// The `"default"` key aliases [`Default::default`]. Every constructor is
     /// reachable through this table.
     ///
     /// An unknown name is the caller's problem to report: callers should
     /// log a warning naming the unknown theme and fall back to
-    /// [`Theme::default`], so a bad name degrades visibly without failing
+    /// [`Default::default`], so a bad name degrades visibly without failing
     /// the session.
     #[must_use]
     pub fn by_name(name: &str) -> Option<Self> {
@@ -517,9 +517,43 @@ impl Theme {
     }
 }
 
+impl Theme {
+    /// Defer the terminal-canvas colors to the terminal's own scheme.
+    ///
+    /// The adaptation for a session whose background override did not
+    /// land — the terminal never answered the OSC 11 query, or the
+    /// platform has no query to send. The palette's near-canvas
+    /// foreground (and every color equal to it) was chosen against
+    /// the theme's own canvas color; on a terminal that kept a light
+    /// background, that text is invisible. Every such color becomes
+    /// [`Color::Reset`], the terminal's own foreground, which its own
+    /// background guarantees readable. Painted pairs survive
+    /// untouched — the composer paints its surface and the status bar
+    /// paints its canvas, so their text keeps its palette — and so do
+    /// the accent colors, which read on both light and dark canvases.
+    #[must_use]
+    pub fn deferred_to_terminal(&self) -> Self {
+        fn deferring(color: Color, anchor: Color) -> Color {
+            if color == anchor { Color::Reset } else { color }
+        }
+        let anchor = self.ui.foreground;
+        let mut deferred = self.clone();
+        deferred.ui.foreground = deferring(deferred.ui.foreground, anchor);
+        deferred.ui.user_message_fg = deferring(deferred.ui.user_message_fg, anchor);
+        deferred.ui.assistant_message_fg = deferring(deferred.ui.assistant_message_fg, anchor);
+        deferred.syntax.punctuation = deferring(deferred.syntax.punctuation, anchor);
+        deferred.syntax.delimiter = deferring(deferred.syntax.delimiter, anchor);
+        deferred.markdown.code_block = Style::default().fg(deferring(
+            deferred.markdown.code_block.fg.unwrap_or(anchor),
+            anchor,
+        ));
+        deferred
+    }
+}
+
 impl Default for Theme {
     fn default() -> Self {
-        Self::transparent()
+        Self::default()
     }
 }
 
@@ -597,6 +631,58 @@ mod tests {
             .collect();
         let unique: std::collections::HashSet<&str> = keys.iter().copied().collect();
         assert_eq!(unique.len(), keys.len(), "duplicate registry key: {keys:?}");
+    }
+
+    #[test]
+    fn an_unsynced_terminal_defers_the_canvas_anchored_colors() {
+        // The default palette paints conversation text in its own
+        // near-canvas foreground on an unpainted terminal background;
+        // when the background override never landed — the terminal
+        // kept a light scheme of its own — that text is invisible.
+        // The deferral hands every anchored color to the terminal's
+        // own foreground while the painted pairs and accents stand.
+        let theme = Theme::default();
+        let anchor = theme.ui.foreground;
+        assert_eq!(anchor, Color::Rgb(242, 242, 242));
+        let deferred = theme.deferred_to_terminal();
+        assert_eq!(
+            deferred.ui.foreground,
+            Color::Reset,
+            "conversation foreground defers to the terminal's own"
+        );
+        assert_eq!(deferred.ui.user_message_fg, Color::Reset);
+        assert_eq!(deferred.ui.assistant_message_fg, Color::Reset);
+        assert_eq!(
+            deferred.syntax.punctuation,
+            Color::Reset,
+            "code punctuation sits on the terminal canvas and defers"
+        );
+        assert_eq!(deferred.syntax.delimiter, Color::Reset);
+        assert_eq!(
+            deferred.markdown.code_block.fg,
+            Some(Color::Reset),
+            "code block text sits on the terminal canvas and defers"
+        );
+        assert_eq!(
+            deferred.ui.input_text, theme.ui.input_text,
+            "the composer paints its surface: its pair stands"
+        );
+        assert_eq!(
+            deferred.ui.surface, theme.ui.surface,
+            "the composer's painted surface stands"
+        );
+        assert_eq!(
+            deferred.ui.status_bar_fg, theme.ui.status_bar_fg,
+            "the status bar paints its canvas: its pair stands"
+        );
+        assert_eq!(
+            deferred.syntax.keyword, theme.syntax.keyword,
+            "accent colors read on both schemes and stand"
+        );
+        assert_eq!(
+            deferred.ui.background, theme.ui.background,
+            "the canvas field is inert without the override; it stands"
+        );
     }
 
     #[test]
@@ -695,11 +781,18 @@ mod tests {
     }
 
     #[test]
-    fn default_is_transparent() {
-        assert_eq!(Theme::default().name, "Transparent");
+    fn default_is_the_near_black_palette() {
+        // The shipped default paints: an unconfigured session lands on the
+        // near-black canvas, not the paintless one, so the trait
+        // resolution and the registry's `"default"` row must both be
+        // the palette constructor itself.
+        assert_eq!(Theme::default().name, "Default");
+        assert_eq!(Theme::default().syntax.keyword, Color::Rgb(149, 129, 214));
+        assert_eq!(Theme::default().ui.background, Color::Rgb(14, 14, 14));
         assert_eq!(
-            Theme::default().syntax.keyword,
-            Theme::transparent().syntax.keyword
+            Theme::by_name("default").map(|theme| theme.syntax.keyword),
+            Some(Color::Rgb(149, 129, 214)),
+            "the registry row resolves through the same palette"
         );
     }
 
@@ -853,12 +946,17 @@ mod tests {
     #[test]
     fn the_transparent_theme_defers_every_paint_to_the_terminal() {
         // The contract the user chose: no colors of the app's own —
-        // every foreground is the terminal's, the canvas, the
-        // composer, and the status bar paint nothing, a thin
-        // border in the terminal's dim tone marks the composer, the
-        // semantic trio defers through the terminal's indexed
-        // colors, and the scrollbar's neutral grays are the only
-        // paint of the theme's own.
+        // every full-strength foreground is the terminal's, the
+        // canvas, the composer, and the status bar paint nothing, a
+        // thin border in the terminal's dim tone marks the composer,
+        // the dim register is a fixed neutral gray — the scrollbar's
+        // own mid tone, mid enough to read on either pole, because
+        // the indexed bright-black is scheme-defined and can render
+        // indistinguishable from the foreground — so de-emphasized
+        // text (thinking bodies, timestamps, system rows) greys out
+        // on every terminal, the semantic trio defers through the
+        // terminal's indexed colors, and the scrollbar's neutral
+        // grays are the only other paint of the theme's own.
         let theme = Theme::by_name("transparent").unwrap();
         let ui = theme.ui;
         assert_eq!(ui.background, Color::Reset);
@@ -867,6 +965,13 @@ mod tests {
             ui.composer_border,
             Some(Color::Indexed(8)),
             "a thin border in the terminal's dim tone marks the composer"
+        );
+        assert_eq!(
+            ui.dim,
+            Color::Rgb(142, 142, 142),
+            "de-emphasized text carries the theme's fixed neutral gray, the \
+             scrollbar's own mid tone — deterministic where the indexed \
+             bright-black can render as the foreground"
         );
         assert_eq!(ui.status_bar_bg, Color::Reset);
         assert_eq!(ui.foreground, Color::Reset);

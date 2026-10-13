@@ -32,8 +32,11 @@ mod cases {
     /// the receiver the UI would hold.
     fn ctx_with_channel(
         is_non_interactive: bool,
-    ) -> (ToolContext, std::sync::mpsc::Receiver<QuestionRequest>) {
-        let (tx, rx) = std::sync::mpsc::channel();
+    ) -> (
+        ToolContext,
+        tokio::sync::mpsc::UnboundedReceiver<QuestionRequest>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let runner = RunnerContext::new(std::path::PathBuf::from("/tmp")).with_question_tx(tx);
         let mut ctx = ToolContext::default();
         ctx.set_extension(runner);
@@ -97,17 +100,18 @@ mod cases {
         assert_eq!(AskTool.name(), "AskUserQuestion");
         assert!(!AskTool.is_concurrency_safe());
         assert!(!AskTool.is_read_only());
-        let reg = dch_tools::builtin_registry(&loopctl::tool::builtin::fs::FileSession::new(
-            std::path::PathBuf::from("."),
-        ));
+        let reg = dch_tools::builtin_registry(
+            &loopctl::tool::builtin::fs::FileSession::new(std::path::PathBuf::from(".")),
+            dch_tools::ReadWindows::default(),
+        );
         assert!(reg.get("AskUserQuestion").is_some(), "registered");
     }
 
     #[tokio::test]
     async fn single_question_round_trips_the_selected_label() {
-        let (ctx, rx) = ctx_with_channel(false);
+        let (ctx, mut rx) = ctx_with_channel(false);
         let driver = tokio::spawn(async move {
-            let request = rx.recv().expect("request arrives");
+            let request = rx.recv().await.expect("request arrives");
             let question = request.questions.first().expect("one question");
             assert_eq!(question.question, "Proceed?");
             assert_eq!(question.options.len(), 2);
@@ -127,9 +131,9 @@ mod cases {
 
     #[tokio::test]
     async fn multiple_questions_answer_in_input_order() {
-        let (ctx, rx) = ctx_with_channel(false);
+        let (ctx, mut rx) = ctx_with_channel(false);
         let driver = tokio::spawn(async move {
-            let request = rx.recv().expect("request arrives");
+            let request = rx.recv().await.expect("request arrives");
             assert_eq!(request.questions.len(), 2);
             // Answer the second question first: the tool awaits in input
             // order, so the output must still list Q1 before Q2.
@@ -168,9 +172,9 @@ mod cases {
 
     #[tokio::test]
     async fn multi_select_answers_join_with_commas() {
-        let (ctx, rx) = ctx_with_channel(false);
+        let (ctx, mut rx) = ctx_with_channel(false);
         let driver = tokio::spawn(async move {
-            let request = rx.recv().expect("request arrives");
+            let request = rx.recv().await.expect("request arrives");
             let question = request.questions.first().expect("one question");
             assert!(question.multi_select, "flag round-trips");
             answer_all(request, &["A", "B"]);
@@ -192,9 +196,9 @@ mod cases {
 
     #[tokio::test]
     async fn header_is_optional_and_round_trips() {
-        let (ctx, rx) = ctx_with_channel(false);
+        let (ctx, mut rx) = ctx_with_channel(false);
         let driver = tokio::spawn(async move {
-            let request = rx.recv().expect("request arrives");
+            let request = rx.recv().await.expect("request arrives");
             let question = request.questions.first().expect("one question");
             assert_eq!(question.header.as_deref(), Some("Test"));
             answer_all(request, &["Yes"]);
@@ -212,9 +216,9 @@ mod cases {
         ask(with_header, &ctx).await.unwrap();
         driver.await.unwrap();
 
-        let (ctx2, rx2) = ctx_with_channel(false);
+        let (ctx2, mut rx2) = ctx_with_channel(false);
         let driver2 = tokio::spawn(async move {
-            let request = rx2.recv().expect("request arrives");
+            let request = rx2.recv().await.expect("request arrives");
             let question = request.questions.first().expect("one question");
             assert_eq!(question.header, None);
             answer_all(request, &["Yes"]);
@@ -225,7 +229,7 @@ mod cases {
 
     #[tokio::test]
     async fn non_interactive_mode_returns_a_soft_error_without_sending() {
-        let (ctx, rx) = ctx_with_channel(true);
+        let (ctx, mut rx) = ctx_with_channel(true);
         let out = ask(input("Q?", &["a"]), &ctx).await.unwrap();
         assert!(out.is_error, "soft error");
         assert!(
@@ -254,9 +258,9 @@ mod cases {
 
     #[tokio::test]
     async fn dropped_response_channel_means_dismissed() {
-        let (ctx, rx) = ctx_with_channel(false);
+        let (ctx, mut rx) = ctx_with_channel(false);
         let driver = tokio::spawn(async move {
-            let request = rx.recv().expect("request arrives");
+            let request = rx.recv().await.expect("request arrives");
             for question in request.questions {
                 drop(question.response_tx);
             }
@@ -317,9 +321,9 @@ mod cases {
 
     #[tokio::test]
     async fn camel_case_multi_select_is_accepted() {
-        let (ctx, rx) = ctx_with_channel(false);
+        let (ctx, mut rx) = ctx_with_channel(false);
         let driver = tokio::spawn(async move {
-            let request = rx.recv().expect("request arrives");
+            let request = rx.recv().await.expect("request arrives");
             let question = request.questions.first().expect("one question");
             assert!(question.multi_select, "camelCase accepted");
             answer_all(request, &["a"]);
@@ -340,14 +344,21 @@ mod cases {
     }
 
     #[tokio::test]
-    async fn closed_channel_is_a_structural_execution_error() {
+    async fn a_closed_channel_soft_dismisses_rather_than_failing() {
         let (ctx, rx) = ctx_with_channel(false);
         drop(rx);
 
-        let err = ask(input("Q?", &["a"]), &ctx).await.unwrap_err();
+        let out = ask(input("Q?", &["a"]), &ctx)
+            .await
+            .expect("a retired channel is the tool's dismissal path, never a fault");
         assert!(
-            matches!(err, ToolError::Execution(ref s) if s.contains("closed")),
-            "structural failure distinct from headless: {err:?}"
+            out.is_error,
+            "no answer arrived, so the call is not a success"
+        );
+        assert!(
+            out.text_content().contains("dismissed"),
+            "the model is told it was dismissed, not that a channel faulted: {}",
+            out.text_content()
         );
     }
 
@@ -366,9 +377,9 @@ mod cases {
 
     #[tokio::test]
     async fn empty_answers_mean_dismissed() {
-        let (ctx, rx) = ctx_with_channel(false);
+        let (ctx, mut rx) = ctx_with_channel(false);
         let driver = tokio::spawn(async move {
-            let request = rx.recv().expect("request arrives");
+            let request = rx.recv().await.expect("request arrives");
             for question in request.questions {
                 question
                     .response_tx

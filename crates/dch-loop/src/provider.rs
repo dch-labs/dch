@@ -21,6 +21,7 @@ use loopctl::provider::BedrockClient;
 use loopctl::provider::GeminiClient;
 use loopctl::provider::OpenAiClient;
 use loopctl::stream::StreamEvent;
+use loopctl::structured::ThinkingEffort;
 
 use crate::error::RunnerError;
 
@@ -197,84 +198,110 @@ impl ApiClient for DchClient {
 pub fn create_client(config: &ApiConfig) -> Result<DchClient, RunnerError> {
     let timeout = Duration::from_secs(config.request_timeout_secs);
     let client_error = |error: ApiError| RunnerError::Client(error.to_string());
+    let effort = effort_from_config(config)?;
 
     let client = match config.api_type {
         ApiType::OpenAi => {
             let base_url = effective_base_url(config)?;
             let api_key = resolve_api_key(config)?;
-            DchClient::OpenAi(
-                OpenAiClient::builder()
-                    .with_api_key(api_key)
-                    .with_base_url(base_url)
-                    .with_model(config.model.as_str())
-                    .with_timeout(timeout)
-                    .build()
-                    .map_err(client_error)?,
-            )
+            let mut builder = OpenAiClient::builder()
+                .with_api_key(api_key)
+                .with_base_url(base_url)
+                .with_model(config.model.as_str())
+                .with_timeout(timeout)
+                .replay_reasoning(true);
+            if let Some(effort) = effort {
+                builder = builder.thinking_effort(effort);
+            }
+            DchClient::OpenAi(builder.build().map_err(client_error)?)
         }
         ApiType::Anthropic => {
             let base_url = effective_base_url(config)?;
             let api_key = resolve_api_key(config)?;
-            DchClient::Anthropic(
-                AnthropicClient::builder()
-                    .with_api_key(api_key)
-                    .with_base_url(base_url)
-                    .with_model(config.model.as_str())
-                    .with_max_tokens(config.max_tokens)
-                    .with_timeout(timeout)
-                    .build()
-                    .map_err(client_error)?,
-            )
+            let mut builder = AnthropicClient::builder()
+                .with_api_key(api_key)
+                .with_base_url(base_url)
+                .with_model(config.model.as_str())
+                .with_max_tokens(config.max_tokens)
+                .with_timeout(timeout)
+                .replay_reasoning(true)
+                .prompt_caching(config.prompt_cache);
+            if let Some(effort) = effort {
+                builder = builder.thinking_effort(effort);
+            }
+            DchClient::Anthropic(builder.build().map_err(client_error)?)
         }
         ApiType::Gemini => {
             let base_url = effective_base_url(config)?;
             let api_key = resolve_api_key(config)?;
-            DchClient::Gemini(
-                GeminiClient::builder()
-                    .with_api_key(api_key)
-                    .with_base_url(base_url)
-                    .with_model(config.model.as_str())
-                    .with_timeout(timeout)
-                    .build()
-                    .map_err(client_error)?,
-            )
+            let mut builder = GeminiClient::builder()
+                .with_api_key(api_key)
+                .with_base_url(base_url)
+                .with_model(config.model.as_str())
+                .with_timeout(timeout);
+            if let Some(effort) = effort {
+                builder = builder.thinking_effort(effort);
+            }
+            DchClient::Gemini(builder.build().map_err(client_error)?)
         }
         ApiType::Ollama => DchClient::OpenAi(
             profiled(
                 loopctl::provider::ollama_builder(config.model.as_str()),
                 config,
+                effort,
             )
             .build()
             .map_err(client_error)?,
         ),
         ApiType::DeepSeek => DchClient::OpenAi(
-            profiled(loopctl::provider::deepseek_builder(), config)
+            profiled(loopctl::provider::deepseek_builder(), config, effort)
                 .build()
                 .map_err(client_error)?,
         ),
         ApiType::Grok => DchClient::OpenAi(
-            profiled(loopctl::provider::grok_builder(), config)
+            profiled(loopctl::provider::grok_builder(), config, effort)
                 .build()
                 .map_err(client_error)?,
         ),
         ApiType::Azure => DchClient::OpenAi(
-            profiled(azure_seeded_builder(config)?, config)
+            profiled(azure_seeded_builder(config)?, config, effort)
                 .build()
                 .map_err(client_error)?,
         ),
         ApiType::Moonshot => DchClient::OpenAi(
-            profiled(loopctl::provider::moonshot_builder(), config)
+            profiled(loopctl::provider::moonshot_builder(), config, effort)
                 .build()
                 .map_err(client_error)?,
         ),
         ApiType::Zai => DchClient::Anthropic(
-            profiled(loopctl::provider::zai_builder(), config)
+            profiled(loopctl::provider::zai_builder(), config, effort)
+                .prompt_caching(config.prompt_cache)
                 .build()
                 .map_err(client_error)?,
         ),
         ApiType::Bedrock => DchClient::Bedrock(build_bedrock(config)?),
     };
     Ok(client)
+}
+
+/// Build the compaction chain's client: the session provider with the
+/// session's thinking budget stripped.
+///
+/// The compactors' model calls are utility work. A summarizer
+/// reasoning at the session's `high` effort burns minutes of latency
+/// and its own output budget on thinking before writing a single
+/// summary token, which both stalls the pass and pushes the reply
+/// past the summary budget. The chain therefore speaks to the same
+/// endpoint and model with the provider's own thinking default, while
+/// conversation turns keep the configured budget untouched.
+///
+/// # Errors
+///
+/// Same failure surface as [`create_client`] on the same config.
+pub fn create_compactor_client(config: &ApiConfig) -> Result<DchClient, RunnerError> {
+    let mut stripped = config.clone();
+    stripped.reasoning_effort = None;
+    create_client(&stripped)
 }
 
 /// Resource-name seed for gateway deployments that set `base_url` explicitly.
@@ -372,6 +399,20 @@ trait Profiled {
     /// Bound each reply at the configured completion budget. Families
     /// without a completion knob ignore it.
     fn apply_max_tokens(self, tokens: u32) -> Self;
+
+    /// Set the request-level thinking budget when the family carries
+    /// one.
+    ///
+    /// A family without a native effort dial ignores it, matching the
+    /// completion-budget convention above.
+    fn apply_reasoning_effort(self, effort: ThinkingEffort) -> Self;
+
+    /// Replay prior-turn reasoning on outgoing requests.
+    ///
+    /// dch enables this on every family that carries a replay lane,
+    /// so reasoning-capable models keep their working memory across
+    /// turns instead of re-deriving it after every replay boundary.
+    fn with_reasoning_replay(self) -> Self;
 }
 
 impl Profiled for loopctl::provider::OpenAiClientBuilder {
@@ -393,6 +434,14 @@ impl Profiled for loopctl::provider::OpenAiClientBuilder {
 
     fn apply_max_tokens(self, _tokens: u32) -> Self {
         self
+    }
+
+    fn apply_reasoning_effort(self, effort: ThinkingEffort) -> Self {
+        loopctl::provider::OpenAiClientBuilder::thinking_effort(self, effort)
+    }
+
+    fn with_reasoning_replay(self) -> Self {
+        loopctl::provider::OpenAiClientBuilder::replay_reasoning(self, true)
     }
 }
 
@@ -416,6 +465,14 @@ impl Profiled for loopctl::provider::AnthropicClientBuilder {
     fn apply_max_tokens(self, tokens: u32) -> Self {
         loopctl::provider::AnthropicClientBuilder::with_max_tokens(self, tokens)
     }
+
+    fn apply_reasoning_effort(self, effort: ThinkingEffort) -> Self {
+        loopctl::provider::AnthropicClientBuilder::thinking_effort(self, effort)
+    }
+
+    fn with_reasoning_replay(self) -> Self {
+        loopctl::provider::AnthropicClientBuilder::replay_reasoning(self, true)
+    }
 }
 
 /// Apply dch's config precedence onto a pre-seeded profile builder.
@@ -427,8 +484,10 @@ impl Profiled for loopctl::provider::AnthropicClientBuilder {
 /// forwarded to every family and honored where the family's client has
 /// a completion knob — the Anthropic family does, the OpenAI family's
 /// builder has none, so there it is dropped by documented design and
-/// the provider's own default completion budget governs.
-fn profiled<B: Profiled>(builder: B, config: &ApiConfig) -> B {
+/// the provider's own default completion budget governs. A parsed
+/// `effort`, when set, rides the same path to every family with a
+/// native thinking-budget dial.
+fn profiled<B: Profiled>(builder: B, config: &ApiConfig, effort: Option<ThinkingEffort>) -> B {
     let builder = if config.base_url.is_empty() {
         builder
     } else {
@@ -443,9 +502,45 @@ fn profiled<B: Profiled>(builder: B, config: &ApiConfig) -> B {
         Some(key) => builder.apply_api_key(key),
         None => builder,
     };
+    let builder = match effort {
+        Some(effort) => builder.apply_reasoning_effort(effort),
+        None => builder,
+    }
+    .with_reasoning_replay();
     builder
         .apply_max_tokens(config.max_tokens)
         .apply_timeout(Duration::from_secs(config.request_timeout_secs))
+}
+
+/// Map the config's effort spelling onto the request-level enum.
+///
+/// `None` (the config key unset) is the inert default — requests go
+/// out byte-identical and the provider's own thinking defaults apply.
+/// An unknown spelling fails construction rather than silently
+/// defaulting, naming the accepted values so the operator can fix the
+/// config in one look.
+///
+/// # Errors
+///
+/// Returns [`RunnerError::Config`] when the configured spelling is not
+/// one of `low`, `medium`, `high`, or `max`.
+fn effort_from_config(config: &ApiConfig) -> Result<Option<ThinkingEffort>, RunnerError> {
+    let Some(name) = config.reasoning_effort.as_deref() else {
+        return Ok(None);
+    };
+    let effort = match name {
+        "low" => ThinkingEffort::Low,
+        "medium" => ThinkingEffort::Medium,
+        "high" => ThinkingEffort::High,
+        "max" => ThinkingEffort::Max,
+        other => {
+            return Err(RunnerError::Config(format!(
+                "api.reasoning_effort: unknown level {other:?}; expected one of \
+                 low, medium, high, max"
+            )));
+        }
+    };
+    Ok(Some(effort))
 }
 
 /// Build the Bedrock client for `config`.
@@ -502,7 +597,7 @@ fn build_bedrock(config: &ApiConfig) -> Result<BedrockClient, RunnerError> {
 ///
 /// Returns [`RunnerError::Client`] when the provider defers its endpoint to
 /// a profile — a call only a stock arm should ever make.
-fn effective_base_url(config: &ApiConfig) -> Result<String, RunnerError> {
+pub(crate) fn effective_base_url(config: &ApiConfig) -> Result<String, RunnerError> {
     if config.base_url.is_empty() {
         config.api_type.default_base_url().map(str::to_owned).ok_or_else(|| {
             RunnerError::Client(format!(
@@ -606,6 +701,35 @@ mod tests {
         let c = cfg(ApiType::OpenAi, "https://api.openai.com/v1", Some("k"));
         let client = create_client(&c).expect("openai builds");
         assert_eq!(client.model(), "test-model");
+    }
+
+    #[test]
+    fn effort_mapping_accepts_each_level_and_rejects_the_unknown() {
+        for (name, _) in [("low", 0), ("medium", 1), ("high", 2), ("max", 3)] {
+            let mut c = cfg(ApiType::OpenAi, "https://api.openai.com/v1", Some("k"));
+            c.reasoning_effort = Some(name.to_string());
+            let effort = effort_from_config(&c)
+                .expect("a known level maps")
+                .expect("and is Some");
+            let _ = effort;
+            create_client(&c).expect("the mapped effort constructs the client");
+        }
+        let mut c = cfg(ApiType::OpenAi, "https://api.openai.com/v1", Some("k"));
+        c.reasoning_effort = Some("turbo".to_string());
+        let err = effort_from_config(&c).expect_err("an unknown level fails loudly");
+        assert!(
+            matches!(err, RunnerError::Config(ref msg) if msg.contains("turbo")),
+            "the error names the bad value: {err:?}"
+        );
+    }
+
+    #[test]
+    fn unset_effort_stays_unset() {
+        let c = cfg(ApiType::OpenAi, "https://api.openai.com/v1", Some("k"));
+        assert!(
+            effort_from_config(&c).expect("unset parses").is_none(),
+            "no key means no effort and byte-identical requests"
+        );
     }
 
     #[test]

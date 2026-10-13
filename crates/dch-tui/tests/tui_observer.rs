@@ -15,14 +15,16 @@
 
 mod common;
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use dch_tui::ContentBlock;
 use dch_tui::Graduation;
 use dch_tui::TokenCounts;
 use dch_tui::observer::{TuiObserver, TuiObserverState};
 use loopctl::observer::{
-    LoopObserver, ResponseContext, StreamContext, TextDeltaContext, ToolCallReceivedContext,
-    ToolPreContext, TurnEndContext,
+    AttemptResetContext, LoopObserver, ResponseContext, StreamContext, TextDeltaContext,
+    ToolCallReceivedContext, ToolPreContext, TurnEndContext,
 };
 use serde_json::json;
 
@@ -52,6 +54,474 @@ fn pre(call_id: &str, tool: &str) -> ToolPreContext {
     ctx.tool = tool.to_string();
     ctx.tool_call_id = call_id.to_string();
     ctx
+}
+
+fn thinking(turn: usize, delta: &str) -> loopctl::observer::ThinkingDeltaContext {
+    loopctl::observer::ThinkingDeltaContext {
+        turn,
+        delta: delta.to_string(),
+    }
+}
+
+fn failed_stream() -> loopctl::observer::StreamFailureContext {
+    loopctl::observer::StreamFailureContext {
+        turn: 0,
+        model: "test-model".to_string(),
+        error: loopctl::error::LoopError::InvalidInput("the stream died".to_string()),
+    }
+}
+
+#[test]
+fn an_armed_observer_scrubs_secrets_from_the_input_summary() {
+    let (observer, kept) = TuiObserverState::new()
+        .with_secret_redaction(true)
+        .into_observer();
+    observer.on_tool_call_received(&received(
+        "call-redact",
+        "Bash",
+        json!({"command": "curl -H 'Authorization: Bearer sk-super-secret-value' https://api.test"}),
+    ));
+    observer.on_tool_pre(&pre("call-redact", "Bash"));
+    let active = kept.active_tools.lock().expect("the active lock");
+    let summary = &active.first().expect("the active tool").input_summary;
+    assert!(
+        summary.contains("[REDACTED:bearer]"),
+        "the credential is masked in the summary: {summary}"
+    );
+    assert!(
+        !summary.contains("sk-super-secret-value"),
+        "no raw credential survives: {summary}"
+    );
+}
+
+#[test]
+fn the_default_observer_records_the_input_summary_verbatim() {
+    let (observer, kept) = state_and_observer();
+    observer.on_tool_call_received(&received(
+        "call-raw",
+        "Bash",
+        json!({"command": "curl -H 'Authorization: Bearer sk-super-secret-value' https://api.test"}),
+    ));
+    observer.on_tool_pre(&pre("call-raw", "Bash"));
+    let active = kept.active_tools.lock().expect("the active lock");
+    let summary = &active.first().expect("the active tool").input_summary;
+    assert!(
+        summary.contains("sk-super-secret-value"),
+        "redaction off keeps the summary raw: {summary}"
+    );
+}
+
+#[test]
+fn the_turn_end_reports_the_context_size() {
+    let (observer, kept) = state_and_observer();
+    let mut ctx = turn_end(0, 4, 1);
+    ctx.context_tokens = 45_678;
+    observer.on_turn_end(&ctx);
+    assert_eq!(
+        tokens_of(&kept).context_tokens,
+        45_678,
+        "the loop's exposed context size lands in the shared state"
+    );
+}
+
+#[test]
+fn an_attempt_reset_pushes_a_reconnection_row() {
+    let (observer, kept) = state_and_observer();
+    observer.on_stream_failure(&failed_stream());
+    observer.on_attempt_reset(&AttemptResetContext {
+        turn: 0,
+        attempt: 2,
+    });
+    observer.on_attempt_reset(&AttemptResetContext {
+        turn: 0,
+        attempt: 3,
+    });
+    let lines = kept.retry_lines.lock().expect("the retry lock");
+    let health = kept.health.lock().expect("the health lock");
+    assert_eq!(
+        *health,
+        dch_tui::observer::HealthNotice::Retrying { attempt: Some(2) },
+        "the notice carries the same retry index the row prints — \
+         ctx.attempt is 1-indexed over attempts, the retry index is one less"
+    );
+    assert_eq!(lines.len(), 2, "both retries queue: {lines:?}");
+    let max = usize::try_from(loopctl::stream::handler::StreamRetryConfig::default().max_retries)
+        .unwrap_or(usize::MAX);
+    let first = lines.first().expect("the first");
+    assert_eq!(first.episode, 0);
+    assert!(
+        first
+            .text
+            .contains(&format!("⟳ connection lost — reconnection attempt 1/{max}")),
+        "the first retry reads 1 of the ladder the handler runs: {:?}",
+        first.text
+    );
+    let second = lines.last().expect("the second");
+    assert_eq!(second.episode, 0);
+    assert!(
+        second
+            .text
+            .contains(&format!("⟳ connection lost — reconnection attempt 2/{max}")),
+        "the second retry reads 2 of the ladder the handler runs: {:?}",
+        second.text
+    );
+}
+
+#[test]
+fn a_repeated_tool_failure_keeps_the_conversation_free_of_retry_rows() {
+    let (observer, kept) = state_and_observer();
+    observer.on_tool_call_received(&received("call-1", "Bash", json!({"command": "x"})));
+    observer.finish_tool("call-1", "Bash", true, Duration::from_millis(5));
+    observer.on_tool_call_received(&received("call-2", "Bash", json!({"command": "x"})));
+    let lines = kept.retry_lines.lock().expect("the retry lock");
+    assert!(
+        lines.is_empty(),
+        "tool retries stay out of the conversation — the failure lives in the graduated tool block: {lines:?}"
+    );
+}
+
+#[test]
+fn thinking_deltas_append_in_arrival_order_and_wake_the_render() {
+    let (observer, kept) = state_and_observer();
+    let listener = kept.render_notify.listen();
+    observer.on_thinking_delta(&thinking(0, "first "));
+    observer.on_thinking_delta(&thinking(0, "second"));
+    let stream = kept.thinking.lock().expect("the thinking lock");
+    assert_eq!(
+        stream.text, "first second",
+        "deltas concatenate in arrival order"
+    );
+    assert_eq!(stream.turn, 0);
+    assert!(stream.began.is_some(), "the first delta stamps the clock");
+    assert!(!stream.redacted);
+    drop(stream);
+    futures::executor::block_on(listener);
+}
+
+#[test]
+fn a_response_graduates_the_thinking_with_its_reply_and_clears_the_buffer() {
+    let (observer, kept) = state_and_observer();
+    observer.on_thinking_delta(&thinking(0, "because "));
+    observer.on_thinking_delta(&thinking(0, "reasons"));
+    observer.on_response(&ResponseContext {
+        turn: 0,
+        text: "the answer".to_string(),
+        usage: None,
+    });
+    let graduations = kept.graduations.lock().expect("the queue lock").clone();
+    let [
+        Graduation::Reply {
+            text,
+            thinking: block,
+        },
+    ] = graduations.as_slice()
+    else {
+        panic!("one graduation for one response: {graduations:?}");
+    };
+    assert_eq!(text, "the answer");
+    let Some(dch_tui::ContentBlock::Thinking { text, redacted, .. }) = block else {
+        panic!("the reasoning graduates as a Thinking block: {block:?}");
+    };
+    assert_eq!(text, "because reasons");
+    assert!(!redacted);
+    assert!(
+        kept.thinking
+            .lock()
+            .expect("the thinking lock")
+            .text
+            .is_empty(),
+        "the buffer clears once its reasoning graduates"
+    );
+
+    observer.on_thinking_delta(&thinking(1, "fresh "));
+    assert_eq!(
+        kept.thinking.lock().expect("the thinking lock").text,
+        "fresh ",
+        "a follow-up stream starts from an empty buffer"
+    );
+}
+
+#[test]
+fn a_failed_stream_keeps_its_partial_thinking_for_the_turn_end() {
+    let (observer, kept) = state_and_observer();
+    observer.on_thinking_delta(&thinking(0, "half "));
+    observer.on_thinking_delta(&thinking(0, "a thought"));
+    observer.on_stream_failure(&failed_stream());
+    let stream = kept.thinking.lock().expect("the thinking lock");
+    assert!(
+        stream.text == "half a thought",
+        "a failed attempt's reasoning survives to the turn end: {:?}",
+        stream.text
+    );
+    assert!(!stream.redacted);
+    assert!(stream.began.is_some());
+}
+
+#[test]
+fn a_retried_attempt_resets_the_dead_prefix_before_its_retry_streams() {
+    let (observer, kept) = state_and_observer();
+    observer.on_thinking_delta(&thinking(0, "dead prefix "));
+    observer.on_text_delta(&delta("dead text "));
+    observer.on_attempt_reset(&AttemptResetContext {
+        turn: 0,
+        attempt: 2,
+    });
+    assert!(
+        kept.thinking
+            .lock()
+            .expect("the thinking lock")
+            .text
+            .is_empty(),
+        "the reset cue discards the dead attempt's partial reasoning"
+    );
+    assert!(
+        kept.streaming_text
+            .lock()
+            .expect("the text lock")
+            .is_empty(),
+        "the reset cue discards the dead attempt's partial text"
+    );
+    observer.on_thinking_delta(&thinking(0, "live reasoning"));
+    observer.on_text_delta(&delta("live text"));
+    observer.on_response(&ResponseContext {
+        turn: 0,
+        text: "the retry's answer".to_string(),
+        usage: None,
+    });
+    let graduations = kept.graduations.lock().expect("the queue lock").clone();
+    let [
+        Graduation::Reply {
+            thinking: block, ..
+        },
+    ] = graduations.as_slice()
+    else {
+        panic!("one graduation for one response: {graduations:?}");
+    };
+    let Some(dch_tui::ContentBlock::Thinking { text, .. }) = block else {
+        panic!("the retry's live reasoning graduates: {block:?}");
+    };
+    assert_eq!(
+        text, "live reasoning",
+        "the dead attempt's prefix never concatenates onto the retry's reasoning"
+    );
+}
+
+#[test]
+fn a_fallback_served_turn_discards_its_dead_streaming_prefix() {
+    let (observer, kept) = state_and_observer();
+    observer.on_thinking_delta(&thinking(0, "partially streamed"));
+    observer.on_text_delta(&delta("partially "));
+    let mut cue = common::transport_fallback();
+    cue.turn = 0;
+    observer.on_transport_fallback(&cue);
+    assert!(
+        kept.thinking
+            .lock()
+            .expect("the thinking lock")
+            .text
+            .is_empty(),
+        "the fallback cue discards the dead streaming prefix's reasoning"
+    );
+    assert!(
+        kept.streaming_text
+            .lock()
+            .expect("the text lock")
+            .is_empty(),
+        "the fallback cue discards the dead streaming prefix's text"
+    );
+    observer.on_response(&ResponseContext {
+        turn: 0,
+        text: "the fallback's answer".to_string(),
+        usage: None,
+    });
+    let graduations = kept.graduations.lock().expect("the queue lock").clone();
+    let [
+        Graduation::Reply {
+            thinking: block, ..
+        },
+    ] = graduations.as_slice()
+    else {
+        panic!("one graduation for one response: {graduations:?}");
+    };
+    assert!(
+        block.is_none(),
+        "the dead prefix's reasoning never rides the fallback reply: {block:?}"
+    );
+}
+
+#[test]
+fn an_empty_thinking_delta_marks_the_stream_redacted() {
+    let (observer, kept) = state_and_observer();
+    observer.on_thinking_delta(&thinking(0, ""));
+    let stream = kept.thinking.lock().expect("the thinking lock");
+    assert!(stream.redacted, "an empty delta signals withheld reasoning");
+    assert!(stream.text.is_empty());
+}
+
+#[test]
+fn a_failed_turn_graduates_its_partial_thinking() {
+    let (observer, kept) = state_and_observer();
+    observer.on_thinking_delta(&thinking(0, "half "));
+    observer.on_thinking_delta(&thinking(0, "a thought"));
+    observer.on_turn_end(&failed_turn_end(0, 0, 0));
+    let stream = kept.thinking.lock().expect("the thinking lock");
+    assert!(
+        stream.text.is_empty() && stream.began.is_none(),
+        "the live reasoning row folds once the partial block graduated"
+    );
+    drop(stream);
+    let graduations = kept.graduations.lock().expect("the graduations lock");
+    assert_eq!(
+        graduations.len(),
+        1,
+        "the cancelled run's own reasoning survives as one block: {graduations:?}"
+    );
+    match graduations.first().expect("one graduation") {
+        Graduation::Reply {
+            text,
+            thinking:
+                Some(ContentBlock::Thinking {
+                    text: body,
+                    redacted,
+                    duration_ms,
+                }),
+        } => {
+            assert!(
+                text.is_empty(),
+                "a cancelled turn carries no reply text: {text:?}"
+            );
+            assert_eq!(body, "half a thought", "{body}");
+            assert!(!redacted, "{body}");
+            assert!(*duration_ms < 10_000, "the duration is the stream's own");
+        }
+        other => panic!("unexpected graduation: {other:?}"),
+    }
+}
+
+#[test]
+fn a_retried_turns_failed_end_graduates_only_the_retrys_own_reasoning() {
+    let (observer, kept) = state_and_observer();
+    observer.on_thinking_delta(&thinking(0, "dead attempt "));
+    observer.on_stream_failure(&failed_stream());
+    observer.on_attempt_reset(&AttemptResetContext {
+        turn: 0,
+        attempt: 2,
+    });
+    observer.on_thinking_delta(&thinking(0, "the retry's reasoning"));
+    observer.on_turn_end(&failed_turn_end(0, 0, 0));
+    let graduations = kept
+        .graduations
+        .lock()
+        .expect("the graduations lock")
+        .clone();
+    let [
+        Graduation::Reply {
+            thinking: block, ..
+        },
+    ] = graduations.as_slice()
+    else {
+        panic!("one graduation for the retried turn: {graduations:?}");
+    };
+    let Some(dch_tui::ContentBlock::Thinking { text, .. }) = block else {
+        panic!("the retry's live reasoning graduates: {block:?}");
+    };
+    assert_eq!(
+        text, "the retry's reasoning",
+        "the reset cue discarded the dead attempt's reasoning, so the failed turn end graduates only what the retry itself streamed"
+    );
+}
+
+#[test]
+fn a_stale_turns_thinking_never_graduates_onto_another_turns_failed_end() {
+    let (observer, kept) = state_and_observer();
+    observer.on_thinking_delta(&thinking(0, "turn zero's reasoning"));
+    observer.on_turn_end(&failed_turn_end(1, 0, 0));
+    assert!(
+        kept.graduations
+            .lock()
+            .expect("the graduations lock")
+            .is_empty(),
+        "turn one's failed end must not carry turn zero's orphaned reasoning"
+    );
+}
+
+#[test]
+fn a_stale_stream_never_graduates_onto_a_new_reply() {
+    let (observer, kept) = state_and_observer();
+    observer.on_thinking_delta(&thinking(0, "cancelled mid-thought"));
+    observer.on_response(&ResponseContext {
+        turn: 1,
+        text: "a later reply".to_string(),
+        usage: None,
+    });
+    let stream = kept.thinking.lock().expect("the thinking lock");
+    assert!(
+        stream.text.is_empty() && stream.began.is_none(),
+        "a response for another turn discards the stale stream rather than graduating it"
+    );
+    drop(stream);
+    let graduations = kept.graduations.lock().expect("the graduations lock");
+    let Some(reply) = graduations.iter().rev().find_map(|g| match g {
+        Graduation::Reply { thinking, .. } => Some(thinking),
+        Graduation::Tool(_) | Graduation::RunEnded { .. } => None,
+    }) else {
+        panic!("the reply still graduates");
+    };
+    assert!(
+        reply.is_none(),
+        "the stale reasoning must not ride the new reply's graduation"
+    );
+}
+
+#[test]
+fn a_turn_change_discards_rather_than_splices_living_reasoning() {
+    let (observer, kept) = state_and_observer();
+    observer.on_thinking_delta(&thinking(0, "abandoned mid-flight"));
+    observer.on_thinking_delta(&thinking(1, "fresh turn"));
+    let stream = kept.thinking.lock().expect("the thinking lock");
+    assert_eq!(
+        stream.text, "fresh turn",
+        "a new turn's stream starts empty even when the previous turn's \
+         terminal event never arrived"
+    );
+    assert_eq!(stream.turn, 1);
+}
+
+#[test]
+fn a_turn_end_queues_its_history_for_the_host() {
+    let (observer, kept) = state_and_observer();
+    let mut success = turn_end(0, 10, 20);
+    success.success = true;
+    success.history = Arc::new(vec![
+        loopctl::message::Message::user("read the note"),
+        loopctl::message::Message::assistant("done"),
+    ]);
+    observer.on_turn_end(&success);
+    let mut failed = failed_turn_end(1, 10, 20);
+    failed.history = Arc::new(vec![loopctl::message::Message::user("read the note")]);
+    observer.on_turn_end(&failed);
+    let queued: Vec<(usize, String)> = kept
+        .turn_histories
+        .lock()
+        .expect("the histories lock")
+        .iter()
+        .map(|history| {
+            (
+                history.len(),
+                history
+                    .first()
+                    .map(loopctl::message::Message::text_content)
+                    .unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        queued,
+        vec![(2, "read the note".to_string())],
+        "a successful turn end queues the engine's own snapshot; a \
+         failed one publishes nothing — the resolution read owns that \
+         state"
+    );
 }
 
 fn stream(turn: usize, input_tokens: u64, output_tokens: u64) -> StreamContext {
@@ -137,8 +607,8 @@ fn a_response_hands_the_finalized_reply_to_the_display_buffer() {
         .unwrap()
         .iter()
         .filter_map(|event| match event {
-            Graduation::Reply(text) => Some(text.clone()),
-            Graduation::Tool(_) => None,
+            Graduation::Reply { text, .. } => Some(text.clone()),
+            Graduation::Tool(_) | Graduation::RunEnded { .. } => None,
         })
         .collect();
     assert_eq!(
@@ -162,7 +632,10 @@ fn a_response_without_deltas_keeps_the_only_reply_copy() {
     });
     assert_eq!(
         kept.graduations.lock().unwrap().clone(),
-        vec![Graduation::Reply("the whole reply".to_string())],
+        vec![Graduation::Reply {
+            text: "the whole reply".to_string(),
+            thinking: None,
+        }],
         "a non-streaming turn's response text is the reply's only copy — it must not be dropped"
     );
 }
@@ -284,6 +757,10 @@ fn reset_clears_every_buffer_and_the_private_maps() {
         "the driver's error buffer clears with the rest"
     );
     assert_eq!(tokens_of(&kept), TokenCounts::default());
+    assert!(
+        kept.current_turn.lock().unwrap().is_none(),
+        "the mirrored turn counter resets with the rest"
+    );
     observer.on_tool_pre(&pre("call-1", "Edit"));
     assert!(
         kept.active_tools
