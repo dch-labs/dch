@@ -1591,6 +1591,7 @@ error: test failed, to rerun pass `--test it`
     fn submit_registers_in_the_builtin_registry() {
         let registry = crate::registry::builtin_registry(
             &loopctl::tool::builtin::fs::FileSession::new(std::path::PathBuf::from(".")),
+            crate::registry::ReadWindows::default(),
         );
         assert!(registry.get("Submit").is_some(), "registered");
         assert!(!SubmitTool.is_read_only());

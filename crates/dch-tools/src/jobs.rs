@@ -600,9 +600,10 @@ mod tests {
 
     #[test]
     fn jobstool_registered_in_builtin_registry() {
-        let reg = crate::registry::builtin_registry(&loopctl::tool::builtin::fs::FileSession::new(
-            std::path::PathBuf::from("."),
-        ));
+        let reg = crate::registry::builtin_registry(
+            &loopctl::tool::builtin::fs::FileSession::new(std::path::PathBuf::from(".")),
+            crate::registry::ReadWindows::default(),
+        );
         let tool = reg.get("Jobs").expect("JobsTool registered");
         assert!(!tool.is_read_only());
         assert!(
@@ -802,6 +803,83 @@ mod tests {
             "the table must cap terminal retention, retained {retained}"
         );
         assert!(retained > 0, "recent terminal jobs stay queryable");
+    }
+
+    #[tokio::test]
+    async fn a_running_job_survives_the_retention_rollover_and_its_late_result_lands() {
+        let _guard = JOB_TEST_GUARD.lock().await;
+        reset_job_table();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let ctx = ctx_in(cwd);
+
+        // Fill and roll the terminal retention window first, so the slow
+        // job below starts after the cap has already evicted its oldest
+        // entries and completes into an already-full terminal window.
+        let mut fast_ids = Vec::new();
+        for _ in 0..=MAX_TERMINAL_JOBS {
+            let out = BashTool
+                .call(json!({ "command": "true", "background": true }), &ctx)
+                .await
+                .unwrap();
+            fast_ids.push(parse_spawned_id(&out.text_content()));
+        }
+        let slow = BashTool
+            .call(
+                json!({ "command": "sleep 1 && echo late", "background": true }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let slow_id = parse_spawned_id(&slow.text_content());
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while list_jobs()
+            .iter()
+            .any(|job| job.status == JobStatus::Running)
+            && Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        assert!(
+            list_jobs().len() <= MAX_TERMINAL_JOBS,
+            "the table stays capped after the late completion"
+        );
+        let late = JobsTool
+            .call(
+                json!({ "operation": "job_status", "job_id": slow_id }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let late_text = late.text_content();
+        assert!(
+            !late_text.contains("not found") && late_text.contains("late"),
+            "the last spawn is the newest terminal entry and survives its own completion: {late_text}"
+        );
+        let oldest = JobsTool
+            .call(
+                json!({ "operation": "job_status", "job_id": fast_ids[0] }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            oldest.text_content().contains("not found"),
+            "the oldest terminal job went in the rollover it seeded"
+        );
+    }
+
+    /// Pulls the ID out of the spawn acknowledgement line.
+    ///
+    /// `BashTool` answers a backgrounded call with `Started background
+    /// job {id}: {summary}`; the ID is the second whitespace token.
+    fn parse_spawned_id(ack: &str) -> u64 {
+        ack.split_whitespace()
+            .nth(3)
+            .and_then(|token| token.trim_end_matches(':').parse::<u64>().ok())
+            .unwrap_or_else(|| panic!("spawn acknowledgement must carry the id: {ack}"))
     }
 
     #[tokio::test]

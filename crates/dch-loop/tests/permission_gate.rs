@@ -22,7 +22,7 @@ use std::sync::Mutex;
 
 use dch_loop::permission_layer;
 use dch_tools::permission::PermissionMode;
-use dch_tools::permission::PermissionMode::{AcceptEdits, Auto, Plan};
+use dch_tools::permission::PermissionMode::{AcceptEdits, Auto, Interactive, Plan};
 use loopctl::cancel::CancelSignal;
 use loopctl::middleware::AskResolverFn;
 use loopctl::middleware::ToolDispatchContext;
@@ -183,7 +183,7 @@ async fn auto_mode_passes_every_category_through() {
 
 #[tokio::test]
 async fn plan_allows_the_read_family() {
-    for name in ["read", "Glob", "LSP"] {
+    for name in ["Read", "ReadFiles", "Glob", "LSP"] {
         let pipeline = gated_pipeline(Plan, None, Probe { name });
         let result = pipeline.invoke(dispatch_for(name, fresh_cancel())).await;
         assert!(!result.is_error, "Plan must allow the read-only {name}");
@@ -258,6 +258,27 @@ async fn a_cancelled_signal_denies_a_pending_ask() {
         text.contains("cancelled while awaiting approval"),
         "the denial must name the cancellation: {text}"
     );
+}
+
+#[tokio::test]
+async fn a_batched_read_asks_in_interactive_mode_and_runs_in_plan() {
+    let (resolver, log) = recording();
+    let asking = gated_pipeline(Interactive, Some(resolver), Probe { name: "ReadFiles" });
+    let result = asking
+        .invoke(dispatch_for("ReadFiles", fresh_cancel()))
+        .await;
+    assert!(!result.is_error, "an approved batched read still runs");
+    assert_eq!(
+        log.lock().expect("log lock").len(),
+        1,
+        "Interactive must ask before a batched read runs"
+    );
+
+    let planned = gated_pipeline(Plan, None, Probe { name: "ReadFiles" });
+    let result = planned
+        .invoke(dispatch_for("ReadFiles", fresh_cancel()))
+        .await;
+    assert!(!result.is_error, "Plan runs the read-only batch");
 }
 
 #[tokio::test]

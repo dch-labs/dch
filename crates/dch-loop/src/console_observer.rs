@@ -15,10 +15,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use dch_config::Verbosity;
 use loopctl::observer::{
-    CompactedContext, FallbackContext, LoopObserver, ModelSwitchedContext, ResponseContext,
-    RunEndContext, RunStartContext, StreamFailureContext, TextDeltaContext, ToolPostContext,
-    ToolPreContext, TurnEndContext, TurnStartContext,
+    CompactedContext, CompactionFailedContext, FallbackContext, LoopObserver, ModelSwitchedContext,
+    ResponseContext, RunEndContext, RunStartContext, StreamFailureContext, TextDeltaContext,
+    ToolPostContext, ToolPreContext, TurnEndContext, TurnStartContext,
 };
+use loopctl::stream::Usage;
 
 /// ANSI reset sequence, appended after every colored span.
 ///
@@ -110,10 +111,24 @@ pub struct ConsoleObserver {
     tool_calls: AtomicUsize,
 
     /// Input tokens accumulated across completed turns.
+    ///
+    /// Fed by each successful turn's end event and reported in the
+    /// verbose run summary, so the total covers exactly the current run.
     input_tokens: AtomicU64,
 
     /// Output tokens accumulated across completed turns.
+    ///
+    /// Fed by each successful turn's end event beside the input counter,
+    /// reported in the verbose run summary in the same `in+out` shape
+    /// the per-turn lines use.
     output_tokens: AtomicU64,
+
+    /// Cached input tokens accumulated across model responses.
+    ///
+    /// Fed from each response's provider-reported usage alongside the turn
+    /// counters, and reported in the verbose run summary so a prompt-cache
+    /// hit rate is readable without a metric sink.
+    cached_tokens: AtomicU64,
 }
 
 impl ConsoleObserver {
@@ -153,6 +168,7 @@ impl ConsoleObserver {
             tool_calls: AtomicUsize::new(0),
             input_tokens: AtomicU64::new(0),
             output_tokens: AtomicU64::new(0),
+            cached_tokens: AtomicU64::new(0),
         }
     }
 
@@ -247,6 +263,7 @@ impl LoopObserver for ConsoleObserver {
         self.tool_calls.store(0, Ordering::Relaxed);
         self.input_tokens.store(0, Ordering::Relaxed);
         self.output_tokens.store(0, Ordering::Relaxed);
+        self.cached_tokens.store(0, Ordering::Relaxed);
     }
 
     fn on_turn_start(&self, _ctx: &TurnStartContext) {
@@ -266,13 +283,10 @@ impl LoopObserver for ConsoleObserver {
     /// After streamed deltas this only closes the line the deltas opened —
     /// reprinting the text would duplicate it. When nothing streamed, the
     /// whole response arrives here as the sole copy. At Verbose, a
-    /// token-usage line accompanies it on stderr.
+    /// token-usage line accompanies it on stderr, naming the provider's
+    /// cached share of the input when one is reported.
     fn on_response(&self, ctx: &ResponseContext) {
-        let usage = ctx
-            .usage
-            .as_ref()
-            .map(|usage| (usage.input_tokens, usage.output_tokens));
-        self.finish_response(&ctx.text, usage);
+        self.finish_response(&ctx.text, ctx.usage.as_ref());
     }
 
     /// Announce a tool about to run (chrome; hidden at Quiet).
@@ -323,6 +337,16 @@ impl LoopObserver for ConsoleObserver {
         self.history_compacted(ctx.tokens_before, ctx.tokens_after);
     }
 
+    /// Note a failed compaction pass with its real cause.
+    ///
+    /// Printed at every verbosity, Quiet included — a failed pass is the
+    /// run stopping, the same class of event as a stream failure, and
+    /// suppressing it would leave the run-end summary as the only (and
+    /// later) mention of why the session died.
+    fn on_compaction_failed(&self, ctx: &CompactionFailedContext) {
+        self.compaction_failed(ctx.tokens_before, ctx.context_window, ctx.error.as_deref());
+    }
+
     /// Note a model fallback with both endpoints.
     ///
     /// Verbose only. The primary model failed over to its fallback; the
@@ -370,18 +394,30 @@ impl ConsoleObserver {
     ///
     /// The closing half of the streaming contract: after deltas this emits
     /// only the terminating newline; without deltas it paints and writes
-    /// the whole text as the sole delivery. The usage pair, when present,
-    /// becomes a token-usage line on stderr at Verbose.
-    fn finish_response(&self, text: &str, usage: Option<(u32, u32)>) {
+    /// the whole text as the sole delivery. The usage, when present,
+    /// becomes a token-usage line on stderr at Verbose — with the cached
+    /// share appended when the provider reported one — and its cached
+    /// count feeds the run summary's cache total.
+    fn finish_response(&self, text: &str, usage: Option<&Usage>) {
         if self.saw_text_delta.load(Ordering::Relaxed) {
             self.say("");
         } else {
             self.say(&self.paint(CYAN, text));
         }
         if self.detail_visible()
-            && let Some((input, output)) = usage
+            && let Some(usage) = usage
         {
-            self.note(&format!("{input}+{output} tok"));
+            self.cached_tokens
+                .fetch_add(u64::from(usage.cached_input_tokens), Ordering::Relaxed);
+            let cached = if usage.cached_input_tokens > 0 {
+                format!(" ({} cached)", usage.cached_input_tokens)
+            } else {
+                String::new()
+            };
+            self.note(&format!(
+                "{}+{} tok{cached}",
+                usage.input_tokens, usage.output_tokens
+            ));
         }
     }
 
@@ -469,6 +505,20 @@ impl ConsoleObserver {
         self.note(&format!("{model}: {error}"));
     }
 
+    /// Render a failed compaction pass to stderr, naming the cause.
+    ///
+    /// Printed at every verbosity, Quiet included, for the same reason as
+    /// [`stream_failed`](Self::stream_failed): the pass dying takes the run
+    /// with it. A missing cause is the pass that completed yet still left
+    /// the history over the window — named as such rather than standing in
+    /// as a placeholder.
+    fn compaction_failed(&self, tokens_before: u64, context_window: u64, cause: Option<&str>) {
+        let cause = cause.unwrap_or("the pass completed but the history still did not fit");
+        self.note(&format!(
+            "compaction failed at ~{tokens_before} of {context_window} tokens: {cause}"
+        ));
+    }
+
     /// Note a compaction pass with its token reduction.
     ///
     /// Verbose only: the before/after totals explain why earlier context
@@ -476,7 +526,8 @@ impl ConsoleObserver {
     fn history_compacted(&self, tokens_before: u64, tokens_after: u64) {
         if self.detail_visible() {
             self.note(&format!(
-                "history compacted: {tokens_before} → {tokens_after} tok"
+                "history compacted: {tokens_before} → {tokens_after} tok — \
+                 durable state is the agent's findings file and todo list"
             ));
         }
     }
@@ -510,14 +561,20 @@ impl ConsoleObserver {
         let tool_calls = self.tool_calls.load(Ordering::Relaxed);
         let input = self.input_tokens.load(Ordering::Relaxed);
         let output = self.output_tokens.load(Ordering::Relaxed);
+        let cached = self.cached_tokens.load(Ordering::Relaxed);
         let outcome = if success {
             "finished".to_string()
         } else {
             format!("failed: {}", error.unwrap_or("unknown error"))
         };
+        let cache_line = if cached > 0 {
+            format!(", {cached} tok served from cache")
+        } else {
+            String::new()
+        };
         self.note(&format!(
             "run {outcome} in {duration_ms}ms: {total_turns} turns, \
-             {tool_calls} tool calls, {input}+{output} tok"
+             {tool_calls} tool calls, {input}+{output} tok{cache_line}"
         ));
     }
 }
@@ -605,8 +662,43 @@ mod tests {
         }
 
         fn response(&self, text: &str) {
-            self.observer.finish_response(text, Some((100, 20)));
+            self.observer
+                .finish_response(text, Some(&Usage::new(100, 20)));
         }
+    }
+
+    #[test]
+    fn a_failed_compaction_prints_at_every_verbosity() {
+        let quiet = Harness::build(Verbosity::Quiet, false);
+        quiet.observer.compaction_failed(
+            207_686,
+            180_000,
+            Some("qa summarizer summarize step failed: error sending request"),
+        );
+        assert!(
+            quiet
+                .stderr()
+                .contains("compaction failed at ~207686 of 180000 tokens:"),
+            "the failure prints even at Quiet: {}",
+            quiet.stderr()
+        );
+        assert!(
+            quiet
+                .stderr()
+                .contains("qa summarizer summarize step failed"),
+            "the real cause reaches the line: {}",
+            quiet.stderr()
+        );
+
+        let unfit = Harness::build(Verbosity::Normal, false);
+        unfit.observer.compaction_failed(9_000, 8_000, None);
+        assert!(
+            unfit
+                .stderr()
+                .contains("the pass completed but the history still did not fit"),
+            "a causeless failure names its own shape: {}",
+            unfit.stderr()
+        );
     }
 
     #[test]
@@ -645,6 +737,31 @@ mod tests {
         let h = Harness::build(Verbosity::Quiet, false);
         h.response("hello");
         assert_eq!(h.stdout(), "hello\n");
+    }
+
+    #[test]
+    fn verbose_response_usage_names_the_cached_share() {
+        let h = Harness::build(Verbosity::Verbose, false);
+        h.observer.finish_response(
+            "answer",
+            Some(&Usage::new(1500, 20).with_cached_input(1200)),
+        );
+        assert!(
+            h.stderr().contains("1500+20 tok (1200 cached)"),
+            "the cached share belongs beside the totals: {}",
+            h.stderr()
+        );
+    }
+
+    #[test]
+    fn verbose_response_usage_without_cache_prints_no_cache_clause() {
+        let h = Harness::build(Verbosity::Verbose, false);
+        h.response("answer");
+        assert!(
+            h.stderr().contains("100+20 tok\n") || h.stderr().contains("100+20 tok\r\n"),
+            "a zero cached share must not render an empty clause: {}",
+            h.stderr()
+        );
     }
 
     #[test]

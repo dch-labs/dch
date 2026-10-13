@@ -9,9 +9,9 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::mpsc;
 
 use loopctl::tool::ToolError;
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::question::QuestionRequest;
 use crate::todo::TodoEntry;
@@ -56,13 +56,15 @@ pub struct RunnerContext {
     /// Channel for asking the user interactive questions, behind a shared slot.
     ///
     /// Used by the asking tool to send a [`QuestionRequest`] to the UI (a TUI
-    /// overlay or a headless reader). The slot starts empty; the asking tool
-    /// returns an error instead of blocking when no channel is installed. A
-    /// host that can prompt installs its sender before the first run (or
-    /// between runs) — every tool dispatch reads the slot live, so a later
-    /// installation affects subsequent dispatches immediately. Cloning
+    /// overlay or a headless reader); unbounded so a dispatch never blocks
+    /// on the hand-off, with each question's answer returning over its own
+    /// one-shot. The slot starts empty; the asking tool returns an error
+    /// instead of blocking when no channel is installed. A host that can
+    /// prompt installs its sender before the first run (or between runs) —
+    /// every tool dispatch reads the slot live, so a later installation
+    /// affects subsequent dispatches immediately. Cloning
     /// [`RunnerContext`] shares the same slot.
-    pub question_tx: Arc<Mutex<Option<mpsc::Sender<QuestionRequest>>>>,
+    pub question_tx: Arc<Mutex<Option<UnboundedSender<QuestionRequest>>>>,
 
     /// Whether the search and walk tools confine paths to [`cwd`](Self::cwd).
     ///
@@ -113,21 +115,33 @@ impl RunnerContext {
 
     /// Install the channel tools use to ask the user interactive questions.
     ///
-    /// Builder-style companion to [`new`](Self::new). The sender half goes
-    /// here, where the asking tool reaches it through the shared slot; the
+    /// Builder-style companion to [`new`](Self::new), delegating to
+    /// [`install_question_tx`](Self::install_question_tx). The sender half
+    /// goes into the shared slot, where the asking tool reaches it; the
     /// receiver half stays with the UI, which renders the questions and
     /// answers each one over its response channel. Replaces any channel a
     /// previous call installed.
     #[must_use]
-    pub fn with_question_tx(
-        self,
-        tx: std::sync::mpsc::Sender<crate::question::QuestionRequest>,
-    ) -> Self {
+    pub fn with_question_tx(self, tx: UnboundedSender<QuestionRequest>) -> Self {
+        self.install_question_tx(tx);
+        self
+    }
+
+    /// Install the channel tools use to ask the user interactive questions.
+    ///
+    /// The over-the-slot half of [`with_question_tx`](Self::with_question_tx),
+    /// for a host that holds only a borrow or a clone of the context and so
+    /// cannot consume it — a supervisor task that rebuilds the asking path
+    /// after its channel's reader is gone installs each replacement here.
+    /// Every tool dispatch reads the slot live, so a replacement takes
+    /// effect on the next call. Replaces any channel a previous install put
+    /// in the slot, dropping it — which closes the channel its reader was
+    /// parked on.
+    pub fn install_question_tx(&self, tx: UnboundedSender<QuestionRequest>) {
         *self
             .question_tx
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tx);
-        self
     }
 }
 
@@ -341,7 +355,7 @@ mod tests {
         // asking tool uses.
         assert!(sample().question_tx.lock().expect("slot").is_none());
 
-        let (tx, rx) = mpsc::channel::<QuestionRequest>();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<QuestionRequest>();
         let rc = RunnerContext {
             question_tx: Arc::new(Mutex::new(Some(tx))),
             ..sample()
@@ -394,7 +408,7 @@ mod tests {
         // The slot holds an mpsc::Sender, which is not Debug; the Debug impl
         // must report presence as a bool rather than the channel itself.
         let with_tx = {
-            let (tx, _rx) = mpsc::channel::<QuestionRequest>();
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<QuestionRequest>();
             RunnerContext {
                 question_tx: Arc::new(Mutex::new(Some(tx))),
                 ..sample()

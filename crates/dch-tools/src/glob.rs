@@ -748,9 +748,10 @@ mod integration_tests {
         assert!(tool.is_read_only());
         assert!(tool.is_concurrency_safe());
         assert_eq!(tool.name(), "Glob");
-        let reg = crate::registry::builtin_registry(&loopctl::tool::builtin::fs::FileSession::new(
-            std::path::PathBuf::from("."),
-        ));
+        let reg = crate::registry::builtin_registry(
+            &loopctl::tool::builtin::fs::FileSession::new(std::path::PathBuf::from(".")),
+            crate::registry::ReadWindows::default(),
+        );
         assert!(reg.get("Glob").is_some(), "Glob registered");
     }
 }

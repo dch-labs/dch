@@ -1169,9 +1169,10 @@ mod tests {
         assert!(LspTool.is_read_only());
         assert!(LspTool.is_concurrency_safe());
         assert!(LspTool.system_prompt().is_some());
-        let reg = crate::registry::builtin_registry(&loopctl::tool::builtin::fs::FileSession::new(
-            std::path::PathBuf::from("."),
-        ));
+        let reg = crate::registry::builtin_registry(
+            &loopctl::tool::builtin::fs::FileSession::new(std::path::PathBuf::from(".")),
+            crate::registry::ReadWindows::default(),
+        );
         assert!(reg.get("LSP").is_some(), "registered");
     }
 

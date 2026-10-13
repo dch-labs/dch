@@ -671,12 +671,9 @@ mod tests {
     // ---- MessageAnalysis + analyze_message tests ----
     //
     // The pure logic (MessageAnalysis::tech_profiles — does "rust" resolve to
-    // the right profile?) is tested directly below. The full analyze_message
-    // integration (does the LLM round-trip work end to end?) is #[ignore]'d
-    // because loopctl's MockApiClient does not yet honor the response_format
-    // option that StructuredOutput requires (the default
-    // create_message_with_options rejects it). That's a loopctl gap to file;
-    // when MockApiClient supports response_format, un-ignore these.
+    // the right profile?) is tested directly below. The round trips below
+    // exercise the whole call: the mock client stands in for the API and
+    // serves the canned answer to the structured request the tool makes.
 
     #[test]
     fn tech_profiles_from_coding_intent() {
@@ -748,7 +745,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "until MockApiClient supports response_format (loopctl gap)"]
     async fn analyze_message_round_trip_with_mock() {
         let client = loopctl::testing::MockApiClient::new("test-model")
             .with_text_response(r#"{"suggested_role":"coding","languages":["rust"]}"#);
@@ -758,7 +754,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "until MockApiClient supports response_format (loopctl gap)"]
     async fn analyze_message_error_is_graceful() {
         let client = loopctl::testing::MockApiClient::new("test-model").with_error("boom");
         let result = analyze_message(&client, "anything").await;
