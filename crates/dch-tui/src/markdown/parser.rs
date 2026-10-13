@@ -353,6 +353,21 @@ impl ComponentRoot {
 /// empty root — never a panic.
 #[must_use]
 pub fn parse_markdown(content: &str, width: u16) -> ComponentRoot {
+    // The grammar parser guards itself against deep recursion by
+    // probing the remaining native stack, and that probe misreads a
+    // fully static build's main-thread bounds — reporting a sliver
+    // where there is plenty, which refuses every parse outright.
+    // Running the parse on a grown segment hands the probe a fresh,
+    // honestly-measurable stack while keeping the guard it exists
+    // for.
+    stacker::grow(512 * 1024, || parse_markdown_on_stack(content, width))
+}
+
+/// The parse itself, on whatever stack the caller secured.
+///
+/// Split from [`parse_markdown`] so the segment growth wraps the
+/// whole guarded descent; the body is the plain parser entry.
+fn parse_markdown_on_stack(content: &str, width: u16) -> ComponentRoot {
     let root: Pairs<'_, Rule> = if let Ok(file) = MdParser::parse(Rule::txt, content) {
         file
     } else {
@@ -399,10 +414,12 @@ struct ParseNode {
     ///
     /// The collapsed discriminant the word classification and builders dispatch on.
     kind: MdParseEnum,
+
     /// The node's matched text, post-processed per rule kind.
     ///
     /// Code lines keep expanded tabs; other rules fold newlines to spaces.
     content: String,
+
     /// Child nodes, innermost last.
     ///
     /// Leaves are the leaf collector's input; wrappers exist to be descended.

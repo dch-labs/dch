@@ -9,6 +9,10 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use super::word::{MetaData, Word, WordType};
 
 /// Block-level node kinds in markdown.
+///
+/// One variant per construct the parser emits; the layout transform
+/// and the renderer dispatch on this discriminant, and the `Table`
+/// variant carries the fitted geometry the two passes recorded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TextNode {
     /// A paragraph of flowing text.
@@ -149,24 +153,37 @@ impl TextComponent {
     }
 
     /// The block's kind.
+    ///
+    /// Selects the layout transform the component re-runs on a width
+    /// change and how the renderer paints the block.
     #[must_use]
     pub fn kind(&self) -> &TextNode {
         &self.kind
     }
 
     /// The component's rows of words, each row one visual line.
+    ///
+    /// Reshaped by the layout transform at the current width; the
+    /// renderer projects each row's words into one styled line.
     #[must_use]
     pub fn content(&self) -> &Vec<Vec<Word>> {
         &self.content
     }
 
     /// The component's non-renderable metadata words.
+    ///
+    /// Languages, list kinds, indents, and column counts live here
+    /// rather than in the renderable rows; the layout passes read them
+    /// back out by kind.
     #[must_use]
     pub fn meta_info(&self) -> &[Word] {
         &self.meta_info
     }
 
     /// The component's visual height at the last transform.
+    ///
+    /// The row count the current width produced; recomputed by every
+    /// [`transform`](Self::transform) call.
     #[must_use]
     pub fn height(&self) -> u16 {
         self.height
@@ -401,7 +418,12 @@ fn transform_codeblock(component: &mut TextComponent) {
 ///
 /// Ordered items are renumbered from one per nesting level, which is
 /// what repairs the all-ones numbering models emit; indentation comes
-/// from the indent words recorded in the component's metadata.
+/// from the indent words recorded in the component's metadata. A word
+/// wider than the content width a hanging line can spend — a long
+/// path, URL, or hash inside an item — hard-splits at character
+/// boundaries like [`word_wrapping`] does for paragraphs, every chunk
+/// row carrying the same hanging indent so the split token still reads
+/// as part of its item.
 fn transform_list(component: &mut TextComponent, width: u16) {
     let width = width as usize;
     let mut lines: Vec<Vec<Word>> = Vec::new();
@@ -462,12 +484,31 @@ fn transform_list(component: &mut TextComponent, width: u16) {
                 " ".repeat(indent.saturating_add(2).saturating_add(extra_indent))
             };
 
-            let filler = Word::new(filler_content, WordType::Normal);
+            let hanging = display_width(&filler_content);
             lines.push(std::mem::take(&mut line));
             let trimmed = word.content().trim_start().to_owned();
-            word.set_content(trimmed);
-            len = display_width(word.content()).saturating_add(display_width(filler.content()));
-            line = vec![filler, word.clone()];
+            if display_width(&trimmed).saturating_add(hanging) < width {
+                let filler = Word::new(filler_content, WordType::Normal);
+                word.set_content(trimmed);
+                len = display_width(word.content()).saturating_add(hanging);
+                line = vec![filler, word.clone()];
+            } else {
+                let budget = width.saturating_sub(hanging).max(1);
+                let kind = word.kind();
+                let mut remaining = trimmed;
+                loop {
+                    let (head, tail) = split_by_width(&remaining, budget);
+                    let filler = Word::new(filler_content.clone(), WordType::Normal);
+                    let chunk = Word::new(head, kind);
+                    if tail.is_empty() {
+                        len = display_width(chunk.content()).saturating_add(hanging);
+                        line = vec![filler, chunk];
+                        break;
+                    }
+                    lines.push(vec![filler, chunk]);
+                    remaining = tail;
+                }
+            }
         }
     }
     lines.push(line);

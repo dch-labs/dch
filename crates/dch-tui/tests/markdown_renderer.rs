@@ -426,3 +426,192 @@ fn truncated_wide_cells_keep_their_column_alignment() {
         "every table line must share one width, got {widths:?}"
     );
 }
+
+#[test]
+fn a_list_item_hard_splits_a_word_wider_than_the_width() {
+    let path = "/very/long/path/to/some/deeply/nested/directory/structure/file_name.rs";
+    let lines = render(&format!("- see {path} for details"), 30);
+    assert!(!lines.is_empty());
+    for line in &lines {
+        assert!(
+            line_width(line) <= 30,
+            "list line exceeds 30: {:?}",
+            joined(line)
+        );
+    }
+    let reconstructed: String = lines
+        .iter()
+        .map(|l| joined(l).trim().to_string())
+        .collect::<String>();
+    assert!(
+        reconstructed.starts_with("• see"),
+        "the marker row leads the item: {reconstructed:?}"
+    );
+    assert!(
+        reconstructed.contains(path),
+        "the split token survives contiguously across its chunk rows: {reconstructed:?}"
+    );
+    assert!(
+        lines.iter().skip(1).any(|l| joined(l).starts_with("  ")),
+        "continuation rows carry the hanging indent: {:?}",
+        lines.iter().map(joined).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn an_ordered_list_item_hard_splits_a_wide_token() {
+    let path = "/very/long/path/to/some/deeply/nested/directory/structure/file_name.rs";
+    let lines = render(&format!("1. see {path} for details"), 30);
+    for line in &lines {
+        assert!(
+            line_width(line) <= 30,
+            "ordered list line exceeds 30: {:?}",
+            joined(line)
+        );
+    }
+    let reconstructed: String = lines
+        .iter()
+        .map(|l| joined(l).trim().to_string())
+        .collect::<String>();
+    assert!(
+        reconstructed.starts_with("1. see"),
+        "renumbering survives the split: {reconstructed:?}"
+    );
+    assert!(
+        reconstructed.contains(path),
+        "the split token survives contiguously: {reconstructed:?}"
+    );
+}
+
+#[test]
+fn a_nested_list_item_hard_splits_within_its_indent() {
+    let path = "/very/long/path/to/some/deeply/nested/directory/structure/file_name.rs";
+    let lines = render(&format!("- outer\n  - inner {path}"), 40);
+    for line in &lines {
+        assert!(
+            line_width(line) <= 40,
+            "nested list line exceeds 40: {:?}",
+            joined(line)
+        );
+    }
+    let reconstructed: String = lines
+        .iter()
+        .map(|l| joined(l).trim().to_string())
+        .collect::<String>();
+    assert!(
+        reconstructed.contains(path),
+        "the nested token survives contiguously: {reconstructed:?}"
+    );
+}
+
+#[test]
+fn a_fitting_list_item_stays_on_one_line() {
+    let lines = render("- one two three", 40);
+    assert_eq!(lines.len(), 1, "no split when the item fits");
+    assert_eq!(joined(&lines[0]), "• one two three");
+}
+
+fn code_source(line: &Line<'_>) -> String {
+    let text = joined(line);
+    let text = text.as_str();
+    let text = text.strip_prefix(' ').unwrap_or(text);
+    let text = text.strip_prefix("↪ ").unwrap_or(text);
+    let text = text.strip_suffix(' ').unwrap_or(text);
+    text.to_string()
+}
+
+#[test]
+fn a_wide_code_line_soft_wraps_onto_continuation_rows() {
+    let source = "a".repeat(60);
+    let lines = render(&format!("```text\n{source}\n```"), 30);
+    assert!(lines.len() >= 3, "60 columns wrap at a 30-column pane");
+    for line in &lines {
+        assert!(
+            line_width(line) <= 30,
+            "code row exceeds 30: {:?}",
+            joined(line)
+        );
+    }
+    assert!(
+        joined(&lines[0]).starts_with(' ') && joined(&lines[0]).ends_with(' '),
+        "the first row keeps its panel padding: {:?}",
+        joined(&lines[0])
+    );
+    for line in lines.iter().skip(1) {
+        assert!(
+            joined(line).starts_with(" ↪ "),
+            "continuation rows carry the marker: {:?}",
+            joined(line)
+        );
+    }
+    let reconstructed: String = lines.iter().map(code_source).collect();
+    assert_eq!(reconstructed, source, "wrapping drops no characters");
+}
+
+#[test]
+fn code_soft_wrapping_preserves_every_source_line() {
+    let long = "b".repeat(45);
+    let source = format!("{long}\n\nshort");
+    let lines = render(&format!("```text\n{source}\n```"), 30);
+    for line in &lines {
+        assert!(
+            line_width(line) <= 30,
+            "code row exceeds 30: {:?}",
+            joined(line)
+        );
+    }
+    let mut reconstructed = String::new();
+    for line in &lines {
+        if joined(line).starts_with(" ↪ ") {
+            reconstructed.push_str(&code_source(line));
+        } else {
+            reconstructed.push('\n');
+            reconstructed.push_str(&code_source(line));
+        }
+    }
+    let reconstructed = reconstructed.trim_start_matches('\n').to_string();
+    assert_eq!(reconstructed, source, "wrapping reorders nothing");
+}
+
+#[test]
+fn an_empty_code_line_renders_one_blank_panel_row() {
+    let lines = render("```text\na\n\nb\n```", 80);
+    let blanks: Vec<&Line<'_>> = lines
+        .iter()
+        .filter(|l| joined(l).trim().is_empty())
+        .collect();
+    assert_eq!(blanks.len(), 1, "one blank panel row per empty source line");
+    assert_eq!(line_width(blanks[0]), 2, "the blank row is the two pads");
+}
+
+#[test]
+#[cfg(feature = "syntax-highlight")]
+fn a_split_highlighted_span_keeps_its_style_across_the_break() {
+    let literal = format!("\"{}\"", "x".repeat(50));
+    let source = format!("let s = {literal};");
+    let lines = render(&format!("```rust\n{source}\n```"), 30);
+    for line in &lines {
+        assert!(
+            line_width(line) <= 30,
+            "highlighted code row exceeds 30: {:?}",
+            joined(line)
+        );
+    }
+    let spans: Vec<&ratatui::text::Span> = lines.iter().flat_map(|l| l.spans.iter()).collect();
+    let head = spans
+        .iter()
+        .find(|s| s.content.starts_with('"') && s.content.len() > 1)
+        .expect("the literal's head renders");
+    let tail = spans
+        .iter()
+        .find(|s| s.content.contains('"') && s.content.ends_with('"'))
+        .expect("the literal's tail renders");
+    assert!(
+        head.content != tail.content,
+        "the literal actually split across rows"
+    );
+    assert_eq!(
+        head.style.fg, tail.style.fg,
+        "both pieces of the split span keep one style"
+    );
+}
