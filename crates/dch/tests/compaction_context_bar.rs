@@ -128,7 +128,8 @@ async fn the_context_figure_refreshes_the_moment_a_pass_lands() {
         .flatten();
     assert_eq!(
         recorded_compactor, serving_stage,
-        "the record names the stage that served the pass — the transcript's          compactor field is populated from the serving-stage report"
+        "the record names the stage that served the pass — the transcript's \
+         compactor field is populated from the serving-stage report"
     );
     assert!(
         tokens_after < 40_000,

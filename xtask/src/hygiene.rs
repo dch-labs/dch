@@ -51,10 +51,15 @@ pub struct IndexView<'a> {
     /// ignored, the state an ignore rule can never undo on its own.
     pub staged_and_ignored: &'a [String],
 
-    /// Paths in neither the index nor the ignore set.
+    /// Paths a commit omits silently: untracked files and the
+    /// untracked files the ignore rules also match.
     ///
-    /// Untracked files, which a commit omits silently — unlike a missing
-    /// source file, nothing fails to build when one of them is left out.
+    /// The standard untracked list excludes ignored paths, so an
+    /// ignore rule covering a new integration test or fixture would
+    /// hide it from the pin rule — the rule reads this union instead:
+    /// both halves name work the index does not hold. Unlike a
+    /// missing source file, nothing fails to build when one of them
+    /// is left out.
     pub untracked: &'a [String],
 }
 
@@ -171,7 +176,7 @@ fn is_pin_path(path: &str) -> bool {
     in_test_tree || (at_root && is_record)
 }
 
-/// Ask `git` for one list of paths, one per line.
+/// Ask `git` for one list of paths, NUL-separated.
 ///
 /// The returned error is the text the caller prints verbatim, naming the
 /// `git` invocation that failed and what it reported.
@@ -183,22 +188,57 @@ fn is_pin_path(path: &str) -> bool {
 /// not be consulted" exit rather than a violation, because a toolchain
 /// problem must not read as a clean index.
 fn git_listed(args: &[&str]) -> Result<Vec<String>, String> {
+    let mut invocation = vec!["ls-files", "-z"];
+    invocation.extend_from_slice(args);
     let output = Command::new("git")
-        .args(args)
+        .args(&invocation)
         .output()
-        .map_err(|e| format!("failed to spawn `git {}`: {e}", args.join(" ")))?;
+        .map_err(|spawn_err| {
+            format!(
+                "failed to spawn `git {}`: {spawn_err}",
+                invocation.join(" ")
+            )
+        })?;
     if !output.status.success() {
         return Err(format!(
             "`git {}` failed: {}",
-            args.join(" "),
+            invocation.join(" "),
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect())
+    Ok(nul_listed(&output.stdout))
+}
+
+/// Split a `-z` path listing into owned paths.
+///
+/// `git` quotes paths with non-ASCII or special bytes in the
+/// line-oriented form (`"crates/\303\251llo.rs"`), and a quoted path
+/// no longer matches the prefixes the pin rule reads — the `-z` form
+/// is raw by construction, so this split is the guarantee the rule
+/// sees the path as spelled. Empty segments (the trailing NUL) drop
+/// out.
+fn nul_listed(output: &[u8]) -> Vec<String> {
+    output
+        .split(|byte| *byte == 0)
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| String::from_utf8_lossy(segment).into_owned())
+        .collect()
+}
+
+/// Union the two untracked halves into one list for the pin rule.
+///
+/// The standard query excludes ignored paths; the ignored-untracked
+/// query carries exactly those. Order preserves the standard half
+/// first, and a path in both (impossible from git, defensive here)
+/// appears once.
+fn merge_untracked(standard: &[String], ignored: &[String]) -> Vec<String> {
+    let mut merged = standard.to_vec();
+    for path in ignored {
+        if !merged.contains(path) {
+            merged.push(path.clone());
+        }
+    }
+    merged
 }
 
 /// Runs the hygiene check over this repository and reports the verdict.
@@ -208,20 +248,33 @@ fn git_listed(args: &[&str]) -> Result<Vec<String>, String> {
 /// `1` when a rule is violated, and `3` when `git` could not be consulted —
 /// an unreadable repository must not read as a clean one.
 pub fn run_check() -> ExitCode {
-    let staged = match git_listed(&["ls-files", "-i", "-c", "--exclude-standard"]) {
+    let staged = match git_listed(&["-i", "-c", "--exclude-standard"]) {
         Ok(paths) => paths,
         Err(message) => {
             eprintln!("xtask: {message}");
             return ExitCode::from(3);
         }
     };
-    let untracked = match git_listed(&["ls-files", "--others", "--exclude-standard"]) {
+    let untracked_standard = match git_listed(&["--others", "--exclude-standard"]) {
         Ok(paths) => paths,
         Err(message) => {
             eprintln!("xtask: {message}");
             return ExitCode::from(3);
         }
     };
+    // The ignored-untracked half: without it, an ignore rule covering
+    // a new integration test or fixture would hide the file from the
+    // pin rule — exactly the work the rule exists to notice. Entries
+    // collapse to directories so an ignored build tree costs one row.
+    let untracked_ignored =
+        match git_listed(&["--others", "--exclude-standard", "-i", "--directory"]) {
+            Ok(paths) => paths,
+            Err(message) => {
+                eprintln!("xtask: {message}");
+                return ExitCode::from(3);
+            }
+        };
+    let untracked = merge_untracked(&untracked_standard, &untracked_ignored);
 
     let view = IndexView {
         staged_and_ignored: &staged,
@@ -369,6 +422,52 @@ mod tests {
             violations.is_empty(),
             "work in progress and a nested file borrowing a record's name are not index \
              problems: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn nul_splitting_reads_non_ascii_paths_raw() {
+        // The line-oriented form would quote this path, and a quoted
+        // path matches no prefix the pin rule reads — the -z split is
+        // what keeps the rule seeing the path as spelled.
+        let bytes = b"crates/dch/tests/h\xc3\xa9llo.rs\0notes.md\0";
+        let listed = nul_listed(bytes);
+        assert_eq!(
+            listed,
+            vec![
+                "crates/dch/tests/h\u{e9}llo.rs".to_string(),
+                "notes.md".to_string()
+            ],
+            "raw segments split on NUL, trailing separator dropped"
+        );
+        let first = listed.first().map(String::as_str).unwrap_or_default();
+        assert!(
+            is_pin_path(first),
+            "the quoted-in-line form's path flags as a pin once read raw"
+        );
+    }
+
+    #[test]
+    fn an_ignored_untracked_test_still_flags() {
+        // The ignore rules cover a new fixture tree; the standard
+        // untracked query never lists it. The union keeps it in front
+        // of the pin rule, so the coverage a commit claims cannot be
+        // hidden behind an ignore rule.
+        let standard = paths(&["scratch/notes.txt"]);
+        let ignored = paths(&["crates/dch/tests/fixtures/frozen-705aa92c/"]);
+        let untracked = merge_untracked(&standard, &ignored);
+        let violations = Checker::new(&IndexView {
+            staged_and_ignored: &[],
+            untracked: &untracked,
+        })
+        .check();
+        assert_eq!(
+            violations
+                .iter()
+                .map(|v| v.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["crates/dch/tests/fixtures/frozen-705aa92c/"],
+            "an ignored untracked fixture tree still names its violation"
         );
     }
 

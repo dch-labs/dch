@@ -1584,9 +1584,9 @@ impl TuiApp {
             }
             Event::Mouse(mouse) => self.handle_mouse(*mouse),
             Event::Paste(text) => {
-                if self.pending_permissions.front().is_some() {
-                    // The overlay owns the keyboard; a paste behind it
-                    // must not seed the composer invisibly.
+                if self.pending_permissions.front().is_some()
+                    || self.pending_questions.front().is_some()
+                {
                     return true;
                 }
                 self.caret_blink.resolidify();

@@ -547,10 +547,14 @@ pub enum HealthNotice {
     /// engine's retry decision; the attempt-reset cue refines the
     /// entry with the attempt number once the retry is certain.
     Retrying {
-        /// The attempt the stream is entering, 1-indexed.
+        /// The retry the stream is entering, 1-indexed against the
+        /// ladder's retry budget.
         ///
         /// `None` until the retry starts — the failure cue fires
-        /// before the engine decides whether to retry at all.
+        /// before the engine decides whether to retry at all. Once
+        /// set, the value is the same index the reconnection row
+        /// prints: one less than the 1-indexed attempt the handler
+        /// reports, so no two surfaces disagree by one.
         attempt: Option<usize>,
     },
     /// A retried stream recovered.
@@ -896,12 +900,16 @@ impl LoopObserver for TuiObserver {
 
     fn on_attempt_reset(&self, ctx: &AttemptResetContext) {
         self.discard_live_streams(ctx.turn);
-        *recover(&self.state.health) = HealthNotice::Retrying {
-            attempt: Some(ctx.attempt),
-        };
         let max = loopctl::stream::handler::StreamRetryConfig::default().max_retries;
         let max = usize::try_from(max).unwrap_or(usize::MAX);
+        // The retry index the row prints — one less than the 1-indexed
+        // attempt the handler reports, clamped to the ladder's budget —
+        // is the one number every surface carries; a raw attempt here
+        // would read one higher than the row beside it.
         let attempt = ctx.attempt.saturating_sub(1).min(max);
+        *recover(&self.state.health) = HealthNotice::Retrying {
+            attempt: Some(attempt),
+        };
         let episode = recover(&self.state.retry_episode);
         if let Some(episode) = *episode {
             recover(&self.state.retry_lines).push(RetryLine {

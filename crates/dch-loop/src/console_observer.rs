@@ -86,6 +86,13 @@ pub struct ConsoleObserver {
     /// convention); the observer never re-probes the environment.
     use_color: bool,
 
+    /// How many compaction passes have landed, process-wide.
+    ///
+    /// Bumped on every settled pass; the headless save path reads the
+    /// total so the machine snapshot's compaction count stays truthful
+    /// about a session the transcript beside it cannot witness.
+    compactions: std::sync::Arc<std::sync::atomic::AtomicU32>,
+
     /// Stdout sink: the model's text.
     ///
     /// Streamed deltas and whole-turn responses both land here, serialized
@@ -169,7 +176,29 @@ impl ConsoleObserver {
             input_tokens: AtomicU64::new(0),
             output_tokens: AtomicU64::new(0),
             cached_tokens: AtomicU64::new(0),
+            compactions: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
         }
+    }
+
+    /// How many compaction passes have landed so far.
+    ///
+    /// The count the headless machine snapshot saves beside its
+    /// history: cumulative over the process's life, so a snapshot
+    /// taken after several passes carries the total.
+    #[must_use]
+    pub fn compaction_count(&self) -> u32 {
+        self.compactions.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// A handle on the observer's compaction counter.
+    ///
+    /// The headless run outlives the observer's own borrow sites: the
+    /// save path reads the total after the runner has finished, so
+    /// construction hands this clone out with the built runner and
+    /// the count survives without keeping the observer alive.
+    #[must_use]
+    pub fn compaction_counter(&self) -> std::sync::Arc<std::sync::atomic::AtomicU32> {
+        std::sync::Arc::clone(&self.compactions)
     }
 
     /// Whether ANSI color should be emitted for this terminal.
@@ -334,6 +363,8 @@ impl LoopObserver for ConsoleObserver {
     /// Verbose only: the before/after totals explain why earlier context
     /// stopped being visible to the model.
     fn on_compaction(&self, ctx: &CompactedContext) {
+        self.compactions
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.history_compacted(ctx.tokens_before, ctx.tokens_after);
     }
 
@@ -867,6 +898,9 @@ mod tests {
 
     #[test]
     fn quiet_lifecycle_notes_stay_silent() {
+        // Detail chrome hides at Quiet: the notes the Verbose pin prints
+        // must leave stderr entirely empty, or the model's text is no
+        // longer the only thing stdout carries.
         let h = Harness::build(Verbosity::Quiet, false);
         h.observer.history_compacted(12_000, 4_000);
         h.observer

@@ -169,9 +169,17 @@ pub fn init_terminal(mouse_capture: bool) -> io::Result<Terminal<CrosstermBacken
 /// deadline before the event reader starts, and typed-ahead input in
 /// that window is gated, not blindly consumed (the query's own doc
 /// records the accepted residual).
-pub fn sync_default_background(background: Color) {
+///
+/// Returns whether the override landed: `true` when the terminal
+/// answered and its default background now carries the theme's
+/// canvas; `false` when it stayed silent or the canvas is not RGB.
+/// A caller whose palette assumes the canvas must read `false` as
+/// "defer to the terminal" — the palette's terminal-background
+/// colors were chosen against the theme's canvas, which this
+/// terminal is not showing.
+pub fn sync_default_background(background: Color) -> bool {
     let Color::Rgb(red, green, blue) = background else {
-        return;
+        return false;
     };
     #[cfg(unix)]
     if let Some(original) = query_default_background() {
@@ -183,11 +191,13 @@ pub fn sync_default_background(background: Color) {
             background_sequence((red, green, blue))
         ));
         drop(stdout.flush());
+        return true;
     }
     #[cfg(not(unix))]
     {
         let _ = (red, green, blue);
     }
+    false
 }
 
 /// The OSC 11 sequence that points the terminal's default background
@@ -515,7 +525,14 @@ extern "C" fn fatal_signal_restore_handler(
     info: *mut libc::siginfo_t,
     context: *mut libc::c_void,
 ) {
-    if SIGNAL_RESTORE_DEAF.load(Ordering::SeqCst) {
+    let chain = if signal == libc::SIGINT {
+        &CHAINED_SIGINT
+    } else {
+        &CHAINED_SIGTERM
+    };
+    let previous = chain.load(Ordering::SeqCst);
+    let action = disposition_action(previous);
+    if SIGNAL_RESTORE_DEAF.load(Ordering::SeqCst) || action == DispositionAction::RestoreAndExit {
         // SAFETY: the byte string and termios statics were captured at
         // arm time; the call only touches raw fds and process state.
         unsafe { run_signal_restore() };
@@ -523,13 +540,7 @@ extern "C" fn fatal_signal_restore_handler(
         // process's terminal is already restored.
         unsafe { libc::_exit(130) };
     }
-    let chain = if signal == libc::SIGINT {
-        &CHAINED_SIGINT
-    } else {
-        &CHAINED_SIGTERM
-    };
-    let previous = chain.load(Ordering::SeqCst);
-    if chains_to_previous(previous) {
+    if action == DispositionAction::Chain {
         type ChainedHandler =
             unsafe extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void);
         // SAFETY: the value was stored from a sigaction handoff at arm
@@ -542,18 +553,60 @@ extern "C" fn fatal_signal_restore_handler(
     }
 }
 
-/// Whether a displaced `sa_sigaction` value names a callable handler.
+/// What the live-phase handler does with a displaced disposition.
 ///
 /// The kernel encodes the two non-handler dispositions as the small
 /// integers `SIG_DFL` (0) and `SIG_IGN` (1); anything above them is a
-/// function address. Chaining to a sentinel would call a non-address
-/// as code — an inherited-ignored disposition that reached the arm
-/// because the cooperative bridge could not install its listener is
-/// the concrete case — so the live-phase handler honors the inherited
-/// ignore instead and simply returns.
+/// function address. Each encoding has its own duty: a real handler
+/// is chained to (the tokio bridge's listener, so cooperative
+/// cancellation keeps working); an inherited ignore is honored by
+/// returning silently; and a displaced default — which meant
+/// "terminate the process" before this handler was armed — is
+/// restored-and-exited exactly like the deaf phase, so a session the
+/// bridge never registered for can still be stopped by SIGTERM or
+/// Ctrl-C instead of surviving the signal that should have ended it.
 #[cfg(unix)]
-fn chains_to_previous(sa_sigaction: usize) -> bool {
-    sa_sigaction > 1
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DispositionAction {
+    /// Chain to the displaced handler.
+    ///
+    /// The live phase's ordinary case: the tokio bridge owned the
+    /// signal before arming, and handing the kernel's arguments back
+    /// keeps cooperative cancellation working.
+    Chain,
+    /// Honor an inherited `SIG_IGN`: return without acting.
+    ///
+    /// The process inherited silence for this signal, so the handler
+    /// adds none — the case of a launch that ignored the signal and a
+    /// bridge whose listener never registered.
+    HonorIgnore,
+    /// Restore the terminal and exit 130, as the deaf phase does.
+    ///
+    /// The displaced default meant "terminate the process", so
+    /// honoring it means leaving cleanly with the terminal restored —
+    /// not swallowing the SIGTERM or Ctrl-C that should have ended
+    /// the session.
+    RestoreAndExit,
+}
+
+/// Map a displaced `sa_sigaction` value to its [`DispositionAction`].
+///
+/// Pure over the raw disposition word so the pin drives every
+/// encoding without arming anything: the kernel's sentinel integers
+/// name the two special duties, and any other value is a handler
+/// address to chain to.
+#[cfg(unix)]
+fn disposition_action(sa_sigaction: usize) -> DispositionAction {
+    match sa_sigaction {
+        0 => DispositionAction::RestoreAndExit,
+        1 => DispositionAction::HonorIgnore,
+        address => {
+            // Real handler addresses sit far above both sentinels; the
+            // binding exists only to name that any other value is one.
+            let _ = address;
+            DispositionAction::Chain
+        }
+    }
 }
 
 /// Replace one signal's disposition with the fatal-restore handler,
@@ -809,22 +862,31 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn the_chain_guard_refuses_both_disposition_sentinels() {
+    fn each_displaced_disposition_gets_its_own_action() {
         // SIG_DFL (0) and SIG_IGN (1) are encodings, not addresses:
-        // an inherited-ignored launch whose bridge registration failed
-        // arms with the 1, and transmuting that into a call would
-        // fault. Real handler addresses sit far above both sentinels.
-        assert!(
-            !chains_to_previous(0),
-            "SIG_DFL names no handler to chain to"
+        // transmuting either into a call would fault. But they are not
+        // the same duty — a displaced default meant "terminate", so
+        // the handler restores and exits rather than swallowing the
+        // signal; an inherited ignore is honored silently; real
+        // handler addresses sit far above both sentinels and chain.
+        assert_eq!(
+            disposition_action(0),
+            DispositionAction::RestoreAndExit,
+            "SIG_DFL displaced is honored as the termination it named"
         );
-        assert!(
-            !chains_to_previous(1),
-            "SIG_IGN names no handler to chain to"
+        assert_eq!(
+            disposition_action(1),
+            DispositionAction::HonorIgnore,
+            "SIG_IGN displaced is honored as the silence it named"
         );
-        assert!(chains_to_previous(2), "the lowest real address chains");
-        assert!(
-            chains_to_previous(0x5555_5555_5000),
+        assert_eq!(
+            disposition_action(2),
+            DispositionAction::Chain,
+            "the lowest real address chains"
+        );
+        assert_eq!(
+            disposition_action(0x5555_5555_5000),
+            DispositionAction::Chain,
             "a typical PIE handler address chains"
         );
     }

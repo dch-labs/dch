@@ -6206,6 +6206,33 @@ fn a_paste_behind_a_pending_prompt_lands_nowhere() {
 }
 
 #[test]
+fn a_paste_behind_a_pending_question_lands_nowhere() {
+    // The question overlay owns the composer exactly as the permission
+    // overlay does — the caret is hidden and the draft invisible — so
+    // a paste while it is up must not seed text the user finds later.
+    let (mut app, _replies) = question_app(&[StagedQuestion {
+        question: "Deploy the release now?",
+        options: &[("yes", None), ("no", None)],
+        multi_select: false,
+    }]);
+    assert!(app.handle_event(&Event::Paste("pasted behind the question".to_string())));
+    assert_eq!(
+        app.input(),
+        "",
+        "a paste while a question is up must not reach the composer"
+    );
+
+    // Answer the question — the overlay retires — and pasting works.
+    assert!(app.handle_event(&plain(KeyCode::Enter)));
+    assert!(app.handle_event(&Event::Paste("after the answer".to_string())));
+    assert_eq!(
+        app.input(),
+        "after the answer",
+        "with the question gone, paste reaches the composer again"
+    );
+}
+
+#[test]
 fn a_click_behind_a_pending_prompt_leaves_the_hidden_caret_alone() {
     // The overlay hides the composer, but a click landing where the
     // composer sits would still move its caret — the draft would come

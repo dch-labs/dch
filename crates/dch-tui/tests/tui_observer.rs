@@ -137,6 +137,13 @@ fn an_attempt_reset_pushes_a_reconnection_row() {
         attempt: 3,
     });
     let lines = kept.retry_lines.lock().expect("the retry lock");
+    let health = kept.health.lock().expect("the health lock");
+    assert_eq!(
+        *health,
+        dch_tui::observer::HealthNotice::Retrying { attempt: Some(2) },
+        "the notice carries the same retry index the row prints — \
+         ctx.attempt is 1-indexed over attempts, the retry index is one less"
+    );
     assert_eq!(lines.len(), 2, "both retries queue: {lines:?}");
     let max = usize::try_from(loopctl::stream::handler::StreamRetryConfig::default().max_retries)
         .unwrap_or(usize::MAX);

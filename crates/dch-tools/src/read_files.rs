@@ -191,7 +191,10 @@ impl ReadFilesTool {
     /// is served. Each section is charged exactly the bytes it contributes,
     /// a failed read's wider header included, so the content a batch serves
     /// never exceeds the budget; the marker rows that follow exhaustion are
-    /// fixed-size and sit outside it.
+    /// fixed-size and sit outside it. A failed read is the one section
+    /// exempt from the fit check: its body is the error text, short by
+    /// construction and the fact the caller needs, so it is served even
+    /// past the line and the charge saturates the budget to zero.
     ///
     /// # Errors
     ///
@@ -255,7 +258,7 @@ impl ReadFilesTool {
                 .len()
                 .saturating_add(header.len())
                 .saturating_add(SECTION_TAIL.len());
-            if section_len > remaining {
+            if !failed && section_len > remaining {
                 remaining = 0;
                 Self::push_section(&mut body, &Self::section_header(path, false), OVER_BUDGET);
                 continue;
@@ -639,7 +642,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_read_too_big_for_the_budget_is_marked_not_served() {
+    async fn a_failed_read_too_big_for_the_budget_is_served_with_its_error() {
         let tmp = tempfile::TempDir::new().unwrap();
         let ctx = ctx_in(tmp.path());
         let whole = tool_over(tmp.path(), 0)
@@ -652,18 +655,28 @@ mod tests {
             "the unbudgeted form serves a failure under its marked header: {whole}"
         );
 
-        let marked = tool_over(tmp.path(), 16)
+        // A failure's body is its error text — short, and the one
+        // thing the model needs to act on — so the budget never
+        // replaces a failed section with the not-returned marker:
+        // that marker's remedy (read it with the Read tool) is a lie
+        // for a file that does not exist.
+        let served = tool_over(tmp.path(), 16)
             .call(json!({ "files": ["nope.rs"] }), &ctx)
             .await
             .unwrap()
             .text_content();
         assert!(
-            marked.contains("not returned"),
-            "a failure wider than the budget arrives as the marker: {marked}"
+            served.contains("(failed)"),
+            "a failure wider than the budget is still served under its \
+             marked header: {served}"
         );
         assert!(
-            !marked.contains("(failed)"),
-            "the marker replaces the section rather than trailing it: {marked}"
+            served.contains("nope.rs"),
+            "the failed section names the file: {served}"
+        );
+        assert!(
+            !served.contains("not returned"),
+            "the marker never replaces a failure's own error text: {served}"
         );
     }
 

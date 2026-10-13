@@ -190,10 +190,9 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
     TerminalGuard::install_panic_hook();
     let (guard, mut terminal) =
         TerminalGuard::new(mouse_capture).map_err(|err| format!("terminal init: {err}"))?;
-    // Render draws the grid on the terminal's default background;
-    // this points that default at the theme's canvas color for the
-    // session's lifetime, so the margin around the grid matches it.
-    dch_tui::sync_default_background(app.theme.ui.background);
+    if !dch_tui::sync_default_background(app.theme.ui.background) {
+        app.theme = app.theme.deferred_to_terminal();
+    }
     dch_tui::arm_fatal_signal_restore();
 
     let cancel = runner.cancel_signal();
@@ -202,20 +201,17 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
         app.set_run_canceller(Box::new(move || cancel_for_app.cancel()));
     }
     let shutting_down = Arc::new(AtomicBool::new(false));
-    // Adopted-only by design: a derived resume must never stamp the
-    // uncompacted derive-walk result fresh — that makes the oversized
-    // transcript a permanently adoptable machine half, and every later
-    // resume recompacts it. A derived pair stays stale until a run
-    // resolves and the driver writes the post-run history.
     if let Some(machine) = &resumed_machine {
         let adopted = Arc::new(machine.clone());
         *state
             .machine_history
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&adopted));
+        let compactions = recorded_compactions(app.conversation());
         initial_transcript.send_machine(MachineSnapshot {
             messages: adopted,
             saved_at: chrono::Utc::now(),
+            compactions,
         });
     }
     let driver = tokio::spawn(drive_submissions(
@@ -269,9 +265,11 @@ fn install_turn_end_hook(
                 .clone()
         });
         if let Some(history) = history {
+            let compactions = recorded_compactions(conversation);
             transcript_handle.send_machine(MachineSnapshot {
                 messages: history,
                 saved_at: chrono::Utc::now(),
+                compactions,
             });
         }
     }));
@@ -453,6 +451,31 @@ struct MachineSnapshot {
     ///
     /// Carried through to the file's `saved_at` unchanged.
     saved_at: chrono::DateTime<chrono::Utc>,
+
+    /// How many compaction passes the conversation had recorded when
+    /// this snapshot was published.
+    ///
+    /// Counted from the display transcript's Compacted rows — the
+    /// TUI transcript carries them, so the count and the rows agree;
+    /// the driver's post-run republish passes zero, which loses
+    /// nothing because the transcript's rows carry the exemption on
+    /// this path.
+    compactions: u32,
+}
+
+/// Count the compaction rows a conversation has recorded.
+///
+/// The TUI's machine snapshots source their compaction count from the
+/// display transcript's own Compacted rows, so the snapshot file and
+/// the transcript beside it always tell the guard the same story.
+fn recorded_compactions(conversation: &[dch_tui::TuiMessage]) -> u32 {
+    u32::try_from(
+        conversation
+            .iter()
+            .filter(|message| matches!(message, dch_tui::TuiMessage::Compacted { .. }))
+            .count(),
+    )
+    .unwrap_or(u32::MAX)
 }
 
 /// The writer's pending halves, newest-wins per half.
@@ -596,7 +619,11 @@ impl TranscriptWorker {
                     tracing::warn!(error = %err, "session transcript could not be saved");
                 }
                 if let Some(snapshot) = machine
-                    && let Err(err) = saver.save_machine(&snapshot.messages, snapshot.saved_at)
+                    && let Err(err) = saver.save_machine(
+                        &snapshot.messages,
+                        snapshot.saved_at,
+                        snapshot.compactions,
+                    )
                 {
                     tracing::warn!(error = %err, "machine history could not be saved");
                 }
@@ -760,9 +787,13 @@ async fn drive_submissions(
         let result = runner.run(&text).await;
         state.agent_running.store(false, Ordering::SeqCst);
         let resolved = Arc::new(runner.committed_history());
+        // Zero is lossless on this path: the display transcript's
+        // Compacted rows carry the exemption wherever this snapshot
+        // lands, and the driver has no conversation to count from.
         transcript.send_machine(MachineSnapshot {
             messages: Arc::clone(&resolved),
             saved_at: chrono::Utc::now(),
+            compactions: 0,
         });
         *state
             .machine_history
@@ -842,6 +873,7 @@ mod tests {
         handle.send_machine(MachineSnapshot {
             messages: Arc::new(Vec::new()),
             saved_at: chrono::Utc::now(),
+            compactions: 0,
         });
         worker.join();
         let (_, _, _, session_at) = crate::session::load_with_meta_in(id, &root).unwrap();

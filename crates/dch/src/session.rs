@@ -140,6 +140,18 @@ struct StoredMachine {
     /// — so seeding a new runner from it continues the session exactly
     /// where the process left off.
     messages: Vec<loopctl::message::Message>,
+
+    /// How many compaction passes the session had run when this
+    /// snapshot was taken.
+    ///
+    /// The display transcript is the usual witness — its Compacted
+    /// rows explain why the engine half is small — but a headless
+    /// session's transcript builder never records one, so the count
+    /// rides the snapshot itself and the resume guard reads it as the
+    /// same exemption. Absent in older files, reading as zero: a
+    /// pre-count snapshot never claims a compaction it cannot show.
+    #[serde(default)]
+    compactions: u32,
 }
 
 /// Errors arising while saving, loading, or listing sessions.
@@ -351,6 +363,7 @@ impl SessionSaver {
         &self,
         machine: &[loopctl::message::Message],
         saved_at: chrono::DateTime<chrono::Utc>,
+        compactions: u32,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let path = self.machine_path();
         let dir = path.parent().unwrap_or(Path::new("."));
@@ -359,6 +372,7 @@ impl SessionSaver {
             format: MACHINE_FORMAT.to_string(),
             saved_at,
             messages: machine.to_vec(),
+            compactions,
         };
         let json = serde_json::to_string(&stored)?;
         let mut temp = tempfile::NamedTempFile::new_in(dir)?;
@@ -523,7 +537,7 @@ pub(crate) fn load_machine_in(
     id: Uuid,
     base: &Path,
     session_saved_at: chrono::DateTime<chrono::Utc>,
-) -> Option<Vec<loopctl::message::Message>> {
+) -> Option<(Vec<loopctl::message::Message>, u32)> {
     let path = base.join(id.to_string()).join("machine.json");
     let json = match std::fs::read_to_string(&path) {
         Ok(json) => json,
@@ -560,7 +574,7 @@ pub(crate) fn load_machine_in(
         );
         return None;
     }
-    Some(stored.messages)
+    Some((stored.messages, stored.compactions))
 }
 
 /// Read and parse a transcript file into its full envelope.
@@ -1247,17 +1261,38 @@ mod tests {
     }
 
     #[test]
+    fn a_machine_snapshot_round_trips_its_compaction_count() {
+        // The count is the headless transcript's only compaction
+        // witness: what the saver writes is what the resume guard's
+        // exemption reads, and a pre-count file loads as zero.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let id = Uuid::new_v4();
+        write_envelope(dir.path(), id, stamp(10), &sample_messages());
+        saver(dir.path(), id)
+            .save_machine(&machine_history(), stamp(10), 3)
+            .expect("machine saved");
+        let restored = load_machine_in(id, dir.path(), stamp(10)).expect("a fresh pair loads");
+        assert_eq!(restored.1, 3, "the count survives the round trip");
+        assert_eq!(
+            restored.0.len(),
+            machine_history().len(),
+            "the count rides beside the history it describes"
+        );
+    }
+
+    #[test]
     fn a_machine_snapshot_restores_the_working_set_exactly() {
         let dir = tempfile::tempdir().expect("tempdir");
         let id = Uuid::new_v4();
         write_envelope(dir.path(), id, stamp(10), &sample_messages());
         saver(dir.path(), id)
-            .save_machine(&machine_history(), stamp(10))
+            .save_machine(&machine_history(), stamp(10), 0)
             .expect("machine saved");
         let restored = load_machine_in(id, dir.path(), stamp(10)).expect("a fresh pair loads");
-        assert_eq!(rendered(&restored), rendered(&machine_history()));
+        assert_eq!(rendered(&restored.0), rendered(&machine_history()));
         assert!(
             restored
+                .0
                 .iter()
                 .flat_map(|message| &message.parts)
                 .any(|part| matches!(part, loopctl::message::MessagePart::ToolCall { id, .. } if id == "call_7f3a")),
@@ -1271,7 +1306,7 @@ mod tests {
         let id = Uuid::new_v4();
         write_envelope(dir.path(), id, stamp(20), &sample_messages());
         saver(dir.path(), id)
-            .save_machine(&machine_history(), stamp(10))
+            .save_machine(&machine_history(), stamp(10), 0)
             .expect("machine saved");
         assert!(
             load_machine_in(id, dir.path(), stamp(20)).is_none(),
@@ -1285,18 +1320,18 @@ mod tests {
         let id = Uuid::new_v4();
         let keeper = saver(dir.path(), id);
         keeper
-            .save_machine(&machine_history(), stamp(10))
+            .save_machine(&machine_history(), stamp(10), 0)
             .expect("first machine save");
         write_envelope(dir.path(), id, stamp(10), &sample_messages());
         let first = load_machine_in(id, dir.path(), stamp(10)).expect("first cycle loads");
         keeper
-            .save_machine(&first, stamp(30))
+            .save_machine(&first.0, stamp(30), first.1)
             .expect("second machine save");
         write_envelope(dir.path(), id, stamp(30), &sample_messages());
         let second = load_machine_in(id, dir.path(), stamp(30)).expect("second cycle loads");
         assert_eq!(
-            rendered(&first),
-            rendered(&second),
+            rendered(&first.0),
+            rendered(&second.0),
             "a save-resume-save cycle keeps the working set byte-stable"
         );
     }
@@ -1306,9 +1341,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let id = Uuid::new_v4();
         write_envelope(dir.path(), id, stamp(10), &sample_messages());
+        // A complete envelope with an alien tag: the parse succeeds, so
+        // the refusal below is genuinely the format check's verdict.
         std::fs::write(
             dir.path().join(id.to_string()).join("machine.json"),
-            "{\"format\": \"dch.machine.v99\"}",
+            "{\"format\": \"dch.machine.v99\", \"saved_at\": \"2026-09-16T12:10:00Z\", \
+             \"messages\": [], \"compactions\": 0}",
         )
         .expect("alien machine file written");
         assert!(

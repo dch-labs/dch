@@ -99,6 +99,15 @@ pub(crate) struct ResumeOutcome {
     /// Seeds the resumed display's running count so it continues
     /// the session's accounting instead of restarting at zero.
     pub(crate) tokens: crate::session::SessionTokens,
+
+    /// How many compaction passes the adopted machine snapshot
+    /// records.
+    ///
+    /// Zero whenever no snapshot was adopted; the staleness guard
+    /// reads it beside the transcript's Compacted rows, because a
+    /// headless session's transcript carries none and the snapshot's
+    /// count is its only witness of a legitimate shrink.
+    pub(crate) machine_compactions: u32,
 }
 
 /// Why a resume could not load a session.
@@ -201,10 +210,11 @@ pub(crate) fn resolve_resume_in(args: &Args, base: &Path) -> ResumeControl {
                         )
                     })
                     .count();
-                let compacted = outcome
-                    .messages
-                    .iter()
-                    .any(|message| matches!(message, TuiMessage::Compacted { .. }));
+                let compacted = outcome.machine_compactions > 0
+                    || outcome
+                        .messages
+                        .iter()
+                        .any(|message| matches!(message, TuiMessage::Compacted { .. }));
                 let frozen =
                     machine.len().saturating_mul(3) < exchanges && exchanges >= 12 && !compacted;
                 if frozen {
@@ -329,7 +339,8 @@ pub(crate) fn history_for_resume(outcome: &ResumeOutcome, redact: bool) -> Vec<M
 /// narrowed: when the current policy hides these shapes from the
 /// model, replaying the saved bytes verbatim would hand the provider
 /// what the pipeline would have redacted. Both halves of an exchange
-/// go — the result's output and every string leaf of the call's
+/// go — the result's output (the plain variant's text and every text
+/// part of a multipart result) and every string leaf of the call's
 /// arguments — because a session resumed onto a different provider
 /// otherwise replays argument bytes that provider was never shown. The
 /// derive path applies the same policy to the same two halves, so the
@@ -343,12 +354,18 @@ fn scrub_machine_history(messages: &mut [Message]) {
     for message in messages {
         for part in &mut message.parts {
             match part {
-                MessagePart::ToolResult {
-                    output: loopctl::message::ToolContent::Text(text),
-                    ..
-                } => {
-                    patterns.scrub(text);
-                }
+                MessagePart::ToolResult { output, .. } => match output {
+                    loopctl::message::ToolContent::Text(text) => {
+                        patterns.scrub(text);
+                    }
+                    loopctl::message::ToolContent::Multipart(parts) => {
+                        for part in parts {
+                            if let loopctl::message::ToolContentPart::Text { text } = part {
+                                patterns.scrub(text);
+                            }
+                        }
+                    }
+                },
                 MessagePart::ToolCall { input, .. } => scrub_json_strings(&patterns, input),
                 _ => {}
             }
@@ -399,12 +416,16 @@ fn scrub_json_strings(
 /// resume flow.
 pub(crate) fn load_for_resume_in(id: Uuid, base: &Path) -> Result<ResumeOutcome, ResumeError> {
     let (messages, _model, tokens, saved_at) = crate::session::load_with_meta_in(id, base)?;
-    let machine = crate::session::load_machine_in(id, base, saved_at);
+    let (machine, machine_compactions) = match crate::session::load_machine_in(id, base, saved_at) {
+        Some((messages, compactions)) => (Some(messages), compactions),
+        None => (None, 0),
+    };
     Ok(ResumeOutcome {
         session_id: id,
         messages,
         tokens,
         machine,
+        machine_compactions,
     })
 }
 
@@ -1319,6 +1340,7 @@ mod tests {
                     vec![loopctl::message::MessagePart::text("exact marker fa1")],
                 )],
                 stamp,
+                0,
             )
             .unwrap();
         let outcome = load_for_resume_in(id, &root).unwrap();
@@ -1551,6 +1573,7 @@ mod tests {
             messages: Vec::new(),
             machine: Some(machine),
             tokens: crate::session::SessionTokens::default(),
+            machine_compactions: 0,
         };
         let redacted = history_for_resume(&outcome, true);
         let raw = redacted
@@ -1575,6 +1598,45 @@ mod tests {
                     if text.contains("abcdefghijklmnop")))
             });
         assert!(kept, "redaction off replays the snapshot byte-identically");
+    }
+
+    #[test]
+    fn a_secret_inside_a_multipart_tool_result_scrubs_before_replay() {
+        // A tool that returns mixed content carries its text in the
+        // multipart variant's parts; the scrub must reach inside each
+        // text part exactly as it reaches the plain variant, or the
+        // snapshot path replays the secret the dispatch pipeline would
+        // have hidden.
+        let machine = vec![Message::new(
+            Role::User,
+            vec![MessagePart::tool_result(
+                "call_9",
+                "Bash",
+                loopctl::message::ToolContent::Multipart(vec![
+                    loopctl::message::ToolContentPart::Text {
+                        text: "stdout:\napi_key=abcdefghijklmnop\n".to_string(),
+                    },
+                ]),
+                false,
+            )],
+        )];
+        let outcome = ResumeOutcome {
+            session_id: Uuid::nil(),
+            messages: Vec::new(),
+            machine: Some(machine),
+            tokens: crate::session::SessionTokens::default(),
+            machine_compactions: 0,
+        };
+        let replayed = serde_json::to_string(&history_for_resume(&outcome, true)).unwrap();
+        assert!(
+            !replayed.contains("abcdefghijklmnop"),
+            "the multipart part's secret bytes are scrubbed before replay: {replayed}"
+        );
+        let verbatim = serde_json::to_string(&history_for_resume(&outcome, false)).unwrap();
+        assert!(
+            verbatim.contains("abcdefghijklmnop"),
+            "redaction off replays the multipart bytes byte-identically"
+        );
     }
 
     #[test]
@@ -1608,6 +1670,7 @@ mod tests {
             messages: Vec::new(),
             machine: Some(machine.clone()),
             tokens: crate::session::SessionTokens::default(),
+            machine_compactions: 0,
         };
         let replayed = serde_json::to_string(&history_for_resume(&outcome, true)).unwrap();
         assert!(
@@ -1726,7 +1789,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(5));
         let stamp = chrono::Utc::now();
         saver
-            .save_machine(machine, stamp)
+            .save_machine(machine, stamp, 0)
             .expect("save the engine half");
     }
 
@@ -1813,6 +1876,58 @@ mod tests {
                         TuiMessage::System { text, .. }
                             if text.contains("engine snapshot was stale"))),
                     "no degradation row for a legitimate compaction gap"
+                );
+            }
+            ResumeControl::Fresh { .. } => panic!("the session resumes"),
+        }
+    }
+
+    #[test]
+    fn a_counted_compaction_exempts_a_headless_machine_half() {
+        // A headless session's display transcript never carries a
+        // Compacted row — its builder sees no compaction events — so
+        // the snapshot's own compaction count is the guard's only
+        // witness that the engine half's gap is a legitimate
+        // compaction rather than a publishing freeze.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let id = Uuid::new_v4();
+        let transcript = marathon_transcript(10);
+        let compacted: Vec<loopctl::message::Message> = (0..5)
+            .map(|step| loopctl::message::Message::user(format!("kept {step}")))
+            .collect();
+        let saver = crate::session::SessionSaver::with_base_dir(
+            id,
+            "m".to_string(),
+            dir.path().to_path_buf(),
+        );
+        saver
+            .save(&transcript, crate::session::SessionTokens::default())
+            .expect("save the display half");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let envelope = serde_json::json!({
+            "format": "dch.machine.v1",
+            "saved_at": chrono::Utc::now(),
+            "messages": compacted,
+            "compactions": 2,
+        });
+        let machine_path = dir.path().join(id.to_string()).join("machine.json");
+        std::fs::create_dir_all(machine_path.parent().expect("the session dir"))
+            .expect("session dir");
+        std::fs::write(&machine_path, envelope.to_string()).expect("machine half");
+
+        let mut args = parse(&[]);
+        args.continue_session = Some(true);
+        match resolve_resume_in(&args, dir.path()) {
+            ResumeControl::Resumed(outcome) => {
+                assert!(
+                    outcome.machine.is_some(),
+                    "the counted half is adopted — the count explains the gap"
+                );
+                assert!(
+                    !outcome.messages.iter().any(|m| matches!(m,
+                        TuiMessage::System { text, .. }
+                            if text.contains("engine snapshot was stale"))),
+                    "no degradation row for a counted compaction gap"
                 );
             }
             ResumeControl::Fresh { .. } => panic!("the session resumes"),

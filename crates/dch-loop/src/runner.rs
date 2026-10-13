@@ -4078,6 +4078,63 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_settled_compaction_counts_for_the_headless_save_path() {
+        // The headless machine snapshot persists its compaction count
+        // from the console observer's counter; a real settled pass —
+        // the truncating selection spends no model call — must land
+        // in both the observer and the handle construction hands the
+        // save path.
+        let dir = TempDir::new().expect("tempdir");
+        let chunk = "payload line for the context budget\n".repeat(400);
+        std::fs::write(dir.path().join("chunk-a.txt"), &chunk).expect("write fixture");
+        std::fs::write(dir.path().join("chunk-b.txt"), &chunk).expect("write fixture");
+        let mut script = Vec::new();
+        for index in 0..18 {
+            let name = if index % 2 == 0 {
+                "chunk-a.txt"
+            } else {
+                "chunk-b.txt"
+            };
+            script.push(sse_tool_call_turn(
+                "Read",
+                &serde_json::json!({"path": name}),
+            ));
+        }
+        script.push(sse_text_turn("recovered"));
+        let server = SseServer::start(script).await;
+        let mut config = wire_config(server.port, 22);
+        config.api.context_window = Some(90_000);
+        config.runner.compactor = dch_config::CompactorSelection::Truncating;
+        let observer = Arc::new(crate::console_observer::ConsoleObserver::with_sinks(
+            dch_config::Verbosity::Quiet,
+            false,
+            Box::new(std::io::sink()),
+            Box::new(std::io::sink()),
+        ));
+        let counter = observer.compaction_counter();
+        let mut runner = Runner::builder(&config, dir.path())
+            .with_observer(Arc::clone(&observer) as Arc<dyn LoopObserver>)
+            .build()
+            .await
+            .expect("constructs");
+        let run = tokio::time::timeout(std::time::Duration::from_secs(20), runner.run("grow"))
+            .await
+            .expect("the run completes")
+            .expect("the run compacts and finishes");
+        assert_eq!(run.output.as_deref(), Some("recovered"));
+        assert_eq!(
+            observer.compaction_count(),
+            1,
+            "the settled pass lands in the count the snapshot saves"
+        );
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the save path's handle reads the same total"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_truncating_selection_compacts_by_dropping_messages() {
         // Several tool turns of medium results accumulate past the compact
         // threshold; the next request must be preceded by a compaction pass

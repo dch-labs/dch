@@ -386,8 +386,10 @@ fn wrap_code_rows(
             let mut piece = String::new();
             for ch in span.content.chars() {
                 let ch_width = ch.width().unwrap_or(0);
-                if used.saturating_add(ch_width) > budget && !piece.is_empty() {
-                    out.push(Span::styled(std::mem::take(&mut piece), style));
+                if used.saturating_add(ch_width) > budget && used > 0 {
+                    if !piece.is_empty() {
+                        out.push(Span::styled(std::mem::take(&mut piece), style));
+                    }
                     out.push(Span::styled(" ", pad));
                     lines.push(Line::from(std::mem::take(&mut out)));
                     out = vec![Span::styled(" ", pad), marker.clone()];
@@ -653,5 +655,44 @@ mod tests {
         let clipped = clip_line(line, 3);
         let width = UnicodeWidthStr::width(clipped.spans[0].content.as_ref());
         assert!(width <= 3, "clipped width {width} exceeds 3");
+    }
+
+    #[test]
+    fn a_span_boundary_wraps_on_the_first_glyph_of_the_next_span() {
+        // Highlighted code splits one source row into many spans, so
+        // the overflow lands on a span boundary, not inside one span:
+        // a span that fills the row exactly must not buy its
+        // successor a free first glyph — the wrap fires on that
+        // glyph, not on the one after it.
+        let rows = vec![vec![Span::raw("abcdef"), Span::raw("gh")]];
+        let mut lines = Vec::new();
+        wrap_code_rows(rows, 8, Color::Reset, Color::Reset, &mut lines);
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.to_string())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            rendered.len(),
+            2,
+            "the successor span starts a continuation row: {rendered:?}"
+        );
+        assert!(
+            rendered[0].trim() == "abcdef",
+            "the filled span rides the first row: {rendered:?}"
+        );
+        assert!(
+            rendered[1].contains('g') && !rendered[1].contains('f'),
+            "the boundary glyph leads the continuation: {rendered:?}"
+        );
+        let first_width = UnicodeWidthStr::width(rendered[0].as_str());
+        assert!(
+            first_width <= 8,
+            "the first row stays inside its frame budget: {rendered:?}"
+        );
     }
 }

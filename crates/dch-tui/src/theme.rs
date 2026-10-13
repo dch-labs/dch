@@ -517,9 +517,41 @@ impl Theme {
     }
 }
 
+impl Theme {
+    /// Defer the terminal-canvas colors to the terminal's own scheme.
+    ///
+    /// The adaptation for a session whose background override did not
+    /// land — the terminal never answered the OSC 11 query, or the
+    /// platform has no query to send. The palette's near-canvas
+    /// foreground (and every color equal to it) was chosen against
+    /// the theme's own canvas color; on a terminal that kept a light
+    /// background, that text is invisible. Every such color becomes
+    /// [`Color::Reset`], the terminal's own foreground, which its own
+    /// background guarantees readable. Painted pairs survive
+    /// untouched — the composer paints its surface and the status bar
+    /// paints its canvas, so their text keeps its palette — and so do
+    /// the accent colors, which read on both light and dark canvases.
+    #[must_use]
+    pub fn deferred_to_terminal(&self) -> Self {
+        fn deferring(color: Color, anchor: Color) -> Color {
+            if color == anchor { Color::Reset } else { color }
+        }
+        let anchor = self.ui.foreground;
+        let mut deferred = self.clone();
+        deferred.ui.foreground = deferring(deferred.ui.foreground, anchor);
+        deferred.ui.user_message_fg = deferring(deferred.ui.user_message_fg, anchor);
+        deferred.ui.assistant_message_fg = deferring(deferred.ui.assistant_message_fg, anchor);
+        deferred.syntax.punctuation = deferring(deferred.syntax.punctuation, anchor);
+        deferred.syntax.delimiter = deferring(deferred.syntax.delimiter, anchor);
+        deferred.markdown.code_block = Style::default().fg(deferring(
+            deferred.markdown.code_block.fg.unwrap_or(anchor),
+            anchor,
+        ));
+        deferred
+    }
+}
+
 impl Default for Theme {
-    /// The shipped default: the near-black palette, which the
-    /// `"default"` registry key also names.
     fn default() -> Self {
         Self::default()
     }
@@ -599,6 +631,58 @@ mod tests {
             .collect();
         let unique: std::collections::HashSet<&str> = keys.iter().copied().collect();
         assert_eq!(unique.len(), keys.len(), "duplicate registry key: {keys:?}");
+    }
+
+    #[test]
+    fn an_unsynced_terminal_defers_the_canvas_anchored_colors() {
+        // The default palette paints conversation text in its own
+        // near-canvas foreground on an unpainted terminal background;
+        // when the background override never landed — the terminal
+        // kept a light scheme of its own — that text is invisible.
+        // The deferral hands every anchored color to the terminal's
+        // own foreground while the painted pairs and accents stand.
+        let theme = Theme::default();
+        let anchor = theme.ui.foreground;
+        assert_eq!(anchor, Color::Rgb(242, 242, 242));
+        let deferred = theme.deferred_to_terminal();
+        assert_eq!(
+            deferred.ui.foreground,
+            Color::Reset,
+            "conversation foreground defers to the terminal's own"
+        );
+        assert_eq!(deferred.ui.user_message_fg, Color::Reset);
+        assert_eq!(deferred.ui.assistant_message_fg, Color::Reset);
+        assert_eq!(
+            deferred.syntax.punctuation,
+            Color::Reset,
+            "code punctuation sits on the terminal canvas and defers"
+        );
+        assert_eq!(deferred.syntax.delimiter, Color::Reset);
+        assert_eq!(
+            deferred.markdown.code_block.fg,
+            Some(Color::Reset),
+            "code block text sits on the terminal canvas and defers"
+        );
+        assert_eq!(
+            deferred.ui.input_text, theme.ui.input_text,
+            "the composer paints its surface: its pair stands"
+        );
+        assert_eq!(
+            deferred.ui.surface, theme.ui.surface,
+            "the composer's painted surface stands"
+        );
+        assert_eq!(
+            deferred.ui.status_bar_fg, theme.ui.status_bar_fg,
+            "the status bar paints its canvas: its pair stands"
+        );
+        assert_eq!(
+            deferred.syntax.keyword, theme.syntax.keyword,
+            "accent colors read on both schemes and stand"
+        );
+        assert_eq!(
+            deferred.ui.background, theme.ui.background,
+            "the canvas field is inert without the override; it stands"
+        );
     }
 
     #[test]

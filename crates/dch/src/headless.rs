@@ -267,6 +267,8 @@ async fn run_headless_inner(
         prompt,
         mut runner,
         model,
+        resumed_compactions,
+        compaction_counter,
     } = built;
 
     let force_args = args.clone();
@@ -308,7 +310,13 @@ async fn run_headless_inner(
                 &turn_outputs,
                 None,
             ));
-            save_transcript(&saver, &runner, &transcript);
+            save_transcript(
+                &saver,
+                &runner,
+                &transcript,
+                resumed_compactions
+                    .saturating_add(compaction_counter.load(std::sync::atomic::Ordering::SeqCst)),
+            );
             bridge.stop().await;
             Ok(outcome)
         }
@@ -321,7 +329,13 @@ async fn run_headless_inner(
                 &turn_outputs,
                 Some(&err),
             ));
-            save_transcript(&saver, &runner, &transcript);
+            save_transcript(
+                &saver,
+                &runner,
+                &transcript,
+                resumed_compactions
+                    .saturating_add(compaction_counter.load(std::sync::atomic::Ordering::SeqCst)),
+            );
             bridge.stop().await;
             Err(outcome)
         }
@@ -344,9 +358,10 @@ fn save_transcript(
     saver: &crate::session::SessionSaver,
     runner: &dch_loop::Runner,
     transcript: &[dch_tui::TuiMessage],
+    compactions: u32,
 ) {
     let stamp = chrono::Utc::now();
-    if let Err(err) = saver.save_machine(&runner.committed_history(), stamp) {
+    if let Err(err) = saver.save_machine(&runner.committed_history(), stamp, compactions) {
         tracing::warn!(error = %err, "machine history could not be saved");
     }
     if let Err(err) = saver.save_at(transcript, crate::session::SessionTokens::default(), stamp) {
@@ -399,6 +414,20 @@ struct ConstructedRun {
     /// Carried out of construction so the session transcript records
     /// the model the session actually ran.
     model: String,
+
+    /// The compaction count a resumed snapshot already carried.
+    ///
+    /// The observer's counter starts at zero for this process, so a
+    /// session whose compactions predate this run still records them
+    /// in the snapshot it saves at exit.
+    resumed_compactions: u32,
+
+    /// A live handle on the observer's compaction counter.
+    ///
+    /// Read at save time; the total it and
+    /// [`ConstructedRun::resumed_compactions`] produce is the count
+    /// the machine snapshot persists.
+    compaction_counter: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 /// Resolve the prompt, load the config, and build the runner.
@@ -437,6 +466,10 @@ async fn construct_run(
         construction_failure(args, format!("cannot determine cwd: {err}"), inherited_mode)
     })?;
 
+    let resumed_compactions = match &control {
+        crate::resume::ResumeControl::Resumed(outcome) => outcome.machine_compactions,
+        crate::resume::ResumeControl::Fresh { .. } => 0,
+    };
     let mut builder = dch_loop::Runner::builder(&config, &workdir)
         .with_observer(Arc::clone(&observer) as Arc<dyn loopctl::observer::LoopObserver>);
     if let crate::resume::ResumeControl::Resumed(outcome) = control {
@@ -464,6 +497,8 @@ async fn construct_run(
         prompt,
         runner,
         model,
+        resumed_compactions,
+        compaction_counter: observer.compaction_counter(),
     })
 }
 
