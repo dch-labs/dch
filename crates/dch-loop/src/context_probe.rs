@@ -80,24 +80,30 @@ pub(crate) async fn probe_context_window(config: &ApiConfig, base_url: &str) -> 
 ///
 /// The capability document is the local llama.cpp-style server's own
 /// route; a cloud endpoint does not serve it, and probing there would
-/// spend an extra request — and, worse, an authenticated one — on a
-/// host that never asked. Only loopback roots qualify: `localhost`
-/// or a loopback address literal — `127/8`, or `::1` in its
-/// bracketed URL spelling. The gate admits addresses, never names: a
-/// DNS label may begin with `127.` and resolve anywhere, so a
-/// prefix match would open the probe to hosts the loopback promise
-/// excludes.
+/// spend an extra request on a host that never asked. The gate parses
+/// `root` with the same URL parser the dialing client uses, so it
+/// judges the host the request would actually reach: in an authority
+/// like `localhost:@remote.example`, `remote.example` is the host and
+/// the loopback-looking prefix is mere userinfo. A parsed host of
+/// `localhost` or a loopback address — `127/8`, or `::1` in its
+/// bracketed URL spelling — qualifies; a DNS label may begin with
+/// `127.` and resolve anywhere, so names are never probeable on the
+/// strength of spelling. A root that will not parse has no host to
+/// vouch for it, and is never dialed.
 fn props_probe_reachable(root: &str) -> bool {
-    let after_scheme = root
-        .strip_prefix("https://")
-        .or_else(|| root.strip_prefix("http://"))
-        .unwrap_or(root);
-    let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
-    let host = if let Some(rest) = authority.strip_prefix('[') {
-        rest.split(']').next().unwrap_or(rest)
-    } else {
-        authority.split(':').next().unwrap_or(authority)
+    let Ok(url) = reqwest::Url::parse(root) else {
+        return false;
     };
+    // The parser returns IPv6 hosts in their bracketed URL spelling,
+    // which is not an address to `IpAddr`; the brackets are syntax, so
+    // they come off before the address check.
+    let Some(bracketed) = url.host_str() else {
+        return false;
+    };
+    let host = bracketed
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(bracketed);
     host == "localhost"
         || host
             .parse::<std::net::IpAddr>()
@@ -308,6 +314,9 @@ mod tests {
             "http://127.0.0.1:8080",
             "http://127.42.0.9",
             "http://[::1]:9000",
+            // The URL parser case-folds domain hosts, so the gate
+            // judges the same host the dialing client would reach.
+            "http://LOCALHOST:8080",
         ] {
             assert!(
                 props_probe_reachable(root),
@@ -324,6 +333,12 @@ mod tests {
             // names, so none of these is ever probed.
             "http://127.evil.example.com",
             "http://127.0.1.1.evil.com",
+            // Userinfo disguises: the parser puts `remote.example`
+            // behind the `@`, and it is the host the client would
+            // dial — a loopback-looking userinfo must not vouch for
+            // a remote host.
+            "http://localhost:@remote.example",
+            "http://[::1]@remote.example",
         ] {
             assert!(
                 !props_probe_reachable(root),
