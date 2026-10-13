@@ -81,9 +81,12 @@ pub(crate) async fn probe_context_window(config: &ApiConfig, base_url: &str) -> 
 /// The capability document is the local llama.cpp-style server's own
 /// route; a cloud endpoint does not serve it, and probing there would
 /// spend an extra request — and, worse, an authenticated one — on a
-/// host that never asked. Only loopback roots qualify: `localhost`,
-/// any `127.*` address, and the `::1` loopback, spelled bracketed or
-/// not.
+/// host that never asked. Only loopback roots qualify: `localhost`
+/// or a loopback address literal — `127/8`, or `::1` in its
+/// bracketed URL spelling. The gate admits addresses, never names: a
+/// DNS label may begin with `127.` and resolve anywhere, so a
+/// prefix match would open the probe to hosts the loopback promise
+/// excludes.
 fn props_probe_reachable(root: &str) -> bool {
     let after_scheme = root
         .strip_prefix("https://")
@@ -95,7 +98,10 @@ fn props_probe_reachable(root: &str) -> bool {
     } else {
         authority.split(':').next().unwrap_or(authority)
     };
-    host == "localhost" || host == "::1" || host.starts_with("127.")
+    host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 #[cfg(test)]
@@ -313,6 +319,11 @@ mod tests {
             "https://example.com",
             "http://10.1.2.3:8080",
             "http://llama.internal.lan",
+            // Lookalike names: a DNS label may begin with `127.` and
+            // still resolve anywhere — the gate admits addresses, not
+            // names, so none of these is ever probed.
+            "http://127.evil.example.com",
+            "http://127.0.1.1.evil.com",
         ] {
             assert!(
                 !props_probe_reachable(root),
