@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -25,14 +26,17 @@ use unicode_width::UnicodeWidthChar as _;
 use unicode_width::UnicodeWidthStr as _;
 
 use dch_config::DchConfig;
+use dch_config::StripPosition;
+use dch_config::StripStyle;
 
 use crate::Graduation;
 use crate::events::TerminalEvents;
 use crate::input::{InputAction, InputEditor};
 use crate::markdown;
 use crate::message::{ActiveTool, ContentBlock, TokenCounts, TuiMessage};
-use crate::observer::{ToolResultDisplay, TuiObserverState};
+use crate::observer::{HealthNotice, ToolResultDisplay, TuiObserverState};
 use crate::permission::PermissionRequest;
+use crate::question::QuestionPrompt;
 use crate::theme::Theme;
 use crate::tool_render::SPINNER_FRAMES;
 use dch_config::Verbosity;
@@ -40,9 +44,12 @@ use dch_config::Verbosity;
 /// The callback fired when a turn's outcome joins the conversation.
 ///
 /// Installed by the mode driver to persist the session transcript;
-/// receives the conversation snapshot, so the host never reaches
-/// into display state.
-type TurnEndHook = Box<dyn Fn(&[TuiMessage]) + Send + Sync>;
+/// receives the conversation snapshot and, when a turn end arrived
+/// since the last fire, the engine's own history snapshot for that
+/// turn — full on success, committed-only on failure — so the host
+/// persists both halves without reaching into display state.
+type TurnEndHook =
+    Box<dyn Fn(&[TuiMessage], Option<&Arc<Vec<loopctl::message::Message>>>) + Send + Sync>;
 
 /// The largest elapsed span a persisted tool block may carry.
 ///
@@ -69,6 +76,16 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 /// nothing: it claims a parked background redraw, and neither that,
 /// a drag, nor a blink flip being due, the loop sleeps on.
 const TICK_INTERVAL: Duration = Duration::from_millis(100);
+
+/// The frame cadence the activity strip animates at while the agent
+/// runs.
+///
+/// The loop's own tick is far too coarse for a moving bar, and deltas
+/// alone leave it frozen between provider chunks; for as long as the
+/// run lives the animation wake redraws at this step — fifty frames a
+/// second, so even the fastest styles jump at most a couple of cells
+/// per frame — whatever the wire's granularity.
+const ANIMATION_INTERVAL: Duration = Duration::from_millis(20);
 
 /// Ticks per caret blink phase.
 ///
@@ -450,6 +467,71 @@ pub struct TuiApp {
     /// expansion opened while the tool runs survives its graduation.
     expanded_tools: std::collections::HashSet<String>,
 
+    /// The session's thinking-display preference.
+    ///
+    /// Follow renders live reasoning expanded and auto-collapses at
+    /// graduation; Suppressed renders every stream collapsed from its
+    /// first delta. Only clicks on the live row change it — completed
+    /// sections toggle their own display and leave this untouched.
+    /// Session-only: never persisted, every session starts in Follow.
+    thinking_mode: ThinkingMode,
+
+    /// Which completed thinking sections render expanded, by block key.
+    ///
+    /// Keys are message-and-block positions, stable for the session
+    /// because the conversation only ever appends. Empty means every
+    /// section renders collapsed — the default both after graduation
+    /// and after loading a session.
+    expanded_thinking: std::collections::HashSet<String>,
+
+    /// Which compaction notices render expanded, by message key.
+    ///
+    /// Same positional-key scheme as the thinking sections, so the
+    /// expand gesture covers the notices with one vocabulary.
+    expanded_compactions: std::collections::HashSet<String>,
+
+    /// Conversation lines that sit inside a thinking section, by key.
+    ///
+    /// Mirrors [`tool_summary_lines`](Self::tool_summary_lines): every
+    /// line a click can toggle, mapped to the key it belongs to.
+    thinking_summary_lines: HashMap<usize, String>,
+
+    /// Transcript row to compaction-notice key, rebuilt per layout.
+    ///
+    /// The press handler's map for the notice rows, mirroring the
+    /// thinking map beside it.
+    compaction_summary_lines: HashMap<usize, String>,
+
+    /// Where the activity strip renders while the agent runs.
+    ///
+    /// Carried from the display config: the spacer row directly above
+    /// the composer, or a dedicated first row of the terminal. The
+    /// strip's phase and gating are placement-independent.
+    strip_position: StripPosition,
+
+    /// The animation the activity strip plays.
+    ///
+    /// Carried from the display config: the centered breath, or the
+    /// left-anchored fill that clears left-to-right. Style and
+    /// position are orthogonal; the phase and gating are the same
+    /// either way.
+    strip_style: StripStyle,
+
+    /// The live thinking block's absolute rows, when one renders.
+    ///
+    /// Every rendered row of the live section — the marker row and
+    /// the expanded body alike — drives the Follow/Suppressed mode,
+    /// matching tool blocks where any row toggles; `None` when no
+    /// stream is living.
+    thinking_live_rows: Option<std::ops::Range<usize>>,
+
+    /// When the current run started, for the strip's anchor.
+    ///
+    /// Stamped the first frame the agent-running flag is observed
+    /// set and cleared when it clears, so the bar breathes one
+    /// continuous phase per run; no stream property ever moves it.
+    run_anchor: Option<Instant>,
+
     /// Full command and output per tool call, keyed by call id.
     ///
     /// Filled from the dispatch-side capture as calls graduate; a
@@ -459,6 +541,16 @@ pub struct TuiApp {
     /// order, so a long session's oldest blocks fold back to plain
     /// summary rows instead of retaining payloads forever.
     tool_details: HashMap<String, ToolDetail>,
+
+    /// The conversation row each retry episode's bar lives in, keyed
+    /// by episode id.
+    ///
+    /// The first attempt of an episode pushes a `System` row and
+    /// records its index; later attempts of the same episode rewrite
+    /// that row in place, so one rough patch reads as one line that
+    /// counts up. Rows are never removed, so the recorded indices
+    /// stay stable for the session's lifetime.
+    retry_row_index: HashMap<u64, usize>,
 
     /// Graduation order of the retained tool details, oldest first.
     ///
@@ -493,6 +585,30 @@ pub struct TuiApp {
     /// user can read (and copy out) which session they are in.
     session_id: Option<String>,
 
+    /// Screen span of the session-id segment as last rendered.
+    ///
+    /// `(row, start column, end column)` in terminal coordinates, set
+    /// during status-bar rendering — which borrows the app immutably,
+    /// hence the `Cell` — and read by the click handler: a plain click
+    /// inside the span copies the id through the selection transport.
+    /// `None` when no id is displayed or the segment is fully clipped.
+    session_id_span: std::cell::Cell<Option<(u16, u16, u16)>>,
+
+    /// The working directory's own name, as the status bar shows it.
+    ///
+    /// Set by the host at launch with the directory the runner
+    /// operates in, reduced to its leaf — the path that leads to it
+    /// never shows — so a frame paints it without touching the
+    /// filesystem.
+    working_dir: Option<String>,
+
+    /// The git branch beside the working directory's name.
+    ///
+    /// Set by the host at launch from the workdir's repository; the
+    /// bar renders it in parentheses after the folder's name, and
+    /// nothing when the workdir sits in no working tree.
+    git_branch: Option<String>,
+
     /// The transient notice on the row above the composer, with
     /// the instant its hold elapses.
     ///
@@ -524,6 +640,38 @@ pub struct TuiApp {
     /// select arm moves requests into the queue, so between runs the
     /// slot simply holds the receiver.
     permission_rx: Option<tokio::sync::mpsc::UnboundedReceiver<PermissionRequest>>,
+
+    /// Questions from the asking tool waiting for the user's answer,
+    /// oldest first.
+    ///
+    /// The host converts the tool's batched requests into prompts and
+    /// lands them here; the front of the queue is what the overlay
+    /// shows and what the keys answer. Answering sends on the
+    /// prompt's one-shot and advances to the next question of the
+    /// batch. A finished or cancelled run empties the queue — the
+    /// dispatches are gone, and dropping the prompts closes their
+    /// reply channels, which the asking tools read as dismissals.
+    pending_questions: std::collections::VecDeque<QuestionPrompt>,
+
+    /// The channel question prompts arrive on, until `run` claims
+    /// it.
+    ///
+    /// Installed by the host's bridge before the run loop starts; the
+    /// loop's select arm moves prompts into the queue, mirroring the
+    /// permission channel's shape.
+    question_rx: Option<tokio::sync::mpsc::UnboundedReceiver<QuestionPrompt>>,
+
+    /// The option row the question overlay's cursor sits on.
+    ///
+    /// Indexes the pending question's options; reset to the first row
+    /// whenever a question resolves.
+    question_cursor: usize,
+
+    /// The toggled option rows of the pending multi-select question.
+    ///
+    /// Empty for a single-select question (Enter confirms the cursor
+    /// row); cleared whenever a question resolves.
+    question_toggled: std::collections::HashSet<usize>,
 
     /// Whether the next frame must repaint in full.
     ///
@@ -613,15 +761,32 @@ impl TuiApp {
             quit: QuitState::default(),
             run_canceller: None,
             expanded_tools: std::collections::HashSet::new(),
+            thinking_mode: ThinkingMode::Follow,
+            expanded_thinking: std::collections::HashSet::new(),
+            expanded_compactions: std::collections::HashSet::new(),
+            thinking_summary_lines: HashMap::new(),
+            compaction_summary_lines: HashMap::new(),
+            strip_position: config.display.strip_position,
+            strip_style: config.display.strip_style,
+            thinking_live_rows: None,
+            run_anchor: None,
             tool_details: HashMap::new(),
+            retry_row_index: HashMap::new(),
             tool_detail_order: std::collections::VecDeque::new(),
             tool_summary_lines: HashMap::new(),
             tool_running_lines: HashMap::new(),
             input_wrap_cache: None,
             session_id: None,
+            session_id_span: std::cell::Cell::new(None),
+            working_dir: None,
+            git_branch: None,
             transient_notice: None,
             pending_permissions: std::collections::VecDeque::new(),
             permission_rx: None,
+            pending_questions: std::collections::VecDeque::new(),
+            question_rx: None,
+            question_cursor: 0,
+            question_toggled: std::collections::HashSet::new(),
             full_repaint_pending: false,
             config,
         }
@@ -663,6 +828,28 @@ impl TuiApp {
     /// carries it.
     pub fn set_session_id(&mut self, id: String) {
         self.session_id = Some(id);
+    }
+
+    /// Name the working directory the status bar shows.
+    ///
+    /// The host calls this once at launch with the directory the
+    /// runner operates in; the bar renders only the directory's own
+    /// name — the leaf, not the path that leads to it.
+    pub fn set_working_dir(&mut self, dir: &Path) {
+        self.working_dir = Some(dir.file_name().map_or_else(
+            || dir.display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        ));
+    }
+
+    /// Name the git branch shown beside the working directory.
+    ///
+    /// The host calls this once at launch with the workdir's
+    /// checked-out branch, when it sits in a working tree; the bar
+    /// renders it in parentheses after the folder's name, and no
+    /// parenthesis at all when no branch was named.
+    pub fn set_git_branch(&mut self, branch: Option<String>) {
+        self.git_branch = branch;
     }
 
     /// Install the run canceller.
@@ -771,7 +958,11 @@ impl TuiApp {
 
     /// The shared token counters.
     ///
-    /// The status bar's totals read through this handle.
+    /// Per-turn and cumulative usage as the observer records it; a
+    /// host reads session accounting through this handle. The status
+    /// bar renders no token total — the provider's usage figures do
+    /// not state a conversation's size, so no honest number exists
+    /// to show.
     #[must_use]
     pub fn tokens(&self) -> &Arc<Mutex<TokenCounts>> {
         &self.state.tokens
@@ -899,6 +1090,150 @@ impl TuiApp {
         }
     }
 
+    /// Install the channel question prompts arrive on.
+    ///
+    /// The receiver half of the bridge the host builds around the
+    /// runner's question channel; once set, pending questions render
+    /// as an overlay and the run loop claims the channel into its
+    /// select.
+    pub fn set_question_requests(
+        &mut self,
+        rx: tokio::sync::mpsc::UnboundedReceiver<QuestionPrompt>,
+    ) {
+        self.question_rx = Some(rx);
+    }
+
+    /// Land one delivered question and any others already waiting
+    /// behind it.
+    ///
+    /// The run loop's select arm hands the prompt its wakeup
+    /// delivered plus the receiver it owns: the prompt enters the
+    /// queue and the receiver drains, so a multi-question batch lands
+    /// together and the first frame's overlay reports the true
+    /// waiting count.
+    pub fn land_question_requests(
+        &mut self,
+        first: QuestionPrompt,
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<QuestionPrompt>,
+    ) {
+        self.pending_questions.push_back(first);
+        while let Ok(prompt) = rx.try_recv() {
+            self.pending_questions.push_back(prompt);
+        }
+    }
+
+    /// Move any waiting question prompts into the queue.
+    ///
+    /// The test seam for staging questions without the run loop:
+    /// production keeps its receiver in a local and lands batches
+    /// through [`land_question_requests`](Self::land_question_requests)
+    /// instead — once `run` claims the channel, this slot is empty and
+    /// the method is a no-op.
+    pub fn poll_question_requests(&mut self) {
+        while let Some(prompt) = self.question_rx.as_mut().and_then(|rx| rx.try_recv().ok()) {
+            self.pending_questions.push_back(prompt);
+        }
+    }
+
+    /// Answer the front question, if one is pending.
+    ///
+    /// Sends `answers` on its one-shot and drops it from the queue,
+    /// resetting the cursor and toggles for the next question; a send
+    /// that finds no receiver (a dispatch already cancelled away) is
+    /// silently fine — the asking tool read its dismissal when its
+    /// future dropped.
+    fn resolve_pending_question(&mut self, answers: Vec<String>) {
+        if let Some(front) = self.pending_questions.pop_front()
+            && front.reply.send(answers).is_err()
+        {
+            tracing::trace!("question reply channel already closed");
+        }
+        self.question_cursor = 0;
+        self.question_toggled.clear();
+    }
+
+    /// Apply a key press to a pending question.
+    ///
+    /// `Some(redraw)` when a question is pending — the overlay owns
+    /// the keyboard: the arrows move the cursor, Space toggles a
+    /// multi-select row, Enter confirms (the cursor row for a
+    /// single-select, the toggled set for a multi), Esc dismisses
+    /// with no answers, and every other key is swallowed — Enter
+    /// among them, since a press queued to submit the draft must
+    /// never land as an answer. `None` only for the two `c` chords
+    /// the app machinery owns — cancel/quit and copy — so those
+    /// survive under a question.
+    fn question_key(&mut self, key: KeyEvent) -> Option<bool> {
+        let options_len = self
+            .pending_questions
+            .front()
+            .map_or(0, |question| question.options.len());
+        self.pending_questions.front()?;
+        let chord = key.code == KeyCode::Char('c')
+            && (key.modifiers == KeyModifiers::CONTROL
+                || key.modifiers == KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        if chord {
+            return None;
+        }
+        let bare = key.modifiers == KeyModifiers::NONE;
+        match key.code {
+            KeyCode::Up if bare => {
+                self.question_cursor = self.question_cursor.saturating_sub(1);
+                Some(true)
+            }
+            KeyCode::Down if bare => {
+                self.question_cursor =
+                    (self.question_cursor.saturating_add(1)).min(options_len.saturating_sub(1));
+                Some(true)
+            }
+            KeyCode::Char(' ') if bare => {
+                if self
+                    .pending_questions
+                    .front()
+                    .is_some_and(|question| question.multi_select)
+                    && !self.question_toggled.insert(self.question_cursor)
+                {
+                    self.question_toggled.remove(&self.question_cursor);
+                }
+                Some(true)
+            }
+            KeyCode::Enter if bare => {
+                let multi = self
+                    .pending_questions
+                    .front()
+                    .is_some_and(|question| question.multi_select);
+                let answers = if multi {
+                    let toggled = std::mem::take(&mut self.question_toggled);
+                    self.pending_questions
+                        .front()
+                        .map(|question| {
+                            question
+                                .options
+                                .iter()
+                                .enumerate()
+                                .filter(|(index, _)| toggled.contains(index))
+                                .map(|(_, option)| option.label.clone())
+                                .collect::<Vec<String>>()
+                        })
+                        .unwrap_or_default()
+                } else {
+                    self.pending_questions
+                        .front()
+                        .and_then(|question| question.options.get(self.question_cursor))
+                        .map(|option| vec![option.label.clone()])
+                        .unwrap_or_default()
+                };
+                self.resolve_pending_question(answers);
+                Some(true)
+            }
+            KeyCode::Esc if bare => {
+                self.resolve_pending_question(Vec::new());
+                Some(true)
+            }
+            _ => Some(false),
+        }
+    }
+
     /// Claim the pending full repaint, if one is due.
     ///
     /// One-shot: the caller (the run loop) owns acting on the claim —
@@ -983,10 +1318,14 @@ impl TuiApp {
         self.quit = QuitState::default();
         let mut events = TerminalEvents::spawn();
         let mut tick = tokio::time::interval(TICK_INTERVAL);
+        let mut animation = tokio::time::interval(ANIMATION_INTERVAL);
+        animation.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let notify = Arc::clone(&self.state.render_notify);
         let mut listener = notify.listen();
         let mut permission_rx = self.permission_rx.take();
         let mut permission_closed = false;
+        let mut question_rx = self.question_rx.take();
+        let mut question_closed = false;
 
         terminal.draw(|frame| self.render(frame))?;
 
@@ -1006,7 +1345,28 @@ impl TuiApp {
                     }
                 }
                 () = &mut listener => self.notify_wake(&notify, &mut listener),
+                maybe_question = async {
+                    match question_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(prompt) = maybe_question {
+                        match question_rx.as_mut() {
+                            Some(rx) => self.land_question_requests(prompt, rx),
+                            None => self.pending_questions.push_back(prompt),
+                        }
+                        true
+                    } else {
+                        // The asking side is gone (the runner was
+                        // dropped); latching the arm inert keeps the
+                        // closed channel from spinning the loop.
+                        question_closed = true;
+                        false
+                    }
+                }
                 _instant = tick.tick() => self.tick_wake(Instant::now()),
+                _anim = animation.tick(), if self.pulse_animation_living() => true,
                 maybe_request = async {
                     match permission_rx.as_mut() {
                         Some(rx) => rx.recv().await,
@@ -1032,6 +1392,10 @@ impl TuiApp {
                 permission_rx = None;
                 permission_closed = false;
             }
+            if question_closed {
+                question_rx = None;
+                question_closed = false;
+            }
             if self.take_full_repaint() {
                 if let Err(err) = terminal.clear() {
                     tracing::warn!("full repaint clear failed: {err}");
@@ -1043,6 +1407,71 @@ impl TuiApp {
             }
         }
         Ok(())
+    }
+
+    /// Whether the run loop's animation wake should run this iteration.
+    ///
+    /// The strip renders for the whole run — thinking or not — so the
+    /// fast frame cadence follows the agent-running flag, standing
+    /// down only for the configured-off strip, which never has a
+    /// frame to animate; an idle session never pays for it.
+    #[must_use]
+    pub fn pulse_animation_living(&self) -> bool {
+        self.state
+            .agent_running
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && !matches!(self.strip_style, StripStyle::Off)
+    }
+
+    /// Render the pinned pulse strip into its row.
+    ///
+    /// While the agent runs, the strip's configured row becomes the
+    /// activity strip: the bar, full width, in the theme's
+    /// composer-border color (the primary edge on themes without one
+    /// — the same color the prompt box's left border paints). The row
+    /// is the spacer directly above the composer by default, or the
+    /// terminal's dedicated first row when the config says so; the
+    /// glow style holds a static full-width bar whose color breathes,
+    /// and the off style yields the row back, nothing drawn. The bar
+    /// anchors on the run's first frame and never re-anchors: streams
+    /// beginning and graduating inside the run leave its phase
+    /// untouched, so one continuous animation runs from the frame the
+    /// run starts to the frame it ends. Returns whether the strip
+    /// claimed the row, so the composer hairline can stand down for
+    /// the frame when the row was its spacer.
+    fn render_pulse_strip(&self, frame: &mut Frame, area: Rect) -> bool {
+        if matches!(self.strip_style, StripStyle::Off) {
+            return false;
+        }
+        if !self
+            .state
+            .agent_running
+            .load(std::sync::atomic::Ordering::Relaxed)
+            || area.height == 0
+        {
+            return false;
+        }
+        let now = Instant::now();
+        let base = self
+            .theme
+            .ui
+            .composer_border
+            .unwrap_or(self.theme.ui.primary);
+        let anchor = self.run_anchor.unwrap_or(now);
+        let color = if matches!(self.strip_style, StripStyle::Glow) {
+            scaled_color(base, glow_eighths(anchor, now))
+        } else {
+            base
+        };
+        let pulse = pulse_span(
+            self.strip_style,
+            anchor,
+            now,
+            usize::from(area.width),
+            color,
+        );
+        frame.render_widget(pulse, area);
+        true
     }
 
     /// Copy the live selection, if any.
@@ -1078,7 +1507,29 @@ impl TuiApp {
         let attempt = next_attempt(&self.copy_attempts);
         let answer = (self.copier)(attempt, text);
         self.posted_copy_attempt = attempt;
-        self.post_notice(copy_answer_notice(answer).to_string());
+        let wording = copy_answer_notice(answer);
+        if !wording.is_empty() {
+            self.post_notice(wording.to_string());
+        }
+    }
+
+    /// Copy the session id when the click landed inside its segment.
+    ///
+    /// Reads the span recorded by the last status-bar render; a click
+    /// inside it routes the id through the same transport and notice
+    /// path a text selection uses. Returns whether the click consumed
+    /// itself here, so the caller can treat a bar click as handled.
+    fn copy_session_id_at(&mut self, column: u16, row: u16) -> bool {
+        let Some((span_row, start, end)) = self.session_id_span.get() else {
+            return false;
+        };
+        if row != span_row || column < start || column >= end {
+            return false;
+        }
+        if let Some(id) = self.session_id.clone() {
+            self.copy_selection_and_notice(&id);
+        }
+        true
     }
 
     /// Handle the events already waiting behind the first one.
@@ -1169,12 +1620,15 @@ impl TuiApp {
     /// Ctrl+Shift+C copies the live selection where the terminal
     /// reports the shift; on terminals that collapse it to a plain
     /// Ctrl+C it simply joins the chord's clearing behavior. Up,
-    /// Down, and End fall back to the transcript while the input
-    /// sits empty with nothing to recall — a fresh session's arrows
-    /// still scroll the conversation — and join the editor as soon as
-    /// anything is typed or recallable. Shift and an arrow, with a
-    /// transcript selection up, moves the selection's head instead:
-    /// the editor's select-by-keyboard.
+    /// Down, Home, and End fall back to the transcript while the
+    /// input sits empty — Home jumps to the oldest line, End snaps
+    /// to the newest, and the arrows scroll by one once nothing is
+    /// recallable. The arrows join the editor as soon as anything
+    /// is typed or recallable; Home and End follow the input's
+    /// emptiness alone, so with an empty draft they keep scrolling
+    /// the transcript even while history is recallable. Shift and
+    /// an arrow, with a transcript selection up, moves the
+    /// selection's head instead: the editor's select-by-keyboard.
     fn handle_key(&mut self, key: KeyEvent) -> bool {
         if !matches!(
             (key.code, key.modifiers),
@@ -1183,6 +1637,9 @@ impl TuiApp {
             self.quit.disarm();
         }
         if let Some(resolved) = self.permission_key(key) {
+            return resolved;
+        }
+        if let Some(resolved) = self.question_key(key) {
             return resolved;
         }
         match (key.code, key.modifiers) {
@@ -1237,6 +1694,10 @@ impl TuiApp {
             {
                 self.scroll_offset = self.scroll_offset.saturating_sub(1);
                 self.rearm_if_near_bottom();
+                true
+            }
+            (KeyCode::Home, _) if self.input.is_empty() => {
+                self.scroll_to_top();
                 true
             }
             (KeyCode::End, _) if self.input.is_empty() => {
@@ -1321,20 +1782,26 @@ impl TuiApp {
             }
             MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
                 self.drag_position = None;
-                match self.selection.take() {
-                    Some(selection) => {
-                        if selection.anchor == selection.head {
-                            self.toggle_tool_at(mouse.column, mouse.row);
-                        } else {
-                            let (text, covered_any) = self.selection_text(&selection);
-                            if covered_any {
-                                self.copy_selection_and_notice(&text);
-                            }
-                            self.selection = Some(selection);
+                if let Some(selection) = self.selection.take() {
+                    if selection.anchor == selection.head {
+                        self.toggle_thinking_at(mouse.column, mouse.row);
+                        self.toggle_compaction_at(mouse.column, mouse.row);
+                        self.toggle_tool_at(mouse.column, mouse.row);
+                        self.copy_session_id_at(mouse.column, mouse.row);
+                    } else {
+                        let (text, covered_any) = self.selection_text(&selection);
+                        if covered_any {
+                            self.copy_selection_and_notice(&text);
                         }
-                        true
+                        self.selection = Some(selection);
                     }
-                    None => self.toggle_tool_at(mouse.column, mouse.row),
+                    true
+                } else {
+                    let toggled_thinking = self.toggle_thinking_at(mouse.column, mouse.row);
+                    let toggled_compaction = self.toggle_compaction_at(mouse.column, mouse.row);
+                    let toggled_tool = self.toggle_tool_at(mouse.column, mouse.row);
+                    let copied_id = self.copy_session_id_at(mouse.column, mouse.row);
+                    toggled_thinking || toggled_compaction || toggled_tool || copied_id
                 }
             }
             MouseEventKind::Moved => {
@@ -1541,6 +2008,8 @@ impl TuiApp {
                 &self.frozen_lines,
                 &self.live_lines,
                 &NO_LINES,
+                &NO_LINES,
+                &NO_LINES,
             ],
             skip,
             height,
@@ -1647,6 +2116,224 @@ impl TuiApp {
             self.selection = None;
             self.drag_position = None;
         }
+        true
+    }
+
+    /// The live thinking section's rows, and where its row sits.
+    ///
+    /// Renders while a reasoning stream is living and the turn's
+    /// reply text has not begun: one row carrying the marker, label,
+    /// and running duration, with the capped italic body below it under
+    /// Follow and nothing under Suppressed — and every returned row a
+    /// click target for the Follow/Suppressed mode, as tool rows are.
+    /// The reply's first text delta folds the lane for the rest of
+    /// the turn; reasoning deltas keep accumulating out of sight. The
+    /// breathing bar itself lives in the pinned strip above the
+    /// composer, not here. The second slot is the block's first row
+    /// within the returned lines, for click registration.
+    fn live_thinking_lines(&self, width: u16) -> (Vec<Line<'static>>, Option<usize>) {
+        if !self
+            .state
+            .agent_running
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            // A cancelled run's buffer may outlive its terminal
+            // event; a stream renders only while its run does.
+            return (Vec::new(), None);
+        }
+        let stream = self
+            .state
+            .thinking
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !stream.is_living() {
+            return (Vec::new(), None);
+        }
+        // A folded stream whose turn is the one replying rides the
+        // live lane as its collapsed row — the block stays on
+        // display through the reply's text and any tool phase until
+        // the response event graduates it into the transcript. A
+        // stream from any other turn is an orphan superseded by a
+        // newer reply; it leaves the display entirely.
+        let folded = stream.text_began;
+        if folded
+            && stream.turn
+                != self
+                    .state
+                    .reply_turn
+                    .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return (Vec::new(), None);
+        }
+        let now = Instant::now();
+        // A folded row's timer freezes at the fold: the span it
+        // measured — the thinking phase — ended when the reply began,
+        // and running it on would claim reasoning that is not
+        // happening beside the streaming text.
+        let phase_end = stream.text_began_at.unwrap_or(now);
+        let elapsed = stream.began.map_or(0, |began| {
+            u64::try_from(phase_end.duration_since(began).as_millis()).unwrap_or(0)
+        });
+        let dim = self.theme.ui.dim;
+        let expanded = !folded && matches!(self.thinking_mode, ThinkingMode::Follow);
+        let marker = if expanded { "▾" } else { "▸" };
+        let row = Line::from(vec![
+            Span::styled(format!("{marker} "), Style::default().fg(dim)),
+            Span::styled(
+                "Thinking",
+                Style::default()
+                    .fg(dim)
+                    .add_modifier(ratatui::style::Modifier::ITALIC),
+            ),
+            Span::styled(
+                format!(" · {}", format_duration(elapsed)),
+                Style::default().fg(dim),
+            ),
+        ]);
+        let mut lines = vec![row];
+        if expanded {
+            let body_source: &str = if stream.redacted && stream.text.is_empty() {
+                THINKING_REDACTED_PLACEHOLDER
+            } else {
+                stream.text.as_str()
+            };
+            let body_style = Style::default()
+                .fg(dim)
+                .add_modifier(ratatui::style::Modifier::ITALIC);
+            let mut wrapped = Vec::new();
+            for segment in body_source.lines() {
+                wrapped.extend(plain_wrapped_lines_styled(
+                    segment,
+                    usize::from(width),
+                    body_style,
+                ));
+            }
+            let start = wrapped.len().saturating_sub(LIVE_THINKING_BODY_CAP);
+            lines.extend(wrapped.into_iter().skip(start));
+        }
+        // The folded row is not a toggle target: it ignores the mode
+        // while folded, so the click would flip state with no
+        // visible effect. The graduated block in the transcript owns
+        // the toggle once the response event lands.
+        let toggleable = if folded { None } else { Some(0) };
+        (lines, toggleable)
+    }
+
+    /// The running compaction pass's rows for the live lane.
+    ///
+    /// Renders while the pass-start cue holds — one row in the same
+    /// register as the live thinking row: marker, italic label, and
+    /// the running duration measured from the cue. The pass settles
+    /// into the transcript's compacted row on its own; nothing
+    /// renders here once it does.
+    fn live_compaction_lines(&self) -> Vec<Line<'static>> {
+        let began = {
+            let health = self
+                .state
+                .health
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let HealthNotice::Compacting { began } = *health else {
+                return Vec::new();
+            };
+            began
+        };
+        let dim = self.theme.ui.dim;
+        let elapsed = u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX);
+        vec![Line::from(vec![
+            Span::styled("▸ ".to_string(), Style::default().fg(dim)),
+            Span::styled(
+                "Compacting",
+                Style::default()
+                    .fg(dim)
+                    .add_modifier(ratatui::style::Modifier::ITALIC),
+            ),
+            Span::styled(
+                format!(" · {}", format_duration(elapsed)),
+                Style::default().fg(dim),
+            ),
+        ])]
+    }
+
+    /// Toggle the thinking section a press landed on.
+    ///
+    /// Every row of the live block — marker or expanded body — drives
+    /// the session's Follow/Suppressed mode, as tool blocks do; a
+    /// completed section's rows toggle that section's display alone.
+    /// Returns whether the press belonged to a thinking section at
+    /// all, so callers can fall through to the tool rows.
+    fn toggle_thinking_at(&mut self, column: u16, row: u16) -> bool {
+        let Some(view) = self.last_view else {
+            return false;
+        };
+        if column < view.area.x
+            || column >= view.area.right()
+            || row < view.area.y
+            || row >= view.area.bottom()
+        {
+            return false;
+        }
+        let line = view
+            .skip
+            .saturating_add(usize::from(row.saturating_sub(view.area.y)));
+        if self
+            .thinking_live_rows
+            .as_ref()
+            .is_some_and(|rows| rows.contains(&line))
+        {
+            self.thinking_mode = match self.thinking_mode {
+                ThinkingMode::Follow => ThinkingMode::Suppressed,
+                ThinkingMode::Suppressed => ThinkingMode::Follow,
+            };
+            self.selection = None;
+            self.drag_position = None;
+            return true;
+        }
+        let Some(key) = self.thinking_summary_lines.get(&line).cloned() else {
+            return false;
+        };
+        let expanding = !self.expanded_thinking.remove(&key);
+        if expanding {
+            self.expanded_thinking.insert(key);
+            self.auto_scroll = false;
+        }
+        self.conversation_generation = self.conversation_generation.saturating_add(1);
+        self.selection = None;
+        self.drag_position = None;
+        true
+    }
+
+    /// Toggle the compaction notice a press landed on.
+    ///
+    /// Mirrors the completed thinking sections: every row of the
+    /// notice toggles its own display between the collapsed summary
+    /// and the pass's details. Returns whether the press belonged to
+    /// a notice at all, so callers can fall through to the tool rows.
+    fn toggle_compaction_at(&mut self, column: u16, row: u16) -> bool {
+        let Some(view) = self.last_view else {
+            return false;
+        };
+        if column < view.area.x
+            || column >= view.area.right()
+            || row < view.area.y
+            || row >= view.area.bottom()
+        {
+            return false;
+        }
+        let line = view
+            .skip
+            .saturating_add(usize::from(row.saturating_sub(view.area.y)));
+        let Some(key) = self.compaction_summary_lines.get(&line).cloned() else {
+            return false;
+        };
+        let expanding = !self.expanded_compactions.remove(&key);
+        if expanding {
+            self.expanded_compactions.insert(key);
+            self.auto_scroll = false;
+        }
+        self.conversation_generation = self.conversation_generation.saturating_add(1);
+        self.selection = None;
+        self.drag_position = None;
         true
     }
 
@@ -1771,6 +2458,18 @@ impl TuiApp {
         self.auto_scroll = true;
     }
 
+    /// Jump the view to the oldest line and drop stickiness.
+    ///
+    /// The Home key calls this. The offset is saturated because the
+    /// scrollable height is layout-time knowledge: the next render's
+    /// settle clamps it to the document's top, and the dropped
+    /// stickiness keeps growth below the viewport from dragging the
+    /// view back down.
+    fn scroll_to_top(&mut self) {
+        self.scroll_offset = usize::MAX;
+        self.auto_scroll = false;
+    }
+
     /// Re-arm stickiness when a scroll lands near the bottom.
     ///
     /// Scroll-down actions within [`STICK_TOLERANCE`] lines of the
@@ -1878,6 +2577,25 @@ impl TuiApp {
         if notice_lapsed {
             self.transient_notice = None;
         }
+        let health_lapsed = {
+            let mut health = self
+                .state
+                .health
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            match *health {
+                HealthNotice::Reconnected { at } => {
+                    let lapsed = at
+                        .checked_add(NOTICE_HOLD)
+                        .is_some_and(|until| until <= now);
+                    if lapsed {
+                        *health = HealthNotice::Idle;
+                    }
+                    lapsed
+                }
+                _ => false,
+            }
+        };
         // No run, no prompts: a finished or cancelled run's dispatches
         // are gone, so the gate already denied whatever went unanswered
         // — the queue must not hold an overlay the run can no longer
@@ -1891,12 +2609,28 @@ impl TuiApp {
         if prompts_retired {
             self.pending_permissions.clear();
         }
+        // The same retirement for questions: a run that is no longer
+        // live has no dispatch left to carry the answers, so dropping
+        // the prompts (and with them their reply senders) reads as a
+        // dismissal on any asking tool still parked on a channel.
+        let questions_retired = !self.pending_questions.is_empty()
+            && !self
+                .state
+                .agent_running
+                .load(std::sync::atomic::Ordering::SeqCst);
+        if questions_retired {
+            self.pending_questions.clear();
+            self.question_cursor = 0;
+            self.question_toggled.clear();
+        }
         self.any_tools_running()
             || claimed
             || dragged
             || blinked
             || notice_lapsed
+            || health_lapsed
             || prompts_retired
+            || questions_retired
     }
 
     /// Whether a graduation is waiting to land.
@@ -1940,33 +2674,63 @@ impl TuiApp {
             .unwrap_or(1)
             .clamp(1, INPUT_TEXT_ROWS);
         let composer_height = text_rows.saturating_add(INPUT_VERTICAL_PADDING.saturating_mul(2));
+        // The strip's configured row shapes the frame: a dedicated
+        // first row of the terminal, or the spacer above the composer
+        // every later pane shifts down past.
+        let strip_at_top = matches!(self.strip_position, StripPosition::Top);
+        let mut constraints = Vec::with_capacity(6);
+        if strip_at_top {
+            constraints.push(Constraint::Length(1));
+        }
+        constraints.extend([
+            Constraint::Min(0),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(composer_height),
+            Constraint::Length(STATUS_BAR_ROWS),
+        ]);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(0),
-                Constraint::Length(1),
-                Constraint::Length(1),
-                Constraint::Length(composer_height),
-                Constraint::Length(STATUS_BAR_ROWS),
-            ])
+            .constraints(constraints)
             .split(area);
 
+        let base = usize::from(strip_at_top);
         let fallback = area;
-        self.render_conversation(frame, pane(&chunks, 0, fallback));
-        self.render_notice(frame, pane(&chunks, 1, fallback));
-        // The paintless theme's composer marking: hairline rules the
-        // terminal draws itself — an underlined spacer puts a 1px
-        // line at the box's top edge, an underlined last row at its
-        // bottom. Solid and thin on every terminal: the rule is the
-        // terminal's own decoration, not glyphs (which gap between
-        // rows on some) or paint (which is a full cell thick).
+        self.render_conversation(frame, pane(&chunks, base, fallback));
+        self.render_notice(frame, pane(&chunks, base.saturating_add(1), fallback));
+        // While the agent runs, the strip breathes in its configured
+        // row; when that row is the composer's spacer, the paintless
+        // hairline stands down for those frames rather than
+        // underlining the bar.
+        if self
+            .state
+            .agent_running
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.run_anchor.get_or_insert_with(Instant::now);
+        } else {
+            self.run_anchor = None;
+        }
+        let strip_row = if strip_at_top {
+            0
+        } else {
+            base.saturating_add(2)
+        };
+        let strip_drew = self.render_pulse_strip(frame, pane(&chunks, strip_row, fallback));
+        let strip_owns_spacer = strip_drew && !strip_at_top;
         if let Some(color) = self.theme.ui.composer_border {
-            let spacer = pane(&chunks, 2, fallback);
-            let composer = pane(&chunks, 3, fallback);
+            let spacer = pane(&chunks, base.saturating_add(2), fallback);
+            let composer = pane(&chunks, base.saturating_add(3), fallback);
+            // The hairline is the composer's top edge on border themes:
+            // an underlined row of spaces reads as a rule without
+            // consuming a layout row of its own. While the strip
+            // breathes in the spacer, the strip owns the row and the
+            // rule waits; a strip configured to the top row never
+            // claims it.
             let rule = Style::default()
                 .fg(color)
                 .add_modifier(ratatui::style::Modifier::UNDERLINED);
-            if spacer.height > 0 {
+            if spacer.height > 0 && !strip_owns_spacer {
                 frame.buffer_mut().set_style(spacer, rule);
             }
             if composer.height > 0 {
@@ -1978,10 +2742,15 @@ impl TuiApp {
                 frame.buffer_mut().set_style(bottom, rule);
             }
         }
-        let input_area = pane(&chunks, 3, fallback);
+        let input_area = pane(&chunks, base.saturating_add(3), fallback);
         self.input_wrap_width = wrap_width;
         self.render_input(frame, input_area, &rows, caret);
-        self.render_status_bar(frame, pane(&chunks, 4, fallback), &rows, caret);
+        self.render_status_bar(
+            frame,
+            pane(&chunks, base.saturating_add(4), fallback),
+            &rows,
+            caret,
+        );
         if let Some((prompt, more)) = self.pending_permissions.front().map(|request| {
             (
                 request.prompt.clone(),
@@ -1989,7 +2758,110 @@ impl TuiApp {
             )
         }) {
             self.render_permission_overlay(frame, area, &prompt, more);
+            return;
         }
+        if self.pending_permissions.is_empty() && self.pending_questions.front().is_some() {
+            self.render_question_overlay(
+                frame,
+                area,
+                self.pending_questions.len().saturating_sub(1),
+            );
+        }
+    }
+
+    /// Render the pending question as a sheet over the prompt box.
+    ///
+    /// The same anchored sheet the permission ask uses, carrying the
+    /// question's optional header chip, its text, its option rows
+    /// (the cursor marked `›`, toggled multi-select rows marked `•`),
+    /// each option's dimmed description, and the key hints. Long
+    /// question text wraps at the box's inner width; option labels
+    /// and descriptions clamp to one row each, ellipsized — the
+    /// pickable surface stays scannable whatever the model asked.
+    /// Only a terminal shorter than the box clips, at the box's top.
+    fn render_question_overlay(&self, frame: &mut Frame, area: Rect, more: usize) {
+        let Some(question) = self.pending_questions.front() else {
+            return;
+        };
+        let hints = if more == 0 {
+            "[↑↓] move · [space] toggle · [enter] confirm · [esc] dismiss".to_string()
+        } else {
+            format!(
+                "[↑↓] move · [space] toggle · [enter] confirm · [esc] dismiss · {more} more waiting"
+            )
+        };
+        let wrap_at = usize::from(area.width.saturating_sub(4));
+        let mut lines: Vec<Line<'_>> = Vec::new();
+        if let Some(header) = &question.header {
+            lines.push(Line::styled(
+                format!("[{header}]"),
+                Style::default().fg(self.theme.ui.secondary),
+            ));
+        }
+        lines.extend(
+            wrap_prompt_rows(&question.question, wrap_at, MAX_OVERLAY_ROWS)
+                .into_iter()
+                .map(|row| Line::styled(row, Style::default().fg(self.theme.ui.foreground))),
+        );
+        lines.push(Line::default());
+        for (index, option) in question.options.iter().enumerate() {
+            let marker = if index == self.question_cursor {
+                "› "
+            } else {
+                "  "
+            };
+            let checked = if self.question_toggled.contains(&index) {
+                "• "
+            } else {
+                "  "
+            };
+            let label = wrap_prompt_rows(&format!("{marker}{checked}{}", option.label), wrap_at, 1)
+                .first()
+                .cloned()
+                .unwrap_or_default();
+            let style = if index == self.question_cursor {
+                Style::default().fg(self.theme.ui.primary)
+            } else {
+                Style::default().fg(self.theme.ui.foreground)
+            };
+            lines.push(Line::styled(label, style));
+            if let Some(description) = &option.description {
+                let detail = wrap_prompt_rows(&format!("      {description}"), wrap_at, 1)
+                    .first()
+                    .cloned()
+                    .unwrap_or_default();
+                lines.push(Line::styled(
+                    detail,
+                    Style::default().fg(self.theme.ui.secondary),
+                ));
+            }
+        }
+        lines.push(Line::default());
+        lines.extend(
+            wrap_prompt_rows(&hints, wrap_at, MAX_OVERLAY_ROWS)
+                .into_iter()
+                .map(|row| Line::styled(row, Style::default().fg(self.theme.ui.secondary))),
+        );
+        let sheet_area = Rect {
+            height: area.height.saturating_sub(STATUS_BAR_ROWS),
+            ..area
+        };
+        let height = u16::try_from(lines.len())
+            .unwrap_or(u16::MAX)
+            .saturating_add(2)
+            .min(sheet_area.height);
+        let overlay = bottom_sheet_rect(height, sheet_area);
+        if overlay.width == 0 || overlay.height == 0 {
+            return;
+        }
+        let accent = Style::default().fg(self.theme.ui.primary);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(accent)
+            .title(Span::styled(" Question ", accent));
+        frame.render_widget(Clear, overlay);
+        frame.render_widget(Paragraph::new(lines).block(block), overlay);
     }
 
     /// Render the pending permission ask as a sheet over the prompt
@@ -2109,10 +2981,19 @@ impl TuiApp {
             || self.conversation_cache_width != width
         {
             let mut summary_lines = HashMap::new();
+            let mut thinking_lines = HashMap::new();
+            let mut compaction_lines = HashMap::new();
             let mut user_turns = Vec::new();
-            self.conversation_cache =
-                self.conversation_lines(text_area, &mut summary_lines, &mut user_turns);
+            self.conversation_cache = self.conversation_lines(
+                text_area,
+                &mut summary_lines,
+                &mut thinking_lines,
+                &mut compaction_lines,
+                &mut user_turns,
+            );
             self.tool_summary_lines = summary_lines;
+            self.thinking_summary_lines = thinking_lines;
+            self.compaction_summary_lines = compaction_lines;
             self.user_turn_ranges = user_turns;
             self.conversation_cache_width = width;
             self.conversation_cache_generation = self.conversation_generation;
@@ -2131,16 +3012,35 @@ impl TuiApp {
             self.drag_position = None;
         }
         let (tools, running_rows) = self.active_tool_lines(width);
+        let thinking_rows = self.live_thinking_lines(width);
+        let compaction_rows = self.live_compaction_lines();
         let selectable_lines = self
             .conversation_cache
             .len()
             .saturating_add(self.frozen_lines.len())
             .saturating_add(self.live_lines.len());
+        // The thinking row sits above the streaming reply it precedes:
+        // its content arrived before the text, so the live lane reads in
+        // conversation order — thinking, then the reply it introduced.
+        self.thinking_live_rows = thinking_rows.1.map(|row| {
+            let start = row.saturating_add(self.conversation_cache.len());
+            start..start.saturating_add(thinking_rows.0.len())
+        });
+        let pre_tool_offset = self
+            .conversation_cache
+            .len()
+            .saturating_add(thinking_rows.0.len())
+            .saturating_add(self.frozen_lines.len())
+            .saturating_add(self.live_lines.len())
+            .saturating_add(compaction_rows.len());
         self.tool_running_lines = running_rows
             .into_iter()
-            .map(|(index, call_id)| (index.saturating_add(selectable_lines), call_id))
+            .map(|(index, call_id)| (index.saturating_add(pre_tool_offset), call_id))
             .collect();
-        let total_lines = selectable_lines.saturating_add(tools.len());
+        let total_lines = selectable_lines
+            .saturating_add(thinking_rows.0.len())
+            .saturating_add(compaction_rows.len())
+            .saturating_add(tools.len());
         self.settle_scroll_offset(total_lines, conversation_height);
         let skip = total_lines
             .saturating_sub(conversation_height)
@@ -2148,8 +3048,10 @@ impl TuiApp {
         let mut visible = visible_window(
             [
                 &self.conversation_cache,
+                &thinking_rows.0,
                 &self.frozen_lines,
                 &self.live_lines,
+                &compaction_rows,
                 &tools,
             ],
             skip,
@@ -2310,23 +3212,63 @@ impl TuiApp {
     /// the conversation as assistant messages; run failures
     /// recorded by the mode driver surface as error messages — so
     /// none of the shared buffers accumulates across frames.
-    /// Whenever a reply, a tool completion, or a failure lands, the
-    /// turn-end hook — when installed — receives the conversation
-    /// snapshot, the host's save point. A poisoned lock is
+    /// Whenever a reply, a tool completion, a failure, or a turn-end
+    /// history lands, the turn-end hook — when installed — receives
+    /// the conversation snapshot beside the newest engine history,
+    /// the host's save point. A poisoned lock is
     /// recovered — the same policy the observer writes with — so
     /// finalized data still graduates.
     fn drain_shared_state(&mut self) {
         let graduations = take_locked(&self.state.graduations);
+        let retry_lines = take_locked(&self.state.retry_lines);
         let now = chrono::Utc::now();
+        for line in retry_lines {
+            if let Some(index) = self.retry_row_index.get(&line.episode).copied() {
+                // The episode's row exists — the attempt count climbs
+                // in place, never stacking a second row.
+                if let Some(TuiMessage::System { text, .. }) = self.conversation.get_mut(index) {
+                    *text = line.text;
+                }
+            } else {
+                self.push_message(TuiMessage::System {
+                    text: line.text.clone(),
+                    timestamp: now,
+                });
+                let index = self.conversation.len().saturating_sub(1);
+                self.retry_row_index.insert(line.episode, index);
+            }
+        }
         let mut turn_ended = !graduations.is_empty();
+        let turn_histories = take_locked(&self.state.turn_histories);
+        let machine_history = turn_histories.last().cloned();
+        turn_ended |= machine_history.is_some();
         for graduation in graduations {
             match graduation {
-                Graduation::Reply(text) => {
+                Graduation::Reply { text, thinking } => {
+                    let mut blocks = Vec::new();
+                    blocks.extend(thinking);
+                    if !text.is_empty() {
+                        blocks.push(ContentBlock::Text { text });
+                    }
                     self.push_message(TuiMessage::Assistant {
-                        blocks: vec![ContentBlock::Text { text }],
+                        blocks,
                         timestamp: now,
                         duration_ms: None,
                     });
+                }
+                Graduation::RunEnded { duration_ms } => {
+                    // The run's total lands on its final reply — the
+                    // reply the queue graduated ahead of this marker.
+                    // A run that produced none leaves a non-assistant
+                    // message last, and the total is dropped rather
+                    // than stamped onto a stranger.
+                    if let Some(TuiMessage::Assistant {
+                        duration_ms: reply_duration,
+                        ..
+                    }) = self.conversation.last_mut()
+                    {
+                        *reply_duration = Some(duration_ms);
+                    }
                 }
                 Graduation::Tool(result) => {
                     self.retain_tool_detail(
@@ -2350,6 +3292,7 @@ impl TuiApp {
                 }
             }
         }
+        let compactions = take_locked(&self.state.compactions);
         let errors = take_locked(&self.state.errors);
         turn_ended |= !errors.is_empty();
         for text in errors {
@@ -2357,6 +3300,9 @@ impl TuiApp {
                 text,
                 timestamp: now,
             });
+        }
+        for record in compactions {
+            self.push_message(record);
         }
         let verdicts = take_locked(&self.copy_outcomes);
         // Overlapping copies drain in attempt order, not arrival
@@ -2366,10 +3312,13 @@ impl TuiApp {
             && latest.attempt >= self.posted_copy_attempt
         {
             self.posted_copy_attempt = latest.attempt;
-            self.post_notice(copy_verdict_notice(latest).to_string());
+            let wording = copy_verdict_notice(latest);
+            if !wording.is_empty() {
+                self.post_notice(wording.to_string());
+            }
         }
         if turn_ended && let Some(hook) = &self.turn_end_hook {
-            hook(&self.conversation);
+            hook(&self.conversation, machine_history.as_ref());
         }
     }
 
@@ -2391,6 +3340,8 @@ impl TuiApp {
         &self,
         area: Rect,
         summary_lines: &mut HashMap<usize, String>,
+        thinking_lines: &mut HashMap<usize, String>,
+        compaction_lines: &mut HashMap<usize, String>,
         user_turns: &mut Vec<(usize, usize, usize)>,
     ) -> Vec<Line<'static>> {
         let width = area.width.max(1);
@@ -2398,7 +3349,7 @@ impl TuiApp {
         let syntax_theme = markdown::SyntaxTheme::from(&self.theme);
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut previous_was_user: Option<bool> = None;
-        for message in &self.conversation {
+        for (message_index, message) in self.conversation.iter().enumerate() {
             let is_user = matches!(message, TuiMessage::User { .. });
             if previous_was_user.is_some_and(|was_user| was_user != is_user) {
                 lines.push(Line::default());
@@ -2419,9 +3370,31 @@ impl TuiApp {
                     lines.push(Line::default());
                     user_turns.push((tint_start, lines.len(), mark_row));
                 }
-                TuiMessage::Assistant { blocks, .. } => {
-                    for block in blocks {
+                TuiMessage::Assistant {
+                    blocks,
+                    duration_ms,
+                    ..
+                } => {
+                    for (block_index, block) in blocks.iter().enumerate() {
                         match block {
+                            ContentBlock::Thinking {
+                                text,
+                                redacted,
+                                duration_ms,
+                            } => {
+                                let key = format!("m{message_index}b{block_index}");
+                                let expanded = self.expanded_thinking.contains(&key);
+                                let first = lines.len();
+                                lines.extend(thinking_section_lines(
+                                    text,
+                                    *redacted,
+                                    *duration_ms,
+                                    expanded,
+                                    usize::from(width),
+                                    self.theme.ui.dim,
+                                ));
+                                index_summary_rows(thinking_lines, first, lines.len(), &key);
+                            }
                             ContentBlock::Text { text } => {
                                 lines.extend(markdown::render_markdown(
                                     text,
@@ -2432,61 +3405,16 @@ impl TuiApp {
                                     None,
                                 ));
                             }
-                            ContentBlock::Tool {
-                                name,
-                                call_id,
-                                input_preview,
-                                success,
-                                elapsed_secs,
-                                ..
-                            } => {
-                                let elapsed = if elapsed_secs.is_finite()
-                                    && *elapsed_secs >= 0.0
-                                    && *elapsed_secs <= MAX_ELAPSED_SECS
-                                {
-                                    std::time::Duration::from_secs_f64(*elapsed_secs)
-                                } else {
-                                    std::time::Duration::ZERO
-                                };
-                                let record = ToolResultDisplay {
-                                    name: name.clone(),
-                                    call_id: String::new(),
-                                    is_error: !*success,
-                                    duration: elapsed,
-                                    input_summary: input_preview.clone(),
-                                    output_preview: String::new(),
-                                    full_input: String::new(),
-                                    full_output: String::new(),
-                                };
-                                let first = lines.len();
-                                lines.extend(crate::tool_render::completed_tool_lines(
-                                    &record,
-                                    &self.theme,
-                                    self.verbosity,
-                                ));
-                                if let Some(detail) = self.tool_details.get(call_id) {
-                                    let expanded = self.expanded_tools.contains(call_id);
-                                    prepend_marker(
-                                        &mut lines,
-                                        first,
-                                        if expanded { "▾ " } else { "▸ " },
-                                        self.theme.ui.dim,
-                                    );
-                                    if expanded {
-                                        lines.extend(expansion_lines(
-                                            &detail.input_json,
-                                            Some(&detail.output),
-                                            width,
-                                            self.theme.ui.assistant_message_fg,
-                                            self.theme.ui.dim,
-                                        ));
-                                    }
-                                    for index in first..lines.len() {
-                                        summary_lines.insert(index, call_id.clone());
-                                    }
-                                }
+                            ContentBlock::Tool { .. } => {
+                                self.push_tool_block_lines(block, width, &mut lines, summary_lines);
                             }
                         }
+                    }
+                    if let Some(duration_ms) = duration_ms {
+                        lines.push(Line::styled(
+                            format_duration(*duration_ms),
+                            self.theme.ui.dim,
+                        ));
                     }
                 }
                 TuiMessage::System { text, .. } => {
@@ -2505,9 +3433,91 @@ impl TuiApp {
                         self.theme.ui.status_error,
                     ));
                 }
+                message @ TuiMessage::Compacted { .. } => {
+                    let key = format!("m{message_index}");
+                    let first = lines.len();
+                    lines.extend(compaction_notice_lines(
+                        message,
+                        self.expanded_compactions.contains(&key),
+                        self.theme.ui.dim,
+                    ));
+                    index_summary_rows(compaction_lines, first, lines.len(), &key);
+                }
             }
         }
         lines
+    }
+
+    /// Render one completed tool block into the conversation rows.
+    ///
+    /// Builds the block's verbosity-shaped summary line(s) and, when
+    /// the call carries retained expansion data, prepends the fold
+    /// marker and appends the expanded detail. Every row the block
+    /// produced is registered under the call's id, so a press on any
+    /// of them resolves back to the call it belongs to.
+    fn push_tool_block_lines(
+        &self,
+        block: &ContentBlock,
+        width: u16,
+        lines: &mut Vec<Line<'static>>,
+        summary_lines: &mut HashMap<usize, String>,
+    ) {
+        let ContentBlock::Tool {
+            name,
+            call_id,
+            input_preview,
+            success,
+            elapsed_secs,
+            ..
+        } = block
+        else {
+            return;
+        };
+        let elapsed = if elapsed_secs.is_finite()
+            && *elapsed_secs >= 0.0
+            && *elapsed_secs <= MAX_ELAPSED_SECS
+        {
+            std::time::Duration::from_secs_f64(*elapsed_secs)
+        } else {
+            std::time::Duration::ZERO
+        };
+        let record = ToolResultDisplay {
+            name: name.clone(),
+            call_id: String::new(),
+            is_error: !*success,
+            duration: elapsed,
+            input_summary: input_preview.clone(),
+            output_preview: String::new(),
+            full_input: String::new(),
+            full_output: String::new(),
+        };
+        let first = lines.len();
+        lines.extend(crate::tool_render::completed_tool_lines(
+            &record,
+            &self.theme,
+            self.verbosity,
+        ));
+        if let Some(detail) = self.tool_details.get(call_id) {
+            let expanded = self.expanded_tools.contains(call_id);
+            prepend_marker(
+                lines,
+                first,
+                if expanded { "▾ " } else { "▸ " },
+                self.theme.ui.dim,
+            );
+            if expanded {
+                lines.extend(expansion_lines(
+                    &detail.input_json,
+                    Some(&detail.output),
+                    width,
+                    self.theme.ui.assistant_message_fg,
+                    self.theme.ui.dim,
+                ));
+            }
+            for index in first..lines.len() {
+                summary_lines.insert(index, call_id.clone());
+            }
+        }
     }
 
     /// The streaming region's live rows: everything after the
@@ -2799,13 +3809,45 @@ impl TuiApp {
         (rows, caret)
     }
 
+    /// The connection-health line for the notice row, if one shows.
+    ///
+    /// A retry in flight is invisible here (the retries themselves
+    /// live in the conversation as reconnection rows; the notice row
+    /// would only duplicate them), and the reconnected note holds only
+    /// for the notice hold before yielding to whatever transient
+    /// notice waits beneath it. A running compaction pass does not
+    /// render here either — it lives in the conversation's live lane
+    /// while it holds, beside the streaming rows it sits among.
+    fn health_notice_text(&self) -> Option<String> {
+        match &*self
+            .state
+            .health
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+        {
+            // The retries themselves live in the conversation as
+            // reconnection rows now — the notice row would only
+            // duplicate them; only the recovery confirmation is a
+            // notice-row concern.
+            HealthNotice::Reconnected { at } => {
+                let until = at.checked_add(NOTICE_HOLD)?;
+                (Instant::now() < until).then(|| "reconnected".to_string())
+            }
+            HealthNotice::Idle
+            | HealthNotice::Retrying { .. }
+            | HealthNotice::Compacting { .. } => None,
+        }
+    }
+
     /// Render the notice row: one line of transient or state-driven
     /// message above the composer.
     ///
     /// The armed-quit hint owns the row while it holds — safety
-    /// wording outranks anything expiring — and a transient notice
-    /// (a cancel, an event worth a glance, not a transcript row)
-    /// shows until its hold elapses. Blank otherwise; the row is
+    /// wording outranks anything expiring — and a transient
+    /// notice (a cancel, an event worth a glance, not a transcript
+    /// row) shows until its hold elapses. Stream and tool retries
+    /// live in the conversation as their own rows and keep this row
+    /// free. Blank otherwise; the row is
     /// always reserved so nothing on screen shifts when a message
     /// arrives or leaves.
     fn render_notice(&self, frame: &mut Frame, area: Rect) {
@@ -2813,12 +3855,14 @@ impl TuiApp {
             return;
         }
         let text = if self.quit.armed {
-            Some("press ctrl+c again to quit")
+            Some("press ctrl+c again to quit".to_string())
         } else {
-            self.transient_notice
-                .as_ref()
-                .filter(|(_, until)| *until > Instant::now())
-                .map(|(text, _)| text.as_str())
+            self.health_notice_text().or_else(|| {
+                self.transient_notice
+                    .as_ref()
+                    .filter(|(_, until)| *until > Instant::now())
+                    .map(|(text, _)| text.clone())
+            })
         };
         if let Some(text) = text {
             frame.render_widget(
@@ -2936,13 +3980,18 @@ impl TuiApp {
     /// decision.
     #[must_use]
     pub fn composer_caret_visible(&self) -> bool {
-        self.caret_blink.on && self.pending_permissions.front().is_none()
+        self.caret_blink.on
+            && self.pending_permissions.front().is_none()
+            && self.pending_questions.front().is_none()
     }
 
     /// Render the one-line status bar.
     ///
-    /// Names the configured model, the cumulative token totals, and
-    /// the session's permission mode on the left; while the input
+    /// Names the configured model with its thinking effort in
+    /// parentheses — an unset effort reads `(Auto)`, because the
+    /// provider's own thinking defaults then apply — the session's
+    /// permission mode, and, once the host names one, the working
+    /// directory on the left; while the input
     /// holds state — submissions queued
     /// behind the driver, or a buffer longer than the composer's
     /// window — a position tag sits right-aligned in the theme's
@@ -2956,24 +4005,60 @@ impl TuiApp {
         if area.height == 0 {
             return;
         }
-        let tokens = self.state.tokens.lock().map_or_else(
-            |_| 0,
-            |counts| {
-                counts
-                    .cumulative_input
-                    .saturating_add(counts.cumulative_output)
-            },
-        );
-        let mut status_text = format!(" {}  │  CTX: {tokens}", self.config.api.model);
+        let effort = match self.config.api.reasoning_effort.as_deref() {
+            Some(level) => capitalize_first(level),
+            None => "Auto".to_string(),
+        };
+        let mut status_text = format!(" {} ({effort})", self.config.api.model);
         status_text.push_str("  │  mode: ");
         status_text.push_str(self.config.runner.permission_mode.as_str());
-        if let Some(id) = &self.session_id {
-            status_text.push_str("  │  ");
-            status_text.push_str(id);
+        if let Some(dir) = &self.working_dir {
+            let segment = match &self.git_branch {
+                Some(branch) => format!("  │  {dir} ({branch})"),
+                None => format!("  │  {dir}"),
+            };
+            status_text.push_str(&segment);
         }
         let bar_style = Style::default()
             .fg(self.theme.ui.status_bar_fg)
             .bg(self.theme.ui.status_bar_bg);
+        let mut id_layout: Option<(usize, usize)> = None;
+        if let Some(id) = &self.session_id {
+            status_text.push_str("  │  ");
+            let start = status_text.width();
+            status_text.push_str(id);
+            id_layout = Some((start, id.width()));
+        }
+        status_text.push_str("  │  ");
+        let live_window = self.state.context_window.load(Ordering::SeqCst);
+        let window = if live_window > 0 {
+            live_window
+        } else {
+            self.config
+                .api
+                .context_window
+                .unwrap_or(dch_config::FALLBACK_CONTEXT_WINDOW)
+        };
+        let context_fill = context_bar_fill(
+            self.state
+                .tokens
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .context_tokens,
+            window,
+            CONTEXT_BAR_CELLS,
+        );
+        let status_line = Line::from(vec![
+            Span::styled(std::mem::take(&mut status_text), bar_style),
+            Span::styled(
+                " ".repeat(context_fill),
+                Style::default().bg(self.theme.ui.scrollbar_thumb),
+            ),
+            Span::styled(
+                " ".repeat(CONTEXT_BAR_CELLS.saturating_sub(context_fill)),
+                Style::default().bg(self.theme.ui.scrollbar_track),
+            ),
+        ]);
         let tag = self.input_state_tag(rows, caret);
         let tag_width = if !tag.is_empty() && area.width > 4 {
             u16::try_from(tag.width().saturating_add(2))
@@ -2998,8 +4083,15 @@ impl TuiApp {
             height: 1,
             ..area
         };
+        self.session_id_span.set(id_layout.and_then(|(prefix, id)| {
+            let start = u16::try_from(prefix).ok()?.saturating_add(content.x);
+            let end = start
+                .saturating_add(u16::try_from(id).ok()?)
+                .min(content.x.saturating_add(left_width));
+            (end > start).then_some((content.y, start, end))
+        }));
         frame.render_widget(
-            Paragraph::new(status_text).style(bar_style),
+            Paragraph::new(status_line).style(bar_style),
             Rect {
                 width: left_width,
                 ..content
@@ -3103,6 +4195,49 @@ fn expansion_lines(
     lines
 }
 
+/// Cells the status bar's context-usage bar fills.
+///
+/// The bar is deliberately short — a glanceable fraction, not a
+/// second scrollbar.
+const CONTEXT_BAR_CELLS: usize = 10;
+
+/// The filled-cell count of the status bar's context-usage bar.
+///
+/// `used` tokens against a `window` budget, rounded to the nearest of
+/// `cells` cells and clamped to the bar — a full bar when usage
+/// somehow exceeds the window, an empty one when the window is
+/// unknown (zero), which is the fresh-session state before the first
+/// turn reports.
+fn context_bar_fill(used: u64, window: u64, cells: usize) -> usize {
+    if window == 0 {
+        return 0;
+    }
+    let cells = u64::try_from(cells).unwrap_or(u64::MAX);
+    let filled = used
+        .saturating_mul(cells)
+        .saturating_add(window.saturating_div(2))
+        .checked_div(window)
+        .unwrap_or(cells);
+    usize::try_from(filled.min(cells)).unwrap_or(usize::MAX)
+}
+
+/// Copy `word` with its first character uppercased.
+///
+/// The status bar's effort label shows the configured level's own
+/// spelling with a leading capital — `low` renders `(Low)` — whatever
+/// case the config file carried; the rest of the word is untouched.
+fn capitalize_first(word: &str) -> String {
+    let mut chars = word.chars();
+    match chars.next() {
+        Some(first) => {
+            let mut out: String = first.to_uppercase().collect();
+            out.push_str(chars.as_str());
+            out
+        }
+        None => String::new(),
+    }
+}
+
 /// One display cell of the rendered transcript.
 ///
 /// A conversation line index paired with the column, in cells, of
@@ -3111,8 +4246,15 @@ fn expansion_lines(
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct CellPos {
     /// The conversation line the cell sits on.
+    ///
+    /// Index into the app's rendered-transcript row space, not the
+    /// terminal's — scrolling moves the terminal row but never this
+    /// index.
     line: usize,
     /// The cell column within the rendered line.
+    ///
+    /// Terminal cells, so a wide glyph counts two; the selection's
+    /// character granularity comes from clipping to the line's width.
     col: usize,
 }
 
@@ -3123,8 +4265,14 @@ struct CellPos {
 /// turnover.
 struct ToolDetail {
     /// The call's input, pretty-printed JSON.
+    ///
+    /// What the dispatch-side capture recorded at call time; the
+    /// expansion renders it verbatim below the summary row.
     input_json: String,
     /// The call's output, within the retention cap.
+    ///
+    /// Truncated to the capture store's bound before it lands here,
+    /// so a host rendering the expansion never reparses megabytes.
     output: String,
 }
 
@@ -3136,8 +4284,14 @@ struct ToolDetail {
 /// between drags does not move the selection.
 struct CellSelection {
     /// The cell the press landed on.
+    ///
+    /// Stays fixed for the selection's lifetime — the anchor is where
+    /// the press began, whichever end of the range it reads as.
     anchor: CellPos,
     /// The cell the drag currently reaches.
+    ///
+    /// Moves with the drag and the edge-scroll steps that carry it
+    /// past the viewport; the copy takes the range it spans.
     head: CellPos,
 }
 
@@ -3151,6 +4305,9 @@ struct CellSelection {
 #[derive(Debug, Clone, Copy, Default)]
 struct QuitState {
     /// Whether one press has armed the exit.
+    ///
+    /// True only between the empty-buffer chord press and the key
+    /// that confirms or disarms it.
     armed: bool,
     /// Whether the second press confirmed it.
     ///
@@ -3160,6 +4317,9 @@ struct QuitState {
 
 impl QuitState {
     /// Record a first press.
+    ///
+    /// Called only for the chord's own spelling on an empty buffer;
+    /// the press that clears a draft never reaches here.
     fn arm(&mut self) {
         self.armed = true;
     }
@@ -3182,8 +4342,14 @@ impl QuitState {
 /// reads, it does not type, and leaves the phase alone.
 struct CaretBlink {
     /// Whether the caret is in its visible phase.
+    ///
+    /// The frame shows the terminal cursor only while this is true;
+    /// the pending-permission and pending-question sheets suppress it.
     on: bool,
     /// Ticks since the phase last flipped.
+    ///
+    /// Counted against the run loop's tick so the half-second phases
+    /// survive frame-rate changes.
     ticks: u32,
 }
 
@@ -3195,6 +4361,10 @@ impl Default for CaretBlink {
 
 impl CaretBlink {
     /// Restart the visible phase — the reaction to any input.
+    ///
+    /// Keyboard input resolidifies the caret immediately; mouse
+    /// traffic never calls this, so reading alone does not hold the
+    /// caret solid.
     fn resolidify(&mut self) {
         self.on = true;
         self.ticks = 0;
@@ -3380,7 +4550,10 @@ pub enum CopyAnswer {
 fn copy_answer_notice(answer: CopyAnswer) -> &'static str {
     match answer {
         CopyAnswer::Verified => "selection copied",
-        CopyAnswer::Unconfirmed => "selection copied (unconfirmed)",
+        // An in-flight transport chain owes a verdict; saying anything
+        // now would flash a claim the next frame replaces — the
+        // verdict is the only wording that holds the row.
+        CopyAnswer::Unconfirmed => "",
         CopyAnswer::Failed => "copy failed — set display.copy_command",
     }
 }
@@ -3454,7 +4627,10 @@ fn copy_verdict_notice(verdict: CopyVerdict) -> &'static str {
     if verdict.verified {
         "selection copied"
     } else if verdict.escape_written {
-        "selection copied (unconfirmed)"
+        // The escape's bytes left but nothing confirmed delivery —
+        // claiming either way would lie, and an empty wording posts
+        // no row at all, which is the honest silence.
+        ""
     } else {
         "copy failed — set display.copy_command"
     }
@@ -3559,7 +4735,7 @@ fn osc52_write(text: &str) -> bool {
 /// it never runs just to fail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ClipboardEnv {
-    /// Whether `$TMUX` is set: inside tmux, `set-buffer -w` reaches
+    /// Whether `$TMUX` is set: inside tmux, `load-buffer -w` reaches
     /// tmux's own paste buffer and asks the outer terminal for its
     /// clipboard.
     in_tmux: bool,
@@ -3581,8 +4757,10 @@ struct ClipboardEnv {
 enum HostTransport {
     /// tmux's buffer, pushed onward to the system clipboard.
     ///
-    /// `set-buffer -w` fills tmux's paste buffer and forwards to the
-    /// attached terminal's clipboard, covering both paste paths.
+    /// `load-buffer -w -` reads the text on stdin — `set-buffer`
+    /// would take `-` as its literal data argument and drop the piped
+    /// text — fills tmux's paste buffer, and forwards to the attached
+    /// terminal's clipboard, covering both paste paths.
     Tmux,
 
     /// The Wayland clipboard helper.
@@ -3612,7 +4790,7 @@ impl HostTransport {
         match self {
             Self::Tmux => {
                 let mut command = std::process::Command::new("tmux");
-                command.args(["set-buffer", "-w", "-"]);
+                command.args(["load-buffer", "-w", "-"]);
                 command
             }
             Self::WlCopy => std::process::Command::new("wl-copy"),
@@ -3638,9 +4816,40 @@ impl HostTransport {
 fn clipboard_env() -> ClipboardEnv {
     ClipboardEnv {
         in_tmux: non_empty("TMUX"),
-        wayland: non_empty("WAYLAND_DISPLAY"),
+        wayland: non_empty("WAYLAND_DISPLAY") || wayland_socket_present(),
         x11: non_empty("DISPLAY"),
     }
+}
+
+/// Whether a Wayland compositor's socket is discoverable without
+/// `$WAYLAND_DISPLAY`.
+///
+/// A tmux server launched from a text console carries no graphical
+/// variables into its panes even while a Wayland session runs
+/// elsewhere, and a terminal that ignores OSC 52 then turns the
+/// tmux-buffer transport into a dead end. libwayland falls back to
+/// the conventional `wayland-0` socket under `$XDG_RUNTIME_DIR`, so a
+/// socket sitting there is evidence enough that `wl-copy` can reach a
+/// compositor; the lock file beside it counts too, since it appears
+/// and disappears with the socket.
+fn wayland_socket_present() -> bool {
+    let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") else {
+        return false;
+    };
+    wayland_socket_in(std::path::Path::new(&runtime_dir))
+}
+
+/// The directory scan behind [`wayland_socket_present`].
+///
+/// Pure over the directory so the pin can drive it with a fixture;
+/// every entry whose name begins `wayland-` — socket or lock — is
+/// evidence a compositor is reachable through it.
+fn wayland_socket_in(dir: &std::path::Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|entries| {
+        entries
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().starts_with("wayland-"))
+    })
 }
 
 /// Whether `name` is set to a non-empty value.
@@ -3950,8 +5159,10 @@ fn take_locked<T: Default>(mutex: &Mutex<T>) -> T {
 /// the frame, so instead of concatenating and cloning every segment
 /// this walks them with the skip offset and clones only the lines
 /// the viewport actually shows — per-frame cost tracks the pane
-/// height, not the session length.
-fn visible_window<'a>(segments: [&'a [Line<'a>]; 4], skip: usize, height: usize) -> Vec<Line<'a>> {
+/// height, not the session length. The segments' borrow and their
+/// content are decoupled lifetimes: the caller may assemble the
+/// window from transient borrows of lines it keeps beyond them.
+fn visible_window<'a>(segments: [&'a [Line<'a>]; 6], skip: usize, height: usize) -> Vec<Line<'a>> {
     let mut visible = Vec::with_capacity(height.min(64));
     let mut skip = skip;
     for segment in segments {
@@ -4448,6 +5659,722 @@ fn fingerprint(text: &str) -> u64 {
     hasher.finish()
 }
 
+/// The thinking-display preference for the current session.
+///
+/// Follow is the default: live reasoning renders expanded and
+/// auto-collapses when the stream completes. Suppressed renders every
+/// stream collapsed from its first delta — the remembered answer to a
+/// live-stream collapse, held only for the session.
+enum ThinkingMode {
+    /// Live reasoning renders expanded and auto-collapses at graduation.
+    ///
+    /// The default every session starts in; clicking the live row
+    /// while expanded switches to
+    /// [`Suppressed`](ThinkingMode::Suppressed).
+    Follow,
+
+    /// Every reasoning stream renders collapsed from its first delta.
+    ///
+    /// The remembered answer to a live-stream collapse; clicking the
+    /// live row while collapsed switches back to
+    /// [`Follow`](ThinkingMode::Follow).
+    Suppressed,
+}
+
+/// The pulse bar's breathing period, in milliseconds.
+///
+/// One full animation cycle per period — the centered breath's
+/// grow-and-shrink or the sweep's fill-and-clear; the phase is a pure
+/// function of elapsed time, so the bar animates smoothly at any
+/// frame rate and renders identically in tests.
+const PULSE_PERIOD_MS: u64 = 3600;
+
+/// How many live thinking body lines render at most.
+///
+/// The expanded live body keeps its trailing lines, bounding the
+/// per-frame wrap cost of an unbounded reasoning dump; the graduated
+/// block keeps everything.
+const LIVE_THINKING_BODY_CAP: usize = 500;
+
+/// The placeholder shown for withheld reasoning.
+///
+/// A redaction marker carries no text; a blank body would read as
+/// nothing, so the section says what happened instead.
+const THINKING_REDACTED_PLACEHOLDER: &str = "reasoning withheld by the provider";
+
+/// Render a thinking duration for its summary row.
+///
+/// Sub-second streams read `<1s`, longer ones seconds, and anything
+/// over a minute minutes-with-seconds — the two units a human glances
+/// at a reasoning stream in.
+/// The rows a compaction notice renders as.
+///
+/// Collapsed, one dim row — the trigger and the before-to-after
+/// token counts a scrolling reader needs; expanded, the pass's
+/// remaining facts follow beneath. The marker mirrors the thinking
+/// sections' shape so one gesture vocabulary covers every
+/// expandable row.
+fn compaction_notice_lines(
+    message: &TuiMessage,
+    expanded: bool,
+    dim: ratatui::style::Color,
+) -> Vec<Line<'static>> {
+    let TuiMessage::Compacted {
+        tokens_before,
+        tokens_after,
+        reason,
+        evicted,
+        duration_ms,
+        compactor,
+        compression_ratio,
+        ..
+    } = message
+    else {
+        return Vec::new();
+    };
+    let (tokens_before, tokens_after, evicted, duration_ms) =
+        (*tokens_before, *tokens_after, *evicted, *duration_ms);
+    let compactor = compactor.as_deref();
+    let compression_ratio = *compression_ratio;
+    let reason = reason.as_str();
+    let marker = if expanded { "▾" } else { "▸" };
+    let mut lines = vec![Line::styled(
+        format!("{marker} Compacted · {}", format_duration(duration_ms)),
+        dim,
+    )];
+    if expanded {
+        let saved = tokens_before.saturating_sub(tokens_after);
+        lines.push(Line::styled(
+            format!("  {tokens_before} → {tokens_after} tokens (saved {saved})"),
+            dim,
+        ));
+        lines.push(Line::styled(format!("  {evicted} messages evicted"), dim));
+        lines.push(Line::styled(format!("  reason: {reason}"), dim));
+        if let Some(name) = compactor {
+            lines.push(Line::styled(format!("  compactor: {name}"), dim));
+        }
+        if let Some(ratio) = compression_ratio {
+            lines.push(Line::styled(format!("  compression {ratio:.1}x"), dim));
+        }
+        lines.push(Line::styled(
+            "  earlier exchanges now live in the summary — durable state is \
+             the findings file and todo list"
+                .to_string(),
+            dim,
+        ));
+    }
+    lines
+}
+
+/// Map every row a keyed block produced onto its key.
+///
+/// The press handlers resolve a screen row to the expandable block
+/// it belongs to through these maps; one inserter keeps every
+/// keyed block's registration identical.
+fn index_summary_rows(
+    map: &mut HashMap<usize, String>,
+    first: usize,
+    after_last: usize,
+    key: &str,
+) {
+    for index in first..after_last {
+        map.insert(index, key.to_string());
+    }
+}
+
+/// Render a millisecond duration in the largest units that fit.
+///
+/// Under a second renders as `<1s`; seconds render bare; a minute or
+/// more renders minutes beside seconds; an hour or more renders
+/// hours, minutes, and seconds together — so a reader sees the
+/// magnitude at a glance whether the span is a twitch or a marathon.
+fn format_duration(ms: u64) -> String {
+    let secs = ms / 1000;
+    if secs == 0 {
+        "<1s".to_string()
+    } else if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h {}m {}s", secs / 3600, secs % 3600 / 60, secs % 60)
+    }
+}
+
+/// The breathing pulse bar as a fixed-width string with unstyled padding.
+///
+/// A thin centered run of `─` that grows linearly from the row's
+/// center toward both edges and shrinks back over
+/// [`PULSE_PERIOD_MS`] — a triangle breath, computed in pure integer
+/// arithmetic and centered to the cell: when the padding splits odd,
+/// the run sits half a cell right of center. The run never fully
+/// disappears: its floor is one cell, so the strip is visible from
+/// the run's first frame. Only the run carries the style; the
+/// padding around it stays unstyled, so no terminal ever shows
+/// styled spaces as a tinted band. The string is exactly `width`
+/// characters, filling the span its caller reserves without
+/// shifting anything around it.
+fn pulse_centered(began: Instant, now: Instant, width: usize) -> String {
+    let period = PULSE_PERIOD_MS.max(2);
+    let half = period / 2;
+    let elapsed = u64::try_from(now.duration_since(began).as_millis()).unwrap_or(0);
+    let mark = elapsed.rem_euclid(period);
+    let progress = if mark < half {
+        mark
+    } else {
+        period.saturating_sub(mark)
+    };
+    let len = u64::try_from(width)
+        .unwrap_or(0)
+        .saturating_mul(progress)
+        .checked_div(half)
+        .unwrap_or(0);
+    let len = usize::try_from(len).unwrap_or(0).min(width);
+    let len = len.max(width.min(1));
+    let start = width.saturating_sub(len).div_ceil(2);
+    let tail = width.saturating_sub(start).saturating_sub(len);
+    let mut pulse = String::with_capacity(width);
+    for _ in 0..start {
+        pulse.push(' ');
+    }
+    for _ in 0..len {
+        pulse.push('─');
+    }
+    for _ in 0..tail {
+        pulse.push(' ');
+    }
+    pulse
+}
+
+/// The sweeping pulse bar as a fixed-width string with unstyled padding.
+///
+/// The first half of [`PULSE_PERIOD_MS`] fills from the left edge —
+/// a one-cell seed growing right until the row is full — and the
+/// second half clears left-to-right with the right edge pinned at
+/// the row's end, the cleared count rounded up so the row blanks for
+/// an instant before the wrap restarts the seed. Like the breath,
+/// the phase is a pure function of elapsed time and the string is
+/// exactly `width` characters, its run carrying the only style.
+fn pulse_sweep(began: Instant, now: Instant, width: usize) -> String {
+    let period = PULSE_PERIOD_MS.max(2);
+    let half = period / 2;
+    let elapsed = u64::try_from(now.duration_since(began).as_millis()).unwrap_or(0);
+    let mark = elapsed.rem_euclid(period);
+    let mut pulse = String::with_capacity(width);
+    if mark < half {
+        let len = u64::try_from(width)
+            .unwrap_or(0)
+            .saturating_mul(mark)
+            .checked_div(half)
+            .unwrap_or(0);
+        let len = usize::try_from(len)
+            .unwrap_or(0)
+            .min(width)
+            .max(width.min(1));
+        for _ in 0..len {
+            pulse.push('─');
+        }
+        for _ in 0..width.saturating_sub(len) {
+            pulse.push(' ');
+        }
+    } else {
+        let cleared = u64::try_from(width)
+            .unwrap_or(0)
+            .saturating_mul(mark.saturating_sub(half))
+            .div_ceil(half)
+            .min(u64::try_from(width).unwrap_or(0));
+        let cleared = usize::try_from(cleared).unwrap_or(0).min(width);
+        for _ in 0..cleared {
+            pulse.push(' ');
+        }
+        for _ in 0..width.saturating_sub(cleared) {
+            pulse.push('─');
+        }
+    }
+    pulse
+}
+
+/// The bouncing pulse bar as a fixed-width string with unstyled padding.
+///
+/// One [`PULSE_PERIOD_MS`] pass sweeps left-to-right — the sweep's
+/// fill and clear — and the next sweeps back right-to-left with the
+/// geometry mirrored: a right-anchored fill growing from a one-cell
+/// seed and a left-pinned clear, the row blanking for an instant at
+/// every turn before the next pass begins. Like the other styles,
+/// the phase is a pure function of elapsed time and the string is
+/// exactly `width` characters, its run carrying the only style.
+fn pulse_bounce(began: Instant, now: Instant, width: usize) -> String {
+    let period = PULSE_PERIOD_MS.max(2);
+    let half = period / 2;
+    let elapsed = u64::try_from(now.duration_since(began).as_millis()).unwrap_or(0);
+    let mark = elapsed.rem_euclid(period.saturating_mul(2));
+    let forward = mark < period;
+    let pass = if forward {
+        mark
+    } else {
+        mark.saturating_sub(period)
+    };
+    let span = u64::try_from(width).unwrap_or(0);
+    let (len, left_pad) = if pass < half {
+        let len = span
+            .saturating_mul(pass)
+            .checked_div(half)
+            .unwrap_or(0)
+            .min(span);
+        let len = usize::try_from(len)
+            .unwrap_or(0)
+            .min(width)
+            .max(width.min(1));
+        let pad = if forward {
+            0
+        } else {
+            width.saturating_sub(len)
+        };
+        (len, pad)
+    } else {
+        let cleared = span
+            .saturating_mul(pass.saturating_sub(half))
+            .div_ceil(half)
+            .min(span);
+        let cleared = usize::try_from(cleared).unwrap_or(0).min(width);
+        let len = width.saturating_sub(cleared);
+        let pad = if forward { cleared } else { 0 };
+        (len, pad)
+    };
+    let mut pulse = String::with_capacity(width);
+    for _ in 0..left_pad {
+        pulse.push(' ');
+    }
+    for _ in 0..len {
+        pulse.push('─');
+    }
+    for _ in 0..width.saturating_sub(left_pad).saturating_sub(len) {
+        pulse.push(' ');
+    }
+    pulse
+}
+
+/// The traveling pulse bar as a fixed-width string with unstyled padding.
+///
+/// A segment a quarter of the row's width (floored at three cells,
+/// capped at the row) glides from the left edge to the right over
+/// one [`PULSE_PERIOD_MS`] pass and back over the next, the mirror
+/// continuing from exactly where the forward pass ended — one
+/// continuous scanner motion with the segment always on the row.
+/// Like the other styles, the phase is a pure function of elapsed
+/// time and the string is exactly `width` characters, its run
+/// carrying the only style.
+fn pulse_travel(began: Instant, now: Instant, width: usize) -> String {
+    let period = PULSE_PERIOD_MS.max(2);
+    let elapsed = u64::try_from(now.duration_since(began).as_millis()).unwrap_or(0);
+    let mark = elapsed.rem_euclid(period.saturating_mul(2));
+    let forward = mark < period;
+    let pass = if forward {
+        mark
+    } else {
+        mark.saturating_sub(period)
+    };
+    let len = (width / 4).max(3).min(width);
+    let reach = width.saturating_sub(len);
+    let pos = u64::try_from(reach)
+        .unwrap_or(0)
+        .saturating_mul(pass)
+        .checked_div(period)
+        .unwrap_or(0);
+    let pos = usize::try_from(pos).unwrap_or(0).min(reach);
+    let left_pad = if forward {
+        pos
+    } else {
+        reach.saturating_sub(pos)
+    };
+    let mut pulse = String::with_capacity(width);
+    for _ in 0..left_pad {
+        pulse.push(' ');
+    }
+    for _ in 0..len {
+        pulse.push('─');
+    }
+    for _ in 0..width.saturating_sub(left_pad).saturating_sub(len) {
+        pulse.push(' ');
+    }
+    pulse
+}
+
+/// The circulating pulse bar as a fixed-width string with unstyled padding.
+///
+/// A segment in travel's geometry — a quarter of the row's width,
+/// floored at three cells, capped at the row — advances one full lap
+/// around the row per [`PULSE_PERIOD_MS`], covering
+/// `[pos, pos + len)` modulo the width: while the tail is still
+/// exiting the right edge the head is already entering the left, two
+/// runs visible during the crossing and the row never blank. Like
+/// the other styles, the phase is a pure function of elapsed time
+/// and the string is exactly `width` characters.
+fn pulse_snake(began: Instant, now: Instant, width: usize) -> String {
+    let period = PULSE_PERIOD_MS.max(2);
+    let elapsed = u64::try_from(now.duration_since(began).as_millis()).unwrap_or(0);
+    let mark = elapsed.rem_euclid(period);
+    let len = (width / 4).max(3).min(width);
+    let pos = u64::try_from(width)
+        .unwrap_or(0)
+        .saturating_mul(mark)
+        .checked_div(period)
+        .unwrap_or(0);
+    let pos = usize::try_from(pos)
+        .unwrap_or(0)
+        .min(width.saturating_sub(1));
+    let head = pos.saturating_add(len).saturating_sub(width);
+    let tail = len.saturating_sub(head);
+    let mut pulse = String::with_capacity(width);
+    for _ in 0..head {
+        pulse.push('─');
+    }
+    for _ in 0..pos.saturating_sub(head) {
+        pulse.push(' ');
+    }
+    for _ in 0..tail {
+        pulse.push('─');
+    }
+    for _ in 0..width.saturating_sub(pos).saturating_sub(tail) {
+        pulse.push(' ');
+    }
+    pulse
+}
+
+/// The worm path's position numerator and its shared denominator.
+///
+/// The path is the integral of a velocity `2 + 12(2u−1)⁴` — position
+/// `(20u + 12(2u−1)⁵ + 12)/44` — racing the outer sections at up to
+/// seven times its center crawl and dipping between smoothly. Every
+/// progress shares one denominator, so a caller holding two ends
+/// rounds their difference once instead of rounding the ends against
+/// each other. The quintic terms outgrow `u64` at wide rows, hence
+/// `u128`.
+fn worm_numer(progress: u64, span: u64) -> (u128, u128) {
+    let n = progress.min(span);
+    let wide_span = u128::from(span);
+    let second = wide_span.saturating_mul(wide_span);
+    let fourth = second.saturating_mul(second);
+    let fifth = fourth.saturating_mul(wide_span);
+    let base = u128::from(n)
+        .saturating_mul(20)
+        .saturating_mul(fourth)
+        .saturating_add(fifth.saturating_mul(12));
+    let numer = if n.saturating_mul(2) <= span {
+        base.saturating_sub(
+            u128::from(span.saturating_sub(n.saturating_mul(2)))
+                .saturating_pow(5)
+                .saturating_mul(12),
+        )
+    } else {
+        base.saturating_add(
+            u128::from(n.saturating_mul(2).saturating_sub(span))
+                .saturating_pow(5)
+                .saturating_mul(12),
+        )
+    };
+    (numer, fifth.saturating_mul(44).max(1))
+}
+
+/// The worm-large path: position numerator and denominator.
+///
+/// The path is the integral of a velocity `(3 + 6u + 6u²)/8` —
+/// position `(3n·span² + 3n²·span + 2n³) / (8·span³)` — moving at
+/// three-eighths of the mean speed from the first frame with real
+/// acceleration from the start, the pull strengthening through and
+/// past the row's center, the far edge arriving at five times the
+/// seed's speed. No deceleration anywhere and no branch split; the
+/// cubes keep the numerator far inside `u128`.
+fn worm_large_numer(progress: u64, span: u64) -> (u128, u128) {
+    let n = progress.min(span);
+    let wide_span = u128::from(span);
+    let wide_n = u128::from(n);
+    let squared = wide_n.saturating_mul(wide_n);
+    let cubed = squared.saturating_mul(wide_n);
+    let span_squared = wide_span.saturating_mul(wide_span);
+    (
+        wide_n
+            .saturating_mul(span_squared)
+            .saturating_mul(3)
+            .saturating_add(squared.saturating_mul(wide_span).saturating_mul(3))
+            .saturating_add(cubed.saturating_mul(2)),
+        span_squared
+            .saturating_mul(wide_span)
+            .saturating_mul(8)
+            .max(1),
+    )
+}
+
+/// Render a worm run between two half-cell edges.
+///
+/// A cell the run covers fully renders `─`, and one it covers halfway
+/// renders that half as a solid tick — `╴` for the left half, `╶` for
+/// the right — so the run reads as one line with trimmed ends, its
+/// length breathing at most half a cell. An empty run still seeds the
+/// run's own leading half-cell tick at the left while seeding — the
+/// shape the next frames grow from — so a traversal's first frame
+/// never snaps from a full cell to a half.
+fn worm_run(head_h: u128, tail_h: u128, width: usize, seeding: bool) -> String {
+    let mut pulse = String::with_capacity(width.saturating_mul(3));
+    for cell in 0..width {
+        let lo = (cell as u128).saturating_mul(2);
+        let hi = lo.saturating_add(1);
+        let lo_covered = lo >= tail_h && lo < head_h;
+        let hi_covered = hi >= tail_h && hi < head_h;
+        match (lo_covered, hi_covered) {
+            (true, true) => pulse.push('─'),
+            (true, false) => pulse.push('╴'),
+            (false, true) => pulse.push('╶'),
+            (false, false) => pulse.push(' '),
+        }
+    }
+    if seeding && width > 0 && !pulse.contains('─') && !pulse.contains('╴') && !pulse.contains('╶')
+    {
+        pulse.replace_range(..1, "╴");
+    }
+    pulse
+}
+
+/// The worm pulse bar as a fixed-width string with unstyled padding.
+///
+/// The bunched inchworm crawl on a shared path: the head crosses the
+/// row racing the outer sections and flowing through a center that
+/// crawls at a seventh of that speed, and the tail follows the same
+/// path a quarter-period behind — the run stretching as one end
+/// races away, bunching where the other catches it flowing, and
+/// absorbed at the head's settle on the right edge, the row blanking
+/// for an instant before the seed reappears at the left; one
+/// traversal per [`PULSE_PERIOD_MS`]. Like the other styles, the
+/// phase is a pure function of elapsed time and the string is
+/// exactly `width` characters, its run carrying the only style.
+fn pulse_worm(began: Instant, now: Instant, width: usize) -> String {
+    let period = PULSE_PERIOD_MS.max(2);
+    let quarter = period / 4;
+    let move_span = quarter.saturating_mul(3);
+    let elapsed = u64::try_from(now.duration_since(began).as_millis()).unwrap_or(0);
+    let mark = elapsed.rem_euclid(period);
+    // A widening cast: `usize` has no `From` into `u128`, and this
+    // one can never truncate.
+    let wide_width = width as u128;
+    let (head_n, den) = worm_numer(mark, move_span);
+    let (tail_n, _) = worm_numer(mark.saturating_sub(quarter), move_span);
+    let scale = wide_width.saturating_mul(2);
+    let head_h = head_n
+        .saturating_mul(scale)
+        .checked_div(den)
+        .unwrap_or(0)
+        .min(scale);
+    let tail_h = if mark < move_span {
+        tail_n.saturating_mul(scale).checked_div(den).unwrap_or(0)
+    } else {
+        tail_n.saturating_mul(scale).div_ceil(den)
+    }
+    .min(head_h);
+    worm_run(head_h, tail_h, width, mark < move_span)
+}
+
+/// The large worm pulse bar as a fixed-width string with unstyled
+/// padding.
+///
+/// The inchworm stretched to the row's full span on its own clock —
+/// a little quicker than the shared pulse period, so the long
+/// traversal reads as its own tempo — with one traversal spanning two
+/// periods: the head rides the accelerating path over the whole first
+/// period, setting off gently from the seed and pulling away ever
+/// harder through and past the row's center, the run spanning the
+/// full row at the period, while the tail rides the same path over
+/// the whole second, swallowing the run into the right the same way;
+/// each end moves one period and rests one, the tail anchored first,
+/// the head settled last. Like
+/// the other styles, the phase is a pure function of elapsed time and
+/// the string is exactly `width` characters, its run carrying the
+/// only style.
+fn pulse_worm_large(began: Instant, now: Instant, width: usize) -> String {
+    let period = PULSE_PERIOD_MS.max(2).saturating_mul(3).saturating_div(4);
+    let traversal = period.saturating_mul(2);
+    let elapsed = u64::try_from(now.duration_since(began).as_millis()).unwrap_or(0);
+    let mark = elapsed.rem_euclid(traversal);
+    // A widening cast: `usize` has no `From` into `u128`, and this
+    // one can never truncate.
+    let wide_width = width as u128;
+    let (head_n, den) = worm_large_numer(mark, period);
+    let (tail_n, _) = worm_large_numer(mark.saturating_sub(period), period);
+    let scale = wide_width.saturating_mul(2);
+    let head_h = head_n
+        .saturating_mul(scale)
+        .checked_div(den)
+        .unwrap_or(0)
+        .min(scale);
+    let tail_h = if mark < period {
+        tail_n.saturating_mul(scale).checked_div(den).unwrap_or(0)
+    } else {
+        tail_n.saturating_mul(scale).div_ceil(den)
+    }
+    .min(head_h);
+    worm_run(head_h, tail_h, width, mark < period)
+}
+
+/// The glow's brightness at an instant, in eighths of full.
+///
+/// One eased breath per [`PULSE_PERIOD_MS`]: full brightness at the
+/// breath's start, easing down to half at the half-breath and back —
+/// a smoothstep on each leg, so the turns at the extremes settle
+/// gently instead of snapping. A pure function of elapsed time, so
+/// the glow renders identically at any frame rate.
+fn glow_eighths(began: Instant, now: Instant) -> u64 {
+    let period = PULSE_PERIOD_MS.max(2);
+    let half = period / 2;
+    let elapsed = u64::try_from(now.duration_since(began).as_millis()).unwrap_or(0);
+    let mark = elapsed.rem_euclid(period);
+    let leg = if mark < half {
+        mark
+    } else {
+        mark.saturating_sub(half)
+    };
+    // The smoothstep `3x² − 2x³` on the leg's own clock, exact in
+    // integers over `half³`.
+    let leg_wide = u128::from(leg);
+    let half_wide = u128::from(half).max(1);
+    let leg_squared = leg_wide.saturating_mul(leg_wide);
+    let half_cubed = half_wide
+        .saturating_mul(half_wide)
+        .saturating_mul(half_wide);
+    let step = leg_squared
+        .saturating_mul(half_wide)
+        .saturating_mul(3)
+        .saturating_sub(leg_squared.saturating_mul(leg_wide).saturating_mul(2));
+    let eighths = if mark < half {
+        8_u128
+            .saturating_mul(half_cubed)
+            .saturating_sub(step.saturating_mul(4))
+    } else {
+        4_u128
+            .saturating_mul(half_cubed)
+            .saturating_add(step.saturating_mul(4))
+    }
+    .checked_div(half_cubed)
+    .unwrap_or(8);
+    u64::try_from(eighths).unwrap_or(8)
+}
+
+/// A color scaled to eighths of its brightness.
+///
+/// RGB colors scale channel-wise; every other color returns
+/// unchanged, so a theme with a named strip color renders the glow
+/// as a plain static bar rather than guessing at named-color
+/// distances.
+fn scaled_color(color: Color, eighths: u64) -> Color {
+    let scale = |channel: u8| -> u8 {
+        u8::try_from(
+            u64::from(channel)
+                .saturating_mul(eighths)
+                .checked_div(8)
+                .unwrap_or(0),
+        )
+        .unwrap_or(0)
+    };
+    match color {
+        Color::Rgb(r, g, b) => Color::Rgb(scale(r), scale(g), scale(b)),
+        other => other,
+    }
+}
+
+/// The styled span of a pulse bar: only its runs, unstyled padding around.
+///
+/// Walking the bar's string — whichever style shaped it — run by run
+/// keeps every padding cell free of any style, so the strip paints
+/// exactly the bar and never a tinted band of colored spaces, however
+/// many runs the style renders. The run class covers the bar's full
+/// cell and its half-cell solid ticks alike: all three carry the
+/// color.
+fn pulse_span(
+    style: StripStyle,
+    began: Instant,
+    now: Instant,
+    width: usize,
+    color: Color,
+) -> Line<'static> {
+    let pulse = match style {
+        StripStyle::Breathe => pulse_centered(began, now, width),
+        StripStyle::Sweep => pulse_sweep(began, now, width),
+        StripStyle::Bounce => pulse_bounce(began, now, width),
+        StripStyle::Travel => pulse_travel(began, now, width),
+        StripStyle::Snake => pulse_snake(began, now, width),
+        StripStyle::Worm => pulse_worm(began, now, width),
+        StripStyle::WormLong => pulse_worm_large(began, now, width),
+        StripStyle::Off => String::new(),
+        StripStyle::Glow => std::iter::repeat_n('─', width).collect(),
+    };
+    let mut spans = Vec::new();
+    let mut pad = String::new();
+    let mut run = String::new();
+    let mut in_run = false;
+    for ch in pulse.chars() {
+        if ch == '─' || ch == '╴' || ch == '╶' {
+            if !in_run && !pad.is_empty() {
+                spans.push(Span::raw(std::mem::take(&mut pad)));
+            }
+            in_run = true;
+            run.push(ch);
+        } else {
+            if in_run && !run.is_empty() {
+                spans.push(Span::styled(
+                    std::mem::take(&mut run),
+                    Style::default().fg(color),
+                ));
+            }
+            in_run = false;
+            pad.push(ch);
+        }
+    }
+    if !run.is_empty() {
+        spans.push(Span::styled(run, Style::default().fg(color)));
+    } else if !pad.is_empty() {
+        spans.push(Span::raw(pad));
+    }
+    Line::from(spans)
+}
+
+/// Render one thinking section's lines.
+///
+/// The summary row — marker, label, duration — always renders in the
+/// dim tone; expanded sections add the body as italic dim-wrapped
+/// lines, never through the markdown pipeline — the slant and the
+/// tone together mark the reasoning as the model's inner voice, not
+/// the reply. Withheld reasoning renders the placeholder in place of
+/// an empty body, in the same italic register.
+fn thinking_section_lines(
+    text: &str,
+    redacted: bool,
+    duration_ms: u64,
+    expanded: bool,
+    width: usize,
+    dim: Color,
+) -> Vec<Line<'static>> {
+    let marker = if expanded { "▾" } else { "▸" };
+    let style = Style::default().fg(dim);
+    let mut lines = vec![Line::from(vec![
+        Span::styled(format!("{marker} "), style),
+        Span::styled(
+            "Thinking",
+            style.add_modifier(ratatui::style::Modifier::ITALIC),
+        ),
+        Span::styled(format!(" · {}", format_duration(duration_ms)), style),
+    ])];
+    if expanded {
+        let body = if redacted && text.is_empty() {
+            THINKING_REDACTED_PLACEHOLDER
+        } else {
+            text
+        };
+        let body_style = style.add_modifier(ratatui::style::Modifier::ITALIC);
+        for segment in body.split('\n') {
+            lines.extend(plain_wrapped_lines_styled(segment, width, body_style));
+        }
+    }
+    lines
+}
+
 /// Wrap text into styled plaintext lines at a display width.
 ///
 /// The input renders raw: split on newlines and greedily wrapped at
@@ -4456,6 +6383,15 @@ fn fingerprint(text: &str) -> u64 {
 /// partial markup shows exactly as typed — the properties the
 /// streaming tail and the error rows both rely on.
 fn plain_wrapped_lines(text: &str, width: usize, fg: ratatui::style::Color) -> Vec<Line<'static>> {
+    plain_wrapped_lines_styled(text, width, Style::default().fg(fg))
+}
+
+/// Wrap text into styled plaintext lines under a full [`Style`].
+///
+/// The same greedy wrapping as [`plain_wrapped_lines`]; the style
+/// carries modifiers as well as the foreground, so registers like the
+/// italic thinking body — color plus slant — pass through intact.
+fn plain_wrapped_lines_styled(text: &str, width: usize, style: Style) -> Vec<Line<'static>> {
     let cap = width.max(1);
     let mut lines = Vec::new();
     for raw in text.split('\n') {
@@ -4464,16 +6400,13 @@ fn plain_wrapped_lines(text: &str, width: usize, fg: ratatui::style::Color) -> V
         for ch in raw.chars() {
             let ch_width = ch.width().unwrap_or(0);
             if cap.saturating_sub(current_width) < ch_width && !current.is_empty() {
-                lines.push(Line::styled(
-                    std::mem::take(&mut current),
-                    Style::default().fg(fg),
-                ));
+                lines.push(Line::styled(std::mem::take(&mut current), style));
                 current_width = 0;
             }
             current.push(ch);
             current_width = current_width.saturating_add(ch_width);
         }
-        lines.push(Line::styled(current, Style::default().fg(fg)));
+        lines.push(Line::styled(current, style));
     }
     lines
 }
@@ -4492,6 +6425,100 @@ mod tests {
 
     fn app() -> TuiApp {
         TuiApp::new(dch_config::DchConfig::default())
+    }
+
+    /// The rendered text of a whole buffer, row by row.
+    ///
+    /// Joins each row's cell symbols so a test can assert on words
+    /// the way a reader sees them, not on individual cells.
+    fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
+        let mut rows = Vec::new();
+        for y in buffer.area.y..buffer.area.bottom() {
+            let mut row = String::new();
+            for x in buffer.area.x..buffer.area.right() {
+                if let Some(cell) = buffer.cell((x, y)) {
+                    row.push_str(cell.symbol());
+                }
+            }
+            rows.push(row.trim_end().to_string());
+        }
+        rows.join("\n")
+    }
+
+    #[test]
+    fn a_running_compaction_owns_the_live_lane_like_thinking() {
+        let (_observer, state) = crate::observer::TuiObserverState::new().into_observer();
+        state
+            .agent_running
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut app = TuiApp::from_observer_state(dch_config::DchConfig::default(), state.clone());
+        *state.health.lock().unwrap() = HealthNotice::Compacting {
+            began: std::time::Instant::now(),
+        };
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let showing = buffer_text(terminal.backend().buffer());
+        assert!(
+            showing.contains("▸ Compacting ·"),
+            "the running pass renders in the thinking row's register, \
+             marker and label and running duration: {showing}"
+        );
+        assert!(
+            !showing.contains("compacting context ("),
+            "the old notice-row wording is gone: {showing}"
+        );
+
+        *state.health.lock().unwrap() = HealthNotice::Idle;
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let cleared = buffer_text(terminal.backend().buffer());
+        assert!(
+            !cleared.contains("Compacting"),
+            "the lane clears with the pass: {cleared}"
+        );
+    }
+
+    #[test]
+    fn a_compaction_notice_renders_collapsed_and_expands_to_its_details() {
+        let mut app = app();
+        app.push_message(TuiMessage::Compacted {
+            tokens_before: 16_686,
+            tokens_after: 4_231,
+            reason: "threshold".to_string(),
+            evicted: 7,
+            duration_ms: 312,
+            compactor: Some("qa".to_string()),
+            compression_ratio: Some(3.9),
+            timestamp: chrono::Utc::now(),
+        });
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24)).expect("terminal");
+        terminal.draw(|frame| app.render(frame)).expect("draw");
+        let collapsed = buffer_text(terminal.backend().buffer());
+        assert!(
+            collapsed.contains("Compacted · <1s"),
+            "the collapsed row carries the pass duration like every other block: {collapsed}"
+        );
+        assert!(
+            !collapsed.contains("16686"),
+            "the token counts wait for the expansion: {collapsed}"
+        );
+        assert!(!collapsed.contains("messages evicted"));
+
+        app.expanded_compactions.insert("m0".to_string());
+        app.conversation_generation = app.conversation_generation.saturating_add(1);
+        terminal.draw(|frame| app.render(frame)).expect("redraw");
+        let expanded = buffer_text(terminal.backend().buffer());
+        assert!(expanded.contains("16686 → 4231 tokens"), "{expanded}");
+        assert!(expanded.contains("saved 12455"), "{expanded}");
+        assert!(expanded.contains("7 messages evicted"), "{expanded}");
+        assert!(expanded.contains("reason: threshold"), "{expanded}");
+        assert!(expanded.contains("compactor: qa"), "{expanded}");
+        assert!(expanded.contains("compression 3.9x"), "{expanded}");
+        assert!(
+            expanded.contains("durable state is the findings file and todo list"),
+            "the expanded details remind the reader what survived: {expanded}"
+        );
     }
 
     #[test]
@@ -4552,6 +6579,50 @@ mod tests {
     }
 
     #[test]
+    fn the_scrollbar_stays_one_column_wide_at_any_document_length() {
+        fn seed_turns(app: &mut TuiApp, count: usize) {
+            for _ in 0..count {
+                app.push_message(TuiMessage::User {
+                    text: "a turn of a few wrapped lines".to_string(),
+                    timestamp: chrono::Utc::now(),
+                });
+            }
+        }
+
+        fn thumb_columns(app: &mut TuiApp) -> Vec<u16> {
+            let thumb = app.theme.ui.scrollbar_thumb;
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24))
+                .expect("terminal");
+            terminal.draw(|frame| app.render(frame)).expect("draw");
+            let buffer = terminal.backend().buffer();
+            let mut columns: Vec<u16> = Vec::new();
+            for y in 0..24u16 {
+                for x in 0..80u16 {
+                    if buffer[(x, y)].style().bg == Some(thumb) && !columns.contains(&x) {
+                        columns.push(x);
+                    }
+                }
+            }
+            columns
+        }
+
+        let mut short = app();
+        seed_turns(&mut short, 1);
+        assert!(
+            thumb_columns(&mut short).is_empty(),
+            "a conversation that fits draws no scrollbar at all"
+        );
+
+        let mut long = app();
+        seed_turns(&mut long, 60);
+        assert_eq!(
+            thumb_columns(&mut long),
+            vec![79],
+            "a long conversation's scrollbar is exactly the one reserved gutter column"
+        );
+    }
+
+    #[test]
     fn the_tick_redraws_only_while_tools_run() {
         let app = app();
         assert!(!app.any_tools_running(), "no tools in flight yet");
@@ -4579,6 +6650,30 @@ mod tests {
     }
 
     #[test]
+    fn a_runtime_dir_socket_names_wayland_without_the_variable() {
+        // The console-launched tmux shape: no $WAYLAND_DISPLAY, but the
+        // compositor's socket sits in the runtime dir libwayland
+        // already falls back to — the wl-copy transport engages.
+        let dir = std::env::temp_dir().join(format!("dch-wayland-pin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("pin dir");
+        assert!(
+            !wayland_socket_in(&dir),
+            "an empty runtime dir offers no wayland"
+        );
+        std::fs::write(dir.join("wayland-0"), b"").expect("socket marker");
+        assert!(
+            wayland_socket_in(&dir),
+            "the conventional socket names a reachable compositor"
+        );
+        std::fs::write(dir.join("wayland-1.lock"), b"").expect("lock marker");
+        assert!(
+            wayland_socket_in(&dir),
+            "the lock file beside the socket counts"
+        );
+        std::fs::remove_dir_all(&dir).expect("pin dir cleaned");
+    }
+
+    #[test]
     fn host_transports_follow_the_environment_snapshot() {
         let none = host_transports(ClipboardEnv {
             in_tmux: false,
@@ -4593,6 +6688,14 @@ mod tests {
             x11: false,
         });
         assert_eq!(tmux_only, [HostTransport::Tmux], "tmux is named first");
+
+        let tmux_command = HostTransport::Tmux.command();
+        assert_eq!(tmux_command.get_program(), "tmux");
+        assert_eq!(
+            tmux_command.get_args().collect::<Vec<_>>(),
+            ["load-buffer", "-w", "-"],
+            "set-buffer would take `-` as literal data and drop the piped text"
+        );
 
         let wayland_only = host_transports(ClipboardEnv {
             in_tmux: false,
@@ -4650,8 +6753,8 @@ mod tests {
                 escape_written: true,
                 verified: false,
             }),
-            "selection copied (unconfirmed)",
-            "an escape that only left the process says so"
+            "",
+            "an escape nothing confirmed posts no row at all"
         );
         assert_eq!(
             copy_verdict_notice(CopyVerdict {
@@ -4743,8 +6846,9 @@ mod tests {
         terminal.draw(|frame| app.render(frame)).expect("draw");
         assert_eq!(
             app.transient_notice.as_ref().map(|(text, _)| text.as_str()),
-            Some("selection copied (unconfirmed)"),
-            "the drain posts the verdict's definitive wording"
+            Some("selection copied"),
+            "an unconfirmed verdict clears no posted wording — the row a \
+             verified claim posted stays"
         );
     }
 
@@ -4855,8 +6959,8 @@ mod tests {
         );
         assert_eq!(
             copy_answer_notice(CopyAnswer::Unconfirmed),
-            "selection copied (unconfirmed)",
-            "a pending delivery says so"
+            "",
+            "a pending delivery posts nothing — the verdict is the only wording"
         );
         assert_eq!(
             copy_answer_notice(CopyAnswer::Failed),
@@ -4887,5 +6991,1285 @@ mod tests {
             CopyAnswer::Unconfirmed,
             "a failed escape still waits on the transports' verdict"
         );
+    }
+
+    #[test]
+    fn the_pulse_bar_breathes_symmetrically_from_the_center() {
+        let began = Instant::now();
+        let width = 20;
+        let quarter = pulse_centered(began, began + Duration::from_millis(900), width);
+        let three_quarter = pulse_centered(began, began + Duration::from_millis(2700), width);
+        // 450 ms in: len 5 against 15 cells of padding — the odd
+        // remainder that floors or ceils; the run must take the ceil
+        // half on its left.
+        let odd = pulse_centered(began, began + Duration::from_millis(450), width);
+        for bar in [&quarter, &three_quarter, &odd] {
+            assert_eq!(bar.chars().count(), width, "the bar fills its span exactly");
+            let left = bar.chars().take_while(|ch| *ch == ' ').count();
+            let right = bar.chars().rev().take_while(|ch| *ch == ' ').count();
+            assert!(
+                left == right || left == right.saturating_add(1),
+                "centered to the cell — at most half a cell right: \
+                 left {left}, right {right}: {bar:?}"
+            );
+        }
+        assert!(
+            odd.chars().take_while(|ch| *ch == ' ').count() == 8,
+            "the odd remainder ceils onto the left pad: {odd:?}"
+        );
+        assert!(quarter.contains('─'), "the growing half carries a run");
+        assert!(
+            three_quarter.contains('─'),
+            "the shrinking half still carries a run"
+        );
+        let full = pulse_centered(began, began + Duration::from_millis(1800), width);
+        assert_eq!(
+            full.matches('─').count(),
+            width,
+            "the cycle's peak fills the whole span"
+        );
+        let empty = pulse_centered(began, began, width);
+        assert_eq!(
+            empty.matches('─').count(),
+            1,
+            "the cycle's start and end hold the one-cell seed, never a blank strip"
+        );
+    }
+
+    #[test]
+    fn an_off_strip_draws_nothing_and_stands_the_wake_down() {
+        let (_observer, state) = crate::observer::TuiObserverState::new().into_observer();
+        state
+            .agent_running
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut config = dch_config::DchConfig::default();
+        config.display.strip_style = dch_config::StripStyle::Off;
+        let app = TuiApp::from_observer_state(config, state);
+        assert!(
+            !app.pulse_animation_living(),
+            "an off strip never pays the animation cadence, even mid-run"
+        );
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 1)).unwrap();
+        let drew = terminal
+            .draw(|frame| {
+                app.render_pulse_strip(
+                    frame,
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: 80,
+                        height: 1,
+                    },
+                );
+            })
+            .unwrap();
+        let _ = drew;
+        let buffer = terminal.backend().buffer();
+        for column in 0..80u16 {
+            assert!(
+                buffer
+                    .cell((column, 0))
+                    .is_some_and(|cell| cell.symbol() == " "),
+                "the off strip leaves the row empty at {column}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_glow_breathes_its_color_while_staying_put() {
+        let (_observer, state) = crate::observer::TuiObserverState::new().into_observer();
+        state
+            .agent_running
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut config = dch_config::DchConfig::default();
+        config.display.theme = "dracula".to_string();
+        config.display.strip_style = dch_config::StripStyle::Glow;
+        let mut app = TuiApp::from_observer_state(config, state);
+        let base = app.theme.ui.composer_border.unwrap_or(app.theme.ui.primary);
+        assert!(
+            matches!(base, ratatui::prelude::Color::Rgb(..)),
+            "the dracula strip color is RGB, so the breath is visible"
+        );
+        let render = |app: &TuiApp| -> (usize, ratatui::prelude::Color) {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 1)).unwrap();
+            terminal
+                .draw(|frame| {
+                    app.render_pulse_strip(
+                        frame,
+                        Rect {
+                            x: 0,
+                            y: 0,
+                            width: 80,
+                            height: 1,
+                        },
+                    );
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let bar = (0..80u16)
+                .filter(|&column| {
+                    buffer
+                        .cell((column, 0))
+                        .is_some_and(|cell| cell.symbol() == "─")
+                })
+                .count();
+            let color = buffer
+                .cell((0, 0))
+                .map_or(ratatui::prelude::Color::Reset, |cell| cell.fg);
+            (bar, color)
+        };
+        app.run_anchor = Some(Instant::now());
+        let (bar, full) = render(&app);
+        assert_eq!(bar, 80, "the glow bar holds the full row");
+        assert_eq!(full, base, "the breath starts at full brightness");
+        app.run_anchor = Some(
+            Instant::now()
+                .checked_sub(Duration::from_millis(1800))
+                .expect("now is past the epoch"),
+        );
+        let (bar, dim) = render(&app);
+        assert_eq!(bar, 80, "the bar never moves");
+        assert_eq!(
+            dim,
+            scaled_color(base, 4),
+            "the half-breath sits at half brightness"
+        );
+        app.run_anchor = Some(
+            Instant::now()
+                .checked_sub(Duration::from_millis(3600))
+                .expect("now is past the epoch"),
+        );
+        let (bar, wrapped) = render(&app);
+        assert_eq!(bar, 80, "the bar stays full through the wrap");
+        assert_eq!(wrapped, base, "the wrap returns to full brightness");
+    }
+
+    #[test]
+    fn a_named_strip_color_glows_without_breathing() {
+        let (_observer, state) = crate::observer::TuiObserverState::new().into_observer();
+        state
+            .agent_running
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut config = dch_config::DchConfig::default();
+        config.display.strip_style = dch_config::StripStyle::Glow;
+        let mut app = TuiApp::from_observer_state(config, state);
+        let named = ratatui::prelude::Color::Blue;
+        app.theme.ui.composer_border = Some(named);
+        let render = |app: &TuiApp| -> ratatui::prelude::Color {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 1)).unwrap();
+            terminal
+                .draw(|frame| {
+                    app.render_pulse_strip(
+                        frame,
+                        Rect {
+                            x: 0,
+                            y: 0,
+                            width: 80,
+                            height: 1,
+                        },
+                    );
+                })
+                .unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .cell((0, 0))
+                .map_or(ratatui::prelude::Color::Reset, |cell| cell.fg)
+        };
+        app.run_anchor = Some(Instant::now());
+        assert_eq!(
+            render(&app),
+            named,
+            "the named color draws as itself at full breath"
+        );
+        app.run_anchor = Some(
+            Instant::now()
+                .checked_sub(Duration::from_millis(1800))
+                .expect("now is past the epoch"),
+        );
+        assert_eq!(
+            render(&app),
+            named,
+            "a named color cannot scale, so the glow stays static through the half breath"
+        );
+    }
+
+    #[test]
+    fn the_pulse_bar_runs_on_the_runs_clock_not_the_streams() {
+        let (_observer, state) = crate::observer::TuiObserverState::new().into_observer();
+        let mut app = TuiApp::from_observer_state(dch_config::DchConfig::default(), state.clone());
+        state
+            .agent_running
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // 900 ms into the run, a stream that began this instant: the
+        // bar must follow the run's clock, not the stream's.
+        app.run_anchor = Some(
+            Instant::now()
+                .checked_sub(Duration::from_millis(900))
+                .expect("the monotonic clock is well past its epoch"),
+        );
+        *state.thinking.lock().expect("the thinking lock") = crate::observer::ThinkingStream {
+            text: "a stream that just began".to_string(),
+            began: Some(Instant::now()),
+            ..Default::default()
+        };
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 1)).unwrap();
+        terminal
+            .draw(|frame| {
+                app.render_pulse_strip(
+                    frame,
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: 80,
+                        height: 1,
+                    },
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let bar = (0..80u16)
+            .filter(|&column| {
+                buffer
+                    .cell((column, 0))
+                    .is_some_and(|cell| cell.symbol() == "─")
+            })
+            .count();
+        assert!(
+            bar > 8,
+            "a run 900 ms old grows the bar wide ({bar} cells), not the one-cell seed \
+             a fresh stream's clock would draw"
+        );
+    }
+
+    #[test]
+    fn a_sweep_fills_from_the_left_then_clears_left_to_right() {
+        let began = Instant::now();
+        let width = 20;
+        let seed = pulse_sweep(began, began, width);
+        assert_eq!(
+            seed.matches('─').count(),
+            1,
+            "the fill starts from a one-cell seed: {seed:?}"
+        );
+        assert!(seed.starts_with('─'), "the seed sits at the left edge");
+        let quarter = pulse_sweep(began, began + Duration::from_millis(900), width);
+        assert_eq!(
+            quarter.matches('─').count(),
+            10,
+            "a quarter cycle fills half the row: {quarter:?}"
+        );
+        assert!(
+            quarter.starts_with('─'),
+            "the fill is left-anchored: {quarter:?}"
+        );
+        let full = pulse_sweep(began, began + Duration::from_millis(1800), width);
+        assert_eq!(
+            full.matches('─').count(),
+            20,
+            "the half point fills the whole row"
+        );
+        let three_quarter = pulse_sweep(began, began + Duration::from_millis(2700), width);
+        assert_eq!(
+            three_quarter.matches('─').count(),
+            10,
+            "the clear removes half the row from the left: {three_quarter:?}"
+        );
+        assert!(
+            three_quarter.ends_with('─'),
+            "the clear keeps the right edge pinned: {three_quarter:?}"
+        );
+        assert_eq!(
+            three_quarter
+                .chars()
+                .take(10)
+                .filter(|ch| *ch == ' ')
+                .count(),
+            10,
+            "the cleared cells lead: {three_quarter:?}"
+        );
+        let near_wrap = pulse_sweep(began, began + Duration::from_millis(3599), width);
+        assert_eq!(
+            near_wrap.matches('─').count(),
+            0,
+            "the row blanks just before the wrap: {near_wrap:?}"
+        );
+        let wrapped = pulse_sweep(began, began + Duration::from_millis(3600), width);
+        assert_eq!(
+            wrapped.matches('─').count(),
+            1,
+            "the wrap restarts the seed: {wrapped:?}"
+        );
+        for bar in [&seed, &quarter, &full, &three_quarter, &near_wrap, &wrapped] {
+            assert_eq!(
+                bar.chars().count(),
+                width,
+                "every sample fills its span exactly"
+            );
+        }
+    }
+
+    #[test]
+    fn the_sweep_renders_left_anchored_when_configured() {
+        let (_observer, state) = crate::observer::TuiObserverState::new().into_observer();
+        let mut config = dch_config::DchConfig::default();
+        config.display.strip_style = dch_config::StripStyle::Sweep;
+        let mut app = TuiApp::from_observer_state(config, state.clone());
+        state
+            .agent_running
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        app.run_anchor = Some(
+            Instant::now()
+                .checked_sub(Duration::from_millis(900))
+                .expect("the monotonic clock is well past its epoch"),
+        );
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 1)).unwrap();
+        terminal
+            .draw(|frame| {
+                app.render_pulse_strip(
+                    frame,
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: 80,
+                        height: 1,
+                    },
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(
+            buffer.cell((0, 0)).expect("the first cell").symbol(),
+            "─",
+            "the sweep run starts at column 0, where the breath would pad first"
+        );
+        assert!(
+            buffer
+                .cell((39, 0))
+                .is_some_and(|cell| cell.symbol() == "─"),
+            "the fill reached its 900 ms extent"
+        );
+        assert!(
+            buffer
+                .cell((45, 0))
+                .is_some_and(|cell| cell.symbol() == " "),
+            "beyond the fill the row stays clear"
+        );
+    }
+
+    #[test]
+    fn a_bounce_sweeps_each_way_in_turn() {
+        let began = Instant::now();
+        let width = 20;
+        let forward_seed = pulse_bounce(began, began, width);
+        assert!(
+            forward_seed.starts_with('─') && forward_seed.matches('─').count() == 1,
+            "the forward pass seeds at the left edge: {forward_seed:?}"
+        );
+        let forward_half = pulse_bounce(began, began + Duration::from_millis(900), width);
+        assert!(
+            forward_half.starts_with('─') && forward_half.matches('─').count() == 10,
+            "the forward fill grows left-anchored: {forward_half:?}"
+        );
+        let forward_clear = pulse_bounce(began, began + Duration::from_millis(2700), width);
+        assert!(
+            forward_clear.ends_with('─') && forward_clear.matches('─').count() == 10,
+            "the forward clear keeps the right edge pinned: {forward_clear:?}"
+        );
+        let turn = pulse_bounce(began, began + Duration::from_millis(3599), width);
+        assert_eq!(
+            turn.matches('─').count(),
+            0,
+            "the row blanks for the turn: {turn:?}"
+        );
+        let reverse_seed = pulse_bounce(began, began + Duration::from_millis(3600), width);
+        assert!(
+            reverse_seed.ends_with('─') && reverse_seed.matches('─').count() == 1,
+            "the reverse pass seeds at the right edge: {reverse_seed:?}"
+        );
+        let reverse_half = pulse_bounce(began, began + Duration::from_millis(4500), width);
+        assert!(
+            reverse_half.ends_with('─') && reverse_half.matches('─').count() == 10,
+            "the reverse fill grows right-anchored: {reverse_half:?}"
+        );
+        let reverse_clear = pulse_bounce(began, began + Duration::from_millis(6300), width);
+        assert!(
+            reverse_clear.starts_with('─') && reverse_clear.matches('─').count() == 10,
+            "the reverse clear keeps the left edge pinned: {reverse_clear:?}"
+        );
+        let back = pulse_bounce(began, began + Duration::from_millis(7199), width);
+        assert_eq!(
+            back.matches('─').count(),
+            0,
+            "the row blanks before the round trip wraps: {back:?}"
+        );
+        let wrapped = pulse_bounce(began, began + Duration::from_millis(7200), width);
+        assert!(
+            wrapped.starts_with('─') && wrapped.matches('─').count() == 1,
+            "the wrap restarts the forward seed: {wrapped:?}"
+        );
+        for bar in [
+            &forward_seed,
+            &forward_half,
+            &forward_clear,
+            &turn,
+            &reverse_seed,
+            &reverse_half,
+            &reverse_clear,
+            &back,
+            &wrapped,
+        ] {
+            assert_eq!(
+                bar.chars().count(),
+                width,
+                "every sample fills its span exactly"
+            );
+        }
+    }
+
+    #[test]
+    fn the_bounce_renders_right_anchored_on_its_reverse_pass() {
+        let (_observer, state) = crate::observer::TuiObserverState::new().into_observer();
+        let mut config = dch_config::DchConfig::default();
+        config.display.strip_style = dch_config::StripStyle::Bounce;
+        let mut app = TuiApp::from_observer_state(config, state.clone());
+        state
+            .agent_running
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        app.run_anchor = Some(
+            Instant::now()
+                .checked_sub(Duration::from_millis(4500))
+                .expect("the monotonic clock is well past its epoch"),
+        );
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 1)).unwrap();
+        terminal
+            .draw(|frame| {
+                app.render_pulse_strip(
+                    frame,
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: 80,
+                        height: 1,
+                    },
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(
+            buffer.cell((79, 0)).expect("the last cell").symbol(),
+            "─",
+            "the reverse pass anchors its run at the right edge"
+        );
+        assert!(
+            buffer
+                .cell((40, 0))
+                .is_some_and(|cell| cell.symbol() == "─"),
+            "the reverse fill reached its halfway extent"
+        );
+        assert!(
+            buffer
+                .cell((35, 0))
+                .is_some_and(|cell| cell.symbol() == " "),
+            "before the fill the row stays clear"
+        );
+    }
+
+    #[test]
+    fn a_travel_glides_each_way_across_the_row() {
+        let began = Instant::now();
+        let width = 20;
+        let leading = |bar: &str| bar.chars().take_while(|ch| *ch == ' ').count();
+        let forward_start = pulse_travel(began, began, width);
+        assert!(
+            leading(&forward_start) == 0 && forward_start.matches('─').count() == 5,
+            "the forward pass starts the segment at the left edge: {forward_start:?}"
+        );
+        let forward_mid = pulse_travel(began, began + Duration::from_millis(1800), width);
+        assert!(
+            leading(&forward_mid) == 7 && forward_mid.matches('─').count() == 5,
+            "mid-pass the segment sits mid-row: {forward_mid:?}"
+        );
+        let reverse_start = pulse_travel(began, began + Duration::from_millis(3600), width);
+        assert!(
+            leading(&reverse_start) == 15 && reverse_start.ends_with('─'),
+            "the reverse pass continues from the right edge: {reverse_start:?}"
+        );
+        let reverse_mid = pulse_travel(began, began + Duration::from_millis(4500), width);
+        assert!(
+            leading(&reverse_mid) == 12 && reverse_mid.matches('─').count() == 5,
+            "the reverse glide walks the span backwards: {reverse_mid:?}"
+        );
+        let wrapped = pulse_travel(began, began + Duration::from_millis(7200), width);
+        assert!(
+            leading(&wrapped) == 0 && wrapped.matches('─').count() == 5,
+            "the wrap restarts the forward pass: {wrapped:?}"
+        );
+        for bar in [
+            &forward_start,
+            &forward_mid,
+            &reverse_start,
+            &reverse_mid,
+            &wrapped,
+        ] {
+            assert_eq!(
+                bar.chars().count(),
+                width,
+                "every sample fills its span exactly"
+            );
+            assert_eq!(
+                bar.matches('─').count(),
+                5,
+                "the segment keeps its length at every sample"
+            );
+        }
+    }
+
+    #[test]
+    fn the_travel_renders_right_anchored_on_its_reverse_pass() {
+        let (_observer, state) = crate::observer::TuiObserverState::new().into_observer();
+        let mut config = dch_config::DchConfig::default();
+        config.display.strip_style = dch_config::StripStyle::Travel;
+        let mut app = TuiApp::from_observer_state(config, state.clone());
+        state
+            .agent_running
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        app.run_anchor = Some(
+            Instant::now()
+                .checked_sub(Duration::from_millis(4500))
+                .expect("the monotonic clock is well past its epoch"),
+        );
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 1)).unwrap();
+        terminal
+            .draw(|frame| {
+                app.render_pulse_strip(
+                    frame,
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: 80,
+                        height: 1,
+                    },
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert!(
+            buffer
+                .cell((45, 0))
+                .is_some_and(|cell| cell.symbol() == "─"),
+            "the reverse pass carries the segment past mid-row"
+        );
+        assert!(
+            buffer
+                .cell((64, 0))
+                .is_some_and(|cell| cell.symbol() == "─"),
+            "the segment's right end trails it"
+        );
+        assert!(
+            buffer
+                .cell((70, 0))
+                .is_some_and(|cell| cell.symbol() == " "),
+            "clear cells sit beyond the segment"
+        );
+        assert!(
+            buffer
+                .cell((20, 0))
+                .is_some_and(|cell| cell.symbol() == " "),
+            "and before it, where the forward pass would have begun at column 0"
+        );
+    }
+
+    #[test]
+    fn a_snake_circulates_through_the_wrap() {
+        let began = Instant::now();
+        let width = 20;
+        let leading = |bar: &str| bar.chars().take_while(|ch| *ch == ' ').count();
+        let lap_start = pulse_snake(began, began, width);
+        assert!(
+            leading(&lap_start) == 0 && lap_start.matches('─').count() == 5,
+            "the lap starts the segment at the left edge: {lap_start:?}"
+        );
+        let mid_lap = pulse_snake(began, began + Duration::from_millis(1800), width);
+        assert!(
+            leading(&mid_lap) == 10 && mid_lap.matches('─').count() == 5,
+            "mid-lap the segment sits mid-row: {mid_lap:?}"
+        );
+        let wrapping = pulse_snake(began, began + Duration::from_millis(3150), width);
+        assert!(
+            wrapping.starts_with('─')
+                && wrapping.ends_with('─')
+                && wrapping.matches('─').count() == 5,
+            "the crossing splits the segment across both edges: {wrapping:?}"
+        );
+        let near_lap_end = pulse_snake(began, began + Duration::from_millis(3599), width);
+        assert!(
+            near_lap_end.starts_with('─')
+                && near_lap_end.ends_with('─')
+                && near_lap_end.matches('─').count() == 5,
+            "the segment stays whole in circulation, never blank: {near_lap_end:?}"
+        );
+        let wrapped = pulse_snake(began, began + Duration::from_millis(3600), width);
+        assert!(
+            leading(&wrapped) == 0 && wrapped.matches('─').count() == 5,
+            "the lap wraps cleanly: {wrapped:?}"
+        );
+        for bar in [&lap_start, &mid_lap, &wrapping, &near_lap_end, &wrapped] {
+            assert_eq!(
+                bar.chars().count(),
+                width,
+                "every sample fills its span exactly"
+            );
+            assert_eq!(
+                bar.matches('─').count(),
+                5,
+                "the segment keeps its length at every sample"
+            );
+        }
+    }
+
+    #[test]
+    fn the_snake_renders_split_at_the_wrap() {
+        let (_observer, state) = crate::observer::TuiObserverState::new().into_observer();
+        let mut config = dch_config::DchConfig::default();
+        config.display.strip_style = dch_config::StripStyle::Snake;
+        let mut app = TuiApp::from_observer_state(config, state.clone());
+        state
+            .agent_running
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        app.run_anchor = Some(
+            Instant::now()
+                .checked_sub(Duration::from_millis(3150))
+                .expect("the monotonic clock is well past its epoch"),
+        );
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 1)).unwrap();
+        terminal
+            .draw(|frame| {
+                app.render_pulse_strip(
+                    frame,
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: 80,
+                        height: 1,
+                    },
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert!(
+            buffer.cell((0, 0)).is_some_and(|cell| cell.symbol() == "─"),
+            "the entering head run claims the left edge"
+        );
+        assert!(
+            buffer
+                .cell((10, 0))
+                .is_some_and(|cell| cell.symbol() == " "),
+            "clear cells follow the head run"
+        );
+        assert!(
+            buffer
+                .cell((69, 0))
+                .is_some_and(|cell| cell.symbol() == " "),
+            "and precede the exiting tail run"
+        );
+        assert!(
+            buffer
+                .cell((79, 0))
+                .is_some_and(|cell| cell.symbol() == "─"),
+            "the exiting tail run holds the right edge"
+        );
+    }
+
+    #[test]
+    fn a_large_worm_stretches_the_full_row_and_folds_back() {
+        let began = Instant::now();
+        let width = 20;
+        let leading = |bar: &str| bar.chars().take_while(|ch| *ch == ' ').count();
+        let fulls = |bar: &str| bar.matches('─').count();
+        let halves = |bar: &str| bar.matches('╴').count() + bar.matches('╶').count();
+        let left_seed = pulse_worm_large(began, began, width);
+        assert!(
+            leading(&left_seed) == 0 && fulls(&left_seed) == 0 && halves(&left_seed) == 1,
+            "the run's own half-cell tick seeds the left edge: {left_seed:?}"
+        );
+        let setting_off = pulse_worm_large(began, began + Duration::from_millis(900), width);
+        assert!(
+            leading(&setting_off) == 0 && fulls(&setting_off) == 3 && halves(&setting_off) == 1,
+            "the head sets off with the acceleration already felt: {setting_off:?}"
+        );
+        let building = pulse_worm_large(began, began + Duration::from_millis(1800), width);
+        assert!(
+            leading(&building) == 0 && fulls(&building) == 9 && halves(&building) == 1,
+            "the head pulls harder as it approaches the row's center: {building:?}"
+        );
+        let center_crossing = pulse_worm_large(began, began + Duration::from_millis(2400), width);
+        assert!(
+            leading(&center_crossing) == 0
+                && fulls(&center_crossing) == 16
+                && halves(&center_crossing) == 0,
+            "past the row's center the acceleration is at its steepest so far: {center_crossing:?}"
+        );
+        let arrived = pulse_worm_large(began, began + Duration::from_millis(2700), width);
+        assert!(
+            leading(&arrived) == 0
+                && fulls(&arrived) == 20
+                && halves(&arrived) == 0
+                && arrived.starts_with('─')
+                && arrived.ends_with('─'),
+            "the head reaches the right edge at full sprint: {arrived:?}"
+        );
+        let chasing = pulse_worm_large(began, began + Duration::from_millis(3599), width);
+        assert!(
+            leading(&chasing) == 4
+                && fulls(&chasing) == 16
+                && halves(&chasing) == 0
+                && chasing.ends_with('─'),
+            "the tail chases the settled head, the run pinned to the right edge: {chasing:?}"
+        );
+        let building_tail = pulse_worm_large(began, began + Duration::from_millis(4500), width);
+        assert!(
+            leading(&building_tail) == 10
+                && fulls(&building_tail) == 10
+                && halves(&building_tail) == 0,
+            "the tail pulls harder as it crosses the row's center: {building_tail:?}"
+        );
+        let folding = pulse_worm_large(began, began + Duration::from_millis(5300), width);
+        assert!(
+            leading(&folding) == 19
+                && fulls(&folding) == 1
+                && halves(&folding) == 0
+                && folding.ends_with('─'),
+            "the tail folds the run home: {folding:?}"
+        );
+        let gone = pulse_worm_large(began, began + Duration::from_millis(5399), width);
+        assert_eq!(
+            (fulls(&gone), halves(&gone)),
+            (0, 0),
+            "the row blanks just before the wrap: {gone:?}"
+        );
+        let wrapped = pulse_worm_large(began, began + Duration::from_millis(5400), width);
+        assert!(
+            leading(&wrapped) == 0 && fulls(&wrapped) == 0 && halves(&wrapped) == 1,
+            "the wrap restarts the left seed at half-cell width: {wrapped:?}"
+        );
+        for bar in [
+            &left_seed,
+            &setting_off,
+            &building,
+            &center_crossing,
+            &arrived,
+            &chasing,
+            &building_tail,
+            &folding,
+            &gone,
+            &wrapped,
+        ] {
+            assert_eq!(
+                bar.chars().count(),
+                width,
+                "every sample fills its span exactly"
+            );
+        }
+    }
+
+    #[test]
+    fn a_worms_edges_step_in_half_cells_with_their_ends() {
+        let began = Instant::now();
+        let width = 20;
+        let leading = |bar: &str| bar.chars().take_while(|ch| *ch == ' ').count();
+        let fulls = |bar: &str| bar.matches('─').count();
+        let halves = |bar: &str| bar.matches('╴').count() + bar.matches('╶').count();
+        let left_seed = pulse_worm(began, began, width);
+        assert!(
+            leading(&left_seed) == 0 && fulls(&left_seed) == 0 && halves(&left_seed) == 1,
+            "the run's own half-cell tick seeds the left edge: {left_seed:?}"
+        );
+        let stretching = pulse_worm(began, began + Duration::from_millis(900), width);
+        assert!(
+            leading(&stretching) == 0 && fulls(&stretching) == 8 && halves(&stretching) == 0,
+            "the head races toward the center while the tail waits: {stretching:?}"
+        );
+        let bunched = pulse_worm(began, began + Duration::from_millis(1350), width);
+        assert!(
+            leading(&bunched) == 6 && fulls(&bunched) == 4 && halves(&bunched) == 0,
+            "the tail closes on the head flowing through the center: {bunched:?}"
+        );
+        let head_half = pulse_worm(began, began + Duration::from_millis(1800), width);
+        assert!(
+            leading(&head_half) == 8
+                && fulls(&head_half) == 3
+                && halves(&head_half) == 1
+                && head_half.contains("───╴"),
+            "the head's edge crosses its half — one solid tick trimming the run's end: {head_half:?}"
+        );
+        let before = pulse_worm(began, began + Duration::from_millis(1799), width);
+        assert_eq!(
+            (fulls(&before), halves(&before)),
+            (fulls(&head_half), halves(&head_half)),
+            "adjacent frames hold the bunch steady — each edge rounds alone: {before:?} {head_half:?}"
+        );
+        let tail_half = pulse_worm(began, began + Duration::from_millis(1950), width);
+        assert!(
+            leading(&tail_half) == 8
+                && fulls(&tail_half) == 3
+                && halves(&tail_half) == 1
+                && tail_half.contains(" ╶──"),
+            "the tail's edge crosses its half beside the center — one solid tick leading the run, no twitch: {tail_half:?}"
+        );
+        let stretched = pulse_worm(began, began + Duration::from_millis(2250), width);
+        assert!(
+            leading(&stretched) == 10 && fulls(&stretched) == 3 && halves(&stretched) == 1,
+            "the head races right while the tail flows through the center: {stretched:?}"
+        );
+        let right_full = pulse_worm(began, began + Duration::from_millis(2700), width);
+        assert!(
+            leading(&right_full) == 12
+                && right_full.ends_with('─')
+                && fulls(&right_full) == 8
+                && halves(&right_full) == 0,
+            "the head settles at the right edge, the run pinned to it: {right_full:?}"
+        );
+        let absorbing = pulse_worm(began, began + Duration::from_millis(3150), width);
+        assert!(
+            leading(&absorbing) == 14 && fulls(&absorbing) == 6 && halves(&absorbing) == 0,
+            "the racing tail clears the run from the left: {absorbing:?}"
+        );
+        let gone = pulse_worm(began, began + Duration::from_millis(3599), width);
+        assert_eq!(
+            (fulls(&gone), halves(&gone)),
+            (0, 0),
+            "the row blanks just before the wrap: {gone:?}"
+        );
+        let wrapped = pulse_worm(began, began + Duration::from_millis(3600), width);
+        assert!(
+            leading(&wrapped) == 0 && fulls(&wrapped) == 0 && halves(&wrapped) == 1,
+            "the wrap restarts the left seed at half-cell width: {wrapped:?}"
+        );
+        for bar in [
+            &left_seed,
+            &stretching,
+            &bunched,
+            &head_half,
+            &before,
+            &tail_half,
+            &stretched,
+            &right_full,
+            &absorbing,
+            &gone,
+            &wrapped,
+        ] {
+            assert_eq!(
+                bar.chars().count(),
+                width,
+                "every sample fills its span exactly"
+            );
+        }
+    }
+
+    #[test]
+    fn the_half_cell_edges_render_beside_the_center() {
+        let (_observer, state) = crate::observer::TuiObserverState::new().into_observer();
+        let mut config = dch_config::DchConfig::default();
+        config.display.strip_style = dch_config::StripStyle::Worm;
+        let mut app = TuiApp::from_observer_state(config, state.clone());
+        state
+            .agent_running
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        app.run_anchor = Some(
+            Instant::now()
+                .checked_sub(Duration::from_millis(1850))
+                .expect("the monotonic clock is well past its epoch"),
+        );
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 1)).unwrap();
+        terminal
+            .draw(|frame| {
+                app.render_pulse_strip(
+                    frame,
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: 80,
+                        height: 1,
+                    },
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert!(
+            buffer
+                .cell((33, 0))
+                .is_some_and(|cell| cell.symbol() == " "),
+            "clear cells sit before the run"
+        );
+        assert!(
+            buffer
+                .cell((34, 0))
+                .is_some_and(|cell| cell.symbol() == "╶"),
+            "the tail's solid half-tick leads the run"
+        );
+        assert!(
+            buffer
+                .cell((35, 0))
+                .is_some_and(|cell| cell.symbol() == "─"),
+            "full cells carry the run between the dashes"
+        );
+        assert!(
+            buffer
+                .cell((45, 0))
+                .is_some_and(|cell| cell.symbol() == "─"),
+            "full cells reach the head's half"
+        );
+        assert!(
+            buffer
+                .cell((46, 0))
+                .is_some_and(|cell| cell.symbol() == "╴"),
+            "the head's solid half-tick ends the run"
+        );
+        assert!(
+            buffer
+                .cell((47, 0))
+                .is_some_and(|cell| cell.symbol() == " "),
+            "clear cells sit beyond the head"
+        );
+    }
+
+    #[test]
+    fn context_bar_fill_rounds_usage_into_cells() {
+        assert_eq!(context_bar_fill(0, 200_000, 10), 0);
+        assert_eq!(context_bar_fill(100_000, 200_000, 10), 5);
+        assert_eq!(context_bar_fill(20_000, 200_000, 10), 1);
+        assert_eq!(context_bar_fill(200_000, 200_000, 10), 10);
+        assert_eq!(
+            context_bar_fill(300_000, 200_000, 10),
+            10,
+            "usage past the window clamps at full"
+        );
+        assert_eq!(
+            context_bar_fill(100_000, 0, 10),
+            0,
+            "an unknown window draws the bar empty"
+        );
+    }
+
+    #[test]
+    fn the_status_bar_reads_the_live_window() {
+        let mut app = app();
+        app.config.api.context_window = Some(200_000);
+        app.state
+            .context_window
+            .store(100_000, std::sync::atomic::Ordering::SeqCst);
+        app.state
+            .tokens
+            .lock()
+            .expect("the tokens lock")
+            .context_tokens = 50_000;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+        terminal.draw(|frame| app.render(frame)).expect("draw");
+        let thumb = app.theme.ui.scrollbar_thumb;
+        let buffer = terminal.backend().buffer();
+        let mut thumb_cells = 0usize;
+        for y in 0..24u16 {
+            for x in 0..80u16 {
+                if buffer[(x, y)].style().bg == Some(thumb) {
+                    thumb_cells += 1;
+                }
+            }
+        }
+        let expected = context_bar_fill(50_000, 100_000, CONTEXT_BAR_CELLS);
+        assert_eq!(
+            thumb_cells, expected,
+            "the bar divides by the live window, not the config field"
+        );
+    }
+
+    #[test]
+    fn the_status_bar_shows_the_context_bar_at_the_configured_fill() {
+        let mut app = app();
+        app.state
+            .tokens
+            .lock()
+            .expect("the tokens lock")
+            .context_tokens = 100_000;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+        terminal.draw(|frame| app.render(frame)).expect("draw");
+        let thumb = app.theme.ui.scrollbar_thumb;
+        let buffer = terminal.backend().buffer();
+        let mut thumb_cells = 0usize;
+        for y in 0..24u16 {
+            for x in 0..80u16 {
+                if buffer[(x, y)].style().bg == Some(thumb) {
+                    thumb_cells += 1;
+                }
+            }
+        }
+        assert_eq!(
+            thumb_cells, 5,
+            "half the window fills half of the short bar"
+        );
+    }
+
+    #[test]
+    fn drain_shared_state_moves_retry_lines_into_the_conversation() {
+        let mut app = app();
+        let queue = std::sync::Arc::clone(&app.state.retry_lines);
+        queue
+            .lock()
+            .expect("the retry lock")
+            .push(crate::observer::RetryLine {
+                episode: 0,
+                text: "⟳ connection lost — reconnection attempt 1/3".to_string(),
+            });
+        app.drain_shared_state();
+        queue
+            .lock()
+            .expect("the retry lock")
+            .push(crate::observer::RetryLine {
+                episode: 0,
+                text: "⟳ connection lost — reconnection attempt 2/3".to_string(),
+            });
+        app.drain_shared_state();
+        let retry_rows: Vec<&TuiMessage> = app
+            .conversation()
+            .iter()
+            .filter(|message| matches!(message, TuiMessage::System { .. }))
+            .collect();
+        assert_eq!(
+            retry_rows.len(),
+            1,
+            "one episode, one row — the second attempt rewrote it: {retry_rows:?}"
+        );
+        match retry_rows.first().expect("the retry row") {
+            TuiMessage::System { text, .. } => {
+                assert!(
+                    text.contains("reconnection attempt 2/3"),
+                    "the row holds the newest attempt: {text}"
+                );
+            }
+            other => panic!("the retry row is a system row: {other:?}"),
+        }
+        assert!(
+            queue.lock().expect("the retry lock").is_empty(),
+            "the queue drains"
+        );
+    }
+
+    #[test]
+    fn a_finished_run_stamps_its_total_onto_the_final_reply_only() {
+        let mut app = app();
+        let mut queue = app.state.graduations.lock().expect("the graduation lock");
+        queue.push(crate::observer::Graduation::Reply {
+            text: "checking".to_string(),
+            thinking: None,
+        });
+        queue.push(crate::observer::Graduation::Reply {
+            text: "done".to_string(),
+            thinking: None,
+        });
+        queue.push(crate::observer::Graduation::RunEnded {
+            duration_ms: 84_000,
+        });
+        drop(queue);
+        app.drain_shared_state();
+        let durations: Vec<Option<u64>> = app
+            .conversation()
+            .iter()
+            .filter_map(|message| match message {
+                TuiMessage::Assistant { duration_ms, .. } => Some(*duration_ms),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            durations,
+            vec![None, Some(84_000)],
+            "only the run's final reply carries the run's total"
+        );
+    }
+
+    #[test]
+    fn a_run_that_graduated_no_reply_drops_its_total() {
+        let mut app = app();
+        app.push_message(TuiMessage::User {
+            text: "do a thing".to_string(),
+            timestamp: chrono::Utc::now(),
+        });
+        app.state
+            .graduations
+            .lock()
+            .expect("the graduation lock")
+            .push(crate::observer::Graduation::RunEnded {
+                duration_ms: 84_000,
+            });
+        app.drain_shared_state();
+        assert!(
+            app.conversation()
+                .last()
+                .is_some_and(|message| matches!(message, TuiMessage::User { .. })),
+            "a run with no reply leaves the conversation alone — no stranger is stamped"
+        );
+    }
+
+    #[test]
+    fn an_assistant_reply_renders_its_duration_as_a_trailing_line() {
+        let mut app = app();
+        app.push_message(TuiMessage::Assistant {
+            blocks: vec![ContentBlock::Text {
+                text: "the measured answer".to_string(),
+            }],
+            timestamp: chrono::Utc::now(),
+            duration_ms: Some(5_424_500),
+        });
+        app.push_message(TuiMessage::Assistant {
+            blocks: vec![ContentBlock::Text {
+                text: "the unmeasured answer".to_string(),
+            }],
+            timestamp: chrono::Utc::now(),
+            duration_ms: None,
+        });
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).expect("terminal");
+        terminal.draw(|frame| app.render(frame)).expect("draw");
+        let showing = buffer_text(terminal.backend().buffer());
+        assert!(
+            showing.contains("1h 30m 24s"),
+            "a measured reply carries its duration on a trailing line: {showing}"
+        );
+        assert_eq!(
+            showing.matches("1h 30m 24s").count(),
+            1,
+            "an unmeasured reply renders no duration line: {showing}"
+        );
+    }
+
+    #[test]
+    fn durations_render_in_their_largest_fitting_units() {
+        assert_eq!(format_duration(0), "<1s");
+        assert_eq!(format_duration(999), "<1s");
+        assert_eq!(format_duration(1_000), "1s");
+        assert_eq!(format_duration(42_500), "42s");
+        assert_eq!(format_duration(60_000), "1m 0s");
+        assert_eq!(format_duration(84_000), "1m 24s");
+        assert_eq!(format_duration(3_600_000), "1h 0m 0s");
+        assert_eq!(format_duration(5_424_500), "1h 30m 24s");
+    }
+
+    #[test]
+    fn a_thinking_section_collapses_to_one_row_and_expands_to_dim_body() {
+        let dim = Color::Rgb(1, 2, 3);
+        let collapsed = thinking_section_lines("line one\nline two", false, 84_000, false, 40, dim);
+        assert_eq!(collapsed.len(), 1, "collapsed renders only the summary row");
+        let row = collapsed.first().expect("the summary row");
+        let joined: String = row.spans.iter().map(|span| span.content.as_ref()).collect();
+        assert!(
+            joined.contains("▸ Thinking · 1m 24s"),
+            "the summary row reads as one label: {joined}"
+        );
+        assert!(
+            row.spans.iter().any(|span| span.content == "Thinking"
+                && span
+                    .style
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::ITALIC)),
+            "the Thinking word renders italic: {row:?}"
+        );
+
+        let expanded = thinking_section_lines("line one\nline two", false, 84_000, true, 40, dim);
+        assert_eq!(expanded.len(), 3, "the row plus two body lines");
+        for line in &expanded {
+            let fg = line
+                .style
+                .fg
+                .or_else(|| line.spans.first().and_then(|span| span.style.fg));
+            assert_eq!(fg, Some(dim), "every thinking line carries the dim tone");
+        }
+        for line in expanded.iter().skip(1) {
+            let italic = line
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::ITALIC)
+                || line.spans.iter().any(|span| {
+                    span.style
+                        .add_modifier
+                        .contains(ratatui::style::Modifier::ITALIC)
+                });
+            assert!(italic, "the thinking body renders italic: {line:?}");
+        }
+
+        let redacted = thinking_section_lines("", true, 500, true, 40, dim);
+        assert!(
+            redacted.iter().any(|line| line
+                .spans
+                .iter()
+                .any(|span| span.content.contains(THINKING_REDACTED_PLACEHOLDER))),
+            "withheld reasoning renders the placeholder, not a blank body"
+        );
+    }
+
+    #[test]
+    fn the_live_thinking_body_renders_italic_in_the_dim_tone() {
+        // The live lane must read the same register the completed
+        // sections do: dim plus italic. The default theme here is the
+        // transparent one, so the tone asserted is that theme's fixed
+        // neutral gray — the deterministic grey-out that keeps
+        // reasoning from matching the reply's foreground.
+        let (_observer, state) = crate::observer::TuiObserverState::new().into_observer();
+        let app = TuiApp::from_observer_state(dch_config::DchConfig::default(), state.clone());
+        state
+            .agent_running
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        *state.thinking.lock().expect("the thinking lock") = crate::observer::ThinkingStream {
+            text: "reasoning in flight".to_string(),
+            began: Some(Instant::now()),
+            ..Default::default()
+        };
+        let (lines, first_row) = app.live_thinking_lines(80);
+        assert_eq!(first_row, Some(0), "the marker row registers for clicks");
+        assert!(
+            lines.len() >= 2,
+            "the marker row plus the expanded body: {lines:?}"
+        );
+        let joined: String = lines
+            .first()
+            .expect("the marker row")
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(
+            joined.contains("Thinking"),
+            "the marker row labels the stream: {joined}"
+        );
+        for line in lines.iter().skip(1) {
+            let fg = line
+                .style
+                .fg
+                .or_else(|| line.spans.first().and_then(|span| span.style.fg));
+            assert_eq!(
+                fg,
+                Some(app.theme.ui.dim),
+                "the live body carries the theme's dim tone: {line:?}"
+            );
+            let italic = line
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::ITALIC)
+                || line.spans.iter().any(|span| {
+                    span.style
+                        .add_modifier
+                        .contains(ratatui::style::Modifier::ITALIC)
+                });
+            assert!(italic, "the live body renders italic: {line:?}");
+        }
     }
 }

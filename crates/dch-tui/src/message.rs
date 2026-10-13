@@ -89,6 +89,60 @@ pub enum TuiMessage {
         /// Recorded when the failure surfaces.
         timestamp: DateTime<Utc>,
     },
+
+    /// A context-compaction pass that fired mid-session.
+    ///
+    /// Display-only bookkeeping for the reader: what the pass did to
+    /// the context, in the same flow as the tool activity around it.
+    /// The resume derive walk skips it — a record about the engine's
+    /// context is never itself conversation.
+    Compacted {
+        /// Estimated context tokens before the pass.
+        ///
+        /// The payload estimate the engine measured ahead of the pass.
+        tokens_before: u64,
+
+        /// Estimated context tokens after the pass.
+        ///
+        /// The estimate over the compacted history the run continues
+        /// on.
+        tokens_after: u64,
+
+        /// Why the pass ran, as the engine's short label.
+        ///
+        /// `threshold exceeded` for the routine trigger, `emergency`
+        /// for the 95% line, `manual` for a host-forced pass.
+        reason: String,
+
+        /// How many messages the pass removed from the feed.
+        ///
+        /// Message-granular, matching the engine's eviction count.
+        evicted: usize,
+
+        /// How long the pass took, in milliseconds.
+        ///
+        /// The engine-measured wall time of the whole pass.
+        duration_ms: u64,
+
+        /// The compactor's own name, when the host supplied one.
+        ///
+        /// Absent when the compactor was not named; skipped in the
+        /// serialized form rather than written as `null`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        compactor: Option<String>,
+
+        /// The pass's compression ratio, when finite.
+        ///
+        /// Pre-pass tokens over post-pass tokens; an infinite ratio —
+        /// an empty result — is omitted rather than serialized.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        compression_ratio: Option<f64>,
+
+        /// When the pass fired.
+        ///
+        /// Recorded at the compaction event.
+        timestamp: DateTime<Utc>,
+    },
 }
 
 /// A block within an assistant message.
@@ -162,6 +216,35 @@ pub enum ContentBlock {
         #[serde(default)]
         retained_input: String,
     },
+
+    /// The turn's reasoning stream, graduated from the observer buffer.
+    ///
+    /// One concatenated block per turn: the delta contract carries no
+    /// reasoning boundaries, so every chunk of the turn meets here in
+    /// arrival order. Display-only — the resume strip never re-sends
+    /// it to the provider.
+    Thinking {
+        /// The concatenated reasoning text, in arrival order.
+        ///
+        /// Every chunk of the turn's reasoning stream, joined in the
+        /// order it arrived; the live row shows it growing and the
+        /// graduated section folds it behind its summary row.
+        text: String,
+
+        /// Whether the provider withheld the reasoning.
+        ///
+        /// Set when the stream signalled redaction — an empty delta —
+        /// so the section renders a placeholder instead of blanks.
+        redacted: bool,
+
+        /// How long the reasoning streamed, in milliseconds.
+        ///
+        /// Wall-clock from the first delta to graduation; the summary
+        /// row renders it as seconds or minutes. The serde default
+        /// keeps a session file that omits the field loading as zero.
+        #[serde(default)]
+        duration_ms: u64,
+    },
 }
 
 /// Token usage counters shared with the observer.
@@ -184,6 +267,14 @@ pub struct TokenCounts {
     /// at a turn's start, so the value keeps the previous turn's
     /// counts until the next one reports.
     pub output: u64,
+
+    /// The loop's last reported context-size estimate, in tokens.
+    ///
+    /// Written by the turn-end event (the estimate shrinks when
+    /// compaction fires); feeds the status bar's usage bar and the
+    /// session snapshot, so a resume opens the bar where the session
+    /// closed it. Zero until the first turn reports.
+    pub context_tokens: u64,
 
     /// Input tokens since the session began.
     ///
@@ -302,5 +393,43 @@ mod tests {
                         if call_id.is_empty() && retained_input.is_empty())))),
             "a tool block without a call id or retained input defaults both empty"
         );
+    }
+
+    #[test]
+    fn a_thinking_block_round_trips_through_the_session_format() {
+        let message = TuiMessage::Assistant {
+            blocks: vec![
+                ContentBlock::Thinking {
+                    text: "because reasons".to_string(),
+                    redacted: false,
+                    duration_ms: 84_000,
+                },
+                ContentBlock::Text {
+                    text: "the answer".to_string(),
+                },
+            ],
+            timestamp: chrono::Utc::now(),
+            duration_ms: None,
+        };
+        let json = serde_json::to_string(&message).expect("serializes");
+        assert!(
+            json.contains("\"thinking\""),
+            "the variant carries its snake_case tag: {json}"
+        );
+        let back: TuiMessage = serde_json::from_str(&json).expect("parses back");
+        assert_eq!(back, message, "the block survives the round trip intact");
+    }
+
+    #[test]
+    fn a_thinking_block_without_a_duration_loads_as_zero() {
+        let raw = r#"{"role":"assistant","blocks":[{"type":"thinking","text":"reasons","redacted":false}],"timestamp":"2026-09-28T12:00:00Z"}"#;
+        let message: TuiMessage = serde_json::from_str(raw).expect("loads without duration_ms");
+        let TuiMessage::Assistant { blocks, .. } = message else {
+            panic!("loads as an assistant message: {message:?}");
+        };
+        let Some(ContentBlock::Thinking { duration_ms, .. }) = blocks.first() else {
+            panic!("the thinking block loads: {blocks:?}");
+        };
+        assert_eq!(*duration_ms, 0, "the serde default fills the new field");
     }
 }

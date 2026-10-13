@@ -1,9 +1,17 @@
 //! Session persistence — crash-atomic transcripts under `~/.dch/sessions`.
 //!
-//! [`SessionSaver`] writes one JSON file per session
-//! (`~/.dch/sessions/<uuid>/session.json`) holding the display
-//! conversation plus a small envelope, rewrites it atomically after
-//! every completed turn, and reads it back for resume. The session id
+//! [`SessionSaver`] writes a pair of JSON files per session
+//! (`~/.dch/sessions/<uuid>/`): `session.json`, the display
+//! conversation, and `machine.json`, the engine's committed history —
+//! the working set the model carried. The display file is rewritten
+//! atomically after every completed turn through a same-directory
+//! temp file and rename; the machine file uses the same discipline
+//! under its own stamp, the moment its content was read from the
+//! runner. Resume seeds a new engine from the machine file whenever
+//! it is at least as new as the display file beside it, so a resumed
+//! session continues process-identically — the same messages the
+//! model would have seen had the process never exited — and degrades
+//! to deriving over the display transcript otherwise. The session id
 //! always comes from the agent loop — the saver never mints one.
 
 use std::path::{Path, PathBuf};
@@ -18,6 +26,13 @@ use uuid::Uuid;
 /// reinterpretation: a reader that meets a tag it does not know
 /// refuses the file as corrupt instead of guessing at its shape.
 const FORMAT: &str = "dch.v1";
+
+/// The format tag of the machine-history sibling file.
+///
+/// Namespaces the engine-side snapshot the same way [`FORMAT`]
+/// namespaces the display transcript, so a machine history written by
+/// a future shape is refused rather than misread.
+const MACHINE_FORMAT: &str = "dch.machine.v1";
 
 /// Persists and restores conversation sessions under
 /// `~/.dch/sessions/<uuid>/session.json`.
@@ -96,6 +111,37 @@ pub struct SessionSummary {
     pub token_total: u64,
 }
 
+/// The machine-history sibling's on-disk shape; private like
+/// [`StoredSession`].
+///
+/// Carries the engine's committed conversation under its own format
+/// tag and stamp. The stamp is the snapshot's read time, so the pair
+/// rule — a machine history older than the display file beside it is
+/// stale — judges content age, not write order.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct StoredMachine {
+    /// The format tag; [`MACHINE_FORMAT`] for everything this version
+    /// writes.
+    ///
+    /// Refused on read when unknown, exactly as the display file's
+    /// tag is.
+    format: String,
+
+    /// When the runner's committed history was read for this
+    /// snapshot.
+    ///
+    /// Written by the caller at read time and compared against the
+    /// display file's save stamp on resume.
+    saved_at: chrono::DateTime<chrono::Utc>,
+
+    /// The engine's committed history, in conversation order.
+    ///
+    /// Verbatim loopctl messages — the working set the model carried
+    /// — so seeding a new runner from it continues the session exactly
+    /// where the process left off.
+    messages: Vec<loopctl::message::Message>,
+}
+
 /// Errors arising while saving, loading, or listing sessions.
 ///
 /// Typed so resume can tell "no such session" (start fresh) from
@@ -164,8 +210,9 @@ struct StoredSession {
     /// The model the session ran.
     ///
     /// Written by the host at saver construction so the envelope
-    /// always carries it; listing surfaces it and resume re-applies
-    /// it unless the CLI overrides the model.
+    /// always carries it; the listing surfaces it, and a resume reads
+    /// it as provenance — the engine runs on the current
+    /// configuration's model and provider.
     model: String,
 
     /// When this save happened; restamped per save.
@@ -223,6 +270,16 @@ pub(crate) struct SessionTokens {
     /// files saved before it was tracked.
     #[serde(default)]
     pub(crate) last_input_tokens: u64,
+
+    /// The engine's context-size estimate at the moment of the save.
+    ///
+    /// The same figure the loop's `context_tokens` accessor reports —
+    /// what the status bar's usage bar shows across a resume, before
+    /// the first turn re-reports it. Absent on files saved before the
+    /// field existed; those read as zero and the first turn refills
+    /// the bar.
+    #[serde(default)]
+    pub(crate) context_tokens: u64,
 }
 
 impl SessionSaver {
@@ -264,35 +321,111 @@ impl SessionSaver {
             .join("session.json")
     }
 
-    /// Serialize `messages` into the session file, atomically.
+    /// The machine-history sibling: `<base>/<uuid>/machine.json`.
     ///
-    /// Creates the per-session directory when missing, writes to a
-    /// temp file in that same directory, then renames over the
-    /// target — a crash mid-write leaves the previous transcript
-    /// intact, and the rename never crosses a filesystem.
+    /// Sits beside [`session.json`](Self::session_path) in the same
+    /// directory so the pair travels with a copied session directory;
+    /// the display file never references it, so its absence degrades
+    /// resume to the derive walk rather than breaking the load.
+    fn machine_path(&self) -> PathBuf {
+        self.base_dir
+            .join(self.session_id.to_string())
+            .join("machine.json")
+    }
+
+    /// Serialize the engine's working set into the machine-history
+    /// file, atomically.
+    ///
+    /// The snapshot is the loop's committed history — exactly what the
+    /// model would have carried had the process never exited — and
+    /// `saved_at` is the moment the caller read it from the runner, not
+    /// the moment of this write, so a resume comparing it against the
+    /// display file's stamp judges the pair by when each half was
+    /// true, never by how long the write queue was backed up.
+    ///
+    /// # Errors
+    ///
+    /// Same conditions as [`SessionSaver::save_at`], against the sibling
+    /// path.
+    pub fn save_machine(
+        &self,
+        machine: &[loopctl::message::Message],
+        saved_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let path = self.machine_path();
+        let dir = path.parent().unwrap_or(Path::new("."));
+        std::fs::create_dir_all(dir)?;
+        let stored = StoredMachine {
+            format: MACHINE_FORMAT.to_string(),
+            saved_at,
+            messages: machine.to_vec(),
+        };
+        let json = serde_json::to_string(&stored)?;
+        let mut temp = tempfile::NamedTempFile::new_in(dir)?;
+        std::io::Write::write_all(&mut temp, json.as_bytes())?;
+        drop(
+            temp.persist(&path)
+                .map_err(|err| SessionError::Io(err.error))?,
+        );
+        Ok(())
+    }
+
+    /// Serialize `messages` into the session file, atomically, stamped
+    /// at this call.
+    ///
+    /// The test-facing convenience: production paths stamp by content
+    /// time through [`SessionSaver::save_at`] — the turn-end hook's
+    /// fire time on the TUI path, the shared pair stamp on the
+    /// headless path — so the machine-history sibling's read-time
+    /// stamp beside it compares content against content.
     ///
     /// # Errors
     ///
     /// Fails when the directory or file cannot be created, written,
     /// or renamed — always through a boxed [`SessionError`].
+    #[cfg(test)]
     pub fn save(
         &self,
         messages: &[TuiMessage],
         tokens: SessionTokens,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        self.save_inner(messages, tokens)?;
+        self.save_at(messages, tokens, chrono::Utc::now())?;
         Ok(())
     }
 
-    /// The typed core of [`SessionSaver::save`].
+    /// The stamped core of [`SessionSaver::save_at`].
+    ///
+    /// `saved_at` is the moment this snapshot's content was true —
+    /// the hook's fire time on the turn-end path, not the writer's
+    /// write time — so the machine-history sibling's read-time stamp
+    /// beside it compares content against content: a pair is fresh
+    /// exactly when the engine half saw everything the display half
+    /// recorded.
     ///
     /// # Errors
     ///
-    /// Same conditions as [`SessionSaver::save`], typed.
+    /// Same conditions as [`SessionSaver::save_at`], typed through a
+    /// boxed [`SessionError`].
+    pub fn save_at(
+        &self,
+        messages: &[TuiMessage],
+        tokens: SessionTokens,
+        saved_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.save_inner(messages, tokens, saved_at)?;
+        Ok(())
+    }
+
+    /// The typed core of [`SessionSaver::save_at`].
+    ///
+    /// # Errors
+    ///
+    /// Same conditions as [`SessionSaver::save_at`], typed.
     fn save_inner(
         &self,
         messages: &[TuiMessage],
         tokens: SessionTokens,
+        saved_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), SessionError> {
         let path = self.session_path();
         let dir = path.parent().unwrap_or(Path::new("."));
@@ -301,7 +434,7 @@ impl SessionSaver {
             format: FORMAT.to_string(),
             session_id: self.session_id,
             model: self.model.clone(),
-            saved_at: chrono::Utc::now(),
+            saved_at,
             messages: messages.to_vec(),
             tokens,
         };
@@ -356,9 +489,78 @@ pub(crate) fn sessions_dir() -> PathBuf {
 pub(crate) fn load_with_meta_in(
     id: Uuid,
     base: &Path,
-) -> Result<(Vec<TuiMessage>, String, SessionTokens), SessionError> {
+) -> Result<
+    (
+        Vec<TuiMessage>,
+        String,
+        SessionTokens,
+        chrono::DateTime<chrono::Utc>,
+    ),
+    SessionError,
+> {
     let stored = load_envelope(&base.join(id.to_string()).join("session.json"), id, base)?;
-    Ok((stored.messages, stored.model, stored.tokens))
+    Ok((
+        stored.messages,
+        stored.model,
+        stored.tokens,
+        stored.saved_at,
+    ))
+}
+
+/// Load a session's machine-history snapshot when the pair is fresh.
+///
+/// The pair rule: a snapshot older than the display file beside it is
+/// stale — the display half recorded turns the engine half never saw,
+/// so seeding from it would silently drop them; resume derives from
+/// the display transcript instead, which is lossy but complete. An
+/// absent, unreadable, or unknown-format snapshot degrades the same
+/// way with one warn, so the worst case of any sibling-file problem is
+/// exactly the pre-snapshot resume behavior.
+///
+/// Returns the committed history to seed a new runner with, or `None`
+/// when the caller should derive.
+pub(crate) fn load_machine_in(
+    id: Uuid,
+    base: &Path,
+    session_saved_at: chrono::DateTime<chrono::Utc>,
+) -> Option<Vec<loopctl::message::Message>> {
+    let path = base.join(id.to_string()).join("machine.json");
+    let json = match std::fs::read_to_string(&path) {
+        Ok(json) => json,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "machine history unreadable; deriving resume from the display transcript"
+            );
+            return None;
+        }
+    };
+    let stored: StoredMachine = match serde_json::from_str(&json) {
+        Ok(stored) => stored,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "machine history unparseable; deriving resume from the display transcript"
+            );
+            return None;
+        }
+    };
+    if stored.format != MACHINE_FORMAT {
+        tracing::warn!(
+            format = %stored.format,
+            "unknown machine-history format; deriving resume from the display transcript"
+        );
+        return None;
+    }
+    if stored.saved_at < session_saved_at {
+        tracing::warn!(
+            session = %id,
+            "machine history predates the display file; deriving resume from the display transcript"
+        );
+        return None;
+    }
+    Some(stored.messages)
 }
 
 /// Read and parse a transcript file into its full envelope.
@@ -603,6 +805,7 @@ mod tests {
             cumulative_input: 12_345,
             cumulative_output: 678,
             last_input_tokens: 54_321,
+            context_tokens: 45_678,
         };
         crate::session::SessionSaver::with_base_dir(
             id,
@@ -611,7 +814,7 @@ mod tests {
         )
         .save(&sample_messages(), totals)
         .expect("save");
-        let (_, _, loaded) = load_with_meta_in(id, dir.path()).expect("load");
+        let (_, _, loaded, _) = load_with_meta_in(id, dir.path()).expect("load");
         assert_eq!(loaded, totals, "the accounting rides the envelope");
         let listed = list_sessions_in(dir.path()).expect("list");
         assert_eq!(
@@ -631,7 +834,8 @@ mod tests {
             legacy.replace("ID", &legacy_id.to_string()),
         )
         .expect("legacy file");
-        let (_, _, legacy_tokens) = load_with_meta_in(legacy_id, dir.path()).expect("load legacy");
+        let (_, _, legacy_tokens, _) =
+            load_with_meta_in(legacy_id, dir.path()).expect("load legacy");
         assert_eq!(
             legacy_tokens,
             SessionTokens::default(),
@@ -1011,6 +1215,105 @@ mod tests {
             ids.len(),
             2,
             "a copied transcript does not duplicate the envelope's identity"
+        );
+    }
+
+    /// A working set carrying a real tool-call id, as a tool-using
+    /// turn leaves in the engine's committed history.
+    fn machine_history() -> Vec<loopctl::message::Message> {
+        use loopctl::message::Message;
+        use loopctl::message::MessagePart;
+        use loopctl::message::Role;
+        vec![
+            Message::new(Role::User, vec![MessagePart::text("read the note")]),
+            Message::new(
+                Role::Assistant,
+                vec![MessagePart::tool_call(
+                    "call_7f3a",
+                    "Read",
+                    serde_json::json!({"path": "note.txt"}),
+                )],
+            ),
+        ]
+    }
+
+    /// The JSON rendering of a message list, for value equality.
+    ///
+    /// Messages are `#[non_exhaustive]` without `PartialEq`, but they
+    /// are serializable — comparing renderings is the same equality
+    /// a round trip must preserve, byte for byte.
+    fn rendered(messages: &[loopctl::message::Message]) -> serde_json::Value {
+        serde_json::to_value(messages).expect("messages serialize")
+    }
+
+    #[test]
+    fn a_machine_snapshot_restores_the_working_set_exactly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let id = Uuid::new_v4();
+        write_envelope(dir.path(), id, stamp(10), &sample_messages());
+        saver(dir.path(), id)
+            .save_machine(&machine_history(), stamp(10))
+            .expect("machine saved");
+        let restored = load_machine_in(id, dir.path(), stamp(10)).expect("a fresh pair loads");
+        assert_eq!(rendered(&restored), rendered(&machine_history()));
+        assert!(
+            restored
+                .iter()
+                .flat_map(|message| &message.parts)
+                .any(|part| matches!(part, loopctl::message::MessagePart::ToolCall { id, .. } if id == "call_7f3a")),
+            "the model-issued call id survives the round trip"
+        );
+    }
+
+    #[test]
+    fn a_stale_pair_degrades_to_derive() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let id = Uuid::new_v4();
+        write_envelope(dir.path(), id, stamp(20), &sample_messages());
+        saver(dir.path(), id)
+            .save_machine(&machine_history(), stamp(10))
+            .expect("machine saved");
+        assert!(
+            load_machine_in(id, dir.path(), stamp(20)).is_none(),
+            "a snapshot older than the display file must not seed the resume"
+        );
+    }
+
+    #[test]
+    fn call_ids_survive_a_second_save_resume_cycle() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let id = Uuid::new_v4();
+        let keeper = saver(dir.path(), id);
+        keeper
+            .save_machine(&machine_history(), stamp(10))
+            .expect("first machine save");
+        write_envelope(dir.path(), id, stamp(10), &sample_messages());
+        let first = load_machine_in(id, dir.path(), stamp(10)).expect("first cycle loads");
+        keeper
+            .save_machine(&first, stamp(30))
+            .expect("second machine save");
+        write_envelope(dir.path(), id, stamp(30), &sample_messages());
+        let second = load_machine_in(id, dir.path(), stamp(30)).expect("second cycle loads");
+        assert_eq!(
+            rendered(&first),
+            rendered(&second),
+            "a save-resume-save cycle keeps the working set byte-stable"
+        );
+    }
+
+    #[test]
+    fn an_unknown_machine_format_degrades_to_derive() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let id = Uuid::new_v4();
+        write_envelope(dir.path(), id, stamp(10), &sample_messages());
+        std::fs::write(
+            dir.path().join(id.to_string()).join("machine.json"),
+            "{\"format\": \"dch.machine.v99\"}",
+        )
+        .expect("alien machine file written");
+        assert!(
+            load_machine_in(id, dir.path(), stamp(10)).is_none(),
+            "an unknown tag degrades to the derive walk, never a guess"
         );
     }
 }

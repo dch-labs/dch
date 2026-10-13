@@ -35,6 +35,14 @@ struct CannedResponse {
     /// provider client parses, exactly as a scripted model would send
     /// it.
     body: String,
+
+    /// How long the server sleeps before answering with this body.
+    ///
+    /// Zero for an immediate answer; a positive hold keeps the
+    /// request in flight for scenarios that need to catch the binary
+    /// mid-turn — a kill or a cancel landing before the response
+    /// arrives.
+    delay: std::time::Duration,
 }
 
 /// A canned provider endpoint on an ephemeral local port.
@@ -70,10 +78,10 @@ impl CannedServer {
                 .map(|body| CannedResponse {
                     content_type: "text/event-stream".to_string(),
                     body,
+                    delay: std::time::Duration::ZERO,
                 })
                 .collect(),
             false,
-            std::time::Duration::ZERO,
         )
     }
 
@@ -89,10 +97,32 @@ impl CannedServer {
                 .map(|body| CannedResponse {
                     content_type: "text/event-stream".to_string(),
                     body,
+                    delay,
                 })
                 .collect(),
             false,
-            delay,
+        )
+    }
+
+    /// Start an SSE server where every scripted body carries its own
+    /// pre-answer hold.
+    ///
+    /// For scenarios that mix pacing: early turns answer instantly
+    /// while one later turn is held long enough for a signal — a
+    /// kill or a cancel — to land before the response arrives. The
+    /// uniform-delay twin cannot express that; its hold applies to
+    /// every answer alike.
+    pub fn sse_scheduled(bodies: Vec<(String, std::time::Duration)>) -> Self {
+        Self::start(
+            bodies
+                .into_iter()
+                .map(|(body, delay)| CannedResponse {
+                    content_type: "text/event-stream".to_string(),
+                    body,
+                    delay,
+                })
+                .collect(),
+            false,
         )
     }
 
@@ -107,16 +137,50 @@ impl CannedServer {
             vec![CannedResponse {
                 content_type: content_type.to_string(),
                 body: body.to_string(),
+                delay: std::time::Duration::ZERO,
             }],
             true,
-            std::time::Duration::ZERO,
         )
     }
 
-    fn start(
+    /// Start an SSE server whose non-stream requests are answered with
+    /// one fixed JSON completion instead of the scripted queue.
+    ///
+    /// For strict-compactor scenarios: the conversation turns parse
+    /// their SSE bodies from the queue while the summarizer's
+    /// non-stream call lands a body it can actually parse — the queue
+    /// is never spent on a compactor connection, so the script stays
+    /// aligned with the turns it was written for.
+    pub fn sse_with_nonstream(bodies: Vec<String>, nonstream: String) -> Self {
+        Self::start_with_nonstream(
+            bodies
+                .into_iter()
+                .map(|body| CannedResponse {
+                    content_type: "text/event-stream".to_string(),
+                    body,
+                    delay: std::time::Duration::ZERO,
+                })
+                .collect(),
+            CannedResponse {
+                content_type: "application/json".to_string(),
+                body: nonstream,
+                delay: std::time::Duration::ZERO,
+            },
+        )
+    }
+
+    fn start(responses: Vec<CannedResponse>, repeat_last: bool) -> Self {
+        Self::start_split(responses, repeat_last, None)
+    }
+
+    fn start_with_nonstream(responses: Vec<CannedResponse>, nonstream: CannedResponse) -> Self {
+        Self::start_split(responses, false, Some(nonstream))
+    }
+
+    fn start_split(
         responses: Vec<CannedResponse>,
         repeat_last: bool,
-        delay: std::time::Duration,
+        nonstream: Option<CannedResponse>,
     ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("ephemeral bind");
         let port = listener.local_addr().expect("bound address").port();
@@ -128,14 +192,32 @@ impl CannedServer {
                 let Ok(mut stream) = stream else {
                     break;
                 };
-                if let Some(request) = read_request(&mut stream)
-                    && let Ok(mut log) = recorded.lock()
+                let mut logged = String::new();
+                if let Some(request) = read_request(&mut stream) {
+                    logged.clone_from(&request);
+                    if let Ok(mut log) = recorded.lock() {
+                        log.push(request);
+                    }
+                }
+                if logged.contains("\"stream\":false")
+                    && let Some(response) = nonstream.as_ref()
                 {
-                    log.push(request);
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n\
+                         Connection: close\r\n\r\n",
+                        response.content_type,
+                        response.body.len()
+                    );
+                    if response.delay > std::time::Duration::ZERO {
+                        std::thread::sleep(response.delay);
+                    }
+                    stream.write_all(head.as_bytes()).ok();
+                    stream.write_all(response.body.as_bytes()).ok();
+                    continue;
                 }
                 let served = queue.front().map(|response| {
-                    if delay > std::time::Duration::ZERO {
-                        std::thread::sleep(delay);
+                    if response.delay > std::time::Duration::ZERO {
+                        std::thread::sleep(response.delay);
                     }
                     let head = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n\
@@ -276,7 +358,8 @@ impl Sandbox {
             &config_path,
             format!(
                 "[api]\napi_type = \"openai\"\nbase_url = \"http://127.0.0.1:{}\"\
-                 \napi_key = \"dummy\"\nmodel = \"test-model\"\nrequest_timeout_secs = 30\n",
+                 \napi_key = \"dummy\"\nmodel = \"test-model\"\nrequest_timeout_secs = 30\n\
+                 context_window = 200000\n",
                 server.port()
             ),
         )
@@ -302,6 +385,177 @@ impl Sandbox {
     /// The recorded provider request bodies so far.
     pub fn requests(&self) -> Vec<String> {
         self.server.requests()
+    }
+
+    /// Append `extra` to the sandbox's config file.
+    ///
+    /// Scenarios that need runner-side knobs — a compactor selection,
+    /// a small context window — write them here after construction,
+    /// as more `[section]` TOML the binary reads alongside the
+    /// endpoint wiring already present.
+    pub fn extend_config(&self, extra: &str) {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&self.config_path)
+            .expect("config opens for append");
+        file.write_all(extra.as_bytes()).expect("config extended");
+    }
+
+    /// Build a sandbox around a delayed scripted stream with extra
+    /// `[api]` and `[runner]` lines.
+    ///
+    /// The delayed twin of [`sse_configured`](Self::sse_configured):
+    /// the server sleeps `delay` before every answer, so a scenario
+    /// can catch the interface mid-flight — a compaction pass holding
+    /// its notice row — on the server's own clock instead of racing
+    /// the binary's timing. As with the plain twin, no window is
+    /// declared here: `api_extra` carries one.
+    pub fn sse_delayed_configured(
+        bodies: Vec<String>,
+        delay: std::time::Duration,
+        api_extra: &str,
+        runner_extra: &str,
+    ) -> Self {
+        let server = CannedServer::sse_delayed(bodies, delay);
+        let home = tempfile::tempdir().expect("home tempdir");
+        let workdir = tempfile::tempdir().expect("workdir tempdir");
+        let config_path = home.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[api]\napi_type = \"openai\"\nbase_url = \"http://127.0.0.1:{}\"\
+                 \napi_key = \"dummy\"\nmodel = \"test-model\"\nrequest_timeout_secs = 30\n\
+                 {api_extra}\n[runner]\n{runner_extra}\n",
+                server.port()
+            ),
+        )
+        .expect("config written");
+        Self {
+            server,
+            home,
+            workdir,
+            config_path,
+        }
+    }
+
+    /// Build a delayed sandbox whose non-stream requests land one
+    /// fixed JSON completion.
+    ///
+    /// The strict-compactor twin of
+    /// [`sse_delayed_configured`](Self::sse_delayed_configured): the
+    /// hold applies to the summarizer's call too, so a compaction pass
+    /// spans the delay and the live lane paints while it runs.
+    pub fn sse_delayed_nonstream_configured(
+        bodies: Vec<String>,
+        delay: std::time::Duration,
+        nonstream: String,
+        api_extra: &str,
+        runner_extra: &str,
+    ) -> Self {
+        let server = CannedServer::start_with_nonstream(
+            bodies
+                .into_iter()
+                .map(|body| CannedResponse {
+                    content_type: "text/event-stream".to_string(),
+                    body,
+                    delay,
+                })
+                .collect(),
+            CannedResponse {
+                content_type: "application/json".to_string(),
+                body: nonstream,
+                delay,
+            },
+        );
+        Self::configured(server, api_extra, runner_extra)
+    }
+
+    /// Build a sandbox whose config carries extra `[api]` and
+    /// `[runner]` lines.
+    ///
+    /// The sandbox's own `[api]` table ends with `api_extra` and a
+    /// `[runner]` table follows with `runner_extra`, so a scenario
+    /// tunes knobs TOML refuses to define twice — the context window,
+    /// the compactor selection — without reopening a table. Unlike
+    /// the plain sandbox, no window is declared here: `api_extra`
+    /// carries one, keeping the spawned binary from probing the
+    /// scripted endpoint and shifting its responses.
+    pub fn sse_configured(bodies: Vec<String>, api_extra: &str, runner_extra: &str) -> Self {
+        Self::configured(CannedServer::sse(bodies), api_extra, runner_extra)
+    }
+
+    /// The scheduled twin of [`sse_configured`](Self::sse_configured).
+    ///
+    /// Every body carries its own pre-answer hold, so a scenario can
+    /// pace its early turns instantly while one later turn is held
+    /// for a signal to land — against the same tuned config knobs the
+    /// plain twin takes.
+    pub fn sse_scheduled_configured(
+        bodies: Vec<(String, std::time::Duration)>,
+        api_extra: &str,
+        runner_extra: &str,
+    ) -> Self {
+        Self::configured(CannedServer::sse_scheduled(bodies), api_extra, runner_extra)
+    }
+
+    /// The scheduled twin of
+    /// [`sse_delayed_nonstream_configured`](Self::sse_delayed_nonstream_configured).
+    ///
+    /// Every scripted SSE body keeps its own hold while the
+    /// summarizer's non-stream call lands the fixed JSON completion
+    /// instantly — a compaction the resume assertions need to have
+    /// already finished.
+    pub fn sse_scheduled_nonstream_configured(
+        bodies: Vec<(String, std::time::Duration)>,
+        nonstream: String,
+        api_extra: &str,
+        runner_extra: &str,
+    ) -> Self {
+        let server = CannedServer::start_with_nonstream(
+            bodies
+                .into_iter()
+                .map(|(body, delay)| CannedResponse {
+                    content_type: "text/event-stream".to_string(),
+                    body,
+                    delay,
+                })
+                .collect(),
+            CannedResponse {
+                content_type: "application/json".to_string(),
+                body: nonstream,
+                delay: std::time::Duration::ZERO,
+            },
+        );
+        Self::configured(server, api_extra, runner_extra)
+    }
+
+    /// Assemble the sandbox around a started server and tuned config
+    /// tables.
+    ///
+    /// The shared body of the configured constructors: the endpoint
+    /// arrives already started, the config file is written with the
+    /// caller's extra lines, and no default window is declared.
+    fn configured(server: CannedServer, api_extra: &str, runner_extra: &str) -> Self {
+        let home = tempfile::tempdir().expect("home tempdir");
+        let workdir = tempfile::tempdir().expect("workdir tempdir");
+        let config_path = home.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[api]\napi_type = \"openai\"\nbase_url = \"http://127.0.0.1:{}\"\
+                 \napi_key = \"dummy\"\nmodel = \"test-model\"\nrequest_timeout_secs = 30\n\
+                 {api_extra}\n[runner]\n{runner_extra}\n",
+                server.port()
+            ),
+        )
+        .expect("config written");
+        Self {
+            server,
+            home,
+            workdir,
+            config_path,
+        }
     }
 
     /// Run the real binary to completion with `args` and no stdin.
@@ -483,6 +737,21 @@ impl PtySession {
     pub fn send(&mut self, bytes: &[u8]) {
         self.writer.write_all(bytes).expect("keystrokes written");
         self.writer.flush().expect("keystrokes flushed");
+    }
+
+    /// The child's process id, for tests that deliver signals.
+    pub fn pid(&self) -> u32 {
+        self.child.process_id().expect("child reports its pid")
+    }
+
+    /// Reap without signaling: the exit status once the child is dead.
+    ///
+    /// The signal-delivery scenarios own the kill side and must observe
+    /// the status the signal path produced, so unlike
+    /// [`reap_within`](PtySession::reap_within) this never kills a
+    /// lingering child.
+    pub fn try_reap(&mut self) -> Option<portable_pty::ExitStatus> {
+        self.child.try_wait().expect("child is waitable")
     }
 
     /// Reap the child before `timeout` runs out, killing it if it lingers.
@@ -862,4 +1131,66 @@ pub fn git_fixture(dir: &Path) {
     git(dir, &["commit", "-m", "second"]);
     std::fs::write(dir.join("staged.txt"), "staged change\n").expect("staged written");
     git(dir, &["add", "staged.txt"]);
+}
+
+/// An SSE body whose turn reasons first, then answers.
+///
+/// One thinking delta chunk, one content delta chunk, then the stop
+/// chunk — the shape whose display the final-answer pins ride on.
+pub fn sse_thinking_text_turn(thinking: &str, text: &str) -> String {
+    [
+        serde_json::json!({
+            "id": "c1", "model": "test-model",
+            "choices": [{"delta": {"reasoning_content": thinking}, "finish_reason": null}]
+        }),
+        serde_json::json!({
+            "id": "c1", "model": "test-model",
+            "choices": [{"delta": {"content": text}, "finish_reason": null}]
+        }),
+        serde_json::json!({
+            "id": "c1", "model": "test-model",
+            "choices": [{"delta": null, "finish_reason": "stop"}]
+        }),
+    ]
+    .iter()
+    .map(|chunk| format!("data: {chunk}\n\n"))
+    .chain(std::iter::once("data: [DONE]\n\n".to_string()))
+    .collect()
+}
+
+/// An SSE body whose turn reasons first, then issues one tool call.
+///
+/// The marathon shape before a final answer: a thinking delta chunk,
+/// the tool-call deltas, and a `tool_calls` finish so the engine
+/// dispatches and the loop continues.
+pub fn sse_thinking_tool_turn(thinking: &str, tool: &str, args: &serde_json::Value) -> String {
+    let args = args.to_string();
+    [
+        serde_json::json!({
+            "id": "c1", "model": "test-model",
+            "choices": [{"delta": {"reasoning_content": thinking}, "finish_reason": null}]
+        }),
+        serde_json::json!({
+            "id": "c1", "model": "test-model",
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0, "id": "call_1",
+                "function": {"name": tool, "arguments": ""}
+            }]}, "finish_reason": null}]
+        }),
+        serde_json::json!({
+            "id": "c1", "model": "test-model",
+            "choices": [{"delta": {"tool_calls": [{
+                "index": 0,
+                "function": {"arguments": args}
+            }]}, "finish_reason": null}]
+        }),
+        serde_json::json!({
+            "id": "c1", "model": "test-model",
+            "choices": [{"delta": null, "finish_reason": "tool_calls"}]
+        }),
+    ]
+    .iter()
+    .map(|chunk| format!("data: {chunk}\n\n"))
+    .chain(std::iter::once("data: [DONE]\n\n".to_string()))
+    .collect()
 }

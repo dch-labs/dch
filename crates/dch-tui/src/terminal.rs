@@ -11,6 +11,7 @@ use crossterm::cursor::SetCursorStyle;
 use std::io::Write as _;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use crossterm::event::{
@@ -35,6 +36,58 @@ use ratatui::style::Color;
 /// was installed, so restore never touches a terminal that was never
 /// changed.
 static ORIGINAL_BACKGROUND: OnceLock<(u8, u8, u8)> = OnceLock::new();
+
+/// The terminal's line discipline as this process found it, captured
+/// before raw mode was first enabled.
+///
+/// The fatal-signal handler cannot call crossterm to stand raw mode
+/// down — crossterm guards its saved state behind a lock a signal must
+/// never block on — so it replays this captured copy directly through
+/// `tcsetattr` instead. Absent when the capture failed, in which case
+/// the handler still writes the mode teardown sequences and exits;
+/// a shell-side `reset` then covers the residue.
+#[cfg(unix)]
+static ORIGINAL_TERMIOS: OnceLock<libc::termios> = OnceLock::new();
+
+/// The exact bytes the fatal-signal handler writes to restore the
+/// terminal, built once at arm time from the state the session had
+/// then: the original background when one was captured, the mode
+/// teardown, and the alternate screen exit.
+#[cfg(unix)]
+static SIGNAL_RESTORE_BYTES: OnceLock<Vec<u8>> = OnceLock::new();
+
+/// The SIGINT handler action this process replaced when it armed the
+/// fatal-signal restore, as a raw `sa_sigaction` value; a sentinel
+/// (`SIG_DFL` = 0 or `SIG_IGN` = 1) when the arm found no real
+/// handler to chain to.
+#[cfg(unix)]
+static CHAINED_SIGINT: AtomicUsize = AtomicUsize::new(0);
+
+/// The SIGTERM counterpart of [`CHAINED_SIGINT`].
+///
+/// Holds the `sa_sigaction` the arm displaced for SIGTERM, so the
+/// handler chains to whoever owned the signal before the session.
+#[cfg(unix)]
+static CHAINED_SIGTERM: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether the fatal-signal handler must restore and exit itself
+/// rather than chain to the cooperative owner.
+///
+/// False while the tokio bridge owns interrupts — the whole live
+/// session, including a stalled run teardown the runtime is still
+/// polling — and true from the top of [`restore_terminal`] onward and
+/// inside blocking windows the runtime cannot serve, where a chained
+/// handler would strand the signal and leave the terminal broken.
+#[cfg(unix)]
+static SIGNAL_RESTORE_DEAF: AtomicBool = AtomicBool::new(false);
+
+/// Whether the fatal-signal handler has been armed for this process.
+///
+/// Arming is once-per-process: the handler and its byte string are
+/// built from the first session's state, and a second session in the
+/// same process is not a shape this binary runs.
+#[cfg(unix)]
+static SIGNAL_RESTORE_ARMED: AtomicBool = AtomicBool::new(false);
 
 /// Initialize the terminal for a full-screen TUI session.
 ///
@@ -64,6 +117,8 @@ static ORIGINAL_BACKGROUND: OnceLock<(u8, u8, u8)> = OnceLock::new();
 /// Fails when the terminal mode or escape-sequence writes are
 /// rejected, most commonly because stdout is not a terminal.
 pub fn init_terminal(mouse_capture: bool) -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
+    #[cfg(unix)]
+    capture_original_termios();
     enable_raw_mode()?;
     let initialized = (|| {
         let mut stdout = io::stdout();
@@ -353,6 +408,267 @@ fn alternate_scroll_sequence(_enable: bool) -> &'static str {
 /// whatever runs in that terminal next.
 static ALTERNATE_SCROLL_ON: AtomicBool = AtomicBool::new(false);
 
+/// Capture the line discipline exactly as the session found it.
+///
+/// Runs before raw mode is enabled once per process; a failed capture
+/// is recorded as absent, and the fatal-signal handler then does the
+/// escape-sequence half of the restore only.
+#[cfg(unix)]
+fn capture_original_termios() {
+    use std::os::fd::AsRawFd as _;
+
+    // SAFETY: `termios` is a plain-data struct owned by this frame, and
+    // tcgetattr only fills it from the descriptor's current discipline.
+    let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+    // SAFETY: the pointer is valid for one termios record, per above.
+    let captured = unsafe { libc::tcgetattr(io::stdin().as_raw_fd(), &raw mut termios) } == 0;
+    if captured {
+        let _stored = ORIGINAL_TERMIOS.set(termios);
+    }
+}
+
+/// Build the exact byte string the fatal-signal handler writes.
+///
+/// Mirrors [`restore_terminal`]'s sequence — original background first
+/// when one was captured, then every mode the session stood up stood
+/// back down, then the alternate screen left — but assembled once,
+/// here, from crossterm's own serializers, so the handler never
+/// formats or locks at signal time.
+#[cfg(unix)]
+fn signal_restore_bytes(original: Option<(u8, u8, u8)>) -> Vec<u8> {
+    use crossterm::Command as _;
+
+    /// Append one command's serialized ANSI form.
+    ///
+    /// The destination is an in-memory string, which never fails a write;
+    /// a failure is unreachable in practice and only logged.
+    fn pushed(result: std::fmt::Result) {
+        if result.is_err() {
+            tracing::warn!("in-memory terminal command serialization failed");
+        }
+    }
+
+    let mut bytes = String::new();
+    if let Some(channels) = original {
+        bytes.push_str(&background_sequence(channels));
+    }
+    pushed(DisableMouseCapture.write_ansi(&mut bytes));
+    pushed(DisableBracketedPaste.write_ansi(&mut bytes));
+    pushed(DisableFocusChange.write_ansi(&mut bytes));
+    pushed(PopKeyboardEnhancementFlags.write_ansi(&mut bytes));
+    pushed(SetCursorStyle::DefaultUserShape.write_ansi(&mut bytes));
+    pushed(LeaveAlternateScreen.write_ansi(&mut bytes));
+    if ALTERNATE_SCROLL_ON.load(Ordering::Relaxed) {
+        bytes.push_str(alternate_scroll_sequence(false));
+    }
+    bytes.into_bytes()
+}
+
+/// Replay the captured restore bytes and the captured line discipline.
+///
+/// The handler-side twin of [`restore_terminal`]'s first and last
+/// steps, built from raw `write` and `tcsetattr` so a signal arriving
+/// on any thread can run it without touching a lock or an allocator.
+///
+/// # Safety
+///
+/// Called from a signal handler: the statics it reads must have been
+/// set before the handler was armed, and the caller must tolerate the
+/// call running on any thread while other threads are mid-operation.
+#[cfg(unix)]
+unsafe fn run_signal_restore() {
+    if let Some(bytes) = SIGNAL_RESTORE_BYTES.get() {
+        let mut offset = 0usize;
+        while offset < bytes.len() {
+            let remaining = bytes.len().saturating_sub(offset);
+            // SAFETY: the offset stays within the byte string by the
+            // loop condition, and fd 1 is the terminal the session drew on.
+            let written = unsafe { libc::write(1, bytes.as_ptr().add(offset).cast(), remaining) };
+            let advanced = usize::try_from(written).unwrap_or(0);
+            if advanced == 0 {
+                break;
+            }
+            offset = offset.saturating_add(advanced);
+        }
+    }
+    if let Some(original) = ORIGINAL_TERMIOS.get() {
+        // SAFETY: the pointer names the captured termios copy, and
+        // TCSANOW applies it in place without waiting on queued output.
+        unsafe { libc::tcsetattr(0, libc::TCSANOW, original) };
+    }
+}
+
+/// The fatal-signal handler: chain while the cooperative layer owns
+/// interrupts, restore and exit once it cannot.
+///
+/// In the live phase the saved previous action runs — the tokio
+/// bridge's handler, so cooperative cancellation keeps working and the
+/// forced double-press path performs its own restore. In the deaf
+/// phase the captured restore bytes go out, the captured line
+/// discipline comes back, and the process exits 130; the alternative
+/// on this path is a terminal stranded in raw mode and the session
+/// theme. Only SIGINT and SIGTERM are armed, so the SIGTERM slot is
+/// the chain for every signal that is not SIGINT.
+#[cfg(unix)]
+extern "C" fn fatal_signal_restore_handler(
+    signal: libc::c_int,
+    info: *mut libc::siginfo_t,
+    context: *mut libc::c_void,
+) {
+    if SIGNAL_RESTORE_DEAF.load(Ordering::SeqCst) {
+        // SAFETY: the byte string and termios statics were captured at
+        // arm time; the call only touches raw fds and process state.
+        unsafe { run_signal_restore() };
+        // SAFETY: _exit is async-signal-safe and, on this path, the
+        // process's terminal is already restored.
+        unsafe { libc::_exit(130) };
+    }
+    let chain = if signal == libc::SIGINT {
+        &CHAINED_SIGINT
+    } else {
+        &CHAINED_SIGTERM
+    };
+    let previous = chain.load(Ordering::SeqCst);
+    if chains_to_previous(previous) {
+        type ChainedHandler =
+            unsafe extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void);
+        // SAFETY: the value was stored from a sigaction handoff at arm
+        // time and names the handler that owned this signal before this
+        // one; the incoming arguments are passed through unchanged.
+        let chained = unsafe { std::mem::transmute::<usize, ChainedHandler>(previous) };
+        // SAFETY: calling the displaced handler with the kernel's own
+        // arguments is the documented chain handoff.
+        unsafe { chained(signal, info, context) };
+    }
+}
+
+/// Whether a displaced `sa_sigaction` value names a callable handler.
+///
+/// The kernel encodes the two non-handler dispositions as the small
+/// integers `SIG_DFL` (0) and `SIG_IGN` (1); anything above them is a
+/// function address. Chaining to a sentinel would call a non-address
+/// as code — an inherited-ignored disposition that reached the arm
+/// because the cooperative bridge could not install its listener is
+/// the concrete case — so the live-phase handler honors the inherited
+/// ignore instead and simply returns.
+#[cfg(unix)]
+fn chains_to_previous(sa_sigaction: usize) -> bool {
+    sa_sigaction > 1
+}
+
+/// Replace one signal's disposition with the fatal-restore handler,
+/// remembering the action it displaced for the live-phase chain.
+///
+/// # Safety
+///
+/// `signal` must be one of the signals this module arms (SIGINT or
+/// SIGTERM), and the caller must run before or after any other thread
+/// depends on the signal's disposition, since `sigaction` swaps it
+/// process-wide.
+#[cfg(unix)]
+unsafe fn install_fatal_handler(signal: libc::c_int, chain: &AtomicUsize) {
+    let mut previous: libc::sigaction = unsafe { std::mem::zeroed() };
+    // SAFETY: both sigaction structs are owned plain-data frames, and
+    // the signal numbers are the constants this module arms.
+    let replaced = unsafe {
+        type RawHandler = extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void);
+        let mut action: libc::sigaction = std::mem::zeroed();
+        let handler: RawHandler = fatal_signal_restore_handler;
+        action.sa_sigaction = handler as *const () as usize;
+        action.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
+        libc::sigemptyset(&raw mut action.sa_mask);
+        libc::sigaction(signal, &raw const action, &raw mut previous)
+    } == 0;
+    if replaced {
+        chain.store(previous.sa_sigaction, Ordering::SeqCst);
+    } else {
+        tracing::warn!("fatal-signal terminal restore could not be armed");
+    }
+}
+
+/// Arm the fatal-signal terminal restore for SIGINT and SIGTERM.
+///
+/// Builds the restore byte string from the state the session has at
+/// arm time — call after [`sync_default_background`] so a captured
+/// original background rides in it — and replaces both signals'
+/// dispositions, keeping the displaced handlers for the live-phase
+/// chain. Idempotent: the first call arms, later calls return.
+///
+/// The handler is deliberately synchronous rather than a tokio
+/// listener: it must still work when the runtime is blocked in a
+/// non-polling call or already gone, which is exactly where the
+/// terminal would otherwise be stranded.
+#[cfg(unix)]
+pub fn arm_fatal_signal_restore() {
+    if SIGNAL_RESTORE_ARMED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let _stored =
+        SIGNAL_RESTORE_BYTES.set(signal_restore_bytes(ORIGINAL_BACKGROUND.get().copied()));
+    // SAFETY: the two calls only register this module's handler and
+    // record the actions they displaced.
+    unsafe {
+        install_fatal_handler(libc::SIGINT, &CHAINED_SIGINT);
+        install_fatal_handler(libc::SIGTERM, &CHAINED_SIGTERM);
+    }
+}
+
+/// The non-unix counterpart: no POSIX signal handling to arm.
+///
+/// Windows console handling does not go through `sigaction`, so the
+/// safety net has no shape here; the ordered teardown still restores
+/// the terminal on every path.
+#[cfg(not(unix))]
+pub fn arm_fatal_signal_restore() {}
+
+/// Mark the start of a blocking window the async runtime cannot serve.
+///
+/// While the window is open the fatal-signal handler restores the
+/// terminal and exits instead of chaining, because the cooperative
+/// owner of interrupts cannot run to accept the handoff. Wrap only
+/// stretches of straight-line blocking work — a thread join, not an
+/// await.
+#[cfg(unix)]
+pub fn enter_signal_deaf_window() {
+    SIGNAL_RESTORE_DEAF.store(true, Ordering::SeqCst);
+}
+
+/// The non-unix counterpart: no POSIX signal handling to gate.
+///
+/// A no-op so the session wiring reads the same on every platform.
+#[cfg(not(unix))]
+pub fn enter_signal_deaf_window() {}
+
+/// Close a window opened by [`enter_signal_deaf_window`], returning
+/// interrupts to the cooperative owner.
+#[cfg(unix)]
+pub fn exit_signal_deaf_window() {
+    SIGNAL_RESTORE_DEAF.store(false, Ordering::SeqCst);
+}
+
+/// The non-unix counterpart: no POSIX signal handling to gate.
+///
+/// A no-op so the session wiring reads the same on every platform.
+#[cfg(not(unix))]
+pub fn exit_signal_deaf_window() {}
+
+/// Point the fatal-signal handler at self-restore for everything that
+/// follows.
+///
+/// Once the ordinary restore has run — or failed — there is no
+/// cooperative layer left to hand a signal to, so the handler stops
+/// chaining and makes any later signal a clean, restored exit.
+#[cfg(unix)]
+fn mark_signal_restore_deaf() {
+    SIGNAL_RESTORE_DEAF.store(true, Ordering::SeqCst);
+}
+
+/// The non-unix counterpart: nothing to gate.
+///
+/// The ordered restore is the only restoration path on these platforms.
+#[cfg(not(unix))]
+fn mark_signal_restore_deaf() {}
+
 /// Restore the terminal after a TUI session.
 ///
 /// Puts a default background the session overrode back first,
@@ -374,6 +690,7 @@ static ALTERNATE_SCROLL_ON: AtomicBool = AtomicBool::new(false);
 /// Fails only when the mode change or the escape-sequence write is
 /// rejected by the underlying terminal.
 pub fn restore_terminal() -> io::Result<()> {
+    mark_signal_restore_deaf();
     if let Some(original) = ORIGINAL_BACKGROUND.get() {
         let mut stdout = io::stdout();
         drop(write!(stdout, "{}", background_sequence(*original)));
@@ -418,7 +735,11 @@ fn discard_pending_input() {
     }
 }
 
-/// The non-unix teardown counterpart: nothing to flush.
+/// The non-unix teardown counterpart of the input drain.
+///
+/// The POSIX flush has no counterpart on this platform's console
+/// paths, and leaving queued bytes for the shell is harmless there,
+/// so the drain is deliberately empty.
 #[cfg(not(unix))]
 fn discard_pending_input() {}
 
@@ -485,6 +806,62 @@ impl Drop for TerminalGuard {
 )]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn the_chain_guard_refuses_both_disposition_sentinels() {
+        // SIG_DFL (0) and SIG_IGN (1) are encodings, not addresses:
+        // an inherited-ignored launch whose bridge registration failed
+        // arms with the 1, and transmuting that into a call would
+        // fault. Real handler addresses sit far above both sentinels.
+        assert!(
+            !chains_to_previous(0),
+            "SIG_DFL names no handler to chain to"
+        );
+        assert!(
+            !chains_to_previous(1),
+            "SIG_IGN names no handler to chain to"
+        );
+        assert!(chains_to_previous(2), "the lowest real address chains");
+        assert!(
+            chains_to_previous(0x5555_5555_5000),
+            "a typical PIE handler address chains"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_signal_restore_bytes_carry_the_full_teardown() {
+        let with_background = signal_restore_bytes(Some((0x28, 0x2a, 0x36)));
+        assert!(
+            with_background.starts_with(b"\x1b]11;rgb:28/2a/36\x1b\\"),
+            "the original background leads: {:?}",
+            String::from_utf8_lossy(&with_background)
+        );
+        let without_background = signal_restore_bytes(None);
+        assert!(
+            !without_background.windows(5).any(|w| w == b"\x1b]11;"),
+            "no background override was captured, none goes back: {:?}",
+            String::from_utf8_lossy(&without_background)
+        );
+        for bytes in [&with_background, &without_background] {
+            assert!(
+                bytes.windows(8).any(|w| w == b"\x1b[?1049l"),
+                "the alternate screen exit must be in the byte string"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn arming_is_idempotent_and_deaf_windows_toggle() {
+        arm_fatal_signal_restore();
+        arm_fatal_signal_restore();
+        enter_signal_deaf_window();
+        assert!(SIGNAL_RESTORE_DEAF.load(Ordering::SeqCst));
+        exit_signal_deaf_window();
+        assert!(!SIGNAL_RESTORE_DEAF.load(Ordering::SeqCst));
+    }
 
     #[cfg(unix)]
     #[test]

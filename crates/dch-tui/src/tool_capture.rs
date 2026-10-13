@@ -15,7 +15,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use loopctl::message::{ToolContent, ToolContentPart};
-use loopctl::middleware::{ToolDispatchContext, ToolMiddleware, ToolPipeline};
+use loopctl::middleware::{SecretPatternSet, ToolDispatchContext, ToolMiddleware, ToolPipeline};
 use loopctl::tool::ToolDispatchResult;
 
 /// The shared capture store: call id to captured call.
@@ -214,12 +214,23 @@ fn sanitize_for_display(text: &str) -> String {
 /// the call runs and the result's output after it completes, both
 /// keyed by the call id the engine reports. The captured output is
 /// what the inner layers already redacted, so the display never
-/// sees a secret the model was spared.
+/// sees a secret the model was spared. When input redaction is
+/// armed, the recorded input is scrubbed with the same pattern set —
+/// a credential echoed inside a command or file content is displayed
+/// and persisted masked, though the tool itself always ran on the
+/// real bytes.
 pub struct CapturingMiddleware {
     /// The store this middleware writes into.
     ///
     /// The same allocation the observer side drains from.
     sink: ToolCaptureSink,
+
+    /// The pattern set scrubbing the recorded input, when the host
+    /// armed input redaction.
+    ///
+    /// The output needs no scrubber here: the redacting middleware
+    /// sits inside this one, so its result arrives already masked.
+    input_scrub: Option<SecretPatternSet>,
 }
 
 impl CapturingMiddleware {
@@ -228,10 +239,44 @@ impl CapturingMiddleware {
     /// The sink is the shared state's capture store, cloned by
     /// `Arc` so the middleware and the observer side share one
     /// allocation. One middleware instance serves the whole
-    /// pipeline; every dispatched call passes through it.
+    /// pipeline; every dispatched call passes through it. The
+    /// recorded input is stored verbatim — arm
+    /// [`new_with_input_redaction`](Self::new_with_input_redaction)
+    /// to scrub it.
     #[must_use]
     pub fn new(sink: ToolCaptureSink) -> Self {
-        Self { sink }
+        Self {
+            sink,
+            input_scrub: None,
+        }
+    }
+
+    /// Create a middleware that also scrubs the recorded input.
+    ///
+    /// The same default pattern set the dispatch pipeline's
+    /// redacting pass applies to tool output runs over the
+    /// pretty-printed input before it lands in the store — the
+    /// conversation's expanded block and the persisted transcript
+    /// then hold masked text.
+    #[must_use]
+    pub fn new_with_input_redaction(sink: ToolCaptureSink, enabled: bool) -> Self {
+        Self {
+            sink,
+            input_scrub: enabled.then(SecretPatternSet::default_common),
+        }
+    }
+
+    /// The pretty-printed input as the store records it: scrubbed
+    /// when armed, then capped.
+    ///
+    /// Scrubbing runs over the full text before the cap, so a
+    /// placeholder cannot be cut away by the retention trim.
+    fn recorded_input(&self, input: &serde_json::Value) -> String {
+        let mut json = serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string());
+        if let Some(set) = &self.input_scrub {
+            set.scrub(&mut json);
+        }
+        cap_output(&json)
     }
 
     /// Insert a capture, dropping the store wholesale at capacity.
@@ -271,12 +316,10 @@ impl ToolMiddleware for CapturingMiddleware {
     ) -> Pin<Box<dyn Future<Output = ToolDispatchResult> + Send + 'a>> {
         Box::pin(async move {
             let call_id = ctx.call_id.clone();
-            let input_json = cap_output(
-                &serde_json::to_string_pretty(&ctx.input).unwrap_or_else(|_| ctx.input.to_string()),
-            );
+            let input_json = self.recorded_input(&ctx.input);
             self.record(
                 ToolCapture {
-                    input_json,
+                    input_json: input_json.clone(),
                     output: String::new(),
                     is_error: false,
                     done: false,
@@ -286,10 +329,7 @@ impl ToolMiddleware for CapturingMiddleware {
             let result = next.dispatch(ctx).await;
             self.record(
                 ToolCapture {
-                    input_json: cap_output(
-                        &serde_json::to_string_pretty(&ctx.input)
-                            .unwrap_or_else(|_| ctx.input.to_string()),
-                    ),
+                    input_json,
                     output: cap_output(&sanitize_for_display(&content_text(&result.output))),
                     is_error: result.is_error,
                     done: true,
@@ -402,6 +442,145 @@ mod tests {
                 ))
             })
         }
+    }
+
+    #[tokio::test]
+    async fn an_armed_capture_scrubs_secrets_from_the_recorded_input() {
+        struct EchoTool;
+        impl loopctl::tool::Tool for EchoTool {
+            fn name(&self) -> &'static str {
+                "Echo"
+            }
+            fn description(&self) -> &'static str {
+                "Answers nothing"
+            }
+            fn schema(&self) -> loopctl::tool::ToolSchema {
+                loopctl::tool::ToolSchema::new(
+                    "Echo",
+                    "Answers nothing",
+                    serde_json::json!({"type": "object"}),
+                )
+            }
+            fn call(
+                &self,
+                _input: serde_json::Value,
+                _ctx: &loopctl::tool::ToolContext,
+            ) -> Pin<
+                Box<
+                    dyn Future<Output = Result<loopctl::tool::ToolOutput, loopctl::tool::ToolError>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async { Ok(loopctl::tool::ToolOutput::text("done")) })
+            }
+        }
+        let sink: ToolCaptureSink = Arc::new(Mutex::new(HashMap::new()));
+        let mut registry = loopctl::tool::ToolRegistry::new();
+        registry.register(EchoTool);
+        let pipeline = ToolPipeline::builder()
+            .with_middleware(CapturingMiddleware::new_with_input_redaction(
+                Arc::clone(&sink),
+                true,
+            ))
+            .with_core(Arc::new(registry))
+            .build()
+            .expect("the pipeline builds");
+        let ctx = ToolDispatchContext {
+            tool_name: "Echo".to_string(),
+            input: serde_json::json!({
+                "command":
+                    "curl -H 'Authorization: Bearer sk-super-secret-value' https://api.test"
+            }),
+            call_id: "call-in".to_string(),
+            turn_number: 1,
+            cancel: Arc::new(loopctl::cancel::CancelSignal::new()),
+            permission: loopctl::tool::PermissionCheck::allow(),
+            tool_context: loopctl::tool::ToolContext::default(),
+        };
+        let result = pipeline.invoke(ctx).await;
+        assert!(!result.is_error);
+        let capture = sink
+            .lock()
+            .expect("sink")
+            .get("call-in")
+            .cloned()
+            .expect("the capture exists");
+        assert!(
+            capture.input_json.contains("[REDACTED:bearer]"),
+            "the secret is masked in the recorded input: {}",
+            capture.input_json
+        );
+        assert!(
+            !capture.input_json.contains("sk-super-secret-value"),
+            "no raw credential survives: {}",
+            capture.input_json
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unarmed_capture_records_the_input_verbatim() {
+        struct EchoTool;
+        impl loopctl::tool::Tool for EchoTool {
+            fn name(&self) -> &'static str {
+                "Echo"
+            }
+            fn description(&self) -> &'static str {
+                "Answers nothing"
+            }
+            fn schema(&self) -> loopctl::tool::ToolSchema {
+                loopctl::tool::ToolSchema::new(
+                    "Echo",
+                    "Answers nothing",
+                    serde_json::json!({"type": "object"}),
+                )
+            }
+            fn call(
+                &self,
+                _input: serde_json::Value,
+                _ctx: &loopctl::tool::ToolContext,
+            ) -> Pin<
+                Box<
+                    dyn Future<Output = Result<loopctl::tool::ToolOutput, loopctl::tool::ToolError>>
+                        + Send
+                        + '_,
+                >,
+            > {
+                Box::pin(async { Ok(loopctl::tool::ToolOutput::text("done")) })
+            }
+        }
+        let sink: ToolCaptureSink = Arc::new(Mutex::new(HashMap::new()));
+        let mut registry = loopctl::tool::ToolRegistry::new();
+        registry.register(EchoTool);
+        let pipeline = ToolPipeline::builder()
+            .with_middleware(CapturingMiddleware::new(Arc::clone(&sink)))
+            .with_core(Arc::new(registry))
+            .build()
+            .expect("the pipeline builds");
+        let ctx = ToolDispatchContext {
+            tool_name: "Echo".to_string(),
+            input: serde_json::json!({
+                "command":
+                    "curl -H 'Authorization: Bearer sk-super-secret-value' https://api.test"
+            }),
+            call_id: "call-in".to_string(),
+            turn_number: 1,
+            cancel: Arc::new(loopctl::cancel::CancelSignal::new()),
+            permission: loopctl::tool::PermissionCheck::allow(),
+            tool_context: loopctl::tool::ToolContext::default(),
+        };
+        pipeline.invoke(ctx).await;
+        let capture = sink
+            .lock()
+            .expect("sink")
+            .get("call-in")
+            .cloned()
+            .expect("the capture exists");
+        assert!(
+            capture.input_json.contains("sk-super-secret-value"),
+            "redaction off keeps the recorded input raw: {}",
+            capture.input_json
+        );
     }
 
     #[tokio::test]

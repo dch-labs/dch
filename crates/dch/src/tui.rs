@@ -8,10 +8,12 @@
 //! runs, routes run failures into the display, and tears everything
 //! down when the user quits.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use dch_tui::PermissionRequest;
+use dch_tui::QuestionPrompt;
 use dch_tui::TuiMessage;
 use dch_tui::{TerminalGuard, TuiApp, TuiObserverState};
 use tokio::sync::mpsc;
@@ -55,10 +57,12 @@ pub async fn run_tui(args: &Args, control: ResumeControl) -> u8 {
 /// failure reports to the user's normal terminal. Draw failures after
 /// the session started are reported only once the guard has restored
 /// the terminal, so the message never lands inside raw mode. A
-/// resumed control shapes each step: the saved model applies unless
-/// the CLI overrides it, the restored conversation seeds both the
-/// agent's history and the display, and the session id is the loaded
-/// one so auto-saves keep writing the resumed file.
+/// resumed control shapes each step: the restored conversation seeds
+/// both the agent's history and the display, the engine runs on the
+/// current configuration's model and provider — the session's
+/// recorded model is provenance for the listing, not an instruction —
+/// and the session id is the loaded one so auto-saves keep writing
+/// the resumed file.
 ///
 /// # Errors
 ///
@@ -73,13 +77,12 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
     }
     let mut config = load_config(args.config.config_path.as_deref())?;
     apply_cli_overrides(&mut config, args);
-    if let ResumeControl::Resumed(outcome) = &control {
-        crate::resume::apply_resumed_model(&mut config, args, outcome);
-    }
 
     let workdir = std::env::current_dir().map_err(|err| format!("cannot determine cwd: {err}"))?;
 
-    let (observer, state) = TuiObserverState::new().into_observer();
+    let (observer, state) = TuiObserverState::new()
+        .with_secret_redaction(config.security.redact_secrets)
+        .into_observer();
     if let ResumeControl::Resumed(outcome) = &control {
         let mut tokens = state
             .tokens
@@ -88,17 +91,21 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
         tokens.cumulative_input = outcome.tokens.cumulative_input;
         tokens.cumulative_output = outcome.tokens.cumulative_output;
         tokens.input = outcome.tokens.last_input_tokens;
+        tokens.context_tokens = outcome.tokens.context_tokens;
     }
     let (permission_resolver, permission_rx) = permission_bridge();
     let mut builder = dch_loop::Runner::builder(&config, &workdir)
         .with_observer(Arc::new(observer) as Arc<dyn loopctl::observer::LoopObserver>)
-        .with_middleware(Arc::new(dch_tui::CapturingMiddleware::new(Arc::clone(
-            &state.tool_captures,
-        ))))
+        .with_middleware(Arc::new(
+            dch_tui::CapturingMiddleware::new_with_input_redaction(
+                Arc::clone(&state.tool_captures),
+                config.security.redact_secrets,
+            ),
+        ))
         .with_permission_resolver(permission_resolver);
     if let ResumeControl::Resumed(outcome) = &control {
-        builder = builder.with_history(crate::resume::tui_messages_to_loopctl(
-            &outcome.messages,
+        builder = builder.with_history(crate::resume::history_for_resume(
+            outcome,
             config.security.redact_secrets,
         ));
     }
@@ -106,15 +113,35 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
         .build()
         .await
         .map_err(|err| format!("agent construction: {err}"))?;
+    state
+        .context_window
+        .store(runner.context_window(), Ordering::SeqCst);
 
     // Rebuild the read-before-write guard's baselines for the files
     // the restored transcript shows being read: without this, a
     // resumed Write treats every previously-read file as never-read.
     if let ResumeControl::Resumed(outcome) = &control {
-        for path in crate::resume::resumed_read_paths(&outcome.messages) {
+        for path in crate::resume::resumed_read_paths_with_machine(
+            &outcome.messages,
+            outcome.machine.as_deref(),
+        ) {
             let _recorded = runner.record_resumed_read(&path).await;
         }
     }
+
+    // The cooperative interrupt bridge: the first external SIGINT or
+    // SIGTERM cancels the run in flight; the forced second press
+    // restores the terminal before the bridge's own exit.
+    let signal_bridge = crate::signals::install_cancel_handler(runner.cancel_signal(), || {
+        let _restored = dch_tui::restore_terminal();
+    });
+
+    // The asking path: the runner's asking channel and its bridge are
+    // supervised, so the prompts the app's overlay renders keep
+    // arriving for the session's whole life — each answer returns to
+    // the asking tool through the bridge's own correlation.
+    let (prompt_tx, prompt_rx) = mpsc::unbounded_channel();
+    let questions = runner.question_path().supervise(prompt_tx, overlay_prompt);
 
     let (submit_tx, submit_rx) = mpsc::unbounded_channel();
     let model = config.api.model.clone();
@@ -122,13 +149,18 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
     let mut app = TuiApp::from_observer_state(config, state.clone());
     app.set_submit_tx(submit_tx);
     app.set_permission_requests(permission_rx);
+    app.set_question_requests(prompt_rx);
+    app.set_working_dir(&workdir);
+    app.set_git_branch(git_branch(&workdir));
 
     // Seed the display from the control — the restored transcript, or
     // the note that a resume degraded to this fresh session — and take
     // the id the saver writes under: the resumed file's own identity.
+    let mut resumed_machine: Option<Vec<loopctl::message::Message>> = None;
     let session_id = match control {
         ResumeControl::Resumed(outcome) => {
             app.seed_messages(outcome.messages);
+            resumed_machine = outcome.machine;
             outcome.session_id
         }
         ResumeControl::Fresh {
@@ -151,10 +183,7 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
     let saver = Arc::new(crate::session::SessionSaver::with_model(session_id, model));
     let (transcript_handle, transcript_worker) = TranscriptWorker::spawn(saver);
     let initial_transcript = transcript_handle.clone();
-    let hook_tokens = Arc::clone(&state.tokens);
-    app.set_turn_end_hook(Box::new(move |conversation| {
-        transcript_handle.send(conversation.to_vec(), snapshot_tokens(&hook_tokens));
-    }));
+    install_turn_end_hook(&mut app, &state, transcript_handle);
 
     initial_transcript.send(app.conversation().to_vec(), snapshot_tokens(&state.tokens));
 
@@ -165,6 +194,7 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
     // this points that default at the theme's canvas color for the
     // session's lifetime, so the margin around the grid matches it.
     dch_tui::sync_default_background(app.theme.ui.background);
+    dch_tui::arm_fatal_signal_restore();
 
     let cancel = runner.cancel_signal();
     {
@@ -172,22 +202,79 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
         app.set_run_canceller(Box::new(move || cancel_for_app.cancel()));
     }
     let shutting_down = Arc::new(AtomicBool::new(false));
+    // Adopted-only by design: a derived resume must never stamp the
+    // uncompacted derive-walk result fresh — that makes the oversized
+    // transcript a permanently adoptable machine half, and every later
+    // resume recompacts it. A derived pair stays stale until a run
+    // resolves and the driver writes the post-run history.
+    if let Some(machine) = &resumed_machine {
+        let adopted = Arc::new(machine.clone());
+        *state
+            .machine_history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&adopted));
+        initial_transcript.send_machine(MachineSnapshot {
+            messages: adopted,
+            saved_at: chrono::Utc::now(),
+        });
+    }
     let driver = tokio::spawn(drive_submissions(
         runner,
         submit_rx,
         state,
         Arc::clone(&shutting_down),
+        initial_transcript,
     ));
 
     let session = app.run(&mut terminal).await;
     drop(app);
+    questions.abort();
     shutting_down.store(true, Ordering::SeqCst);
     cancel.cancel();
     drop(driver.await);
+    signal_bridge.stop().await;
+    dch_tui::enter_signal_deaf_window();
     transcript_worker.join();
+    dch_tui::exit_signal_deaf_window();
     drop(guard);
     println!("{}", session_exit_line(session_id));
     session.map_err(|err| format!("terminal error: {err}"))
+}
+
+/// Install the session's turn-end persistence hook.
+///
+/// Every hook fire publishes the conversation and then the machine
+/// half beside it — display first, machine second, so the machine
+/// stamp stays the newer of the pair. The engine truth comes from the
+/// fire's own history when a turn end just graduated, and otherwise
+/// from the newest history however it was last known: a run's
+/// trailing error rows re-stamp the display half after the engine
+/// half's own publish, and without a re-stamp beside them the pair
+/// rule would read the engine half stale and the next resume would
+/// derive from the display transcript instead of adopting.
+fn install_turn_end_hook(
+    app: &mut TuiApp,
+    state: &dch_tui::TuiObserverState,
+    transcript_handle: TranscriptHandle,
+) {
+    let hook_tokens = Arc::clone(&state.tokens);
+    let hook_state = state.clone();
+    app.set_turn_end_hook(Box::new(move |conversation, machine| {
+        transcript_handle.send(conversation.to_vec(), snapshot_tokens(&hook_tokens));
+        let history = machine.map(Arc::clone).or_else(|| {
+            hook_state
+                .machine_history
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        });
+        if let Some(history) = history {
+            transcript_handle.send_machine(MachineSnapshot {
+                messages: history,
+                saved_at: chrono::Utc::now(),
+            });
+        }
+    }));
 }
 
 /// The session-file token totals for the live counters.
@@ -206,6 +293,7 @@ fn snapshot_tokens(
             cumulative_input: counts.cumulative_input,
             cumulative_output: counts.cumulative_output,
             last_input_tokens: counts.input,
+            context_tokens: counts.context_tokens,
         },
     )
 }
@@ -222,6 +310,38 @@ fn session_exit_line(session_id: uuid::Uuid) -> String {
     format!("Resume with:\ndch --resume {session_id}")
 }
 
+/// The workdir's checked-out branch, read from the repository's
+/// `HEAD` file — no subprocess.
+///
+/// A symbolic ref yields its branch name (`ref: refs/heads/x` →
+/// `x`), a detached head its seven-character commit id — a full
+/// object id of either width git writes, SHA-1's 40 hex characters
+/// or SHA-256's 64 — and a
+/// linked worktree's `.git` pointer file resolves to the gitdir
+/// holding the real `HEAD`. Anything else — no repository, an
+/// unreadable head, a ref outside `refs/heads` — reads as no
+/// branch, and the caller shows none.
+fn git_branch(workdir: &Path) -> Option<String> {
+    let dot_git = workdir.join(".git");
+    // A linked worktree's `.git` is a file naming the real gitdir;
+    // a plain repository's is the directory holding `HEAD` itself.
+    let head = match std::fs::read_to_string(&dot_git) {
+        Ok(pointer) => {
+            let gitdir = pointer.trim().strip_prefix("gitdir: ")?;
+            Path::new(gitdir).join("HEAD")
+        }
+        Err(_) => dot_git.join("HEAD"),
+    };
+    let head = std::fs::read_to_string(head).ok()?;
+    let head = head.trim();
+    if let Some(branch) = head.strip_prefix("ref: refs/heads/") {
+        return Some(branch.to_string());
+    }
+    let hex = head.chars().all(|c| c.is_ascii_hexdigit());
+    let detached = hex && matches!(head.len(), 40 | 64);
+    detached.then(|| head.chars().take(7).collect())
+}
+
 /// The handle a turn-end hook uses to hand transcripts to the writer.
 ///
 /// Holds the shared one-slot mailbox: publishing a snapshot
@@ -230,7 +350,7 @@ fn session_exit_line(session_id: uuid::Uuid) -> String {
 /// snapshots up behind it. Publishing is all the hook does — cheap
 /// enough to run inline on the render task.
 struct TranscriptHandle {
-    slot: Arc<std::sync::Mutex<Option<TranscriptSnapshot>>>,
+    pending: Arc<std::sync::Mutex<PendingSaves>>,
     signal: Arc<std::sync::Condvar>,
 }
 
@@ -242,7 +362,7 @@ impl Clone for TranscriptHandle {
     /// seed the session file before the first frame.
     fn clone(&self) -> Self {
         Self {
-            slot: Arc::clone(&self.slot),
+            pending: Arc::clone(&self.pending),
             signal: Arc::clone(&self.signal),
         }
     }
@@ -255,12 +375,32 @@ impl TranscriptHandle {
     /// transcript is ever worth writing — then wakes the writer.
     /// Never blocks and never fails visibly.
     fn send(&self, messages: Vec<TuiMessage>, tokens: crate::session::SessionTokens) {
-        let mut slot = self
-            .slot
+        let mut pending = self
+            .pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *slot = Some(TranscriptSnapshot { messages, tokens });
-        drop(slot);
+        pending.display = Some(TranscriptSnapshot {
+            messages,
+            tokens,
+            saved_at: chrono::Utc::now(),
+        });
+        drop(pending);
+        self.signal.notify_one();
+    }
+
+    /// Publish one machine-history snapshot for the writer.
+    ///
+    /// Same overwrite-newest semantics as [`send`](Self::send), for
+    /// the engine's committed history; the writer persists it under
+    /// its own sibling file, so the display half in flight beside it
+    /// is never held back by this half or vice versa.
+    fn send_machine(&self, machine: MachineSnapshot) {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pending.machine = Some(machine);
+        drop(pending);
         self.signal.notify_one();
     }
 }
@@ -285,6 +425,66 @@ struct TranscriptSnapshot {
     /// publish time, so the file never carries a total the bar did
     /// not show.
     tokens: crate::session::SessionTokens,
+
+    /// When this snapshot's content became true.
+    ///
+    /// The publish moment — the hook's fire time — so the machine
+    /// sibling's read-time stamp beside it compares content against
+    /// content, never write order.
+    saved_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// One machine-history snapshot: the engine's committed conversation.
+///
+/// What the turn-end hook publishes at every turn boundary and the
+/// submission driver re-publishes when a run resolves; the writer
+/// persists it under the sibling `machine.json`. The stamp is the
+/// moment the snapshot was taken for persistence, so the pair rule on
+/// resume judges content age rather than write order.
+struct MachineSnapshot {
+    /// The engine's history at the snapshot's turn boundary.
+    ///
+    /// The event's own coherent set — full on a successful turn,
+    /// committed-only on a failed one, engine truth either way —
+    /// shared behind an Arc so publishing never clones the history.
+    messages: Arc<Vec<loopctl::message::Message>>,
+
+    /// When this snapshot was taken for persistence.
+    ///
+    /// Carried through to the file's `saved_at` unchanged.
+    saved_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// The writer's pending halves, newest-wins per half.
+///
+/// Display and machine snapshots arrive from different tasks on
+/// different schedules — the hook fires from observer events while
+/// the run future is still resolving, the driver's machine read
+/// follows the resolution — so each half overwrites only its own
+/// kind and the writer persists whichever halves it finds.
+#[derive(Default)]
+struct PendingSaves {
+    /// The newest display snapshot, when one is waiting.
+    ///
+    /// Overwritten by every publish, so a stalled writer always
+    /// persists the newest transcript rather than a queue of them.
+    display: Option<TranscriptSnapshot>,
+
+    /// The newest machine-history snapshot, when one is waiting.
+    ///
+    /// The same newest-wins rule on the engine half; the two halves
+    /// never block each other, only replace their own kind.
+    machine: Option<MachineSnapshot>,
+}
+
+impl PendingSaves {
+    /// Whether neither half is waiting.
+    ///
+    /// The writer's condvar predicate: sleep only when there is
+    /// nothing of either kind to persist.
+    fn is_empty(&self) -> bool {
+        self.display.is_none() && self.machine.is_none()
+    }
 }
 
 /// The single writer thread that persists turn-end snapshots.
@@ -297,7 +497,7 @@ struct TranscriptSnapshot {
 /// and any snapshot still in the slot, so a quitting session
 /// persists its last turn.
 struct TranscriptWorker {
-    slot: Arc<std::sync::Mutex<Option<TranscriptSnapshot>>>,
+    pending: Arc<std::sync::Mutex<PendingSaves>>,
     signal: Arc<std::sync::Condvar>,
     shutdown: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
@@ -309,9 +509,7 @@ struct TranscriptWorker {
 /// wait in production, anything a test needs to interpose in
 /// between.
 type WaitFn = std::sync::Arc<
-    dyn Fn(
-            std::sync::MutexGuard<'_, Option<TranscriptSnapshot>>,
-        ) -> std::sync::MutexGuard<'_, Option<TranscriptSnapshot>>
+    dyn Fn(std::sync::MutexGuard<'_, PendingSaves>) -> std::sync::MutexGuard<'_, PendingSaves>
         + Send
         + Sync,
 >;
@@ -374,36 +572,44 @@ impl TranscriptWorker {
         signal: Arc<std::sync::Condvar>,
         wait: WaitFn,
     ) -> (TranscriptHandle, Self) {
-        let slot = Arc::new(std::sync::Mutex::new(None::<TranscriptSnapshot>));
+        let pending = Arc::new(std::sync::Mutex::new(PendingSaves::default()));
         let shutdown = Arc::new(AtomicBool::new(false));
-        let thread_slot = Arc::clone(&slot);
+        let thread_pending = Arc::clone(&pending);
         let thread_shutdown = Arc::clone(&shutdown);
         let handle = std::thread::spawn(move || {
             loop {
-                let mut guard = thread_slot
+                let mut guard = thread_pending
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                while guard.is_none() && !thread_shutdown.load(Ordering::SeqCst) {
+                while guard.is_empty() && !thread_shutdown.load(Ordering::SeqCst) {
                     guard = wait(guard);
                 }
-                let snapshot = guard.take();
+                let (display, machine) = (guard.display.take(), guard.machine.take());
                 drop(guard);
-                let Some(snapshot) = snapshot else {
+                if display.is_none() && machine.is_none() {
                     break;
-                };
-                if let Err(err) = saver.save(&snapshot.messages, snapshot.tokens) {
+                }
+                if let Some(snapshot) = display
+                    && let Err(err) =
+                        saver.save_at(&snapshot.messages, snapshot.tokens, snapshot.saved_at)
+                {
                     tracing::warn!(error = %err, "session transcript could not be saved");
+                }
+                if let Some(snapshot) = machine
+                    && let Err(err) = saver.save_machine(&snapshot.messages, snapshot.saved_at)
+                {
+                    tracing::warn!(error = %err, "machine history could not be saved");
                 }
             }
         });
-        let worker_slot = Arc::clone(&slot);
+        let worker_pending = Arc::clone(&pending);
         (
             TranscriptHandle {
-                slot,
+                pending,
                 signal: Arc::clone(&signal),
             },
             TranscriptWorker {
-                slot: worker_slot,
+                pending: worker_pending,
                 signal,
                 shutdown,
                 handle: Some(handle),
@@ -421,8 +627,8 @@ impl TranscriptWorker {
     /// exits.
     fn signal_shutdown(&self) {
         {
-            let _slot = self
-                .slot
+            let _pending = self
+                .pending
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             self.shutdown.store(true, Ordering::SeqCst);
@@ -488,6 +694,29 @@ fn permission_bridge() -> (
     (resolver, requests_rx)
 }
 
+/// Rewrite one asking-path prompt into the app's overlay type.
+///
+/// The mechanical field-for-field mapping between the composition
+/// layer's prompt and the display's own type; the reply one-shot
+/// rides through untouched, so an answer reaches the asking tool
+/// without this mapping holding anything open.
+fn overlay_prompt(prompted: dch_loop::PromptedQuestion) -> QuestionPrompt {
+    QuestionPrompt {
+        question: prompted.question,
+        header: prompted.header,
+        options: prompted
+            .options
+            .into_iter()
+            .map(|option| dch_tui::QuestionChoice {
+                label: option.label,
+                description: option.description,
+            })
+            .collect(),
+        multi_select: prompted.multi_select,
+        reply: prompted.reply,
+    }
+}
+
 /// Execute submitted tasks one at a time until the session ends.
 ///
 /// Owns the runner for the session's whole lifetime, so runs never
@@ -516,6 +745,7 @@ async fn drive_submissions(
     mut receiver: mpsc::UnboundedReceiver<String>,
     state: TuiObserverState,
     shutting_down: Arc<AtomicBool>,
+    transcript: TranscriptHandle,
 ) {
     let cancel = runner.cancel_signal();
     while !shutting_down.load(Ordering::SeqCst)
@@ -529,6 +759,15 @@ async fn drive_submissions(
         state.agent_running.store(true, Ordering::SeqCst);
         let result = runner.run(&text).await;
         state.agent_running.store(false, Ordering::SeqCst);
+        let resolved = Arc::new(runner.committed_history());
+        transcript.send_machine(MachineSnapshot {
+            messages: Arc::clone(&resolved),
+            saved_at: chrono::Utc::now(),
+        });
+        *state
+            .machine_history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(resolved);
         let run_errored = result.is_err();
         let run_cancelled = result
             .as_ref()
@@ -574,6 +813,60 @@ mod tests {
     use super::*;
     use dch_config::ApiType;
 
+    #[test]
+    fn a_crash_between_the_pair_writes_degrades_to_derive_not_half_adoption() {
+        let dir = tempfile::tempdir().expect("session tempdir");
+        let root = dir.keep();
+        let id = uuid::Uuid::new_v4();
+        let saver = Arc::new(crate::session::SessionSaver::with_base_dir(
+            id,
+            "m".to_string(),
+            root.clone(),
+        ));
+        let (handle, worker) = TranscriptWorker::spawn(Arc::clone(&saver));
+        handle.send(
+            vec![TuiMessage::User {
+                text: "turn one".to_string(),
+                timestamp: chrono::Utc::now(),
+            }],
+            crate::session::SessionTokens::default(),
+        );
+        worker.join();
+        let (_, _, _, session_at) = crate::session::load_with_meta_in(id, &root).unwrap();
+        assert!(
+            crate::session::load_machine_in(id, &root, session_at).is_none(),
+            "a display-only save never adopts a machine half it did not write"
+        );
+
+        let (handle, worker) = TranscriptWorker::spawn(saver);
+        handle.send_machine(MachineSnapshot {
+            messages: Arc::new(Vec::new()),
+            saved_at: chrono::Utc::now(),
+        });
+        worker.join();
+        let (_, _, _, session_at) = crate::session::load_with_meta_in(id, &root).unwrap();
+        assert!(
+            crate::session::load_machine_in(id, &root, session_at).is_some(),
+            "the machine half landing after restores the pair"
+        );
+    }
+
+    /// A transcript handle parked on a throwaway directory.
+    ///
+    /// The drive tests need the driver's fifth argument without
+    /// caring where its snapshots land; the worker behind this
+    /// handle writes into a tempdir and parks on drop.
+    fn parked_transcript() -> TranscriptHandle {
+        let dir = tempfile::tempdir().expect("transcript tempdir");
+        let saver = Arc::new(crate::session::SessionSaver::with_base_dir(
+            uuid::Uuid::new_v4(),
+            "m".to_string(),
+            dir.keep(),
+        ));
+        let (handle, _worker) = TranscriptWorker::spawn(saver);
+        handle
+    }
+
     /// A config whose provider endpoint refuses connections on the
     /// loopback interface.
     ///
@@ -611,6 +904,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_overlay_prompt_carries_every_prompt_field_and_the_reply_channel() {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let prompt = dch_loop::PromptedQuestion {
+            question: "Ship it?".to_string(),
+            header: Some("Ship".to_string()),
+            options: vec![dch_loop::PromptOption {
+                label: "yes".to_string(),
+                description: Some("now, at 3am".to_string()),
+            }],
+            multi_select: true,
+            reply: reply_tx,
+        };
+
+        let overlay = overlay_prompt(prompt);
+
+        assert_eq!(overlay.question, "Ship it?");
+        assert_eq!(overlay.header.as_deref(), Some("Ship"));
+        assert_eq!(overlay.options.len(), 1);
+        assert_eq!(overlay.options[0].label, "yes");
+        assert_eq!(
+            overlay.options[0].description.as_deref(),
+            Some("now, at 3am")
+        );
+        assert!(overlay.multi_select);
+        overlay
+            .reply
+            .send(vec!["yes".to_string()])
+            .expect("the asking path awaits the reply");
+        assert_eq!(
+            reply_rx.await.expect("the reply channel rode through"),
+            vec!["yes".to_string()]
+        );
+    }
+
+    #[test]
+    fn the_workdir_branch_reads_the_repository_head() {
+        // The branch comes from `HEAD` directly, no subprocess: a
+        // symbolic ref names its branch, a detached head shows its
+        // short commit id, a worktree's pointer file resolves to the
+        // real gitdir, and no repository reads as no branch.
+        let dir = tempfile::tempdir().expect("a temp workdir");
+        assert_eq!(git_branch(dir.path()), None, "no repository: no branch");
+
+        let git = dir.path().join(".git");
+        std::fs::create_dir(&git).expect("the git dir");
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/feature/x\n").expect("HEAD");
+        assert_eq!(
+            git_branch(dir.path()),
+            Some("feature/x".to_string()),
+            "a symbolic ref names its branch"
+        );
+
+        std::fs::write(git.join("HEAD"), "951121ea12375166642754d3766f2a046638e82e").expect("HEAD");
+        assert_eq!(
+            git_branch(dir.path()),
+            Some("951121e".to_string()),
+            "a detached head shows its short commit id"
+        );
+
+        let sha256 = "5".repeat(64);
+        std::fs::write(git.join("HEAD"), sha256).expect("HEAD");
+        assert_eq!(
+            git_branch(dir.path()),
+            Some("5555555".to_string()),
+            "a SHA-256 repository's 64-character detached head also shows its short id"
+        );
+
+        let worktree = tempfile::tempdir().expect("a linked worktree");
+        std::fs::write(
+            worktree.path().join(".git"),
+            format!("gitdir: {}\n", git.display()),
+        )
+        .expect("the gitdir pointer");
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/master\n").expect("HEAD");
+        assert_eq!(
+            git_branch(worktree.path()),
+            Some("master".to_string()),
+            "a worktree's pointer file resolves to the real HEAD"
+        );
+    }
+
+    #[tokio::test]
     async fn a_failing_run_routes_its_error_into_the_shared_buffer() {
         let runner = unreachable_runner().await;
         let (_, state) = TuiObserverState::new().into_observer();
@@ -622,7 +997,13 @@ mod tests {
         state.queued.store(1, Ordering::SeqCst);
         tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            drive_submissions(runner, rx, state.clone(), shutdown_flag(false)),
+            drive_submissions(
+                runner,
+                rx,
+                state.clone(),
+                shutdown_flag(false),
+                parked_transcript(),
+            ),
         )
         .await
         .expect("a refused connection resolves without hanging");
@@ -668,7 +1049,13 @@ mod tests {
         state.queued.store(1, Ordering::SeqCst);
         tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            drive_submissions(runner, rx, state.clone(), shutdown_flag(false)),
+            drive_submissions(
+                runner,
+                rx,
+                state.clone(),
+                shutdown_flag(false),
+                parked_transcript(),
+            ),
         )
         .await
         .expect("a refused connection resolves without hanging");
@@ -691,7 +1078,13 @@ mod tests {
         let flag = Arc::clone(&state.agent_running);
         tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            drive_submissions(runner, rx, state.clone(), shutdown_flag(false)),
+            drive_submissions(
+                runner,
+                rx,
+                state.clone(),
+                shutdown_flag(false),
+                parked_transcript(),
+            ),
         )
         .await
         .expect("a refused connection resolves without hanging");
@@ -715,7 +1108,7 @@ mod tests {
 
         let ended = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            drive_submissions(runner, rx, state, shutdown_flag(false)),
+            drive_submissions(runner, rx, state, shutdown_flag(false), parked_transcript()),
         )
         .await;
         assert!(ended.is_ok(), "a closed channel ends the driver promptly");
@@ -734,7 +1127,13 @@ mod tests {
 
         tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            drive_submissions(runner, rx, state.clone(), shutdown_flag(true)),
+            drive_submissions(
+                runner,
+                rx,
+                state.clone(),
+                shutdown_flag(true),
+                parked_transcript(),
+            ),
         )
         .await
         .expect("the driver leaves the queue behind instead of draining it");
@@ -763,6 +1162,7 @@ mod tests {
             rx,
             state.clone(),
             Arc::clone(&flag),
+            parked_transcript(),
         ));
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         state.queued.fetch_add(1, Ordering::SeqCst);
@@ -1263,6 +1663,10 @@ mod tests {
     }
 
     /// The offset of the header/body boundary, if the bytes hold one.
+    ///
+    /// Scans for the blank-line separator the wire framing uses;
+    /// `None` until the full four-byte sequence has arrived, so a
+    /// partial header keeps the read loop waiting for more bytes.
     fn find_header_end(buf: &[u8]) -> Option<usize> {
         buf.windows(4).position(|w| w == b"\r\n\r\n")
     }
@@ -1314,6 +1718,7 @@ mod tests {
             rx,
             state.clone(),
             shutdown_flag(false),
+            parked_transcript(),
         ));
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         cancel.cancel();
@@ -1363,7 +1768,13 @@ mod tests {
 
         tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            drive_submissions(runner, rx, state.clone(), shutdown_flag(false)),
+            drive_submissions(
+                runner,
+                rx,
+                state.clone(),
+                shutdown_flag(false),
+                parked_transcript(),
+            ),
         )
         .await
         .expect("two refused runs settle without hanging");
@@ -1400,7 +1811,13 @@ mod tests {
 
         tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            drive_submissions(runner, rx, state.clone(), shutdown_flag(false)),
+            drive_submissions(
+                runner,
+                rx,
+                state.clone(),
+                shutdown_flag(false),
+                parked_transcript(),
+            ),
         )
         .await
         .expect("the run settles without hanging");

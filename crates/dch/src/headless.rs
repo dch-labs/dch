@@ -135,9 +135,10 @@ impl HeadlessOutcome {
 /// resolves the prompt (from the task argument or stdin), runs one full
 /// session, writes the `--done-file` (if requested), and returns the exit
 /// code. The caller (`main`) turns the code into the process exit status. A
-/// resumed `control` continues the loaded session: the saved model applies
-/// unless the CLI overrides it, the agent starts from the restored history,
-/// the session id is the loaded one, and the saved transcript is the whole
+/// resumed `control` continues the loaded session: the agent starts
+/// from the restored history on the current configuration's model and
+/// provider — the saved model is provenance for the listing — the
+/// session id is the loaded one, and the saved transcript is the whole
 /// resumed conversation rather than the new turn alone; a degradation
 /// warning is printed to stderr before the run starts. The
 /// startup bridge armed before this call is stopped once the run bridge is
@@ -307,7 +308,7 @@ async fn run_headless_inner(
                 &turn_outputs,
                 None,
             ));
-            save_transcript(&saver, &transcript);
+            save_transcript(&saver, &runner, &transcript);
             bridge.stop().await;
             Ok(outcome)
         }
@@ -320,23 +321,35 @@ async fn run_headless_inner(
                 &turn_outputs,
                 Some(&err),
             ));
-            save_transcript(&saver, &transcript);
+            save_transcript(&saver, &runner, &transcript);
             bridge.stop().await;
             Err(outcome)
         }
     }
 }
 
-/// Persist the run's transcript; a failed save never fails the run.
+/// Persist the run's transcript and the engine's committed history;
+/// a failed save never fails the run.
 ///
-/// The transcript is the artifact a user returns for, so it is
-/// written on every exit path the run resolves — success, failure,
-/// and cancel alike. A forced exit (the repeated interrupt) writes
-/// nothing: that run never resolved, so nothing is written for it.
-/// A save that itself fails only warns: the run's own outcome
-/// outranks the bookkeeping.
-fn save_transcript(saver: &crate::session::SessionSaver, transcript: &[dch_tui::TuiMessage]) {
-    if let Err(err) = saver.save(transcript, crate::session::SessionTokens::default()) {
+/// The machine history lands first, so a crash between the two writes
+/// leaves the older display file beside it — the stale-pair rule then
+/// degrades a resume to the derive walk instead of trusting a
+/// snapshot that predates the transcript. The transcript is the
+/// artifact a user returns for, so both are written on every exit
+/// path the run resolves — success, failure, and cancel alike. A
+/// forced exit (the repeated interrupt) writes nothing: that run
+/// never resolved, so nothing is written for it. A save that itself
+/// fails only warns: the run's own outcome outranks the bookkeeping.
+fn save_transcript(
+    saver: &crate::session::SessionSaver,
+    runner: &dch_loop::Runner,
+    transcript: &[dch_tui::TuiMessage],
+) {
+    let stamp = chrono::Utc::now();
+    if let Err(err) = saver.save_machine(&runner.committed_history(), stamp) {
+        tracing::warn!(error = %err, "machine history could not be saved");
+    }
+    if let Err(err) = saver.save_at(transcript, crate::session::SessionTokens::default(), stamp) {
         tracing::warn!(error = %err, "session transcript could not be saved");
     }
 }
@@ -393,8 +406,9 @@ struct ConstructedRun {
 /// Every step before the run bridge exists; each failure maps through
 /// [`construction_failure`], which writes the done-file marker before
 /// the outcome leaves this function. A resumed `control` shapes the
-/// construction: the saved model applies unless the CLI overrides it,
-/// and the agent's history starts from the restored conversation.
+/// construction: the agent's history starts from the restored
+/// conversation, on the current configuration's model and provider —
+/// the saved model is provenance for the listing.
 ///
 /// # Errors
 ///
@@ -412,9 +426,6 @@ async fn construct_run(
     let mut config = load_config(args.config.config_path.as_deref())
         .map_err(|message| construction_failure(args, message, inherited_mode))?;
     apply_cli_overrides(&mut config, args);
-    if let crate::resume::ResumeControl::Resumed(outcome) = control {
-        crate::resume::apply_resumed_model(&mut config, args, outcome);
-    }
 
     let verbosity = resolve_verbosity(&config, args);
     let observer = Arc::new(ConsoleObserver::new(
@@ -429,8 +440,8 @@ async fn construct_run(
     let mut builder = dch_loop::Runner::builder(&config, &workdir)
         .with_observer(Arc::clone(&observer) as Arc<dyn loopctl::observer::LoopObserver>);
     if let crate::resume::ResumeControl::Resumed(outcome) = control {
-        builder = builder.with_history(crate::resume::tui_messages_to_loopctl(
-            &outcome.messages,
+        builder = builder.with_history(crate::resume::history_for_resume(
+            outcome,
             config.security.redact_secrets,
         ));
     }
@@ -441,7 +452,10 @@ async fn construct_run(
     // the restored transcript shows being read: without this, a
     // resumed Write treats every previously-read file as never-read.
     if let crate::resume::ResumeControl::Resumed(outcome) = control {
-        for path in crate::resume::resumed_read_paths(&outcome.messages) {
+        for path in crate::resume::resumed_read_paths_with_machine(
+            &outcome.messages,
+            outcome.machine.as_deref(),
+        ) {
             let _recorded = runner.record_resumed_read(&path).await;
         }
     }
@@ -594,17 +608,21 @@ fn read_stdin_prompt() -> Result<String, String> {
 ///
 /// An explicit path is read and parsed verbatim, relative paths resolving
 /// against the process's current directory; with no path, the default
-/// config lookup applies. Both mode runners resolve their config here.
+/// config lookup applies. Both routes arrive at
+/// [`from_toml_str`](dch_config::DchConfig::from_toml_str), so a value the
+/// loader rejects fails here identically. Both mode runners resolve their
+/// config here.
 ///
 /// # Errors
 ///
-/// Returns an error message when the file cannot be read or parsed.
+/// Returns an error message when the file cannot be read, parsed, or
+/// accepted.
 pub(crate) fn load_config(path: Option<&Path>) -> Result<dch_config::DchConfig, String> {
     match path {
         Some(path) => {
             let content = std::fs::read_to_string(path)
                 .map_err(|e| format!("config read error ({}): {e}", path.display()))?;
-            toml::from_str(&content)
+            dch_config::DchConfig::from_toml_str(&content)
                 .map_err(|e| format!("config parse error ({}): {e}", path.display()))
         }
         None => dch_config::DchConfig::load().map_err(|e| format!("config error: {e}")),
@@ -615,9 +633,13 @@ pub(crate) fn load_config(path: Option<&Path>) -> Result<dch_config::DchConfig, 
 ///
 /// Deliberately small: `--model` is the only per-run provider override,
 /// `--theme` the only per-run display switch, `--unsafe-paths` the
-/// only per-run access switch, and `--permission-mode` the only
-/// per-run policy switch. Verbosity resolves separately when the
-/// observer is built. Both mode runners apply the same overrides.
+/// only per-run access switch, `--permission-mode` the only per-run
+/// policy switch, `--reasoning-effort` the only per-run thinking
+/// budget, and `--no-redact` the only per-run redaction switch — it
+/// removes the scrubbing pass together with the overwrite guard that
+/// refuses whole-file writes over secret-bearing targets. Verbosity
+/// resolves separately when the observer is built. Both mode runners
+/// apply the same overrides.
 pub(crate) fn apply_cli_overrides(config: &mut dch_config::DchConfig, args: &Args) {
     if let Some(model) = &args.model {
         config.api.model.clone_from(model);
@@ -625,11 +647,17 @@ pub(crate) fn apply_cli_overrides(config: &mut dch_config::DchConfig, args: &Arg
     if let Some(theme) = &args.theme {
         config.display.theme.clone_from(theme);
     }
+    if let Some(effort) = &args.config.reasoning_effort {
+        config.api.reasoning_effort = Some(effort.clone());
+    }
     if args.config.unsafe_paths {
         config.runner.unsafe_paths = true;
     }
     if let Some(mode) = args.permission_mode {
         config.runner.permission_mode = mode.into();
+    }
+    if args.config.no_redact {
+        config.security.redact_secrets = false;
     }
 }
 
@@ -712,6 +740,80 @@ mod tests {
             session_id: None,
             warn: None,
         }
+    }
+
+    #[test]
+    fn the_config_flag_route_rejects_a_turn_timeout_below_the_floor() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "[runner]\nturn_timeout_secs = 119\n").unwrap();
+        let err = load_config(Some(&path)).unwrap_err();
+        assert!(
+            err.contains("turn_timeout_secs = 119") && err.contains("120"),
+            "the --config route names the rejected value and the floor: {err}"
+        );
+    }
+
+    #[test]
+    fn the_config_flag_route_loads_a_config_at_the_floor() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "[runner]\nturn_timeout_secs = 120\n").unwrap();
+        let config = load_config(Some(&path)).unwrap();
+        assert_eq!(
+            config.runner.turn_timeout_secs, 120,
+            "the floor itself is an accepted budget on the flag route"
+        );
+    }
+
+    #[test]
+    fn the_config_flag_route_rejects_an_incoherent_read_ceiling() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[runner]\nread_max_bytes = 1000\nmax_tool_output_chars = 512\n",
+        )
+        .unwrap();
+        let err = load_config(Some(&path)).unwrap_err();
+        assert!(
+            err.contains("read_max_bytes = 1000") && err.contains("max_tool_output_chars = 512"),
+            "the --config route names both ceilings of a crossing pair: {err}"
+        );
+    }
+
+    #[test]
+    fn a_compaction_failure_maps_to_the_failure_exit_with_its_cause() {
+        let err = LoopError::CompactionFailed {
+            used: 207_686,
+            limit: 180_000,
+            cause: "qa summarizer summarize step failed: error sending request".to_string(),
+        };
+        let outcome = HeadlessOutcome::from_loop_error(&err);
+        assert_eq!(
+            outcome.exit_code, 2,
+            "a failed pass is a failed run, not a cancellation"
+        );
+        assert!(!outcome.success);
+        assert!(
+            outcome
+                .message
+                .contains("qa summarizer summarize step failed"),
+            "the real cause reaches the message verbatim: {}",
+            outcome.message
+        );
+    }
+
+    #[test]
+    fn a_compaction_stall_maps_to_the_failure_exit_without_a_budget() {
+        let err = LoopError::CompactionStalled { used: 208_327 };
+        let outcome = HeadlessOutcome::from_loop_error(&err);
+        assert_eq!(outcome.exit_code, 2);
+        assert!(
+            outcome.message.contains("made no progress"),
+            "the stall reads as a stall, not a token budget: {}",
+            outcome.message
+        );
     }
 
     #[test]
@@ -971,6 +1073,25 @@ mod tests {
     }
 
     #[test]
+    fn the_no_redact_flag_forces_redaction_off_over_the_config() {
+        let mut config = dch_config::DchConfig::default();
+        assert!(
+            config.security.redact_secrets,
+            "redaction defaults on, so the flag has something to disable"
+        );
+        apply_cli_overrides(&mut config, &parse(&["--no-redact"]));
+        assert!(!config.security.redact_secrets);
+
+        let mut config = dch_config::DchConfig::default();
+        config.security.redact_secrets = false;
+        apply_cli_overrides(&mut config, &parse(&[]));
+        assert!(
+            !config.security.redact_secrets,
+            "the flag is one-way: it never re-enables a config-level opt-out"
+        );
+    }
+
+    #[test]
     fn the_theme_flag_overrides_the_configured_theme() {
         let mut config = dch_config::DchConfig::default();
         let original = config.display.theme.clone();
@@ -996,6 +1117,26 @@ mod tests {
         let mut config = dch_config::DchConfig::default();
         apply_cli_overrides(&mut config, &parse(&[]));
         assert!(!config.runner.unsafe_paths);
+    }
+
+    #[test]
+    fn the_reasoning_effort_flag_overrides_the_config() {
+        let mut config = dch_config::DchConfig::default();
+        apply_cli_overrides(&mut config, &parse(&["--reasoning-effort", "low"]));
+        assert_eq!(config.api.reasoning_effort.as_deref(), Some("low"));
+
+        let mut config = dch_config::DchConfig::default();
+        config.api.reasoning_effort = Some("high".to_string());
+        apply_cli_overrides(&mut config, &parse(&["--reasoning-effort", "low"]));
+        assert_eq!(
+            config.api.reasoning_effort.as_deref(),
+            Some("low"),
+            "an explicit flag wins over the configured level"
+        );
+
+        let mut config = dch_config::DchConfig::default();
+        apply_cli_overrides(&mut config, &parse(&[]));
+        assert_eq!(config.api.reasoning_effort, None);
     }
 
     #[test]
@@ -1124,7 +1265,8 @@ mod tests {
         fn config_toml(&self) -> String {
             format!(
                 "[api]\napi_type = \"openai\"\nbase_url = \"http://127.0.0.1:{}\"\
-                 \napi_key = \"dummy\"\nmodel = \"test-model\"\nrequest_timeout_secs = 10\n",
+                 \napi_key = \"dummy\"\nmodel = \"test-model\"\nrequest_timeout_secs = 10\n\
+                 context_window = 200000\n",
                 self.port
             )
         }
@@ -1434,7 +1576,8 @@ mod tests {
         fn config_toml_with_model(&self, model: &str) -> String {
             format!(
                 "[api]\napi_type = \"openai\"\nbase_url = \"http://127.0.0.1:{}\"\
-                 \napi_key = \"dummy\"\nmodel = \"{model}\"\nrequest_timeout_secs = 10\n",
+                 \napi_key = \"dummy\"\nmodel = \"{model}\"\nrequest_timeout_secs = 10\n\
+                 context_window = 200000\n",
                 self.port
             )
         }
@@ -1528,7 +1671,7 @@ mod tests {
             vec![*id],
             "the resumed run reuses the loaded session's identity — no second directory"
         );
-        let (messages, _model, _tokens) =
+        let (messages, _model, _tokens, _saved_at) =
             crate::session::load_with_meta_in(*id, sessions.path()).unwrap();
         assert_eq!(
             messages.len(),
@@ -1554,19 +1697,20 @@ mod tests {
         }
     }
 
-    /// Session model beats the config default on resume; the CLI flag
-    /// beats both.
+    /// A resumed session runs on the current configuration's model; the
+    /// CLI flag overrides it.
     ///
     /// The precedence the resume docs promise, exercised end to end:
     /// a first run saves under the config's model; a resumed run over
-    /// a config naming a different model keeps the session's; adding
-    /// `--model` overrides both and the re-saved envelope records
-    /// the override. The signal lock is held throughout — each run
-    /// installs an interrupt bridge, which a concurrently delivered
-    /// test signal would hijack.
+    /// a config naming a different model runs — and re-records — that
+    /// new model, the saved one being provenance only; adding
+    /// `--model` overrides the config in turn and the re-saved
+    /// envelope records the override. The signal lock is held
+    /// throughout — each run installs an interrupt bridge, which a
+    /// concurrently delivered test signal would hijack.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn a_resumed_run_keeps_the_session_model_until_the_cli_overrides_it() {
+    async fn a_resumed_run_uses_the_current_config_s_model_until_the_cli_overrides_it() {
         let _signal_lock = SIGNAL_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1593,7 +1737,7 @@ mod tests {
         let Some(id) = saved.first() else {
             panic!("the saved session id is readable: {saved:?}")
         };
-        let (_, model, _) = crate::session::load_with_meta_in(*id, sessions.path()).unwrap();
+        let (_, model, _, _) = crate::session::load_with_meta_in(*id, sessions.path()).unwrap();
         assert_eq!(
             model, "m-first",
             "the first save records the model the config named"
@@ -1619,10 +1763,10 @@ mod tests {
             0,
             "the resumed run completes against the canned turn"
         );
-        let (_, model, _) = crate::session::load_with_meta_in(*id, sessions.path()).unwrap();
+        let (_, model, _, _) = crate::session::load_with_meta_in(*id, sessions.path()).unwrap();
         assert_eq!(
-            model, "m-first",
-            "a resumed session keeps the model it ran with, not the new config default"
+            model, "m-second",
+            "a resumed session runs — and re-records — the current configuration's model"
         );
 
         let third = parse(&[
@@ -1646,10 +1790,10 @@ mod tests {
             0,
             "the CLI-overridden resume completes against the canned turn"
         );
-        let (_, model, _) = crate::session::load_with_meta_in(*id, sessions.path()).unwrap();
+        let (_, model, _, _) = crate::session::load_with_meta_in(*id, sessions.path()).unwrap();
         assert_eq!(
             model, "m-cli",
-            "an explicit --model overrides the session's recorded model"
+            "an explicit --model overrides the current configuration"
         );
     }
 }

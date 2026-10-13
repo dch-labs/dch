@@ -13,11 +13,19 @@ use ratatui::style::{Color, Modifier, Style};
 use super::{MarkdownTheme, SyntaxTheme, Theme, UIStyle};
 
 /// A bold style for a heading: `color` at bold weight.
+///
+/// Headings own their whole block line, so weight alone carries the
+/// level — no underline or background, which would compete with the
+/// prose the heading introduces.
 fn heading(color: Color) -> Style {
     Style::default().fg(color).add_modifier(Modifier::BOLD)
 }
 
 /// An underlined style for a link.
+///
+/// The underline keeps a link recognizable on a monochrome terminal,
+/// where the color shift alone would vanish into the surrounding
+/// prose.
 fn link(color: Color) -> Style {
     Style::default()
         .fg(color)
@@ -25,6 +33,10 @@ fn link(color: Color) -> Style {
 }
 
 /// An italic style for quoted material.
+///
+/// The slant marks the span as someone else's words without dimming
+/// it, so a quotation stays fully readable against the agent's own
+/// prose.
 fn quote(color: Color) -> Style {
     Style::default().fg(color).add_modifier(Modifier::ITALIC)
 }
@@ -38,16 +50,18 @@ fn inline_code(fg: Color) -> Style {
 }
 
 /// A plain foreground for an element without modifiers.
+///
+/// Color only: any modifier here would leak into every element built
+/// on the style, so decoration stays each caller's own choice.
 fn plain(color: Color) -> Style {
     Style::default().fg(color)
 }
 
 impl Theme {
-    /// The default dch theme.
+    /// The Dracula theme.
     ///
     /// Dark violet surfaces with pink, purple, and cyan accents at high
-    /// contrast — readable at small sizes, and the fallback for unknown
-    /// theme names.
+    /// contrast — readable at small sizes.
     #[must_use]
     pub(crate) fn dracula() -> Self {
         Self {
@@ -1357,6 +1371,85 @@ impl Theme {
         }
     }
 
+    /// The default dch palette.
+    ///
+    /// A neutral near-black canvas a shade above true black, stepped
+    /// through an achromatic gray ramp, with a warm peach accent, violet
+    /// secondary, and cyan and green for the registers between — the
+    /// darkest canvas in the registry, and the one that stays furthest
+    /// from a hue cast at rest. [`Theme::default`] is this palette, so
+    /// the `"default"` key and an unconfigured session both resolve to
+    /// it.
+    ///
+    /// Derived from opencode's default dark palette
+    /// (`packages/tui/src/theme/assets/opencode.json`), MIT-licensed,
+    /// Copyright (c) 2025 opencode. The display name is `"Default"`: it
+    /// is reached as the default, not as a named palette.
+    #[must_use]
+    pub(crate) fn default() -> Self {
+        Self {
+            name: "Default",
+            syntax: SyntaxTheme {
+                attribute: Color::Rgb(236, 188, 132),
+                comment: Color::Rgb(123, 123, 123),
+                constant: Color::Rgb(248, 159, 71),
+                constructor: Color::Rgb(248, 185, 127),
+                embedded: Color::Rgb(136, 210, 146),
+                function: Color::Rgb(248, 185, 127),
+                keyword: Color::Rgb(149, 129, 214),
+                number: Color::Rgb(248, 159, 71),
+                operator: Color::Rgb(93, 178, 203),
+                property: Color::Rgb(93, 178, 203),
+                punctuation: Color::Rgb(242, 242, 242),
+                string: Color::Rgb(136, 210, 146),
+                r#type: Color::Rgb(236, 188, 132),
+                variable: Color::Rgb(220, 117, 111),
+                variable_builtin: Color::Rgb(220, 117, 111),
+                tag: Color::Rgb(149, 129, 214),
+                delimiter: Color::Rgb(242, 242, 242),
+                escape: Color::Rgb(252, 199, 164),
+            },
+            markdown: MarkdownTheme {
+                header1: heading(Color::Rgb(248, 185, 127)),
+                header2: heading(Color::Rgb(149, 129, 214)),
+                header3: heading(Color::Rgb(136, 210, 146)),
+                header4: heading(Color::Rgb(93, 178, 203)),
+                header5: heading(Color::Rgb(236, 188, 132)),
+                header6: heading(Color::Rgb(123, 123, 123)),
+                bold: Style::default().add_modifier(Modifier::BOLD),
+                italic: Style::default().add_modifier(Modifier::ITALIC),
+                code_inline: inline_code(Color::Rgb(136, 210, 146)),
+                code_block: plain(Color::Rgb(242, 242, 242)),
+                link: link(Color::Rgb(248, 185, 127)),
+                quote: quote(Color::Rgb(236, 188, 132)),
+                list_item: plain(Color::Rgb(248, 185, 127)),
+                horizontal_rule: plain(Color::Rgb(123, 123, 123)),
+            },
+            ui: UIStyle {
+                background: Color::Rgb(14, 14, 14),
+                surface: Color::Rgb(32, 32, 32),
+                foreground: Color::Rgb(242, 242, 242),
+                primary: Color::Rgb(248, 185, 127),
+                secondary: Color::Rgb(123, 123, 123),
+                dim: Color::Rgb(123, 123, 123),
+                border_color: Color::Rgb(77, 77, 77),
+                focused_border_color: Color::Rgb(248, 185, 127),
+                user_message_fg: Color::Rgb(242, 242, 242),
+                assistant_message_fg: Color::Rgb(242, 242, 242),
+                input_border: Color::Rgb(123, 123, 123),
+                input_text: Color::Rgb(242, 242, 242),
+                status_bar_bg: Color::Rgb(14, 14, 14),
+                status_bar_fg: Color::Rgb(242, 242, 242),
+                composer_border: None,
+                status_success: Color::Rgb(136, 210, 146),
+                status_warning: Color::Rgb(248, 159, 71),
+                status_error: Color::Rgb(220, 117, 111),
+                scrollbar_thumb: Color::Rgb(123, 123, 123),
+                scrollbar_track: Color::Rgb(57, 57, 57),
+            },
+        }
+    }
+
     /// The Transparent theme.
     ///
     /// No colors of its own: every background and foreground defers
@@ -1368,8 +1461,15 @@ impl Theme {
     /// to plain defaults: hairline rules in the terminal's own dim
     /// tone underline the rows above and below the composer — thin
     /// and solid on every terminal, where glyphs gap between rows
-    /// and paint is a full cell thick — and the terminal-indexed
-    /// semantic trio (green,
+    /// and paint is a full cell thick — the dim register as a fixed
+    /// neutral gray, the scrollbar's own mid tone, so de-emphasized
+    /// text (thinking bodies, timestamps, system rows) greys out on
+    /// every terminal: the indexed bright-black is scheme-defined
+    /// and some schemes — or a contrast-adjusting terminal — render
+    /// it indistinguishable from the foreground, while a truecolor
+    /// gray renders exactly and degrades to a visible silver on
+    /// 256- and 16-color fallbacks; the terminal-indexed semantic
+    /// trio (green,
     /// yellow, red — the scheme's own, not ours) and the
     /// scrollbar's neutral grays, mid enough to read on either
     /// pole, carry the rest.
@@ -1421,7 +1521,7 @@ impl Theme {
                 foreground: Color::Reset,
                 primary: Color::Reset,
                 secondary: Color::Reset,
-                dim: Color::Reset,
+                dim: Color::Rgb(142, 142, 142),
                 border_color: Color::Reset,
                 focused_border_color: Color::Reset,
                 user_message_fg: Color::Reset,

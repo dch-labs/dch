@@ -42,7 +42,7 @@ pub const HIGHLIGHT_NAMES: [&str; 18] = [
 /// A complete color theme: syntax highlighting, markdown rendering, and UI
 /// chrome.
 ///
-/// Construct via [`Theme::by_name`] or [`Theme::default`]; every field is
+/// Construct via [`Theme::by_name`] or [`Default::default`]; every field is
 /// public, so a custom palette can also be assembled as a plain struct
 /// literal. Themes are value types with no behavior beyond
 /// [`SyntaxTheme::syntax_colors`]; rendering logic lives with the
@@ -496,12 +496,12 @@ impl Theme {
     /// `gruvbox_dark`), matched case-insensitively with whitespace runs
     /// folding to underscores — so the display spelling (`"Gruvbox Dark"`)
     /// resolves the same as the identifier, however it is spaced or cased.
-    /// The `"default"` key aliases [`Theme::default`]. Every constructor is
+    /// The `"default"` key aliases [`Default::default`]. Every constructor is
     /// reachable through this table.
     ///
     /// An unknown name is the caller's problem to report: callers should
     /// log a warning naming the unknown theme and fall back to
-    /// [`Theme::default`], so a bad name degrades visibly without failing
+    /// [`Default::default`], so a bad name degrades visibly without failing
     /// the session.
     #[must_use]
     pub fn by_name(name: &str) -> Option<Self> {
@@ -518,8 +518,10 @@ impl Theme {
 }
 
 impl Default for Theme {
+    /// The shipped default: the near-black palette, which the
+    /// `"default"` registry key also names.
     fn default() -> Self {
-        Self::transparent()
+        Self::default()
     }
 }
 
@@ -695,11 +697,18 @@ mod tests {
     }
 
     #[test]
-    fn default_is_transparent() {
-        assert_eq!(Theme::default().name, "Transparent");
+    fn default_is_the_near_black_palette() {
+        // The shipped default paints: an unconfigured session lands on the
+        // near-black canvas, not the paintless one, so the trait
+        // resolution and the registry's `"default"` row must both be
+        // the palette constructor itself.
+        assert_eq!(Theme::default().name, "Default");
+        assert_eq!(Theme::default().syntax.keyword, Color::Rgb(149, 129, 214));
+        assert_eq!(Theme::default().ui.background, Color::Rgb(14, 14, 14));
         assert_eq!(
-            Theme::default().syntax.keyword,
-            Theme::transparent().syntax.keyword
+            Theme::by_name("default").map(|theme| theme.syntax.keyword),
+            Some(Color::Rgb(149, 129, 214)),
+            "the registry row resolves through the same palette"
         );
     }
 
@@ -853,12 +862,17 @@ mod tests {
     #[test]
     fn the_transparent_theme_defers_every_paint_to_the_terminal() {
         // The contract the user chose: no colors of the app's own —
-        // every foreground is the terminal's, the canvas, the
-        // composer, and the status bar paint nothing, a thin
-        // border in the terminal's dim tone marks the composer, the
-        // semantic trio defers through the terminal's indexed
-        // colors, and the scrollbar's neutral grays are the only
-        // paint of the theme's own.
+        // every full-strength foreground is the terminal's, the
+        // canvas, the composer, and the status bar paint nothing, a
+        // thin border in the terminal's dim tone marks the composer,
+        // the dim register is a fixed neutral gray — the scrollbar's
+        // own mid tone, mid enough to read on either pole, because
+        // the indexed bright-black is scheme-defined and can render
+        // indistinguishable from the foreground — so de-emphasized
+        // text (thinking bodies, timestamps, system rows) greys out
+        // on every terminal, the semantic trio defers through the
+        // terminal's indexed colors, and the scrollbar's neutral
+        // grays are the only other paint of the theme's own.
         let theme = Theme::by_name("transparent").unwrap();
         let ui = theme.ui;
         assert_eq!(ui.background, Color::Reset);
@@ -867,6 +881,13 @@ mod tests {
             ui.composer_border,
             Some(Color::Indexed(8)),
             "a thin border in the terminal's dim tone marks the composer"
+        );
+        assert_eq!(
+            ui.dim,
+            Color::Rgb(142, 142, 142),
+            "de-emphasized text carries the theme's fixed neutral gray, the \
+             scrollbar's own mid tone — deterministic where the indexed \
+             bright-black can render as the foreground"
         );
         assert_eq!(ui.status_bar_bg, Color::Reset);
         assert_eq!(ui.foreground, Color::Reset);

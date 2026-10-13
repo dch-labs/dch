@@ -253,13 +253,13 @@ pub enum StripStyle {
     /// Stretches from the seed across the whole row to the right
     /// edge, then folds back into it.
     ///
-    /// The large worm: the run grows from the left seed along the
+    /// The long worm: the run grows from the left seed along the
     /// worm's eased path until it spans the full row at the period's
     /// half, then shrinks along the same path as the tail races from
     /// the left edge and swallows it into the right; one traversal
     /// per period.
-    #[serde(rename = "worm-large")]
-    WormLarge,
+    #[serde(rename = "worm_long")]
+    WormLong,
 
     /// Draws no strip at all.
     ///
@@ -1783,10 +1783,10 @@ mod tests {
             StripStyle::Worm,
             "the inchworm crawl parses from its lowercase name"
         );
-        let display: DisplayConfig = toml::from_str(r#"strip_style = "worm-large""#).unwrap();
+        let display: DisplayConfig = toml::from_str(r#"strip_style = "worm_long""#).unwrap();
         assert_eq!(
             display.strip_style,
-            StripStyle::WormLarge,
+            StripStyle::WormLong,
             "the full-row worm parses from its hyphenated name"
         );
         let display: DisplayConfig = toml::from_str(r#"strip_style = "off""#).unwrap();
