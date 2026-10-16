@@ -244,7 +244,7 @@ mod tests {
 
     /// Build a registry from a list of test tools.
     fn reg(tools: Vec<FragTool>) -> ToolRegistry {
-        let mut r = ToolRegistry::new();
+        let r = ToolRegistry::new();
         for t in tools {
             r.register(t);
         }

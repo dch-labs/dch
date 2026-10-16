@@ -4,6 +4,7 @@
 #![warn(missing_docs)]
 
 pub mod app;
+pub mod diff;
 pub mod events;
 pub mod input;
 pub mod markdown;

@@ -86,7 +86,7 @@ fn harvested() -> &'static (ToolPreContext, TurnEndContext) {
         let client = MockApiClient::new("harvest-model")
             .with_tool_call("harvest-call", "Mock", serde_json::json!({}))
             .with_text_response("harvest complete");
-        let mut tools = ToolRegistry::new();
+        let tools = ToolRegistry::new();
         tools.register(MockTool::new("Mock", "harvest transport"));
         let managers =
             LoopManagers::new().with_observer(Arc::clone(&recorder) as Arc<dyn LoopObserver>);

@@ -701,7 +701,7 @@ mod tests {
         // removed without updating this test fails here first.
         assert_eq!(
             theme_data::THEME_CONSTRUCTORS.len(),
-            21,
+            22,
             "the registry scope moved; update this census with it"
         );
         for key in [
@@ -725,6 +725,7 @@ mod tests {
             "rose_pine",
             "kanagawa_wave",
             "dark_plus",
+            "autumn_night",
             "transparent",
         ] {
             assert!(
