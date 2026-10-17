@@ -1450,6 +1450,93 @@ impl Theme {
         }
     }
 
+    /// The Autumn Night theme.
+    ///
+    /// A faithful port of the Helix editor's `autumn_night` palette:
+    /// a near-black neutral background under cream foreground text, with
+    /// autumn accents — red keywords, green strings, yellow functions,
+    /// and a brown-turquoise supporting family; the cream foreground
+    /// is where the warmth lives, the background itself is neutral.
+    /// Syntax and UI cells are faithful, with one accessibility
+    /// lift: the muted gray-green upstream paints comments and dim
+    /// text (`#626C66`) sits under the 4.5:1 small-text contrast
+    /// floor on this canvas, so the three roles that carry words —
+    /// comments, level-6 headings, and the dim register — use a
+    /// lighter tone of the same hue, while the decorative cells that
+    /// share it upstream (the scrollbar thumb, the rule, the input
+    /// border) stay faithful. Markdown headers grade across the
+    /// palette for the TUI's six-level structure, where upstream's
+    /// flat single color would render every level alike. The scheme
+    /// descends from the Autumn color scheme built for the Komodo IDE,
+    /// ported to Vim by Kenneth Love and Chris Jones, improved by
+    /// Yorick Peterse, and ported to Helix by Jens Getreu; this port
+    /// keeps its night variant's darker background set. The display
+    /// name is `"Autumn Night"`.
+    #[must_use]
+    pub(crate) fn autumn_night() -> Self {
+        Self {
+            name: "Autumn Night",
+            syntax: SyntaxTheme {
+                attribute: Color::Rgb(134, 193, 185),
+                comment: Color::Rgb(130, 140, 133),
+                constant: Color::Rgb(243, 242, 204),
+                constructor: Color::Rgb(250, 213, 102),
+                embedded: Color::Rgb(153, 190, 112),
+                function: Color::Rgb(250, 213, 102),
+                keyword: Color::Rgb(240, 94, 72),
+                number: Color::Rgb(134, 193, 185),
+                operator: Color::Rgb(243, 242, 204),
+                property: Color::Rgb(207, 186, 139),
+                punctuation: Color::Rgb(243, 242, 204),
+                string: Color::Rgb(153, 190, 112),
+                r#type: Color::Rgb(243, 242, 204),
+                variable: Color::Rgb(243, 242, 204),
+                variable_builtin: Color::Rgb(250, 213, 102),
+                tag: Color::Rgb(243, 242, 204),
+                delimiter: Color::Rgb(243, 242, 204),
+                escape: Color::Rgb(134, 193, 185),
+            },
+            markdown: MarkdownTheme {
+                header1: heading(Color::Rgb(250, 213, 102)),
+                header2: heading(Color::Rgb(255, 255, 159)),
+                header3: heading(Color::Rgb(207, 186, 139)),
+                header4: heading(Color::Rgb(134, 193, 185)),
+                header5: heading(Color::Rgb(196, 196, 196)),
+                header6: heading(Color::Rgb(130, 140, 133)),
+                bold: Style::default().add_modifier(Modifier::BOLD),
+                italic: Style::default().add_modifier(Modifier::ITALIC),
+                code_inline: inline_code(Color::Rgb(153, 190, 112)),
+                code_block: plain(Color::Rgb(153, 190, 112)),
+                link: link(Color::Rgb(114, 165, 158)),
+                quote: quote(Color::Rgb(207, 186, 139)),
+                list_item: plain(Color::Rgb(243, 242, 204)),
+                horizontal_rule: plain(Color::Rgb(98, 108, 102)),
+            },
+            ui: UIStyle {
+                background: Color::Rgb(9, 9, 9),
+                surface: Color::Rgb(26, 26, 26),
+                foreground: Color::Rgb(243, 242, 204),
+                primary: Color::Rgb(250, 213, 102),
+                secondary: Color::Rgb(170, 170, 170),
+                dim: Color::Rgb(130, 140, 133),
+                border_color: Color::Rgb(64, 64, 64),
+                focused_border_color: Color::Rgb(250, 213, 102),
+                user_message_fg: Color::Rgb(243, 242, 204),
+                assistant_message_fg: Color::Rgb(243, 242, 204),
+                input_border: Color::Rgb(98, 108, 102),
+                input_text: Color::Rgb(243, 242, 204),
+                status_bar_bg: Color::Rgb(9, 9, 9),
+                status_bar_fg: Color::Rgb(196, 196, 196),
+                composer_border: None,
+                status_success: Color::Rgb(153, 190, 112),
+                status_warning: Color::Rgb(255, 255, 159),
+                status_error: Color::Rgb(240, 94, 72),
+                scrollbar_thumb: Color::Rgb(98, 108, 102),
+                scrollbar_track: Color::Rgb(14, 14, 14),
+            },
+        }
+    }
+
     /// The Transparent theme.
     ///
     /// No colors of its own: every background and foreground defers
@@ -1575,5 +1662,6 @@ pub(crate) const THEME_CONSTRUCTORS: &[(&str, ThemeConstructor)] = &[
     ("rose_pine", Theme::rose_pine),
     ("kanagawa_wave", Theme::kanagawa_wave),
     ("dark_plus", Theme::dark_plus),
+    ("autumn_night", Theme::autumn_night),
     ("transparent", Theme::transparent),
 ];

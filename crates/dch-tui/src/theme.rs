@@ -634,6 +634,73 @@ mod tests {
     }
 
     #[test]
+    fn autumn_night_s_text_roles_clear_the_contrast_floor() {
+        // The upstream muted gray-green (#626C66) reads 3.66:1 on this
+        // theme's canvas — under the 4.5:1 AA floor for small text.
+        // The three roles that carry words lift to a lighter tone of
+        // the same hue (5.73:1 on the canvas, 5.01:1 on the surface);
+        // the decorative cells that share the color upstream stay
+        // faithful.
+        /// WCAG relative luminance: the sRGB channels through the
+        /// spec's transfer function, then the fixed coefficient mix.
+        fn luminance(color: Color) -> f64 {
+            let channel = |value: u8| {
+                let c = f64::from(value) / 255.0;
+                if c <= 0.040_45 {
+                    c / 12.92
+                } else {
+                    ((c + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            let Color::Rgb(r, g, b) = color else {
+                return 0.0;
+            };
+            0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+        }
+        fn ratio(foreground: Color, background: Color) -> f64 {
+            let a = luminance(foreground);
+            let b = luminance(background);
+            (a.max(b) + 0.05) / (a.min(b) + 0.05)
+        }
+        let theme = Theme::autumn_night();
+        let canvas = theme.ui.background;
+        let surface = theme.ui.surface;
+        for (role, color) in [
+            ("syntax comments", theme.syntax.comment),
+            (
+                "level-6 headings",
+                theme.markdown.header6.fg.unwrap_or(canvas),
+            ),
+            ("the dim register", theme.ui.dim),
+        ] {
+            assert!(
+                ratio(color, canvas) >= 4.5,
+                "{role} reads {} on the canvas — under the floor",
+                ratio(color, canvas)
+            );
+            assert!(
+                ratio(color, surface) >= 4.5,
+                "{role} reads {} on the surface — under the floor",
+                ratio(color, surface)
+            );
+        }
+        for (role, color) in [
+            ("the scrollbar thumb", theme.ui.scrollbar_thumb),
+            ("the input border", theme.ui.input_border),
+            (
+                "the horizontal rule",
+                theme.markdown.horizontal_rule.fg.unwrap_or(canvas),
+            ),
+        ] {
+            assert_eq!(
+                color,
+                Color::Rgb(98, 108, 102),
+                "{role} stays the upstream muted gray-green"
+            );
+        }
+    }
+
+    #[test]
     fn an_unsynced_terminal_defers_the_canvas_anchored_colors() {
         // The default palette paints conversation text in its own
         // near-canvas foreground on an unpainted terminal background;
@@ -701,7 +768,7 @@ mod tests {
         // removed without updating this test fails here first.
         assert_eq!(
             theme_data::THEME_CONSTRUCTORS.len(),
-            21,
+            22,
             "the registry scope moved; update this census with it"
         );
         for key in [
@@ -725,6 +792,7 @@ mod tests {
             "rose_pine",
             "kanagawa_wave",
             "dark_plus",
+            "autumn_night",
             "transparent",
         ] {
             assert!(

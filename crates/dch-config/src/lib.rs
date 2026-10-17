@@ -842,6 +842,16 @@ pub struct DisplayConfig {
     /// (PageUp/PageDown, arrows on an empty editor) covers the rest.
     pub mouse_capture: bool,
 
+    /// How the TUI lays out a file edit's diff in the conversation
+    /// pane.
+    ///
+    /// `inline` (the default) stacks removals above insertions as
+    /// full-width solid bands; `side-by-side` pairs each removed line
+    /// with its replacement across a center gutter. Narrow terminals
+    /// fall back to the inline shape whatever the setting. See
+    /// [`DiffLayout`].
+    pub diff_layout: DiffLayout,
+
     /// A custom clipboard command for the TUI's selection copy.
     ///
     /// When set, a completed selection's text is piped to this command's
@@ -852,6 +862,33 @@ pub struct DisplayConfig {
     /// where none of the built-ins reach, e.g. a remote session whose
     /// local terminal ignores OSC 52. Defaults to unset.
     pub copy_command: Option<String>,
+}
+
+/// How the TUI renders a file edit's diff in the conversation pane.
+///
+/// Both layouts show the same hunks with the same real line numbers;
+/// the choice is spatial. A side-by-side view pairs each removed line
+/// with the line that replaced it across a center gutter, which reads
+/// fastest on wide terminals; an inline view stacks removals above
+/// insertions, which fits narrow terminals and unified-diff habits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DiffLayout {
+    /// Two panes across one row: the old line beside its replacement.
+    ///
+    /// A replacement reads as one glance. Terminals narrower than the
+    /// two-pane floor fall back to the inline shape rather than
+    /// squeeze the panes unreadably, so the choice degrades
+    /// gracefully on split screens.
+    SideBySide,
+
+    /// One pane: removals stack above the insertions that replaced
+    /// them, in unified-diff order.
+    ///
+    /// The default: full-width solid bands under bright text —
+    /// the shape an edit reads fastest in.
+    #[default]
+    Inline,
 }
 
 /// Which compaction strategy an automatically compacting session runs.
@@ -1219,6 +1256,7 @@ impl Default for DisplayConfig {
             theme: "default".to_string(),
             strip_position: StripPosition::default(),
             strip_style: StripStyle::default(),
+            diff_layout: DiffLayout::default(),
             mouse_capture: true,
             copy_command: None,
         }
@@ -1902,6 +1940,30 @@ redact_secrets = false
         assert_eq!(c.runner.permission_mode, PermissionMode::Auto);
         assert_eq!(c.telemetry.level, "info");
         assert!(c.security.redact_secrets);
+    }
+
+    #[test]
+    fn the_default_diff_layout_is_inline_and_every_spelling_loads() {
+        assert_eq!(
+            DisplayConfig::default().diff_layout,
+            DiffLayout::Inline,
+            "a config that never names a layout runs the inline bands"
+        );
+        for (spelling, expected) in [
+            ("side-by-side", DiffLayout::SideBySide),
+            ("inline", DiffLayout::Inline),
+        ] {
+            let parsed: DisplayConfig =
+                toml::from_str(&format!("diff_layout = \"{spelling}\"")).unwrap();
+            assert_eq!(
+                parsed.diff_layout, expected,
+                "the {spelling} spelling loads"
+            );
+        }
+        assert!(
+            toml::from_str::<DisplayConfig>("diff_layout = \"diagonal\"").is_err(),
+            "an unknown layout is a config error, not a silent default"
+        );
     }
 
     #[test]

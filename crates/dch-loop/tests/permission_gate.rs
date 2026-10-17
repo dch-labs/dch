@@ -82,7 +82,7 @@ fn gated_pipeline(
     resolver: Option<AskResolverFn>,
     probe: Probe,
 ) -> ToolPipeline {
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(probe);
     ToolPipeline::builder()
         .with_middleware(permission_layer(mode, resolver))

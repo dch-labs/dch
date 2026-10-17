@@ -253,15 +253,17 @@ mod tests {
             &loopctl::tool::builtin::fs::FileSession::new(std::path::PathBuf::from(".")),
             crate::registry::ReadWindows::default(),
         );
-        let registered: Vec<&str> = registry
+        let registered: Vec<String> = registry
             .all_tools()
             .into_iter()
-            .map(loopctl::Tool::name)
+            .map(|tool| tool.name().to_owned())
             .collect();
         assert!(!registered.is_empty(), "the registry must not be empty");
         for name in registered {
             assert!(
-                TOOL_TABLE.iter().any(|(row_name, _)| *row_name == name),
+                TOOL_TABLE
+                    .iter()
+                    .any(|(row_name, _)| *row_name == name.as_str()),
                 "{name} is registered but has no category row"
             );
         }

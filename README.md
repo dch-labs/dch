@@ -142,7 +142,8 @@ Themes: `default` (near-black, derived from OpenCode's dark palette),
 `gruvbox_dark`, `gruvbox_light`, `solarized_dark`, `solarized_light`,
 `catppuccin_latte`, `catppuccin_frappe`, `catppuccin_macchiato`,
 `catppuccin_mocha`, `one_dark`, `monokai`, `github_dark`,
-`github_light`, `ayu_dark`, `rose_pine`, `kanagawa_wave`, `dark_plus`.
+`github_light`, `ayu_dark`, `rose_pine`, `kanagawa_wave`, `dark_plus`,
+`autumn_night`.
 The transparent theme defers to the terminal's own colors, so the
 terminal's background (transparency included) shows through; hairline
 rules in the terminal's own dim tone mark the composer's top and
@@ -263,6 +264,12 @@ role = "general"                  # general | coding | refactor | debug | review
 
 [display]
 theme = "default"
+# diff_layout = "inline"          # how edit diffs render in the
+                                  # conversation: inline stacks removals
+                                  # above insertions as full-width solid
+                                  # bands; side-by-side pairs each removed
+                                  # line with its replacement. Narrow
+                                  # terminals fall back to inline
 # mouse_capture = true            # the wheel scrolls dch; false hands
                                   # selection back to the terminal
 verbosity = "normal"              # quiet | normal | verbose

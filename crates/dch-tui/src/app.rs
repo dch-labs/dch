@@ -3276,6 +3276,11 @@ impl TuiApp {
                         &result.full_input,
                         &result.full_output,
                     );
+                    if matches!(result.name.as_str(), "Edit" | "MultiEdit" | "Write")
+                        && crate::diff::parse_receipt(&result.full_output).is_some()
+                    {
+                        self.expanded_tools.insert(result.call_id.clone());
+                    }
                     self.push_message(TuiMessage::Assistant {
                         blocks: vec![ContentBlock::Tool {
                             name: result.name,
@@ -3506,13 +3511,24 @@ impl TuiApp {
                 self.theme.ui.dim,
             );
             if expanded {
-                lines.extend(expansion_lines(
-                    &detail.input_json,
-                    Some(&detail.output),
-                    width,
-                    self.theme.ui.assistant_message_fg,
-                    self.theme.ui.dim,
-                ));
+                if matches!(name.as_str(), "Edit" | "MultiEdit" | "Write")
+                    && let Some(diff) = crate::diff::parse_receipt(&detail.output)
+                {
+                    lines.extend(crate::diff::render_diff(
+                        &diff,
+                        self.config.display.diff_layout,
+                        width,
+                        crate::diff::diff_colors(&self.theme),
+                    ));
+                } else {
+                    lines.extend(expansion_lines(
+                        &detail.input_json,
+                        Some(&detail.output),
+                        width,
+                        self.theme.ui.assistant_message_fg,
+                        self.theme.ui.dim,
+                    ));
+                }
             }
             for index in first..lines.len() {
                 summary_lines.insert(index, call_id.clone());
@@ -6443,6 +6459,182 @@ mod tests {
             rows.push(row.trim_end().to_string());
         }
         rows.join("\n")
+    }
+
+    #[test]
+    fn an_expanded_edit_with_an_undiffable_output_keeps_the_plain_expansion() {
+        // The edit family's rows own the diff render only when the
+        // parser says diff; an error body or a large-file preview
+        // falls back to the plain input/output expansion, and that
+        // branch needs its own witness — a claim without a test is
+        // how the branch rots.
+        let mut subject = app();
+        subject.tool_details.insert(
+            "call_err".to_string(),
+            ToolDetail {
+                input_json: "{\"file_path\": \"src/gone.rs\"}".to_string(),
+                output: "Edit failed: old_text not found in src/gone.rs".to_string(),
+            },
+        );
+        subject.expanded_tools.insert("call_err".to_string());
+        let block = ContentBlock::Tool {
+            name: "Edit".to_string(),
+            call_id: "call_err".to_string(),
+            input_preview: "src/gone.rs".to_string(),
+            output_preview: String::new(),
+            retained_input: String::new(),
+            success: false,
+            elapsed_secs: 0.1,
+        };
+        let mut lines = Vec::new();
+        let mut summaries = HashMap::new();
+        subject.push_tool_block_lines(&block, 80, &mut lines, &mut summaries);
+        let flat: String = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            flat.contains("input:"),
+            "the plain expansion renders for an undiffable edit output: {flat}"
+        );
+        assert!(
+            flat.contains("output:"),
+            "the raw output is shown verbatim: {flat}"
+        );
+        assert!(
+            !flat.contains("lines changed"),
+            "no stats bar renders for an undiffable output: {flat}"
+        );
+    }
+
+    #[test]
+    fn an_edit_s_diff_expands_only_on_live_arrival() {
+        // The diff is the point of a live edit row: it renders as it
+        // happens, without a click. Restored history keeps its
+        // collapsed rows — a resumed marathon of past edits would
+        // otherwise bury the prose under walls of bands — and neither
+        // a read nor a non-diff output expands anywhere.
+        let mut subject = app();
+        let receipt = [
+            "Changed: src/lib.rs (modified)",
+            "│ 1 line removed, 1 added",
+            "@@ -1,2 +1,2 @@",
+            "  fn main() {",
+            "-     old();",
+            "+     new();",
+            "  }",
+        ]
+        .join("\n");
+        // The resume-seeding path: details recorded, nothing expanded.
+        subject.retain_tool_detail("call_restored", "{\"k\":1}", &receipt);
+        assert!(
+            !subject.expanded_tools.contains("call_restored"),
+            "restored history stays collapsed however diff-shaped"
+        );
+        // The live graduation path: the same receipt expands itself
+        // once the app drains the observer's graduation queue.
+        subject
+            .state
+            .graduations
+            .lock()
+            .expect("the graduation lock")
+            .push(crate::observer::Graduation::Tool(
+                crate::observer::ToolResultDisplay {
+                    name: "Edit".to_string(),
+                    call_id: "call_live".to_string(),
+                    is_error: false,
+                    duration: std::time::Duration::ZERO,
+                    input_summary: "src/lib.rs".to_string(),
+                    output_preview: receipt.clone(),
+                    full_input: "{\"k\":1}".to_string(),
+                    full_output: receipt,
+                },
+            ));
+        subject.drain_shared_state();
+        assert!(
+            subject.expanded_tools.contains("call_live"),
+            "a live parsed edit diff expands its own row"
+        );
+    }
+
+    #[test]
+    fn an_expanded_edit_renders_its_diff_with_real_line_numbers() {
+        // The expanded detail of an edit-family call is the parsed
+        // diff — banded rows, both gutters — not the raw receipt; the
+        // layout follows the config, and an unparseable output keeps
+        // the plain input/output expansion.
+        let mut config = dch_config::DchConfig::default();
+        config.display.diff_layout = dch_config::DiffLayout::Inline;
+        let mut subject = TuiApp::new(config);
+        let receipt = [
+            "Changed: src/lib.rs (modified)",
+            "│ 1 line removed, 1 added",
+            "@@ -38,3 +38,3 @@",
+            "  fn main() {",
+            "-     let old = previous();",
+            "+     let new = followup();",
+            "  }",
+        ]
+        .join("\n");
+        subject.tool_details.insert(
+            "call_diff".to_string(),
+            ToolDetail {
+                input_json: "{\"file_path\": \"src/lib.rs\"}".to_string(),
+                output: receipt,
+            },
+        );
+        subject.expanded_tools.insert("call_diff".to_string());
+        let block = ContentBlock::Tool {
+            name: "Edit".to_string(),
+            call_id: "call_diff".to_string(),
+            input_preview: "src/lib.rs".to_string(),
+            output_preview: String::new(),
+            retained_input: String::new(),
+            success: true,
+            elapsed_secs: 0.1,
+        };
+        let mut lines = Vec::new();
+        let mut summaries = HashMap::new();
+        subject.push_tool_block_lines(&block, 100, &mut lines, &mut summaries);
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.to_string())
+                    .collect()
+            })
+            .collect();
+        let joined = rendered.join("\n");
+        assert!(
+            joined.contains("+1") && joined.contains("-1") && joined.contains("2 lines changed"),
+            "the stats bar leads the block: {joined}"
+        );
+        assert!(
+            !joined.contains("@@"),
+            "no raw hunk header — the rendered rows carry the addresses"
+        );
+        assert!(
+            joined.contains("39") && joined.contains("previous();"),
+            "the removal carries its real old-side number: {joined}"
+        );
+        assert!(
+            !joined.contains("input:"),
+            "the diff replaces the raw input/output expansion: {joined}"
+        );
+        assert!(
+            subject
+                .tool_details
+                .get("call_diff")
+                .is_some_and(|detail| detail.output.contains("let new")),
+            "the detail record itself is untouched by rendering"
+        );
     }
 
     #[test]

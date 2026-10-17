@@ -476,7 +476,7 @@ mod tests {
             }
         }
         let sink: ToolCaptureSink = Arc::new(Mutex::new(HashMap::new()));
-        let mut registry = loopctl::tool::ToolRegistry::new();
+        let registry = loopctl::tool::ToolRegistry::new();
         registry.register(EchoTool);
         let pipeline = ToolPipeline::builder()
             .with_middleware(CapturingMiddleware::new_with_input_redaction(
@@ -550,7 +550,7 @@ mod tests {
             }
         }
         let sink: ToolCaptureSink = Arc::new(Mutex::new(HashMap::new()));
-        let mut registry = loopctl::tool::ToolRegistry::new();
+        let registry = loopctl::tool::ToolRegistry::new();
         registry.register(EchoTool);
         let pipeline = ToolPipeline::builder()
             .with_middleware(CapturingMiddleware::new(Arc::clone(&sink)))
@@ -622,7 +622,7 @@ mod tests {
             }
         }
         let sink: ToolCaptureSink = Arc::new(Mutex::new(HashMap::new()));
-        let mut registry = loopctl::tool::ToolRegistry::new();
+        let registry = loopctl::tool::ToolRegistry::new();
         registry.register(LeakyTool);
         let pipeline = ToolPipeline::builder()
             .with_middleware(CapturingMiddleware::new(Arc::clone(&sink)))
@@ -665,7 +665,7 @@ mod tests {
     async fn the_middleware_records_the_input_first_and_the_sanitized_output_last() {
         let sink: ToolCaptureSink = Arc::new(Mutex::new(HashMap::new()));
         let seen_mid_call: Arc<Mutex<Option<ToolCapture>>> = Arc::new(Mutex::new(None));
-        let mut registry = loopctl::tool::ToolRegistry::new();
+        let registry = loopctl::tool::ToolRegistry::new();
         registry.register(DyeTool {
             sink: Arc::clone(&sink),
             seen_mid_call: Arc::clone(&seen_mid_call),

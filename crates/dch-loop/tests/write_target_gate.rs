@@ -67,7 +67,7 @@ const REDIRECTION_MARK: &str = "through Bash instead";
 /// meets the gate before the tool touches its destination, and only the real
 /// tool shows what the gate kept from happening.
 fn write_family_pipeline() -> ToolPipeline {
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(WriteTool::new());
     registry.register(EditTool::new());
     registry.register(MultiEditTool::new());

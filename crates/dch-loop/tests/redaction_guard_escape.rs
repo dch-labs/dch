@@ -86,7 +86,7 @@ fn bash_dispatch(command: &str) -> ToolDispatchContext {
 
 /// A redacting pipeline over the recording probe.
 fn pipeline(ran: Arc<std::sync::Mutex<bool>>) -> ToolPipeline {
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(BashProbe { ran });
     with_redaction(ToolPipeline::builder())
         .with_core(Arc::new(registry))

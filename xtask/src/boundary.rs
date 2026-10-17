@@ -73,6 +73,58 @@ fn is_dch_crate(dep: &str) -> bool {
     dep == "dch" || dep.starts_with("dch-")
 }
 
+/// The crates the declared local bridge may redirect to a sibling
+/// checkout, and no others.
+///
+/// Rule 5's carve-out names this family explicitly so a bridge can
+/// never sanction a path dependency that is not the loopctl git
+/// dependency it exists to redirect; a new foreign path dep fails the
+/// rule bridged or not.
+fn is_bridge_family(name: &str) -> bool {
+    name == "loopctl" || name == "loopctl-derive"
+}
+
+/// The git URL the bridge redirects.
+///
+/// The exact dependency URL `Cargo.toml` names; the config's
+/// `[patch]` table is keyed by it, so the URL — not a formatted
+/// header string — is what the parsed lookup keys on.
+const LOOPCTL_GIT_URL: &str = "https://github.com/dch-labs/loopctl.git";
+
+/// Whether config text declares the local bridge.
+///
+/// Declaration means a live TOML `[patch]` table keyed by
+/// [`LOOPCTL_GIT_URL`] — parsed, not searched for: a commented-out
+/// header or the header's text carried inside a string value is not a
+/// table, and only a table Cargo would actually honor may relax the
+/// foreign-path rule. Unparseable text declares nothing (Cargo would
+/// refuse it too). Pure over the text so the rule is pinnable without
+/// owning a working directory or a config file.
+fn bridge_declared_in(config: &str) -> bool {
+    config.parse::<toml::Value>().is_ok_and(|value| {
+        value
+            .get("patch")
+            .is_some_and(|patch| patch.get(LOOPCTL_GIT_URL).is_some())
+    })
+}
+
+/// Whether the workspace's `.cargo/config.toml` declares the local
+/// bridge.
+///
+/// Reads `path` — the caller hands the workspace root's config, from
+/// `cargo metadata`'s own answer, so a check launched from a member
+/// directory still reads the workspace's file rather than the
+/// member's — and answers through [`bridge_declared_in`]. An
+/// unreadable or absent file declares nothing. Git-ignored by
+/// convention, so a clean checkout — CI included — never declares
+/// one.
+fn local_bridge_declared(config_path: &std::path::Path) -> bool {
+    match std::fs::read_to_string(config_path) {
+        Ok(config) => bridge_declared_in(&config),
+        Err(_) => false,
+    }
+}
+
 /// The `dch-*` subset of a package's declared dependencies.
 ///
 /// Sorted and de-duplicated so a rule can compare the result against an
@@ -120,13 +172,30 @@ impl<'a> Checker<'a> {
     /// The rules are independent, so one pass reports every boundary
     /// problem in the manifest rather than stopping at the first; an
     /// empty return is the verdict `check-boundary` prints as a pass.
+    /// Reads the graph with no local bridge declared — the shape a clean
+    /// checkout resolves.
     pub fn check(&self) -> Vec<Violation> {
+        self.check_with_local_bridge(false)
+    }
+
+    /// Run the rules under a declared local bridge, which sanctions
+    /// exactly the loopctl family resolving by path.
+    ///
+    /// The bridge is the documented developer workflow for exercising
+    /// uncommitted sibling `loopctl` work through this workspace: an
+    /// uncommitted `.cargo/config.toml` `[patch]` redirects the git
+    /// dependency to the sibling checkout. Under that declaration rule 5
+    /// spares path-resolved `loopctl`/`loopctl-derive` — every other
+    /// foreign path dependency still violates, so the carve-out cannot
+    /// launder a new one — and `run_check` prints a notice for each
+    /// spared crate so a bridged run never reads as a clean-graph pass.
+    pub fn check_with_local_bridge(&self, local_bridge: bool) -> Vec<Violation> {
         let mut out = Vec::new();
         out.extend(self.rule_dch_tools_loopctl_only());
         out.extend(self.rule_dch_tui_dch_config_only());
         out.extend(self.rule_loopctl_no_dch());
         out.extend(self.rule_exact_dch_dep_sets());
-        out.extend(self.rule_no_foreign_path_deps());
+        out.extend(self.rule_no_foreign_path_deps(local_bridge));
         out
     }
 
@@ -270,11 +339,17 @@ impl<'a> Checker<'a> {
     /// neither a source nor a checksum for it, so a clean checkout, a
     /// release build, and a container image that copies just the
     /// workspace all fail to resolve it, and the lockfile stops being a
-    /// reproducible record of what was built.
-    fn rule_no_foreign_path_deps(&self) -> Vec<Violation> {
+    /// reproducible record of what was built. The sole exception is the
+    /// declared local bridge
+    /// ([`check_with_local_bridge`](Checker::check_with_local_bridge)):
+    /// when one is active, path-resolved `loopctl`/`loopctl-derive`
+    /// are the sanctioned sibling-patch workflow and pass — nothing
+    /// else ever does.
+    fn rule_no_foreign_path_deps(&self, local_bridge: bool) -> Vec<Violation> {
         self.pkgs
             .iter()
             .filter(|pkg| !pkg.workspace_member && pkg.source.is_none())
+            .filter(|pkg| !(local_bridge && is_bridge_family(&pkg.name)))
             .map(|pkg| Violation {
                 crate_name: pkg.name.clone(),
                 detail: "resolves by path from outside the workspace; a clean \
@@ -294,6 +369,13 @@ impl<'a> Checker<'a> {
 struct MetadataDoc {
     packages: Vec<MetadataPackage>,
     workspace_members: Vec<String>,
+    /// The absolute path of the workspace root `cargo metadata`
+    /// resolved.
+    ///
+    /// The directory whose `.cargo/config.toml` is the workspace's —
+    /// the file the bridge carve-out reads, located from the metadata
+    /// itself so the check's launch directory cannot redirect it.
+    workspace_root: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -334,6 +416,7 @@ fn packages_from_metadata(doc: MetadataDoc) -> Vec<Package> {
     let MetadataDoc {
         packages,
         workspace_members,
+        ..
     } = doc;
     packages
         .into_iter()
@@ -385,9 +468,33 @@ pub fn run_check() -> ExitCode {
         }
     };
 
+    // The bridge config lives at the workspace root; `cargo
+    // metadata` names that root whatever directory the check was
+    // launched from, so the read cannot land on a member's config.
+    let config_path = std::path::Path::new(&doc.workspace_root).join(".cargo/config.toml");
     let pkgs = packages_from_metadata(doc);
-    let violations = Checker::new(&pkgs).check();
+    let bridge = local_bridge_declared(&config_path);
+    let checker = Checker::new(&pkgs);
+    let violations = if bridge {
+        checker.check_with_local_bridge(true)
+    } else {
+        checker.check()
+    };
 
+    if bridge {
+        for pkg in pkgs
+            .iter()
+            .filter(|p| p.source.is_none() && !p.workspace_member)
+        {
+            if is_bridge_family(&pkg.name) {
+                println!(
+                    "xtask: local bridge active — {} resolves by path via \
+                     .cargo/config.toml (uncommitted; not a clean-graph pass)",
+                    pkg.name
+                );
+            }
+        }
+    }
     if violations.is_empty() {
         println!("xtask: boundary check passed (5 rules, 0 violations)");
         ExitCode::SUCCESS
@@ -404,7 +511,12 @@ pub fn run_check() -> ExitCode {
 }
 
 #[cfg(test)]
-#[allow(clippy::missing_panics_doc, clippy::missing_errors_doc)]
+#[allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    clippy::expect_used,
+    clippy::unwrap_used
+)]
 mod tests {
     use super::*;
 
@@ -479,6 +591,71 @@ mod tests {
     }
 
     #[test]
+    fn bridge_declaration_reads_content_not_existence() {
+        // The carve-out keys on the patch-table header, nothing else:
+        // an aliases-only config — the file exists, the bridge does
+        // not — must not relax the foreign-path rule, while the
+        // section's exact spelling declares. A revert to
+        // `.exists()`-style behavior cannot pass this.
+        let bridge = "# local-only\n[patch.\"https://github.com/dch-labs/loopctl.git\"]\nloopctl = { path = \"../loopctl\" }\n";
+        assert!(
+            bridge_declared_in(bridge),
+            "the patch section declares the bridge"
+        );
+        let aliases =
+            "[alias]\nck = \"check\"\n[target.x86_64-unknown-linux-gnu]\nlinker = \"clang\"\n";
+        assert!(
+            !bridge_declared_in(aliases),
+            "an aliases-only config declares nothing"
+        );
+        assert!(!bridge_declared_in(""), "an empty config declares nothing");
+        assert!(
+            !bridge_declared_in("[patch.\"https://github.com/other/dep.git\"]"),
+            "a foreign patch section is not this bridge"
+        );
+        assert!(
+            !bridge_declared_in("# [patch.\"https://github.com/dch-labs/loopctl.git\"]"),
+            "a commented-out header is not a table Cargo honors"
+        );
+        assert!(
+            !bridge_declared_in(
+                "note = \"the header [patch.\"https://github.com/dch-labs/loopctl.git\"] is retired\""
+            ),
+            "the header's text inside a string value is not a declaration"
+        );
+        assert!(
+            !bridge_declared_in("[patch."),
+            "unparseable text declares nothing"
+        );
+    }
+
+    #[test]
+    fn the_bridge_read_targets_the_path_it_was_handed() {
+        // The carve-out reads the path the metadata front-end derives
+        // — the workspace root's config — never the process's current
+        // directory: a config at a named path declares through that
+        // path, and a directory without one declares nothing however
+        // the CWD is set.
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let config_dir = dir.path().join(".cargo");
+        std::fs::create_dir_all(&config_dir).expect("config dir");
+        std::fs::write(
+            config_dir.join("config.toml"),
+            "[patch.\"https://github.com/dch-labs/loopctl.git\"]\nloopctl = { path = \"../loopctl\" }\n",
+        )
+        .expect("config written");
+        assert!(
+            local_bridge_declared(&config_dir.join("config.toml")),
+            "the named path's config declares through itself"
+        );
+        let bare = tempfile::TempDir::new().expect("tempdir");
+        assert!(
+            !local_bridge_declared(&bare.path().join(".cargo/config.toml")),
+            "a directory without a config declares nothing"
+        );
+    }
+
+    #[test]
     fn an_external_path_dependency_violates_the_source_rule() {
         let sibling = path_pkg("loopctl", &["serde", "tokio"]);
         let ws = with_pkg(&good_workspace(), "loopctl", &sibling);
@@ -501,6 +678,49 @@ mod tests {
         assert!(
             v.is_empty(),
             "the same dependency fetched passes all rules: {v:?}"
+        );
+    }
+
+    #[test]
+    fn the_local_bridge_sanctions_only_the_loopctl_family() {
+        let mut ws = with_pkg(
+            &good_workspace(),
+            "loopctl",
+            &path_pkg("loopctl", &["serde", "tokio"]),
+        );
+        ws.push(path_pkg("loopctl-derive", &["syn"]));
+        let bridged = Checker::new(&ws).check_with_local_bridge(true);
+        assert!(
+            bridged.is_empty(),
+            "the declared bridge sanctions the loopctl family resolving by \
+             path: {bridged:?}"
+        );
+        let unbridged = Checker::new(&ws).check_with_local_bridge(false);
+        assert!(
+            has_violation(&unbridged, "loopctl", "outside the workspace")
+                && has_violation(&unbridged, "loopctl-derive", "outside the workspace"),
+            "without the declaration the same graph violates rule 5 for both: \
+             {unbridged:?}"
+        );
+    }
+
+    #[test]
+    fn the_local_bridge_never_sanctions_other_path_deps() {
+        let mut ws = with_pkg(
+            &good_workspace(),
+            "loopctl",
+            &path_pkg("loopctl", &["serde", "tokio"]),
+        );
+        ws.push(path_pkg("some-other-sibling", &["serde"]));
+        let v = Checker::new(&ws).check_with_local_bridge(true);
+        assert!(
+            has_violation(&v, "some-other-sibling", "outside the workspace"),
+            "the bridge cannot launder a path dependency outside the loopctl \
+             family: {v:?}"
+        );
+        assert!(
+            !has_violation(&v, "loopctl", "outside the workspace"),
+            "the family itself stays sanctioned beside the stranger: {v:?}"
         );
     }
 
@@ -582,7 +802,8 @@ mod tests {
                     ]
                 }
             ],
-            "workspace_members": []
+            "workspace_members": [],
+            "workspace_root": "/tmp/ws"
         }"#;
         let doc: MetadataDoc = serde_json::from_str(json)?;
         let pkgs = packages_from_metadata(doc);

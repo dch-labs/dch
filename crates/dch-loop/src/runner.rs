@@ -527,11 +527,11 @@ impl RunnerBuilder<'_> {
         let client = Arc::new(crate::create_client(&self.config.api)?);
         let connections = connect_mcp_servers(self.config, &context.cwd).await?;
         let read_windows = read_windows_for(&self.config.runner);
-        let mut registry = compose_registry(&connections, &fs_session, read_windows);
-        let mut core_registry = compose_registry(&connections, &fs_session, read_windows);
+        let registry = compose_registry(&connections, &fs_session, read_windows);
+        let core_registry = compose_registry(&connections, &fs_session, read_windows);
         for provider in &self.mcp_providers {
-            provider.register_into(&mut registry);
-            provider.register_into(&mut core_registry);
+            provider.register_into(&registry);
+            provider.register_into(&core_registry);
         }
 
         let mut session_config = build_session(self.config, &registry, &self.workdir);
@@ -740,10 +740,10 @@ fn compose_registry(
     fs_session: &FileSession,
     windows: dch_tools::ReadWindows,
 ) -> ToolRegistry {
-    let mut registry = builtin_registry(fs_session, windows);
+    let registry = builtin_registry(fs_session, windows);
     for connection in connections {
         match &connection.allowed {
-            None => connection.provider.register_into(&mut registry),
+            None => connection.provider.register_into(&registry),
             Some(allowed) => {
                 for tool in connection.provider.tools() {
                     if allowed.contains(tool.name()) {
@@ -1105,7 +1105,7 @@ mod tests {
         if with_injector {
             probe_pipeline_with(&sample_context("/tmp/probe-cwd"))
         } else {
-            let mut registry = ToolRegistry::new();
+            let registry = ToolRegistry::new();
             registry.register(ExtensionProbe);
             ToolPipeline::builder()
                 .with_core(Arc::new(registry))
@@ -1115,7 +1115,7 @@ mod tests {
     }
 
     fn probe_pipeline_with(context: &Arc<RunnerContext>) -> ToolPipeline {
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(ExtensionProbe);
         ToolPipeline::builder()
             .with_core(Arc::new(registry))
@@ -1181,7 +1181,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_panicking_tool_surfaces_as_an_error_result_through_the_composed_pipeline() {
-        let mut registry = builtin_registry(
+        let registry = builtin_registry(
             &FileSession::new(PathBuf::from(".")),
             dch_tools::ReadWindows::default(),
         );
@@ -1339,7 +1339,7 @@ mod tests {
 
     #[tokio::test]
     async fn redaction_scrubs_high_entropy_tokens_in_tool_output() {
-        let mut registry = loopctl::tool::ToolRegistry::new();
+        let registry = loopctl::tool::ToolRegistry::new();
         registry.register(HighEntropyEchoTool);
         let pipeline = build_pipeline(
             &sample_context("/tmp/probe-cwd"),
@@ -1398,7 +1398,7 @@ mod tests {
 
     /// A pipeline over `output_limit` dispatching only [`FloodingEchoTool`].
     fn capped_pipeline(output_limit: usize) -> ToolPipeline {
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(FloodingEchoTool);
         build_pipeline(
             &sample_context("/tmp/probe-cwd"),
@@ -1514,7 +1514,7 @@ mod tests {
         // while the model receives the cut — the retention bound the
         // capture itself sets is the transcript's only ceiling.
         let recorded = Arc::new(std::sync::Mutex::new(String::new()));
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(FloodingEchoTool);
         let pipeline = build_pipeline(
             &sample_context("/tmp/probe-cwd"),
@@ -5238,7 +5238,7 @@ mod tests {
         // The engine executes through the pipeline's core registry while its
         // own registry only advertises schemas, so the probe must sit in both.
         managers.set_pipeline(probe_pipeline_with(&context));
-        let mut registry = ToolRegistry::new();
+        let registry = ToolRegistry::new();
         registry.register(ExtensionProbe);
         let config = wire_config(server.port, 7);
         let client = crate::create_client(&config.api).expect("client builds");

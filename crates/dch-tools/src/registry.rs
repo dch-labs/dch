@@ -120,7 +120,7 @@ impl ReadWindows {
 #[must_use]
 pub fn builtin_registry(session: &FileSession, windows: ReadWindows) -> ToolRegistry {
     let lint: Arc<dyn ContentValidator> = Arc::new(LintGate);
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     let reader = windows.session_reader(session);
     registry.register(reader.clone());
     registry.register(ReadFilesTool::new(reader, windows.max_batch_bytes));

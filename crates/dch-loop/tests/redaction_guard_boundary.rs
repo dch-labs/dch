@@ -56,7 +56,7 @@ impl ContentValidator for UnfitGate {
 
 /// A pipeline of the redaction pair over a Write tool gated by [`UnfitGate`].
 fn guarded_pipeline() -> loopctl::middleware::ToolPipeline {
-    let mut registry = ToolRegistry::new();
+    let registry = ToolRegistry::new();
     registry.register(
         WriteTool::new().with_validator(Arc::new(UnfitGate) as Arc<dyn ContentValidator>),
     );
