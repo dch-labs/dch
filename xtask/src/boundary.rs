@@ -84,34 +84,42 @@ fn is_bridge_family(name: &str) -> bool {
     name == "loopctl" || name == "loopctl-derive"
 }
 
-/// The patch-table header a bridge file must carry to count as one.
+/// The git URL the bridge redirects.
 ///
-/// The exact `[patch.<git-url>]` spelling Cargo documents for
-/// redirecting a git dependency; compared as a literal so a similar
-/// URL cannot half-match its way into the carve-out.
-const PATCH_SECTION: &str = "[patch.\"https://github.com/dch-labs/loopctl.git\"]";
+/// The exact dependency URL `Cargo.toml` names; the config's
+/// `[patch]` table is keyed by it, so the URL — not a formatted
+/// header string — is what the parsed lookup keys on.
+const LOOPCTL_GIT_URL: &str = "https://github.com/dch-labs/loopctl.git";
 
 /// Whether config text declares the local bridge.
 ///
-/// Declaration means content, not existence: the text must carry the
-/// [`PATCH_SECTION`] header that redirects the loopctl git dependency.
-/// A config the file's mere presence would bless — aliases, linker
-/// flags, anything else a developer keeps there — must not relax the
-/// foreign-path rule. Pure over the text so the rule is pinnable
-/// without owning a working directory or a config file.
+/// Declaration means a live TOML `[patch]` table keyed by
+/// [`LOOPCTL_GIT_URL`] — parsed, not searched for: a commented-out
+/// header or the header's text carried inside a string value is not a
+/// table, and only a table Cargo would actually honor may relax the
+/// foreign-path rule. Unparseable text declares nothing (Cargo would
+/// refuse it too). Pure over the text so the rule is pinnable without
+/// owning a working directory or a config file.
 fn bridge_declared_in(config: &str) -> bool {
-    config.contains(PATCH_SECTION)
+    config.parse::<toml::Value>().is_ok_and(|value| {
+        value
+            .get("patch")
+            .is_some_and(|patch| patch.get(LOOPCTL_GIT_URL).is_some())
+    })
 }
 
-/// Whether an uncommitted `.cargo/config.toml` declares the local
-/// bridge from the workspace this check runs in.
+/// Whether the workspace's `.cargo/config.toml` declares the local
+/// bridge.
 ///
-/// Reads the workspace's config file and answers through
-/// [`bridge_declared_in`]; an unreadable or absent file declares
-/// nothing. Git-ignored by convention, so a clean checkout — CI
-/// included — never declares one.
-fn local_bridge_declared() -> bool {
-    match std::fs::read_to_string(".cargo/config.toml") {
+/// Reads `path` — the caller hands the workspace root's config, from
+/// `cargo metadata`'s own answer, so a check launched from a member
+/// directory still reads the workspace's file rather than the
+/// member's — and answers through [`bridge_declared_in`]. An
+/// unreadable or absent file declares nothing. Git-ignored by
+/// convention, so a clean checkout — CI included — never declares
+/// one.
+fn local_bridge_declared(config_path: &std::path::Path) -> bool {
+    match std::fs::read_to_string(config_path) {
         Ok(config) => bridge_declared_in(&config),
         Err(_) => false,
     }
@@ -361,6 +369,13 @@ impl<'a> Checker<'a> {
 struct MetadataDoc {
     packages: Vec<MetadataPackage>,
     workspace_members: Vec<String>,
+    /// The absolute path of the workspace root `cargo metadata`
+    /// resolved.
+    ///
+    /// The directory whose `.cargo/config.toml` is the workspace's —
+    /// the file the bridge carve-out reads, located from the metadata
+    /// itself so the check's launch directory cannot redirect it.
+    workspace_root: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -401,6 +416,7 @@ fn packages_from_metadata(doc: MetadataDoc) -> Vec<Package> {
     let MetadataDoc {
         packages,
         workspace_members,
+        ..
     } = doc;
     packages
         .into_iter()
@@ -452,8 +468,12 @@ pub fn run_check() -> ExitCode {
         }
     };
 
+    // The bridge config lives at the workspace root; `cargo
+    // metadata` names that root whatever directory the check was
+    // launched from, so the read cannot land on a member's config.
+    let config_path = std::path::Path::new(&doc.workspace_root).join(".cargo/config.toml");
     let pkgs = packages_from_metadata(doc);
-    let bridge = local_bridge_declared();
+    let bridge = local_bridge_declared(&config_path);
     let checker = Checker::new(&pkgs);
     let violations = if bridge {
         checker.check_with_local_bridge(true)
@@ -491,7 +511,12 @@ pub fn run_check() -> ExitCode {
 }
 
 #[cfg(test)]
-#[allow(clippy::missing_panics_doc, clippy::missing_errors_doc)]
+#[allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    clippy::expect_used,
+    clippy::unwrap_used
+)]
 mod tests {
     use super::*;
 
@@ -587,6 +612,46 @@ mod tests {
         assert!(
             !bridge_declared_in("[patch.\"https://github.com/other/dep.git\"]"),
             "a foreign patch section is not this bridge"
+        );
+        assert!(
+            !bridge_declared_in("# [patch.\"https://github.com/dch-labs/loopctl.git\"]"),
+            "a commented-out header is not a table Cargo honors"
+        );
+        assert!(
+            !bridge_declared_in(
+                "note = \"the header [patch.\"https://github.com/dch-labs/loopctl.git\"] is retired\""
+            ),
+            "the header's text inside a string value is not a declaration"
+        );
+        assert!(
+            !bridge_declared_in("[patch."),
+            "unparseable text declares nothing"
+        );
+    }
+
+    #[test]
+    fn the_bridge_read_targets_the_path_it_was_handed() {
+        // The carve-out reads the path the metadata front-end derives
+        // — the workspace root's config — never the process's current
+        // directory: a config at a named path declares through that
+        // path, and a directory without one declares nothing however
+        // the CWD is set.
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let config_dir = dir.path().join(".cargo");
+        std::fs::create_dir_all(&config_dir).expect("config dir");
+        std::fs::write(
+            config_dir.join("config.toml"),
+            "[patch.\"https://github.com/dch-labs/loopctl.git\"]\nloopctl = { path = \"../loopctl\" }\n",
+        )
+        .expect("config written");
+        assert!(
+            local_bridge_declared(&config_dir.join("config.toml")),
+            "the named path's config declares through itself"
+        );
+        let bare = tempfile::TempDir::new().expect("tempdir");
+        assert!(
+            !local_bridge_declared(&bare.path().join(".cargo/config.toml")),
+            "a directory without a config declares nothing"
         );
     }
 
@@ -737,7 +802,8 @@ mod tests {
                     ]
                 }
             ],
-            "workspace_members": []
+            "workspace_members": [],
+            "workspace_root": "/tmp/ws"
         }"#;
         let doc: MetadataDoc = serde_json::from_str(json)?;
         let pkgs = packages_from_metadata(doc);

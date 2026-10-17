@@ -1457,8 +1457,15 @@ impl Theme {
     /// autumn accents — red keywords, green strings, yellow functions,
     /// and a brown-turquoise supporting family; the cream foreground
     /// is where the warmth lives, the background itself is neutral.
-    /// Syntax and UI cells are faithful; markdown headers grade across
-    /// the palette for the TUI's six-level structure, where upstream's
+    /// Syntax and UI cells are faithful, with one accessibility
+    /// lift: the muted gray-green upstream paints comments and dim
+    /// text (`#626C66`) sits under the 4.5:1 small-text contrast
+    /// floor on this canvas, so the three roles that carry words —
+    /// comments, level-6 headings, and the dim register — use a
+    /// lighter tone of the same hue, while the decorative cells that
+    /// share it upstream (the scrollbar thumb, the rule, the input
+    /// border) stay faithful. Markdown headers grade across the
+    /// palette for the TUI's six-level structure, where upstream's
     /// flat single color would render every level alike. The scheme
     /// descends from the Autumn color scheme built for the Komodo IDE,
     /// ported to Vim by Kenneth Love and Chris Jones, improved by
@@ -1471,7 +1478,7 @@ impl Theme {
             name: "Autumn Night",
             syntax: SyntaxTheme {
                 attribute: Color::Rgb(134, 193, 185),
-                comment: Color::Rgb(98, 108, 102),
+                comment: Color::Rgb(130, 140, 133),
                 constant: Color::Rgb(243, 242, 204),
                 constructor: Color::Rgb(250, 213, 102),
                 embedded: Color::Rgb(153, 190, 112),
@@ -1495,7 +1502,7 @@ impl Theme {
                 header3: heading(Color::Rgb(207, 186, 139)),
                 header4: heading(Color::Rgb(134, 193, 185)),
                 header5: heading(Color::Rgb(196, 196, 196)),
-                header6: heading(Color::Rgb(98, 108, 102)),
+                header6: heading(Color::Rgb(130, 140, 133)),
                 bold: Style::default().add_modifier(Modifier::BOLD),
                 italic: Style::default().add_modifier(Modifier::ITALIC),
                 code_inline: inline_code(Color::Rgb(153, 190, 112)),
@@ -1511,7 +1518,7 @@ impl Theme {
                 foreground: Color::Rgb(243, 242, 204),
                 primary: Color::Rgb(250, 213, 102),
                 secondary: Color::Rgb(170, 170, 170),
-                dim: Color::Rgb(98, 108, 102),
+                dim: Color::Rgb(130, 140, 133),
                 border_color: Color::Rgb(64, 64, 64),
                 focused_border_color: Color::Rgb(250, 213, 102),
                 user_message_fg: Color::Rgb(243, 242, 204),
