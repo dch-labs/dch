@@ -1,10 +1,11 @@
 //! Bridge from the asking tool's requests to a host's prompt stream.
 //!
 //! The asking tool's channel carries its own batched request type; a
-//! display host wants one prompt at a time, in display terms. This
-//! module converts between the two: each batched request splits into
-//! single prompts delivered in order, and each answer returns over
-//! the asking tool's per-question response channel.
+//! display host wants prompts in display terms, one question each.
+//! This module converts between the two: each batched request splits
+//! into one prompt per question, delivered together in the batch's
+//! order for the host to queue, and each answer returns over the
+//! asking tool's per-question response channel.
 
 use std::sync::Arc;
 
@@ -67,7 +68,10 @@ pub struct PromptedQuestion {
     /// Where the answer goes.
     ///
     /// The bridge awaits this one-shot and forwards the labels to the
-    /// asking tool as its response.
+    /// asking tool as its response. Should the asking tool stop waiting
+    /// first, the bridge drops its half — a closed reply on this sender
+    /// tells the host the question has been withdrawn, and a prompt whose
+    /// answer no one will read should not stay on the screen.
     pub reply: oneshot::Sender<Vec<String>>,
 }
 
@@ -75,15 +79,24 @@ pub struct PromptedQuestion {
 ///
 /// Spawns the conversion task and returns the receiver a display host
 /// watches: each batched request becomes one [`PromptedQuestion`] per
-/// question, delivered in the batch's order, and the next question
-/// of a batch is only delivered once the previous one is answered —
-/// the host shows one question at a time without holding any of the
-/// batch back itself. Each answer is forwarded to the asking tool as
-/// its response, an empty set included (the dismissal contract). A
+/// question, and the whole batch is delivered at once in the batch's
+/// order. A host that shows one question at a time keeps the rest of
+/// the batch in its own queue, so it can walk the batch and answer its
+/// questions in any order — waiting here for each answer before
+/// handing over the next prompt would leave such a queue holding only
+/// the question already on screen, and its walk, its per-question
+/// state, and its count of what still waits would all be dead weight.
+/// Answers are forwarded in the batch's own order, which is the order
+/// the asking tool reads them in. Each answer reaches the asking tool
+/// as its response, an empty set included (the dismissal contract). A
 /// prompt whose reply sender is dropped unanswered — a host that
 /// retired the prompt out from under the task — is dismissed on that
 /// same contract, and the stream carries on with the questions behind
-/// it and with every later request. The task ends only when the asking
+/// it and with every later request. The withdrawal runs the other way
+/// too: when the asking side stops waiting for a question — the batch
+/// dismissed before the wait reached it — the bridge stops waiting with
+/// it and drops that prompt's reply sender, which is how a host holding
+/// the prompt on screen learns it is no longer an ask. The task ends only when the asking
 /// side's channel closes or the host's receiver drops. A host receiver
 /// that vanishes mid-batch closes every still-parked answer channel
 /// unanswered, which the asking side reads as that same dismissal.
@@ -94,6 +107,7 @@ pub fn spawn_question_bridge(
     let (prompts_tx, prompts_rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
         while let Some(request) = requests.recv().await {
+            let mut awaiting = Vec::with_capacity(request.questions.len());
             for question in request.questions {
                 let (reply_tx, reply_rx) = oneshot::channel();
                 let delivered = prompts_tx.send(PromptedQuestion {
@@ -113,12 +127,22 @@ pub fn spawn_question_bridge(
                 if delivered.is_err() {
                     return;
                 }
-                let labels = reply_rx.await.unwrap_or_default();
+                awaiting.push((question.question, question.response_tx, reply_rx));
+            }
+            for (question_text, mut response_tx, mut reply_rx) in awaiting {
+                let labels = tokio::select! {
+                    biased;
+                    labels = &mut reply_rx => labels.unwrap_or_default(),
+                    () = response_tx.closed() => {
+                        drop(reply_rx);
+                        continue;
+                    }
+                };
                 let response = dch_tools::QuestionResponse {
-                    question: question.question,
+                    question: question_text,
                     answers: labels,
                 };
-                if question.response_tx.send(response).is_err() {
+                if response_tx.send(response).is_err() {
                     tracing::trace!("question response channel already closed");
                 }
             }
@@ -369,42 +393,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_batch_delivers_one_question_at_a_time_in_order() {
-        let questions: Vec<Question> = (0..2)
-            .map(|index| Question {
-                question: format!("question {index}?"),
-                header: None,
-                options: vec![QuestionOption {
-                    label: "ok".to_string(),
-                    description: None,
-                }],
-                multi_select: false,
-                response_tx: oneshot::channel().0,
-            })
-            .collect();
-        let (requests_tx, requests_rx) = tokio::sync::mpsc::unbounded_channel();
-        requests_tx
-            .send(QuestionRequest { questions })
-            .expect("the bridge task holds the receiver");
+    async fn a_batch_delivers_every_question_before_any_is_answered() {
+        // The whole batch reaches the host before any of it is answered.
+        //
+        // The display queues what it is handed and lets the user walk it,
+        // so learning that a batch has more in it cannot depend on
+        // answering the question already on screen.
+        let (requests_tx, requests_rx, mut responses) = batch(2);
+        let _kept_alive = requests_tx;
         let mut prompts = spawn_question_bridge(requests_rx);
 
-        let first = tokio::time::timeout(std::time::Duration::from_secs(5), prompts.recv())
-            .await
-            .expect("the first prompt arrives")
-            .expect("the bridge stays alive");
+        let first = recv_prompt(&mut prompts).await;
         assert_eq!(first.question, "question 0?");
-        let second =
-            tokio::time::timeout(std::time::Duration::from_millis(50), prompts.recv()).await;
-        assert!(
-            second.is_err(),
-            "the second question waits behind the first's answer"
-        );
-        first.reply.send(vec!["ok".to_string()]).expect("awaited");
-        let second = tokio::time::timeout(std::time::Duration::from_secs(5), prompts.recv())
-            .await
-            .expect("the second prompt arrives after the first answers")
-            .expect("the bridge stays alive");
+        let second = recv_prompt(&mut prompts).await;
         assert_eq!(second.question, "question 1?");
+
+        // Answered back to front: each question carries its own answer
+        // channel, so the host's order is its own business, and the
+        // forwarding follows the batch instead of the answering.
+        second
+            .reply
+            .send(vec!["later".to_string()])
+            .expect("the bridge awaits the reply");
+        first
+            .reply
+            .send(vec!["ok".to_string()])
+            .expect("the bridge awaits the reply");
+
+        let answered = recv_answer(
+            responses
+                .pop_front()
+                .expect("the first question's response channel"),
+        )
+        .await;
+        assert_eq!(answered.question, "question 0?");
+        assert_eq!(answered.answers, vec!["ok".to_string()]);
+        let answered = recv_answer(
+            responses
+                .pop_front()
+                .expect("the second question's response channel"),
+        )
+        .await;
+        assert_eq!(answered.question, "question 1?");
+        assert_eq!(answered.answers, vec!["later".to_string()]);
     }
 
     #[tokio::test]

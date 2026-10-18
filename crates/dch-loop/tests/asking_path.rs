@@ -119,6 +119,117 @@ async fn an_ask_through_the_installed_channel_reaches_the_host_and_answers() {
     );
 }
 
+/// One walked queue, two questions: the batch has to arrive together
+/// for the display to walk it at all, and the user is free to answer
+/// the questions in the order they like — the second one first here.
+#[tokio::test]
+async fn an_ask_with_two_questions_reaches_the_host_as_one_queue() {
+    let (context, mut prompts) = asking_path();
+    let input = json!({
+        "questions": [
+            { "question": "first?", "options": [ { "label": "yes" }, { "label": "no" } ] },
+            { "question": "second?", "options": [ { "label": "later" } ] }
+        ]
+    });
+
+    let (result, ()) = tokio::join!(AskTool.call(input, &context), async {
+        let first = recv_prompt(&mut prompts).await;
+        let second = recv_prompt(&mut prompts).await;
+        assert_eq!(first.question, "first?");
+        assert_eq!(second.question, "second?");
+        answer(second, "later");
+        answer(first, "no");
+    });
+
+    let output = result.expect("the ask resolves");
+    assert!(!output.is_error, "an answered ask succeeds");
+    let text = output.text_content();
+    assert!(
+        text.contains("first? → no") && text.contains("second? → later"),
+        "each question reads back with its own answer: {text}"
+    );
+    let first_at = text.find("first?").unwrap_or(usize::MAX);
+    let second_at = text.find("second?").unwrap_or(usize::MAX);
+    assert!(
+        first_at < second_at,
+        "the answers read back in the order the model asked: {text}"
+    );
+}
+
+#[tokio::test]
+async fn a_dismissed_question_leaves_the_rest_being_asked() {
+    // A dismissal is one question's answer, not the batch's. The ask used
+    // to end on the first empty one, which cost the whole exchange to a
+    // stray keypress and told the model nothing about what had been
+    // answered; the questions behind a dismissal are therefore still
+    // asked, still live on the host's screen, and still answerable.
+    let (context, mut prompts) = asking_path();
+    let input = json!({
+        "questions": [
+            { "question": "first?", "options": [ { "label": "yes" } ] },
+            { "question": "second?", "options": [ { "label": "later" } ] }
+        ]
+    });
+
+    let (result, ()) = tokio::join!(AskTool.call(input, &context), async {
+        let first = recv_prompt(&mut prompts).await;
+        let second = recv_prompt(&mut prompts).await;
+        first
+            .reply
+            .send(Vec::new())
+            .expect("the bridge awaits the reply");
+        // Give the bridge its beat, then look: the dismissal is the first
+        // question's whole answer, so the second must still be waiting.
+        for _ in 0..10 {
+            assert!(
+                !second.reply.is_closed(),
+                "a dismissal elsewhere withdrew a question still being asked"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        answer(second, "later");
+    });
+
+    let out = result.expect("the ask resolves");
+    assert!(out.is_error, "an incomplete ask is still a soft result");
+    let text = out.text_content();
+    assert!(
+        text.contains("second? \u{2192} later"),
+        "the question that was answered still counts: {text}"
+    );
+    assert!(
+        text.contains("1 of 2"),
+        "and the one that was dismissed is counted, not hidden: {text}"
+    );
+}
+
+#[tokio::test]
+async fn a_cancelled_ask_withdraws_its_prompt() {
+    // What the withdrawal is actually for: the asking side is gone
+    // mid-wait, so the prompt on the host's screen can never be read by
+    // anyone again. A cancelled dispatch is that case — the tool's future
+    // drops, its reply receiver with it, and the bridge stops waiting
+    // rather than holding a dead question open. The closed reply channel
+    // is how the host learns.
+    let (context, mut prompts) = asking_path();
+    let mut tool = ask(&context, "Cancel me?");
+    let prompt = tokio::select! {
+        biased;
+        _ = tool.as_mut() => panic!("the ask answered itself before its prompt was shown"),
+        p = recv_prompt(&mut prompts) => p,
+    };
+
+    drop(tool); // the dispatch is cancelled while the question is on screen
+
+    for _ in 0..100 {
+        if prompt.reply.is_closed() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("the prompt stayed live after the ask asking it was cancelled");
+}
+
 #[tokio::test]
 async fn a_retired_prompt_soft_dismisses_and_a_later_ask_still_reaches_the_host() {
     let (context, mut prompts) = asking_path();

@@ -143,6 +143,499 @@ const LIVE_PARSE_LINE_CAP: usize = 400;
 /// plaintext head, on a character boundary.
 const LIVE_PARSE_BYTE_CAP: usize = 16_384;
 
+/// One question's answer-in-progress: its cursor, its marks, and its
+/// draft.
+///
+/// Everything about answering a question that is not the question
+/// itself. It lives on the queued question — [`PendingQuestion`] —
+/// rather than on the app, so walking a batch with Left and Right sets
+/// an unfinished answer aside and finds it waiting on the return visit;
+/// a question answers or retires, and its state leaves with it.
+///
+/// The answer has two modes and the keys split between them. Over the
+/// rows, Space marks the row under the cursor and Enter confirms; in the
+/// draft, the arrows and Home and End belong to the text and Enter sends
+/// it. [`composing`](Self::composing) is which mode the question stands
+/// in, and flipping it changes no answer itself — the marks stay, the
+/// words stay, and only the keys' meaning moves. That is why the draft
+/// can be stepped out of and back into without losing anything: the mode
+/// is a layer over the answer, not the answer.
+#[derive(Debug, Default)]
+struct QuestionUi {
+    /// The cursor row over the option rows plus the compose row.
+    ///
+    /// Indexes into the question's options, with one past the last
+    /// naming the compose row. Enter confirms this row when nothing is
+    /// marked.
+    cursor: usize,
+
+    /// The rows marked so far, by option index.
+    ///
+    /// A multi-select marks any number and Enter confirms the set. A
+    /// single-select marks at most one — Space moves the mark, and
+    /// Space on the marked row clears it — so Space always does
+    /// something and never answers; Enter is the only send.
+    toggled: std::collections::HashSet<usize>,
+
+    /// Whether the compose row is open and the draft owns keys.
+    ///
+    /// While set, printable keys build the draft and the arrows move
+    /// its caret instead of walking the queue; Enter sends the draft
+    /// and Esc steps back to the rows with the text kept.
+    composing: bool,
+
+    /// The free answer being composed, if any.
+    ///
+    /// Survives the step back to the options — a half-typed reply is
+    /// the user's text, not the overlay's to discard — and clears when
+    /// the question resolves.
+    draft: String,
+
+    /// The draft's caret, counted in characters from its start.
+    ///
+    /// A character count, not a byte offset: the draft carries accents
+    /// and double-width glyphs, and the caret moves by characters. The
+    /// byte offsets an edit needs derive from this, and so does the
+    /// screen column it draws at.
+    caret: usize,
+}
+
+impl QuestionUi {
+    /// The draft's length in characters — the unit every caret position
+    /// in this type is counted in.
+    ///
+    /// `String::len` would answer in bytes and put the caret a keystroke
+    /// inside an accent, so every bound the caret is clamped against goes
+    /// through here. The byte offsets an edit needs are derived from this
+    /// count rather than the other way round, because the user counts
+    /// characters and only `String` counts bytes.
+    fn draft_len(&self) -> usize {
+        self.draft.chars().count()
+    }
+
+    /// Open the draft for editing, with the caret at its end.
+    ///
+    /// This is where a fresh draft and a held one meet, and the rule is
+    /// that opening never discards: text left by an earlier edit stays,
+    /// because coming back to add a word is not a request to lose the
+    /// sentence. The caret therefore goes to the end rather than the
+    /// start — carrying on is the ordinary move, and `Home` is one press
+    /// away when the intent is the front.
+    ///
+    /// What opening *costs* is the caller's business, not this type's.
+    /// Over the compose row it is free; over an option on a
+    /// single-answer question it competes with a marked row, and the
+    /// sheet shows that trade by shadowing the mark while the draft is
+    /// open.
+    fn open_composing(&mut self) {
+        self.composing = true;
+        self.caret = self.draft_len();
+    }
+
+    /// Type `ch` at the caret, pushing what stood there to the right.
+    ///
+    /// Insertion is the whole of typing here: there is no overtype mode,
+    /// and the caret ends up just past the character it placed so the
+    /// next keystroke follows it. That is what makes pausing to fix a
+    /// word mid-sentence behave — step back, insert, and carry on writing
+    /// forward without the caret wandering off.
+    ///
+    /// The character's byte width and the caret's position are two counts
+    /// that meet only in `byte_index`: the string is edited by bytes, the
+    /// caret is moved in characters, and neither is allowed to assume the
+    /// other for the draft's whole length.
+    fn type_char(&mut self, ch: char) {
+        let byte = byte_index(&self.draft, self.caret);
+        self.draft.insert(byte, ch);
+        self.caret = self.caret.saturating_add(1);
+    }
+
+    /// Delete the character before the caret, leaving the text right of
+    /// it exactly where it stands.
+    ///
+    /// A caret names a position *between* characters, so deleting takes
+    /// from the left, as every editor does: the word ahead is untouched,
+    /// which is what lets the cursor be parked in the middle of a
+    /// sentence and work backwards through it.
+    ///
+    /// At the start there is nothing to the left, and nothing goes.
+    /// Deleting the character to the right instead would borrow this key
+    /// for a different one, and a draft empty in the first place is the
+    /// same case by position — both leave the text and the caret alone.
+    /// A grapheme cluster is not atomic here either: one backspace peels
+    /// one character, so an accent is removed before the letter it sits
+    /// on.
+    fn backspace(&mut self) {
+        if self.caret == 0 {
+            return;
+        }
+        let Some((byte, ch)) = self.draft.char_indices().nth(self.caret.saturating_sub(1)) else {
+            return;
+        };
+        self.draft
+            .replace_range(byte..byte.saturating_add(ch.len_utf8()), "");
+        self.caret = self.caret.saturating_sub(1);
+    }
+
+    /// Move the caret one character left, stopping at the draft's start.
+    ///
+    /// The stop is the substance of it. While the draft is open the
+    /// arrows are the text's, and an arrow that walked off the end of the
+    /// text would be two different keys sharing one press — the same
+    /// reason the queue's own walking is unreachable from in here.
+    fn caret_left(&mut self) {
+        self.caret = self.caret.saturating_sub(1);
+    }
+
+    /// Move the caret one character right, stopping at the draft's end.
+    ///
+    /// Clamped to the current length rather than to any past-the-end
+    /// position, so the caret always sits on a real boundary between two
+    /// characters and a type after the last one appends. A draft emptied
+    /// from under the caret clamps it back to the single position the
+    /// empty string has.
+    fn caret_right(&mut self) {
+        self.caret = (self.caret.saturating_add(1)).min(self.draft_len());
+    }
+
+    /// Put the caret at the draft's start.
+    ///
+    /// A jump, not a walk: `Home` and `End` are why the arrow keys can
+    /// stop at the edges without stranding anyone at the far end of a
+    /// long reply. Both are safe on an empty draft, where the two ends
+    /// are the same single position.
+    fn caret_home(&mut self) {
+        self.caret = 0;
+    }
+
+    /// Put the caret at the draft's end — the position `open_composing`
+    /// already puts it in, kept for the key that means the end from
+    /// wherever the caret stands.
+    ///
+    /// Read off the current length rather than remembered, so text
+    /// inserted or deleted elsewhere cannot leave it pointing past what
+    /// is there.
+    fn caret_end(&mut self) {
+        self.caret = self.draft_len();
+    }
+
+    /// Insert `text` at the caret as one edit, the caret landing past it.
+    ///
+    /// The entry a paste takes: one gesture, one insertion, rather than a
+    /// character at a time. Landing the caret past what arrived is the
+    /// point — text dropped into the middle of a sentence leaves the caret
+    /// where typing resumes, the way it does after typing that text by
+    /// hand.
+    fn insert_str(&mut self, text: &str) {
+        let byte = byte_index(&self.draft, self.caret);
+        self.draft.insert_str(byte, text);
+        self.caret = self.caret.saturating_add(text.chars().count());
+    }
+
+    /// Delete the character right of the caret, leaving the caret and the
+    /// text left of it exactly where they stand.
+    ///
+    /// `backspace`'s mirror: a caret names a position between characters,
+    /// and this one takes from the right. At the draft's end there is
+    /// nothing to the right and nothing goes, which is the same reason
+    /// backspace does nothing at the start.
+    fn delete_forward(&mut self) {
+        let Some((byte, ch)) = self.draft.char_indices().nth(self.caret) else {
+            return;
+        };
+        self.draft
+            .replace_range(byte..byte.saturating_add(ch.len_utf8()), "");
+    }
+
+    /// Move the caret to the start of the word left of it, or of the word
+    /// it stands inside.
+    ///
+    /// A word is a run of non-blank characters, and blanks are crossed
+    /// before the word beyond them, so a caret parked in a gap lands at
+    /// the previous word's start rather than at the gap's end — the
+    /// backward-word spot the composer's own editor walks to. The step
+    /// counts characters here because that is the unit the draft's caret
+    /// is held in.
+    fn caret_word_left(&mut self) {
+        self.caret = self.word_boundary_left(self.caret.min(self.draft_len()));
+    }
+
+    /// Move the caret past the end of the word right of it.
+    ///
+    /// From inside a word the jump is to that word's end; from a gap it
+    /// crosses the gap and the word after it, matching the forward-word
+    /// convention the composer follows. The caret stops at the draft's end,
+    /// where the arrows already stop.
+    fn caret_word_right(&mut self) {
+        let chars: Vec<char> = self.draft.chars().collect();
+        let last = chars.len();
+        let mut index = self.caret.min(last);
+        while chars.get(index).copied().is_some_and(char::is_whitespace) {
+            index = index.saturating_add(1);
+        }
+        while chars.get(index).is_some_and(|ch| !ch.is_whitespace()) {
+            index = index.saturating_add(1);
+        }
+        self.caret = index;
+    }
+
+    /// Delete the word left of the caret, taking the caret with it.
+    ///
+    /// The text right of the caret keeps its place, so the word reads as
+    /// lifted out rather than the tail shifted back. With nothing left of
+    /// the caret the boundary is already where the caret stands and
+    /// nothing goes.
+    fn delete_word_left(&mut self) {
+        let caret = self.caret.min(self.draft_len());
+        let from = self.word_boundary_left(caret);
+        let start = byte_index(&self.draft, from);
+        let end = byte_index(&self.draft, caret);
+        self.draft.replace_range(start..end, "");
+        self.caret = from;
+    }
+
+    /// Delete everything between the caret and the draft's start.
+    ///
+    /// The line-head kill the composer's editor answers with the same
+    /// chord: what was typed before the point the user meant to start at
+    /// goes in one press, and the caret lands on the start it cleared.
+    fn delete_to_start(&mut self) {
+        let end = byte_index(&self.draft, self.caret.min(self.draft_len()));
+        self.draft.replace_range(0..end, "");
+        self.caret = 0;
+    }
+
+    /// The draft's character index at the start of the word standing left
+    /// of `index`, crossing any blanks between the two.
+    fn word_boundary_left(&self, index: usize) -> usize {
+        let chars: Vec<char> = self.draft.chars().collect();
+        let mut at = index.min(chars.len());
+        // The `at > 0` guard is what ends these walks, and the only thing
+        // that ends them: `0usize.saturating_sub(1)` is still 0, so the
+        // saturated offsets the borrow checker asks for keep reading the
+        // draft's first character, and a walk without the guard never
+        // reaches the start it is walking to.
+        while at > 0
+            && chars
+                .get(at.saturating_sub(1))
+                .copied()
+                .is_some_and(char::is_whitespace)
+        {
+            at = at.saturating_sub(1);
+        }
+        while at > 0
+            && chars
+                .get(at.saturating_sub(1))
+                .is_some_and(|ch| !ch.is_whitespace())
+        {
+            at = at.saturating_sub(1);
+        }
+        at
+    }
+}
+
+/// The byte offset of `text`'s `index`th character, or the end of the
+/// string once the index is past the last character.
+///
+/// Caret positions count characters while `String` edits take byte
+/// offsets, and the two meet here.
+fn byte_index(text: &str, index: usize) -> usize {
+    text.char_indices()
+        .nth(index)
+        .map_or(text.len(), |(byte, _)| byte)
+}
+
+/// A queued question and the answer being composed for it.
+///
+/// The answer's state rides with its question instead of sitting on the
+/// app, so a batch behaves like a form: mark three answers, walk back to
+/// the first, change it, and everything else is as it was left. A
+/// question's state leaves with it when it answers or retires, and the
+/// question behind it is still clean.
+#[derive(Debug)]
+struct PendingQuestion {
+    /// What was asked, exactly as delivered.
+    ///
+    /// The asking side's own wording, with its options in the order the
+    /// model wrote them: the sheet renders the question verbatim and the
+    /// answer reads its labels off these rows, so the text the user chose
+    /// is the text that was asked with. Nothing here is the display's to
+    /// reword, reorder, or truncate.
+    prompt: QuestionPrompt,
+
+    /// This question's cursor, marks, and draft.
+    ///
+    /// The answer-in-progress rides with its question rather than on the
+    /// app, which is what lets a batch behave like a form: walk away from
+    /// a half-answered question and it waits, unwritten, for the return
+    /// visit. It arrives clean and retires with the question, so the one
+    /// behind an answered question has never worn the last answer.
+    ui: QuestionUi,
+}
+
+impl PendingQuestion {
+    /// Wrap a delivered prompt with a clean answer-in-progress.
+    ///
+    /// The only way a question enters the queue, which is what makes an
+    /// inherited answer impossible: every prompt lands at row zero,
+    /// unmarked, with an empty draft, whatever the question that left the
+    /// queue just before it had been doing.
+    fn new(prompt: QuestionPrompt) -> Self {
+        Self {
+            prompt,
+            ui: QuestionUi::default(),
+        }
+    }
+}
+
+/// The question sheet's rows and the caret riding them.
+///
+/// Built by [`TuiApp::question_sheet`], the one walk both the render and
+/// the height the frame reserves go through, so the box the user sees and
+/// the rows held aside for it cannot disagree.
+struct QuestionSheet {
+    /// Every row from the header chip to the key hints.
+    ///
+    /// Already wrapped to the width asked for, in the order they draw.
+    /// Their count *is* the sheet's height, which is why the layout that
+    /// holds rows aside for the overlay counts this list instead of
+    /// measuring anything on its own: one walk produces both, so the box
+    /// and the space reserved for it cannot disagree.
+    lines: Vec<Line<'static>>,
+
+    /// The row holding the draft, and the caret's display column within
+    /// its text — `Some` only while the draft owns the keys, since only
+    /// then is anything on the sheet being edited.
+    caret: Option<(usize, usize)>,
+}
+
+/// The columns the compose row spends before its draft text: the cursor
+/// marker and the pencil, one display column each.
+///
+/// The caret's cell is the row's start, plus this, plus the display width
+/// of the text left of the caret — so the row and the caret share one
+/// spelling of the prefix.
+const COMPOSE_PREFIX: &str = "\u{203a} \u{270e} ";
+
+/// The column option descriptions and the compose row's subtext hang at:
+/// the two marker columns an option row spends before its label — the
+/// cursor's and the toggle's.
+///
+/// Detail rows share it so a description reads as belonging to the option
+/// above it rather than as an unrelated indented row. The indent is
+/// applied outside `wrap_prompt_rows`, which splits on spaces and would
+/// drop a leading run of them as empty words.
+const DETAIL_INDENT: &str = "    ";
+
+/// Assemble the question sheet's blocks into at most `budget` rows.
+///
+/// The compose block and the hints are the two blocks a user cannot answer
+/// without: the first is where a reply the options never offered gets
+/// written, and the second is the only place the keys are explained. Both
+/// keep their rows whatever the terminal asks, which is what stops a short
+/// window from cutting the row the user is typing into and leaving them
+/// writing blind. The question text follows them, clamped to the rows that
+/// fit, and the option list is what gives way.
+///
+/// The options give way as a window rather than a truncation, anchored on
+/// `cursor_option` and grown outward — see [`option_window`]. Returns the
+/// assembled rows beside the index the compose block starts at, which is
+/// where the caret's row within that block is measured from; a terminal so
+/// short that the untouchable blocks do not fit loses the tail, the only
+/// sacrifice left, and the caret with it.
+fn fit_question_sheet(
+    head: Vec<Line<'static>>,
+    options: &[(usize, Vec<Line<'static>>)],
+    compose: Vec<Line<'static>>,
+    tail: Vec<Line<'static>>,
+    cursor_option: usize,
+    budget: usize,
+) -> (Vec<Line<'static>>, usize) {
+    // The blocks that never give way are paid for first; whatever the
+    // budget still holds is what the question and the options may spend.
+    let fixed = compose.len().saturating_add(tail.len());
+    let spendable = budget.saturating_sub(fixed);
+    let head_rows = head.len().min(spendable);
+    let room = spendable.saturating_sub(head_rows);
+    let (lo, hi) = option_window(options, cursor_option, room);
+    let mut lines = Vec::with_capacity(budget.saturating_add(1));
+    lines.extend(head.into_iter().take(head_rows));
+    lines.extend(
+        options
+            .iter()
+            .skip(lo)
+            .take(hi.saturating_sub(lo))
+            .flat_map(|(_, rows)| rows.clone()),
+    );
+    let compose_start = lines.len();
+    lines.extend(compose);
+    lines.extend(tail);
+    lines.truncate(budget.saturating_add(1).max(1));
+    (lines, compose_start)
+}
+
+/// The option groups that fit in `room` rows, as the `(lo, hi)` index
+/// range into `options` that holds `cursor_option`.
+///
+/// The cursor's own group is taken first, because it is the row the sheet
+/// has to show, and the window then grows downward before upward so a list
+/// reads in the order it was asked. Walking with the arrows moves the
+/// window with the cursor, so an option is never unreachable — only
+/// undrawn until it is stood on. A budget that will not hold the cursor's
+/// own group leaves the window empty: options have nothing to spare rather
+/// than half a row between them.
+fn option_window(
+    options: &[(usize, Vec<Line<'static>>)],
+    cursor_option: usize,
+    room: usize,
+) -> (usize, usize) {
+    let last = options.len();
+    if last == 0 || room == 0 {
+        return (0, 0);
+    }
+    let rows_of = |index: usize| {
+        options
+            .get(index)
+            .map_or(usize::MAX, |(_, rows)| rows.len())
+    };
+    let below = |index: usize| {
+        if index < last {
+            rows_of(index)
+        } else {
+            usize::MAX
+        }
+    };
+    let above = |index: usize| {
+        if index > 0 {
+            rows_of(index.saturating_sub(1))
+        } else {
+            usize::MAX
+        }
+    };
+    let start = cursor_option.min(last.saturating_sub(1));
+    let mut used = rows_of(start);
+    if used > room {
+        return (0, 0);
+    }
+    let (mut lo, mut hi) = (start, start.saturating_add(1));
+    loop {
+        let down = below(hi);
+        if used.saturating_add(down) <= room {
+            used = used.saturating_add(down);
+            hi = hi.saturating_add(1);
+            continue;
+        }
+        let up = above(lo);
+        if used.saturating_add(up) <= room {
+            used = used.saturating_add(up);
+            lo = lo.saturating_sub(1);
+            continue;
+        }
+        break;
+    }
+    (lo, hi)
+}
+
 /// The main TUI application.
 ///
 /// Owns the event loop, the input buffer, and the shared state
@@ -651,7 +1144,23 @@ pub struct TuiApp {
     /// batch. A finished or cancelled run empties the queue — the
     /// dispatches are gone, and dropping the prompts closes their
     /// reply channels, which the asking tools read as dismissals.
-    pending_questions: std::collections::VecDeque<QuestionPrompt>,
+    ///
+    /// Each entry carries the answer being composed for its own
+    /// question, so walking the batch with Left and Right changes only
+    /// which question is shown — nothing already marked or typed is
+    /// left behind on the way.
+    pending_questions: std::collections::VecDeque<PendingQuestion>,
+
+    /// Which queued question is on screen: an index into
+    /// [`pending_questions`](Self::pending_questions).
+    ///
+    /// The walk moves this and leaves the queue's arrival order alone, so
+    /// a question keeps its number in the sheet's title while the user
+    /// walks away from it and back, and the count names the batch the
+    /// asking tool sent. Always a live index: landing only lengthens the
+    /// queue, and answering lifts the shown entry out with the next one
+    /// sliding into its place.
+    question_view: usize,
 
     /// The channel question prompts arrive on, until `run` claims
     /// it.
@@ -660,18 +1169,6 @@ pub struct TuiApp {
     /// loop's select arm moves prompts into the queue, mirroring the
     /// permission channel's shape.
     question_rx: Option<tokio::sync::mpsc::UnboundedReceiver<QuestionPrompt>>,
-
-    /// The option row the question overlay's cursor sits on.
-    ///
-    /// Indexes the pending question's options; reset to the first row
-    /// whenever a question resolves.
-    question_cursor: usize,
-
-    /// The toggled option rows of the pending multi-select question.
-    ///
-    /// Empty for a single-select question (Enter confirms the cursor
-    /// row); cleared whenever a question resolves.
-    question_toggled: std::collections::HashSet<usize>,
 
     /// Whether the next frame must repaint in full.
     ///
@@ -784,9 +1281,8 @@ impl TuiApp {
             pending_permissions: std::collections::VecDeque::new(),
             permission_rx: None,
             pending_questions: std::collections::VecDeque::new(),
+            question_view: 0,
             question_rx: None,
-            question_cursor: 0,
-            question_toggled: std::collections::HashSet::new(),
             full_repaint_pending: false,
             config,
         }
@@ -1065,10 +1561,7 @@ impl TuiApp {
     /// the documented keys are the plain ones.
     fn permission_key(&mut self, key: KeyEvent) -> Option<bool> {
         self.pending_permissions.front()?;
-        let chord = key.code == KeyCode::Char('c')
-            && (key.modifiers == KeyModifiers::CONTROL
-                || key.modifiers == KeyModifiers::CONTROL | KeyModifiers::SHIFT);
-        if chord {
+        if key_survives_the_sheet(key) {
             return None;
         }
         let bare = key.modifiers == KeyModifiers::NONE;
@@ -1116,122 +1609,465 @@ impl TuiApp {
         first: QuestionPrompt,
         rx: &mut tokio::sync::mpsc::UnboundedReceiver<QuestionPrompt>,
     ) {
-        self.pending_questions.push_back(first);
+        self.pending_questions
+            .push_back(PendingQuestion::new(first));
         while let Ok(prompt) = rx.try_recv() {
-            self.pending_questions.push_back(prompt);
+            self.pending_questions
+                .push_back(PendingQuestion::new(prompt));
         }
     }
 
-    /// Move any waiting question prompts into the queue.
+    /// Refresh the queue: land what arrived, drop what nobody asks.
     ///
-    /// The test seam for staging questions without the run loop:
-    /// production keeps its receiver in a local and lands batches
-    /// through [`land_question_requests`](Self::land_question_requests)
-    /// instead — once `run` claims the channel, this slot is empty and
-    /// the method is a no-op.
+    /// Landing and withdrawal are one pass because they are the same
+    /// question asked twice — is this prompt still live? — and the run
+    /// loop does both on its own beat. The test seam for staging
+    /// questions without the loop: production keeps its receiver in a
+    /// local and lands batches through
+    /// [`land_question_requests`](Self::land_question_requests) instead —
+    /// once `run` claims the channel, this slot is empty and only the
+    /// withdrawal half has anything left to say.
     pub fn poll_question_requests(&mut self) {
         while let Some(prompt) = self.question_rx.as_mut().and_then(|rx| rx.try_recv().ok()) {
-            self.pending_questions.push_back(prompt);
+            self.pending_questions
+                .push_back(PendingQuestion::new(prompt));
         }
+        self.retire_withdrawn_questions();
     }
 
-    /// Answer the front question, if one is pending.
+    /// Answer the question on screen, wherever the walk left it.
     ///
-    /// Sends `answers` on its one-shot and drops it from the queue,
-    /// resetting the cursor and toggles for the next question; a send
-    /// that finds no receiver (a dispatch already cancelled away) is
-    /// silently fine — the asking tool read its dismissal when its
-    /// future dropped.
+    /// Sends `answers` on its one-shot and lifts it out of the queue —
+    /// its cursor, marks, and draft going with it, so the question
+    /// behind it is still clean rather than wearing the last one's
+    /// answer. A send that finds no receiver (a dispatch already
+    /// cancelled away) is silently fine — the asking tool read its
+    /// dismissal when its future dropped.
     fn resolve_pending_question(&mut self, answers: Vec<String>) {
-        if let Some(front) = self.pending_questions.pop_front()
-            && front.reply.send(answers).is_err()
+        let shown = self.question_view;
+        if let Some(entry) = self.pending_questions.remove(shown)
+            && entry.prompt.reply.send(answers).is_err()
         {
             tracing::trace!("question reply channel already closed");
         }
-        self.question_cursor = 0;
-        self.question_toggled.clear();
+        // The entry behind the answered one slides into its place and is
+        // shown by the same index; answering the batch's last question
+        // leaves the view past the end, so it steps back onto what is
+        // left.
+        self.clamp_question_view();
     }
 
-    /// Apply a key press to a pending question.
+    /// What the shown question's marks and its draft add up to, as the
+    /// answer Enter sends.
     ///
-    /// `Some(redraw)` when a question is pending — the overlay owns
-    /// the keyboard: the arrows move the cursor, Space toggles a
-    /// multi-select row, Enter confirms (the cursor row for a
-    /// single-select, the toggled set for a multi), Esc dismisses
-    /// with no answers, and every other key is swallowed — Enter
-    /// among them, since a press queued to submit the draft must
-    /// never land as an answer. `None` only for the two `c` chords
-    /// the app machinery owns — cancel/quit and copy — so those
-    /// survive under a question.
-    fn question_key(&mut self, key: KeyEvent) -> Option<bool> {
-        let options_len = self
+    /// Marked option rows answer in the order the sheet shows them and a
+    /// draft answers last, from the row below every option. A single
+    /// select answers one thing: the marked row — or the draft, where the
+    /// draft is what the user chose to write — and with nothing marked at
+    /// all, the row the cursor stands on.
+    ///
+    /// `draft_counts` is whether the typed text belongs to the answer on
+    /// its own rather than only where its row is marked: the draft's own
+    /// Enter says yes, because writing a reply *is* choosing it, while
+    /// Enter over the rows asks the mark. Both paths come here, so a
+    /// marked draft answers the same however it was reached and composing
+    /// never silently drops the rows marked beside it.
+    fn shown_answer(&self, draft_counts: bool) -> Vec<String> {
+        let Some(entry) = self.shown_question() else {
+            return Vec::new();
+        };
+        let ui = &entry.ui;
+        let free_row = entry.prompt.options.len();
+        let draft = ui.draft.trim().to_string();
+        let draft_wanted = (draft_counts || ui.toggled.contains(&free_row)) && !draft.is_empty();
+        if entry.prompt.multi_select {
+            let mut answers = entry
+                .prompt
+                .options
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index < free_row && ui.toggled.contains(index))
+                .map(|(_, option)| option.label.clone())
+                .collect::<Vec<String>>();
+            if draft_wanted {
+                answers.push(draft);
+            }
+            answers
+        } else if draft_wanted {
+            vec![draft]
+        } else {
+            ui.toggled
+                .iter()
+                .copied()
+                .find(|index| *index < free_row)
+                .and_then(|index| entry.prompt.options.get(index))
+                .or_else(|| entry.prompt.options.get(ui.cursor))
+                .map(|option| vec![option.label.clone()])
+                .unwrap_or_default()
+        }
+    }
+
+    /// Take off the queue every question the asking side has stopped
+    /// waiting for.
+    ///
+    /// A prompt's one-shot is the asker's stake in its question: the
+    /// receiver lives exactly as long as the wait does, and ends with it.
+    /// A batch's wait ends early on its first dismissal — one question
+    /// coming back unanswered is the whole ask's answer to the model —
+    /// and the questions behind it drop their receivers unheard, as they
+    /// do when a dispatch is cancelled or the asking channel closes
+    /// mid-wait. Nothing else says so: without this the user keeps
+    /// looking at a question nobody will ever read, over the reply that
+    /// question never waited for. A closed reply channel is the whole
+    /// notice, and this is where it is read.
+    ///
+    /// This is the running half of a question's retirement: the tick
+    /// already drops the whole queue when the run itself is gone, while
+    /// this catches the single ask abandoned *inside* a live run — the
+    /// model goes on asking and answering other things, and only these
+    /// few questions stop being anyone's.
+    ///
+    /// The view follows the questions rather than their indices: it steps
+    /// back by the ones withdrawn ahead of it, so the question the walk
+    /// arrived at stays on screen for as long as it survives.
+    fn retire_withdrawn_questions(&mut self) -> bool {
+        let view = self.question_view;
+        let withdrawn_ahead = self
             .pending_questions
-            .front()
-            .map_or(0, |question| question.options.len());
-        self.pending_questions.front()?;
-        let chord = key.code == KeyCode::Char('c')
-            && (key.modifiers == KeyModifiers::CONTROL
-                || key.modifiers == KeyModifiers::CONTROL | KeyModifiers::SHIFT);
-        if chord {
+            .iter()
+            .take(view)
+            .filter(|entry| entry.prompt.reply.is_closed())
+            .count();
+        let before = self.pending_questions.len();
+        self.pending_questions
+            .retain(|entry| !entry.prompt.reply.is_closed());
+        if before == self.pending_questions.len() {
+            return false;
+        }
+        self.question_view = view.saturating_sub(withdrawn_ahead);
+        self.clamp_question_view();
+        true
+    }
+
+    /// The question on screen: the one the sheet renders and the keys
+    /// answer.
+    ///
+    /// Read through the view index rather than the queue's front, which
+    /// is what lets a batch hold its arrival order — the count the title
+    /// prints — while the user walks it: the third question of four is
+    /// what this returns after two presses of Right, not the one that
+    /// arrived third. `None` is a closed sheet, an empty queue, which
+    /// every question path faces the moment the last answer is sent or
+    /// the last prompt withdrawn.
+    fn shown_question(&self) -> Option<&PendingQuestion> {
+        self.pending_questions.get(self.question_view)
+    }
+
+    /// The question on screen, for the keys that move its cursor, mark a
+    /// row, or compose a draft on it.
+    ///
+    /// The same index the render reads, so a key can only ever reach the
+    /// question the user is looking at, and walking the queue leaves every
+    /// other answer-in-progress exactly as it was. `None` means no sheet
+    /// is open: a key that arrives in that moment has nothing to act on
+    /// and does nothing, rather than borrowing the next question to
+    /// arrive.
+    fn shown_question_mut(&mut self) -> Option<&mut PendingQuestion> {
+        self.pending_questions.get_mut(self.question_view)
+    }
+
+    /// Walk the shown question one step, wrapping at both ends.
+    ///
+    /// The walk moves the view and leaves the queue's arrival order
+    /// alone, because that order is what the sheet counts: walking to the
+    /// third question of four says `3 of 4`, and says it again after a
+    /// walk away and back. It is a circle in both directions, so the
+    /// question answered last sits one press from the one answered first.
+    ///
+    /// A batch of one has nowhere to go, and the step declines rather
+    /// than reports: the key that asked for it is still swallowed, which
+    /// keeps an arrow from falling through to the transcript behind the
+    /// sheet.
+    fn step_question_view(&mut self, forward: bool) {
+        let count = self.pending_questions.len();
+        if count < 2 {
+            return;
+        }
+        self.question_view = if forward {
+            // Past the batch's last question comes its first: the walk is
+            // a circle, so the question answered last is one press from
+            // the question answered first.
+            let next = self.question_view.saturating_add(1);
+            if next >= count { 0 } else { next }
+        } else if self.question_view == 0 {
+            count.saturating_sub(1)
+        } else {
+            self.question_view.saturating_sub(1)
+        };
+    }
+
+    /// Keep [`question_view`](Self::question_view) a live index into the
+    /// queue.
+    ///
+    /// Answering or withdrawing a question can shrink the queue under a
+    /// user standing at its end, and an index past the last row is a
+    /// sheet showing nothing rather than a sheet showing the next
+    /// question. So the view is pulled back to the last question left; an
+    /// emptied queue takes it home to zero, which is also where the next
+    /// batch is met.
+    fn clamp_question_view(&mut self) {
+        self.question_view = self
+            .question_view
+            .min(self.pending_questions.len().saturating_sub(1));
+    }
+
+    /// Apply a key press to the question on screen.
+    ///
+    /// `Some(redraw)` when a question is pending — the overlay owns the
+    /// keyboard, and which half of it answers depends on whether the
+    /// draft is being edited. Over the rows, Up and Down move the cursor,
+    /// Left and Right walk the queued questions (the walk moves the view
+    /// and not the queue, so the question on screen is the one Enter
+    /// answers and Esc dismisses the one question the walk left it on —
+    /// never the batch behind it), Space marks
+    /// the row it stands on — the compose row included — without ever
+    /// answering, and Enter confirms: the marked rows, or the cursor row
+    /// where nothing is marked. On the compose row Enter opens the draft,
+    /// and a marked compose row still empty opens it too rather than
+    /// answer without its text — as does typing a letter anywhere in the
+    /// sheet, which opens the draft with that letter in it. Inside the
+    /// draft the arrows move its caret and Home and
+    /// End jump its ends — those keys belong to the text being typed, not
+    /// to the queue — printable keys build it, Enter sends it, and Esc
+    /// steps back to the rows with the text kept. Every other key is
+    /// swallowed; `None` for the two `c` chords and the keys
+    /// [`key_survives_the_sheet`] names — the machinery's own chords, and
+    /// the paging and verbosity that read the conversation the sheet is
+    /// parked over.
+    fn question_key(&mut self, key: KeyEvent) -> Option<bool> {
+        self.shown_question()?;
+        if key_survives_the_sheet(key) {
             return None;
         }
         let bare = key.modifiers == KeyModifiers::NONE;
+        let redraw = if self
+            .shown_question()
+            .is_some_and(|entry| entry.ui.composing)
+        {
+            self.question_draft_key(key, bare)
+        } else {
+            self.question_rows_key(key, bare)
+        };
+        Some(redraw)
+    }
+
+    /// The keys the compose draft answers, on the question on screen.
+    ///
+    /// The draft owns these while it is open: printable characters land
+    /// at its caret, the arrows and Home/End move that caret, Enter sends
+    /// the text as the answer the options never offered, and Esc steps
+    /// back to the rows keeping the text. Editing follows the composer's
+    /// line-editor conventions wherever the surface can honour them:
+    /// `Delete` erases to the right, Ctrl with an arrow walks a whole
+    /// word, and Ctrl+W and Ctrl+U erase a word and the line's head.
+    /// Enter means send whatever modifier it arrives under — the draft
+    /// holds one line, so a terminal that spells `Shift+Enter` as its own
+    /// event is not asking for a newline the answer cannot carry. A draft
+    /// with nothing in it is not an answer and does not go; it says so on
+    /// the sheet's own hint row, which is where the key promised
+    /// otherwise. Everything else is swallowed.
+    fn question_draft_key(&mut self, key: KeyEvent, bare: bool) -> bool {
+        let mut send = false;
+        if let Some(entry) = self.shown_question_mut() {
+            let ui = &mut entry.ui;
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            match key.code {
+                KeyCode::Enter => {
+                    // The written reply is the answer, so it counts here
+                    // whether or not its row carries a mark. Whitespace
+                    // alone is not a reply and does not go, and the hint
+                    // row has already changed its wording to say what is
+                    // missing — a refusal the user reads, not a key
+                    // dropped without a word.
+                    send = !ui.draft.trim().is_empty();
+                }
+                KeyCode::Esc => ui.composing = false,
+                KeyCode::Left if ctrl => ui.caret_word_left(),
+                KeyCode::Left if bare => ui.caret_left(),
+                KeyCode::Right if ctrl => ui.caret_word_right(),
+                KeyCode::Right if bare => ui.caret_right(),
+                KeyCode::Home if bare => ui.caret_home(),
+                KeyCode::End if bare => ui.caret_end(),
+                KeyCode::Backspace | KeyCode::Char('w') if ctrl => ui.delete_word_left(),
+                KeyCode::Backspace => ui.backspace(),
+                KeyCode::Delete => ui.delete_forward(),
+                KeyCode::Char('u') if ctrl => ui.delete_to_start(),
+                KeyCode::Char(ch) if bare => ui.type_char(ch),
+                _ => {}
+            }
+        }
+        // The borrow above ends with the match; an answer leaves through
+        // the queue's own removal, which takes the drafted question — and
+        // its draft — out with it.
+        if send {
+            let answers = self.shown_answer(true);
+            self.resolve_pending_question(answers);
+        }
+        true
+    }
+
+    /// Land a paste on the question on screen: into the open draft at its
+    /// caret, or into a draft opened for it.
+    ///
+    /// A paste is a burst of keystrokes, and the overlay answers
+    /// keystrokes — a letter typed at the rows opens the draft with that
+    /// letter in it, so a paste arrives the same way rather than vanishing
+    /// without a word. Dropping it would lose the likeliest thing a user
+    /// has to say that the options never offered: a path, a hash, the line
+    /// copied out of the conversation above the box.
+    ///
+    /// The text lands as one line whatever it held. A draft answers one
+    /// question in one row, so the breaks a multi-line paste carries
+    /// become the spaces between its parts; nothing is discarded.
+    fn paste_into_the_question(&mut self, text: &str) -> bool {
+        let Some(entry) = self.shown_question_mut() else {
+            return true;
+        };
+        if !entry.ui.composing {
+            entry.ui.open_composing();
+        }
+        entry.ui.insert_str(&paste_for_one_line(text));
+        true
+    }
+
+    /// Whether Enter here means go and write a reply rather than answer.
+    ///
+    /// An empty compose row cannot be sent, so Enter opens the draft to
+    /// fill it — whenever the row is the answer the user is pointing at
+    /// (`on_compose_row`, where an unmarked compose row is exactly that
+    /// invitation) or when it is the only mark on the sheet. Marks on real
+    /// options beside it settle the matter the other way: the answer is
+    /// chosen, and the empty row contributes nothing to it.
+    fn needs_the_draft(&self, on_compose_row: bool) -> bool {
+        self.shown_question().is_some_and(|entry| {
+            let free_row = entry.prompt.options.len();
+            let marks = entry.ui.toggled.len();
+            let options_marked = entry
+                .ui
+                .toggled
+                .iter()
+                .filter(|index| **index < free_row)
+                .count();
+            entry.ui.draft.trim().is_empty()
+                && if on_compose_row || entry.ui.toggled.contains(&free_row) {
+                    options_marked == 0 && (on_compose_row || marks == 1)
+                } else {
+                    false
+                }
+        })
+    }
+
+    /// The keys the option rows answer, on the question on screen.
+    ///
+    /// The rows' half of the overlay: navigation, marking, walking the
+    /// queue, confirming, dismissing. Marking is Space's whole job, on the
+    /// compose row as on an option — it adds or removes the row it stands
+    /// on for a multi-select, and moves the one mark there for a
+    /// single-select — and it never answers, so a stray press cannot send
+    /// a reply. Enter answers with the marked rows (the marked row, or the
+    /// cursor row where nothing is marked), a marked draft answering with
+    /// its own text.
+    fn question_rows_key(&mut self, key: KeyEvent, bare: bool) -> bool {
+        let Some(entry) = self.shown_question() else {
+            return true;
+        };
+        // The shown question's shape is read first, into copies: the arms
+        // below mutate the queue and hand an answer out, and no borrow of
+        // it can outlive that.
+        let free_row = entry.prompt.options.len();
+        let multi = entry.prompt.multi_select;
+        let cursor = entry.ui.cursor;
         match key.code {
             KeyCode::Up if bare => {
-                self.question_cursor = self.question_cursor.saturating_sub(1);
-                Some(true)
+                if let Some(entry) = self.shown_question_mut() {
+                    entry.ui.cursor = entry.ui.cursor.saturating_sub(1);
+                }
             }
             KeyCode::Down if bare => {
-                self.question_cursor =
-                    (self.question_cursor.saturating_add(1)).min(options_len.saturating_sub(1));
-                Some(true)
-            }
-            KeyCode::Char(' ') if bare => {
-                if self
-                    .pending_questions
-                    .front()
-                    .is_some_and(|question| question.multi_select)
-                    && !self.question_toggled.insert(self.question_cursor)
-                {
-                    self.question_toggled.remove(&self.question_cursor);
+                if let Some(entry) = self.shown_question_mut() {
+                    entry.ui.cursor = (entry.ui.cursor.saturating_add(1)).min(free_row);
                 }
-                Some(true)
+            }
+            // The walk moves the view and leaves the queue's arrival
+            // order alone — that order is what the sheet counts, so
+            // walking to the third question of four can say `3 of 4`, and
+            // say it again after a walk away and back. Nothing resets on
+            // the way: each entry carries its own cursor, marks, and
+            // draft, so the question walked to still holds what was left
+            // there and the one walked away from keeps it for the return.
+            KeyCode::Right if bare => self.step_question_view(true),
+            KeyCode::Left if bare => self.step_question_view(false),
+            // Space's whole job is the dot, and the compose row is a row
+            // like the others: marking it is the user saying the typed
+            // reply is the answer. Opening the draft used to be Space's
+            // trick on that one row, which made a single key mean two
+            // things by where the cursor happened to stand; Enter is what
+            // opens the draft, as it is everywhere it means onward.
+            KeyCode::Char(' ') if bare => {
+                if let Some(entry) = self.shown_question_mut() {
+                    let ui = &mut entry.ui;
+                    let marked = ui.toggled.contains(&cursor);
+                    if multi {
+                        if marked {
+                            ui.toggled.remove(&cursor);
+                        } else {
+                            ui.toggled.insert(cursor);
+                        }
+                    } else {
+                        // One mark, moved: the row Space stands on takes
+                        // it and every other row loses it, and Space again
+                        // on the marked row clears it.
+                        ui.toggled.clear();
+                        if !marked {
+                            ui.toggled.insert(cursor);
+                        }
+                    }
+                }
             }
             KeyCode::Enter if bare => {
-                let multi = self
-                    .pending_questions
-                    .front()
-                    .is_some_and(|question| question.multi_select);
-                let answers = if multi {
-                    let toggled = std::mem::take(&mut self.question_toggled);
-                    self.pending_questions
-                        .front()
-                        .map(|question| {
-                            question
-                                .options
-                                .iter()
-                                .enumerate()
-                                .filter(|(index, _)| toggled.contains(index))
-                                .map(|(_, option)| option.label.clone())
-                                .collect::<Vec<String>>()
-                        })
-                        .unwrap_or_default()
-                } else {
-                    self.pending_questions
-                        .front()
-                        .and_then(|question| question.options.get(self.question_cursor))
-                        .map(|option| vec![option.label.clone()])
-                        .unwrap_or_default()
-                };
+                // An empty compose row has no reply to send, so Enter goes
+                // and writes one — but only where that empty row is the
+                // whole answer the user asked for. Beside marks on real
+                // options, the marks are the answer already chosen, and a
+                // row with nothing to say does not veto them: it simply
+                // adds nothing, on the cursor's row as anywhere.
+                if self.needs_the_draft(cursor == free_row) {
+                    if let Some(entry) = self.shown_question_mut() {
+                        entry.ui.open_composing();
+                    }
+                    return true;
+                }
+                let answers = self.shown_answer(false);
                 self.resolve_pending_question(answers);
-                Some(true)
             }
             KeyCode::Esc if bare => {
                 self.resolve_pending_question(Vec::new());
-                Some(true)
             }
-            _ => Some(false),
+            // A letter typed at the rows is a reply being started, and it
+            // belongs to the draft rather than vanishing on the way to
+            // nowhere. Space marks and Enter opens, but the fastest road
+            // to a typed answer is to start typing it, and a keystroke
+            // the overlay drops in silence is the one thing a keyboard
+            // should never do.
+            KeyCode::Char(ch) if bare => {
+                if let Some(entry) = self.shown_question_mut() {
+                    entry.ui.open_composing();
+                    entry.ui.type_char(ch);
+                }
+            }
+            _ => return false,
         }
+        true
     }
 
     /// Claim the pending full repaint, if one is due.
@@ -1354,7 +2190,10 @@ impl TuiApp {
                     if let Some(prompt) = maybe_question {
                         match question_rx.as_mut() {
                             Some(rx) => self.land_question_requests(prompt, rx),
-                            None => self.pending_questions.push_back(prompt),
+                            None => {
+                                self.pending_questions
+                                    .push_back(PendingQuestion::new(prompt));
+                            }
                         }
                         true
                     } else {
@@ -1395,6 +2234,13 @@ impl TuiApp {
             if question_closed {
                 question_rx = None;
                 question_closed = false;
+            }
+            // A question the asking side gave up on leaves on this beat,
+            // not on the next keypress: a dismissal ends a whole batch,
+            // and the questions behind the dismissed one would otherwise
+            // sit on the screen through the answer they never waited for.
+            if self.retire_withdrawn_questions() {
+                needs_redraw = true;
             }
             if self.take_full_repaint() {
                 if let Err(err) = terminal.clear() {
@@ -1584,12 +2430,13 @@ impl TuiApp {
             }
             Event::Mouse(mouse) => self.handle_mouse(*mouse),
             Event::Paste(text) => {
-                if self.pending_permissions.front().is_some()
-                    || self.pending_questions.front().is_some()
-                {
+                if self.pending_permissions.front().is_some() {
                     return true;
                 }
                 self.caret_blink.resolidify();
+                if !self.pending_questions.is_empty() {
+                    return self.paste_into_the_question(text);
+                }
                 self.input.insert_str(&normalize_pasted_newlines(text));
                 true
             }
@@ -1606,8 +2453,9 @@ impl TuiApp {
     /// page-scroll keys stay app-level, everything else belongs to the
     /// input editor — unless a permission ask is pending, in which
     /// case the overlay owns the keyboard first (`y` allows,
-    /// `n`/Esc deny, the rest swallowed) and only the two `c` chords
-    /// (cancel/quit, copy) pass through to the machinery below.
+    /// `n`/Esc deny, the rest swallowed) and only the two `c` chords and
+    /// the keys [`key_survives_the_sheet`] names pass through to the
+    /// machinery below.
     ///
     /// Ctrl+C clears a non-empty buffer — arming nothing, so a
     /// cleared draft still takes two further presses to exit — and
@@ -1731,7 +2579,10 @@ impl TuiApp {
     /// over the composer pane places its caret where it landed.
     /// Anything else is ignored. While a permission ask is pending,
     /// the overlay owns the pointer as it owns the keyboard: every
-    /// report is swallowed and any parked drag is dropped.
+    /// report is swallowed and any parked drag is dropped. A question
+    /// sheet holds the presses for the same reason but not the wheel —
+    /// reading the conversation above the box is how a question gets
+    /// answered, and the wheel is how that reading happens.
     fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
         if self.pending_permissions.front().is_some() {
             // The overlay owns the pointer as it owns the keyboard: a
@@ -1740,17 +2591,23 @@ impl TuiApp {
             self.drag_position = None;
             return true;
         }
+        if !self.pending_questions.is_empty() {
+            return match mouse.kind {
+                MouseEventKind::ScrollUp => self.scroll_the_wheel(true),
+                MouseEventKind::ScrollDown => self.scroll_the_wheel(false),
+                // The rows under the pointer belong to the sheet, not to
+                // the transcript behind it: a press here would place the
+                // caret in a composer the user cannot see, or start a
+                // selection in text the sheet has covered.
+                _ => {
+                    self.drag_position = None;
+                    true
+                }
+            };
+        }
         match mouse.kind {
-            MouseEventKind::ScrollUp => {
-                self.scroll_offset = self.scroll_offset.saturating_add(WHEEL_SCROLL_LINES);
-                self.auto_scroll = false;
-                true
-            }
-            MouseEventKind::ScrollDown => {
-                self.scroll_offset = self.scroll_offset.saturating_sub(WHEEL_SCROLL_LINES);
-                self.rearm_if_near_bottom();
-                true
-            }
+            MouseEventKind::ScrollUp => self.scroll_the_wheel(true),
+            MouseEventKind::ScrollDown => self.scroll_the_wheel(false),
             MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
                 self.quit.disarm();
                 if let Some(cell) = self.cell_at(mouse.column, mouse.row) {
@@ -1810,6 +2667,23 @@ impl TuiApp {
             }
             _ => false,
         }
+    }
+
+    /// One wheel notch: up pages into the conversation, down toward the
+    /// newest line.
+    ///
+    /// The plain transcript and both overlays take their scrolling from
+    /// here, so a notch means the same distance and rearms auto-scroll on
+    /// the same terms wherever it arrives.
+    fn scroll_the_wheel(&mut self, up: bool) -> bool {
+        if up {
+            self.scroll_offset = self.scroll_offset.saturating_add(WHEEL_SCROLL_LINES);
+            self.auto_scroll = false;
+        } else {
+            self.scroll_offset = self.scroll_offset.saturating_sub(WHEEL_SCROLL_LINES);
+            self.rearm_if_near_bottom();
+        }
+        true
     }
 
     /// Scroll one step while a drag sits at the pane's top or bottom
@@ -2620,8 +3494,7 @@ impl TuiApp {
                 .load(std::sync::atomic::Ordering::SeqCst);
         if questions_retired {
             self.pending_questions.clear();
-            self.question_cursor = 0;
-            self.question_toggled.clear();
+            self.clamp_question_view();
         }
         self.any_tools_running()
             || claimed
@@ -2678,12 +3551,34 @@ impl TuiApp {
         // first row of the terminal, or the spacer above the composer
         // every later pane shifts down past.
         let strip_at_top = matches!(self.strip_position, StripPosition::Top);
-        let mut constraints = Vec::with_capacity(6);
+        // A pending question reserves its sheet's rows above the
+        // bottom furniture: the sheet's height minus the notice,
+        // spacer, and composer rows it already covers. The
+        // conversation's Min(0) chunk gives those rows up, so its
+        // text ends above the box — nothing the run said hides
+        // behind the ask.
+        let question_pending =
+            self.pending_permissions.is_empty() && !self.pending_questions.is_empty();
+        let question_reserved = if question_pending {
+            let sheet_area_height = self.question_sheet_area(area).height;
+            let sheet = self.question_sheet_height(
+                area.width,
+                sheet_area_height,
+                self.pending_questions.len().saturating_sub(1),
+            );
+            sheet.saturating_sub(composer_height.saturating_add(2))
+        } else {
+            0
+        };
+        let mut constraints = Vec::with_capacity(7);
         if strip_at_top {
             constraints.push(Constraint::Length(1));
         }
+        constraints.push(Constraint::Min(0));
+        if question_reserved > 0 {
+            constraints.push(Constraint::Length(question_reserved));
+        }
         constraints.extend([
-            Constraint::Min(0),
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(composer_height),
@@ -2695,9 +3590,17 @@ impl TuiApp {
             .split(area);
 
         let base = usize::from(strip_at_top);
+        // The rows reserved for the ask's sheet sit between the
+        // conversation and the bottom furniture, so every chunk from
+        // the notice down shifts one slot while a question is up. The
+        // conversation keeps `base`; everything below the reservation
+        // walks from `furniture`, or the notice, strip, composer, and
+        // status bar each render a row too high — and the status bar's
+        // own rows are never painted at all.
+        let furniture = base.saturating_add(usize::from(question_reserved > 0));
         let fallback = area;
         self.render_conversation(frame, pane(&chunks, base, fallback));
-        self.render_notice(frame, pane(&chunks, base.saturating_add(1), fallback));
+        self.render_notice(frame, pane(&chunks, furniture.saturating_add(1), fallback));
         // While the agent runs, the strip breathes in its configured
         // row; when that row is the composer's spacer, the paintless
         // hairline stands down for those frames rather than
@@ -2714,13 +3617,13 @@ impl TuiApp {
         let strip_row = if strip_at_top {
             0
         } else {
-            base.saturating_add(2)
+            furniture.saturating_add(2)
         };
         let strip_drew = self.render_pulse_strip(frame, pane(&chunks, strip_row, fallback));
         let strip_owns_spacer = strip_drew && !strip_at_top;
         if let Some(color) = self.theme.ui.composer_border {
-            let spacer = pane(&chunks, base.saturating_add(2), fallback);
-            let composer = pane(&chunks, base.saturating_add(3), fallback);
+            let spacer = pane(&chunks, furniture.saturating_add(2), fallback);
+            let composer = pane(&chunks, furniture.saturating_add(3), fallback);
             // The hairline is the composer's top edge on border themes:
             // an underlined row of spaces reads as a rule without
             // consuming a layout row of its own. While the strip
@@ -2742,12 +3645,12 @@ impl TuiApp {
                 frame.buffer_mut().set_style(bottom, rule);
             }
         }
-        let input_area = pane(&chunks, base.saturating_add(3), fallback);
+        let input_area = pane(&chunks, furniture.saturating_add(3), fallback);
         self.input_wrap_width = wrap_width;
         self.render_input(frame, input_area, &rows, caret);
         self.render_status_bar(
             frame,
-            pane(&chunks, base.saturating_add(4), fallback),
+            pane(&chunks, furniture.saturating_add(4), fallback),
             &rows,
             caret,
         );
@@ -2760,7 +3663,7 @@ impl TuiApp {
             self.render_permission_overlay(frame, area, &prompt, more);
             return;
         }
-        if self.pending_permissions.is_empty() && self.pending_questions.front().is_some() {
+        if self.pending_permissions.is_empty() && !self.pending_questions.is_empty() {
             self.render_question_overlay(
                 frame,
                 area,
@@ -2772,26 +3675,141 @@ impl TuiApp {
     /// Render the pending question as a sheet over the prompt box.
     ///
     /// The same anchored sheet the permission ask uses, carrying the
-    /// question's optional header chip, its text, its option rows
-    /// (the cursor marked `›`, toggled multi-select rows marked `•`),
-    /// each option's dimmed description, and the key hints. Long
-    /// question text wraps at the box's inner width; option labels
-    /// and descriptions clamp to one row each, ellipsized — the
-    /// pickable surface stays scannable whatever the model asked.
-    /// Only a terminal shorter than the box clips, at the box's top.
+    /// question's optional header chip, its text, its option rows (the
+    /// cursor row marked `›`, a marked row also `•`), each option's
+    /// dimmed description, the key hints — and, after the model's
+    /// options, the compose row: the escape the option list never
+    /// offered, where Enter or Space opens a draft the user types freely
+    /// and the next Enter sends as the answer. While that draft is open
+    /// the terminal cursor rides its caret, so the cell the next
+    /// character lands in is visible; the composer's own caret is hidden
+    /// under a question anyway, so nothing competes for it. Long question
+    /// text wraps at the box's inner width; option labels and
+    /// descriptions clamp to one row each, ellipsized — the pickable
+    /// surface stays scannable whatever the model asked. The frame
+    /// reserves the sheet's height above the conversation (see
+    /// [`TuiApp::render`]), so nothing the run said hides behind the
+    /// box. A terminal shorter than the sheet does not clip it: the same
+    /// walk chooses the rows that fit, keeping the draft row and the hints
+    /// and windowing the options around the cursor.
     fn render_question_overlay(&self, frame: &mut Frame, area: Rect, more: usize) {
-        let Some(question) = self.pending_questions.front() else {
+        let Some(entry) = self.shown_question() else {
             return;
         };
-        let hints = if more == 0 {
-            "[↑↓] move · [space] toggle · [enter] confirm · [esc] dismiss".to_string()
+        let sheet_area = self.question_sheet_area(area);
+        let wrap_at = usize::from(area.width.saturating_sub(4));
+        // The same budget the reservation worked from, so the rows the
+        // walk chose to spend and the rows the layout held aside are the
+        // same rows — one sheet, counted once.
+        let budget = usize::from(sheet_area.height.saturating_sub(2));
+        let sheet = self.question_sheet(entry, wrap_at, more, budget);
+        let lines = sheet.lines;
+        let height = u16::try_from(lines.len())
+            .unwrap_or(u16::MAX)
+            .saturating_add(2)
+            .min(sheet_area.height);
+        let overlay = bottom_sheet_rect(height, sheet_area);
+        if overlay.width == 0 || overlay.height == 0 {
+            return;
+        }
+        let accent = Style::default().fg(self.theme.ui.primary);
+        // The title names the shown question's place in the batch. The
+        // walk moves the view and not the queue, so the number holds
+        // still while the user walks away from a question and back to it
+        // — which is the whole reason it is worth a place on the border.
+        let title = if more == 0 {
+            " Question ".to_string()
         } else {
             format!(
-                "[↑↓] move · [space] toggle · [enter] confirm · [esc] dismiss · {more} more waiting"
+                " Question {} of {} ",
+                self.question_view.saturating_add(1),
+                more.saturating_add(1)
             )
         };
-        let wrap_at = usize::from(area.width.saturating_sub(4));
-        let mut lines: Vec<Line<'_>> = Vec::new();
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(accent)
+            .title(Span::styled(title, accent));
+        frame.render_widget(Clear, overlay);
+        frame.render_widget(Paragraph::new(lines).block(block), overlay);
+        // The draft's caret is the terminal cursor, parked on the cell
+        // the next character takes. It does not blink: the composer's
+        // blink serves a prompt that is always there, while this mode is
+        // one the user stepped into in order to type, and a caret going
+        // dark mid-word reads as a dropped keystroke. Clamped to the
+        // box, so a draft past its width parks the cursor on the last
+        // cell the sheet can show rather than somewhere off it.
+        if let Some((row, column)) = sheet.caret
+            && row.saturating_add(1) < usize::from(overlay.height)
+        {
+            let caret_x = usize::from(overlay.x)
+                .saturating_add(1)
+                .saturating_add(COMPOSE_PREFIX.width())
+                .saturating_add(column)
+                .min(usize::from(overlay.right()).saturating_sub(1));
+            let caret_y = usize::from(overlay.y)
+                .saturating_add(1)
+                .saturating_add(row)
+                .min(usize::from(overlay.bottom()).saturating_sub(1));
+            frame.set_cursor_position((
+                u16::try_from(caret_x).unwrap_or(0),
+                u16::try_from(caret_y).unwrap_or(0),
+            ));
+        }
+    }
+
+    /// The question sheet's rows and the caret riding them, laid out for
+    /// the width the box has and the height the terminal leaves it.
+    ///
+    /// Every consumer of the sheet's shape — the render and the height
+    /// the frame reserves for it — builds through this one walk, so the
+    /// box the user sees and the rows the layout holds aside can never
+    /// drift apart.
+    ///
+    /// `budget` is the rows the sheet may occupy inside its borders, and
+    /// both consumers hand it the same number. When the terminal cannot
+    /// hold everything, the rows go where the answer is made: the draft
+    /// row and the key hints keep theirs whatever happens, because a
+    /// sheet that cut the row being typed would leave the user writing
+    /// blind, and it is the option list that gives way — windowed around
+    /// the row the cursor stands on, so the walk stays on screen and the
+    /// arrows walk the window alongside it. See [`fit_question_sheet`].
+    fn question_sheet(
+        &self,
+        entry: &PendingQuestion,
+        wrap_at: usize,
+        more: usize,
+        budget: usize,
+    ) -> QuestionSheet {
+        let head = self.question_sheet_head(entry, wrap_at);
+        let options = self.question_sheet_options(entry, wrap_at);
+        let (compose, caret_in_compose) = self.question_sheet_compose(entry, wrap_at);
+        let tail = self.question_sheet_tail(entry, wrap_at, more);
+        let cursor_option = entry.ui.cursor.min(entry.prompt.options.len());
+        let (lines, compose_start) =
+            fit_question_sheet(head, &options, compose, tail, cursor_option, budget);
+        // The caret rides the row the draft's own wrap chose, inside the
+        // compose block; the block starts where the fitted sheet says it
+        // does. A terminal too short to reach that block loses the caret
+        // and nothing else — the draft row itself is never the row cut.
+        let caret = caret_in_compose
+            .map(|(row, column)| (compose_start.saturating_add(row), column))
+            .filter(|(row, _)| *row < lines.len());
+        QuestionSheet { lines, caret }
+    }
+
+    /// The sheet's opening block: the header chip, the question's own
+    /// text, and the row of air over the options.
+    ///
+    /// The question wraps at the box's inner width and clamps to
+    /// [`MAX_OVERLAY_ROWS`] rows, the last ellipsized, so a paragraph of a
+    /// question cannot push the options off a short terminal on its own.
+    /// It is the one text block the sheet never re-wraps: what was asked
+    /// is what the user has to read to answer.
+    fn question_sheet_head(&self, entry: &PendingQuestion, wrap_at: usize) -> Vec<Line<'static>> {
+        let question = &entry.prompt;
+        let mut lines: Vec<Line<'static>> = Vec::new();
         if let Some(header) = &question.header {
             lines.push(Line::styled(
                 format!("[{header}]"),
@@ -2804,64 +3822,312 @@ impl TuiApp {
                 .map(|row| Line::styled(row, Style::default().fg(self.theme.ui.foreground))),
         );
         lines.push(Line::default());
-        for (index, option) in question.options.iter().enumerate() {
-            let marker = if index == self.question_cursor {
-                "› "
-            } else {
-                "  "
-            };
-            let checked = if self.question_toggled.contains(&index) {
-                "• "
-            } else {
-                "  "
-            };
-            let label = wrap_prompt_rows(&format!("{marker}{checked}{}", option.label), wrap_at, 1)
-                .first()
-                .cloned()
-                .unwrap_or_default();
-            let style = if index == self.question_cursor {
-                Style::default().fg(self.theme.ui.primary)
-            } else {
-                Style::default().fg(self.theme.ui.foreground)
-            };
-            lines.push(Line::styled(label, style));
-            if let Some(description) = &option.description {
-                let detail = wrap_prompt_rows(&format!("      {description}"), wrap_at, 1)
+        lines
+    }
+
+    /// The sheet's option block: one entry per option, holding its label
+    /// row and, where it has one, its description row beneath it.
+    ///
+    /// Grouped rather than flattened because a short terminal drops
+    /// options whole: a description left standing apart from the label it
+    /// describes reads as another option's. The grouping is also what lets
+    /// the sheet keep the cursor's own option visible — the walk that
+    /// chooses which options survive is anchored on it.
+    ///
+    /// Labels and descriptions clamp to one row each, ellipsized, so the
+    /// pickable surface stays scannable whatever the model asked. The
+    /// indent is applied *outside* `wrap_prompt_rows`: that wrapper splits
+    /// on spaces, so a leading run of them is dropped as empty words and
+    /// the row lands flush-left instead.
+    fn question_sheet_options(
+        &self,
+        entry: &PendingQuestion,
+        wrap_at: usize,
+    ) -> Vec<(usize, Vec<Line<'static>>)> {
+        let question = &entry.prompt;
+        let ui = &entry.ui;
+        // A reply being written to a question that wants one answer has
+        // the ask to itself: the dot on a marked row steps aside for the
+        // duration, because the Enter taken inside the draft answers with
+        // those words and not with the row. Stepping back out with Esc
+        // brings the dot back — the mark was never taken away, only
+        // shadowed while something else was being chosen.
+        let draft_supersedes =
+            ui.composing && !question.multi_select && !ui.draft.trim().is_empty();
+        question
+            .options
+            .iter()
+            .enumerate()
+            .map(|(index, option)| {
+                let marker = if index == ui.cursor && !ui.composing {
+                    "\u{203a} "
+                } else {
+                    "  "
+                };
+                let checked = if ui.toggled.contains(&index) && !draft_supersedes {
+                    "\u{2022} "
+                } else {
+                    "  "
+                };
+                let label =
+                    wrap_prompt_rows(&format!("{marker}{checked}{}", option.label), wrap_at, 1)
+                        .first()
+                        .cloned()
+                        .unwrap_or_default();
+                let style = if index == ui.cursor {
+                    Style::default().fg(self.theme.ui.primary)
+                } else {
+                    Style::default().fg(self.theme.ui.foreground)
+                };
+                let mut rows = vec![Line::styled(label, style)];
+                if let Some(description) = &option.description {
+                    let detail = wrap_prompt_rows(
+                        description,
+                        wrap_at.saturating_sub(DETAIL_INDENT.width()),
+                        1,
+                    )
                     .first()
                     .cloned()
                     .unwrap_or_default();
+                    rows.push(Line::styled(
+                        format!("{DETAIL_INDENT}{detail}"),
+                        Style::default().fg(self.theme.ui.secondary),
+                    ));
+                }
+                (index, rows)
+            })
+            .collect()
+    }
+
+    /// The sheet's compose block: the row the answer is written on, with
+    /// the draft laid across as many rows as the box's width asks for, and
+    /// the caret's place in that layout while the draft owns the keys.
+    ///
+    /// The draft wraps with the composer's own wrap rather than a second
+    /// one of the sheet's devising, so the two editable surfaces in the
+    /// app break text at the same points and an answer longer than the box
+    /// — a path, a UUID, a sentence — continues on a row the user can see
+    /// instead of running past the border into nothing. The caret's row
+    /// comes out of that wrap too, which is the only place that knows
+    /// which row the caret's character landed on.
+    ///
+    /// Outside the draft the block is the row at rest plus the subtext
+    /// saying what it is for: the invitation, or the words already typed,
+    /// which Esc leaves in place precisely because stepping out of the
+    /// mode is not a request to lose them.
+    fn question_sheet_compose(
+        &self,
+        entry: &PendingQuestion,
+        wrap_at: usize,
+    ) -> (Vec<Line<'static>>, Option<(usize, usize)>) {
+        let ui = &entry.ui;
+        let mut lines: Vec<Line<'static>> = vec![Line::default()];
+        if ui.composing {
+            let draft_width = wrap_at
+                .saturating_sub(COMPOSE_PREFIX.width())
+                .max(1)
+                .min(u16::MAX as usize);
+            let caret_byte = byte_index(&ui.draft, ui.caret);
+            let (rows, caret) = crate::input::wrap_rows_and_caret(
+                &ui.draft,
+                caret_byte,
+                u16::try_from(draft_width).unwrap_or(1).max(1),
+            );
+            let first = lines.len();
+            // Every row spends the prefix's width before its text — the
+            // pencil on the first, the same width of air on the rows
+            // below — so the caret's column means one thing wherever it
+            // lands, and the renderer adds the prefix once for all of them.
+            let continuation = " ".repeat(COMPOSE_PREFIX.width());
+            for (index, row) in rows.iter().enumerate() {
+                let prefix = if index == 0 {
+                    COMPOSE_PREFIX
+                } else {
+                    continuation.as_str()
+                };
                 lines.push(Line::styled(
-                    detail,
-                    Style::default().fg(self.theme.ui.secondary),
+                    format!("{prefix}{row}"),
+                    Style::default().fg(self.theme.ui.primary),
                 ));
             }
+            let (caret_row, caret_column) = caret.unwrap_or((0, 0));
+            return (
+                lines,
+                Some((
+                    first.saturating_add(usize::from(caret_row)),
+                    usize::from(caret_column),
+                )),
+            );
         }
-        lines.push(Line::default());
+        let free_row = entry.prompt.options.len();
+        let marker = if ui.cursor == free_row {
+            "\u{203a} "
+        } else {
+            "  "
+        };
+        // The same dot an option row wears, because Space marks this
+        // row exactly as it marks those: the dot is what says the
+        // typed reply joins the answer. Inside the draft the row
+        // shows the caret instead — the text being written has the
+        // row to itself, and a dot beside a blinking caret says
+        // nothing the caret does not.
+        let checked = if ui.toggled.contains(&free_row) {
+            "\u{2022} "
+        } else {
+            "  "
+        };
+        // A draft carried back out of the compose mode is the
+        // user's text and takes the row in place of the
+        // invitation: Esc leaves the mode, never the words.
+        let has_draft = !ui.draft.is_empty();
+        let body = if has_draft {
+            ui.draft.as_str()
+        } else {
+            "Type your answer"
+        };
+        lines.push(Line::styled(
+            format!("{marker}{checked}\u{270e} {body}"),
+            if ui.cursor == free_row {
+                Style::default().fg(self.theme.ui.primary)
+            } else {
+                Style::default().fg(self.theme.ui.foreground)
+            },
+        ));
+        let subtext = if has_draft {
+            "enter opens it again \u{b7} enter there sends"
+        } else {
+            "a reply the options did not offer"
+        };
+        lines.push(Line::styled(
+            format!("{DETAIL_INDENT}{subtext}"),
+            Style::default().fg(self.theme.ui.secondary),
+        ));
+        (lines, None)
+    }
+
+    /// The sheet's closing block: the row of air under the compose row and
+    /// the keys explained.
+    ///
+    /// The hints never give up their rows to the terminal, which is the
+    /// other half of why they lead with the keys that end the exchange:
+    /// what a short terminal cuts is the tail of the list, not the list.
+    fn question_sheet_tail(
+        &self,
+        entry: &PendingQuestion,
+        wrap_at: usize,
+        more: usize,
+    ) -> Vec<Line<'static>> {
+        let ui = &entry.ui;
+        let mut lines: Vec<Line<'static>> = vec![Line::default()];
+        // Space marks a row on every ask, so the hint names it on every
+        // ask: it adds and removes rows where several answers are wanted
+        // and moves the one mark where a single one is. It never answers,
+        // which is what the row's own wording promises — Enter is the
+        // press that sends.
+        let toggle = if entry.prompt.multi_select {
+            "[space] toggle"
+        } else {
+            "[space] pick"
+        };
+        // The keys that end the exchange lead the row, because a narrow
+        // terminal cuts its tail: hints wrap at the box's width and the
+        // last row is ellipsized, so whatever trails is the first thing a
+        // user on a small terminal never sees. Leaving the key that cancels
+        // last hid exactly the hint that matters most when the row cannot
+        // fit.
+        let parts: Vec<&str> = if ui.composing {
+            // The row that promises a send owns the refusal too. A draft
+            // holding nothing is not an answer, and the notice row above
+            // the composer — where a refusal would naturally be posted —
+            // is a row the sheet is drawn over. So the promise changes its
+            // own wording: the key says what it needs before it works.
+            let enter = if ui.draft.trim().is_empty() {
+                "[enter] needs a written answer"
+            } else {
+                "[enter] send"
+            };
+            vec![
+                "[esc] back",
+                enter,
+                "[home/end] ends",
+                "[\u{2190}\u{2192}] caret",
+            ]
+        } else if more == 0 {
+            vec![
+                "[esc] dismiss",
+                "[enter] confirm",
+                "[\u{2191}\u{2193}] move",
+                toggle,
+            ]
+        } else {
+            // The batch's hint narrows Esc to the row under it: one press
+            // answers one question's dismissal, and the questions behind
+            // it stay asked. Saying `[esc] dismiss` over a queue of ten let
+            // it be read as the queue's.
+            vec![
+                "[esc] dismiss one",
+                "[enter] confirm",
+                "[\u{2191}\u{2193}] move",
+                "[\u{2190}\u{2192}] question",
+                toggle,
+            ]
+        };
+        let hints = parts.join(" \u{b7} ");
         lines.extend(
             wrap_prompt_rows(&hints, wrap_at, MAX_OVERLAY_ROWS)
                 .into_iter()
                 .map(|row| Line::styled(row, Style::default().fg(self.theme.ui.secondary))),
         );
-        let sheet_area = Rect {
-            height: area.height.saturating_sub(STATUS_BAR_ROWS),
-            ..area
+        lines
+    }
+
+    /// The rows the pending question's sheet occupies, borders included.
+    ///
+    /// The frame reserves this many rows above its bottom furniture —
+    /// whatever of the sheet the furniture does not already cover —
+    /// so the conversation's rows end above the box instead of
+    /// rendering behind it. A terminal shorter than the sheet fits the
+    /// sheet to it, rows chosen as [`fit_question_sheet`] describes,
+    /// rather than hanging rows the frame has nowhere to draw.
+    ///
+    /// `more` is the count the sheet itself renders beside the hints.
+    /// Passing anything else desynchronizes the two by exactly the rows
+    /// the queue segment adds once the hints wrap — the box grows past
+    /// the rows held aside and covers the conversation's tail it was
+    /// reserved to uncover.
+    #[must_use]
+    fn question_sheet_height(&self, width: u16, sheet_area_height: u16, more: usize) -> u16 {
+        let Some(entry) = self.shown_question() else {
+            return 0;
         };
-        let height = u16::try_from(lines.len())
+        let wrap_at = usize::from(width.max(4).saturating_sub(4));
+        let budget = usize::from(sheet_area_height.saturating_sub(2));
+        let sheet = self.question_sheet(entry, wrap_at, more, budget);
+        u16::try_from(sheet.lines.len())
             .unwrap_or(u16::MAX)
             .saturating_add(2)
-            .min(sheet_area.height);
-        let overlay = bottom_sheet_rect(height, sheet_area);
-        if overlay.width == 0 || overlay.height == 0 {
-            return;
+            .min(sheet_area_height)
+    }
+
+    /// The rows a question sheet may take over the frame.
+    ///
+    /// The status bar's rows stay its own — the session line reads while
+    /// an ask waits — and so does the strip's row when the strip is
+    /// configured to the top of the terminal: the sheet cannot occupy a
+    /// row the layout has already promised elsewhere, and a reservation
+    /// that counted it too asked the solver for one row more than the
+    /// frame had, leaving it to squeeze an unspecified pane to pay. Both
+    /// the reservation and the box derive their height from here, so they
+    /// cannot disagree about how much room there is.
+    fn question_sheet_area(&self, area: Rect) -> Rect {
+        let strip_rows = u16::from(matches!(self.strip_position, StripPosition::Top));
+        Rect {
+            height: area
+                .height
+                .saturating_sub(STATUS_BAR_ROWS)
+                .saturating_sub(strip_rows),
+            ..area
         }
-        let accent = Style::default().fg(self.theme.ui.primary);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(accent)
-            .title(Span::styled(" Question ", accent));
-        frame.render_widget(Clear, overlay);
-        frame.render_widget(Paragraph::new(lines).block(block), overlay);
     }
 
     /// Render the pending permission ask as a sheet over the prompt
@@ -3998,7 +5264,7 @@ impl TuiApp {
     pub fn composer_caret_visible(&self) -> bool {
         self.caret_blink.on
             && self.pending_permissions.front().is_none()
-            && self.pending_questions.front().is_none()
+            && self.pending_questions.is_empty()
     }
 
     /// Render the one-line status bar.
@@ -5041,6 +6307,42 @@ static NO_LINES: [Line<'static>; 0] = [];
 /// reaches the terminal as a cell the renderer never meant to
 /// draw. Both spellings fold here; every other character passes
 /// through untouched.
+/// A paste's text as the question draft can hold it: one line, nothing
+/// discarded.
+///
+/// The composer keeps pasted newlines because its own buffer is
+/// multi-line; a draft answers one question in one row, so the breaks a
+/// pasted block carries become the spaces between its parts. Any other
+/// control character joins them for the same reason the terminal has no
+/// cell for it — a tab or a stray escape has nowhere to draw — and the
+/// spaces leave the text readable and re-editable.
+fn paste_for_one_line(text: &str) -> String {
+    normalize_pasted_newlines(text)
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect()
+}
+
+/// Whether a key belongs to the app while an overlay owns the screen.
+///
+/// Paging the transcript and cycling the display verbosity read the
+/// conversation; neither answers the question or the permission waiting on
+/// top of it, and that conversation is exactly what a user needs in order
+/// to decide. Both overlays therefore hold these keys off the sheet and
+/// hand them to the machinery below, the way they already hold off the `c`
+/// chords: swallowing them would leave a user scrolling for context with a
+/// keyboard that answers nothing.
+fn key_survives_the_sheet(key: KeyEvent) -> bool {
+    let chord = key.code == KeyCode::Char('c')
+        && (key.modifiers == KeyModifiers::CONTROL
+            || key.modifiers == KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+    chord
+        || matches!(
+            key.code,
+            KeyCode::PageUp | KeyCode::PageDown | KeyCode::F(2)
+        )
+}
+
 fn normalize_pasted_newlines(text: &str) -> String {
     if !text.contains('\r') {
         return text.to_string();
@@ -8463,5 +9765,226 @@ mod tests {
                 });
             assert!(italic, "the live body renders italic: {line:?}");
         }
+    }
+
+    #[test]
+    fn the_draft_wraps_a_written_answer_with_the_caret_in_it() {
+        // The rows a written answer is drawn across, and the caret's place
+        // among them, come from the composer's own wrap — the sheet asks the
+        // same question the composer asks and gets the same answer.
+        let (rows, caret) = crate::input::wrap_rows_and_caret("keep the reply short", 4, 10);
+        assert_eq!(
+            rows,
+            vec!["keep the", "reply", "short"],
+            "the draft breaks where the composer breaks the same text"
+        );
+        assert_eq!(
+            caret,
+            Some((0, 4)),
+            "a caret after a word stands in that word's row, past it"
+        );
+
+        let (_rows, caret) = crate::input::wrap_rows_and_caret("keep the reply short", 12, 10);
+        assert_eq!(
+            caret,
+            Some((1, 3)),
+            "a caret inside a wrapped row counts cells from that row's own start"
+        );
+    }
+
+    #[test]
+    fn a_caret_after_the_last_character_opens_the_row_it_writes_on() {
+        // A caret past the last character takes the next free cell, which is
+        // a row of its own when the row it follows has no room left — the
+        // cell a user is about to type into is always on screen.
+        let (rows, caret) = crate::input::wrap_rows_and_caret("short", 5, 5);
+        assert_eq!(rows, vec!["short", ""], "a full row hands the caret a row");
+        assert_eq!(caret, Some((1, 0)));
+
+        let (rows, caret) = crate::input::wrap_rows_and_caret("hi", 2, 10);
+        assert_eq!(rows, vec!["hi"], "room left on the row means no extra row");
+        assert_eq!(caret, Some((0, 2)));
+    }
+
+    #[test]
+    fn a_pasted_block_becomes_one_line() {
+        // An answer is one line, so the breaks and control characters a
+        // pasted block carries arrive as the spaces between its parts.
+        assert_eq!(paste_for_one_line("two\r\nlines"), "two lines");
+        assert_eq!(paste_for_one_line("two\nlines"), "two lines");
+        assert_eq!(paste_for_one_line("tab\there"), "tab here");
+        assert_eq!(paste_for_one_line("plain"), "plain");
+    }
+
+    #[test]
+    fn the_keys_that_belong_to_the_app_survive_the_sheet() {
+        // The keys that read the conversation rather than answer the sheet
+        // stay the app's, so a user can page for context with a question up.
+        for code in [KeyCode::PageUp, KeyCode::PageDown, KeyCode::F(2)] {
+            assert!(
+                key_survives_the_sheet(KeyEvent::new(code, KeyModifiers::NONE)),
+                "{code:?} reads the conversation, not the sheet"
+            );
+        }
+        assert!(key_survives_the_sheet(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL
+        )));
+        for key in [
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+        ] {
+            assert!(
+                !key_survives_the_sheet(key),
+                "{key:?} belongs to the sheet in front of the user"
+            );
+        }
+    }
+
+    /// Rows to spend on the sheet, marked by the block each came from, so
+    /// a test can say which rows survived.
+    fn block_rows(mark: &str, count: usize) -> Vec<ratatui::text::Line<'static>> {
+        (0..count)
+            .map(|index| ratatui::text::Line::from(format!("{mark}{index}")))
+            .collect()
+    }
+
+    #[test]
+    fn the_sheet_never_gives_up_the_row_being_written() {
+        // The compose block and the key hints are what a user cannot answer
+        // without, so they are paid for first and the question's text and the
+        // option list are what a short terminal takes from.
+        let groups: Vec<(usize, Vec<ratatui::text::Line<'static>>)> =
+            (0..2).map(|index| (index, block_rows("o", 1))).collect();
+        let (lines, compose_start) = fit_question_sheet(
+            block_rows("h", 3),
+            &groups,
+            block_rows("c", 2),
+            block_rows("t", 1),
+            0,
+            3,
+        );
+        let rows: Vec<String> = lines.iter().map(ToString::to_string).collect();
+        assert_eq!(compose_start, 0, "the draft starts at the top of the sheet");
+        assert_eq!(
+            rows,
+            vec!["c0", "c1", "t0"],
+            "a terminal holding only the untouchable blocks keeps them whole"
+        );
+
+        // One more row buys the question's text back before it buys a
+        // single option: reading the question outranks reading the list.
+        let groups = vec![(0, block_rows("o", 1)), (1, block_rows("o", 1))];
+        let (lines, compose_start) = fit_question_sheet(
+            block_rows("h", 3),
+            &groups,
+            block_rows("c", 2),
+            block_rows("t", 1),
+            0,
+            6,
+        );
+        let rows: Vec<String> = lines.iter().map(ToString::to_string).collect();
+        assert_eq!(compose_start, 3);
+        assert_eq!(rows, vec!["h0", "h1", "h2", "c0", "c1", "t0"]);
+    }
+
+    #[test]
+    fn the_option_window_holds_the_row_the_cursor_stands_on() {
+        // The options give way as a window around the row the cursor stands
+        // on, never as a truncation that leaves the cursor outside.
+        let options: Vec<(usize, Vec<ratatui::text::Line<'static>>)> =
+            (0..5).map(|index| (index, block_rows("o", 1))).collect();
+        assert_eq!(
+            option_window(&options, 4, 1),
+            (4, 5),
+            "the cursor's own row is the row that survives"
+        );
+        assert_eq!(
+            option_window(&options, 1, 2),
+            (1, 3),
+            "the window grows below first, so the list reads in the order it was asked"
+        );
+        assert_eq!(option_window(&options, 2, 0), (0, 0), "nothing to show");
+        let tall = vec![(0, block_rows("o", 3)), (1, block_rows("o", 1))];
+        assert_eq!(
+            option_window(&tall, 0, 2),
+            (0, 0),
+            "a cursor's group that will not fit leaves the list out entirely"
+        );
+    }
+
+    #[test]
+    fn the_draft_walks_and_erases_by_words() {
+        // Editing a written reply follows the composer's line-editor
+        // conventions: words are units, and `Delete` erases to the right.
+        let mut ui = QuestionUi::default();
+        ui.open_composing();
+        for ch in "run the lints".chars() {
+            ui.type_char(ch);
+        }
+        assert_eq!(ui.caret, 13);
+
+        ui.caret_word_left();
+        assert_eq!(ui.caret, 8, "the caret lands at the word's start");
+        ui.caret_word_right();
+        assert_eq!(ui.caret, 13, "and walks back the same distance");
+
+        ui.caret_word_left();
+        ui.delete_word_left();
+        assert_eq!(
+            ui.draft, "run lints",
+            "one word goes with the space that held it off, and not the line"
+        );
+        assert_eq!(ui.caret, 4);
+
+        ui.caret_word_left();
+        assert_eq!(ui.caret, 0, "the caret stops at the line's start");
+        ui.delete_word_left();
+        assert_eq!(ui.draft, "run lints", "nothing lies before the start");
+
+        ui.caret_end();
+        ui.delete_to_start();
+        assert_eq!(
+            ui.draft, "",
+            "from the end of the line, one press takes everything written"
+        );
+
+        for ch in "draft".chars() {
+            ui.type_char(ch);
+        }
+        ui.caret = 0;
+        ui.delete_forward();
+        assert_eq!(ui.draft, "raft", "Delete erases right of the caret");
+        ui.caret_word_right();
+        assert_eq!(ui.caret, 4);
+        ui.insert_str("s were ");
+        assert_eq!(ui.draft, "rafts were ", "a paste lands at the caret");
+    }
+
+    #[test]
+    fn the_sheet_is_measured_against_the_rows_left_after_the_strip() {
+        // The rows the question sheet may occupy: the frame's height less
+        // the status bar, less the pulse strip's row when it is configured
+        // to the top. The sheet's reservation and its box are both measured
+        // from here, which is what keeps the layout's fixed rows from ever
+        // summing past the frame the solver was handed.
+        use ratatui::layout::Rect;
+
+        let mut app = app();
+        let area = Rect::new(0, 0, 40, 12);
+        assert_eq!(
+            app.question_sheet_area(area).height,
+            12 - STATUS_BAR_ROWS,
+            "the status bar's rows are spoken for before the sheet sees the frame"
+        );
+
+        app.strip_position = dch_config::StripPosition::Top;
+        assert_eq!(
+            app.question_sheet_area(area).height,
+            12 - STATUS_BAR_ROWS - 1,
+            "a strip at the top spends a row the sheet is then not offered"
+        );
     }
 }

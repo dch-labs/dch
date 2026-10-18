@@ -400,4 +400,155 @@ mod cases {
         );
         driver.await.unwrap();
     }
+
+    #[tokio::test]
+    async fn one_dismissal_withdraws_the_questions_behind_it() {
+        // What the UI leans on. A dismissal answers the whole ask, so the
+        // tool returns without ever awaiting the questions behind it — and
+        // a closed reply channel is the only notice the overlay gets that
+        // a question on its screen is no one's to ask. Pin that the
+        // untouched receivers really do drop.
+        let (ctx, mut rx) = ctx_with_channel(false);
+        let (hold_tx, mut hold_rx) = tokio::sync::mpsc::unbounded_channel();
+        let driver = tokio::spawn(async move {
+            let request = rx.recv().await.expect("request arrives");
+            let mut questions = request.questions.into_iter();
+            let first = questions.next().expect("Q1");
+            let second = questions.next().expect("Q2");
+            // Hand Q2's sender out: whether it still has a reader once
+            // the tool has returned is exactly what the UI reads.
+            hold_tx
+                .send(second.response_tx)
+                .expect("the test is listening");
+            first
+                .response_tx
+                .send(QuestionResponse {
+                    question: "First?".to_string(),
+                    answers: Vec::new(),
+                })
+                .expect("Q1 receiver alive");
+        });
+
+        let two = json!({
+            "questions": [
+                { "question": "First?", "options": [ { "label": "one" } ] },
+                { "question": "Second?", "options": [ { "label": "two" } ] }
+            ]
+        });
+        let out = ask(two, &ctx).await.unwrap();
+        assert!(out.is_error, "the dismissal is a soft error");
+        assert!(
+            out.text_content().contains("dismissed"),
+            "{}",
+            out.text_content()
+        );
+        let second = hold_rx.recv().await.expect("Q2's sender was held");
+        assert!(
+            second.is_closed(),
+            "the question the ask never reached is withdrawn"
+        );
+        driver.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_dismissal_keeps_the_answers_already_given() {
+        // Two answered and a third dismissed used to read as one flat
+        // dismissal: the answers the user did give were forwarded to the
+        // tool and dropped with the early return, so the model was told
+        // less than the exchange contained. The answered part stands, and
+        // the gap is named as the tail it is.
+        let (ctx, mut rx) = ctx_with_channel(false);
+        let driver = tokio::spawn(async move {
+            let request = rx.recv().await.expect("request arrives");
+            let mut questions = request.questions.into_iter();
+            let first = questions.next().expect("Q1");
+            first
+                .response_tx
+                .send(QuestionResponse {
+                    question: first.question,
+                    answers: vec!["one".to_string()],
+                })
+                .expect("Q1 receiver alive");
+            let second = questions.next().expect("Q2");
+            second
+                .response_tx
+                .send(QuestionResponse {
+                    question: second.question,
+                    answers: vec!["two".to_string()],
+                })
+                .expect("Q2 receiver alive");
+            let third = questions.next().expect("Q3");
+            third
+                .response_tx
+                .send(QuestionResponse {
+                    question: third.question,
+                    answers: Vec::new(),
+                })
+                .expect("Q3 receiver alive");
+        });
+
+        let three = json!({
+            "questions": [
+                { "question": "a?", "options": [ { "label": "one" } ] },
+                { "question": "b?", "options": [ { "label": "two" } ] },
+                { "question": "c?", "options": [ { "label": "three" } ] }
+            ]
+        });
+        let out = ask(three, &ctx).await.unwrap();
+        assert!(out.is_error, "an incomplete ask is still a soft error");
+        let text = out.text_content();
+        assert!(
+            text.contains("a? \u{2192} one") && text.contains("b? \u{2192} two"),
+            "what the user answered is not thrown away: {text}"
+        );
+        assert!(text.contains("unanswered"), "the gap is named: {text}");
+        driver.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_dismissed_first_question_still_asks_the_rest() {
+        // The headline of the change: `Esc` on one question answers that
+        // question and nothing else. The wait used to end there, so the
+        // questions behind it lost their asker and the model got a bare
+        // dismissal in place of everything still to be answered.
+        let (ctx, mut rx) = ctx_with_channel(false);
+        let driver = tokio::spawn(async move {
+            let request = rx.recv().await.expect("request arrives");
+            let mut questions = request.questions.into_iter();
+            let first = questions.next().expect("Q1");
+            first
+                .response_tx
+                .send(QuestionResponse {
+                    question: first.question,
+                    answers: Vec::new(),
+                })
+                .expect("Q1 receiver alive — a dismissal is an answer too");
+            // Still here, still awaiting: the dismissal was Q1's own
+            // business, so Q2's receiver is alive to be answered.
+            let second = questions.next().expect("Q2");
+            second
+                .response_tx
+                .send(QuestionResponse {
+                    question: second.question,
+                    answers: vec!["two".to_string()],
+                })
+                .expect("Q2 still being asked after Q1 was dismissed");
+        });
+
+        let two = json!({
+            "questions": [
+                { "question": "a?", "options": [ { "label": "one" } ] },
+                { "question": "b?", "options": [ { "label": "two" } ] }
+            ]
+        });
+        let out = ask(two, &ctx).await.unwrap();
+        assert!(out.is_error, "an incomplete ask is a soft error");
+        let text = out.text_content();
+        assert!(
+            text.contains("b? \u{2192} two") && !text.contains("a? \u{2192}"),
+            "only the dismissed question is missing from the read-back: {text}"
+        );
+        assert!(text.contains("1 of 2"), "the gap is counted: {text}");
+        driver.await.unwrap();
+    }
 }
