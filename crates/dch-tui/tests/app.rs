@@ -5610,6 +5610,24 @@ fn row_of(terminal: &Terminal<TestBackend>, needle: &str) -> usize {
     panic!("{needle:?} is not on screen");
 }
 
+/// The column at which `needle` starts on screen.
+///
+/// Counts cells rather than bytes — the box's own borders are
+/// multi-byte — so two rows asked about here are comparable.
+/// Panics when `needle` is nowhere on screen.
+fn column_of(terminal: &Terminal<TestBackend>, needle: &str) -> usize {
+    let buffer = terminal.backend().buffer();
+    for y in 0..buffer.area.height {
+        let row: String = (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol().to_string())
+            .collect();
+        if let Some(found) = row.find(needle) {
+            return row[..found].chars().count();
+        }
+    }
+    panic!("{needle:?} is not on screen");
+}
+
 /// Every glyph the last frame drew, row by row.
 ///
 /// One line per terminal row, newline-joined, so content assertions
@@ -5898,6 +5916,918 @@ fn run_end_clears_pending_requests() {
 }
 
 #[test]
+fn the_question_sheet_reserves_its_rows_above_the_conversation() {
+    // The ask box grows with its options, and a tall one used to
+    // paint over the conversation's bottom rows — the run's last
+    // words hidden behind the very question asking about them. The
+    // frame now holds the sheet's rows aside: the conversation ends
+    // above the box, its tail visible, whatever the options' count.
+    let question = StagedQuestion {
+        question: "Deploy the release now?",
+        options: &[
+            ("yes", Some("ships immediately")),
+            ("no", None),
+            ("later", Some("asks again tomorrow")),
+            ("staging first", Some("promote after smoke")),
+            ("force", Some("skip the checks")),
+            ("abort", None),
+        ],
+        multi_select: false,
+    };
+    let (mut app, _replies) = question_app(&[question]);
+    for step in 0..30 {
+        let _ = step;
+        app.push_message(dch_tui::TuiMessage::System {
+            text: format!("conversation row {step}"),
+            timestamp: chrono::Utc::now(),
+        });
+    }
+    app.push_message(dch_tui::TuiMessage::System {
+        text: "TAIL MARKER the last word".to_string(),
+        timestamp: chrono::Utc::now(),
+    });
+    let terminal = render_to_buffer(&mut app, 80, 24);
+    let screen = screen_text(&terminal);
+    assert!(
+        screen.contains("TAIL MARKER"),
+        "the conversation's tail stays visible above the ask: {screen}"
+    );
+    assert!(
+        screen.contains("Type your answer"),
+        "the compose row rides after the options: {screen}"
+    );
+}
+
+#[test]
+fn the_compose_row_sends_a_typed_answer_the_options_never_offered() {
+    let (mut app, mut replies) = question_app(&[StagedQuestion {
+        question: "Ship it?",
+        options: &[("yes", None), ("no", None)],
+        multi_select: false,
+    }]);
+    // Walk to the compose row (after the last option), open it, type,
+    // send: the reply is the typed text, exactly as typed.
+    let _ = app.handle_event(&plain(KeyCode::Down));
+    let _ = app.handle_event(&plain(KeyCode::Down));
+    let _ = app.handle_event(&plain(KeyCode::Enter));
+    for ch in "ship friday".chars() {
+        let _ = app.handle_event(&plain(KeyCode::Char(ch)));
+    }
+    let _ = app.handle_event(&plain(KeyCode::Enter));
+    let answer = replies.remove(0).try_recv().unwrap();
+    assert_eq!(
+        answer,
+        vec!["ship friday".to_string()],
+        "the typed text is the answer"
+    );
+    // The question resolved: the next key reaches no overlay — the
+    // composer answers instead, the one surface the overlay had
+    // swallowed the keyboard from.
+    let _ = app.handle_event(&plain(KeyCode::Char('z')));
+    assert_eq!(app.input(), "z", "the keyboard returned to the composer");
+}
+
+#[test]
+fn escape_from_compose_steps_back_to_the_options_with_the_draft_kept() {
+    let (mut app, mut replies) = question_app(&[StagedQuestion {
+        question: "Ship it?",
+        options: &[("yes", None), ("no", None)],
+        multi_select: false,
+    }]);
+    let _ = app.handle_event(&plain(KeyCode::Down));
+    let _ = app.handle_event(&plain(KeyCode::Down));
+    let _ = app.handle_event(&plain(KeyCode::Enter));
+    for ch in "maybe".chars() {
+        let _ = app.handle_event(&plain(KeyCode::Char(ch)));
+    }
+    // Esc leaves the draft, not the question; Up returns to a real
+    // option and Enter answers with its label.
+    let _ = app.handle_event(&plain(KeyCode::Esc));
+    let _ = app.handle_event(&plain(KeyCode::Up));
+    let _ = app.handle_event(&plain(KeyCode::Enter));
+    let answer = replies.remove(0).try_recv();
+    assert_eq!(
+        answer.unwrap(),
+        vec!["no".to_string()],
+        "Esc stepped back, the option row answered, the question lives no longer"
+    );
+}
+
+#[test]
+fn a_pending_question_keeps_the_status_bar() {
+    // The rows the sheet reserves sit between the conversation and the
+    // bottom furniture, so the notice, strip, composer, and status bar
+    // each claim one chunk further down while an ask is up. Miss that
+    // step and the status bar paints over the composer's rows — which
+    // the sheet clears anyway — while its own rows draw nothing at all.
+    let (mut app, _replies) = question_app(&[StagedQuestion {
+        question: "Ship it?",
+        options: &[("yes", None), ("no", None)],
+        multi_select: false,
+    }]);
+    let screen = screen_text(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        screen.contains("mode:"),
+        "the status bar survives a pending ask: {screen}"
+    );
+}
+
+#[test]
+fn space_marks_a_row_on_every_ask_and_never_answers() {
+    // Space used to do nothing at all on a question that takes one
+    // answer, and the hint line kept quiet about it. It marks a row on
+    // every ask now: the single mark moves on a single-select, rows add
+    // and drop on a multi-select. What it never does is answer — a
+    // stray press cannot send a reply, and Enter stays the one press
+    // that sends.
+    let (mut single, mut receivers) = question_app(&[StagedQuestion {
+        question: "Ship it?",
+        options: &[("yes", None), ("no", None)],
+        multi_select: false,
+    }]);
+    let screen = screen_text(&render_to_buffer(&mut single, 80, 24));
+    assert!(
+        screen.contains("[space] pick"),
+        "a single-select ask names what Space does: {screen}"
+    );
+
+    let _ = single.handle_event(&plain(KeyCode::Char(' ')));
+    let _ = single.handle_event(&plain(KeyCode::Down));
+    let marked = screen_text(&render_to_buffer(&mut single, 80, 24));
+    assert!(
+        marked.contains("\u{2022} yes"),
+        "Space marks the row it stands on, and the mark stays as the cursor moves on: {marked}"
+    );
+    assert!(
+        receivers[0].try_recv().is_err(),
+        "marking a row answers nothing"
+    );
+
+    let reply = receivers.remove(0);
+    let _ = single.handle_event(&plain(KeyCode::Enter));
+    assert_eq!(
+        reply.blocking_recv(),
+        Ok(vec!["yes".to_string()]),
+        "Enter sends the marked row, not the row the cursor ended on"
+    );
+
+    let (mut multi, _multi_rx) = question_app(&[StagedQuestion {
+        question: "Which environments?",
+        options: &[("staging", None), ("prod", None)],
+        multi_select: true,
+    }]);
+    let screen = screen_text(&render_to_buffer(&mut multi, 80, 24));
+    assert!(
+        screen.contains("[space] toggle"),
+        "a multi-select ask advertises the control it honors: {screen}"
+    );
+    let _ = multi.handle_event(&plain(KeyCode::Char(' ')));
+    let marked = screen_text(&render_to_buffer(&mut multi, 80, 24));
+    assert!(
+        marked.contains('\u{2022}'),
+        "space marks the cursor row it stands on: {marked}"
+    );
+}
+
+#[test]
+fn space_marks_the_compose_row_and_enter_is_what_writes_it() {
+    // One key, one meaning everywhere: Space puts the dot on the compose
+    // row exactly as it puts it on an option, and does not slip into the
+    // draft on the way. Enter is the press that opens the draft — and a
+    // marked row with nothing written yet has no reply to send, so Enter
+    // goes and writes one instead of answering with half of one.
+    let (mut app, mut replies) = question_app(&[StagedQuestion {
+        question: "How should this ship?",
+        options: &[("now", None), ("later", None)],
+        multi_select: false,
+    }]);
+    render_to_buffer(&mut app, 80, 30);
+    for code in [KeyCode::Down, KeyCode::Down] {
+        app.handle_event(&plain(code)); // past "later", onto the compose row
+    }
+    app.handle_event(&plain(KeyCode::Char(' ')));
+    let screen = screen_text(&render_to_buffer(&mut app, 80, 30));
+    assert!(
+        screen.contains("\u{2022} \u{270e}"),
+        "Space marks the compose row with the same dot an option wears: {screen}"
+    );
+    assert!(
+        screen.contains("[space] pick") && !screen.contains("[\u{2190}\u{2192}] caret"),
+        "marking the row is not writing it, so the draft stays shut: {screen}"
+    );
+    assert!(
+        screen.contains("How should this ship?") && screen.contains("Question"),
+        "Space marks without answering: the ask is still on screen: {screen}"
+    );
+
+    app.handle_event(&plain(KeyCode::Enter));
+    let screen = screen_text(&render_to_buffer(&mut app, 80, 30));
+    assert!(
+        screen.contains("[\u{2190}\u{2192}] caret"),
+        "Enter on the marked row opens the draft to be written: {screen}"
+    );
+    for ch in ['t', 'o', 'm', 'o', 'r', 'r', 'o', 'w'] {
+        app.handle_event(&plain(KeyCode::Char(ch)));
+    }
+    let answer = replies.remove(0);
+    app.handle_event(&plain(KeyCode::Enter));
+    assert_eq!(
+        answer.blocking_recv(),
+        Ok(vec!["tomorrow".to_string()]),
+        "a marked draft answers on its own against a single-select"
+    );
+}
+
+#[test]
+fn a_marked_draft_answers_beside_the_options_marked_with_it() {
+    // The draft used to answer alone: whatever a multi-select had marked
+    // beside it, the Enter taken inside the caret sent the typed text and
+    // dropped the marks. One answer builder serves both Enters now, so
+    // writing a reply is not a way of forgetting the rows marked for it.
+    let (mut app, mut replies) = question_app(&[StagedQuestion {
+        question: "What runs before the push?",
+        options: &[
+            ("lint", Some("the rust lints")),
+            ("tests", Some("the whole suite")),
+        ],
+        multi_select: true,
+    }]);
+    render_to_buffer(&mut app, 80, 30);
+    app.handle_event(&plain(KeyCode::Char(' '))); // mark "lint"
+    for code in [KeyCode::Down, KeyCode::Down] {
+        app.handle_event(&plain(code)); // to the compose row
+    }
+    app.handle_event(&plain(KeyCode::Char(' '))); // and mark it too
+    let screen = screen_text(&render_to_buffer(&mut app, 80, 30));
+    assert!(
+        screen.contains("\u{2022} \u{270e}"),
+        "the draft's row carries a mark of its own: {screen}"
+    );
+
+    // Typing opens the draft the mark says the reply belongs in. Enter
+    // would answer with what is marked, and an empty compose row has
+    // nothing to add to the options marked beside it.
+    for ch in ['t', 'w', 'i', 'c', 'e'] {
+        app.handle_event(&plain(KeyCode::Char(ch)));
+    }
+    let answer = replies.remove(0);
+    app.handle_event(&plain(KeyCode::Enter));
+    assert_eq!(
+        answer.blocking_recv(),
+        Ok(vec!["lint".to_string(), "twice".to_string()]),
+        "the marked options answer in the sheet's order, the draft last"
+    );
+}
+#[test]
+fn typing_at_the_rows_opens_the_draft_with_that_letter() {
+    // A letter typed with the sheet up is a reply being started. It used
+    // to be swallowed outright, so the words simply failed to appear and
+    // the only way in was to know about Enter first.
+    let (mut app, mut replies) = question_app(&[StagedQuestion {
+        question: "Say something?",
+        options: &[("yes", None), ("no", None)],
+        multi_select: false,
+    }]);
+    render_to_buffer(&mut app, 80, 30);
+    for ch in ['h', 'e', 'l', 'l', 'o'] {
+        app.handle_event(&plain(KeyCode::Char(ch)));
+    }
+    let screen = screen_text(&render_to_buffer(&mut app, 80, 30));
+    assert!(
+        screen.contains("\u{270e} hello"),
+        "the letters land in the draft, not the void: {screen}"
+    );
+    assert!(
+        screen.contains("[\u{2190}\u{2192}] caret"),
+        "and the sheet says the draft has the keys: {screen}"
+    );
+    assert_eq!(app.input(), "", "the composer never saw a keystroke");
+
+    let answer = replies.remove(0);
+    app.handle_event(&plain(KeyCode::Enter));
+    assert_eq!(
+        answer.blocking_recv(),
+        Ok(vec!["hello".to_string()]),
+        "what was typed is what answers"
+    );
+}
+
+#[test]
+fn a_written_reply_shadows_the_marked_option_and_gives_it_back() {
+    // The trade the user is making has to be on the screen while they
+    // make it. Writing against a question that wants one answer shadows
+    // the marked row's dot — the text is what Enter inside the draft
+    // would send — and stepping out with Esc hands the dot back, because
+    // the mark was never taken, only put aside while other words were
+    // being chosen.
+    let (mut app, mut replies) = question_app(&[StagedQuestion {
+        question: "Ship it?",
+        options: &[("yes", None), ("no", None)],
+        multi_select: false,
+    }]);
+    render_to_buffer(&mut app, 80, 30);
+    app.handle_event(&plain(KeyCode::Char(' '))); // mark "yes"
+    let screen = screen_text(&render_to_buffer(&mut app, 80, 30));
+    assert!(
+        screen.contains("\u{2022} yes"),
+        "Space marks the row: {screen}"
+    );
+
+    app.handle_event(&plain(KeyCode::Char('x'))); // start a reply instead
+    let screen = screen_text(&render_to_buffer(&mut app, 80, 30));
+    assert!(
+        !screen.contains("\u{2022} yes"),
+        "while the reply is being written, its text has the ask: {screen}"
+    );
+
+    app.handle_event(&plain(KeyCode::Esc)); // step back out of the draft
+    let screen = screen_text(&render_to_buffer(&mut app, 80, 30));
+    assert!(
+        screen.contains("\u{2022} yes"),
+        "and the mark is where it was left: {screen}"
+    );
+
+    let answer = replies.remove(0);
+    app.handle_event(&plain(KeyCode::Enter)); // Enter over the rows
+    assert_eq!(
+        answer.blocking_recv(),
+        Ok(vec!["yes".to_string()]),
+        "stepping back out answers with the marked row, not the abandoned words"
+    );
+}
+
+#[test]
+fn the_draft_answers_over_the_marked_option_when_entered_inside_it() {
+    // The other half of the same trade: Enter taken *inside* the draft
+    // sends the text, and the shadowed mark does not ride along to make a
+    // single-select answer two things at once.
+    let (mut app, mut replies) = question_app(&[StagedQuestion {
+        question: "Ship it?",
+        options: &[("yes", None), ("no", None)],
+        multi_select: false,
+    }]);
+    render_to_buffer(&mut app, 80, 30);
+    app.handle_event(&plain(KeyCode::Char(' '))); // mark "yes"
+    for ch in ['t', 'o', 'm', 'o', 'r', 'r', 'o', 'w'] {
+        app.handle_event(&plain(KeyCode::Char(ch))); // and write instead
+    }
+    let answer = replies.remove(0);
+    app.handle_event(&plain(KeyCode::Enter));
+    assert_eq!(
+        answer.blocking_recv(),
+        Ok(vec!["tomorrow".to_string()]),
+        "the drafted reply answers alone against a single-select"
+    );
+}
+#[test]
+fn a_walked_question_keeps_its_answer_in_progress() {
+    // Walking a batch with the arrows used to start every question
+    // fresh, so a form filled out of order lost each unfinished answer
+    // on the way past. Each question carries its own cursor, marks, and
+    // draft now: the one walked away from keeps what was left there for
+    // the return visit, and the answer sent is only ever its own.
+    let (mut app, mut receivers) = question_app(&[
+        StagedQuestion {
+            question: "Which gates block the merge?",
+            options: &[("lint", None), ("tests", None)],
+            multi_select: true,
+        },
+        StagedQuestion {
+            question: "Which deploys follow?",
+            options: &[("staging", None), ("prod", None)],
+            multi_select: true,
+        },
+    ]);
+
+    // Mark the first question's second option, then walk to the second.
+    let _ = app.handle_event(&plain(KeyCode::Down));
+    let _ = app.handle_event(&plain(KeyCode::Char(' ')));
+    let _ = app.handle_event(&plain(KeyCode::Right));
+    let screen = screen_text(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        screen.contains("Which deploys follow?"),
+        "Right walks to the next question: {screen}"
+    );
+    assert!(
+        !screen.contains("\u{2022}"),
+        "the second question arrives with nothing marked: {screen}"
+    );
+
+    // Mark its first option, then walk back.
+    let _ = app.handle_event(&plain(KeyCode::Char(' ')));
+    let _ = app.handle_event(&plain(KeyCode::Left));
+    let back = screen_text(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        back.contains("Which gates block the merge?"),
+        "Left walks back to the question it came from: {back}"
+    );
+    assert!(
+        back.contains("\u{2022} tests"),
+        "the mark left there is still there: {back}"
+    );
+
+    let first = receivers.remove(0);
+    let _ = app.handle_event(&plain(KeyCode::Enter));
+    assert_eq!(
+        first.blocking_recv(),
+        Ok(vec!["tests".to_string()]),
+        "the answered question sends its own marks, not the other one's"
+    );
+    assert!(
+        receivers[0].try_recv().is_err(),
+        "the question left mid-answer still waits"
+    );
+    let screen = screen_text(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        screen.contains("\u{2022} staging"),
+        "and it is still standing where it was left: {screen}"
+    );
+}
+
+#[test]
+fn a_capital_letter_types_into_the_open_draft() {
+    // A capital reaches a terminal as the letter with Shift held, which is
+    // how the composer's own editor receives it too. The draft dropping
+    // that shape lost the capital out of the middle of a word — "Deploy"
+    // arrived as "eploy" — and nothing on the screen said so.
+    let (mut app, _replies) = question_app(&[StagedQuestion {
+        question: "which migration runs first?",
+        options: &[("none", None)],
+        multi_select: false,
+    }]);
+    let _ = app.handle_event(&plain(KeyCode::Down));
+    let _ = app.handle_event(&plain(KeyCode::Enter)); // open the draft
+    let _ = app.handle_event(&key(KeyCode::Char('D'), KeyModifiers::SHIFT));
+    for ch in ['b', 'c'] {
+        let _ = app.handle_event(&plain(KeyCode::Char(ch)));
+    }
+    let screen = screen_text(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        screen.contains("Dbc"),
+        "the capital lands where it was typed: {screen}"
+    );
+}
+
+#[test]
+fn a_capital_letter_starts_a_draft_from_the_rows() {
+    // Typing at the rows starts the answer; a shifted letter is the same
+    // invitation. The word has to arrive whole, because the answer is
+    // what was written and not the letters that happened to be unshifted.
+    let (mut app, mut replies) = question_app(&[StagedQuestion {
+        question: "Deploy the release now?",
+        options: &[("yes", None), ("no", None)],
+        multi_select: false,
+    }]);
+    let _ = app.handle_event(&key(KeyCode::Char('Y'), KeyModifiers::SHIFT));
+    for ch in ['e', 's'] {
+        let _ = app.handle_event(&plain(KeyCode::Char(ch)));
+    }
+    let screen = screen_text(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        screen.contains("Yes"),
+        "a shifted letter opens the draft with its capital in it: {screen}"
+    );
+
+    let mut reply = replies.remove(0);
+    let _ = app.handle_event(&plain(KeyCode::Enter));
+    assert_eq!(
+        reply.try_recv().expect("the drafted answer goes at once"),
+        vec!["Yes".to_string()],
+        "the capital is in the answer, not dropped on the way to it"
+    );
+}
+
+#[test]
+fn the_draft_edits_at_its_caret() {
+    // The drafted answer was append-only: a word in the wrong place
+    // meant deleting back to it. The arrows move a caret inside the
+    // draft, Home and End jump its ends, and the terminal cursor shows
+    // where the next character lands.
+    let (mut app, _rx) = question_app(&[StagedQuestion {
+        question: "Anything to add?",
+        options: &[("yes", None)],
+        multi_select: false,
+    }]);
+    let _ = app.handle_event(&plain(KeyCode::Down));
+    let _ = app.handle_event(&plain(KeyCode::Enter));
+    for ch in ['c', 'd'] {
+        let _ = app.handle_event(&plain(KeyCode::Char(ch)));
+    }
+    let _ = app.handle_event(&plain(KeyCode::Home));
+    for ch in ['a', 'b'] {
+        let _ = app.handle_event(&plain(KeyCode::Char(ch)));
+    }
+    let mut terminal = render_to_buffer(&mut app, 80, 24);
+    let screen = screen_text(&terminal);
+    assert!(
+        screen.contains("abcd"),
+        "typing lands at the caret: {screen}"
+    );
+    assert_eq!(
+        terminal.get_cursor_position().unwrap().x,
+        7,
+        "the caret sits after the two characters typed at its start"
+    );
+
+    // Back from the end, one character back, delete: the character left
+    // of the caret goes, not the row's tail.
+    let _ = app.handle_event(&plain(KeyCode::End));
+    let _ = app.handle_event(&plain(KeyCode::Home));
+    let _ = app.handle_event(&plain(KeyCode::Right));
+    let _ = app.handle_event(&plain(KeyCode::Right));
+    let _ = app.handle_event(&plain(KeyCode::Backspace));
+    let terminal = render_to_buffer(&mut app, 80, 24);
+    let screen = screen_text(&terminal);
+    assert!(
+        screen.contains("acd") && !screen.contains("abcd"),
+        "Backspace eats the character before the caret: {screen}"
+    );
+
+    // At the start there is nothing before the caret to eat.
+    let _ = app.handle_event(&plain(KeyCode::Home));
+    let _ = app.handle_event(&plain(KeyCode::Backspace));
+    let screen = screen_text(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        screen.contains("acd"),
+        "a caret at the draft's start deletes nothing: {screen}"
+    );
+}
+
+#[test]
+fn the_arrows_belong_to_the_draft_while_it_is_open() {
+    // The same two keys mean two things, split by whether the draft is
+    // being typed: between the rows they walk the queue, inside the
+    // draft they move its caret. A walk mid-sentence would send the
+    // text looking like nothing at all.
+    let (mut app, mut receivers) = question_app(&[
+        StagedQuestion {
+            question: "First question?",
+            options: &[("yes", None)],
+            multi_select: false,
+        },
+        StagedQuestion {
+            question: "Second question?",
+            options: &[("yes", None)],
+            multi_select: false,
+        },
+    ]);
+
+    // Between the rows: the arrows walk.
+    let _ = app.handle_event(&plain(KeyCode::Right));
+    let screen = screen_text(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        screen.contains("Second question?"),
+        "with no draft open, Right walks the queue: {screen}"
+    );
+
+    // Inside the draft: the same keys move the caret and leave the
+    // queue where it stands.
+    let _ = app.handle_event(&plain(KeyCode::Down));
+    let _ = app.handle_event(&plain(KeyCode::Enter));
+    for ch in ['h', 'i'] {
+        let _ = app.handle_event(&plain(KeyCode::Char(ch)));
+    }
+    let _ = app.handle_event(&plain(KeyCode::Home));
+    let mut before = render_to_buffer(&mut app, 80, 24);
+    let _ = app.handle_event(&plain(KeyCode::Right));
+    let mut after = render_to_buffer(&mut app, 80, 24);
+    assert!(
+        after.get_cursor_position().unwrap().x > before.get_cursor_position().unwrap().x,
+        "Right moves the caret right inside the draft"
+    );
+    let screen = screen_text(&after);
+    assert!(
+        screen.contains("Second question?"),
+        "and does not walk away from the question being answered: {screen}"
+    );
+
+    let second = receivers.remove(1);
+    let _ = app.handle_event(&plain(KeyCode::End));
+    let _ = app.handle_event(&plain(KeyCode::Enter));
+    assert_eq!(
+        second.blocking_recv(),
+        Ok(vec!["hi".to_string()]),
+        "the draft answers the question it was typed for"
+    );
+}
+
+#[test]
+fn the_compose_row_hangs_at_the_options_indent() {
+    // Option descriptions and the compose row's subtext hang at one
+    // column. The indent used to ride inside the text handed to
+    // wrap_prompt_rows, which splits on spaces and drops a leading run
+    // of them — the descriptions landed flush-left while the compose
+    // subtext kept its spaces, and the extra row read as shifted right.
+    let (mut app, _replies) = question_app(&[StagedQuestion {
+        question: "Ship it?",
+        options: &[("yes", Some("ships immediately")), ("no", None)],
+        multi_select: false,
+    }]);
+    let terminal = render_to_buffer(&mut app, 80, 24);
+    let label = column_of(&terminal, "yes");
+    let description = column_of(&terminal, "ships immediately");
+    let subtext = column_of(&terminal, "a reply the options");
+    assert_eq!(
+        description, label,
+        "a description hangs under its own option's text, not beside it"
+    );
+    assert_eq!(
+        subtext, label,
+        "the compose row's subtext hangs where the descriptions do"
+    );
+}
+
+#[test]
+fn a_draft_kept_out_of_compose_shows_on_its_row() {
+    // Esc steps out of the draft and back to the rows, and the words
+    // stay — but staying in the state while the row redrew its empty
+    // invitation meant a half-typed answer vanished from sight, with
+    // nothing to show it was still there to send.
+    let (mut app, _replies) = question_app(&[StagedQuestion {
+        question: "Ship it?",
+        options: &[("yes", None), ("no", None)],
+        multi_select: false,
+    }]);
+    let _ = app.handle_event(&plain(KeyCode::Down));
+    let _ = app.handle_event(&plain(KeyCode::Down));
+    let _ = app.handle_event(&plain(KeyCode::Enter));
+    for ch in "friday night".chars() {
+        let _ = app.handle_event(&plain(KeyCode::Char(ch)));
+    }
+    let _ = app.handle_event(&plain(KeyCode::Esc));
+    let screen = screen_text(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        screen.contains("friday night"),
+        "the draft left behind shows on its row: {screen}"
+    );
+}
+
+#[test]
+fn the_arrow_keys_walk_the_queued_questions() {
+    // A batch arrives as a queue, and only the head was reachable: Left
+    // and Right landed on the overlay's swallow-all arm, so a second
+    // question was invisible and unreachable until the first was
+    // dismissed. They now rotate the queue, so whichever question is on
+    // screen is the one Enter answers and Esc dismisses.
+    let (mut app, mut replies) = question_app(&[
+        StagedQuestion {
+            question: "Ship the release tonight?",
+            options: &[("yes", None)],
+            multi_select: false,
+        },
+        StagedQuestion {
+            question: "Run the migration too?",
+            options: &[("yes", None)],
+            multi_select: false,
+        },
+    ]);
+
+    let _ = app.handle_event(&plain(KeyCode::Right));
+    let screen = screen_text(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        screen.contains("Run the migration too?"),
+        "Right walks to the next question: {screen}"
+    );
+
+    let _ = app.handle_event(&plain(KeyCode::Left));
+    let screen = screen_text(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        screen.contains("Ship the release tonight?"),
+        "Left walks back to the one it came from: {screen}"
+    );
+
+    let _ = app.handle_event(&plain(KeyCode::Right));
+    let _ = app.handle_event(&plain(KeyCode::Enter));
+    let answered = replies[1]
+        .try_recv()
+        .expect("the question on screen took the answer");
+    assert_eq!(
+        answered,
+        vec!["yes".to_string()],
+        "the visible question answers"
+    );
+    assert!(
+        replies[0].try_recv().is_err(),
+        "the question walked past still waits, unanswered"
+    );
+}
+
+#[test]
+fn the_sheet_titles_which_question_is_up() {
+    // Being able to walk a queue is useless without knowing where you
+    // stand in it: the count rides the title, and the hint line names
+    // the keys that move between questions.
+    let (mut single, _single_rx) = question_app(&[StagedQuestion {
+        question: "Ship it?",
+        options: &[("yes", None)],
+        multi_select: false,
+    }]);
+    let screen = screen_text(&render_to_buffer(&mut single, 80, 30));
+    assert!(
+        !screen.contains("of "),
+        "a lone question counts nothing: {screen}"
+    );
+    assert!(
+        !screen.contains("[\u{2190}\u{2192}]"),
+        "nothing to walk between, nothing advertised: {screen}"
+    );
+
+    let (mut queued, _queued_rx) = question_app(&[
+        StagedQuestion {
+            question: "Ship it?",
+            options: &[("yes", None)],
+            multi_select: false,
+        },
+        StagedQuestion {
+            question: "Migrate too?",
+            options: &[("yes", None)],
+            multi_select: false,
+        },
+    ]);
+    let screen = screen_text(&render_to_buffer(&mut queued, 80, 30));
+    assert!(
+        screen.contains("Question 1 of 2"),
+        "the title says which question this is: {screen}"
+    );
+    assert!(
+        screen.contains("[\u{2190}\u{2192}] question"),
+        "the hint line names the keys that walk the queue: {screen}"
+    );
+}
+
+#[test]
+fn the_title_counts_the_question_the_walk_arrived_at() {
+    // The count tracks the walk, not the queue's shape.
+    //
+    // Selecting a question by rotating the queue would leave every one of
+    // them reading `1 of N`: true of the batch, useless about the sheet on
+    // screen. Walking is what a user does with these keys, so the count has
+    // to move with the walk — and say something true again after a wrap and
+    // after an answer shrinks the batch.
+    let (mut app, _rx) = question_app(&[
+        StagedQuestion {
+            question: "first?",
+            options: &[("ok", None)],
+            multi_select: false,
+        },
+        StagedQuestion {
+            question: "second?",
+            options: &[("ok", None)],
+            multi_select: false,
+        },
+        StagedQuestion {
+            question: "third?",
+            options: &[("ok", None)],
+            multi_select: false,
+        },
+    ]);
+    let screen = |app: &mut TuiApp| screen_text(&render_to_buffer(app, 80, 24));
+
+    assert!(
+        screen(&mut app).contains("Question 1 of 3"),
+        "the batch opens on its first question"
+    );
+
+    app.handle_event(&plain(KeyCode::Right));
+    let walked = screen(&mut app);
+    assert!(
+        walked.contains("Question 2 of 3") && walked.contains("second?"),
+        "the walk carries its number with it: {walked}"
+    );
+
+    app.handle_event(&plain(KeyCode::Right));
+    let walked = screen(&mut app);
+    assert!(
+        walked.contains("Question 3 of 3") && walked.contains("third?"),
+        "the batch's last question counts itself last: {walked}"
+    );
+
+    // Wrapping is the same walk past the end: the first question comes
+    // round with its own number, not a fresh `1` for whatever is up.
+    app.handle_event(&plain(KeyCode::Right));
+    let wrapped = screen(&mut app);
+    assert!(
+        wrapped.contains("Question 1 of 3") && wrapped.contains("first?"),
+        "wrapping restarts at the batch's own first: {wrapped}"
+    );
+    app.handle_event(&plain(KeyCode::Left));
+    assert!(
+        screen(&mut app).contains("Question 3 of 3"),
+        "and steps back over the same edge"
+    );
+
+    // Answering shrinks the batch the count is measuring.
+    app.handle_event(&plain(KeyCode::Enter));
+    let answered = screen(&mut app);
+    assert!(
+        answered.contains("Question 2 of 2") && answered.contains("second?"),
+        "the answered question leaves the count with it: {answered}"
+    );
+}
+
+#[test]
+fn a_batch_lands_through_the_run_loop_as_one_walkable_queue() {
+    // A batch arrives through the run loop's own landing path, not the
+    // test seam.
+    //
+    // Production hands `run` one prompt with the rest of the batch still
+    // in the channel, and [`land_question_requests`](TuiApp::land_question_requests)
+    // drains what sits beside it. Staging prompts one at a time — what
+    // [`question_app`] does — can't tell a queue that fills from a batch
+    // apart from a queue that only ever holds the question on screen, and
+    // that blind spot is precisely how an asking bridge handing its batch
+    // over a question at a time kept every question of a batch but the
+    // first off the terminal, the walk and the count along with it.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut waiting = Vec::new();
+    for question in ["first?", "second?", "third?"] {
+        let (reply, reply_rx) = tokio::sync::oneshot::channel();
+        tx.send(dch_tui::QuestionPrompt {
+            question: question.to_string(),
+            header: None,
+            options: vec![dch_tui::QuestionChoice {
+                label: "ok".to_string(),
+                description: None,
+            }],
+            multi_select: false,
+            reply,
+        })
+        .expect("receiver alive");
+        waiting.push(reply_rx);
+    }
+    let first = rx.try_recv().expect("the batch's first prompt");
+    let mut app = app();
+    app.land_question_requests(first, &mut rx);
+
+    let screen = screen_text(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        screen.contains("Question 1 of 3"),
+        "the sheet counts the batch that landed together: {screen}"
+    );
+
+    // The count is not decoration: two presses reach the batch's end,
+    // and every question still waits on its own answer.
+    for _ in 0..2 {
+        app.handle_event(&plain(KeyCode::Right));
+    }
+    let screen = screen_text(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        screen.contains("third?"),
+        "the batch's last question is two presses from its first: {screen}"
+    );
+    assert!(
+        waiting.iter_mut().all(|answer| answer.try_recv().is_err()),
+        "walking the queue answers nothing"
+    );
+
+    app.handle_event(&plain(KeyCode::Enter));
+    let answered = waiting
+        .pop()
+        .expect("the batch's last question")
+        .try_recv()
+        .expect("the question on screen is the one that answers");
+    assert_eq!(answered, vec!["ok".to_string()]);
+}
+
+#[test]
+fn queued_questions_keep_the_conversation_clear() {
+    // The queue segment lengthens the hints line, and at a narrow width
+    // that line wraps into a row the frame never reserved — the box grew
+    // upward past the rows held aside and covered the very transcript it
+    // reserves them to uncover. The reservation counts the same `more`
+    // the sheet renders, so the two cannot disagree.
+    let (mut app, _replies) = question_app(&[
+        StagedQuestion {
+            question: "Ship the release to production tonight?",
+            options: &[("yes", None), ("no", None)],
+            multi_select: false,
+        },
+        StagedQuestion {
+            question: "And the migration?",
+            options: &[("yes", None), ("no", None)],
+            multi_select: false,
+        },
+    ]);
+    for step in 0..30 {
+        app.push_message(dch_tui::TuiMessage::System {
+            text: format!("conversation row {step}"),
+            timestamp: chrono::Utc::now(),
+        });
+    }
+    app.push_message(dch_tui::TuiMessage::System {
+        text: "TAIL MARKER".to_string(),
+        timestamp: chrono::Utc::now(),
+    });
+    let terminal = render_to_buffer(&mut app, 60, 24);
+    let tail = row_of(&terminal, "TAIL MARKER");
+    let sheet = row_of(&terminal, "Question");
+    assert!(
+        tail < sheet,
+        "the queued hints row costs a reserved row: tail at {tail}, sheet tops at {sheet}"
+    );
+}
+
+#[test]
 fn a_pending_question_renders_the_overlay() {
     let (mut app, _replies) = question_app(&[StagedQuestion {
         question: "Deploy the release now?",
@@ -5961,19 +6891,27 @@ fn arrows_space_and_enter_answer_a_multi_select_question() {
 
 #[test]
 fn toggling_a_row_twice_returns_it_to_untoggled() {
-    let (mut app, mut replies) = question_app(&[StagedQuestion {
+    // Space's contract is the mark and nothing else: one press puts the
+    // dot on the row, the next takes it off. The answer Enter makes
+    // afterwards is its own subject (pinned beside it), so this test
+    // reads the row rather than the reply.
+    let (mut app, _replies) = question_app(&[StagedQuestion {
         question: "Which checks run?",
         options: &[("lint", None), ("tests", None)],
         multi_select: true,
     }]);
-    assert!(app.handle_event(&plain(KeyCode::Char(' '))));
-    assert!(app.handle_event(&plain(KeyCode::Char(' '))));
-    let reply = replies.remove(0);
-    assert!(app.handle_event(&plain(KeyCode::Enter)));
-    assert_eq!(
-        reply.blocking_recv(),
-        Ok(Vec::<String>::new()),
-        "a toggled-then-untoggled row confirms no answer"
+    let _ = app.handle_event(&plain(KeyCode::Char(' ')));
+    let marked = screen_text(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        marked.contains("\u{2022} lint"),
+        "the first Space marks the row: {marked}"
+    );
+
+    let _ = app.handle_event(&plain(KeyCode::Char(' ')));
+    let cleared = screen_text(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        !cleared.contains("\u{2022} lint"),
+        "the second Space takes the mark off again: {cleared}"
     );
 }
 
@@ -5991,6 +6929,91 @@ fn enter_confirms_the_cursor_row_for_a_single_select_question() {
         reply.blocking_recv(),
         Ok(vec!["no".to_string()]),
         "Enter confirms the row the cursor moved to"
+    );
+}
+
+#[test]
+fn enter_confirms_the_cursor_row_for_a_multi_select_question() {
+    // Enter over the rows is a confirmation on an ask that takes several
+    // answers exactly as it is on one that takes one. An empty reply is
+    // what a dismissal sends, and the ask tool reads the two alike — so a
+    // row the user walked onto and confirmed cannot answer with nothing.
+    let (mut app, mut replies) = question_app(&[StagedQuestion {
+        question: "Which checks run?",
+        options: &[("lint", None), ("tests", None)],
+        multi_select: true,
+    }]);
+    let _ = app.handle_event(&plain(KeyCode::Down));
+    let mut reply = replies.remove(0);
+    assert!(app.handle_event(&plain(KeyCode::Enter)));
+    assert_eq!(
+        reply.try_recv().expect("the confirmed row answers at once"),
+        vec!["tests".to_string()],
+        "the row the cursor reached answers an unmarked multi-select"
+    );
+}
+
+#[test]
+fn a_kept_draft_stands_aside_when_enter_confirms_an_option() {
+    // Stepping out of the draft keeps the words, and Enter on an option
+    // row is the later decision — the pointer's, not the text's. Which of
+    // the two wins is a decision worth a pin: the row answers, and the
+    // draft that was never marked stays unasked rather than answering in
+    // the option's place.
+    let (mut app, mut replies) = question_app(&[StagedQuestion {
+        question: "Which checks run?",
+        options: &[("lint", None), ("tests", None)],
+        multi_select: true,
+    }]);
+    let _ = app.handle_event(&plain(KeyCode::Down)); // to "tests"
+    let _ = app.handle_event(&plain(KeyCode::Down)); // to the compose row
+    let _ = app.handle_event(&plain(KeyCode::Enter)); // open the draft
+    for ch in "just the lints".chars() {
+        let _ = app.handle_event(&plain(KeyCode::Char(ch)));
+    }
+    let _ = app.handle_event(&plain(KeyCode::Esc)); // keep the text, back to rows
+    let _ = app.handle_event(&plain(KeyCode::Up)); // onto "tests"
+    let screen = screen_text(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        screen.contains("just the lints"),
+        "Esc keeps what was written: {screen}"
+    );
+
+    let mut reply = replies.remove(0);
+    assert!(app.handle_event(&plain(KeyCode::Enter)));
+    assert_eq!(
+        reply.try_recv().expect("the confirmed row answers at once"),
+        vec!["tests".to_string()],
+        "the row Enter stood on answers, not the draft left unmarked"
+    );
+}
+
+#[test]
+fn enter_on_the_compose_row_sends_the_draft_it_stands_on() {
+    // The same confirmation one row further down: the compose row's
+    // content is its words, so Enter where it stands sends them. Before
+    // this it sent nothing at all and took the written reply down with
+    // the resolved question.
+    let (mut app, mut replies) = question_app(&[StagedQuestion {
+        question: "Anything to add?",
+        options: &[("nothing", None)],
+        multi_select: false,
+    }]);
+    let _ = app.handle_event(&plain(KeyCode::Down)); // to the compose row
+    let _ = app.handle_event(&plain(KeyCode::Enter)); // open the draft
+    for ch in "run the lints first".chars() {
+        let _ = app.handle_event(&plain(KeyCode::Char(ch)));
+    }
+    let _ = app.handle_event(&plain(KeyCode::Esc)); // step back, cursor stays put
+
+    let mut reply = replies.remove(0);
+    assert!(app.handle_event(&plain(KeyCode::Enter)));
+    assert_eq!(
+        reply
+            .try_recv()
+            .expect("the row Enter stands on answers at once"),
+        vec!["run the lints first".to_string()],
+        "the compose row answers with the words it holds"
     );
 }
 
@@ -6036,7 +7059,10 @@ fn a_batch_of_questions_advances_one_at_a_time() {
         screen.contains("First: continue?") && !screen.contains("Second: really?"),
         "only the first question of a batch shows: {screen}"
     );
-    assert!(screen.contains("1 more"), "the count renders: {screen}");
+    assert!(
+        screen.contains("Question 1 of 2"),
+        "the title counts the batch the hint line used to: {screen}"
+    );
 
     let first = replies.remove(0);
     assert!(app.handle_event(&plain(KeyCode::Enter)));
@@ -6060,6 +7086,128 @@ fn a_batch_of_questions_advances_one_at_a_time() {
     );
 }
 
+#[test]
+fn a_question_no_one_asks_leaves_the_screen() {
+    // A prompt's reply channel is the asking side's stake in it, so a
+    // closed one is the only notice the overlay gets that a question has
+    // been withdrawn — the dispatch cancelled mid-ask, or its answers
+    // otherwise abandoned. Read it, or the user goes on being shown a
+    // question nobody will ever read, over the reply that replaced it.
+    // (A dismissal is *not* that notice: one `Esc` answers one question,
+    // and the questions behind it stay asked.)
+    let (mut app, mut replies) = question_app(&[
+        StagedQuestion {
+            question: "First: continue?",
+            options: &[("yes", None)],
+            multi_select: false,
+        },
+        StagedQuestion {
+            question: "Second: really?",
+            options: &[("ok", None)],
+            multi_select: false,
+        },
+    ]);
+    render_to_buffer(&mut app, 80, 30);
+
+    // The asking side goes away while the second is still on its way to
+    // the screen: its receiver drops, and the prompt with it.
+    app.handle_event(&plain(KeyCode::Esc));
+    drop(replies.remove(1));
+    app.poll_question_requests();
+
+    let screen = screen_text(&render_to_buffer(&mut app, 80, 30));
+    assert!(
+        !screen.contains("Second: really?"),
+        "the withdrawn question leaves with the ask: {screen}"
+    );
+    assert!(
+        !screen.contains("Question"),
+        "and the overlay goes with the last live question: {screen}"
+    );
+}
+
+#[test]
+fn the_walk_keeps_its_question_when_the_one_ahead_is_withdrawn() {
+    // Withdrawal shrinks the queue ahead of the walk as often as behind
+    // it. The view counts questions, not the numbers they wore on their
+    // way in, so a question taken away up front moves the count under the
+    // one on screen without moving the screen off it.
+    let (mut app, mut replies) = question_app(&[
+        StagedQuestion {
+            question: "First: continue?",
+            options: &[("yes", None)],
+            multi_select: false,
+        },
+        StagedQuestion {
+            question: "Second: really?",
+            options: &[("ok", None)],
+            multi_select: false,
+        },
+        StagedQuestion {
+            question: "Third: surely?",
+            options: &[("hm", None)],
+            multi_select: false,
+        },
+    ]);
+    render_to_buffer(&mut app, 80, 30);
+    app.handle_event(&plain(KeyCode::Right)); // onto the second
+    let screen = screen_text(&render_to_buffer(&mut app, 80, 30));
+    assert!(
+        screen.contains("Second: really?") && screen.contains("Question 2 of 3"),
+        "the walk arrives at the second of three: {screen}"
+    );
+
+    drop(replies.remove(0)); // the ask gives up on the first
+    app.poll_question_requests();
+    let screen = screen_text(&render_to_buffer(&mut app, 80, 30));
+    assert!(
+        screen.contains("Second: really?"),
+        "the question under the walk survives the withdrawal: {screen}"
+    );
+    assert!(
+        screen.contains("Question 1 of 2") && !screen.contains("First: continue?"),
+        "the count is the questions that are left and the place this one
+        holds among them, not the numbers they wore arriving: {screen}"
+    );
+}
+#[test]
+fn the_batch_hint_narrows_esc_to_the_question_under_it() {
+    // Over a queue, `[esc] dismiss` reads as the queue's own dismissal —
+    // one press and everything behind the question on screen goes with
+    // it, which is exactly what it never does. The hint now names the
+    // question `Esc` answers, and says so plainly when there is nothing
+    // else to dismiss anyway.
+    let two = [
+        StagedQuestion {
+            question: "First: continue?",
+            options: &[("yes", None)],
+            multi_select: false,
+        },
+        StagedQuestion {
+            question: "Second: really?",
+            options: &[("ok", None)],
+            multi_select: false,
+        },
+    ];
+    let (mut app, _replies) = question_app(&two);
+    let screen = screen_text(&render_to_buffer(&mut app, 100, 30));
+    assert!(
+        screen.contains("[esc] dismiss one"),
+        "with a queue behind it, Esc is said for one question: {screen}"
+    );
+
+    let one = [StagedQuestion {
+        question: "Just one: continue?",
+        options: &[("yes", None)],
+        multi_select: false,
+    }];
+    let (mut app, _replies) = question_app(&one);
+    let screen = screen_text(&render_to_buffer(&mut app, 100, 30));
+    assert!(
+        screen.contains("[esc] dismiss") && !screen.contains("[esc] dismiss one"),
+        "with nothing behind it there is no one to qualify: {screen}"
+    );
+}
 #[test]
 fn the_question_sheet_owns_the_composer() {
     let mut app = app();
@@ -6088,7 +7236,10 @@ fn the_question_sheet_owns_the_composer() {
 
     let (submit_tx, mut submit_rx) = tokio::sync::mpsc::unbounded_channel();
     app.set_submit_tx(submit_tx);
-    assert!(!app.handle_event(&plain(KeyCode::Char('x'))));
+    assert!(
+        app.handle_event(&plain(KeyCode::Char('x'))),
+        "a letter is the sheet's, and opens the draft rather than the composer"
+    );
     assert!(app.handle_event(&plain(KeyCode::Enter)));
     assert!(
         submit_rx.try_recv().is_err(),
@@ -6096,8 +7247,8 @@ fn the_question_sheet_owns_the_composer() {
     );
     assert_eq!(
         reply_rx.blocking_recv(),
-        Ok(vec!["yes".to_string()]),
-        "Enter answers the pending question, never the composer"
+        Ok(vec!["x".to_string()]),
+        "the typed reply answers the question; the composer kept its own words"
     );
     assert_eq!(
         app.input(),
@@ -6206,10 +7357,13 @@ fn a_paste_behind_a_pending_prompt_lands_nowhere() {
 }
 
 #[test]
-fn a_paste_behind_a_pending_question_lands_nowhere() {
+fn a_paste_under_a_question_never_reaches_the_composer() {
     // The question overlay owns the composer exactly as the permission
-    // overlay does — the caret is hidden and the draft invisible — so
-    // a paste while it is up must not seed text the user finds later.
+    // overlay does — the caret is hidden and the draft invisible — so a
+    // paste while it is up must not seed text the user finds later. The
+    // paste itself is answered: it opens the question's own draft and
+    // lands there (pinned separately below); this pin holds only the
+    // composer's side of that boundary.
     let (mut app, _replies) = question_app(&[StagedQuestion {
         question: "Deploy the release now?",
         options: &[("yes", None), ("no", None)],
@@ -7348,4 +8502,720 @@ fn thinking_rows_render_in_the_theme_dim_tone() {
         cell.fg, dim,
         "the thinking row carries the theme's dim tone, not the assistant color"
     );
+}
+
+const STATUS_BAR_ROWS: usize = 2;
+
+fn write(app: &mut TuiApp, text: &str) {
+    for ch in text.chars() {
+        app.handle_event(&plain(KeyCode::Char(ch)));
+    }
+}
+
+fn staged_question(
+    app: &mut TuiApp,
+    question: &str,
+    options: &[(&str, Option<&str>)],
+    multi_select: bool,
+) -> tokio::sync::oneshot::Receiver<Vec<String>> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (reply, reply_rx) = tokio::sync::oneshot::channel();
+    tx.send(dch_tui::QuestionPrompt {
+        question: question.to_string(),
+        header: None,
+        options: options
+            .iter()
+            .map(|(label, description)| dch_tui::QuestionChoice {
+                label: (*label).to_string(),
+                description: description.map(std::string::ToString::to_string),
+            })
+            .collect(),
+        multi_select,
+        reply,
+    })
+    .expect("receiver alive");
+    app.set_question_requests(rx);
+    app.poll_question_requests();
+    let _ = tx;
+    reply_rx
+}
+
+#[test]
+fn a_click_on_the_question_sheet_leaves_the_hidden_caret_alone() {
+    // The sheet covers the composer; a press on the rows it covers would
+    // otherwise move a caret the user cannot see, and the draft would come
+    // back edited in place once the question was answered.
+    let mut app = app();
+    app.handle_event(&Event::Paste("hello world".to_string()));
+    let _answer = staged_question(&mut app, "which one?", &[("one", None)], false);
+    let mut before = render_to_buffer(&mut app, 80, 24);
+    let before_caret = before.backend_mut().get_cursor_position().unwrap();
+
+    assert!(app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        2 + 4,
+        20,
+    )));
+    let mut clicked = render_to_buffer(&mut app, 80, 24);
+    let clicked_caret = clicked.backend_mut().get_cursor_position().unwrap();
+    assert_eq!(
+        (clicked_caret.x, clicked_caret.y),
+        (before_caret.x, before_caret.y),
+        "the press under the sheet moved nothing"
+    );
+
+    assert!(app.handle_event(&plain(KeyCode::Enter)));
+    let mut answered = render_to_buffer(&mut app, 80, 24);
+    let caret = answered.backend_mut().get_cursor_position().unwrap();
+    assert_eq!(
+        (caret.x, caret.y),
+        (2 + 11, 20),
+        "the composer comes back exactly where the press landed on the sheet"
+    );
+}
+
+#[test]
+fn the_wheel_still_pages_under_a_question() {
+    // Reading what the run said above the box is how a question gets
+    // answered, so the wheel stays live while the sheet holds the presses.
+    let (mut app, _answers) = question_app(&[StagedQuestion {
+        question: "which one?",
+        options: &[("one", None)],
+        multi_select: false,
+    }]);
+    let now = chrono::Utc::now();
+    for i in 0..30 {
+        app.push_message(TuiMessage::User {
+            text: format!("line{i:02}"),
+            timestamp: now,
+        });
+    }
+    let _ = render_to_buffer(&mut app, 80, 24);
+    let before = app.scroll_offset();
+
+    assert!(app.handle_event(&wheel_event(MouseEventKind::ScrollUp)));
+    assert!(
+        app.scroll_offset() > before,
+        "the wheel pages the transcript under the sheet"
+    );
+    assert_eq!(
+        app.scroll_offset(),
+        before.saturating_add(1),
+        "one notch, one line, as everywhere else"
+    );
+}
+
+#[test]
+fn page_keys_page_the_transcript_under_a_question() {
+    // Paging is not an answer to anything; swallowing it left a user
+    // scrolling for context with a keyboard that answered nothing.
+    let (mut app, mut answers) = question_app(&[StagedQuestion {
+        question: "which one?",
+        options: &[("one", None)],
+        multi_select: false,
+    }]);
+    let now = chrono::Utc::now();
+    for i in 0..30 {
+        app.push_message(TuiMessage::User {
+            text: format!("line{i:02}"),
+            timestamp: now,
+        });
+    }
+    let mut before_render = render_to_buffer(&mut app, 80, 24);
+    let _ = before_render.backend_mut();
+    let before = app.scroll_offset();
+
+    assert!(app.handle_event(&plain(KeyCode::PageUp)));
+    assert!(
+        app.scroll_offset() > before,
+        "PageUp pages the conversation while the question waits"
+    );
+    let terminal = render_to_buffer(&mut app, 80, 24);
+    assert!(
+        screen_text(&terminal).contains("Question"),
+        "the sheet is still up after the paging key"
+    );
+
+    assert!(app.handle_event(&plain(KeyCode::PageDown)));
+    assert!(app.handle_event(&plain(KeyCode::PageUp)));
+    assert!(
+        app.scroll_offset() > 0,
+        "the paging keys keep working under a question"
+    );
+
+    assert!(app.handle_event(&plain(KeyCode::Enter)));
+    let answered = answers.remove(0).try_recv().expect("answer sent");
+    assert_eq!(answered, vec!["one".to_string()]);
+}
+
+#[test]
+fn the_verbosity_key_still_cycles_under_a_question() {
+    let (mut app, _answers) = question_app(&[StagedQuestion {
+        question: "which one?",
+        options: &[("one", None)],
+        multi_select: false,
+    }]);
+    app.push_message(TuiMessage::Assistant {
+        blocks: vec![ContentBlock::Tool {
+            call_id: String::new(),
+            name: "Read".to_string(),
+            input_preview: r#"{"file_path":"a.rs"}"#.to_string(),
+            success: true,
+            elapsed_secs: 0.42,
+            output_preview: String::new(),
+            retained_input: String::new(),
+        }],
+        timestamp: chrono::Utc::now(),
+        duration_ms: None,
+    });
+    let normal = row_texts(&render_to_buffer(&mut app, 80, 30)).join("\n");
+    assert!(
+        normal.contains("✓ Reading a.rs… (0.4s)"),
+        "Normal shows the summary while a question waits: {normal:?}"
+    );
+
+    app.handle_event(&key(KeyCode::F(2), KeyModifiers::NONE));
+    let verbose = row_texts(&render_to_buffer(&mut app, 80, 30)).join("\n");
+    assert!(
+        verbose.contains("    Input:"),
+        "F2 cycles verbosity under the sheet: {verbose:?}"
+    );
+    assert!(
+        verbose.contains("Question"),
+        "the sheet survives the app-level key"
+    );
+}
+
+#[test]
+fn page_keys_page_the_transcript_behind_a_permission_ask() {
+    // The same finding for the other overlay: only y, n, and Esc answer a
+    // permission ask, and the sheet has no claim on the paging keys.
+    let mut app = app();
+    let now = chrono::Utc::now();
+    for i in 0..30 {
+        app.push_message(TuiMessage::User {
+            text: format!("line{i:02}"),
+            timestamp: now,
+        });
+    }
+    let (requests_tx, requests_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (reply, mut reply_rx) = tokio::sync::oneshot::channel();
+    requests_tx
+        .send(dch_tui::PermissionRequest {
+            tool_name: "Bash".to_string(),
+            prompt: "allow bash?".to_string(),
+            reply,
+        })
+        .expect("receiver alive");
+    app.set_permission_requests(requests_rx);
+    app.poll_permission_requests();
+    let _ = render_to_buffer(&mut app, 80, 24);
+    let before = app.scroll_offset();
+
+    assert!(app.handle_event(&plain(KeyCode::PageUp)));
+    assert!(
+        app.scroll_offset() > before,
+        "PageUp pages the conversation behind the permission sheet"
+    );
+    assert!(app.handle_event(&plain(KeyCode::Char('y'))));
+    assert_eq!(
+        reply_rx.try_recv(),
+        Ok(true),
+        "the ask still answers after the paging key"
+    );
+}
+
+#[test]
+fn a_click_behind_the_permission_sheet_moves_nothing() {
+    // The permission sheet answers y, n, and Esc and holds the rest of the
+    // keyboard; the pointer is its business too. A press on the row the
+    // composer occupies used to fall through to it, moving a caret inside
+    // a box the user could not see — the draft came back edited at a place
+    // nobody had pointed at, once the sheet was gone.
+    let stage = |app: &mut TuiApp| {
+        let (requests_tx, requests_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (reply, _reply_rx) = tokio::sync::oneshot::channel();
+        requests_tx
+            .send(dch_tui::PermissionRequest {
+                tool_name: "Bash".to_string(),
+                prompt: "allow bash?".to_string(),
+                reply,
+            })
+            .expect("receiver alive");
+        app.set_permission_requests(requests_rx);
+        app.poll_permission_requests();
+    };
+    let click_the_composer = |app: &mut TuiApp| {
+        app.handle_event(&mouse_event(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            6,
+            20,
+        ))
+    };
+
+    // The map first: with nothing on the screen this press is a click on
+    // the composer's text, and the caret goes where it was pointed.
+    let mut bare = app();
+    bare.handle_event(&Event::Paste("hello world".to_string()));
+    let _ = render_to_buffer(&mut bare, 80, 24);
+    assert!(click_the_composer(&mut bare));
+    let mut moved = render_to_buffer(&mut bare, 80, 24);
+    let landed = moved
+        .backend_mut()
+        .get_cursor_position()
+        .expect("the composer owns the caret");
+    assert_eq!(
+        (landed.x, landed.y),
+        (6, 20),
+        "the same press is the composer's whenever nothing is on screen"
+    );
+
+    // With the sheet over it, the press stays on the sheet: the caret the
+    // user could not see is not the one the pointer was aimed at.
+    let mut app = app();
+    app.handle_event(&Event::Paste("hello world".to_string()));
+    stage(&mut app);
+    let _ = render_to_buffer(&mut app, 80, 24);
+    assert!(click_the_composer(&mut app));
+    assert!(app.handle_event(&plain(KeyCode::Char('y'))));
+    let mut after = render_to_buffer(&mut app, 80, 24);
+    let held = after
+        .backend_mut()
+        .get_cursor_position()
+        .expect("the composer owns the caret");
+    assert_eq!(
+        (held.x, held.y),
+        (2 + 11, 20),
+        "the caret the sheet hid never moved"
+    );
+}
+
+#[test]
+fn a_paste_under_a_question_opens_the_draft_with_it() {
+    // A paste is a burst of keystrokes, and a keystroke at the rows opens
+    // the draft; dropping the paste lost the likeliest free-form answer.
+    let (mut app, _answers) = question_app(&[StagedQuestion {
+        question: "which path?",
+        options: &[("repo", None)],
+        multi_select: false,
+    }]);
+
+    assert!(app.handle_event(&Event::Paste("/tmp/dch".to_string())));
+
+    let screen = screen_text(&render_to_buffer(&mut app, 60, 20));
+    assert!(
+        screen.contains("/tmp/dch"),
+        "the paste lands in the draft: {screen}"
+    );
+}
+
+#[test]
+fn a_paste_into_an_open_draft_lands_at_its_caret() {
+    let (mut app, mut answers) = question_app(&[StagedQuestion {
+        question: "which path?",
+        options: &[("repo", None)],
+        multi_select: false,
+    }]);
+    write(&mut app, "AB");
+    app.handle_event(&plain(KeyCode::Home));
+
+    app.handle_event(&Event::Paste("12".to_string()));
+
+    let screen = screen_text(&render_to_buffer(&mut app, 60, 20));
+    assert!(
+        screen.contains("12AB"),
+        "the paste joins the draft where the caret stands: {screen}"
+    );
+    assert!(app.handle_event(&plain(KeyCode::Enter)));
+    assert_eq!(
+        answers.remove(0).try_recv().expect("answer sent"),
+        vec!["12AB".to_string()]
+    );
+}
+
+#[test]
+fn a_pasted_block_lands_on_the_draft_as_one_line() {
+    // A draft answers one question in one row: the breaks a pasted block
+    // carries become the spaces between its parts, and nothing is lost.
+    let (mut app, _answers) = question_app(&[StagedQuestion {
+        question: "what failed?",
+        options: &[("tests", None)],
+        multi_select: false,
+    }]);
+
+    app.handle_event(&Event::Paste("first\r\nsecond\r\n".to_string()));
+
+    let screen = screen_text(&render_to_buffer(&mut app, 60, 20));
+    assert!(
+        screen.contains("first second"),
+        "the pasted lines join on one row: {screen}"
+    );
+}
+
+#[test]
+fn a_short_terminal_keeps_the_row_being_written_on() {
+    // A tall option list on a short terminal used to cut its own bottom
+    // rows off: the hints went first, then the compose row, and the draft
+    // was written blind into a box that showed none of it.
+    let (mut app, _answers) = question_app(
+        &[StagedQuestion {
+            question: "pick a target for the release",
+            options: &[
+                ("alpha", Some("the first description")),
+                ("beta", Some("the second description")),
+                ("gamma", Some("the third description")),
+                ("delta", Some("the fourth description")),
+            ],
+            multi_select: false,
+        }; 1],
+    );
+    let _ = render_to_buffer(&mut app, 60, 12);
+
+    write(&mut app, "ship it");
+
+    let mut typed = render_to_buffer(&mut app, 60, 12);
+    let screen = screen_text(&typed);
+    assert!(
+        screen.contains("ship it"),
+        "the draft is on screen on a terminal too short for the whole sheet:\n{screen}"
+    );
+    assert!(
+        screen.contains("[esc]"),
+        "the key hints survive beside it:\n{screen}"
+    );
+    let caret = typed.backend_mut().get_cursor_position().unwrap();
+    assert_eq!(
+        usize::from(caret.y),
+        row_of(&typed, "ship it"),
+        "the caret rides the row the draft is drawn on"
+    );
+    assert!(
+        usize::from(caret.y) < 12,
+        "the caret is inside the terminal, not below it"
+    );
+}
+
+#[test]
+fn a_draft_longer_than_the_box_continues_on_the_row_below() {
+    let (mut app, mut answers) = question_app(&[StagedQuestion {
+        question: "which path?",
+        options: &[("repo", None)],
+        multi_select: false,
+    }]);
+
+    write(
+        &mut app,
+        "/very/long/path/that/keeps/going/into/the/far/distance/end",
+    );
+
+    let mut typed = render_to_buffer(&mut app, 30, 20);
+    let screen = screen_text(&typed);
+    assert!(
+        screen.contains("distance/end"),
+        "the draft's tail wraps onto a row the box shows:\n{screen}"
+    );
+    let caret = typed.backend_mut().get_cursor_position().unwrap();
+    let first_draft_row = row_of(&typed, "\u{270e}");
+    assert!(
+        usize::from(caret.y) > first_draft_row,
+        "the caret follows the wrap to the continuation row, not the box's edge"
+    );
+    assert!(app.handle_event(&plain(KeyCode::Enter)));
+    assert_eq!(
+        answers.remove(0).try_recv().expect("answer sent"),
+        vec!["/very/long/path/that/keeps/going/into/the/far/distance/end".to_string()],
+        "wrapping is display only: the answer is the text the user wrote"
+    );
+}
+
+#[test]
+fn a_marked_option_answers_although_an_empty_compose_row_is_marked_too() {
+    // The mark on a row with nothing to say adds nothing; it does not veto
+    // the marks the user chose beside it.
+    let (mut app, mut answers) = question_app(&[StagedQuestion {
+        question: "which of these?",
+        options: &[("alpha", None), ("beta", None)],
+        multi_select: true,
+    }]);
+    app.handle_event(&plain(KeyCode::Char(' ')));
+    app.handle_event(&plain(KeyCode::Down));
+    app.handle_event(&plain(KeyCode::Down));
+    assert_eq!(
+        screen_text(&render_to_buffer(&mut app, 60, 20))
+            .matches('\u{2022}')
+            .count(),
+        1,
+        "alpha is marked before the compose row joins it"
+    );
+    app.handle_event(&plain(KeyCode::Char(' ')));
+
+    assert!(app.handle_event(&plain(KeyCode::Enter)));
+
+    let screen = screen_text(&render_to_buffer(&mut app, 60, 20));
+    assert!(
+        !screen.contains("Question"),
+        "the question is answered, not opened for writing:\n{screen}"
+    );
+    assert_eq!(
+        answers.remove(0).try_recv().expect("answer sent"),
+        vec!["alpha".to_string()],
+        "the marked option is the answer an empty compose row cannot hold up"
+    );
+}
+
+#[test]
+fn a_marked_empty_compose_row_on_its_own_opens_the_draft() {
+    // With nothing else marked, the empty compose row is the whole answer
+    // the user asked for, and it has no reply yet: Enter writes one.
+    let (mut app, mut answers) = question_app(&[StagedQuestion {
+        question: "which of these?",
+        options: &[("alpha", None), ("beta", None)],
+        multi_select: true,
+    }]);
+    app.handle_event(&plain(KeyCode::Down));
+    app.handle_event(&plain(KeyCode::Down));
+    app.handle_event(&plain(KeyCode::Char(' ')));
+
+    assert!(app.handle_event(&plain(KeyCode::Enter)));
+
+    let screen = screen_text(&render_to_buffer(&mut app, 60, 20));
+    assert!(
+        screen.contains("Question"),
+        "the draft opened instead of an empty answer:\n{screen}"
+    );
+    assert!(
+        matches!(
+            answers[0].try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ),
+        "nothing was sent while the draft was opened"
+    );
+}
+
+#[test]
+fn a_narrow_sheet_keeps_the_key_that_leaves_it() {
+    // A narrow terminal cuts the hints' tail, so the key that cancels
+    // leads the row: last on the list, it was the first thing lost exactly
+    // when the queue's semantics most needed explaining.
+    // A queue is where the hints run longest, and where the semantics the
+    // row explains matter most: one press dismisses one question, not the
+    // batch behind it.
+    let (mut app, _answers) = question_app(&[
+        StagedQuestion {
+            question: "which of these?",
+            options: &[("alpha", None), ("beta", None)],
+            multi_select: true,
+        },
+        StagedQuestion {
+            question: "and then?",
+            options: &[("yes", None), ("no", None)],
+            multi_select: true,
+        },
+    ]);
+
+    // The proof is read off the hints themselves, and read in order: on a
+    // terminal this narrow the row wraps past the rows the sheet gives it,
+    // and the parts past the last one are dropped. Which parts those are
+    // is the whole of the finding, so the assertion names the survivor and
+    // the casualty rather than a glyph either.
+    let rows = row_texts(&render_to_buffer(&mut app, 26, 20));
+    let hints: String = rows
+        .iter()
+        .filter(|row| row.contains("[e"))
+        .map(String::as_str)
+        .collect();
+    let esc = hints
+        .find("[esc]")
+        .expect("the key that leaves the sheet survives the cut");
+    assert!(
+        !hints.contains("[space]"),
+        "what a narrow terminal loses is the row's tail: {hints:?}"
+    );
+    let enter = hints
+        .find("[enter]")
+        .expect("the key that confirms is on the sheet");
+    assert!(
+        esc < enter,
+        "the key that ends the exchange leads, so the cut falls elsewhere: {hints:?}"
+    );
+}
+
+#[test]
+fn delete_erases_the_character_right_of_the_draft_caret() {
+    let (mut app, _answers) = question_app(&[StagedQuestion {
+        question: "which path?",
+        options: &[("repo", None)],
+        multi_select: false,
+    }]);
+    write(&mut app, "abc");
+    app.handle_event(&plain(KeyCode::Home));
+
+    app.handle_event(&plain(KeyCode::Delete));
+
+    let screen = screen_text(&render_to_buffer(&mut app, 60, 20));
+    assert!(
+        screen.contains("bc"),
+        "Delete took the character to the right of the caret: {screen}"
+    );
+    assert!(
+        !screen.contains("abc"),
+        "and left the caret where it stood: {screen}"
+    );
+}
+
+#[test]
+fn word_chords_edit_the_draft_a_word_at_a_time() {
+    let (mut app, mut answers) = question_app(&[StagedQuestion {
+        question: "which path?",
+        options: &[("repo", None)],
+        multi_select: false,
+    }]);
+    write(&mut app, "keep drop");
+
+    app.handle_event(&key(KeyCode::Char('w'), KeyModifiers::CONTROL));
+
+    let screen = screen_text(&render_to_buffer(&mut app, 60, 20));
+    assert!(
+        screen.contains("keep"),
+        "Ctrl+W took the word left of the caret: {screen}"
+    );
+    assert!(
+        !screen.contains("keep drop"),
+        "and left the caret with it: {screen}"
+    );
+
+    write(&mut app, "more");
+    assert!(app.handle_event(&plain(KeyCode::Enter)));
+    assert_eq!(
+        answers.remove(0).try_recv().expect("answer sent"),
+        vec!["keep more".to_string()]
+    );
+}
+
+#[test]
+fn a_modified_enter_sends_the_draft_like_a_plain_one() {
+    // Terminals that spell Shift+Enter as its own event made the hinted
+    // `[enter] send` a lie; the draft holds one line, so a modifier adds
+    // nothing the answer could carry and the key means what it says.
+    let (mut app, mut answers) = question_app(&[StagedQuestion {
+        question: "which path?",
+        options: &[("repo", None)],
+        multi_select: false,
+    }]);
+    write(&mut app, "ok");
+
+    assert!(app.handle_event(&key(KeyCode::Enter, KeyModifiers::SHIFT)));
+
+    assert_eq!(
+        answers.remove(0).try_recv().expect("answer sent"),
+        vec!["ok".to_string()],
+        "Shift+Enter sends, as the hint promises"
+    );
+}
+
+#[test]
+fn an_empty_draft_says_why_it_cannot_send_yet() {
+    // Refusing to answer with whitespace is right; refusing unheard is a
+    // dropped keystroke wearing the hint's own wording. The sheet's hint
+    // row carries the refusal, because the notice row above the composer
+    // is a row the sheet is drawn over.
+    let (mut app, mut answers) = question_app(&[StagedQuestion {
+        question: "which path?",
+        options: &[("repo", None)],
+        multi_select: false,
+    }]);
+    write(&mut app, "x");
+    app.handle_event(&plain(KeyCode::Backspace));
+    app.handle_event(&plain(KeyCode::Char(' ')));
+
+    let blank = screen_text(&render_to_buffer(&mut app, 60, 20));
+    assert!(
+        blank.contains("needs a written answer"),
+        "the hint that promised a send says what is missing:\n{blank}"
+    );
+
+    assert!(app.handle_event(&plain(KeyCode::Enter)));
+
+    let still = screen_text(&render_to_buffer(&mut app, 60, 20));
+    assert!(
+        still.contains("Question"),
+        "the question is still being asked:\n{still}"
+    );
+    assert!(
+        matches!(
+            answers[0].try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ),
+        "nothing left the app on a refused send"
+    );
+
+    write(&mut app, "y");
+    let written = screen_text(&render_to_buffer(&mut app, 60, 20));
+    assert!(
+        written.contains("[enter] send"),
+        "with a word in it the key means send again:\n{written}"
+    );
+    assert!(app.handle_event(&plain(KeyCode::Enter)));
+    assert_eq!(
+        answers.remove(0).try_recv().expect("answer sent"),
+        vec!["y".to_string()],
+        "the reply travels without the whitespace it was padded with"
+    );
+}
+
+#[test]
+fn a_strip_at_the_top_keeps_its_row_from_the_sheet() {
+    // The strip's row is not space the sheet may spend. Ask for more sheet
+    // than the terminal holds — a long question with described options in a
+    // short window — and the box takes every row it is offered, growing
+    // upward into the strip's own row and drawing over the bar that says
+    // the run is still alive.
+    let (_observer, state) = dch_tui::TuiObserverState::new().into_observer();
+    state
+        .agent_running
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut app = TuiApp::from_observer_state(config_with_strip_top(), state);
+    let _answer = staged_question(
+        &mut app,
+        // Asked for more than the window holds, which is the only case
+        // where the sheet's height is a decision rather than a wish.
+        "pick a target for the release with a long question line that wraps twice more",
+        &[
+            ("alpha", Some("the first description")),
+            ("beta", Some("the second description")),
+            ("gamma", Some("the third description")),
+            ("delta", Some("the fourth description")),
+            ("epsilon", Some("the fifth description")),
+        ],
+        false,
+    );
+
+    let rendered = render_to_buffer(&mut app, 40, 12);
+    let rows = row_texts(&rendered);
+    let screen = rows.join("\n");
+    let theme = dch_tui::theme::Theme::by_name("dracula").expect("the theme exists");
+    let edge = theme.ui.primary;
+    let mut strip_bar = 0;
+    for column in 0..40u16 {
+        if let Some(cell) = rendered.backend().buffer().cell((column, 0))
+            && cell.symbol() == "─"
+            && cell.fg == edge
+        {
+            strip_bar += 1;
+        }
+    }
+    assert!(
+        strip_bar > 0,
+        "the strip keeps its row while the sheet is clamped to the rest:\n{screen}"
+    );
+    assert!(
+        screen.contains("Question"),
+        "the sheet is drawn on a short terminal:\n{screen}"
+    );
+    for row in &rows[rows.len().saturating_sub(STATUS_BAR_ROWS)..] {
+        assert!(
+            !row.contains('╰') && !row.contains('╯') && !row.contains('╭'),
+            "the sheet's box never reaches into the status bar:\n{screen}"
+        );
+    }
 }

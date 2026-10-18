@@ -134,8 +134,8 @@ impl AskTool {
     /// Returns [`ToolError::InvalidInput`] for structurally malformed input.
     /// Every other outcome the model can act on is a soft `is_error` result
     /// rather than an error: non-interactive mode, no UI installed, a
-    /// question dismissed before an answer, and a channel whose reader is
-    /// already gone — a send that cannot land is that same dismissal, since
+    /// question left unanswered, and a channel whose reader is already
+    /// gone — a send that cannot land is that same dismissal, since
     /// no user was ever shown the question. An answer wait also ends on the
     /// asking channel's own liveness: once the receiver is gone no answer
     /// can arrive, and the vanished reader answers with that same dismissal
@@ -171,7 +171,8 @@ impl AskTool {
             return Ok(dismissed());
         }
 
-        let mut lines = Vec::with_capacity(parsed.responses.len());
+        let total = parsed.responses.len();
+        let mut lines = Vec::with_capacity(total);
         for response in parsed.responses {
             let answered = tokio::select! {
                 // Priority order is load-bearing: an answer that has
@@ -180,25 +181,51 @@ impl AskTool {
                 // model's context loses the answer, not the turn.
                 biased;
                 outcome = response => outcome,
-                () = question_tx.closed() => return Ok(dismissed()),
+                () = question_tx.closed() => return Ok(unanswered_report(&lines, total)),
             };
             match answered {
-                Ok(resp) if resp.answers.is_empty() => return Ok(dismissed()),
-                Ok(resp) => lines.push(format_response(&resp)),
-                Err(_) => return Ok(dismissed()),
+                Ok(resp) if !resp.answers.is_empty() => lines.push(format_response(&resp)),
+                Ok(_) | Err(_) => {}
             }
         }
-        Ok(ToolOutput::text(lines.join("\n\n")))
+        if lines.len() == total {
+            return Ok(ToolOutput::text(lines.join("\n\n")));
+        }
+        Ok(unanswered_report(&lines, total))
     }
+}
+
+/// How a batch the user did not complete reads back.
+///
+/// Nothing answered at all is the plain case, and [`dismissed`] is the
+/// whole of it: there is nothing there to keep. Something answered is a
+/// different picture — the user chose some rows and passed over others —
+/// and reporting only a dismissal would erase the part of the exchange
+/// that happened. So what was answered stands in front of the model, and
+/// the gap is counted, softly: the ask did not complete, and the model
+/// knows how far it got.
+fn unanswered_report(lines: &[String], total: usize) -> ToolOutput {
+    if lines.is_empty() {
+        return dismissed();
+    }
+    let rest = total.saturating_sub(lines.len());
+    let text = format!(
+        "{}\n\nThe remaining {rest} of {total} questions went unanswered.",
+        lines.join("\n\n")
+    );
+    ToolOutput::error_text(text)
 }
 
 /// The soft answer for every way a question can end without one.
 ///
-/// Every dismissal path — the host's `Esc`, a retired prompt, a reply
-/// channel dropped unanswered, a send that could not land, an asking
-/// channel whose receiver vanished mid-wait — reads the same to the
-/// model however it arrived: the question went unanswered, and the
-/// sound move is to proceed without asking.
+/// Every path that leaves a batch with nothing in it — the host's `Esc`
+/// on every question, a retired prompt, a reply channel dropped
+/// unanswered, a send that could not land, an asking channel whose
+/// receiver vanished mid-wait — reads the same to the model however it
+/// arrived: nothing was answered, and the sound move is to proceed
+/// without asking. A batch answered *partly* reads differently, through
+/// [`unanswered_report`]: dismissal is per question, so what the user did
+/// answer is kept.
 fn dismissed() -> ToolOutput {
     ToolOutput::error_text("The question was dismissed before the user answered.")
 }

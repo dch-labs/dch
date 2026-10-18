@@ -592,45 +592,7 @@ impl InputEditor {
     /// the continuation row a final-row-filling caret appends.
     #[must_use]
     pub fn display_rows_and_caret(&self, width: u16) -> (Vec<String>, Option<(u16, u16)>) {
-        let cap = usize::from(width.max(1));
-        let before = self.text.get(..self.cursor).unwrap_or("");
-        let caret_line = before.matches('\n').count();
-        let caret_bytes = before.rfind('\n').map_or(self.cursor, |i| {
-            self.cursor.saturating_sub(i.saturating_add(1))
-        });
-        let mut rows: Vec<String> = Vec::new();
-        let mut caret: Option<(usize, usize)> = None;
-        let mut row: usize = 0;
-        for (index, logical) in self.text.split('\n').enumerate() {
-            let wrapped = wrap_greedy(logical, cap);
-            if index == caret_line {
-                let cell = if caret_bytes == logical.len() {
-                    end_of_line_caret(logical, cap)
-                } else {
-                    caret_cell_in_line(logical, &wrapped, caret_bytes).unwrap_or((0, 0))
-                };
-                caret = Some((row.saturating_add(cell.0), cell.1));
-            }
-            if wrapped.is_empty() {
-                rows.push(String::new());
-            } else {
-                rows.extend(wrapped.into_iter().map(std::borrow::Cow::into_owned));
-            }
-            row = rows.len();
-        }
-        if rows.is_empty() {
-            rows.push(String::new());
-        }
-        if caret.is_some_and(|(row, _)| row == rows.len()) {
-            rows.push(String::new());
-        }
-        let caret = caret.map(|(row, column)| {
-            (
-                u16::try_from(row).unwrap_or(u16::MAX),
-                u16::try_from(column).unwrap_or(u16::MAX),
-            )
-        });
-        (rows, caret)
+        wrap_rows_and_caret(&self.text, self.cursor, width)
     }
 
     /// The cursor's `(row, column)` within the grid
@@ -1031,4 +993,62 @@ impl Default for InputEditor {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The wrap's rows and the caret's cell within them for one buffer.
+///
+/// [`InputEditor::display_rows_and_caret`] is this run over the editor's
+/// own buffer; the question draft runs it over a borrowed string, so the
+/// app's two editable surfaces break text at the same points and read the
+/// caret out of the same layout. A second wrap of the draft's own would
+/// have put the caret on one row and the text on another the first time
+/// the two algorithms disagreed about where a line breaks.
+///
+/// `cursor` is a byte offset into `text`; the caret is the `(row, column)`
+/// its cell lands on within the returned rows, `None` for a buffer with no
+/// caret inside it.
+pub(crate) fn wrap_rows_and_caret(
+    text: &str,
+    cursor: usize,
+    width: u16,
+) -> (Vec<String>, Option<(u16, u16)>) {
+    let cap = usize::from(width.max(1));
+    let before = text.get(..cursor).unwrap_or("");
+    let caret_line = before.matches('\n').count();
+    let caret_bytes = before.rfind('\n').map_or(cursor, |break_at| {
+        cursor.saturating_sub(break_at.saturating_add(1))
+    });
+    let mut rows: Vec<String> = Vec::new();
+    let mut caret: Option<(usize, usize)> = None;
+    let mut row: usize = 0;
+    for (index, logical) in text.split('\n').enumerate() {
+        let wrapped = wrap_greedy(logical, cap);
+        if index == caret_line {
+            let cell = if caret_bytes == logical.len() {
+                end_of_line_caret(logical, cap)
+            } else {
+                caret_cell_in_line(logical, &wrapped, caret_bytes).unwrap_or((0, 0))
+            };
+            caret = Some((row.saturating_add(cell.0), cell.1));
+        }
+        if wrapped.is_empty() {
+            rows.push(String::new());
+        } else {
+            rows.extend(wrapped.into_iter().map(std::borrow::Cow::into_owned));
+        }
+        row = rows.len();
+    }
+    if rows.is_empty() {
+        rows.push(String::new());
+    }
+    if caret.is_some_and(|(row, _)| row == rows.len()) {
+        rows.push(String::new());
+    }
+    let caret = caret.map(|(row, column)| {
+        (
+            u16::try_from(row).unwrap_or(u16::MAX),
+            u16::try_from(column).unwrap_or(u16::MAX),
+        )
+    });
+    (rows, caret)
 }

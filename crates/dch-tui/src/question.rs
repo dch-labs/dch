@@ -9,8 +9,9 @@
 /// One question awaiting the user's answer.
 ///
 /// The host derives these from the asking tool's batched requests and
-/// lands them on the app's question channel; the overlay shows one at
-/// a time, and the keys answer exactly once by sending the chosen
+/// lands them on the app's question channel — a batch arrives together,
+/// so the overlay queues it and shows one at a time until the keys walk
+/// it. The keys answer a prompt exactly once by sending the chosen
 /// labels on [`reply`](Self::reply) — a send consumes it, which is
 /// the prompt's single-answer contract. Dropping a prompt unanswered
 /// closes its channel and the asking tool reads a dismissal.
