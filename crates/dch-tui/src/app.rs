@@ -1664,7 +1664,14 @@ impl TuiApp {
     /// draft answers last, from the row below every option. A single
     /// select answers one thing: the marked row — or the draft, where the
     /// draft is what the user chose to write — and with nothing marked at
-    /// all, the row the cursor stands on.
+    /// all, the row the cursor stands on. A multi-select asks the same
+    /// question of its rows and, when none of them is marked, takes the
+    /// cursor's row for its own: an empty reply is exactly what a
+    /// dismissal sends, so Enter on a row the user walked onto cannot
+    /// answer with nothing. Whichever row the cursor stands on is the row
+    /// Enter confirms, the compose row included — there its words are its
+    /// content, and a draft kept out of compose answers from no other row
+    /// but that one.
     ///
     /// `draft_counts` is whether the typed text belongs to the answer on
     /// its own rather than only where its row is marked: the draft's own
@@ -1679,7 +1686,8 @@ impl TuiApp {
         let ui = &entry.ui;
         let free_row = entry.prompt.options.len();
         let draft = ui.draft.trim().to_string();
-        let draft_wanted = (draft_counts || ui.toggled.contains(&free_row)) && !draft.is_empty();
+        let draft_wanted = !draft.is_empty()
+            && (draft_counts || ui.toggled.contains(&free_row) || ui.cursor == free_row);
         if entry.prompt.multi_select {
             let mut answers = entry
                 .prompt
@@ -1691,6 +1699,15 @@ impl TuiApp {
                 .collect::<Vec<String>>();
             if draft_wanted {
                 answers.push(draft);
+            }
+            if answers.is_empty() {
+                answers.extend(
+                    entry
+                        .prompt
+                        .options
+                        .get(ui.cursor)
+                        .map(|option| option.label.clone()),
+                );
             }
             answers
         } else if draft_wanted {
@@ -1834,7 +1851,8 @@ impl TuiApp {
     /// answering, and Enter confirms: the marked rows, or the cursor row
     /// where nothing is marked. On the compose row Enter opens the draft,
     /// and a marked compose row still empty opens it too rather than
-    /// answer without its text — as does typing a letter anywhere in the
+    /// answering without its text — as does typing a letter anywhere in
+    /// the
     /// sheet, which opens the draft with that letter in it. Inside the
     /// draft the arrows move its caret and Home and
     /// End jump its ends — those keys belong to the text being typed, not
@@ -1875,12 +1893,15 @@ impl TuiApp {
     /// event is not asking for a newline the answer cannot carry. A draft
     /// with nothing in it is not an answer and does not go; it says so on
     /// the sheet's own hint row, which is where the key promised
-    /// otherwise. Everything else is swallowed.
+    /// otherwise. A letter counts whether it is shifted, because that is
+    /// how a capital arrives; only Ctrl takes a key off its letter.
+    /// Everything else is swallowed.
     fn question_draft_key(&mut self, key: KeyEvent, bare: bool) -> bool {
         let mut send = false;
         if let Some(entry) = self.shown_question_mut() {
             let ui = &mut entry.ui;
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            let letter = bare || key.modifiers == KeyModifiers::SHIFT;
             match key.code {
                 KeyCode::Enter => {
                     // The written reply is the answer, so it counts here
@@ -1902,7 +1923,7 @@ impl TuiApp {
                 KeyCode::Backspace => ui.backspace(),
                 KeyCode::Delete => ui.delete_forward(),
                 KeyCode::Char('u') if ctrl => ui.delete_to_start(),
-                KeyCode::Char(ch) if bare => ui.type_char(ch),
+                KeyCode::Char(ch) if letter => ui.type_char(ch),
                 _ => {}
             }
         }
@@ -1976,7 +1997,9 @@ impl TuiApp {
     /// single-select — and it never answers, so a stray press cannot send
     /// a reply. Enter answers with the marked rows (the marked row, or the
     /// cursor row where nothing is marked), a marked draft answering with
-    /// its own text.
+    /// its own text, and the compose row answering with the words it
+    /// holds. A letter typed here starts a draft, shifted or not, since a
+    /// capital is the letter with Shift held.
     fn question_rows_key(&mut self, key: KeyEvent, bare: bool) -> bool {
         let Some(entry) = self.shown_question() else {
             return true;
@@ -2059,7 +2082,7 @@ impl TuiApp {
             // to a typed answer is to start typing it, and a keystroke
             // the overlay drops in silence is the one thing a keyboard
             // should never do.
-            KeyCode::Char(ch) if bare => {
+            KeyCode::Char(ch) if bare || key.modifiers == KeyModifiers::SHIFT => {
                 if let Some(entry) = self.shown_question_mut() {
                     entry.ui.open_composing();
                     entry.ui.type_char(ch);
@@ -3923,16 +3946,15 @@ impl TuiApp {
         let ui = &entry.ui;
         let mut lines: Vec<Line<'static>> = vec![Line::default()];
         if ui.composing {
-            let draft_width = wrap_at
-                .saturating_sub(COMPOSE_PREFIX.width())
-                .max(1)
-                .min(u16::MAX as usize);
+            // The draft spends the prefix's width before it writes, and a
+            // row one cell wide is still a row; a width past what the frame
+            // can address is the widest row there is. Both bounds are this
+            // one conversion, so nothing downstream has to guess.
+            let draft_width = u16::try_from(wrap_at.saturating_sub(COMPOSE_PREFIX.width()).max(1))
+                .unwrap_or(u16::MAX);
             let caret_byte = byte_index(&ui.draft, ui.caret);
-            let (rows, caret) = crate::input::wrap_rows_and_caret(
-                &ui.draft,
-                caret_byte,
-                u16::try_from(draft_width).unwrap_or(1).max(1),
-            );
+            let (rows, caret) =
+                crate::input::wrap_rows_and_caret(&ui.draft, caret_byte, draft_width);
             let first = lines.len();
             // Every row spends the prefix's width before its text — the
             // pencil on the first, the same width of air on the rows

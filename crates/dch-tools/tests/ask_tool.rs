@@ -402,12 +402,17 @@ mod cases {
     }
 
     #[tokio::test]
-    async fn one_dismissal_withdraws_the_questions_behind_it() {
-        // What the UI leans on. A dismissal answers the whole ask, so the
-        // tool returns without ever awaiting the questions behind it — and
-        // a closed reply channel is the only notice the overlay gets that
-        // a question on its screen is no one's to ask. Pin that the
-        // untouched receivers really do drop.
+    async fn questions_behind_a_vanished_reader_are_withdrawn() {
+        // What the UI leans on, and what ends the wait here is the reader
+        // going away rather than any answer: this driver hands out Q2's
+        // sender and dismisses Q1, then finishes — so the request channel's
+        // receiver drops while the tool is still waiting, and the wait ends
+        // on the closed-channel arm without Q2 ever being asked. Pin that
+        // the question left behind really loses its listener: a closed
+        // reply channel is the only notice the overlay gets that a question
+        // on its screen is no one's to ask. That a dismissal alone keeps the
+        // rest asked, while a reader is alive, is
+        // `a_dismissed_first_question_still_asks_the_rest`.
         let (ctx, mut rx) = ctx_with_channel(false);
         let (hold_tx, mut hold_rx) = tokio::sync::mpsc::unbounded_channel();
         let driver = tokio::spawn(async move {

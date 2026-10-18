@@ -6345,6 +6345,59 @@ fn a_walked_question_keeps_its_answer_in_progress() {
 }
 
 #[test]
+fn a_capital_letter_types_into_the_open_draft() {
+    // A capital reaches a terminal as the letter with Shift held, which is
+    // how the composer's own editor receives it too. The draft dropping
+    // that shape lost the capital out of the middle of a word — "Deploy"
+    // arrived as "eploy" — and nothing on the screen said so.
+    let (mut app, _replies) = question_app(&[StagedQuestion {
+        question: "which migration runs first?",
+        options: &[("none", None)],
+        multi_select: false,
+    }]);
+    let _ = app.handle_event(&plain(KeyCode::Down));
+    let _ = app.handle_event(&plain(KeyCode::Enter)); // open the draft
+    let _ = app.handle_event(&key(KeyCode::Char('D'), KeyModifiers::SHIFT));
+    for ch in ['b', 'c'] {
+        let _ = app.handle_event(&plain(KeyCode::Char(ch)));
+    }
+    let screen = screen_text(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        screen.contains("Dbc"),
+        "the capital lands where it was typed: {screen}"
+    );
+}
+
+#[test]
+fn a_capital_letter_starts_a_draft_from_the_rows() {
+    // Typing at the rows starts the answer; a shifted letter is the same
+    // invitation. The word has to arrive whole, because the answer is
+    // what was written and not the letters that happened to be unshifted.
+    let (mut app, mut replies) = question_app(&[StagedQuestion {
+        question: "Deploy the release now?",
+        options: &[("yes", None), ("no", None)],
+        multi_select: false,
+    }]);
+    let _ = app.handle_event(&key(KeyCode::Char('Y'), KeyModifiers::SHIFT));
+    for ch in ['e', 's'] {
+        let _ = app.handle_event(&plain(KeyCode::Char(ch)));
+    }
+    let screen = screen_text(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        screen.contains("Yes"),
+        "a shifted letter opens the draft with its capital in it: {screen}"
+    );
+
+    let mut reply = replies.remove(0);
+    let _ = app.handle_event(&plain(KeyCode::Enter));
+    assert_eq!(
+        reply.try_recv().expect("the drafted answer goes at once"),
+        vec!["Yes".to_string()],
+        "the capital is in the answer, not dropped on the way to it"
+    );
+}
+
+#[test]
 fn the_draft_edits_at_its_caret() {
     // The drafted answer was append-only: a word in the wrong place
     // meant deleting back to it. The arrows move a caret inside the
@@ -6838,19 +6891,27 @@ fn arrows_space_and_enter_answer_a_multi_select_question() {
 
 #[test]
 fn toggling_a_row_twice_returns_it_to_untoggled() {
-    let (mut app, mut replies) = question_app(&[StagedQuestion {
+    // Space's contract is the mark and nothing else: one press puts the
+    // dot on the row, the next takes it off. The answer Enter makes
+    // afterwards is its own subject (pinned beside it), so this test
+    // reads the row rather than the reply.
+    let (mut app, _replies) = question_app(&[StagedQuestion {
         question: "Which checks run?",
         options: &[("lint", None), ("tests", None)],
         multi_select: true,
     }]);
-    assert!(app.handle_event(&plain(KeyCode::Char(' '))));
-    assert!(app.handle_event(&plain(KeyCode::Char(' '))));
-    let reply = replies.remove(0);
-    assert!(app.handle_event(&plain(KeyCode::Enter)));
-    assert_eq!(
-        reply.blocking_recv(),
-        Ok(Vec::<String>::new()),
-        "a toggled-then-untoggled row confirms no answer"
+    let _ = app.handle_event(&plain(KeyCode::Char(' ')));
+    let marked = screen_text(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        marked.contains("\u{2022} lint"),
+        "the first Space marks the row: {marked}"
+    );
+
+    let _ = app.handle_event(&plain(KeyCode::Char(' ')));
+    let cleared = screen_text(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        !cleared.contains("\u{2022} lint"),
+        "the second Space takes the mark off again: {cleared}"
     );
 }
 
@@ -6868,6 +6929,91 @@ fn enter_confirms_the_cursor_row_for_a_single_select_question() {
         reply.blocking_recv(),
         Ok(vec!["no".to_string()]),
         "Enter confirms the row the cursor moved to"
+    );
+}
+
+#[test]
+fn enter_confirms_the_cursor_row_for_a_multi_select_question() {
+    // Enter over the rows is a confirmation on an ask that takes several
+    // answers exactly as it is on one that takes one. An empty reply is
+    // what a dismissal sends, and the ask tool reads the two alike — so a
+    // row the user walked onto and confirmed cannot answer with nothing.
+    let (mut app, mut replies) = question_app(&[StagedQuestion {
+        question: "Which checks run?",
+        options: &[("lint", None), ("tests", None)],
+        multi_select: true,
+    }]);
+    let _ = app.handle_event(&plain(KeyCode::Down));
+    let mut reply = replies.remove(0);
+    assert!(app.handle_event(&plain(KeyCode::Enter)));
+    assert_eq!(
+        reply.try_recv().expect("the confirmed row answers at once"),
+        vec!["tests".to_string()],
+        "the row the cursor reached answers an unmarked multi-select"
+    );
+}
+
+#[test]
+fn a_kept_draft_stands_aside_when_enter_confirms_an_option() {
+    // Stepping out of the draft keeps the words, and Enter on an option
+    // row is the later decision — the pointer's, not the text's. Which of
+    // the two wins is a decision worth a pin: the row answers, and the
+    // draft that was never marked stays unasked rather than answering in
+    // the option's place.
+    let (mut app, mut replies) = question_app(&[StagedQuestion {
+        question: "Which checks run?",
+        options: &[("lint", None), ("tests", None)],
+        multi_select: true,
+    }]);
+    let _ = app.handle_event(&plain(KeyCode::Down)); // to "tests"
+    let _ = app.handle_event(&plain(KeyCode::Down)); // to the compose row
+    let _ = app.handle_event(&plain(KeyCode::Enter)); // open the draft
+    for ch in "just the lints".chars() {
+        let _ = app.handle_event(&plain(KeyCode::Char(ch)));
+    }
+    let _ = app.handle_event(&plain(KeyCode::Esc)); // keep the text, back to rows
+    let _ = app.handle_event(&plain(KeyCode::Up)); // onto "tests"
+    let screen = screen_text(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        screen.contains("just the lints"),
+        "Esc keeps what was written: {screen}"
+    );
+
+    let mut reply = replies.remove(0);
+    assert!(app.handle_event(&plain(KeyCode::Enter)));
+    assert_eq!(
+        reply.try_recv().expect("the confirmed row answers at once"),
+        vec!["tests".to_string()],
+        "the row Enter stood on answers, not the draft left unmarked"
+    );
+}
+
+#[test]
+fn enter_on_the_compose_row_sends_the_draft_it_stands_on() {
+    // The same confirmation one row further down: the compose row's
+    // content is its words, so Enter where it stands sends them. Before
+    // this it sent nothing at all and took the written reply down with
+    // the resolved question.
+    let (mut app, mut replies) = question_app(&[StagedQuestion {
+        question: "Anything to add?",
+        options: &[("nothing", None)],
+        multi_select: false,
+    }]);
+    let _ = app.handle_event(&plain(KeyCode::Down)); // to the compose row
+    let _ = app.handle_event(&plain(KeyCode::Enter)); // open the draft
+    for ch in "run the lints first".chars() {
+        let _ = app.handle_event(&plain(KeyCode::Char(ch)));
+    }
+    let _ = app.handle_event(&plain(KeyCode::Esc)); // step back, cursor stays put
+
+    let mut reply = replies.remove(0);
+    assert!(app.handle_event(&plain(KeyCode::Enter)));
+    assert_eq!(
+        reply
+            .try_recv()
+            .expect("the row Enter stands on answers at once"),
+        vec!["run the lints first".to_string()],
+        "the compose row answers with the words it holds"
     );
 }
 
