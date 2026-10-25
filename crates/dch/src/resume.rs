@@ -871,6 +871,7 @@ mod tests {
         TuiMessage::User {
             text: text.to_string(),
             timestamp: now(),
+            steered: false,
         }
     }
 
@@ -1388,6 +1389,7 @@ mod tests {
         let mut transcript = vec![TuiMessage::User {
             text: "review the branch".to_string(),
             timestamp: now(),
+            steered: false,
         }];
         for _round in 0..4 {
             transcript.push(assistant(vec![

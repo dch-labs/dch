@@ -635,7 +635,11 @@ impl Tool for TodoTool {
          (e.g., \"Fix bug\", \"Add feature\"). Statuses move one rung at a time — \
          pending → in_progress → completed — and skipped rungs are rejected; \
          at most one entry is in progress at a time, and a second is rejected. \
-         Reopen completed work via in_progress."
+         Reopen completed work via in_progress. \
+         The list is live, not a one-time filing: call this tool again each time a task \
+         starts or completes, and before ending your run mark every task completed or \
+         remove the ones you are no longer doing — a finished run never leaves undone \
+         work in its plan."
     }
 
     fn schema(&self) -> ToolSchema {
@@ -700,7 +704,8 @@ impl Tool for TodoTool {
              it completed in a follow-up call. The list survives context \
              compaction: it is the durable record of what is done and what \
              remains, so a compacted session knows where it stood — keep it \
-             current."
+             current. Before finishing, update the list one last time: every \
+             task completed or removed — never end a turn with a stale plan."
                 .to_string(),
         )
     }
@@ -1070,6 +1075,18 @@ mod tests {
         assert!(
             description.contains("one rung at a time"),
             "tool description must state the rule: {description}"
+        );
+        assert!(
+            description.contains("never leaves undone"),
+            "tool description must state the end-of-run contract — the \
+             filing-only session (work done, list abandoned at 1/10) is \
+             the failure this exists to stop: {description}"
+        );
+        let fragment = TodoTool.system_prompt().expect("fragment present");
+        assert!(
+            fragment.contains("never end a turn with a stale plan"),
+            "the system-prompt fragment must carry the same end-of-run \
+             contract: {fragment}"
         );
         let schema = serde_json::to_string(&TodoTool.schema()).expect("schema serializes");
         assert!(

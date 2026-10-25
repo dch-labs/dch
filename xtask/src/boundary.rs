@@ -309,6 +309,7 @@ impl<'a> Checker<'a> {
         let dch_binary_expected = vec![
             "dch-config".to_string(),
             "dch-loop".to_string(),
+            "dch-tools".to_string(),
             "dch-tui".to_string(),
         ];
         if let Some(pkg) = find(self.pkgs, "dch") {
@@ -317,7 +318,7 @@ impl<'a> Checker<'a> {
                 out.push(Violation {
                     crate_name: "dch".into(),
                     detail: format!(
-                        "dch-* deps must be exactly {{dch-loop, dch-tui, dch-config}}, but are {{{}}}",
+                        "dch-* deps must be exactly {{dch-config, dch-loop, dch-tools, dch-tui}}, but are {{{}}}",
                         actual.join(", ")
                     ),
                 });
@@ -569,7 +570,14 @@ mod tests {
         vec![
             pkg(
                 "dch",
-                &["dch-config", "dch-loop", "dch-tui", "loopctl", "clap"],
+                &[
+                    "dch-config",
+                    "dch-loop",
+                    "dch-tools",
+                    "dch-tui",
+                    "loopctl",
+                    "clap",
+                ],
             ),
             pkg("dch-config", &["loopctl", "serde"]),
             pkg("dch-loop", &["dch-config", "dch-tools", "loopctl", "tokio"]),
@@ -777,15 +785,16 @@ mod tests {
             &[
                 "dch-config",
                 "dch-loop",
-                "dch-tui",
                 "dch-tools",
+                "dch-tui",
+                "dch-mcp",
                 "loopctl",
                 "clap",
             ],
         );
         let ws = with_pkg(&good_workspace(), "dch", &bad);
         let v = Checker::new(&ws).check();
-        assert!(has_violation(&v, "dch", "dch-tools"));
+        assert!(has_violation(&v, "dch", "dch-mcp"));
     }
 
     #[test]
@@ -819,5 +828,25 @@ mod tests {
             }]
         );
         Ok(())
+    }
+
+    #[test]
+    fn agents_table_names_the_enforced_binary_dependency_set() {
+        // The canon table and the enforcer must name the same set: a
+        // widening that updates one and not the other leaves a reader
+        // following AGENTS.md to call a legal dependency a violation.
+        let agents = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../AGENTS.md"))
+            .expect("AGENTS.md sits at the workspace root");
+        let row = agents
+            .lines()
+            .find(|line| line.starts_with("| `dch` (bin) |"))
+            .expect("the boundary table carries the binary's row");
+        for dep in ["dch-config", "dch-loop", "dch-tools", "dch-tui"] {
+            assert!(
+                row.contains(dep),
+                "AGENTS.md's binary row must name {dep} the enforcer \
+                 admits: {row}"
+            );
+        }
     }
 }

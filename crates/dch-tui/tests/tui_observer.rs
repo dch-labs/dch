@@ -463,7 +463,7 @@ fn a_stale_stream_never_graduates_onto_a_new_reply() {
     let graduations = kept.graduations.lock().expect("the graduations lock");
     let Some(reply) = graduations.iter().rev().find_map(|g| match g {
         Graduation::Reply { thinking, .. } => Some(thinking),
-        Graduation::Tool(_) | Graduation::RunEnded { .. } => None,
+        Graduation::Tool(_) | Graduation::RunEnded { .. } | Graduation::Sent { .. } => None,
     }) else {
         panic!("the reply still graduates");
     };
@@ -525,12 +525,7 @@ fn a_turn_end_queues_its_history_for_the_host() {
 }
 
 fn stream(turn: usize, input_tokens: u64, output_tokens: u64) -> StreamContext {
-    StreamContext {
-        turn,
-        model: "test-model".to_string(),
-        input_tokens,
-        output_tokens,
-    }
+    StreamContext::new(turn, "test-model", input_tokens, output_tokens)
 }
 
 fn turn_end(turn: usize, input_tokens: u64, output_tokens: u64) -> TurnEndContext {
@@ -608,7 +603,7 @@ fn a_response_hands_the_finalized_reply_to_the_display_buffer() {
         .iter()
         .filter_map(|event| match event {
             Graduation::Reply { text, .. } => Some(text.clone()),
-            Graduation::Tool(_) | Graduation::RunEnded { .. } => None,
+            Graduation::Tool(_) | Graduation::RunEnded { .. } | Graduation::Sent { .. } => None,
         })
         .collect();
     assert_eq!(
@@ -973,5 +968,46 @@ fn batch_tools_stash_their_counts_with_the_value() {
     assert_eq!(
         todo, "2 items",
         "a list-only input carries its size as the value: {todo}"
+    );
+}
+
+#[test]
+fn a_reset_keeps_a_row_owed_to_a_prompt_that_already_sent() {
+    // A prompt whose text reached a run owes the transcript a row, and a
+    // manager sweep ahead of the next run is no reason to lose it: the send
+    // happened, and a transcript missing it reads as a prompt never asked.
+    // Every other graduation is the run's own work and goes with it.
+    let (observer, kept) = TuiObserverState::new().into_observer();
+    kept.push_sent("sent while a run was being torn down".to_string());
+    kept.graduations.lock().unwrap().push(Graduation::Reply {
+        text: "a reply still in flight when the sweep came".to_string(),
+        thinking: None,
+    });
+
+    observer.reset();
+
+    let owed: Vec<String> = kept
+        .graduations
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|graduation| match graduation {
+            Graduation::Sent { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        owed,
+        ["sent while a run was being torn down"],
+        "the row a finished send owes survives the sweep"
+    );
+    assert!(
+        !kept
+            .graduations
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|graduation| matches!(graduation, Graduation::Reply { .. })),
+        "the half-finished reply is the run\'s own state, and the sweep clears it"
     );
 }

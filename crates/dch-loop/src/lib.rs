@@ -5,6 +5,7 @@
 pub mod console_observer;
 pub mod context_probe;
 pub mod error;
+pub mod known_windows;
 pub mod permission;
 pub mod project;
 pub mod prompt;

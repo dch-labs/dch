@@ -205,7 +205,7 @@ impl ToolMiddleware for RedactionOverwriteGuard {
     ) -> Pin<Box<dyn Future<Output = ToolDispatchResult> + Send + 'a>> {
         Box::pin(async move {
             if ctx.tool_name == WRITE_TOOL
-                && let Some(file_path) = ctx.input.get("file_path").and_then(|value| value.as_str())
+                && let Some(file_path) = crate::write_target_gate::write_family_path(&ctx.input)
                 && write_refused(
                     &write_target(file_path, Path::new(&ctx.tool_context.cwd)),
                     &self.patterns,

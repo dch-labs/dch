@@ -16,12 +16,16 @@ use crate::ToolResultDisplay;
 use crate::message::ActiveTool;
 use crate::theme::Theme;
 
-/// Braille spinner frames, advanced by the render tick while a tool
-/// runs.
+/// Spinner frames, advanced by the render tick while a tool runs.
 ///
-/// One animation beat for every running indicator; each frame is
-/// one display column wide (pinned by test).
-pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// One animation beat for every running indicator; each frame is one
+/// display column wide (pinned by test). The braille orbit the
+/// original prototype turned — ten cells, one full revolution per
+/// ten beats.
+pub const SPINNER_FRAMES: &[&str] = &[
+    "\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}", "\u{2826}", "\u{2827}",
+    "\u{2807}", "\u{280f}",
+];
 
 /// The running indicator for the per-tool line.
 ///

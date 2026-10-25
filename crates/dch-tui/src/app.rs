@@ -26,18 +26,22 @@ use unicode_width::UnicodeWidthChar as _;
 use unicode_width::UnicodeWidthStr as _;
 
 use dch_config::DchConfig;
+use dch_config::PathStyle;
 use dch_config::StripPosition;
 use dch_config::StripStyle;
 
 use crate::Graduation;
 use crate::events::TerminalEvents;
+use crate::guidance::Guidance;
 use crate::input::{InputAction, InputEditor};
 use crate::markdown;
 use crate::message::{ActiveTool, ContentBlock, TokenCounts, TuiMessage};
 use crate::observer::{HealthNotice, ToolResultDisplay, TuiObserverState};
 use crate::permission::PermissionRequest;
 use crate::question::QuestionPrompt;
+use crate::queue::Submission;
 use crate::theme::Theme;
+use crate::todo_view;
 use crate::tool_render::SPINNER_FRAMES;
 use dch_config::Verbosity;
 
@@ -87,6 +91,14 @@ const TICK_INTERVAL: Duration = Duration::from_millis(100);
 /// per frame — whatever the wire's granularity.
 const ANIMATION_INTERVAL: Duration = Duration::from_millis(20);
 
+/// How much run time one spinner frame stands for.
+///
+/// The timer line's leading dot turns at this cadence — a full
+/// ten-frame revolution per 800ms of run time, the prototype's own
+/// rhythm, sampled by every redraw so the motion is continuous
+/// however the wakes fall.
+const SPINNER_FRAME_MS: u64 = 80;
+
 /// Ticks per caret blink phase.
 ///
 /// Half a second on, half a second off — the cadence editors settle
@@ -105,6 +117,195 @@ const CARET_BLINK_TICKS: u32 = 5;
 /// blocks, the ones a reader is still working through, are the
 /// ones that stay openable.
 const TOOL_DETAIL_CAP: usize = 256;
+
+/// The most rows the waiting-prompt section can hold when drawn.
+///
+/// The cap, not the count: the section reserves only the rows it
+/// paints — the air above it, the title row carrying the badge that
+/// names it, the air standing that badge off the prompt below it,
+/// and the rows the shown prompt wraps into. A one-line wording ends
+/// the section at its own last row; no blank rides beneath it, so the
+/// space under the queue is the frame's own furniture rather than the
+/// section's margin. Two prompt rows are the most a wording may take —
+/// one prompt at a time, counting the rest rather than growing
+/// downward, because the rows it takes come straight out of the
+/// conversation: a backlog must not cost a row per prompt of the
+/// transcript the user is reading to decide what to do about it — and
+/// the two blank rows are what stop a filled pill reading as riveted
+/// to its neighbors: the transcript it overlays, the wording it
+/// labels.
+const QUEUE_ROWS: u16 = 5;
+
+/// The most task rows the pinned plan section holds.
+///
+/// Four: the section is the plan's window, not its archive — the
+/// conversation's per-update blocks carry every task in full, so the
+/// section spends the conversation's rows on the tasks nearest the
+/// plan's top and names the rest with one ellipsis line. The header
+/// and that line ride outside the count, so a full section stands at
+/// six rows at the very widest plan.
+const TODO_SECTION_BODY_ROWS: usize = 4;
+
+/// The plan section's inset from each of the frame's edges.
+///
+/// The section's own breath from the frame: the plan's rows read as
+/// the transcript's register, plain lines rather than a panel, and
+/// never flush against the frame — the badge rides flush with the
+/// rows inside it.
+const TODO_SECTION_INSET: u16 = 2;
+
+/// The glyph marking the waiting-prompt section's rows.
+///
+/// Short on purpose: the marker shares its row with the prompt's wording,
+/// and everything a prefix costs is wording squeezed off the end. Both the
+/// renderer and the tests that read a frame locate the section by this
+/// glyph, so it is the section's identity on screen rather than ornament.
+const QUEUE_MARKER: &str = "\u{231b}";
+
+/// The title row the waiting-prompt section opens with.
+///
+/// Rendered as a badge — the word on a filled pill, one cell proud of
+/// its letters on either side, filled with the accent the composer's
+/// edge column wears — flush with the section's left edge, so the
+/// prompts waiting behind the turn in flight are a named region of
+/// the screen rather than a strip a first-time reader must decode
+/// from the hourglass alone. It rides the section's first row, flush
+/// with the prompt rows' left edge, and exists only while prompts
+/// wait — an empty queue is no panel, title included. The section's
+/// chords ride beside it on the same row, dim after the pill: the
+/// badge row is short and always drawn, where the prompt rows wrap
+/// and a right-edge hint would vanish exactly when the terminal
+/// narrows.
+const QUEUE_TITLE: &str = "QUEUED";
+
+/// The prefix the shown prompt's first row carries.
+///
+/// The marker alone when one prompt waits, the marker with its place
+/// in the line when more do. Both the section's renderer and the
+/// height the layout reserves for it measure the prompt's wrap
+/// against this prefix, so the rows reserved are the rows drawn —
+/// the wrap the height counted on is the wrap the frame sees.
+fn queue_prompt_prefix(total: usize, shown: usize) -> String {
+    if total > 1 {
+        format!("{QUEUE_MARKER} [{}/{}] ", shown.saturating_add(1), total)
+    } else {
+        format!("{QUEUE_MARKER} ")
+    }
+}
+
+/// The plan section's posture, as Ctrl+T leaves it.
+///
+/// One chord walks the three: capped at its four task rows with the
+/// cut named, opened to the whole list however tall, or folded away
+/// entirely. A posture is a view preference — the plan keeps updating
+/// underneath every one of them, and the run's landing clears the
+/// section out of whatever posture it was in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlanView {
+    /// Capped at [`TODO_SECTION_BODY_ROWS`] task rows, the ellipsis
+    /// naming the rest and the chord that shows them.
+    Capped,
+
+    /// The whole list — the section grows to whatever the plan holds,
+    /// because opening it is a deliberate act with the cost in plain
+    /// sight.
+    Full,
+
+    /// Folded away: the conversation takes the rows back, one dim
+    /// marker row left standing in the section's place — see
+    /// [`folded_hint`](crate::todo_view::folded_hint).
+    Hidden,
+}
+
+/// Which destructive act the section's confirmation is holding.
+///
+/// Named rather than a flag: the two acts spend different things —
+/// one sends the prompt into the run in flight, the other takes it
+/// out of the queue for good — and the ask's wording is the last
+/// chance to say which before it happens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueueAct {
+    /// Send the shown prompt to the running turn as guidance.
+    ///
+    /// The gentler spend: the prompt leaves the queue and joins the
+    /// conversation the model is already having, read at its next
+    /// boundary rather than waiting for its own turn.
+    Steer,
+
+    /// Take the shown prompt out of the queue for good.
+    ///
+    /// The irreversible spend: the prompt never runs, its words never
+    /// reach the model, and the queue closes up behind it.
+    Drop,
+}
+
+/// Whose hands the keyboard is in, as far as waiting prompts go.
+///
+/// One value rather than a focus flag beside an edit flag, because the two
+/// flags could stand together and nothing in the code would have been able
+/// to tell what a press meant: the section cannot hold the keys while its
+/// prompt is out being typed into — the typing is precisely what the section
+/// would have to give up to let it happen. The states the keys actually have
+/// are three, so three is what is spelled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueueMode {
+    /// The composer holds the keys; the section only shows what waits.
+    ///
+    /// The resting state, and the only one a session with nothing waiting
+    /// can be in: the keys go where they went before the section existed,
+    /// and its rows, when there are any, are reading matter.
+    Plain,
+
+    /// The section holds the keys: the arrows walk, `e` lifts, `d` drops,
+    /// and everything else is swallowed.
+    ///
+    /// Reachable only with something waiting — the chord is refused on an
+    /// empty queue rather than parking the user on a list with no rows —
+    /// and Esc gives the keys back. Nothing leaks from in here: a letter
+    /// typed over the backlog has nowhere it should go, and assembling a
+    /// draft behind the user's back is what the swallowing exists to stop.
+    Focused,
+
+    /// The ask between a destructive key and its act.
+    ///
+    /// `s` and `d` are one keypress away from sending a prompt into a
+    /// running turn or spending it entirely, so the press asks first:
+    /// `y` does the act the ask names, anything else stands it down
+    /// without spending anything — a stray key can cancel, never
+    /// confirm. The ask holds the keyboard while it stands, for the
+    /// same reason the walk does: a key that moved what `y` was about
+    /// to act on would change the answer under the finger already
+    /// resting on it.
+    Confirming {
+        /// Which act the ask is holding.
+        ///
+        /// The answer `y` performs and the ask's wording names — the
+        /// one fact the ask exists to settle before anything is spent.
+        act: QueueAct,
+    },
+
+    /// A prompt's body is out in the composer, held for the prompt this id
+    /// names.
+    ///
+    /// Enter saves into that slot. Esc and Ctrl+C put the draft away,
+    /// leaving the prompt in the queue with the wording it had before the
+    /// composer took it.
+    /// On save the id may name a prompt the run took in the meantime — that
+    /// edge is the commit's to settle, not a state to model. The claim that
+    /// takes it often empties the queue outright, and the mode outlives that:
+    /// the text in the composer is the user's, held for a prompt whose turn is
+    /// already running, which is precisely when a correction is worth sending.
+    Editing {
+        /// The waiting prompt whose text the composer is holding.
+        ///
+        /// An entry, not a copy of one: the prompt stays in the queue while
+        /// its body is out, so this id is how a save finds the slot to write
+        /// back into. A run can claim it in the meantime, and then there is
+        /// no slot to write to — the text goes out as a correction to the
+        /// turn that took it, which is why the id outlives the entry.
+        id: u64,
+    },
+}
 
 /// How long a transient notice holds the row above the composer.
 ///
@@ -636,6 +837,127 @@ fn option_window(
     (lo, hi)
 }
 
+/// Whether the view follows the newest content or holds its ground.
+///
+/// The stickiness posture the scroll keys drive: pinned views
+/// re-anchor to the bottom on every layout; any scroll-up detaches,
+/// and scrolling back within [`STICK_TOLERANCE`] lines of the bottom
+/// — or pressing End or submitting — re-arms.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Stick {
+    /// The view follows the newest content.
+    ///
+    /// The resting posture: every layout re-anchors the view to the
+    /// newest line, so streamed growth and new turns arrive into
+    /// view. A scroll up leaves it for [`Hold`], and the stick
+    /// tolerance — or End, or a submit — returns to it.
+    #[default]
+    Follow,
+
+    /// The view holds its offset.
+    ///
+    /// The reading posture: the offset stands still while content
+    /// grows beneath it, so the lines being read never move; only a
+    /// deliberate act — scrolling back within [`STICK_TOLERANCE`]
+    /// lines of the bottom, pressing End, or submitting — re-arms
+    /// [`Follow`].
+    Hold,
+}
+
+impl Stick {
+    /// Whether the posture re-anchors the view to the newest line.
+    ///
+    /// The one question every layout asks of the posture; callers
+    /// read a boolean instead of matching the pair, so the anchor
+    /// decision stays a single expression wherever the frame builds.
+    #[must_use]
+    fn follows(self) -> bool {
+        matches!(self, Self::Follow)
+    }
+}
+
+/// Which optional frame sections stand this frame.
+///
+/// A set, not a flag bundle: every combination occurs (the waiting
+/// section and the plan row can stand together or alone), so the
+/// frame asks each question it has separately — the same posture the
+/// flags spelled one bit per section, kept as one value the frame
+/// carries.
+#[derive(Clone, Copy, Debug, Default)]
+struct Sections(u8);
+
+/// The plan section's bit.
+///
+/// The set's one value for the plan section: it stands while the
+/// run's todo list holds any entry, and the frame asks after it
+/// where the todo rows would render.
+const SECTION_TODO: u8 = 0b001;
+
+/// The waiting section's bit.
+///
+/// The set's one value for the waiting section: it stands whenever
+/// anything waits in the queue — run or no run — exactly when the
+/// panel itself renders.
+const SECTION_QUEUE: u8 = 0b010;
+
+/// The place row's bit.
+///
+/// The set's one value for the place row: it stands once the host
+/// names a working directory, and nothing else gates it.
+const SECTION_PLACE: u8 = 0b100;
+
+impl Sections {
+    /// No section stands.
+    ///
+    /// The frame's plain furniture only — conversation, notice,
+    /// composer, status — with none of the optional sections between
+    /// them; the frame starts here and adds what its questions earn.
+    const EMPTY: Self = Sections(0);
+
+    /// The set with the plan section added when it stands — the
+    /// section that stands while any task does.
+    #[must_use]
+    const fn add_todo(self, stands: bool) -> Self {
+        if stands && self.0 & SECTION_TODO == 0 {
+            Sections(self.0 | SECTION_TODO)
+        } else {
+            self
+        }
+    }
+
+    /// The set with the waiting section added when it stands — it
+    /// stands whenever anything waits.
+    #[must_use]
+    const fn add_queue(self, stands: bool) -> Self {
+        if stands && self.0 & SECTION_QUEUE == 0 {
+            Sections(self.0 | SECTION_QUEUE)
+        } else {
+            self
+        }
+    }
+
+    /// The set with the place row added when it stands — it stands
+    /// once the host names a directory.
+    #[must_use]
+    const fn add_place(self, stands: bool) -> Self {
+        if stands && self.0 & SECTION_PLACE == 0 {
+            Sections(self.0 | SECTION_PLACE)
+        } else {
+            self
+        }
+    }
+
+    /// Whether the section the bit names stands this frame.
+    ///
+    /// The read half of the set: the constraint walk asks after each
+    /// section in its own order, and the answer is the one bit that
+    /// section contributed.
+    #[must_use]
+    const fn stands(self, section: u8) -> bool {
+        self.0 & section != 0
+    }
+}
+
 /// The main TUI application.
 ///
 /// Owns the event loop, the input buffer, and the shared state
@@ -661,12 +983,27 @@ pub struct TuiApp {
     /// observer hold clones of these same allocations.
     state: TuiObserverState,
 
-    /// Where submitted input lines travel to the agent.
+    /// Where submits travel to the agent.
     ///
     /// Set by the mode driver before the run loop; Enter sends each
-    /// non-empty submit through it alongside the local echo. `None`
-    /// on a bare app — submits render locally and reach no agent.
-    submit_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    /// non-empty submit's id through it, the prompt itself staying in
+    /// the shared queue for the driver to read at its turn's start.
+    /// The channel carries the identity rather than the text because
+    /// the text is what the user may still be editing when the id is
+    /// handed over — which is also why a correction of a prompt that
+    /// already went out carries its text: that wording has no other
+    /// holder left. `None` on a bare app — submits render locally and
+    /// reach no agent.
+    submit_tx: Option<tokio::sync::mpsc::UnboundedSender<Submission>>,
+
+    /// The running loop's steering slot, where this session has one.
+    ///
+    /// Installed by the host beside the submit channel. With it, `Ctrl+S`
+    /// offers the composer's text to the turn already in flight instead of
+    /// opening another one; without it the chord degrades to an ordinary
+    /// submit, which is what a session that cannot interrupt a run should
+    /// do with the key.
+    guidance: Option<Arc<dyn Guidance>>,
 
     /// Notified when a turn's outcome lands in the conversation.
     ///
@@ -693,8 +1030,10 @@ pub struct TuiApp {
     /// The input editor: multi-line buffer, cursor, and history.
     ///
     /// Every non-app key routes here. Submits surface as
-    /// [`InputAction::Submit`], echo into the conversation, and
-    /// travel the submit channel to the agent driver.
+    /// [`InputAction::Submit`], which joins the prompt to the shared
+    /// queue and hands its id down the submit channel; the composer's
+    /// own text is empty from that moment, and what a prompt enters the
+    /// conversation with is its claim, not this hand-off.
     input: InputEditor,
 
     /// The column count the composer last rendered at.
@@ -728,13 +1067,13 @@ pub struct TuiApp {
     /// Zero means pinned to the newest line; submitting resets it.
     scroll_offset: usize,
 
-    /// Whether the view follows the newest content.
+    /// The view's stickiness posture.
     ///
     /// Pinned views re-anchor to the bottom on every layout; any
     /// scroll-up detaches, and scrolling back within
     /// [`STICK_TOLERANCE`] lines of the bottom — or pressing End or
     /// submitting — re-arms.
-    auto_scroll: bool,
+    stick: Stick,
 
     /// Whether a capped background redraw is still owed.
     ///
@@ -900,7 +1239,8 @@ pub struct TuiApp {
     /// Rendered lines of the settled conversation.
     ///
     /// The conversation changes only when a message graduates, a
-    /// submit echoes, a tool result drains, or an error lands —
+    /// claimed prompt takes its row, a tool result drains, or an error
+    /// lands —
     /// everything else a frame does to it is re-rendering identical
     /// markdown. The cache rebuilds on those mutations and on a width
     /// change; frames clone it, the same per-frame linear trait the
@@ -946,12 +1286,20 @@ pub struct TuiApp {
     /// both halves of it.
     quit: QuitState,
 
-    /// How a Ctrl+C cancels the run in flight, when one is.
+    /// How a double Esc cancels the run in flight, when one is.
     ///
     /// Installed by the mode driver alongside the shared running
     /// flag; absent in tests and headless hosts, where a cancel
     /// press simply reports handled.
     run_canceller: Option<Box<dyn Fn()>>,
+
+    /// Whether one Esc has armed the run cancel.
+    ///
+    /// True only between the arming press and the Esc that confirms
+    /// it or any other key that stands it down — cancel is a
+    /// deliberate double press, so one stray Esc cannot kill a run
+    /// mid-flight.
+    cancel_arm: bool,
 
     /// Tool calls whose blocks render expanded.
     ///
@@ -1087,6 +1435,67 @@ pub struct TuiApp {
     /// `None` when no id is displayed or the segment is fully clipped.
     session_id_span: std::cell::Cell<Option<(u16, u16, u16)>>,
 
+    /// The newest todo list the run has filed, for the plan section.
+    ///
+    /// Updated at every accepted `TodoWrite` graduation from the
+    /// call's own submission — the complete list every call carries —
+    /// so the pinned section shows the run's current tasks however
+    /// many updates the transcript holds. A rejected update is not
+    /// state: the tool refused the submission and the last accepted
+    /// list stands. The plan stays up after its run lands — the final
+    /// state, done or not, is the thing to read in the quiet after
+    /// the run — and the next claim retires it, half-done or finished
+    /// alike, at the same edge the runner resets its own store.
+    /// Steering delivers mid-run and never claims, so a plan keeps
+    /// updating through its own run.
+    latest_todos: Vec<todo_view::TodoRow>,
+
+    /// The rows each todo update changed, by the update's call id.
+    ///
+    /// The conversation's per-update block accents exactly these
+    /// rows: the ids whose status moved in that call, against the
+    /// snapshot the previous call left. Bounded with the transcript
+    /// itself; the map rides in memory only — a resumed session
+    /// accents nothing, which reads correctly as "no deltas known".
+    todo_changes: HashMap<String, HashMap<String, todo_view::TodoStatus>>,
+
+    /// The line ranges of the transcript's expanded todo blocks.
+    ///
+    /// Recorded while the conversation cache is assembled — one range
+    /// per `TodoWrite` block whose checkbox rows are on screen — so the
+    /// scrolled view can keep each block whole: a severed list next to
+    /// the plan badge's standing fraction reads as a count the frame
+    /// does not carry. Indexes are cache lines, rebuilt with the cache.
+    todo_block_ranges: Vec<std::ops::Range<usize>>,
+
+    /// The rows the newest todo update changed, for the plan section.
+    ///
+    /// The pinned section accents what the last update moved — the
+    /// same deltas the newest conversation block carries, kept
+    /// beside the list they name so the section can say "this is
+    /// what just moved" without knowing which call id was newest.
+    todo_section_changes: HashMap<String, todo_view::TodoStatus>,
+
+    /// Whether the run that last landed was interrupted.
+    ///
+    /// An interrupted run's plan is owed work — the session resumes
+    /// into it — so the next claim retires nothing: the plan stands
+    /// until the resumed run files its own. Set by the [`RunEnded`](crate::observer::Graduation::RunEnded) arm
+    /// of the drain when `success` is false, consumed and cleared by
+    /// the Sent arm; a run that files no plan leaves the flag
+    /// irrelevant either way.
+    plan_interrupted: bool,
+
+    /// The plan section's posture, as Ctrl+T leaves it.
+    ///
+    /// Capped by default — four task rows and the ellipsis — with one
+    /// press opening the whole list and the next folding the section
+    /// away. A view preference, not a mode: no keys are owned, the
+    /// plan keeps updating underneath, and every claim starts the
+    /// next run's plan from the capped posture whatever the last run
+    /// left.
+    plan_view: PlanView,
+
     /// The working directory's own name, as the status bar shows it.
     ///
     /// Set by the host at launch with the directory the runner
@@ -1110,6 +1519,24 @@ pub struct TuiApp {
     /// [`NOTICE_HOLD`](self::NOTICE_HOLD) and leaves the reserved
     /// row blank again.
     transient_notice: Option<(String, Instant)>,
+
+    /// Which waiting prompt the queue section shows.
+    ///
+    /// A display position rather than an identity: the ids that survive a
+    /// shift are the queue's business, and this is only the row the arrow
+    /// keys last stood on. [`clamp_queue_view`](Self::clamp_queue_view)
+    /// keeps it inside the queue, because a prompt claimed at the front
+    /// pulls every row behind it up a place.
+    queue_view: usize,
+
+    /// Whose hands the keyboard is in, as far as waiting prompts go.
+    ///
+    /// [`QueueMode`] is the whole story: the composer's, the section's, or
+    /// a prompt out for editing. The mode cannot outlive the section — an
+    /// emptied queue takes the keys back by itself, since a mode that
+    /// swallows every key for a panel no longer drawn is indistinguishable
+    /// from a hung terminal.
+    queue_mode: QueueMode,
 
     /// The composer's cached wrap, if it is still fresh.
     ///
@@ -1170,15 +1597,16 @@ pub struct TuiApp {
     /// permission channel's shape.
     question_rx: Option<tokio::sync::mpsc::UnboundedReceiver<QuestionPrompt>>,
 
-    /// Whether the next frame must repaint in full.
+    /// The instant the terminal regained focus and a whole-screen
+    /// repaint is still owed, if one is.
     ///
     /// Set when the terminal regains focus: some terminals skip
     /// painting while their window is hidden or occluded, so frames
     /// drawn during that time leave stale cells that the incremental
-    /// diff cannot know about. The run loop claims the flag, clears
-    /// the screen, and lets the next draw repaint every cell — the
-    /// same full repaint a resize forces.
-    full_repaint_pending: bool,
+    /// diff cannot know about. The run loop claims it, clears the
+    /// screen, and lets the next draw repaint every cell — the same
+    /// full repaint a resize forces.
+    full_repaint_due: Option<Instant>,
 }
 
 impl TuiApp {
@@ -1214,6 +1642,7 @@ impl TuiApp {
             conversation: Vec::new(),
             state,
             submit_tx: None,
+            guidance: None,
             turn_end_hook: None,
             verbosity: config.display.verbosity,
             spinner_idx: 0,
@@ -1222,7 +1651,7 @@ impl TuiApp {
             input_view: None,
             caret_blink: CaretBlink::default(),
             scroll_offset: 0,
-            auto_scroll: true,
+            stick: Stick::default(),
             render_pending: false,
             last_frame: None,
             last_layout_lines: 0,
@@ -1257,6 +1686,7 @@ impl TuiApp {
             conversation_cache_generation: 0,
             quit: QuitState::default(),
             run_canceller: None,
+            cancel_arm: false,
             expanded_tools: std::collections::HashSet::new(),
             thinking_mode: ThinkingMode::Follow,
             expanded_thinking: std::collections::HashSet::new(),
@@ -1275,15 +1705,23 @@ impl TuiApp {
             input_wrap_cache: None,
             session_id: None,
             session_id_span: std::cell::Cell::new(None),
+            latest_todos: Vec::new(),
+            todo_changes: HashMap::new(),
+            todo_block_ranges: Vec::new(),
+            todo_section_changes: HashMap::new(),
+            plan_interrupted: false,
+            plan_view: PlanView::Capped,
             working_dir: None,
             git_branch: None,
             transient_notice: None,
+            queue_view: 0,
+            queue_mode: QueueMode::Plain,
             pending_permissions: std::collections::VecDeque::new(),
             permission_rx: None,
             pending_questions: std::collections::VecDeque::new(),
             question_view: 0,
             question_rx: None,
-            full_repaint_pending: false,
+            full_repaint_due: None,
             config,
         }
     }
@@ -1326,26 +1764,252 @@ impl TuiApp {
         self.session_id = Some(id);
     }
 
-    /// Name the working directory the status bar shows.
+    /// Name the working directory the place row shows.
     ///
     /// The host calls this once at launch with the directory the
-    /// runner operates in; the bar renders only the directory's own
-    /// name — the leaf, not the path that leads to it.
+    /// runner operates in, and the row spells it per the config's
+    /// [`PathStyle`] — the full path, or the `~/`-relative shape —
+    /// with the branch in parentheses when one was named.
     pub fn set_working_dir(&mut self, dir: &Path) {
-        self.working_dir = Some(dir.file_name().map_or_else(
-            || dir.display().to_string(),
-            |name| name.to_string_lossy().into_owned(),
-        ));
+        self.working_dir = Some(dir.display().to_string());
     }
 
     /// Name the git branch shown beside the working directory.
     ///
     /// The host calls this once at launch with the workdir's
-    /// checked-out branch, when it sits in a working tree; the bar
-    /// renders it in parentheses after the folder's name, and no
+    /// checked-out branch, when it sits in a working tree; the place
+    /// row renders it in parentheses after the path, and no
     /// parenthesis at all when no branch was named.
     pub fn set_git_branch(&mut self, branch: Option<String>) {
         self.git_branch = branch;
+    }
+
+    /// Persist the conversation now, whatever the run's state.
+    ///
+    /// The turn-end hook usually fires on the drain that observes a
+    /// turn's end — but a run wedged on a silent stream never ends,
+    /// and the exit must not wait for it: this fires the same hook
+    /// with the conversation as it stands (the claim rows the run
+    /// already wrote) and whatever machine history is newest, so the
+    /// session file carries everything the user saw at the moment of
+    /// leaving. Idempotent with the drain's own firing — the worker
+    /// keeps the newest save.
+    pub fn flush_turn_end(&mut self) {
+        if let Some(hook) = &self.turn_end_hook {
+            let machine = self
+                .state
+                .machine_history
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            hook(&self.conversation, machine.as_ref());
+        }
+    }
+
+    /// The waiting prompts' texts, as the exit finds them.
+    ///
+    /// Read after the shutdown flag rises and before the exit's cancel
+    /// fires, the one window in which every entry in the shared queue
+    /// is a prompt no run ever claimed: the run in flight took its own
+    /// entry when it started, the exit's requeues land only after the
+    /// cancel, and a claim reaching the driver inside the window
+    /// declines under the queue's own lock rather than taking its
+    /// entry. The snapshot is therefore exactly the set of words the
+    /// user typed that no turn spent — the set the transcript owes
+    /// rows to, because the queue they wait in dies with the process.
+    #[must_use]
+    pub fn waiting_prompt_texts_at_exit(&self) -> Vec<String> {
+        let queue = self
+            .state
+            .queued
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (0..queue.len())
+            .filter_map(|index| queue.get(index).map(|entry| entry.text.clone()))
+            .collect()
+    }
+
+    /// Write the still-waiting prompts into the transcript as
+    /// unclaimed rows.
+    ///
+    /// The one place a user row is written without a send behind it:
+    /// the queue is process state, the process is leaving, and words
+    /// the user typed would otherwise leave no trace anywhere — the
+    /// interrupted claim keeps the row its send earned, but a prompt
+    /// no turn took has nothing. The rows land after the stop's own
+    /// record, in queue order, so a resume reads the transcript's end
+    /// as exactly what still stood and seeds every one of them back
+    /// into the waiting section. The flush beside them is the same
+    /// unconditional persist the settle performs — an exit with no
+    /// run in flight skips the settle entirely, and these rows must
+    /// outlive that exit too.
+    pub fn echo_waiting_prompts_at_exit(&mut self, texts: Vec<String>) {
+        if texts.is_empty() {
+            return;
+        }
+        for text in texts {
+            self.conversation.push(TuiMessage::User {
+                text,
+                timestamp: chrono::Utc::now(),
+                steered: false,
+            });
+        }
+        self.flush_turn_end();
+    }
+
+    /// Write the corrections the exit collected into the transcript
+    /// as unclaimed rows.
+    ///
+    /// The drain half of the exit's correction rescue: the driver
+    /// collects each correction still buffered at its exit breaks —
+    /// words that left the queue with the claim, travelled only in
+    /// the channel, and would otherwise leave no trace anywhere — and
+    /// this runs once the driver task has settled, after the waiting
+    /// prompts' own echo, so the transcript ends on everything the
+    /// user typed that no turn spent. The flush beside the rows is
+    /// the same unconditional persist the settle performs; a resume
+    /// seeds each row back into the waiting section.
+    pub fn echo_rescued_corrections_at_exit(&mut self) {
+        let texts: Vec<String> = std::mem::take(
+            &mut *self
+                .state
+                .rescued_corrections
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        if texts.is_empty() {
+            return;
+        }
+        for text in texts {
+            self.conversation.push(TuiMessage::User {
+                text,
+                timestamp: chrono::Utc::now(),
+                steered: false,
+            });
+        }
+        self.flush_turn_end();
+    }
+
+    /// Land an exit-confirmed stop as the record a cancel leaves.
+    ///
+    /// An exit confirmed under a running agent is a cancel first:
+    /// [`cancel_run_in_flight`](Self::cancel_run_in_flight) fires
+    /// while the frame loop still lives, and frames pump until the
+    /// run settles — the stop drains into the conversation as the
+    /// same record an in-app cancel leaves, the turn-end hook
+    /// persists it, and the resumed session reads one shape whichever
+    /// way the run was stopped. With nothing running this is a no-op.
+    pub fn settle_exit_stop(
+        &mut self,
+        terminal: &mut ratatui::Terminal<impl ratatui::backend::Backend>,
+    ) {
+        if !self.cancel_run_in_flight() {
+            return;
+        }
+        // One frame the moment the fire lands: the screen shows the
+        // cancel's record at once — the manual sequence's own
+        // feedback, which is what makes its wait feel live — and the
+        // wait that follows reads as the exit doing its work rather
+        // than a freeze.
+        // The snapshot precedes even the feedback frame: the frame's
+        // own render drains, and a record that landed in that drain
+        // must count as landed — the check below scans from here.
+        let before = self.conversation.len();
+        drop(terminal.draw(|frame| self.render(frame)));
+        // The exit does not wait for the engine to unwind: the manual
+        // sequence's cancel unwinds in the background of a live UI,
+        // and the fire's exit owes the same immediacy. What the
+        // unwind would have landed, the exit lands itself — the lanes
+        // as they stood, the record row, the flush — and the
+        // teardown's bounded abort handles whatever the engine is
+        // still doing.
+        //
+        // The lanes first, exactly as they stood at the fire: the
+        // thinking on screen rides ahead of whatever lands next, so
+        // the transcript reads [prompt, the work so far, the record]
+        // in the order the run actually happened.
+        self.capture_live_lanes_at_exit();
+        // One drain: whatever the cancel resolved before the exit got
+        // here — an instant settle's record row, a completed turn's
+        // graduation — lands now, behind the captured lanes.
+        self.drain_shared_state();
+        // The record the manual sequence always has, deterministically:
+        // only when neither the drain nor anything else landed one.
+        let record_landed = self.conversation.get(before..).is_some_and(|landed| {
+            landed
+                .iter()
+                .any(|message| matches!(message, TuiMessage::Error { text, .. } if text == "Agent cancelled"))
+        });
+        if !record_landed {
+            self.conversation.push(TuiMessage::Error {
+                text: "Agent cancelled".to_string(),
+                timestamp: chrono::Utc::now(),
+            });
+        }
+        self.flush_turn_end();
+    }
+
+    /// Snapshot the run's unfinished lanes into the conversation.
+    ///
+    /// A cancelled run graduates nothing: the thinking it streamed
+    /// and the partial reply text stay in the live lanes and would
+    /// leave with the process. At the exit they join the transcript
+    /// as their own assistant row — the honest shape of a turn that
+    /// was stopped mid-flight, and what a resumed session reads
+    /// instead of an empty gap between the prompt and the record.
+    fn capture_live_lanes_at_exit(&mut self) {
+        let mut blocks = Vec::new();
+        let thinking = self
+            .state
+            .thinking
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !thinking.text.trim().is_empty() {
+            blocks.push(ContentBlock::Thinking {
+                text: thinking.text.clone(),
+                redacted: false,
+                duration_ms: 0,
+            });
+        }
+        drop(thinking);
+        let stream = self
+            .state
+            .streaming_text
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if !stream.trim().is_empty() {
+            blocks.push(ContentBlock::Text { text: stream });
+        }
+        if !blocks.is_empty() {
+            self.conversation.push(TuiMessage::Assistant {
+                blocks,
+                timestamp: chrono::Utc::now(),
+                duration_ms: None,
+            });
+        }
+    }
+
+    /// Cancel the run in flight, when one is.
+    ///
+    /// The exit path's handshake: an exit confirmed under a running
+    /// agent fires the canceller here — while the frame loop still
+    /// drains — so the stop lands as the same record an in-app
+    /// cancel leaves, with the turn's end hook persisting it, before
+    /// the teardown owns the screen. Returns whether a run was in
+    /// flight to stop.
+    pub fn cancel_run_in_flight(&mut self) -> bool {
+        if !self
+            .state
+            .agent_running
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return false;
+        }
+        if let Some(cancel) = &self.run_canceller {
+            cancel();
+        }
+        true
     }
 
     /// Install the run canceller.
@@ -1368,10 +2032,30 @@ impl TuiApp {
     /// the run loop starts; a mid-session call would splice history
     /// into a live conversation.
     pub fn seed_messages(&mut self, messages: Vec<TuiMessage>) {
+        // A transcript's error rows are its cancellation records: a
+        // user row that follows one is a claim after an interrupted
+        // run — the plan it stands over is owed work, and the claim
+        // must not retire it. The live drain's `plan_interrupted`
+        // flag, reconstructed from the transcript's own shape.
+        let mut last_row_was_error = false;
         for message in &messages {
             let TuiMessage::Assistant { blocks, .. } = message else {
+                // A steered row is not a claim: it rode into a run
+                // already in flight, so the plan it lands beside kept
+                // standing in the live session and keeps standing
+                // here — the nudge's echo is this shape on every run
+                // that lands with work left.
+                if let TuiMessage::User { steered: false, .. } = message
+                    && !last_row_was_error
+                {
+                    self.latest_todos.clear();
+                    self.todo_section_changes.clear();
+                }
+                last_row_was_error = matches!(message, TuiMessage::Error { .. });
                 continue;
             };
+            last_row_was_error = false;
+            // fall through: an assistant row answered what stood.
             for block in blocks {
                 if let ContentBlock::Tool {
                     call_id,
@@ -1382,12 +2066,65 @@ impl TuiApp {
                 {
                     self.retain_tool_detail(call_id, retained_input, output_preview);
                 }
+                if let ContentBlock::Tool {
+                    name,
+                    call_id,
+                    success,
+                    retained_input,
+                    ..
+                } = block
+                    && name == "TodoWrite"
+                    && *success
+                    && let Some(rows) = crate::todo_view::parse_submission(retained_input)
+                {
+                    let changes = crate::todo_view::status_changes(&rows, &self.latest_todos);
+                    self.todo_changes.insert(call_id.clone(), changes.clone());
+                    self.todo_section_changes = changes;
+                    self.latest_todos = rows;
+                    self.expanded_tools.insert(call_id.clone());
+                }
             }
         }
         self.conversation.extend(messages);
-        self.conversation_generation = self.conversation_generation.saturating_add(1);
+        // A transcript that ends on bare, unanswered claims is work
+        // the exit left standing — the run in flight's prompt caught
+        // before it could record anything, the waiting ones written
+        // there by the exit itself because no turn ever spent them.
+        // Each waits again in the section, in the order they were
+        // typed. A claim followed by its cancellation record is a
+        // deliberate stop and owes nothing: the user cancelled that
+        // prompt, and resurrecting it into the queue would be a
+        // phantom they never sent. A claim an assistant row answered
+        // is done the same way.
+        let owed: Vec<String> = self
+            .conversation
+            .iter()
+            .rev()
+            .map_while(|message| match message {
+                TuiMessage::User {
+                    text,
+                    steered: false,
+                    ..
+                } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .filter(|text| !text.trim().is_empty())
+            .collect();
+        if !owed.is_empty() {
+            let mut queue = self
+                .state
+                .queued
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for text in owed {
+                queue.push(text);
+            }
+        }
         self.scroll_offset = 0;
-        self.auto_scroll = true;
+        self.stick = Stick::Follow;
     }
 
     /// The input buffer's current text.
@@ -1423,7 +2160,7 @@ impl TuiApp {
     /// returns near the bottom.
     #[must_use]
     pub fn auto_scroll(&self) -> bool {
-        self.auto_scroll
+        self.stick.follows()
     }
 
     /// Whether the run loop should exit.
@@ -1452,6 +2189,15 @@ impl TuiApp {
         &self.state.active_tools
     }
 
+    /// The shared graduation queue, as the observer writes it.
+    ///
+    /// Exposed for tests that drive conversation arrivals the way the
+    /// observer does — push a [`Graduation`] and render, exactly the
+    /// path a live run takes.
+    pub fn graduations(&self) -> &Arc<Mutex<Vec<crate::observer::Graduation>>> {
+        &self.state.graduations
+    }
+
     /// The shared token counters.
     ///
     /// Per-turn and cumulative usage as the observer records it; a
@@ -1472,14 +2218,26 @@ impl TuiApp {
         &self.state.render_notify
     }
 
-    /// Route submitted input lines to the agent driver.
+    /// Route submits to the agent driver.
     ///
     /// The sender half of the channel the mode driver receives on;
-    /// once set, Enter forwards every non-empty submit through it
-    /// while the local echo stays in the conversation. A send no
-    /// receiver awaits is dropped — the session is ending.
-    pub fn set_submit_tx(&mut self, tx: tokio::sync::mpsc::UnboundedSender<String>) {
+    /// once set, Enter queues every non-empty submit and forwards its
+    /// id, and the prompt reaches the transcript when the driver
+    /// claims it rather than when the key was pressed — so the row
+    /// says what was sent, not what was typed. A send no receiver
+    /// awaits puts the prompt back where it came from; the session is
+    /// ending and nothing will claim it.
+    pub fn set_submit_tx(&mut self, tx: tokio::sync::mpsc::UnboundedSender<Submission>) {
         self.submit_tx = Some(tx);
+    }
+
+    /// Install the steering seam, or take it away.
+    ///
+    /// `None` is the bare-app state and the honest answer for a mode that
+    /// cannot reach into a run: the chord stays bound and simply submits,
+    /// rather than binding a key to nothing.
+    pub fn set_guidance(&mut self, guidance: Option<Arc<dyn Guidance>>) {
+        self.guidance = guidance;
     }
 
     /// Install the channel permission requests arrive on.
@@ -2004,9 +2762,6 @@ impl TuiApp {
         let Some(entry) = self.shown_question() else {
             return true;
         };
-        // The shown question's shape is read first, into copies: the arms
-        // below mutate the queue and hand an answer out, and no borrow of
-        // it can outlive that.
         let free_row = entry.prompt.options.len();
         let multi = entry.prompt.multi_select;
         let cursor = entry.ui.cursor;
@@ -2101,7 +2856,7 @@ impl TuiApp {
     /// matched.
     #[must_use]
     pub fn take_full_repaint(&mut self) -> bool {
-        std::mem::take(&mut self.full_repaint_pending)
+        self.full_repaint_due.take().is_some()
     }
 
     /// Replace the selection copier.
@@ -2220,9 +2975,6 @@ impl TuiApp {
                         }
                         true
                     } else {
-                        // The asking side is gone (the runner was
-                        // dropped); latching the arm inert keeps the
-                        // closed channel from spinning the loop.
                         question_closed = true;
                         false
                     }
@@ -2242,9 +2994,6 @@ impl TuiApp {
                         }
                         true
                     } else {
-                        // The resolver side is gone (the runner was
-                        // dropped); latching the arm inert keeps the
-                        // closed channel from spinning the loop.
                         permission_closed = true;
                         false
                     }
@@ -2258,10 +3007,6 @@ impl TuiApp {
                 question_rx = None;
                 question_closed = false;
             }
-            // A question the asking side gave up on leaves on this beat,
-            // not on the next keypress: a dismissal ends a whole batch,
-            // and the questions behind the dismissed one would otherwise
-            // sit on the screen through the answer they never waited for.
             if self.retire_withdrawn_questions() {
                 needs_redraw = true;
             }
@@ -2460,12 +3205,15 @@ impl TuiApp {
                 if !self.pending_questions.is_empty() {
                     return self.paste_into_the_question(text);
                 }
+                if self.queue_mode == QueueMode::Focused {
+                    return true;
+                }
                 self.input.insert_str(&normalize_pasted_newlines(text));
                 true
             }
             Event::Resize(_, _) => true,
             Event::FocusGained => {
-                self.full_repaint_pending = true;
+                self.full_repaint_due = Some(Instant::now());
                 true
             }
             Event::FocusLost => false,
@@ -2480,14 +3228,20 @@ impl TuiApp {
     /// the keys [`key_survives_the_sheet`] names pass through to the
     /// machinery below.
     ///
-    /// Ctrl+C clears a non-empty buffer — arming nothing, so a
-    /// cleared draft still takes two further presses to exit — and
-    /// on an empty one the second press quits; any other key
-    /// disarms, so the chord never fires from stale intent. While a
-    /// run is in flight the press serves the run instead: a draft
-    /// clears first, then an empty-composer press cancels the run —
-    /// arming nothing, so exiting after the cancel takes its own
-    /// two presses.
+    /// Under a running agent, Ctrl+C Ctrl+C is one action in the
+    /// Esc-Esc shape: with an empty composer, the first press only
+    /// arms — nothing stops, nothing leaves — and the second press
+    /// fires the cancel exactly as Esc-Esc fires it (the same
+    /// canceller, the same record) with the program's termination
+    /// riding the same press. Text in the composer clears first,
+    /// run or not — clearing is not consenting, and the fire needs
+    /// its presses behind an empty buffer like everywhere else. A
+    /// stray key between the presses stands the whole action down.
+    /// At rest the chord is the exit alone: a non-empty buffer clears
+    /// first, arming nothing; on an empty one the first press arms
+    /// and the second quits; any other key disarms, so the chord
+    /// never fires from stale intent. Each rung is named by a notice,
+    /// so the ladder reads from the frame instead of from memory.
     /// Ctrl+Shift+C copies the live selection where the terminal
     /// reports the shift; on terminals that collapse it to a plain
     /// Ctrl+C it simply joins the chord's clearing behavior. Up,
@@ -2507,31 +3261,94 @@ impl TuiApp {
         ) {
             self.quit.disarm();
         }
+        if !matches!(
+            (key.code, key.modifiers),
+            (KeyCode::Esc, KeyModifiers::NONE)
+        ) {
+            self.cancel_arm = false;
+        }
         if let Some(resolved) = self.permission_key(key) {
             return resolved;
         }
         if let Some(resolved) = self.question_key(key) {
             return resolved;
         }
+        if let Some(handled) = self.queue_key(key) {
+            return handled;
+        }
         match (key.code, key.modifiers) {
-            (KeyCode::Char('c'), mods) if mods == KeyModifiers::CONTROL | KeyModifiers::SHIFT => {
-                self.copy_selection_now();
-                true
-            }
-            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+            (KeyCode::Esc, KeyModifiers::NONE) => {
                 if self
                     .state
                     .agent_running
                     .load(std::sync::atomic::Ordering::SeqCst)
                 {
-                    if !self.input.is_empty() {
-                        self.input.clear();
-                    } else if let Some(cancel) = &self.run_canceller {
-                        cancel();
+                    if self.cancel_arm {
+                        self.cancel_arm = false;
+                        if let Some(cancel) = &self.run_canceller {
+                            cancel();
+                        }
                         self.post_notice("Agent cancelled".to_string());
+                    } else {
+                        self.cancel_arm = true;
+                        self.post_notice("press Esc again to cancel the run".to_string());
                     }
-                } else if !self.input.is_empty() {
+                    true
+                } else {
+                    false
+                }
+            }
+            (KeyCode::Char('s'), KeyModifiers::CONTROL) => self.steer_now(),
+            (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
+                self.plan_view = match self.plan_view {
+                    PlanView::Capped => PlanView::Full,
+                    PlanView::Full => PlanView::Hidden,
+                    PlanView::Hidden => PlanView::Capped,
+                };
+                true
+            }
+            (KeyCode::Char('c'), mods) if mods == KeyModifiers::CONTROL | KeyModifiers::SHIFT => {
+                self.copy_selection_now();
+                true
+            }
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                // The draft clears first, run or not: the press that
+                // would arm a running exit drops a paste the user
+                // never offered to it — clearing is not consenting.
+                if !self.input.is_empty() {
                     self.input.clear();
+                    if self
+                        .state
+                        .agent_running
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                    {
+                        self.post_notice(
+                            "draft cleared — press ctrl+c twice to cancel and exit".to_string(),
+                        );
+                    } else {
+                        self.post_notice("draft cleared — press ctrl+c twice to quit".to_string());
+                    }
+                } else if self
+                    .state
+                    .agent_running
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    // The Esc-Esc shape, with the exit riding the
+                    // fire: the first press only arms — a stray key
+                    // still stands it down — and the second is one
+                    // action that cancels the run exactly as Esc-Esc
+                    // does and terminates the program beside it. No
+                    // intermediate state, no separate cancel press.
+                    if self.quit.armed {
+                        if let Some(cancel) = &self.run_canceller {
+                            cancel();
+                        }
+                        self.post_notice("Agent cancelled".to_string());
+                        self.quit.requested = true;
+                    } else {
+                        self.post_notice("press ctrl+c again to cancel and exit".to_string());
+                        self.quit.arm();
+                    }
                 } else if self.quit.armed {
                     self.quit.requested = true;
                 } else {
@@ -2545,7 +3362,7 @@ impl TuiApp {
             }
             (KeyCode::PageUp, _) => {
                 self.scroll_offset = self.scroll_offset.saturating_add(10);
-                self.auto_scroll = false;
+                self.stick = Stick::Hold;
                 true
             }
             (KeyCode::PageDown, _) => {
@@ -2557,7 +3374,7 @@ impl TuiApp {
                 if self.input.is_empty() && !self.input.has_history() =>
             {
                 self.scroll_offset = self.scroll_offset.saturating_add(1);
-                self.auto_scroll = false;
+                self.stick = Stick::Hold;
                 true
             }
             (KeyCode::Down, KeyModifiers::NONE)
@@ -2608,9 +3425,6 @@ impl TuiApp {
     /// answered, and the wheel is how that reading happens.
     fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
         if self.pending_permissions.front().is_some() {
-            // The overlay owns the pointer as it owns the keyboard: a
-            // click behind it must not move the hidden draft's caret,
-            // and a parked drag must not keep selecting behind the sheet.
             self.drag_position = None;
             return true;
         }
@@ -2618,10 +3432,6 @@ impl TuiApp {
             return match mouse.kind {
                 MouseEventKind::ScrollUp => self.scroll_the_wheel(true),
                 MouseEventKind::ScrollDown => self.scroll_the_wheel(false),
-                // The rows under the pointer belong to the sheet, not to
-                // the transcript behind it: a press here would place the
-                // caret in a composer the user cannot see, or start a
-                // selection in text the sheet has covered.
                 _ => {
                     self.drag_position = None;
                     true
@@ -2701,7 +3511,7 @@ impl TuiApp {
     fn scroll_the_wheel(&mut self, up: bool) -> bool {
         if up {
             self.scroll_offset = self.scroll_offset.saturating_add(WHEEL_SCROLL_LINES);
-            self.auto_scroll = false;
+            self.stick = Stick::Hold;
         } else {
             self.scroll_offset = self.scroll_offset.saturating_sub(WHEEL_SCROLL_LINES);
             self.rearm_if_near_bottom();
@@ -2748,7 +3558,7 @@ impl TuiApp {
             let scrolled = view.skip > 0;
             if scrolled {
                 self.scroll_offset = self.scroll_offset.saturating_add(1);
-                self.auto_scroll = false;
+                self.stick = Stick::Hold;
             }
             let extended = self.extend_selection_head(head);
             scrolled || extended
@@ -2900,10 +3710,11 @@ impl TuiApp {
     /// same lines the pane shows above any tool block.
     fn selectable_window(&self, skip: usize, height: usize) -> Vec<Line<'_>> {
         visible_window(
-            [
+            &[
                 &self.conversation_cache,
                 &self.frozen_lines,
                 &self.live_lines,
+                &NO_LINES,
                 &NO_LINES,
                 &NO_LINES,
                 &NO_LINES,
@@ -2931,7 +3742,7 @@ impl TuiApp {
             self.scroll_offset = self
                 .scroll_offset
                 .saturating_add(view.skip.saturating_sub(line));
-            self.auto_scroll = false;
+            self.stick = Stick::Hold;
         } else if line >= view.skip.saturating_add(height) {
             let excess = line
                 .saturating_sub(view.skip.saturating_add(height))
@@ -3007,7 +3818,7 @@ impl TuiApp {
         }
         if self.tool_details.contains_key(&call_id) {
             if expanding {
-                self.auto_scroll = false;
+                self.stick = Stick::Hold;
             }
             self.conversation_generation = self.conversation_generation.saturating_add(1);
             self.selection = None;
@@ -3034,8 +3845,6 @@ impl TuiApp {
             .agent_running
             .load(std::sync::atomic::Ordering::Relaxed)
         {
-            // A cancelled run's buffer may outlive its terminal
-            // event; a stream renders only while its run does.
             return (Vec::new(), None);
         }
         let stream = self
@@ -3046,12 +3855,6 @@ impl TuiApp {
         if !stream.is_living() {
             return (Vec::new(), None);
         }
-        // A folded stream whose turn is the one replying rides the
-        // live lane as its collapsed row — the block stays on
-        // display through the reply's text and any tool phase until
-        // the response event graduates it into the transcript. A
-        // stream from any other turn is an orphan superseded by a
-        // newer reply; it leaves the display entirely.
         let folded = stream.text_began;
         if folded
             && stream.turn
@@ -3063,10 +3866,6 @@ impl TuiApp {
             return (Vec::new(), None);
         }
         let now = Instant::now();
-        // A folded row's timer freezes at the fold: the span it
-        // measured — the thinking phase — ended when the reply began,
-        // and running it on would claim reasoning that is not
-        // happening beside the streaming text.
         let phase_end = stream.text_began_at.unwrap_or(now);
         let elapsed = stream.began.map_or(0, |began| {
             u64::try_from(phase_end.duration_since(began).as_millis()).unwrap_or(0)
@@ -3108,10 +3907,6 @@ impl TuiApp {
             let start = wrapped.len().saturating_sub(LIVE_THINKING_BODY_CAP);
             lines.extend(wrapped.into_iter().skip(start));
         }
-        // The folded row is not a toggle target: it ignores the mode
-        // while folded, so the click would flip state with no
-        // visible effect. The graduated block in the transcript owns
-        // the toggle once the response event lands.
         let toggleable = if folded { None } else { Some(0) };
         (lines, toggleable)
     }
@@ -3192,7 +3987,7 @@ impl TuiApp {
         let expanding = !self.expanded_thinking.remove(&key);
         if expanding {
             self.expanded_thinking.insert(key);
-            self.auto_scroll = false;
+            self.stick = Stick::Hold;
         }
         self.conversation_generation = self.conversation_generation.saturating_add(1);
         self.selection = None;
@@ -3226,7 +4021,7 @@ impl TuiApp {
         let expanding = !self.expanded_compactions.remove(&key);
         if expanding {
             self.expanded_compactions.insert(key);
-            self.auto_scroll = false;
+            self.stick = Stick::Hold;
         }
         self.conversation_generation = self.conversation_generation.saturating_add(1);
         self.selection = None;
@@ -3302,8 +4097,9 @@ impl TuiApp {
 
     /// Route an editor action.
     ///
-    /// A submit echoes, enqueues, and re-anchors; the rest need
-    /// nothing beyond the redraw the caller grants.
+    /// A submit hands the prompt to [`submit_text`](Self::submit_text)
+    /// and re-anchors the view to the conversation's newest row; the rest
+    /// need nothing beyond the redraw the caller grants.
     fn apply_input_action(&mut self, action: InputAction) -> bool {
         match action {
             InputAction::Submit(text) => {
@@ -3314,24 +4110,699 @@ impl TuiApp {
         }
     }
 
-    /// Send one submitted text to the agent driver and echo it.
+    /// Send one submitted prompt to the agent driver.
     ///
-    /// The channel send (when a driver is attached) counts toward
-    /// the queued indicator the input title renders; the local echo
-    /// lands immediately and the view re-anchors to the newest line.
+    /// The prompt joins the shared queue before its id is sent, so the
+    /// driver always finds the entry behind an id it was handed — and
+    /// finds it as it stands then, which is what lets a prompt be fixed
+    /// after the fact rather than spent. A send nothing will take puts
+    /// the prompt back out of the queue: an entry no driver can claim
+    /// would otherwise sit in the panel, offering edits to a prompt that
+    /// can never leave.
+    ///
+    /// The transcript row is not written here. The driver records the
+    /// claim with [`push_sent`](crate::observer::TuiObserverState::push_sent)
+    /// and the drain turns it into the row, so what the transcript shows
+    /// is the text that went out — an edit included, a cancel excluded —
+    /// at the place in the transcript its claim time gives it. A bare
+    /// app has no driver to claim, so its echo stays here, where it is
+    /// the only record the prompt would ever get.
+    ///
+    /// A send the channel refuses is the session ending around the prompt:
+    /// the entry leaves the queue, the notice row says why, and the words
+    /// go back into the composer. They were never sent, so they take no
+    /// transcript row; and they are the user's, so a driver's exit is not
+    /// the thing that throws them away.
     fn submit_text(&mut self, text: String) {
-        if let Some(tx) = &self.submit_tx {
-            self.state.queued.fetch_add(1, Ordering::SeqCst);
-            if tx.send(text.clone()).is_err() {
-                self.state.queued.fetch_sub(1, Ordering::SeqCst);
+        if self.submit_tx.is_some() {
+            let id = self.push_queued(text.clone());
+            if self.send_queued_id(id) {
+                self.scroll_to_bottom();
+                return;
+            }
+            self.remove_queued(id);
+            self.post_notice("the driver has gone — nothing more can be sent".to_string());
+            self.input.set_text(text);
+        } else {
+            self.push_message(TuiMessage::User {
+                text,
+                timestamp: chrono::Utc::now(),
+                steered: false,
+            });
+        }
+        self.scroll_to_bottom();
+    }
+
+    /// Hand `id` to the driver, reporting whether the channel took it.
+    ///
+    /// The send is a [`Submission::Run`]: the driver resolves the id
+    /// against the shared queue when the turn comes, so this never has to
+    /// take anything back.
+    fn send_queued_id(&self, id: u64) -> bool {
+        self.submit_tx
+            .as_ref()
+            .is_some_and(|tx| tx.send(Submission::Run { id }).is_ok())
+    }
+
+    /// Tell the driver that the prompt `id` was corrected after it went out.
+    ///
+    /// The gone-arm of a commit: the entry left the queue while its text
+    /// stood open in the composer, so the edited wording has to reach the
+    /// agent as a turn of its own — and the turn that went out with the
+    /// superseded wording has to stop standing in front of it, which only
+    /// the driver's loop can do. The cancel and its flag are raised only
+    /// when the correction names the turn in flight — the driver mirrors
+    /// its live claim into shared state, and a correction committing
+    /// while some other run is going must not cancel it: that run is an
+    /// unrelated conversation the fix was never aimed at. The cut itself
+    /// follows the most recent claim however it settled — a turn that
+    /// already landed and still stands as the newest claim is taken out
+    /// and the fix runs in its place, no cancel needed.
+    /// With no driver (or a channel nobody listens to) there is no turn
+    /// to cut and nothing to run it, so the correction goes into the
+    /// transcript the way any prompt does when this app is standing
+    /// alone. The named turn in flight is stopped, not waited out: the
+    /// correction is sent first and the runner's cancel raised beside
+    /// it, so a superseded turn stops spending its run on wording the
+    /// user has already replaced — the driver clears the signal before
+    /// the corrected turn starts.
+    fn correct_claimed(&mut self, id: u64, text: String) {
+        let taken = self.submit_tx.as_ref().is_some_and(|tx| {
+            tx.send(Submission::Correct {
+                id,
+                text: text.clone(),
+            })
+            .is_ok()
+        });
+        if taken {
+            if self.state.live_claim.load(Ordering::SeqCst) == id {
+                self.state.correction_cancel.store(id, Ordering::SeqCst);
+                if let Some(cancel) = &self.run_canceller {
+                    cancel();
+                }
+                // The check-then-cancel above is not atomic, and the
+                // window it leaves is narrow but real: between the
+                // read that matched and the cancel landing, the named
+                // turn can settle and the driver can claim the next
+                // prompt — the cancel would then stop a run the
+                // correction never named. Re-reading the mirror after
+                // the cancel closes what it can: a mirror that has
+                // moved on names a turn the flag must not ride, so
+                // the flag comes down and the cancellation it caused
+                // is the run's own to report. What remains beyond
+                // this guard — a claim landing between the second
+                // read and the driver's pre-run clear — cannot spend
+                // a prompt silently: the driver's settle goes quiet
+                // only for a run whose own claim the flag carries,
+                // so the run resolves cancelled with its error row
+                // and the buffered correction runs as its own turn
+                // behind it.
+                if self.state.live_claim.load(Ordering::SeqCst) != id {
+                    self.state
+                        .correction_cancel
+                        .store(u64::MAX, Ordering::SeqCst);
+                }
+            }
+        } else {
+            self.submit_text(text);
+        }
+    }
+
+    /// Add `text` to the shared queue and name it.
+    ///
+    /// The id this returns is the prompt's only handle from here on: the
+    /// panel addresses its row through it and the channel carries nothing
+    /// else, which is why an id is issued before the send rather than
+    /// taken from whatever position the prompt happens to land at.
+    fn push_queued(&self, text: String) -> u64 {
+        self.state
+            .queued
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(text)
+    }
+
+    /// Take the prompt `id` out of the shared queue.
+    ///
+    /// The user's drop, the rollback of a send nobody took, and the
+    /// cancel's clearing all need the same act: the prompt is gone and
+    /// can never run.
+    fn remove_queued(&self, id: u64) -> Option<String> {
+        self.state
+            .queued
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(id)
+    }
+
+    /// Rewrite the prompt `id` holds, reporting whether it was still there.
+    ///
+    /// In place and by id: the saved text takes the same slot the prompt
+    /// was submitted into, and a prompt the driver claimed mid-edit
+    /// answers `false` rather than letting the text land on its neighbour.
+    fn replace_queued(&self, id: u64, text: String) -> bool {
+        self.state
+            .queued
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .replace(id, text)
+    }
+
+    /// How many prompts wait.
+    ///
+    /// Two callers depend on this count agreeing with what the panel shows:
+    /// the status tag, which names a number of prompts the user can go on to
+    /// walk, and the layout, which holds rows for the section only while it
+    /// is non-zero — a session with nothing waiting keeps its exact rows.
+    /// A poisoned lock still answers from the queue it holds: a panic
+    /// elsewhere in the process says nothing about what the user queued.
+    fn queued_len(&self) -> usize {
+        self.state
+            .queued
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
+    /// The prompt at display position `index`, as `(id, text)`.
+    ///
+    /// The one conversion from a row on screen to an address, read fresh
+    /// every frame: a prompt claimed or dropped since the last frame
+    /// moves the rows underneath the cursor, and a remembered position
+    /// would point at whoever slid into its place.
+    fn queued_at(&self, index: usize) -> Option<(u64, String)> {
+        let queue = self
+            .state
+            .queued
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        queue.get(index).map(|entry| (entry.id, entry.text.clone()))
+    }
+
+    /// Where the prompt `id` sits now, if it still waits.
+    ///
+    /// Asked after the fact rather than remembered: a save lands by id,
+    /// and this only answers where to draw the row it landed in.
+    fn queued_index_of(&self, id: u64) -> Option<usize> {
+        self.state
+            .queued
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .index_of(id)
+    }
+
+    /// Apply a key press to the queue section while it holds the keys.
+    ///
+    /// `Some(redraw)` when the section owns the press — as the focused
+    /// list, or as the prompt standing open in the composer. `None` while
+    /// the queue holds neither, and for the keys
+    /// [`key_survives_the_sheet`] names: the run's cancel, copy, and
+    /// steering chords and the transcript's paging stay live over the
+    /// section, the same courtesy the ask sheet extends, because a user
+    /// checking what a waiting prompt refers to has to be able to read
+    /// the conversation it came out of. Ctrl+Q is asked here rather than
+    /// below for the two moments it does own: entering the section from
+    /// the composer, and committing an edit from inside it. Leaving a
+    /// focused section is `Esc`'s and the chord's both — the focused arm
+    /// below takes the key and hands the keys back, so one press means
+    /// enter and the next means leave.
+    fn queue_key(&mut self, key: KeyEvent) -> Option<bool> {
+        if matches!(self.queue_mode, QueueMode::Editing { .. }) {
+            if let (KeyCode::Char('q'), KeyModifiers::CONTROL) = (key.code, key.modifiers) {
+                self.commit_queue_edit();
+                return Some(true);
+            }
+            return self.queue_edit_key(key);
+        }
+        if key_survives_the_sheet(key) {
+            return None;
+        }
+        if let QueueMode::Confirming { act } = self.queue_mode {
+            return Some(self.queue_confirm_key(key, act));
+        }
+        if self.queue_mode == QueueMode::Focused {
+            return Some(self.queue_focused_key(key));
+        }
+        if let (KeyCode::Char('q'), KeyModifiers::CONTROL) = (key.code, key.modifiers) {
+            return Some(self.focus_queue());
+        }
+        None
+    }
+
+    /// The keys the section takes back while a prompt is out in the
+    /// composer.
+    ///
+    /// Typing, the caret, and pasting stay the composer's: the draft is
+    /// fixed with the same keys a new prompt is written with, which is the
+    /// point of lifting it there rather than into a box with its own
+    /// editor. Three chords come back here — Enter saves into the prompt
+    /// the text came from, and Esc and Ctrl+C both put the draft away.
+    /// Ctrl+C is the one whose meaning moves: with a prompt out, the press
+    /// lands on the text in front of the user rather than reaching past it
+    /// to a run they have stopped looking at, and the run's cancel is one
+    /// Esc away. Neither abort drops anything — a key taken as a way out
+    /// of the mode leaves the waiting prompt exactly as it was found.
+    /// Everything else is the composer's, and falls through.
+    fn queue_edit_key(&mut self, key: KeyEvent) -> Option<bool> {
+        match (key.code, key.modifiers) {
+            (KeyCode::Enter, _) | (KeyCode::Char('m'), KeyModifiers::CONTROL) => {
+                self.commit_queue_edit();
+                Some(true)
+            }
+            (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                self.abort_queue_edit();
+                Some(true)
+            }
+            _ => None,
+        }
+    }
+
+    /// The keys the focused list answers.
+    ///
+    /// Left and Right walk the waiting prompts, `e` lifts the shown one
+    /// into the composer, `s` sends it to the turn in flight as guidance,
+    /// Delete or `d` takes it out of the queue for good, and Esc hands the
+    /// keyboard back. Whatever else arrives is
+    /// swallowed here rather than handed down: a letter typed while the
+    /// user reads the backlog has nowhere it should be going, and letting
+    /// it reach the composer would build a draft behind their back.
+    fn queue_focused_key(&mut self, key: KeyEvent) -> bool {
+        let bare = key.modifiers == KeyModifiers::NONE;
+        match key.code {
+            KeyCode::Left if bare => self.step_queue_view(false),
+            KeyCode::Right if bare => self.step_queue_view(true),
+            KeyCode::Esc => self.queue_mode = QueueMode::Plain,
+            KeyCode::Char('q') if key.modifiers == KeyModifiers::CONTROL => {
+                self.queue_mode = QueueMode::Plain;
+            }
+            KeyCode::Char('e') if bare => self.open_queue_edit(),
+            KeyCode::Delete | KeyCode::Char('d') if bare => {
+                self.queue_mode = QueueMode::Confirming {
+                    act: QueueAct::Drop,
+                };
+            }
+            KeyCode::Char('s') if bare => {
+                self.queue_mode = QueueMode::Confirming {
+                    act: QueueAct::Steer,
+                };
+            }
+            _ => {}
+        }
+        true
+    }
+
+    /// The keys the confirmation answers.
+    ///
+    /// `y` performs the act the ask holds — after the mode returns to
+    /// `Focused`, so the act's own emptying of the queue still releases
+    /// the focus the way the immediate keypress once did. Everything
+    /// else stands the ask down: `n` and Esc plainly, and any stray key
+    /// too, because a key that lands by accident must never be the one
+    /// that spends the prompt.
+    fn queue_confirm_key(&mut self, key: KeyEvent, act: QueueAct) -> bool {
+        if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::Char('y') {
+            self.queue_mode = QueueMode::Focused;
+            match act {
+                QueueAct::Drop => self.drop_queue_entry(),
+                QueueAct::Steer => self.steer_queued(),
+            }
+        } else {
+            self.queue_mode = QueueMode::Focused;
+        }
+        true
+    }
+
+    /// Put the keyboard in the queue section's hands.
+    ///
+    /// `false` when nothing waits: the chord asks for a panel, and a
+    /// session with nothing queued has none, so taking the keys then
+    /// would leave a mode with nothing on screen to act on. A view left
+    /// from an earlier walk is clamped back onto the queue rather than
+    /// reset, so stepping out and in again returns to where the walk was;
+    /// a first entry meets the queue at the front, the prompt that runs
+    /// next.
+    fn focus_queue(&mut self) -> bool {
+        if self.queued_len() == 0 {
+            return false;
+        }
+        self.queue_mode = QueueMode::Focused;
+        self.clamp_queue_view();
+        true
+    }
+
+    /// Lift the shown prompt into the composer for editing.
+    ///
+    /// What is already in the composer is not collateral: with a draft
+    /// standing there the prompt stays in the queue and the reason goes on
+    /// the notice row. The two texts have nowhere to meet — overwriting
+    /// the user's unsent words to edit somebody else's prompt would trade
+    /// one lost draft for two.
+    ///
+    /// The focus is released for the duration, which is the mechanism and
+    /// not a courtesy: the list's keys and the composer's keys are
+    /// different keys, and typing has to reach the text on screen.
+    fn open_queue_edit(&mut self) {
+        let Some((id, text)) = self.queued_at(self.queue_view) else {
+            self.clamp_queue_view();
+            return;
+        };
+        if !self.input.is_empty() {
+            self.post_notice(
+                "the composer holds a draft — empty it to edit a waiting prompt".to_string(),
+            );
+            return;
+        }
+        self.input.set_text(text);
+        self.queue_mode = QueueMode::Editing { id };
+    }
+
+    /// Save the composer's text into the prompt it was opened from.
+    ///
+    /// A save is not a submission: nothing goes out, nothing enters the
+    /// input history — the recall the Up key walks is the list of prompts
+    /// actually sent, and an edit was never one — and the run in flight is
+    /// untouched. What changes is the body the claim will read, in the
+    /// slot the prompt was submitted into, so the order the prompts were
+    /// typed in stays the order their turns run in.
+    ///
+    /// Two edges, and both say so on the notice row. A blank body is
+    /// refused rather than saved: an entry emptied into a prompt of nothing
+    /// is worse to find on the row than the wrong word that was there, and
+    /// the draft stays out for another try. A prompt the run claimed while
+    /// its text was out cannot be edited retroactively — the words it went
+    /// with already reached the model — so the fix goes out as a prompt of
+    /// its own instead of being quietly thrown away.
+    fn commit_queue_edit(&mut self) {
+        let QueueMode::Editing { id } = self.queue_mode else {
+            return;
+        };
+        let text = self.input.text().to_string();
+        if text.trim().is_empty() {
+            self.post_notice(
+                "the prompt keeps its words — a save needs something to send".to_string(),
+            );
+            return;
+        }
+        self.input.clear();
+        if self.replace_queued(id, text.clone()) {
+            if let Some(index) = self.queued_index_of(id) {
+                self.queue_view = index;
+            }
+        } else {
+            self.correct_claimed(id, text);
+        }
+        self.leave_queue_edit();
+        self.clamp_queue_view();
+    }
+
+    /// Put the draft away, leaving its prompt exactly as it was.
+    ///
+    /// The way out of the mode, not out of the queue: the prompt keeps the
+    /// wording it had before the composer took it and waits where it
+    /// waited, and the composer's buffer — which held somebody else's
+    /// prompt on loan, never the user's own draft — goes with it.
+    fn abort_queue_edit(&mut self) {
+        if !matches!(self.queue_mode, QueueMode::Editing { .. }) {
+            return;
+        }
+        self.input.clear();
+        self.clamp_queue_view();
+        self.leave_queue_edit();
+    }
+
+    /// Take the shown prompt out of the queue for good.
+    ///
+    /// A waiting prompt is the only thing this touches: the run in flight
+    /// keeps running, the prompts behind it keep their order, and the
+    /// prompt itself simply never runs. There is no confirmation because
+    /// there is nothing to lose that cannot be retyped — the entry is on
+    /// screen at the press, and it is the only way to unload an entry a
+    /// blank save refuses to empty.
+    fn drop_queue_entry(&mut self) {
+        let Some((id, _)) = self.queued_at(self.queue_view) else {
+            self.clamp_queue_view();
+            return;
+        };
+        self.remove_queued(id);
+        self.clamp_queue_view();
+        self.release_queue_if_empty();
+    }
+
+    /// Send the composer straight to the model, mid-turn: `Ctrl+S`.
+    ///
+    /// Enter is patient and Ctrl+S is not. With a run in flight and the
+    /// seam installed the text goes to the steering slot and reaches the
+    /// model at the run's next turn boundary, joining the conversation the
+    /// model continues rather than waiting behind the queue. With no run to
+    /// steer — or with a run that ended in the instant between the keypress
+    /// and the offer — `steer` refuses and the text takes the ordinary
+    /// path, so the chord is never a key that eats what was typed.
+    ///
+    /// A prompt open in the composer for editing belongs to the waiting
+    /// section no longer: its slot is retired first, or the same words
+    /// would reach the model now *and* run again from the queue later.
+    ///
+    /// A draft of nothing but blanks is refused, exactly as Enter refuses it:
+    /// the chord sends what Enter would send, and Enter sends nothing here.
+    /// From an edit the stakes are higher than a wasted row — the slot is
+    /// retired before delivery — so a whitespace-only draft would drop a real
+    /// waiting prompt to deliver text nobody typed.
+    ///
+    /// The row is written here rather than at a claim: unlike a queued
+    /// prompt, this one is sent by the hand that writes it, so the
+    /// transcript records it the moment it leaves.
+    fn steer_now(&mut self) -> bool {
+        if self.input.text().trim().is_empty() {
+            return true;
+        }
+        let text = self.input.text().to_string();
+        if let QueueMode::Editing { id } = self.queue_mode {
+            self.remove_queued(id);
+            self.leave_queue_edit();
+            self.clamp_queue_view();
+            self.release_queue_if_empty();
+        }
+        self.input.clear();
+        self.input.remember(text.clone());
+        self.deliver_guidance(text);
+        true
+    }
+
+    /// Hand `text` to the run in flight, or send it as a turn.
+    ///
+    /// The one delivery path behind both entrances to steering — the
+    /// composer's `Ctrl+S` and the waiting section's `s` — so the two can
+    /// never mean different things. Accepted, it is the loop's to read at
+    /// its next boundary; its transcript row then enters the conversation
+    /// with the other events, at the place the moment it was sent gives it.
+    /// Refused, it takes the ordinary path.
+    ///
+    /// Recording on recall stays with the callers: a prompt that arrives
+    /// out of the queue was already recorded when it was submitted, and
+    /// saying it twice would list it twice.
+    fn deliver_guidance(&mut self, text: String) {
+        if self
+            .guidance
+            .as_ref()
+            .is_some_and(|guidance| guidance.steer(text.clone()))
+        {
+            self.state.push_steered(text);
+            self.scroll_to_bottom();
+            return;
+        }
+        self.submit_text(text);
+    }
+
+    /// Guide the waiting prompt on screen: `s` in the focused section.
+    ///
+    /// The hole `Ctrl+S` cannot reach: a prompt typed a minute ago, queued
+    /// patiently, that the running turn has since made urgent. It leaves
+    /// the queue and joins the turn in flight, which is also why it leaves
+    /// first — the same words must not both reach the model now and run
+    /// again from the queue later.
+    ///
+    /// Refused while nothing is running. Guidance is advice for a turn, and
+    /// a session between turns has no turn to advise; the prompt stays
+    /// where it is, in order, rather than being fired into a gap. If the
+    /// run ends in the instant between the key and the offer, the fallback
+    /// gives it a turn of its own — the words outrank the slot they came
+    /// out of.
+    fn steer_queued(&mut self) {
+        let Some((id, text)) = self.queued_at(self.queue_view) else {
+            self.clamp_queue_view();
+            return;
+        };
+        if !self.state.agent_running.load(Ordering::SeqCst) {
+            self.post_notice(
+                "nothing is running to guide — the prompt waits in its place".to_string(),
+            );
+            return;
+        }
+        self.remove_queued(id);
+        self.clamp_queue_view();
+        self.release_queue_if_empty();
+        self.deliver_guidance(text);
+    }
+
+    /// Deliver what the last run never reached.
+    ///
+    /// The user pressed the send-now chord and the run ended before reading
+    /// it, so the intent to send stands: the text goes back to the waiting
+    /// section *with its turn promised again*, the way any submit promises
+    /// one — a prompt standing in a section whose whole meaning is "this
+    /// runs next", with nothing to make it run, would be a decoration. It
+    /// stays editable up to its own claim: `e` fixes the wording, `d`
+    /// takes it out, and a cancel stops only the turn in flight — the
+    /// waiting prompts, this one included, keep their place.
+    ///
+    /// It goes to the *back* of the queue rather than the front, though it
+    /// is the older text: the prompts already waiting were promised their
+    /// turns first, and reordering them behind an unsent aside would be the
+    /// louder surprise.
+    ///
+    /// A closed channel is the session ending, and the entry simply stays
+    /// in the queue — an unrun prompt still held in the queue is the honest last state.
+    /// The take is not atomic with the caller's idle check, and the gap is
+    /// the window a run starts in: the frame sees no run in flight, and by
+    /// the time the slot is emptied a new run is mid-turn. The texts are
+    /// the finished run's, though — advice about turns that no longer
+    /// stand, which the slot's own contract refuses to hand to a later
+    /// run silently — so whatever started in the window, they wait here
+    /// with a turn promised, under the notice that says the model never
+    /// read them. The new run is not steered with them: a user who meant
+    /// them for it still can, seeing the notice, and the alternative
+    /// would put words into a conversation their author never aimed at.
+    fn return_guidance(&mut self) {
+        let Some(guidance) = self.guidance.as_ref() else {
+            return;
+        };
+        let taken = guidance.take_returned();
+        if taken.is_empty() {
+            return;
+        }
+        let count = taken.len();
+        let mut promised = 0usize;
+        for text in taken {
+            let id = self.push_queued(text);
+            if self.send_queued_id(id) {
+                promised = promised.saturating_add(1);
             }
         }
-        self.conversation.push(TuiMessage::User {
-            text,
-            timestamp: chrono::Utc::now(),
-        });
-        self.conversation_generation = self.conversation_generation.saturating_add(1);
-        self.scroll_to_bottom();
+        self.clamp_queue_view();
+        let (noun, verb) = if count == 1 {
+            ("prompt", "is")
+        } else {
+            ("prompts", "are")
+        };
+        let mut notice = format!("{count} {noun} the model never read {verb} waiting again");
+        if promised < count {
+            notice.push_str(" — no driver left to run them");
+        }
+        self.post_notice(notice);
+    }
+
+    /// Come back out of an edit, into the mode the section stands in now.
+    ///
+    /// The keys go to the section, because that is where they were the
+    /// moment before `e` lifted a prompt out: an edit is a detour off the
+    /// walk, not a new departure, and a user who saved one prompt's fix
+    /// expects to step to the next with an arrow rather than a chord. With
+    /// nothing left to stand on there is no section to hold the keys, and
+    /// the composer takes them back.
+    fn leave_queue_edit(&mut self) {
+        self.queue_mode = if self.queued_len() == 0 {
+            QueueMode::Plain
+        } else {
+            QueueMode::Focused
+        };
+    }
+
+    /// Stand the section's focus down when the section is gone.
+    ///
+    /// The focus is the only mode released. It holds keys for a panel that
+    /// is no longer drawn, and keeping it over an empty queue would swallow
+    /// every keystroke for nothing. An open edit is kept: it holds no keys
+    /// of the section's — typing, the caret, and pasting stay the composer's
+    /// in that mode whatever the queue looks like — and what stands in the
+    /// composer is the user's own text mid-edit, not something the section
+    /// can release on the queue's behalf.
+    ///
+    /// Which is the moment the edit matters most. A run claiming the last
+    /// waiting prompt is exactly when the prompt open in the composer has
+    /// already gone out with the older wording, and the frame that draws the
+    /// claim lands before the Enter that fixes it. Releasing the mode there
+    /// would turn the fix into an ordinary second turn and quietly drop the
+    /// cut the section promises; keeping it lets
+    /// [`commit_queue_edit`](Self::commit_queue_edit) find the entry gone and
+    /// send the wording as a correction instead.
+    fn release_queue_if_empty(&mut self) {
+        if self.queued_len() == 0
+            && matches!(
+                self.queue_mode,
+                QueueMode::Focused | QueueMode::Confirming { .. }
+            )
+        {
+            self.queue_mode = QueueMode::Plain;
+        }
+    }
+
+    /// Walk the shown prompt one step, wrapping at both ends.
+    ///
+    /// The walk moves the view and leaves the queue's order alone, for the
+    /// reason the ask sheet's walk gives: the count the section prints is
+    /// the shown prompt's place in the order the prompts were submitted,
+    /// and it says the same thing after a walk away and back. It is a
+    /// circle, so the prompt at the tail is one press from the one at the
+    /// front rather than a walk through everything between. A queue of one
+    /// has nowhere to go and the step declines — the key is still
+    /// swallowed, so an arrow cannot fall through to the transcript.
+    fn step_queue_view(&mut self, forward: bool) {
+        let count = self.queued_len();
+        if count < 2 {
+            return;
+        }
+        self.queue_view = if forward {
+            let next = self.queue_view.saturating_add(1);
+            if next >= count { 0 } else { next }
+        } else if self.queue_view == 0 {
+            count.saturating_sub(1)
+        } else {
+            self.queue_view.saturating_sub(1)
+        };
+    }
+
+    /// Keep [`queue_view`](Self::queue_view) a live position in the queue.
+    ///
+    /// A claim at the front and a drop anywhere pull the rows behind them
+    /// up a place, and a view left past the end would show nothing rather
+    /// than the prompt that slid into the row. An emptied queue takes the
+    /// view home to zero, which is also where the next prompt is met.
+    fn clamp_queue_view(&mut self) {
+        self.queue_view = self.queue_view.min(self.queued_len().saturating_sub(1));
+    }
+
+    /// Reconcile the section's view and mode with what the queue holds.
+    ///
+    /// Once a frame, because the queue changes underneath the keyboard
+    /// with no key pressed: a run's claim takes the front prompt the
+    /// instant its turn starts — one claim per turn, so the backlog
+    /// thins under the walk whenever a turn lands. Nothing here is a
+    /// policy the keys do not already
+    /// apply — it is the same two rules, applied by the frame rather than
+    /// waiting for a press that may never come.
+    ///
+    /// The mode half of the release is the frame's most consequential
+    /// contribution, because the claim that empties the queue is the event
+    /// that makes an open edit a correction rather than a save, and it
+    /// always lands a frame before the Enter that follows it. [`release_queue_if_empty`]
+    /// is why the frame stands down a focus and leaves an edit alone.
+    fn sync_queue_view(&mut self) {
+        if self.queued_len() == 0 {
+            self.queue_view = 0;
+            self.release_queue_if_empty();
+            return;
+        }
+        self.clamp_queue_view();
     }
 
     /// Whether any tool call is in flight.
@@ -3352,7 +4823,7 @@ impl TuiApp {
     /// followed; the End key shares the path.
     fn scroll_to_bottom(&mut self) {
         self.scroll_offset = 0;
-        self.auto_scroll = true;
+        self.stick = Stick::Follow;
     }
 
     /// Jump the view to the oldest line and drop stickiness.
@@ -3364,7 +4835,7 @@ impl TuiApp {
     /// view back down.
     fn scroll_to_top(&mut self) {
         self.scroll_offset = usize::MAX;
-        self.auto_scroll = false;
+        self.stick = Stick::Hold;
     }
 
     /// Re-arm stickiness when a scroll lands near the bottom.
@@ -3374,7 +4845,7 @@ impl TuiApp {
     /// snaps fully.
     fn rearm_if_near_bottom(&mut self) {
         if self.scroll_offset <= STICK_TOLERANCE {
-            self.auto_scroll = true;
+            self.stick = Stick::Follow;
         }
     }
 
@@ -3458,9 +4929,6 @@ impl TuiApp {
             };
         }
         let dragged = if self.pending_permissions.front().is_some() {
-            // The overlay parks the pointer: an edge push that was live
-            // when the ask landed must neither scroll behind the sheet
-            // nor resume once the ask is answered.
             self.drag_position = None;
             false
         } else {
@@ -3493,11 +4961,6 @@ impl TuiApp {
                 _ => false,
             }
         };
-        // No run, no prompts: a finished or cancelled run's dispatches
-        // are gone, so the gate already denied whatever went unanswered
-        // — the queue must not hold an overlay the run can no longer
-        // act on. Dropping the requests closes their reply channels,
-        // which reads as a denial on any resolver still parked on one.
         let prompts_retired = !self.pending_permissions.is_empty()
             && !self
                 .state
@@ -3506,10 +4969,6 @@ impl TuiApp {
         if prompts_retired {
             self.pending_permissions.clear();
         }
-        // The same retirement for questions: a run that is no longer
-        // live has no dispatch left to carry the answers, so dropping
-        // the prompts (and with them their reply senders) reads as a
-        // dismissal on any asking tool still parked on a channel.
         let questions_retired = !self.pending_questions.is_empty()
             && !self
                 .state
@@ -3543,24 +5002,87 @@ impl TuiApp {
         !graduations.is_empty()
     }
 
+    /// Split the frame's rows: the constraints top to bottom, and the
+    /// reservation a pending ask holds out of the conversation.
+    ///
+    /// Every optional section — the plan, the waiting prompts, the
+    /// ask's reserved rows, the place row — takes only the rows it
+    /// paints, and each stands above the furniture below it in the
+    /// order the frame reads: the plan and the waiting prompts ride
+    /// above the ask's sheet, so a tall ask meets their bottom edge
+    /// rather than painting through them.
+    fn frame_constraints(&self, layout: FrameLayout) -> (Vec<Constraint>, u16) {
+        let FrameLayout {
+            area,
+            composer_height,
+            strip_position,
+            question_page,
+            sections,
+        } = layout;
+        let strip_at_top = matches!(strip_position, StripPosition::Top);
+        let queue_shown = sections.stands(SECTION_QUEUE);
+        let todo_shown = sections.stands(SECTION_TODO);
+        let place_shown = sections.stands(SECTION_PLACE);
+        let ruled = self.theme.ui.composer_border.is_some();
+        let question_reserved = if let Some(page) = question_page {
+            let sheet =
+                self.question_sheet_height(area.width, self.question_sheet_area(area).height, page);
+            sheet
+                .saturating_sub(composer_height)
+                .saturating_sub(2)
+                .saturating_sub(STATUS_BAR_AIR)
+                .saturating_sub(u16::from(place_shown))
+        } else {
+            0
+        };
+        let mut constraints = Vec::with_capacity(8);
+        if strip_at_top {
+            constraints.push(Constraint::Length(1));
+        }
+        constraints.push(Constraint::Min(0));
+        if todo_shown {
+            constraints.push(Constraint::Length(self.todo_section_height(area.width)));
+        }
+        if queue_shown {
+            constraints.push(Constraint::Length(self.queue_section_height(area.width)));
+        }
+        if question_reserved > 0 {
+            constraints.push(Constraint::Length(question_reserved));
+        }
+        constraints.push(Constraint::Length(1));
+        // A ruled theme stands its caption above the top rule rather
+        // than between the rules: the caption rides the spacer's own
+        // slot and the spacer takes the next row down, so the box the
+        // rules draw never encloses the directory's name. Unruled
+        // themes keep the caption tight against the composer's paint.
+        if ruled && place_shown {
+            constraints.push(Constraint::Length(1));
+        }
+        constraints.push(Constraint::Length(1));
+        if !ruled && place_shown {
+            constraints.push(Constraint::Length(1));
+        }
+        constraints.extend([
+            Constraint::Length(composer_height),
+            Constraint::Length(STATUS_BAR_ROWS),
+        ]);
+        (constraints, question_reserved)
+    }
+
     /// Render one frame of the layout.
     ///
     /// Conversation fills the space above a blank spacer row that
-    /// separates it from the input field; the two-row status bar
-    /// closes the frame at the bottom — each pane renders through its
-    /// own method. The input field grows with its buffer up to its
+    /// separates it from the input field; the place row — the
+    /// working directory, once the host names one — sits between
+    /// that spacer and the composer, and the three-row footer closes
+    /// the frame at the bottom — each pane renders through its own
+    /// method. The input field grows with its buffer up to its
     /// text-row cap and then holds: the conversation pane reflows
     /// while the composer grows and holds still once it has.
     pub fn render(&mut self, frame: &mut Frame) {
         self.drain_shared_state();
+        self.sync_queue_view();
         let area = frame.area();
-        // The composer's height follows its buffer: one text row when
-        // empty, one more per line — typed or wrapped — up to the cap.
-        // The wrap width is the pane's regardless of how tall the pane
-        // ends up — the vertical split gives every chunk the full
-        // width — so it comes from the terminal itself, and the one
-        // wrap computed here serves the height, the field, and the
-        // status tag alike.
         let wrap_width = area
             .width
             .max(1)
@@ -3569,65 +5091,72 @@ impl TuiApp {
         let text_rows = u16::try_from(rows.len())
             .unwrap_or(1)
             .clamp(1, INPUT_TEXT_ROWS);
-        let composer_height = text_rows.saturating_add(INPUT_VERTICAL_PADDING.saturating_mul(2));
-        // The strip's configured row shapes the frame: a dedicated
-        // first row of the terminal, or the spacer above the composer
-        // every later pane shifts down past.
+        let composer_height = text_rows
+            .saturating_add(INPUT_VERTICAL_PADDING.saturating_mul(2))
+            .saturating_add(1);
         let strip_at_top = matches!(self.strip_position, StripPosition::Top);
-        // A pending question reserves its sheet's rows above the
-        // bottom furniture: the sheet's height minus the notice,
-        // spacer, and composer rows it already covers. The
-        // conversation's Min(0) chunk gives those rows up, so its
-        // text ends above the box — nothing the run said hides
-        // behind the ask.
-        let question_pending =
-            self.pending_permissions.is_empty() && !self.pending_questions.is_empty();
-        let question_reserved = if question_pending {
-            let sheet_area_height = self.question_sheet_area(area).height;
-            let sheet = self.question_sheet_height(
-                area.width,
-                sheet_area_height,
-                self.pending_questions.len().saturating_sub(1),
-            );
-            sheet.saturating_sub(composer_height.saturating_add(2))
-        } else {
-            0
-        };
-        let mut constraints = Vec::with_capacity(7);
-        if strip_at_top {
-            constraints.push(Constraint::Length(1));
-        }
-        constraints.push(Constraint::Min(0));
-        if question_reserved > 0 {
-            constraints.push(Constraint::Length(question_reserved));
-        }
-        constraints.extend([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(composer_height),
-            Constraint::Length(STATUS_BAR_ROWS),
-        ]);
+        let question_page = self
+            .pending_questions
+            .len()
+            .checked_sub(1)
+            .filter(|_| self.pending_permissions.is_empty());
+        let queue_shown = self.queued_len() > 0;
+        // The waiting section stands whenever anything waits, not only
+        // under a run: prompts a resume owes wait with no run up, and
+        // hiding them behind the run gate would put them back in the
+        // invisible backlog the seeding exists to clear. The plan
+        // section below makes the same argument for its own rows.
+        // The plan stands between the conversation and everything else
+        // while any task does — no run gate: a list with work left is
+        // worth keeping in view between runs too, and a finished list
+        // leaves at the claim that follows it (the same edge the runner
+        // resets its own store at), so the section never ghosts done
+        // work across runs. Ctrl+T walks its postures — capped, full,
+        // hidden — a view preference, not a mode: it owns no keys and
+        // the plan keeps updating underneath either way. Hidden keeps
+        // one row of itself standing: the folded marker names the
+        // count and the chord, so a plan can be out of sight without
+        // being out of mind.
+        let todo_shown = !self.latest_todos.is_empty();
+        let place_shown = self.working_dir.is_some();
+        let (constraints, question_reserved) = self.frame_constraints(FrameLayout {
+            area,
+            composer_height,
+            strip_position: self.strip_position,
+            question_page,
+            sections: Sections::EMPTY
+                .add_todo(todo_shown)
+                .add_queue(queue_shown)
+                .add_place(place_shown),
+        });
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints(constraints)
             .split(area);
 
         let base = usize::from(strip_at_top);
-        // The rows reserved for the ask's sheet sit between the
-        // conversation and the bottom furniture, so every chunk from
-        // the notice down shifts one slot while a question is up. The
-        // conversation keeps `base`; everything below the reservation
-        // walks from `furniture`, or the notice, strip, composer, and
-        // status bar each render a row too high — and the status bar's
-        // own rows are never painted at all.
-        let furniture = base.saturating_add(usize::from(question_reserved > 0));
+        let todo_at = usize::from(todo_shown);
+        let furniture = base
+            .saturating_add(todo_at)
+            .saturating_add(usize::from(question_reserved > 0))
+            .saturating_add(usize::from(queue_shown));
+        let place_at = usize::from(place_shown);
         let fallback = area;
         self.render_conversation(frame, pane(&chunks, base, fallback));
+        if todo_shown {
+            self.render_todo_section(frame, pane(&chunks, base.saturating_add(1), fallback));
+        }
+        if queue_shown {
+            self.render_queue(
+                frame,
+                pane(
+                    &chunks,
+                    base.saturating_add(1).saturating_add(todo_at),
+                    fallback,
+                ),
+            );
+        }
         self.render_notice(frame, pane(&chunks, furniture.saturating_add(1), fallback));
-        // While the agent runs, the strip breathes in its configured
-        // row; when that row is the composer's spacer, the paintless
-        // hairline stands down for those frames rather than
-        // underlining the bar.
         if self
             .state
             .agent_running
@@ -3637,45 +5166,71 @@ impl TuiApp {
         } else {
             self.run_anchor = None;
         }
-        let strip_row = if strip_at_top {
-            0
-        } else {
+        // A ruled theme seats its caption above the top rule (the
+        // spacer's own slot rides one row higher than usual); an
+        // unruled one keeps it tight against the composer's paint.
+        let caption_above_rule = self.theme.ui.composer_border.is_some() && place_shown;
+        let spacer_at = furniture
+            .saturating_add(2)
+            .saturating_add(usize::from(caption_above_rule));
+        let place_row_at = if caption_above_rule {
             furniture.saturating_add(2)
+        } else {
+            furniture.saturating_add(3)
         };
+        let strip_row = if strip_at_top { 0 } else { spacer_at };
         let strip_drew = self.render_pulse_strip(frame, pane(&chunks, strip_row, fallback));
         let strip_owns_spacer = strip_drew && !strip_at_top;
+        if place_shown {
+            self.render_place_row(frame, pane(&chunks, place_row_at, fallback));
+        }
         if let Some(color) = self.theme.ui.composer_border {
-            let spacer = pane(&chunks, furniture.saturating_add(2), fallback);
-            let composer = pane(&chunks, furniture.saturating_add(3), fallback);
-            // The hairline is the composer's top edge on border themes:
-            // an underlined row of spaces reads as a rule without
-            // consuming a layout row of its own. While the strip
-            // breathes in the spacer, the strip owns the row and the
-            // rule waits; a strip configured to the top row never
-            // claims it.
+            let spacer = pane(&chunks, spacer_at, fallback);
+            let composer = pane(
+                &chunks,
+                furniture.saturating_add(3).saturating_add(place_at),
+                fallback,
+            );
             let rule = Style::default()
                 .fg(color)
                 .add_modifier(ratatui::style::Modifier::UNDERLINED);
             if spacer.height > 0 && !strip_owns_spacer {
                 frame.buffer_mut().set_style(spacer, rule);
             }
+            // The bottom rule rides the composer's padding row, one
+            // above the identity row: the model and mode hang below
+            // the rule — outside the box — rather than sitting on the
+            // underline, which read as the text crossing its own
+            // border. A starved composer keeps the rule on its last
+            // row rather than underlining a row it does not own.
             if composer.height > 0 {
+                let rule_row = if composer.height >= 2 {
+                    composer.bottom().saturating_sub(2)
+                } else {
+                    composer.bottom().saturating_sub(1)
+                };
                 let bottom = Rect {
-                    y: composer.bottom().saturating_sub(1),
+                    y: rule_row,
                     height: 1,
                     ..composer
                 };
                 frame.buffer_mut().set_style(bottom, rule);
             }
         }
-        let input_area = pane(&chunks, furniture.saturating_add(3), fallback);
+        let input_area = pane(
+            &chunks,
+            furniture.saturating_add(3).saturating_add(place_at),
+            fallback,
+        );
         self.input_wrap_width = wrap_width;
         self.render_input(frame, input_area, &rows, caret);
         self.render_status_bar(
             frame,
-            pane(&chunks, furniture.saturating_add(4), fallback),
-            &rows,
-            caret,
+            pane(
+                &chunks,
+                furniture.saturating_add(4).saturating_add(place_at),
+                fallback,
+            ),
         );
         if let Some((prompt, more)) = self.pending_permissions.front().map(|request| {
             (
@@ -3693,6 +5248,119 @@ impl TuiApp {
                 self.pending_questions.len().saturating_sub(1),
             );
         }
+    }
+
+    /// The rows the pinned plan section holds at this width.
+    ///
+    /// Counted off the same [`todo_view::section_lines`] the section
+    /// renders, so the rows the layout reserves are the rows the
+    /// frame sees — no blank beneath the plan, no row it cannot pay
+    /// for. The folded posture is one row: the marker
+    /// [`todo_view::folded_hint`] leaves, cheaper than the list and
+    /// louder than nothing.
+    fn todo_section_height(&self, width: u16) -> u16 {
+        if self.plan_view == PlanView::Hidden {
+            // The air above the badge row.
+            return 2;
+        }
+        let colors = todo_view::TodoColors {
+            dim: self.theme.ui.dim,
+            accent: self.theme.ui.primary,
+            badge_fill: self.theme.ui.secondary,
+            badge_letters: self.theme.ui.background,
+        };
+        let inner = width
+            .saturating_sub(TODO_SECTION_INSET.saturating_mul(2))
+            .max(1);
+        let body_cap = match self.plan_view {
+            PlanView::Full => usize::MAX,
+            _ => TODO_SECTION_BODY_ROWS,
+        };
+        let chord_hint = (self.plan_view != PlanView::Full).then_some("ctrl+t");
+        u16::try_from(
+            todo_view::section_lines(
+                &self.latest_todos,
+                &self.todo_section_changes,
+                &colors,
+                inner,
+                body_cap,
+                chord_hint,
+            )
+            .len(),
+        )
+        .unwrap_or(0)
+    }
+
+    /// Render the pinned plan section: the run's current tasks,
+    /// standing over the furniture while any do.
+    ///
+    /// Lines of text, not a box — the same register the conversation's
+    /// todo blocks and the notice row use — inset from the frame's
+    /// edges, headed by the done fraction, completed rows uniform and
+    /// retired, moved rows still standing in the accent, and an
+    /// ellipsis naming whatever the cap cut. Read-only by design: the
+    /// tasks are the agent's bookkeeping, the model owns the list, and
+    /// the section asks for no keys at all — it is furniture, not a
+    /// sheet.
+    fn render_todo_section(&self, frame: &mut Frame, area: Rect) {
+        if area.height == 0 || area.width == 0 {
+            return;
+        }
+        let colors = todo_view::TodoColors {
+            dim: self.theme.ui.dim,
+            accent: self.theme.ui.primary,
+            badge_fill: self.theme.ui.secondary,
+            badge_letters: self.theme.ui.background,
+        };
+        if self.plan_view == PlanView::Hidden {
+            // The folded stand-in: air, then the badge row — the count
+            // and the chord that opens the list again. The plan is out
+            // of sight, not out of mind.
+            frame.render_widget(
+                Paragraph::new(todo_view::folded_lines(&self.latest_todos, &colors)),
+                Rect {
+                    x: area
+                        .x
+                        .saturating_add(TODO_SECTION_INSET)
+                        .min(area.right().saturating_sub(1)),
+                    width: area
+                        .width
+                        .saturating_sub(TODO_SECTION_INSET.saturating_mul(2))
+                        .max(1),
+                    ..area
+                },
+            );
+            return;
+        }
+        let body_cap = match self.plan_view {
+            PlanView::Full => usize::MAX,
+            _ => TODO_SECTION_BODY_ROWS,
+        };
+        let chord_hint = (self.plan_view != PlanView::Full).then_some("ctrl+t");
+        let lines = todo_view::section_lines(
+            &self.latest_todos,
+            &self.todo_section_changes,
+            &colors,
+            area.width
+                .saturating_sub(TODO_SECTION_INSET.saturating_mul(2))
+                .max(1),
+            body_cap,
+            chord_hint,
+        );
+        frame.render_widget(
+            Paragraph::new(lines),
+            Rect {
+                x: area
+                    .x
+                    .saturating_add(TODO_SECTION_INSET)
+                    .min(area.right().saturating_sub(1)),
+                width: area
+                    .width
+                    .saturating_sub(TODO_SECTION_INSET.saturating_mul(2))
+                    .max(1),
+                ..area
+            },
+        );
     }
 
     /// Render the pending question as a sheet over the prompt box.
@@ -3719,11 +5387,8 @@ impl TuiApp {
         let Some(entry) = self.shown_question() else {
             return;
         };
-        let sheet_area = self.question_sheet_area(area);
         let wrap_at = usize::from(area.width.saturating_sub(4));
-        // The same budget the reservation worked from, so the rows the
-        // walk chose to spend and the rows the layout held aside are the
-        // same rows — one sheet, counted once.
+        let sheet_area = self.question_sheet_area(area);
         let budget = usize::from(sheet_area.height.saturating_sub(2));
         let sheet = self.question_sheet(entry, wrap_at, more, budget);
         let lines = sheet.lines;
@@ -3736,10 +5401,6 @@ impl TuiApp {
             return;
         }
         let accent = Style::default().fg(self.theme.ui.primary);
-        // The title names the shown question's place in the batch. The
-        // walk moves the view and not the queue, so the number holds
-        // still while the user walks away from a question and back to it
-        // — which is the whole reason it is worth a place on the border.
         let title = if more == 0 {
             " Question ".to_string()
         } else {
@@ -3756,13 +5417,6 @@ impl TuiApp {
             .title(Span::styled(title, accent));
         frame.render_widget(Clear, overlay);
         frame.render_widget(Paragraph::new(lines).block(block), overlay);
-        // The draft's caret is the terminal cursor, parked on the cell
-        // the next character takes. It does not blink: the composer's
-        // blink serves a prompt that is always there, while this mode is
-        // one the user stepped into in order to type, and a caret going
-        // dark mid-word reads as a dropped keystroke. Clamped to the
-        // box, so a draft past its width parks the cursor on the last
-        // cell the sheet can show rather than somewhere off it.
         if let Some((row, column)) = sheet.caret
             && row.saturating_add(1) < usize::from(overlay.height)
         {
@@ -3812,10 +5466,6 @@ impl TuiApp {
         let cursor_option = entry.ui.cursor.min(entry.prompt.options.len());
         let (lines, compose_start) =
             fit_question_sheet(head, &options, compose, tail, cursor_option, budget);
-        // The caret rides the row the draft's own wrap chose, inside the
-        // compose block; the block starts where the fitted sheet says it
-        // does. A terminal too short to reach that block loses the caret
-        // and nothing else — the draft row itself is never the row cut.
         let caret = caret_in_compose
             .map(|(row, column)| (compose_start.saturating_add(row), column))
             .filter(|(row, _)| *row < lines.len());
@@ -3869,12 +5519,6 @@ impl TuiApp {
     ) -> Vec<(usize, Vec<Line<'static>>)> {
         let question = &entry.prompt;
         let ui = &entry.ui;
-        // A reply being written to a question that wants one answer has
-        // the ask to itself: the dot on a marked row steps aside for the
-        // duration, because the Enter taken inside the draft answers with
-        // those words and not with the row. Stepping back out with Esc
-        // brings the dot back — the mark was never taken away, only
-        // shadowed while something else was being chosen.
         let draft_supersedes =
             ui.composing && !question.multi_select && !ui.draft.trim().is_empty();
         question
@@ -3946,20 +5590,12 @@ impl TuiApp {
         let ui = &entry.ui;
         let mut lines: Vec<Line<'static>> = vec![Line::default()];
         if ui.composing {
-            // The draft spends the prefix's width before it writes, and a
-            // row one cell wide is still a row; a width past what the frame
-            // can address is the widest row there is. Both bounds are this
-            // one conversion, so nothing downstream has to guess.
             let draft_width = u16::try_from(wrap_at.saturating_sub(COMPOSE_PREFIX.width()).max(1))
                 .unwrap_or(u16::MAX);
             let caret_byte = byte_index(&ui.draft, ui.caret);
             let (rows, caret) =
                 crate::input::wrap_rows_and_caret(&ui.draft, caret_byte, draft_width);
             let first = lines.len();
-            // Every row spends the prefix's width before its text — the
-            // pencil on the first, the same width of air on the rows
-            // below — so the caret's column means one thing wherever it
-            // lands, and the renderer adds the prefix once for all of them.
             let continuation = " ".repeat(COMPOSE_PREFIX.width());
             for (index, row) in rows.iter().enumerate() {
                 let prefix = if index == 0 {
@@ -3987,20 +5623,11 @@ impl TuiApp {
         } else {
             "  "
         };
-        // The same dot an option row wears, because Space marks this
-        // row exactly as it marks those: the dot is what says the
-        // typed reply joins the answer. Inside the draft the row
-        // shows the caret instead — the text being written has the
-        // row to itself, and a dot beside a blinking caret says
-        // nothing the caret does not.
         let checked = if ui.toggled.contains(&free_row) {
             "\u{2022} "
         } else {
             "  "
         };
-        // A draft carried back out of the compose mode is the
-        // user's text and takes the row in place of the
-        // invitation: Esc leaves the mode, never the words.
         let has_draft = !ui.draft.is_empty();
         let body = if has_draft {
             ui.draft.as_str()
@@ -4041,28 +5668,12 @@ impl TuiApp {
     ) -> Vec<Line<'static>> {
         let ui = &entry.ui;
         let mut lines: Vec<Line<'static>> = vec![Line::default()];
-        // Space marks a row on every ask, so the hint names it on every
-        // ask: it adds and removes rows where several answers are wanted
-        // and moves the one mark where a single one is. It never answers,
-        // which is what the row's own wording promises — Enter is the
-        // press that sends.
         let toggle = if entry.prompt.multi_select {
             "[space] toggle"
         } else {
             "[space] pick"
         };
-        // The keys that end the exchange lead the row, because a narrow
-        // terminal cuts its tail: hints wrap at the box's width and the
-        // last row is ellipsized, so whatever trails is the first thing a
-        // user on a small terminal never sees. Leaving the key that cancels
-        // last hid exactly the hint that matters most when the row cannot
-        // fit.
         let parts: Vec<&str> = if ui.composing {
-            // The row that promises a send owns the refusal too. A draft
-            // holding nothing is not an answer, and the notice row above
-            // the composer — where a refusal would naturally be posted —
-            // is a row the sheet is drawn over. So the promise changes its
-            // own wording: the key says what it needs before it works.
             let enter = if ui.draft.trim().is_empty() {
                 "[enter] needs a written answer"
             } else {
@@ -4082,10 +5693,6 @@ impl TuiApp {
                 toggle,
             ]
         } else {
-            // The batch's hint narrows Esc to the row under it: one press
-            // answers one question's dismissal, and the questions behind
-            // it stay asked. Saying `[esc] dismiss` over a queue of ten let
-            // it be read as the queue's.
             vec![
                 "[esc] dismiss one",
                 "[enter] confirm",
@@ -4133,20 +5740,23 @@ impl TuiApp {
 
     /// The rows a question sheet may take over the frame.
     ///
-    /// The status bar's rows stay its own — the session line reads while
-    /// an ask waits — and so does the strip's row when the strip is
-    /// configured to the top of the terminal: the sheet cannot occupy a
-    /// row the layout has already promised elsewhere, and a reservation
-    /// that counted it too asked the solver for one row more than the
-    /// frame had, leaving it to squeeze an unspecified pane to pay. Both
-    /// the reservation and the box derive their height from here, so they
+    /// The status bar's two content rows stay its own — the session
+    /// line reads while an ask waits — while the footer's air is
+    /// margin no pane paints, which the sheet may stand on: a deeper
+    /// composer margin costs the sheet no rows it did not already
+    /// spend. So does the strip's row when the strip is configured to
+    /// the top of the terminal: the sheet cannot occupy a row the
+    /// layout has already promised elsewhere, and a reservation that
+    /// counted it too asked the solver for one row more than the frame
+    /// had, leaving it to squeeze an unspecified pane to pay. Both the
+    /// reservation and the box derive their height from here, so they
     /// cannot disagree about how much room there is.
     fn question_sheet_area(&self, area: Rect) -> Rect {
         let strip_rows = u16::from(matches!(self.strip_position, StripPosition::Top));
         Rect {
             height: area
                 .height
-                .saturating_sub(STATUS_BAR_ROWS)
+                .saturating_sub(STATUS_BAR_ROWS - STATUS_BAR_AIR)
                 .saturating_sub(strip_rows),
             ..area
         }
@@ -4173,11 +5783,6 @@ impl TuiApp {
         } else {
             format!("[y] allow · [n] deny · ctrl+c cancels · {more} more waiting")
         };
-        // The sheet spans the terminal, so its inner width is the full
-        // width minus the border pair — wrap every block there, and
-        // every rendered line fits the box whatever the terminal's
-        // width. The hints wrap too, so even they cannot re-flow past
-        // the height the box reserves for them.
         let wrap_at = usize::from(area.width.saturating_sub(2));
         let mut lines: Vec<Line<'_>> = wrap_prompt_rows(prompt, wrap_at, MAX_OVERLAY_ROWS)
             .into_iter()
@@ -4189,11 +5794,8 @@ impl TuiApp {
                 .into_iter()
                 .map(|row| Line::styled(row, Style::default().fg(self.theme.ui.secondary))),
         );
-        // The sheet owns every row above the status bar when it needs
-        // them, but never the status bar itself — the session line
-        // stays readable while an ask waits.
         let sheet_area = Rect {
-            height: area.height.saturating_sub(STATUS_BAR_ROWS),
+            height: area.height.saturating_sub(STATUS_BAR_ROWS - STATUS_BAR_AIR),
             ..area
         };
         let height = u16::try_from(lines.len())
@@ -4272,14 +5874,17 @@ impl TuiApp {
             let mut thinking_lines = HashMap::new();
             let mut compaction_lines = HashMap::new();
             let mut user_turns = Vec::new();
+            let mut todo_blocks = Vec::new();
             self.conversation_cache = self.conversation_lines(
                 text_area,
                 &mut summary_lines,
                 &mut thinking_lines,
                 &mut compaction_lines,
                 &mut user_turns,
+                &mut todo_blocks,
             );
             self.tool_summary_lines = summary_lines;
+            self.todo_block_ranges = todo_blocks;
             self.thinking_summary_lines = thinking_lines;
             self.compaction_summary_lines = compaction_lines;
             self.user_turn_ranges = user_turns;
@@ -4302,6 +5907,26 @@ impl TuiApp {
         let (tools, running_rows) = self.active_tool_lines(width);
         let thinking_rows = self.live_thinking_lines(width);
         let compaction_rows = self.live_compaction_lines();
+        // The in-flight turn opens the way a settled one does. The batch
+        // render puts a blank row between a user message and the
+        // assistant content answering it — the speaker-change row — and
+        // the live lanes owe that row from their first frame: without
+        // it a running thinking or tool row rides one row tighter under
+        // the prompt than the same content sits the moment it
+        // graduates, so the gap would open as a jump. The row is
+        // chrome, not content — it counts toward the physical line
+        // space and never the selectable one, exactly the thinking
+        // rows' own accounting.
+        let live_open = !thinking_rows.0.is_empty()
+            || !self.frozen_lines.is_empty()
+            || !self.live_lines.is_empty()
+            || !compaction_rows.is_empty()
+            || !tools.is_empty();
+        let seam: Vec<Line<'static>> = if !self.conversation_cache.is_empty() && live_open {
+            vec![Line::from("")]
+        } else {
+            Vec::new()
+        };
         let selectable_lines = self
             .conversation_cache
             .len()
@@ -4311,12 +5936,15 @@ impl TuiApp {
         // its content arrived before the text, so the live lane reads in
         // conversation order — thinking, then the reply it introduced.
         self.thinking_live_rows = thinking_rows.1.map(|row| {
-            let start = row.saturating_add(self.conversation_cache.len());
+            let start = row
+                .saturating_add(self.conversation_cache.len())
+                .saturating_add(seam.len());
             start..start.saturating_add(thinking_rows.0.len())
         });
         let pre_tool_offset = self
             .conversation_cache
             .len()
+            .saturating_add(seam.len())
             .saturating_add(thinking_rows.0.len())
             .saturating_add(self.frozen_lines.len())
             .saturating_add(self.live_lines.len())
@@ -4325,26 +5953,40 @@ impl TuiApp {
             .into_iter()
             .map(|(index, call_id)| (index.saturating_add(pre_tool_offset), call_id))
             .collect();
+        // The live elapsed line: the running turn's own duration
+        // footer, ticking at the frame cadence, in the completed
+        // reply's format and register — the tail of the streaming
+        // region, where the settled line will take over when the run
+        // lands.
+        let run_timer = self.live_run_timer();
         let total_lines = selectable_lines
+            .saturating_add(seam.len())
             .saturating_add(thinking_rows.0.len())
             .saturating_add(compaction_rows.len())
-            .saturating_add(tools.len());
+            .saturating_add(tools.len())
+            .saturating_add(run_timer.len());
         self.settle_scroll_offset(total_lines, conversation_height);
-        let skip = total_lines
-            .saturating_sub(conversation_height)
-            .saturating_sub(self.scroll_offset);
-        let mut visible = visible_window(
-            [
-                &self.conversation_cache,
-                &thinking_rows.0,
-                &self.frozen_lines,
-                &self.live_lines,
-                &compaction_rows,
-                &tools,
-            ],
-            skip,
+        let skip = self.snap_skip_to_whole_todo_blocks(
+            total_lines
+                .saturating_sub(conversation_height)
+                .saturating_sub(self.scroll_offset),
             conversation_height,
         );
+        // The timer closes the running turn — its footer, exactly
+        // where the completed reply's own duration line lands — so
+        // the in-flight tool rows stand above it, the live region's
+        // content in reading order with the total ticking beneath.
+        let segments: Vec<&[Line<'_>]> = vec![
+            &self.conversation_cache,
+            &seam,
+            &thinking_rows.0,
+            &self.frozen_lines,
+            &self.live_lines,
+            &compaction_rows,
+            &tools,
+            &run_timer,
+        ];
+        let mut visible = visible_window(&segments, skip, conversation_height);
         self.last_view = Some(ViewState {
             area: text_area,
             skip,
@@ -4442,6 +6084,88 @@ impl TuiApp {
         }
     }
 
+    /// The running turn's live elapsed line, when one runs.
+    ///
+    /// The completed reply prints its total duration as a dim `duration`
+    /// line at its foot; the running turn owes the same line while it
+    /// runs — the total so far, the same figure format, the same dim
+    /// register — named by a quiet `elapsed` word while it still
+    /// counts, the `duration` word arriving only when the total is
+    /// final. A breathing row of margin stands above the line, so the
+    /// ticking figure never touches the streaming text it closes. A
+    /// spinner dot leads it in the accent — the same braille orbit,
+    /// the same animation beat, as the running tools' own indicators,
+    /// so everything in flight pulses together. Empty while nothing
+    /// runs: between turns nothing ticks.
+    fn live_run_timer(&self) -> Vec<Line<'static>> {
+        let started = self
+            .state
+            .run_started_ms
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if !self
+            .state
+            .agent_running
+            .load(std::sync::atomic::Ordering::SeqCst)
+            || started == 0
+        {
+            return Vec::new();
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| {
+                u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+            });
+        let elapsed = now.saturating_sub(started);
+        // The frame derives from the elapsed clock itself: one frame
+        // per 80ms of run time, advancing on every redraw in
+        // lockstep with the ticking duration — never frozen by a
+        // quiet tool lane, never desynced from the number it leads.
+        let frame_index = usize::try_from(elapsed.checked_div(SPINNER_FRAME_MS).unwrap_or(0))
+            .unwrap_or(0)
+            .checked_rem(SPINNER_FRAMES.len())
+            .unwrap_or(0);
+        let frame = SPINNER_FRAMES
+            .get(frame_index)
+            .or_else(|| SPINNER_FRAMES.first())
+            .copied()
+            .unwrap_or("");
+        vec![
+            Line::from(Vec::new()),
+            Line::from(vec![
+                Span::styled(
+                    frame.to_string(),
+                    Style::default().fg(self.theme.ui.primary),
+                ),
+                Span::styled(
+                    format!(" elapsed {}", format_duration(elapsed)),
+                    self.theme.ui.dim,
+                ),
+            ]),
+        ]
+    }
+
+    /// Move a scrolled window's cut out of the interior of a todo block.
+    ///
+    /// The plan badge keeps the list's fraction on screen at every
+    /// scroll, so a window that severs an expanded todo block mid-list
+    /// shows a count and a set of rows that disagree — the badge says
+    /// twelve, the frame carries eleven, and nothing marks the cut.
+    /// While the view is scrolled (the bottom pin keeps its
+    /// newest-line guarantee untouched), a cut landing inside a block
+    /// that fits the viewport moves up to the block's own first row:
+    /// the block renders whole or not at all, and the fraction and the
+    /// rows can never disagree. A block taller than the viewport stays
+    /// scrollable — there is no whole to keep.
+    fn snap_skip_to_whole_todo_blocks(&self, skip: usize, viewport: usize) -> usize {
+        if self.scroll_offset == 0 {
+            return skip;
+        }
+        self.todo_block_ranges
+            .iter()
+            .find(|block| skip > block.start && skip < block.end && block.len() <= viewport)
+            .map_or(skip, |block| block.start)
+    }
+
     /// Settle the scroll offset for this frame's layout.
     ///
     /// A pinned view sits at the newest line: the offset resets to
@@ -4451,7 +6175,7 @@ impl TuiApp {
     /// clamped to the scrollable height, so the same lines stay in
     /// view while content streams in below or collapses away.
     fn settle_scroll_offset(&mut self, total_lines: usize, viewport: usize) {
-        if self.auto_scroll {
+        if self.stick.follows() {
             self.scroll_offset = 0;
         } else {
             let delta = total_lines.abs_diff(self.last_layout_lines);
@@ -4512,8 +6236,6 @@ impl TuiApp {
         let now = chrono::Utc::now();
         for line in retry_lines {
             if let Some(index) = self.retry_row_index.get(&line.episode).copied() {
-                // The episode's row exists — the attempt count climbs
-                // in place, never stacking a second row.
                 if let Some(TuiMessage::System { text, .. }) = self.conversation.get_mut(index) {
                     *text = line.text;
                 }
@@ -4526,12 +6248,37 @@ impl TuiApp {
                 self.retry_row_index.insert(line.episode, index);
             }
         }
-        let mut turn_ended = !graduations.is_empty();
+        if !self.state.agent_running.load(Ordering::SeqCst) {
+            self.return_guidance();
+        }
+        let mut turn_ended = graduations
+            .iter()
+            .any(|graduation| !matches!(graduation, Graduation::Sent { .. }));
         let turn_histories = take_locked(&self.state.turn_histories);
         let machine_history = turn_histories.last().cloned();
         turn_ended |= machine_history.is_some();
         for graduation in graduations {
             match graduation {
+                Graduation::Sent { text, steered } => {
+                    self.push_message(TuiMessage::User {
+                        text,
+                        timestamp: now,
+                        steered,
+                    });
+                    // Every claim starts a run of its own, and a plan
+                    // belongs to the run that filed it: the claim
+                    // retires the list outright — half-done or finished
+                    // alike — at the same edge the runner resets its
+                    // own store. A steer's echo is flagged apart: it
+                    // rides into the run already going, which is no
+                    // boundary, so the plan keeps standing through the
+                    // steer exactly as the runner's own store does.
+                    if !steered && !self.plan_interrupted {
+                        self.latest_todos.clear();
+                        self.todo_section_changes.clear();
+                    }
+                    self.plan_interrupted = false;
+                }
                 Graduation::Reply { text, thinking } => {
                     let mut blocks = Vec::new();
                     blocks.extend(thinking);
@@ -4544,12 +6291,16 @@ impl TuiApp {
                         duration_ms: None,
                     });
                 }
-                Graduation::RunEnded { duration_ms } => {
-                    // The run's total lands on its final reply — the
-                    // reply the queue graduated ahead of this marker.
-                    // A run that produced none leaves a non-assistant
-                    // message last, and the total is dropped rather
-                    // than stamped onto a stranger.
+                Graduation::RunEnded {
+                    duration_ms,
+                    success,
+                } => {
+                    // Whether the next claim retires the plan depends
+                    // on how this run ended: a clean run closed its
+                    // plan, an interrupted run's plan is owed work —
+                    // the session resumes into it, and only a newly
+                    // filed plan replaces it.
+                    self.plan_interrupted = !success;
                     if let Some(TuiMessage::Assistant {
                         duration_ms: reply_duration,
                         ..
@@ -4567,6 +6318,17 @@ impl TuiApp {
                     if matches!(result.name.as_str(), "Edit" | "MultiEdit" | "Write")
                         && crate::diff::parse_receipt(&result.full_output).is_some()
                     {
+                        self.expanded_tools.insert(result.call_id.clone());
+                    }
+                    if result.name == "TodoWrite"
+                        && !result.is_error
+                        && let Some(rows) = crate::todo_view::parse_submission(&result.full_input)
+                    {
+                        let changes = crate::todo_view::status_changes(&rows, &self.latest_todos);
+                        self.todo_changes
+                            .insert(result.call_id.clone(), changes.clone());
+                        self.todo_section_changes = changes;
+                        self.latest_todos = rows;
                         self.expanded_tools.insert(result.call_id.clone());
                     }
                     self.push_message(TuiMessage::Assistant {
@@ -4598,9 +6360,6 @@ impl TuiApp {
             self.push_message(record);
         }
         let verdicts = take_locked(&self.copy_outcomes);
-        // Overlapping copies drain in attempt order, not arrival
-        // order: the newest verdict posts only when no newer copy's
-        // wording already holds the row.
         if let Some(latest) = verdicts.into_iter().max_by_key(|verdict| verdict.attempt)
             && latest.attempt >= self.posted_copy_attempt
         {
@@ -4636,6 +6395,7 @@ impl TuiApp {
         thinking_lines: &mut HashMap<usize, String>,
         compaction_lines: &mut HashMap<usize, String>,
         user_turns: &mut Vec<(usize, usize, usize)>,
+        todo_blocks: &mut Vec<std::ops::Range<usize>>,
     ) -> Vec<Line<'static>> {
         let width = area.width.max(1);
         let markdown_theme = markdown::MarkdownTheme::from(&self.theme);
@@ -4699,13 +6459,19 @@ impl TuiApp {
                                 ));
                             }
                             ContentBlock::Tool { .. } => {
-                                self.push_tool_block_lines(block, width, &mut lines, summary_lines);
+                                self.push_tool_block_lines(
+                                    block,
+                                    width,
+                                    &mut lines,
+                                    summary_lines,
+                                    todo_blocks,
+                                );
                             }
                         }
                     }
                     if let Some(duration_ms) = duration_ms {
                         lines.push(Line::styled(
-                            format_duration(*duration_ms),
+                            format!("duration {}", format_duration(*duration_ms)),
                             self.theme.ui.dim,
                         ));
                     }
@@ -4754,6 +6520,7 @@ impl TuiApp {
         width: u16,
         lines: &mut Vec<Line<'static>>,
         summary_lines: &mut HashMap<usize, String>,
+        todo_blocks: &mut Vec<std::ops::Range<usize>>,
     ) {
         let ContentBlock::Tool {
             name,
@@ -4808,6 +6575,23 @@ impl TuiApp {
                         width,
                         crate::diff::diff_colors(&self.theme),
                     ));
+                } else if name == "TodoWrite"
+                    && let Some(rows) = crate::todo_view::parse_submission(&detail.input_json)
+                {
+                    let colors = crate::todo_view::TodoColors {
+                        dim: self.theme.ui.dim,
+                        accent: self.theme.ui.primary,
+                        badge_fill: self.theme.ui.secondary,
+                        badge_letters: self.theme.ui.background,
+                    };
+                    let changes = self
+                        .todo_changes
+                        .get(call_id.as_str())
+                        .cloned()
+                        .unwrap_or_default();
+                    lines.push(todo_view::summary_line(&rows, &colors));
+                    lines.extend(todo_view::render_rows(&rows, &changes, &colors, width));
+                    todo_blocks.push(first..lines.len());
                 } else {
                     lines.extend(expansion_lines(
                         &detail.input_json,
@@ -5129,10 +6913,6 @@ impl TuiApp {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
         {
-            // The retries themselves live in the conversation as
-            // reconnection rows now — the notice row would only
-            // duplicate them; only the recovery confirmation is a
-            // notice-row concern.
             HealthNotice::Reconnected { at } => {
                 let until = at.checked_add(NOTICE_HOLD)?;
                 (Instant::now() < until).then(|| "reconnected".to_string())
@@ -5140,6 +6920,150 @@ impl TuiApp {
             HealthNotice::Idle
             | HealthNotice::Retrying { .. }
             | HealthNotice::Compacting { .. } => None,
+        }
+    }
+
+    /// The rows the waiting section needs for the prompt it shows.
+    ///
+    /// The badge, the air above it and below it, and the rows the
+    /// shown prompt wraps into at this width — the section reserves
+    /// what it paints and nothing beneath it: a one-line wording ends
+    /// the section at its own last row, so the air under the queue is
+    /// the frame's furniture (the notice row, the spacer), never the
+    /// section's own blank margin. A wrapping wording grows the
+    /// section only as far as the two prompt rows the cap allows, so
+    /// the conversation pays for words, not for air.
+    fn queue_section_height(&self, width: u16) -> u16 {
+        let total = self.queued_len();
+        if total == 0 {
+            return 0;
+        }
+        let shown = self.queue_view.min(total.saturating_sub(1));
+        let Some((_, text)) = self.queued_at(shown) else {
+            return 0;
+        };
+        let prefix = queue_prompt_prefix(total, shown);
+        let limit = usize::from(width).saturating_sub(prefix.width()).max(1);
+        let cap = usize::from(QUEUE_ROWS).saturating_sub(3);
+        let body = wrap_prompt_rows(&text, limit, cap).len();
+        u16::try_from(body.saturating_add(3)).unwrap_or(QUEUE_ROWS)
+    }
+
+    /// Render the prompts waiting to run.
+    ///
+    /// The section opens with a `QUEUED` title row naming what the rows
+    /// under it are, then shows one prompt at a time, its text across the
+    /// remaining rows rather than a digest: the reason to look at this
+    /// section is to check wording before it reaches the model, so a
+    /// summary of a prompt is precisely what the user came here to avoid.
+    /// The marker and the `[n/total]` count ride the prompt's first row
+    /// rather than spending columns of their own, and the count stands
+    /// down for a lone prompt — being one of one is not a fact worth two
+    /// columns.
+    ///
+    /// The keys ride the section's last row when the width can pay for
+    /// them, and name only what the current mode answers: the walk's
+    /// chords while the section has the keyboard, the saving ones while a
+    /// prompt is out in the composer, and otherwise the chord that gets the
+    /// user here. A hint for keys that do nothing from where the keys
+    /// actually are would be a lie printed in the theme's dim. Where the
+    /// text and the hint cannot both fit, the text keeps the row and the
+    /// hint is dropped whole — never re-wrapped around, never allowed to
+    /// push a word off the cut.
+    ///
+    /// Paints no background across its rows, exactly as the notice row
+    /// does: these are lines of text, not a box, and a filled panel
+    /// would put a block of the theme's surface into a terminal
+    /// configured to paint none. The title is the one exception, and it
+    /// is a badge rather than a panel — a pill a few cells wide is a
+    /// label, not a filled box — stood in from the section's left edge,
+    /// held a blank row clear of the prompt below it and another clear
+    /// of the transcript above, and filled with the primary, the same
+    /// accent the composer's edge column wears, letters in the canvas
+    /// color, at rest and under the keys alike. In a theme that defers
+    /// to the terminal the fill resets and the badge degrades to plain
+    /// text — the letters keep at most a foreground voice, which
+    /// paints nothing.
+    fn render_queue(&self, frame: &mut Frame, area: Rect) {
+        if area.height == 0 || area.width == 0 {
+            return;
+        }
+        let total = self.queued_len();
+        let shown = self.queue_view.min(total.saturating_sub(1));
+        let Some((_, text)) = self.queued_at(shown) else {
+            return;
+        };
+        let rows = usize::from(area.height.min(QUEUE_ROWS));
+        let top_standoff = usize::from(rows > 3);
+        let bottom_standoff = usize::from(rows > 2);
+        let body_rows = rows
+            .saturating_sub(1)
+            .saturating_sub(top_standoff)
+            .saturating_sub(bottom_standoff);
+        let focused = self.queue_mode == QueueMode::Focused;
+        let prefix = queue_prompt_prefix(total, shown);
+        let width = usize::from(area.width);
+        let limit = width.saturating_sub(prefix.width()).max(1);
+        let body = wrap_prompt_rows(&text, limit, body_rows);
+        let marker_style = Style::default().fg(if focused {
+            self.theme.ui.primary
+        } else {
+            self.theme.ui.dim
+        });
+        let (fill, letters) = (self.theme.ui.primary, self.theme.ui.background);
+        let mut lines: Vec<Line<'static>> = Vec::with_capacity(rows);
+        if top_standoff > 0 {
+            lines.push(Line::from(Vec::new()));
+        }
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {QUEUE_TITLE} "),
+                Style::default().fg(letters).bg(fill),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                self.queue_hint().to_string(),
+                Style::default().fg(self.theme.ui.dim),
+            ),
+        ]));
+        if bottom_standoff > 0 {
+            lines.push(Line::from(Vec::new()));
+        }
+        for (index, row) in body.into_iter().take(body_rows).enumerate() {
+            let mut spans = Vec::with_capacity(2);
+            if index == 0 {
+                spans.push(Span::styled(prefix.clone(), marker_style));
+            }
+            spans.push(Span::styled(
+                row,
+                Style::default().fg(self.theme.ui.input_text),
+            ));
+            lines.push(Line::from(spans));
+        }
+        lines.resize(rows, Line::from(Vec::new()));
+        frame.render_widget(Paragraph::new(lines), area);
+    }
+
+    /// The chords the queue section names beside its badge.
+    ///
+    /// They are the mode's, not the section's: while the composer holds the
+    /// keys the section cannot act on a letter typed into it, so the badge
+    /// offers the way in rather than keys that would be swallowed a moment
+    /// later. Once the section has them, it says what it does with them,
+    /// including the way back out — the mode that swallows everything else
+    /// owes the user the key that ends it.
+    fn queue_hint(&self) -> &'static str {
+        if matches!(self.queue_mode, QueueMode::Editing { .. }) {
+            "enter save  esc discard"
+        } else if let QueueMode::Confirming { act } = self.queue_mode {
+            match act {
+                QueueAct::Steer => "guide the running turn? y/n",
+                QueueAct::Drop => "drop this prompt? y/n",
+            }
+        } else if self.queue_mode == QueueMode::Focused {
+            "\u{2190}/\u{2192} walk  e edit  s guide  d drop  esc back"
+        } else {
+            "ctrl+q walk the queue"
         }
     }
 
@@ -5159,21 +7083,50 @@ impl TuiApp {
             return;
         }
         let text = if self.quit.armed {
-            Some("press ctrl+c again to quit".to_string())
+            // The arming press posts its own wording — the one action
+            // the next press fires, cancel-and-exit under a run, the
+            // plain exit at rest — and that wording outranks the
+            // generic hint while it holds.
+            Some(self.transient_notice.as_ref().map_or_else(
+                || "press ctrl+c again to quit".to_string(),
+                |(notice, _)| notice.clone(),
+            ))
         } else {
-            self.health_notice_text().or_else(|| {
-                self.transient_notice
-                    .as_ref()
-                    .filter(|(_, until)| *until > Instant::now())
-                    .map(|(text, _)| text.clone())
-            })
+            self.health_notice_text()
+                .or_else(|| {
+                    self.transient_notice
+                        .as_ref()
+                        .filter(|(_, until)| *until > Instant::now())
+                        .map(|(text, _)| text.clone())
+                })
+                .or_else(|| self.steering_hint())
         };
         if let Some(text) = text {
             frame.render_widget(
-                Paragraph::new(text).style(Style::default().fg(self.theme.ui.input_border)),
+                Paragraph::new(text)
+                    .style(Style::default().fg(self.theme.ui.input_border))
+                    .alignment(ratatui::layout::Alignment::Right),
                 area,
             );
         }
+    }
+
+    /// The one thing the row offers on its own initiative: a draft standing
+    /// there while a run holds the agent.
+    ///
+    /// The impatient chord is the one a user has to think of at the moment it
+    /// matters, and that moment looks exactly like typing an ordinary prompt.
+    /// Empty composer or idle agent, the row stays blank — advertising a key
+    /// that would do nothing is noise, and the row belongs to real notices
+    /// whenever they have anything to say.
+    fn steering_hint(&self) -> Option<String> {
+        if self.guidance.is_none()
+            || !self.state.agent_running.load(Ordering::SeqCst)
+            || self.input.text().trim().is_empty()
+        {
+            return None;
+        }
+        Some("ctrl+s sends this to the running turn".to_string())
     }
 
     /// Render the input field: a fixed multi-row window onto the
@@ -5193,22 +7146,33 @@ impl TuiApp {
     /// inside horizontal and vertical padding; the window shows the
     /// caret's line and the lines above it, so typing at the end
     /// sees the newest lines and browsing up scrolls with the
-    /// caret. The field carries no text of its own — queue and
-    /// line-position state lives on the status bar. `rows` and
+    /// caret. The box closes with its identity row — the model, its
+    /// effort, and the permission mode in the dim register, the
+    /// composer's state tag at the row's very right — sitting on the
+    /// box's bottom edge, the padding row above it the breathing.
+    /// It is not a composer row: nothing typed lands there and the
+    /// caret never visits it. The field carries no other text of its
+    /// own — queue state lives in its own section. `rows` and
     /// `caret` are the frame's single wrap of the buffer, computed by
-    /// [`render`](Self::render) and shared with the status tag. The
-    /// text window takes its height from the pane's own rows net of
-    /// the vertical padding, so no paint of the field's lands
+    /// [`render`](Self::render) and shared with the identity row's
+    /// tag. The text window takes its height from the pane's own rows
+    /// net of the vertical padding, so no paint of the field's lands
     /// outside the pane it was given; the cursor position is clamped
     /// the same way, so a terminal too short for the field's full
     /// height parks the cursor on a row the field owns, and a field
     /// allotted no rows at all parks no cursor.
     fn render_input(&mut self, frame: &mut Frame, area: Rect, rows: &[String], caret: (u16, u16)) {
         let (caret_row, column) = caret;
+        let muted = self.section_holds_keys();
+        let voice = if muted {
+            self.theme.ui.dim
+        } else {
+            self.theme.ui.input_text
+        };
 
         let surface = self.theme.ui.surface;
         let text_style = if self.theme.ui.composer_border.is_some() {
-            Style::default().fg(self.theme.ui.input_text)
+            Style::default().fg(voice)
         } else {
             frame
                 .buffer_mut()
@@ -5217,12 +7181,71 @@ impl TuiApp {
                 width: area.width.min(1),
                 ..area
             };
-            frame
-                .buffer_mut()
-                .set_style(edge, Style::default().bg(self.theme.ui.primary));
-            Style::default().fg(self.theme.ui.input_text).bg(surface)
+            frame.buffer_mut().set_style(
+                edge,
+                Style::default().bg(if muted {
+                    self.theme.ui.dim
+                } else {
+                    self.theme.ui.primary
+                }),
+            );
+            Style::default().fg(voice).bg(surface)
         };
-        let text_height = INPUT_TEXT_ROWS.min(area.height.saturating_sub(INPUT_VERTICAL_PADDING));
+        let text_height = INPUT_TEXT_ROWS.min(
+            area.height
+                .saturating_sub(INPUT_VERTICAL_PADDING.saturating_mul(2))
+                .saturating_sub(1),
+        );
+        let info_style = if self.theme.ui.composer_border.is_some() {
+            Style::default().fg(self.theme.ui.dim)
+        } else {
+            Style::default().fg(self.theme.ui.dim).bg(surface)
+        };
+        let info_x = area
+            .x
+            .saturating_add(INPUT_SIDE_INSET)
+            .min(area.right().saturating_sub(1));
+        let info_width = area
+            .width
+            .max(1)
+            .saturating_sub(INPUT_SIDE_INSET.saturating_mul(2));
+        if area.height >= 1 {
+            let identity_row = Rect {
+                y: area.bottom().saturating_sub(1),
+                height: 1,
+                width: info_width,
+                x: info_x,
+            };
+            let tag = Self::input_state_tag(rows, caret);
+            let tag_width = if tag.is_empty() {
+                0
+            } else {
+                u16::try_from(tag.width().saturating_add(1))
+                    .unwrap_or(info_width)
+                    .min(info_width)
+            };
+            let identity = self.composer_identity_text();
+            if !identity.is_empty() {
+                frame.render_widget(
+                    Paragraph::new(identity).style(info_style),
+                    Rect {
+                        width: info_width.saturating_sub(tag_width),
+                        ..identity_row
+                    },
+                );
+            }
+            if tag_width > 0 {
+                frame.render_widget(
+                    Paragraph::new(Line::styled(
+                        tag,
+                        Style::default().fg(self.theme.ui.input_border),
+                    ))
+                    .style(info_style)
+                    .alignment(ratatui::layout::Alignment::Right),
+                    identity_row,
+                );
+            }
+        }
         let interior = Rect {
             x: area
                 .x
@@ -5274,66 +7297,213 @@ impl TuiApp {
         }
     }
 
+    /// Whether the waiting section holds the keyboard, the composer
+    /// reduced to reading matter.
+    ///
+    /// True while the section is focused or holding an ask — the two
+    /// states where a keypress lands on the queue, not the draft — and
+    /// false the moment the keys come back: an edit lifts a prompt into
+    /// the composer, and there the composer is the active editor again.
+    fn section_holds_keys(&self) -> bool {
+        matches!(
+            self.queue_mode,
+            QueueMode::Focused | QueueMode::Confirming { .. }
+        )
+    }
+
     /// Whether the composer's terminal cursor shows this frame.
     ///
     /// False while the blink phase has it off — and for the whole
     /// time a permission ask is pending: the sheet owns the composer's
     /// rows and its keys, and a cursor there would point at nothing
-    /// the user can edit. A frame that sets no cursor position hides
-    /// the terminal cursor, so this is the whole show-or-hide
-    /// decision.
+    /// the user can edit. The waiting section's focus and its ask
+    /// hide it for the same reason: the keys are landing on the
+    /// queue, and a blinking caret in a composer that cannot be typed
+    /// into would point at a lie. A frame that sets no cursor
+    /// position hides the terminal cursor, so this is the whole
+    /// show-or-hide decision.
     #[must_use]
     pub fn composer_caret_visible(&self) -> bool {
         self.caret_blink.on
+            && !self.section_holds_keys()
             && self.pending_permissions.front().is_none()
             && self.pending_questions.is_empty()
     }
 
-    /// Render the one-line status bar.
-    ///
-    /// Names the configured model with its thinking effort in
-    /// parentheses — an unset effort reads `(Auto)`, because the
-    /// provider's own thinking defaults then apply — the session's
-    /// permission mode, and, once the host names one, the working
-    /// directory on the left; while the input
-    /// holds state — submissions queued
-    /// behind the driver, or a buffer longer than the composer's
-    /// window — a position tag sits right-aligned in the theme's
-    /// input accent color. Both sit on the themed bar colors, and
-    /// the status text is clipped short of the tag's columns, so
-    /// the two never paint over each other on a narrow frame. A
-    /// chunk allotted no rows renders nothing — the bar never paints
-    /// a row another pane owns. `rows` and `caret` arrive from the
-    /// frame's single wrap of the buffer.
-    fn render_status_bar(&self, frame: &mut Frame, area: Rect, rows: &[String], caret: (u16, u16)) {
+    /// Render the footer's three rows: a row of air under the
+    /// composer, the bar's row, and the bottom row. The air is the
+    /// composer's bottom margin — the identity row closes the box and
+    /// the footer's facts start one clear row under it. The context
+    /// readout is the footer's head — the bar a cell in from the
+    /// left edge of its row, standing exactly over the numbers that
+    /// lead the bottom row from that same column — and the session
+    /// id is its tail, right-aligned a cell in from the right edge
+    /// on the bar's row: the footer's middle, vertically centered
+    /// between the air above and the numbers below. The composer's
+    /// state tag no longer rides here —
+    /// it moved to the identity row inside the composer — so the
+    /// footer is all session, no draft state. Both rows sit on the
+    /// themed bar colors, and an id without the room to clear the bar
+    /// is forgone rather than run into it. A chunk allotted no rows
+    /// renders nothing — the bar never paints a row another pane
+    /// owns.
+    fn render_status_bar(&self, frame: &mut Frame, area: Rect) {
         if area.height == 0 {
             return;
-        }
-        let effort = match self.config.api.reasoning_effort.as_deref() {
-            Some(level) => capitalize_first(level),
-            None => "Auto".to_string(),
-        };
-        let mut status_text = format!(" {} ({effort})", self.config.api.model);
-        status_text.push_str("  │  mode: ");
-        status_text.push_str(self.config.runner.permission_mode.as_str());
-        if let Some(dir) = &self.working_dir {
-            let segment = match &self.git_branch {
-                Some(branch) => format!("  │  {dir} ({branch})"),
-                None => format!("  │  {dir}"),
-            };
-            status_text.push_str(&segment);
         }
         let bar_style = Style::default()
             .fg(self.theme.ui.status_bar_fg)
             .bg(self.theme.ui.status_bar_bg);
-        let mut id_layout: Option<(usize, usize)> = None;
-        if let Some(id) = &self.session_id {
-            status_text.push_str("  │  ");
-            let start = status_text.width();
-            status_text.push_str(id);
-            id_layout = Some((start, id.width()));
+        let (context_tokens, window) = self.context_snapshot();
+        let context_fill = context_bar_fill(context_tokens, window, CONTEXT_BAR_CELLS);
+        let readout = context_bar_readout(context_tokens, window);
+        let air = area.height.saturating_sub(2).min(STATUS_BAR_AIR);
+        frame.buffer_mut().set_style(
+            Rect {
+                y: area.y.saturating_add(air),
+                height: area.height.saturating_sub(air),
+                ..area
+            },
+            Style::default().bg(self.theme.ui.status_bar_bg),
+        );
+        let content = Rect {
+            y: area.bottom().saturating_sub(1),
+            height: 1,
+            ..area
+        };
+        let bar_y = content.y.saturating_sub(1);
+        let id_span = if area.height > 1 {
+            self.session_id.as_ref().and_then(|id| {
+                let id_width = u16::try_from(id.width()).ok()?;
+                let start = area
+                    .width
+                    .checked_sub(id_width)?
+                    .checked_sub(u16::try_from(STATUS_BAR_MARGIN).unwrap_or(0))?;
+                (usize::from(start) > STATUS_BAR_MARGIN + CONTEXT_BAR_CELLS + 1).then(|| {
+                    let x = area.x.saturating_add(start);
+                    (bar_y, x, x.saturating_add(id_width))
+                })
+            })
+        } else {
+            None
+        };
+        self.session_id_span.set(id_span);
+        if area.height > 1 {
+            let mut bar_line = self.context_bar_line(STATUS_BAR_MARGIN, context_fill);
+            if let Some((_, start, _)) = id_span {
+                let pad = usize::from(start)
+                    .saturating_sub(
+                        usize::from(area.x)
+                            .saturating_add(STATUS_BAR_MARGIN)
+                            .saturating_add(CONTEXT_BAR_CELLS),
+                    )
+                    .max(1);
+                bar_line.spans.push(Span::raw(" ".repeat(pad)));
+                bar_line.spans.push(Span::raw(
+                    self.session_id.as_deref().unwrap_or_default().to_string(),
+                ));
+            }
+            frame.render_widget(
+                Paragraph::new(bar_line).style(bar_style),
+                Rect {
+                    y: bar_y,
+                    height: 1,
+                    ..area
+                },
+            );
         }
-        status_text.push_str("  │  ");
+        let mut spans = vec![Span::raw(" ".repeat(STATUS_BAR_MARGIN))];
+        if let Some((percent, totals)) = &readout {
+            spans.push(Span::styled(
+                totals.clone(),
+                Style::default().fg(self.theme.ui.dim),
+            ));
+            spans.push(Span::styled(
+                format!(" ({percent})"),
+                Style::default().fg(self.theme.ui.scrollbar_thumb),
+            ));
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)).style(bar_style), content);
+    }
+
+    /// Render the place row: the working directory and its branch on
+    /// their own row directly above the composer, outside the box —
+    /// a caption, dim on the plain background, inset to line up with
+    /// the composer's text. The caption closes tight against the box:
+    /// the box's top padding row keeps the blank row between the
+    /// caption and the text, so no air row of the layout's own rides
+    /// between the two. The caption costs the frame a single row until
+    /// the host names a directory.
+    fn render_place_row(&self, frame: &mut Frame, area: Rect) {
+        if area.height == 0 || area.width == 0 {
+            return;
+        }
+        let text = self.place_text();
+        if text.is_empty() {
+            return;
+        }
+        frame.render_widget(
+            Paragraph::new(text).style(Style::default().fg(self.theme.ui.dim)),
+            Rect {
+                x: area
+                    .x
+                    .saturating_add(INPUT_SIDE_INSET)
+                    .min(area.right().saturating_sub(1)),
+                y: area.y,
+                height: 1,
+                width: area
+                    .width
+                    .max(1)
+                    .saturating_sub(INPUT_SIDE_INSET.saturating_mul(2)),
+            },
+        );
+    }
+
+    /// The place row's text: the working directory spelled per the
+    /// config's [`PathStyle`] — the full path, or the `~/`-relative
+    /// shape — with the git branch in parentheses when the host named
+    /// one. Where the session stands, named above the box the user
+    /// types into; the footer keeps what the session stands in
+    /// briefly, its context pair and its id.
+    fn place_text(&self) -> String {
+        match (&self.working_dir, &self.git_branch) {
+            (Some(dir), Some(branch)) => {
+                format!(
+                    "{} ({branch})",
+                    display_path(dir, self.config.display.path_style)
+                )
+            }
+            (Some(dir), None) => display_path(dir, self.config.display.path_style),
+            (None, _) => String::new(),
+        }
+    }
+
+    /// The composer's identity row: the model with its thinking
+    /// effort and the permission mode, one dim line closing the box
+    /// over its final row of air, the composer's state tag at the
+    /// row's very right.
+    ///
+    /// These are the facts about the *next* thing the user types —
+    /// which model answers and what it may do without asking — so they
+    /// ride inside the composer's box, one row of context under its
+    /// text, rather than on the footer below where they read as
+    /// facts about the session's tail.
+    fn composer_identity_text(&self) -> String {
+        let effort = match self.config.api.reasoning_effort.as_deref() {
+            Some(level) => capitalize_first(level),
+            None => "Auto".to_string(),
+        };
+        format!(
+            " {} ({effort})  ·  mode: {}",
+            self.config.api.model,
+            self.config.runner.permission_mode.as_str()
+        )
+    }
+
+    /// The context readout's inputs: the tokens used against the window
+    /// the engine actually runs — the live window once the engine has
+    /// reported one, the config's (or the fallback) before that.
+    fn context_snapshot(&self) -> (u64, u64) {
         let live_window = self.state.context_window.load(Ordering::SeqCst);
         let window = if live_window > 0 {
             live_window
@@ -5343,104 +7513,53 @@ impl TuiApp {
                 .context_window
                 .unwrap_or(dch_config::FALLBACK_CONTEXT_WINDOW)
         };
-        let context_fill = context_bar_fill(
-            self.state
-                .tokens
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .context_tokens,
-            window,
-            CONTEXT_BAR_CELLS,
-        );
-        let status_line = Line::from(vec![
-            Span::styled(std::mem::take(&mut status_text), bar_style),
+        let used = self
+            .state
+            .tokens
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .context_tokens;
+        (used, window)
+    }
+
+    /// The context bar's own row: `padding` cells of air, then the
+    /// fill over the track — one line the bottom row's numbers and the
+    /// row above it share a column count through.
+    fn context_bar_line(&self, padding: usize, fill: usize) -> Line<'static> {
+        Line::from(vec![
+            Span::raw(" ".repeat(padding)),
             Span::styled(
-                " ".repeat(context_fill),
+                " ".repeat(fill),
                 Style::default().bg(self.theme.ui.scrollbar_thumb),
             ),
             Span::styled(
-                " ".repeat(CONTEXT_BAR_CELLS.saturating_sub(context_fill)),
+                " ".repeat(CONTEXT_BAR_CELLS.saturating_sub(fill)),
                 Style::default().bg(self.theme.ui.scrollbar_track),
             ),
-        ]);
-        let tag = self.input_state_tag(rows, caret);
-        let tag_width = if !tag.is_empty() && area.width > 4 {
-            u16::try_from(tag.width().saturating_add(2))
-                .unwrap_or(area.width)
-                .min(area.width)
-        } else {
-            0
-        };
-        let left_width = match tag_width {
-            0 => area.width,
-            reserved => area.width.saturating_sub(reserved.saturating_add(1)),
-        };
-        // The bar's own background spans both of its rows first, so
-        // the gutter column a clipped left edge leaves between the two
-        // paragraphs reads as bar, not as a hole in it; the content
-        // sits on the bottom row, the row above it breathing room.
-        frame
-            .buffer_mut()
-            .set_style(area, Style::default().bg(self.theme.ui.status_bar_bg));
-        let content = Rect {
-            y: area.bottom().saturating_sub(1),
-            height: 1,
-            ..area
-        };
-        self.session_id_span.set(id_layout.and_then(|(prefix, id)| {
-            let start = u16::try_from(prefix).ok()?.saturating_add(content.x);
-            let end = start
-                .saturating_add(u16::try_from(id).ok()?)
-                .min(content.x.saturating_add(left_width));
-            (end > start).then_some((content.y, start, end))
-        }));
-        frame.render_widget(
-            Paragraph::new(status_line).style(bar_style),
-            Rect {
-                width: left_width,
-                ..content
-            },
-        );
-        if tag_width > 0 {
-            let tag_area = Rect {
-                x: content.right().saturating_sub(tag_width),
-                width: tag_width,
-                ..content
-            };
-            frame.render_widget(
-                Paragraph::new(Line::styled(
-                    tag,
-                    Style::default().fg(self.theme.ui.input_border),
-                ))
-                .style(bar_style)
-                .alignment(ratatui::layout::Alignment::Right),
-                tag_area,
-            );
-        }
+        ])
     }
 
-    /// The composer's state as a status-bar tag, empty when idle.
+    /// The composer's state as its identity-row tag, empty when the
+    /// buffer fits the window.
     ///
-    /// Reports submissions queued behind the driver and, while the
-    /// buffer holds more lines than the composer's window, which
-    /// line the caret is on — the two facts a user can act on.
+    /// Reports which line the caret is on over the buffer's total
+    /// while the draft outgrows the composer's window — the one fact
+    /// about the draft the box itself cannot show. Submissions queued
+    /// behind the driver count themselves in the queue's own section,
+    /// and the footer's right edge carries no text in any state.
     /// `rows` and `caret` arrive from the frame's single wrap of the
     /// buffer, so asking never re-wraps the editor.
-    fn input_state_tag(&self, rows: &[String], caret: (u16, u16)) -> String {
-        let queued = self.state.queued.load(Ordering::SeqCst);
-        let mut parts = Vec::new();
-        if queued > 0 {
-            parts.push(format!("{queued} queued"));
-        }
+    fn input_state_tag(rows: &[String], caret: (u16, u16)) -> String {
         if rows.len() > usize::from(INPUT_TEXT_ROWS) {
             let (caret_row, _) = caret;
-            parts.push(format!(
+            format!(
                 "{}/{}",
                 usize::from(caret_row).saturating_add(1).min(rows.len()),
                 rows.len()
-            ));
+            )
+        } else {
+            String::new()
         }
-        parts.join(" · ")
     }
 }
 
@@ -5501,9 +7620,39 @@ fn expansion_lines(
 
 /// Cells the status bar's context-usage bar fills.
 ///
-/// The bar is deliberately short — a glanceable fraction, not a
-/// second scrollbar.
-const CONTEXT_BAR_CELLS: usize = 10;
+/// Sixteen — wide enough that the numbers spelling the bar's fraction
+/// never run past its right edge (`200k/200k (100%)`, the widest the
+/// compact units spell, is sixteen cells) — while staying a glanceable
+/// fraction rather than a second scrollbar.
+const CONTEXT_BAR_CELLS: usize = 16;
+
+/// The rows the status bar occupies at any width: three — a row of
+/// air under the composer, the bar's row, and the bottom row. The
+/// air is the composer's bottom margin and stays unpainted, so the
+/// identity row that closes the box — the model, its effort, and the
+/// mode — reads as the last thing in the composer and the footer's
+/// facts start one clear row under it. The footer carries no prose
+/// to wrap: its facts are the numbers leading the bottom row from
+/// the bar's left edge and the id closing it at the right, and a
+/// frame too narrow for both forgoes the id rather than growing
+/// rows.
+const STATUS_BAR_ROWS: u16 = 3;
+
+/// The footer's air: the rows of its margin, painted by no pane.
+/// They belong to no content — an overlay sheet may stand on them,
+/// which is how the margin costs the sheets nothing: their bottom
+/// edge keeps the same clear distance above the bar's own rows.
+const STATUS_BAR_AIR: u16 = 1;
+
+/// The footer's side margins: one cell of air at each edge. The
+/// bar and the numbers beneath it start one cell in — the bar
+/// standing exactly over what it measures — and the session id
+/// closes its row one cell short of the right edge.
+///
+/// One cell each side — a breath, not an inset: the readout is
+/// still the first thing at the left and the id the last at the
+/// right; neither touches the frame's edge.
+const STATUS_BAR_MARGIN: usize = 1;
 
 /// The filled-cell count of the status bar's context-usage bar.
 ///
@@ -5523,6 +7672,76 @@ fn context_bar_fill(used: u64, window: u64, cells: usize) -> usize {
         .checked_div(window)
         .unwrap_or(cells);
     usize::try_from(filled.min(cells)).unwrap_or(usize::MAX)
+}
+
+/// The numbers that spell the context bar's fraction.
+///
+/// The percentage rounds from the true ratio — not from the bar's
+/// cells, whose steps would make every reading end in zero — and the
+/// totals ride in compact units, thousands up to a million and
+/// millions beyond (`419k/1M`, never `1000k`), so a bar kept
+/// deliberately glanceable still answers "how full, exactly". A
+/// session beyond its window shows its honest over-100 percentage:
+/// the bar clamps full, the number tells the truth. An unknown window
+/// (zero) returns `None`: there is no denominator, and the bar above
+/// the readout is already empty.
+fn context_bar_readout(used: u64, window: u64) -> Option<(String, String)> {
+    if window == 0 {
+        return None;
+    }
+    let percent = used
+        .saturating_mul(100)
+        .saturating_add(window.saturating_div(2))
+        .checked_div(window)
+        .unwrap_or(0);
+    let compact = |tokens: u64| {
+        let thousands = tokens.saturating_add(500).checked_div(1_000).unwrap_or(0);
+        if thousands < 1_000 {
+            return format!("{thousands}k");
+        }
+        let tenths = thousands.saturating_add(50).checked_div(100).unwrap_or(0);
+        let whole = tenths.checked_div(10).unwrap_or(0);
+        let frac = tenths.saturating_sub(whole.saturating_mul(10));
+        if frac == 0 {
+            format!("{whole}M")
+        } else {
+            format!("{whole}.{frac}M")
+        }
+    };
+    Some((
+        format!("{percent}%"),
+        format!("{}/{}", compact(used), compact(window)),
+    ))
+}
+
+/// Spell the working directory per the configured style: the full
+/// path as the host named it, or the `~/`-relative shape when the
+/// directory sits under the user's home — falling back to the full
+/// path outside home or when the environment names no home, so the
+/// row never shows a bare unanchored fragment.
+fn display_path(dir: &str, style: PathStyle) -> String {
+    match style {
+        PathStyle::Full => dir.to_string(),
+        PathStyle::Relative => std::env::var("HOME")
+            .ok()
+            .filter(|home| !home.is_empty())
+            .and_then(|home| relativize(Path::new(dir), Path::new(&home)))
+            .unwrap_or_else(|| dir.to_string()),
+    }
+}
+
+/// The `~/`-spelling of `dir` under `home`, or `None` when the
+/// directory sits outside home.
+///
+/// The home directory itself is the bare `~`.
+fn relativize(dir: &Path, home: &Path) -> Option<String> {
+    if dir == home {
+        Some("~".to_string())
+    } else {
+        dir.strip_prefix(home)
+            .ok()
+            .map(|rest| format!("~/{}", rest.display()))
+    }
 }
 
 /// Copy `word` with its first character uppercased.
@@ -5555,6 +7774,7 @@ struct CellPos {
     /// terminal's — scrolling moves the terminal row but never this
     /// index.
     line: usize,
+
     /// The cell column within the rendered line.
     ///
     /// Terminal cells, so a wide glyph counts two; the selection's
@@ -5573,6 +7793,7 @@ struct ToolDetail {
     /// What the dispatch-side capture recorded at call time; the
     /// expansion renders it verbatim below the summary row.
     input_json: String,
+
     /// The call's output, within the retention cap.
     ///
     /// Truncated to the capture store's bound before it lands here,
@@ -5592,6 +7813,7 @@ struct CellSelection {
     /// Stays fixed for the selection's lifetime — the anchor is where
     /// the press began, whichever end of the range it reads as.
     anchor: CellPos,
+
     /// The cell the drag currently reaches.
     ///
     /// Moves with the drag and the edge-scroll steps that carry it
@@ -5613,6 +7835,7 @@ struct QuitState {
     /// True only between the empty-buffer chord press and the key
     /// that confirms or disarms it.
     armed: bool,
+
     /// Whether the second press confirmed it.
     ///
     /// The run loop leaves at the top of its next iteration.
@@ -5650,6 +7873,7 @@ struct CaretBlink {
     /// The frame shows the terminal cursor only while this is true;
     /// the pending-permission and pending-question sheets suppress it.
     on: bool,
+
     /// Ticks since the phase last flipped.
     ///
     /// Counted against the run loop's tick so the half-second phases
@@ -5761,6 +7985,23 @@ struct InputView {
     /// A press below the window's last row clamps into it — the
     /// way editors clamp a click below a document's end.
     visible: usize,
+}
+
+/// The facts [`TuiApp::render`] resolves before the frame's rows are
+/// split, gathered so the constraint build reads as one act: which
+/// optional sections stand this frame, and the heights the fixed
+/// furniture carries.
+#[derive(Clone, Copy)]
+struct FrameLayout {
+    area: Rect,
+    composer_height: u16,
+    /// Where the pulse strip takes its row — above the conversation
+    /// or on the spacer beside the composer.
+    strip_position: StripPosition,
+    /// The question sheet's page the overlay answers, when the sheet
+    /// stands: the count ahead, as the overlay's own footer reads it.
+    question_page: Option<usize>,
+    sections: Sections,
 }
 
 /// What the last frame's conversation pane looked like.
@@ -6353,12 +8594,17 @@ fn paste_for_one_line(text: &str) -> String {
 /// to decide. Both overlays therefore hold these keys off the sheet and
 /// hand them to the machinery below, the way they already hold off the `c`
 /// chords: swallowing them would leave a user scrolling for context with a
-/// keyboard that answers nothing.
+/// keyboard that answers nothing. The steering chord rides the same rule
+/// — the hint row offers it the moment a draft meets a running agent, and
+/// an overlay swallowing a chord the interface is advertising would be
+/// advertising noise.
 fn key_survives_the_sheet(key: KeyEvent) -> bool {
     let chord = key.code == KeyCode::Char('c')
         && (key.modifiers == KeyModifiers::CONTROL
             || key.modifiers == KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+    let steering = key.code == KeyCode::Char('s') && key.modifiers == KeyModifiers::CONTROL;
     chord
+        || steering
         || matches!(
             key.code,
             KeyCode::PageUp | KeyCode::PageDown | KeyCode::F(2)
@@ -6502,7 +8748,7 @@ fn take_locked<T: Default>(mutex: &Mutex<T>) -> T {
 /// height, not the session length. The segments' borrow and their
 /// content are decoupled lifetimes: the caller may assemble the
 /// window from transient borrows of lines it keeps beyond them.
-fn visible_window<'a>(segments: [&'a [Line<'a>]; 6], skip: usize, height: usize) -> Vec<Line<'a>> {
+fn visible_window<'a>(segments: &[&'a [Line<'a>]], skip: usize, height: usize) -> Vec<Line<'a>> {
     let mut visible = Vec::with_capacity(height.min(64));
     let mut skip = skip;
     for segment in segments {
@@ -6712,10 +8958,6 @@ const INPUT_TEXT_ROWS: u16 = 3;
 /// text rows — the vertical half of the composer's inner padding.
 const INPUT_VERTICAL_PADDING: u16 = 1;
 
-/// Rows the status bar spans: its content on the bottom row, one row
-/// of breathing room above it.
-const STATUS_BAR_ROWS: u16 = 2;
-
 /// The scrollbar thumb's track position and length for a document of
 /// `content` lines shown through a `viewport`-line window whose top
 /// line is `skip` lines into the document.
@@ -6784,11 +9026,13 @@ enum ContLine {
     /// Continues a loose list: the blank line above it separates
     /// items, not blocks, so the list stays open across it.
     List,
+
     /// A `>`-prefixed quote line.
     ///
     /// Continues a multi-paragraph quote: consecutive `>`-prefixed
     /// lines around a blank belong to one blockquote.
     Quote,
+
     /// Anything else.
     ///
     /// Starts a fresh block — a blank line above it closes whatever
@@ -7042,11 +9286,6 @@ const LIVE_THINKING_BODY_CAP: usize = 500;
 /// nothing, so the section says what happened instead.
 const THINKING_REDACTED_PLACEHOLDER: &str = "reasoning withheld by the provider";
 
-/// Render a thinking duration for its summary row.
-///
-/// Sub-second streams read `<1s`, longer ones seconds, and anything
-/// over a minute minutes-with-seconds — the two units a human glances
-/// at a reasoning stream in.
 /// The rows a compaction notice renders as.
 ///
 /// Collapsed, one dim row — the trigger and the before-to-after
@@ -7731,7 +9970,11 @@ fn plain_wrapped_lines(text: &str, width: usize, fg: ratatui::style::Color) -> V
 /// The same greedy wrapping as [`plain_wrapped_lines`]; the style
 /// carries modifiers as well as the foreground, so registers like the
 /// italic thinking body — color plus slant — pass through intact.
-fn plain_wrapped_lines_styled(text: &str, width: usize, style: Style) -> Vec<Line<'static>> {
+pub(crate) fn plain_wrapped_lines_styled(
+    text: &str,
+    width: usize,
+    style: Style,
+) -> Vec<Line<'static>> {
     let cap = width.max(1);
     let mut lines = Vec::new();
     for raw in text.split('\n') {
@@ -7812,7 +10055,7 @@ mod tests {
         };
         let mut lines = Vec::new();
         let mut summaries = HashMap::new();
-        subject.push_tool_block_lines(&block, 80, &mut lines, &mut summaries);
+        subject.push_tool_block_lines(&block, 80, &mut lines, &mut summaries, &mut Vec::new());
         let flat: String = lines
             .iter()
             .map(|line| {
@@ -7925,7 +10168,7 @@ mod tests {
         };
         let mut lines = Vec::new();
         let mut summaries = HashMap::new();
-        subject.push_tool_block_lines(&block, 100, &mut lines, &mut summaries);
+        subject.push_tool_block_lines(&block, 100, &mut lines, &mut summaries, &mut Vec::new());
         let rendered: Vec<String> = lines
             .iter()
             .map(|line| {
@@ -8101,6 +10344,7 @@ mod tests {
                 app.push_message(TuiMessage::User {
                     text: "a turn of a few wrapped lines".to_string(),
                     timestamp: chrono::Utc::now(),
+                    steered: false,
                 });
             }
         }
@@ -8162,6 +10406,56 @@ mod tests {
         assert!(
             !app.any_tools_running(),
             "a poisoned lock reads as no tools in flight"
+        );
+    }
+
+    #[test]
+    fn the_live_lane_opens_with_the_speaker_change_row() {
+        // The running turn owes the same blank row under the prompt
+        // that the batch render puts between a user message and the
+        // assistant content answering it: without it the first running
+        // row rides one row tighter than the same content sits after
+        // graduating, and the gap opens as a jump the moment it does.
+        let mut subject = app();
+        subject.push_message(TuiMessage::User {
+            text: "go check the files".to_string(),
+            timestamp: chrono::Utc::now(),
+            steered: false,
+        });
+        subject
+            .active_tools()
+            .lock()
+            .expect("the tools lock")
+            .push(ActiveTool {
+                call_id: "call_seam".to_string(),
+                name: "Grep".to_string(),
+                input_summary: "\"needle\"".to_string(),
+                start: std::time::Instant::now(),
+            });
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+        terminal.draw(|frame| subject.render(frame)).expect("draw");
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<String> = (0..24u16)
+            .map(|y| {
+                (0..80u16)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect();
+        let prompt = rows
+            .iter()
+            .position(|row| row.contains("go check the files"))
+            .expect("the submitted prompt renders");
+        let tool = rows
+            .iter()
+            .position(|row| row.contains("Grep"))
+            .expect("the running tool renders");
+        assert_eq!(
+            tool.saturating_sub(prompt),
+            3,
+            "the prompt's closing blank, the speaker-change row, then the \
+             running tool — the same air the graduated turn sits in: {rows:?}"
         );
     }
 
@@ -9510,6 +11804,45 @@ mod tests {
     }
 
     #[test]
+    fn context_bar_readout_rounds_from_the_true_ratio() {
+        assert_eq!(
+            context_bar_readout(55_000, 100_000),
+            Some(("55%".to_string(), "55k/100k".to_string())),
+            "the readout spells the same fraction the bar paints"
+        );
+        assert_eq!(
+            context_bar_readout(419_000, 1_000_000),
+            Some(("42%".to_string(), "419k/1M".to_string())),
+            "a million-strong window spells its unit: 1M, not 1000k"
+        );
+        assert_eq!(
+            context_bar_readout(1_234_000, 2_000_000),
+            Some(("62%".to_string(), "1.2M/2M".to_string())),
+            "millions in between render in tenths"
+        );
+        assert_eq!(
+            context_bar_readout(999_999, 1_000_000),
+            Some(("100%".to_string(), "1M/1M".to_string())),
+            "rounding into a million promotes the unit rather than printing 1000k"
+        );
+        assert_eq!(
+            context_bar_readout(2_499, 200_000),
+            Some(("1%".to_string(), "2k/200k".to_string())),
+            "small usage rounds to its own numbers, not to zero"
+        );
+        assert_eq!(
+            context_bar_readout(250_000, 200_000),
+            Some(("125%".to_string(), "250k/200k".to_string())),
+            "an over-window session reads its honest over-100 percent"
+        );
+        assert_eq!(
+            context_bar_readout(30_000, 0),
+            None,
+            "an unknown window spells nothing — no denominator"
+        );
+    }
+
+    #[test]
     fn the_status_bar_shows_the_context_bar_at_the_configured_fill() {
         let mut app = app();
         app.state
@@ -9530,9 +11863,25 @@ mod tests {
                 }
             }
         }
+        assert_eq!(thumb_cells, 8, "half the window fills half of the bar");
+        let rows: Vec<String> = (0..24u16)
+            .map(|y| {
+                (0..80u16)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect();
+        let numbers_row = rows
+            .iter()
+            .position(|row| row.contains("100k/200k (50%)"))
+            .expect("the totals and their percent spell below the bar");
+        let bar_row = u16::try_from(numbers_row.saturating_sub(1)).unwrap_or(0);
+        let bar_cells = (0..80u16)
+            .filter(|&x| buffer[(x, bar_row)].style().bg == Some(thumb))
+            .count();
         assert_eq!(
-            thumb_cells, 5,
-            "half the window fills half of the short bar"
+            bar_cells, 8,
+            "the bar rides the row directly above the numbers that spell it"
         );
     }
 
@@ -9595,6 +11944,7 @@ mod tests {
         });
         queue.push(crate::observer::Graduation::RunEnded {
             duration_ms: 84_000,
+            success: true,
         });
         drop(queue);
         app.drain_shared_state();
@@ -9619,6 +11969,7 @@ mod tests {
         app.push_message(TuiMessage::User {
             text: "do a thing".to_string(),
             timestamp: chrono::Utc::now(),
+            steered: false,
         });
         app.state
             .graduations
@@ -9626,6 +11977,7 @@ mod tests {
             .expect("the graduation lock")
             .push(crate::observer::Graduation::RunEnded {
                 duration_ms: 84_000,
+                success: true,
             });
         app.drain_shared_state();
         assert!(
@@ -9829,6 +12181,18 @@ mod tests {
     }
 
     #[test]
+    fn the_steering_chord_survives_the_sheets_and_the_section() {
+        // The hint row offers Ctrl+S the moment a draft meets a running
+        // agent, and the queue's focus swallows everything the section
+        // does not answer — the survival set is what keeps an advertised
+        // key from becoming advertised noise.
+        assert!(key_survives_the_sheet(KeyEvent::new(
+            KeyCode::Char('s'),
+            KeyModifiers::CONTROL
+        )));
+    }
+
+    #[test]
     fn a_pasted_block_becomes_one_line() {
         // An answer is one line, so the breaks and control characters a
         // pasted block carries arrive as the spaces between its parts.
@@ -9998,15 +12362,43 @@ mod tests {
         let area = Rect::new(0, 0, 40, 12);
         assert_eq!(
             app.question_sheet_area(area).height,
-            12 - STATUS_BAR_ROWS,
-            "the status bar's rows are spoken for before the sheet sees the frame"
+            12u16
+                .saturating_sub(STATUS_BAR_ROWS)
+                .saturating_add(STATUS_BAR_AIR),
+            "only the bar's content rows are spoken for before the sheet sees the frame — its air is margin the sheet stands on"
         );
 
         app.strip_position = dch_config::StripPosition::Top;
         assert_eq!(
             app.question_sheet_area(area).height,
-            12 - STATUS_BAR_ROWS - 1,
+            12u16
+                .saturating_sub(STATUS_BAR_ROWS)
+                .saturating_add(STATUS_BAR_AIR)
+                .saturating_sub(1),
             "a strip at the top spends a row the sheet is then not offered"
+        );
+    }
+
+    #[test]
+    fn relativize_spells_home_as_tilde_and_deeper_paths_under_it() {
+        // The `~/` shape: home itself is the bare tilde, a directory
+        // under it keeps its tail, and a directory outside it has no
+        // relative spelling at all — the caller shows the full path.
+        let home = Path::new("/home/tester");
+        assert_eq!(
+            relativize(Path::new("/home/tester"), home).as_deref(),
+            Some("~"),
+            "the home directory itself is the bare tilde"
+        );
+        assert_eq!(
+            relativize(Path::new("/home/tester/repos/dch"), home).as_deref(),
+            Some("~/repos/dch"),
+            "a directory under home keeps its tail under the tilde"
+        );
+        assert_eq!(
+            relativize(Path::new("/srv/work"), home),
+            None,
+            "a directory outside home has no relative spelling"
         );
     }
 }

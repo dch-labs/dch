@@ -60,6 +60,14 @@ const MULTI_EDIT_TOOL: &str = "MultiEdit";
 /// gate to settle, so it passes through for the tool to reject.
 const FILE_PATH_FIELD: &str = "file_path";
 
+/// The alias spelling the fs family also serves for the path field.
+///
+/// The recorded model drift sends `path` where the schemas advertise
+/// `file_path`, so the family resolves both — and a guard that read
+/// only the canonical spelling would let the drift spell a guarded
+/// destination past it, refusing nothing the tool itself would serve.
+const PATH_FIELD: &str = "path";
+
 /// The input field carrying a `MultiEdit` call's edit operations.
 ///
 /// A batch spans files, so this tool carries no top-level destination —
@@ -138,14 +146,14 @@ impl ToolMiddleware for WriteTargetGate {
 ///
 /// `Write` and `Edit` name one target at the top level; a `MultiEdit` call
 /// carries a path per entry of its `edits` array, because one batch spans
-/// several files. Any other dispatch returns nothing, which is how the gate
+/// several files. Both spellings the fs family serves — the canonical
+/// `file_path` and the `path` alias — name the target here, read through
+/// [`write_family_path`] so a destination cannot slip the gate by its
+/// spelling. Any other dispatch returns nothing, which is how the gate
 /// stays out of every call it was not asked to police.
 fn dispatch_targets(ctx: &ToolDispatchContext) -> Vec<String> {
     match ctx.tool_name.as_str() {
-        WRITE_TOOL | EDIT_TOOL => ctx
-            .input
-            .get(FILE_PATH_FIELD)
-            .and_then(|value| value.as_str())
+        WRITE_TOOL | EDIT_TOOL => write_family_path(&ctx.input)
             .map(str::to_string)
             .into_iter()
             .collect(),
@@ -156,13 +164,30 @@ fn dispatch_targets(ctx: &ToolDispatchContext) -> Vec<String> {
             .map(|edits| {
                 edits
                     .iter()
-                    .filter_map(|edit| edit.get(FILE_PATH_FIELD))
-                    .filter_map(|value| value.as_str())
+                    .filter_map(write_family_path)
                     .map(str::to_string)
                     .collect()
             })
             .unwrap_or_default(),
         _ => Vec::new(),
+    }
+}
+
+/// Resolve the path field from a write-family input, canonical
+/// spelling first.
+///
+/// The fs family's alias tolerance, read the same way the family itself
+/// reads it: `file_path` is the canonical key the schemas advertise,
+/// `path` is the spelling the recorded model drift sends, and the
+/// canonical wins when both ride. A present-but-mistyped canonical
+/// resolves to nothing — the tool refuses it with its own teaching
+/// error, and a guard must not let a misspelled key slip the
+/// destination past it on the alias.
+pub(crate) fn write_family_path(input: &serde_json::Value) -> Option<&str> {
+    match input.get(FILE_PATH_FIELD) {
+        Some(serde_json::Value::String(path)) => Some(path.as_str()),
+        Some(_) => None,
+        None => input.get(PATH_FIELD).and_then(serde_json::Value::as_str),
     }
 }
 

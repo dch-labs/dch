@@ -285,6 +285,19 @@ fn enter_submits_clears_and_records_history() {
 }
 
 #[test]
+fn remember_records_a_prompt_that_was_never_typed_out() {
+    let mut editor = InputEditor::new();
+    // The send-now chords deliver the draft without going through Enter, so
+    // they record it themselves: recall is the list of prompts actually sent.
+    assert!(!editor.has_history());
+    editor.remember("steered mid-turn".to_string());
+    assert!(editor.has_history());
+    assert!(editor.is_empty(), "recalling a send does not retype it");
+    editor.handle_key(plain(KeyCode::Up), WRAP);
+    assert_eq!(editor.text(), "steered mid-turn");
+}
+
+#[test]
 fn enter_on_an_empty_buffer_is_a_noop() {
     let mut editor = InputEditor::new();
     assert_eq!(

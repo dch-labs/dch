@@ -87,12 +87,7 @@ fn attempt_reset(turn: usize, attempt: usize) -> AttemptResetContext {
 }
 
 fn stream_success(turn: usize) -> StreamContext {
-    StreamContext {
-        turn,
-        model: "testmodel".to_string(),
-        input_tokens: 0,
-        output_tokens: 0,
-    }
+    StreamContext::new(turn, "testmodel", 0, 0)
 }
 
 fn tool_call(call_id: &str, tool: &str) -> ToolCallReceivedContext {
@@ -598,14 +593,14 @@ fn auto_scroll_pins_the_newest_line_while_streaming() {
         observer.on_text_delta(&delta(0, &format!("para{line}\n\n")));
         let terminal = render_to_buffer(&mut app, 40, 24);
         let rows = row_texts(&terminal);
-        // 24 rows: 16 content rows for the conversation below its
-        // padding row (notice row, spacer, padded two-row input
-        // field, status bar) — the pinned view keeps the newest line
-        // on the pane's last content row.
+        // 24 rows: the conversation's last content row sits at 14 —
+        // one padding row above it, and below it stand the notice
+        // row, the spacer, the composer's four rows, and the footer's
+        // three — the pinned view keeps the newest line on that row.
         assert!(
-            rows[16].contains(&format!("para{line}")),
+            rows[14].contains(&format!("para{line}")),
             "the newest buffered line stays visible: {}",
-            rows[17]
+            rows[15]
         );
     }
     assert!(app.auto_scroll(), "a pinned view stays pinned");
@@ -618,12 +613,17 @@ fn scrolling_up_during_a_stream_holds_the_viewport() {
     render_to_buffer(&mut app, 40, 24);
 
     // PageUp alone lands the viewport's top on a blank paragraph
-    // separator; arrow-ups sit it on content — one more than the
-    // unpadded pane needed, the padding row's line back.
+    // separator; arrow-ups walk it onto content — the count that does
+    // it depends on the pane's height, so the walk runs until the top
+    // row sits on a paragraph.
     app.handle_event(&plain(KeyCode::PageUp));
-    app.handle_event(&plain(KeyCode::Up));
-    app.handle_event(&plain(KeyCode::Up));
-    app.handle_event(&plain(KeyCode::Up));
+    for _ in 0..10 {
+        let landing = row_texts(&render_to_buffer(&mut app, 40, 24));
+        if landing[1].trim().starts_with("para") {
+            break;
+        }
+        app.handle_event(&plain(KeyCode::Up));
+    }
     let held = render_to_buffer(&mut app, 40, 24);
     let top_before = row_texts(&held)[1].clone();
     assert!(
@@ -653,6 +653,7 @@ fn a_detached_view_stays_anchored_when_the_layout_shrinks() {
         app.push_message(TuiMessage::User {
             text: format!("line{i}"),
             timestamp: chrono::Utc::now(),
+            steered: false,
         });
     }
     seed(&app, &paras(1, 9));
@@ -660,7 +661,17 @@ fn a_detached_view_stays_anchored_when_the_layout_shrinks() {
 
     app.handle_event(&plain(KeyCode::PageUp));
     app.handle_event(&plain(KeyCode::PageUp));
-    app.handle_event(&plain(KeyCode::Up));
+    // Ups past the seamless landing: the live lane opens with
+    // the speaker-change row and the chrome below the conversation
+    // shifts where the same PageUps land, so the walk runs until the
+    // top row sits on a conversation row.
+    for _ in 0..20 {
+        let landing = row_texts(&render_to_buffer(&mut app, 40, 24));
+        if landing[1].trim().starts_with("❯  line") {
+            break;
+        }
+        app.handle_event(&plain(KeyCode::Up));
+    }
     assert!(!app.auto_scroll(), "the view is detached");
     let held = render_to_buffer(&mut app, 40, 24);
     let top_before = row_texts(&held)[1].trim().to_string();
@@ -702,7 +713,7 @@ fn end_rearms_stickiness_and_snaps_to_the_newest_line() {
     assert!(app.auto_scroll(), "End re-arms stickiness");
     let terminal = render_to_buffer(&mut app, 40, 24);
     assert!(
-        row_texts(&terminal)[16].contains("para35"),
+        row_texts(&terminal)[14].contains("para35"),
         "the next render snaps to the newest line"
     );
 }

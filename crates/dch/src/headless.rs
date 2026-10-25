@@ -129,6 +129,35 @@ impl HeadlessOutcome {
     }
 }
 
+/// The message a construction-phase failure owes the user, if any.
+///
+/// The headless entry hands back only an exit code, so a failure that
+/// happens before the run begins — an unreadable config file, a `--model`
+/// name matching no configured entry — leaves the terminal silent at exit 1:
+/// the number is the only thing the user gets. A run-level failure arrives
+/// as `Ok` and the observer has already narrated it, so only the `Err` arm
+/// carries an unserved message. Pure over the outcome, so the distinction is
+/// pinnable without running a pipeline.
+fn startup_failure_report(result: &Result<HeadlessOutcome, HeadlessOutcome>) -> Option<&str> {
+    match result {
+        Err(outcome) => Some(outcome.message.as_str()),
+        Ok(_) => None,
+    }
+}
+
+/// Map a finished pipeline to its exit code, reporting what nobody else did.
+///
+/// Both headless entries end here, so the production entry and the in-process
+/// test entry agree on what a construction failure sounds like.
+fn finish_pipeline(result: Result<HeadlessOutcome, HeadlessOutcome>) -> u8 {
+    if let Some(message) = startup_failure_report(&result) {
+        crate::signals::report(&format!("dch: {message}"));
+    }
+    match result {
+        Ok(outcome) | Err(outcome) => outcome.exit_code,
+    }
+}
+
 /// Run a single headless task and return the process exit code.
 ///
 /// Loads config, builds a non-interactive runner with a `ConsoleObserver`,
@@ -156,9 +185,7 @@ pub async fn run_headless(
     control: crate::resume::ResumeControl,
 ) -> u8 {
     let inherited_mode = capture_marker_mode(args.done_file.as_ref());
-    match run_headless_inner(args, startup_bridge, inherited_mode, None, control).await {
-        Ok(outcome) | Err(outcome) => outcome.exit_code,
-    }
+    finish_pipeline(run_headless_inner(args, startup_bridge, inherited_mode, None, control).await)
 }
 
 /// Run the headless pipeline with the session transcript rooted at
@@ -175,17 +202,16 @@ pub(crate) async fn run_headless_rooted(
     control: crate::resume::ResumeControl,
 ) -> u8 {
     let inherited_mode = capture_marker_mode(args.done_file.as_ref());
-    match run_headless_inner(
-        args,
-        startup_bridge,
-        inherited_mode,
-        Some(saver_root),
-        control,
+    finish_pipeline(
+        run_headless_inner(
+            args,
+            startup_bridge,
+            inherited_mode,
+            Some(saver_root),
+            control,
+        )
+        .await,
     )
-    .await
-    {
-        Ok(outcome) | Err(outcome) => outcome.exit_code,
-    }
 }
 
 /// An existing marker's permissions, captured before the run clears it.
@@ -454,7 +480,8 @@ async fn construct_run(
 
     let mut config = load_config(args.config.config_path.as_deref())
         .map_err(|message| construction_failure(args, message, inherited_mode))?;
-    apply_cli_overrides(&mut config, args);
+    apply_cli_overrides(&mut config, args)
+        .map_err(|message| construction_failure(args, message, inherited_mode))?;
 
     let verbosity = resolve_verbosity(&config, args);
     let observer = Arc::new(ConsoleObserver::new(
@@ -675,10 +702,26 @@ pub(crate) fn load_config(path: Option<&Path>) -> Result<dch_config::DchConfig, 
 /// refuses whole-file writes over secret-bearing targets. Verbosity
 /// resolves separately when the observer is built. Both mode runners
 /// apply the same overrides.
-pub(crate) fn apply_cli_overrides(config: &mut dch_config::DchConfig, args: &Args) {
-    if let Some(model) = &args.model {
-        config.api.model.clone_from(model);
-    }
+///
+/// `--model` runs first and selects rather than renames: a config declaring
+/// `[[models]]` entries keeps one provider bundle per model, so the flag
+/// chooses the bundle — endpoint, protocol, and credential included — and the
+/// per-field switches after it still override the selected bundle. A name
+/// matching no declared entry is the one override that can fail, and both
+/// runners carry that failure to their own startup error path rather than
+/// beginning a run against the wrong endpoint.
+///
+/// # Errors
+///
+/// Returns the user-facing message for a `--model` name that matches no
+/// configured entry — the text names the entries that do exist.
+pub(crate) fn apply_cli_overrides(
+    config: &mut dch_config::DchConfig,
+    args: &Args,
+) -> Result<(), String> {
+    config
+        .select_model(args.model.as_deref())
+        .map_err(|err| err.to_string())?;
     if let Some(theme) = &args.theme {
         config.display.theme.clone_from(theme);
     }
@@ -694,6 +737,7 @@ pub(crate) fn apply_cli_overrides(config: &mut dch_config::DchConfig, args: &Arg
     if args.config.no_redact {
         config.security.redact_secrets = false;
     }
+    Ok(())
 }
 
 /// Resolve the effective verbosity from config and CLI flags.
@@ -1098,13 +1142,84 @@ mod tests {
     #[test]
     fn the_model_flag_overrides_the_configured_model() {
         let mut config = dch_config::DchConfig::default();
-        apply_cli_overrides(&mut config, &parse(&["--model", "m2"]));
+        apply_cli_overrides(&mut config, &parse(&["--model", "m2"])).unwrap();
         assert_eq!(config.api.model, "m2");
 
         let mut config = dch_config::DchConfig::default();
         let original = config.api.model.clone();
-        apply_cli_overrides(&mut config, &parse(&[]));
+        apply_cli_overrides(&mut config, &parse(&[])).unwrap();
         assert_eq!(config.api.model, original);
+    }
+
+    /// A `[api]` default plus one selectable entry — the config shape
+    /// `--model` chooses among.
+    fn config_with_entries() -> dch_config::DchConfig {
+        dch_config::DchConfig::from_toml_str(
+            "[api]\nmodel = \"qwen-local\"\nbase_url = \"http://localhost:8080/v1\"\n\
+             api_type = \"ollama\"\nreasoning_effort = \"high\"\n\
+             [[models]]\nmodel = \"glm-5.3\"\n\
+             base_url = \"https://api.z.ai/api/anthropic\"\n\
+             api_type = \"anthropic\"\napi_key = \"zk-one\"\n",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_construction_failure_is_the_one_failure_reported_at_the_exit() {
+        assert_eq!(
+            startup_failure_report(&Ok(HeadlessOutcome::failure(2, "already narrated"))),
+            None,
+            "a run-level failure arrives as Ok and the observer told the user already"
+        );
+        assert_eq!(
+            startup_failure_report(&Err(HeadlessOutcome::failure(1, "unknown model \"x\""))),
+            Some("unknown model \"x\""),
+            "a failure before the run has told nobody, and an exit code alone is not a report"
+        );
+    }
+
+    #[test]
+    fn the_model_flag_selects_an_entry_with_its_endpoint_and_key() {
+        let mut config = config_with_entries();
+        apply_cli_overrides(&mut config, &parse(&["--model", "glm-5.3"])).unwrap();
+        assert_eq!(config.api.model, "glm-5.3");
+        assert_eq!(
+            config.api.base_url, "https://api.z.ai/api/anthropic",
+            "the flag reaches the provider, not merely the model name — which is the whole \
+             reason entries exist"
+        );
+        assert_eq!(config.api.api_type, dch_config::ApiType::Anthropic);
+        assert_eq!(config.api.api_key.as_deref(), Some("zk-one"));
+    }
+
+    #[test]
+    fn a_selected_entry_still_takes_the_per_field_overrides() {
+        let mut config = config_with_entries();
+        apply_cli_overrides(
+            &mut config,
+            &parse(&["--model", "glm-5.3", "--reasoning-effort", "low"]),
+        )
+        .unwrap();
+        assert_eq!(
+            config.api.reasoning_effort.as_deref(),
+            Some("low"),
+            "selection runs first, so an explicit dial still outranks the entry's inheritance"
+        );
+    }
+
+    #[test]
+    fn an_unknown_model_flag_fails_naming_the_configured_models() {
+        let mut config = config_with_entries();
+        let message = apply_cli_overrides(&mut config, &parse(&["--model", "cloude-haiku"]))
+            .expect_err("a declared set closes the name before a request is spent on it");
+        assert!(
+            message.contains("glm-5.3") && message.contains("qwen-local"),
+            "the failure names what can actually be run: {message}"
+        );
+        assert_eq!(
+            config.api.base_url, "http://localhost:8080/v1",
+            "the refused selection leaves the configured provider exactly as configured"
+        );
     }
 
     #[test]
@@ -1114,12 +1229,12 @@ mod tests {
             config.security.redact_secrets,
             "redaction defaults on, so the flag has something to disable"
         );
-        apply_cli_overrides(&mut config, &parse(&["--no-redact"]));
+        apply_cli_overrides(&mut config, &parse(&["--no-redact"])).unwrap();
         assert!(!config.security.redact_secrets);
 
         let mut config = dch_config::DchConfig::default();
         config.security.redact_secrets = false;
-        apply_cli_overrides(&mut config, &parse(&[]));
+        apply_cli_overrides(&mut config, &parse(&[])).unwrap();
         assert!(
             !config.security.redact_secrets,
             "the flag is one-way: it never re-enables a config-level opt-out"
@@ -1130,11 +1245,11 @@ mod tests {
     fn the_theme_flag_overrides_the_configured_theme() {
         let mut config = dch_config::DchConfig::default();
         let original = config.display.theme.clone();
-        apply_cli_overrides(&mut config, &parse(&["--theme", "nord"]));
+        apply_cli_overrides(&mut config, &parse(&["--theme", "nord"])).unwrap();
         assert_eq!(config.display.theme, "nord");
 
         let mut config = dch_config::DchConfig::default();
-        apply_cli_overrides(&mut config, &parse(&[]));
+        apply_cli_overrides(&mut config, &parse(&[])).unwrap();
         assert_eq!(
             config.display.theme, original,
             "with no flag the configured theme stands"
@@ -1146,23 +1261,23 @@ mod tests {
         // Containment stays on unless the flag is passed; the flag can only
         // lift it, never re-impose it over a config that opted out.
         let mut config = dch_config::DchConfig::default();
-        apply_cli_overrides(&mut config, &parse(&["--unsafe-paths"]));
+        apply_cli_overrides(&mut config, &parse(&["--unsafe-paths"])).unwrap();
         assert!(config.runner.unsafe_paths);
 
         let mut config = dch_config::DchConfig::default();
-        apply_cli_overrides(&mut config, &parse(&[]));
+        apply_cli_overrides(&mut config, &parse(&[])).unwrap();
         assert!(!config.runner.unsafe_paths);
     }
 
     #[test]
     fn the_reasoning_effort_flag_overrides_the_config() {
         let mut config = dch_config::DchConfig::default();
-        apply_cli_overrides(&mut config, &parse(&["--reasoning-effort", "low"]));
+        apply_cli_overrides(&mut config, &parse(&["--reasoning-effort", "low"])).unwrap();
         assert_eq!(config.api.reasoning_effort.as_deref(), Some("low"));
 
         let mut config = dch_config::DchConfig::default();
         config.api.reasoning_effort = Some("high".to_string());
-        apply_cli_overrides(&mut config, &parse(&["--reasoning-effort", "low"]));
+        apply_cli_overrides(&mut config, &parse(&["--reasoning-effort", "low"])).unwrap();
         assert_eq!(
             config.api.reasoning_effort.as_deref(),
             Some("low"),
@@ -1170,7 +1285,7 @@ mod tests {
         );
 
         let mut config = dch_config::DchConfig::default();
-        apply_cli_overrides(&mut config, &parse(&[]));
+        apply_cli_overrides(&mut config, &parse(&[])).unwrap();
         assert_eq!(config.api.reasoning_effort, None);
     }
 
@@ -1178,7 +1293,7 @@ mod tests {
     fn the_permission_mode_flag_overrides_the_configured_mode() {
         let mut config = dch_config::DchConfig::default();
         config.runner.permission_mode = dch_config::PermissionMode::Interactive;
-        apply_cli_overrides(&mut config, &parse(&["--permission-mode", "plan"]));
+        apply_cli_overrides(&mut config, &parse(&["--permission-mode", "plan"])).unwrap();
         assert_eq!(
             config.runner.permission_mode,
             dch_config::PermissionMode::Plan,
@@ -1187,7 +1302,7 @@ mod tests {
 
         let mut config = dch_config::DchConfig::default();
         config.runner.permission_mode = dch_config::PermissionMode::AcceptEdits;
-        apply_cli_overrides(&mut config, &parse(&[]));
+        apply_cli_overrides(&mut config, &parse(&[])).unwrap();
         assert_eq!(
             config.runner.permission_mode,
             dch_config::PermissionMode::AcceptEdits,
@@ -1574,6 +1689,34 @@ mod tests {
             let port = listener.local_addr().expect("bound address").port();
             tokio::spawn(async move {
                 while let Ok((mut stream, _)) = listener.accept().await {
+                    let mut seen = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        let read = tokio::io::AsyncReadExt::read(&mut stream, &mut chunk)
+                            .await
+                            .unwrap_or(0);
+                        if read == 0 {
+                            break;
+                        }
+                        seen.extend_from_slice(chunk.get(..read).unwrap_or(&[]));
+                        let Some(head_end) = seen.windows(4).position(|w| w == b"\r\n\r\n") else {
+                            continue;
+                        };
+                        let head = String::from_utf8_lossy(seen.get(..head_end).unwrap_or(&[]));
+                        let body_len = head.lines().find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.trim()
+                                .eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        });
+                        let request_complete = body_len.is_none_or(|len| {
+                            seen.len() >= head_end.saturating_add(4).saturating_add(len)
+                        });
+                        if request_complete {
+                            break;
+                        }
+                    }
                     let body = [
                         serde_json::json!({
                             "id": "c1", "model": "test-model",

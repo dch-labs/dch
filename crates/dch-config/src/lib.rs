@@ -51,6 +51,17 @@ pub enum ApiType {
     #[default]
     Ollama,
 
+    /// A self-hosted server speaking the OpenAI-compatible wire.
+    ///
+    /// The bring-your-own-server arm — llama.cpp, vLLM, LM Studio,
+    /// and local inference servers generally: the chat-completions
+    /// schema with no credential requirement (a placeholder key rides
+    /// the Authorization header; servers that ignore it are the
+    /// norm). Usage reporting stays on, so the session's token
+    /// accounting and calibration anchor to the server's own counts.
+    #[serde(rename = "self_hosted")]
+    SelfHosted,
+
     /// `DeepSeek` API.
     ///
     /// A standalone variant selecting its provider profile, whose endpoint,
@@ -96,7 +107,9 @@ impl ApiType {
     ///
     /// Consulted as the effective endpoint when [`ApiConfig::base_url`] is
     /// unset, for the stock providers (`OpenAi`, `Anthropic`, `Gemini`).
-    /// The profiled providers (`Ollama`, `DeepSeek`, `Grok`, `Azure`,
+    /// The self-hosted arm defaults to llama.cpp's local port, so an
+    /// unset `base_url` still lands on a working local endpoint. The
+    /// profiled providers (`Ollama`, `DeepSeek`, `Grok`, `Azure`,
     /// `Moonshot`, `Zai`) take their default endpoint from their provider
     /// profile instead, and `Bedrock` derives its endpoint from the AWS
     /// region, so this returns `None` for all of them — the type itself
@@ -109,6 +122,7 @@ impl ApiType {
             Self::OpenAi => Some("https://api.openai.com/v1"),
             Self::Anthropic => Some("https://api.anthropic.com"),
             Self::Gemini => Some("https://generativelanguage.googleapis.com"),
+            Self::SelfHosted => Some("http://localhost:8080/v1"),
             Self::Ollama
             | Self::DeepSeek
             | Self::Grok
@@ -129,11 +143,12 @@ impl ApiType {
     /// skip it. `api_type_all_lists_each_variant_once` catches duplicates
     /// only — a mistyped variant path is a compile error; extend this
     /// list in the same change that adds a variant.
-    pub const ALL: [ApiType; 10] = [
+    pub const ALL: [ApiType; 11] = [
         ApiType::OpenAi,
         ApiType::Anthropic,
         ApiType::Gemini,
         ApiType::Ollama,
+        ApiType::SelfHosted,
         ApiType::DeepSeek,
         ApiType::Grok,
         ApiType::Zai,
@@ -191,6 +206,30 @@ pub enum StripPosition {
     /// pane — which shrinks by one row — and the composer's spacer row
     /// keeps its hairline.
     Top,
+}
+
+/// How the TUI spells the session's working directory in the place
+/// row above the composer.
+///
+/// Selects the path's shape. Consumed from
+/// [`DisplayConfig::path_style`] and (de)serialized as its lowercase
+/// name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PathStyle {
+    /// The absolute path, exactly as the host named it.
+    ///
+    /// The default: no information lost, and the row reads the same
+    /// wherever the session roams.
+    #[default]
+    Full,
+
+    /// The path relative to the user's home directory, `~/`-spelled.
+    ///
+    /// `~/repos/dch` for a session under home — and the full path
+    /// when the directory sits outside home or the environment names
+    /// no home, so the row never shows a bare unanchored fragment.
+    Relative,
 }
 
 /// The animation the TUI's activity strip plays while the agent runs.
@@ -584,6 +623,30 @@ pub enum DchConfigError {
     /// the field, the rejected value, and the bound it violated.
     #[error("invalid config: {0}")]
     Invalid(String),
+
+    /// A requested model names no `[[models]]` entry the config declares.
+    ///
+    /// Raised only where the selectable set is closed — a config that
+    /// declares entries — because that is the one case where a name can be
+    /// checked before a request is spent on it. With no entries declared
+    /// there is nothing to choose among and the name passes through to the
+    /// `[api]` provider settings, as it always has. The message lists
+    /// [`available`](Self::UnknownModel::available) in file order.
+    #[error("unknown model {requested:?}; configured models: {available}")]
+    UnknownModel {
+        /// The name that was asked for, as it was typed.
+        ///
+        /// Kept verbatim — the operator's typo is the thing to show
+        /// back, not a normalized guess at it.
+        requested: String,
+
+        /// The declared entry names, comma-separated, in file order.
+        ///
+        /// File order because that is the order the operator reads
+        /// the config in: the message names the choices where the
+        /// hand that wrote them finds them.
+        available: String,
+    },
 }
 
 /// MCP tool-server settings, in the `[mcp]` config section.
@@ -650,6 +713,18 @@ pub struct DchConfig {
     /// [`ApiConfig`].
     #[serde(default)]
     pub api: ApiConfig,
+
+    /// Selectable models beyond the `[api]` default, in file order.
+    ///
+    /// The `[[models]]` entries: each names one model and the provider
+    /// settings that reach it, and `dch --model` chooses among them — see
+    /// [`ModelProfile`] and [`DchConfig::select_model`]. The list is ordered
+    /// and **the first entry is the default run**; `[api]` supplies the
+    /// settings an entry leaves unstated, and stays the default itself only
+    /// while this list is empty — which is every config written before entries
+    /// existed.
+    #[serde(default)]
+    pub models: Vec<ModelProfile>,
 
     /// Display / rendering preferences.
     ///
@@ -736,11 +811,12 @@ pub struct ApiConfig {
     ///
     /// The full window one request may carry. Unset (the default) means
     /// discover it from the provider when it starts — a local
-    /// OpenAI-compatible server is asked directly, and anything without
-    /// an answerable capability route falls back to
-    /// [`FALLBACK_CONTEXT_WINDOW`]. An explicit value always wins over
-    /// discovery. Feeds into compaction decisions via
-    /// [`DchConfig::to_session_config`].
+    /// OpenAI-compatible server is asked directly, first its capability
+    /// document and then its model listing; then the built-in table of
+    /// documented cloud-model windows answers for the models it knows.
+    /// Anything else falls back to [`FALLBACK_CONTEXT_WINDOW`]. An
+    /// explicit value always wins over discovery. Feeds into compaction
+    /// decisions via [`DchConfig::to_session_config`].
     pub context_window: Option<u64>,
 
     /// Per-request timeout in seconds.
@@ -765,13 +841,16 @@ pub struct ApiConfig {
 
     /// Request-level thinking budget for reasoning-capable models.
     ///
-    /// One of `low`, `medium`, `high`, or `max`, mapped at provider
-    /// construction onto the family's native dial — the Anthropic
-    /// `thinking.budget_tokens` ladder, the OpenAI `reasoning_effort`
-    /// parameter, the Gemini `thinkingConfig.thinkingBudget` budget.
-    /// Unset (the default) sends byte-identical requests
-    /// and the provider's own thinking defaults apply; an unrecognized
-    /// value fails client construction rather than silently defaulting.
+    /// One of `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or
+    /// `max`, mapped at provider construction onto the family's native
+    /// dial — the OpenAI `reasoning_effort` label (each level's own
+    /// name, verbatim), the Anthropic `thinking.budget_tokens` ladder,
+    /// the Gemini `thinkingConfig.thinkingBudget` budget. `none` is the
+    /// explicit off — the provider's own no-thinking value where one
+    /// exists — while an unset field is inheritance: byte-identical
+    /// requests and the provider's own thinking defaults. An
+    /// unrecognized value fails client construction rather than
+    /// silently defaulting.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
 
@@ -787,6 +866,148 @@ pub struct ApiConfig {
     /// ignore this setting on the wire; the cached share is reported in
     /// usage either way. Loaded from `[api] prompt_cache`.
     pub prompt_cache: bool,
+}
+
+/// One selectable model and the provider settings that reach it.
+///
+/// A `[[models]]` entry: a partial [`ApiConfig`] whose stated fields replace
+/// `[api]`'s when the entry is chosen, so one config can hold several models
+/// — each with its own endpoint, protocol, credential, and limits — without
+/// repeating the settings they share. The first entry is the default run;
+/// `[api]` supplies the settings an entry leaves unstated, and `dch --model
+/// NAME` picks an entry by its [`model`](Self::model), ignoring case.
+///
+/// Every field but [`model`](Self::model) is optional for the reason
+/// [`ApiConfig`] carries struct-level `#[serde(default)]`: an omitted field
+/// has to mean "inherit `[api]`", not "replace it with this type's default".
+/// An optional setting the entry *does* name is set; one it names as an empty
+/// string is dropped outright — the only way an entry clears a base
+/// `reasoning_effort` or `fallback_model` its model cannot carry.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct ModelProfile {
+    /// The model this entry names, as its provider knows it.
+    ///
+    /// Doubles as the selector `dch --model` matches, ignoring case; the run
+    /// sends this entry's spelling rather than the spelling typed. Empty is
+    /// rejected at load — an unnamed entry could never be chosen.
+    pub model: String,
+
+    /// Endpoint replacing `[api] base_url` for this model.
+    ///
+    /// Usually the reason an entry exists: a second provider lives on another
+    /// host. Unset inherits, which suits a second model on the same server.
+    pub base_url: Option<String>,
+
+    /// Provider protocol replacing `[api] api_type` for this model.
+    ///
+    /// Paired with [`base_url`](Self::base_url): a cross-provider entry names
+    /// both, a same-provider entry names neither.
+    pub api_type: Option<ApiType>,
+
+    /// Credential replacing `[api] api_key` for this model.
+    ///
+    /// Providers still read their own environment variables when this is
+    /// unset, so a second provider keyed from the environment needs no entry
+    /// of its own on that count. An empty string drops the inherited key.
+    pub api_key: Option<String>,
+
+    /// Output cap per response replacing `[api] max_tokens`.
+    ///
+    /// Bound to the entry's own model, whose cheaper tiers often carry
+    /// a smaller completion budget than the shared base assumes; unset
+    /// inherits `[api]`'s value, and the provider honors it exactly as
+    /// it honors the base's.
+    pub max_tokens: Option<u32>,
+
+    /// Context window replacing `[api] context_window` for this model.
+    ///
+    /// Models in one config routinely differ here, so an entry usually states
+    /// its own. An entry cannot ask for provider discovery where `[api]`
+    /// already states a number: leave `[api]` without a window and name each
+    /// entry's own to keep discovery for the models that want it.
+    pub context_window: Option<u64>,
+
+    /// Per-request timeout replacing `[api] request_timeout_secs`.
+    ///
+    /// A model that reasons at length routinely outlives a budget tuned
+    /// for quick chats, so an entry states its own; unset inherits
+    /// `[api]`'s value unchanged.
+    pub request_timeout_secs: Option<u64>,
+
+    /// Fallback model replacing `[api] fallback_model`.
+    ///
+    /// Names a model on *this* entry's provider — a fallback shares the
+    /// selected bundle's endpoint and credential. An empty string selects no
+    /// fallback at all.
+    pub fallback_model: Option<String>,
+
+    /// Azure resource replacing `[api] azure_resource`.
+    ///
+    /// For an entry whose model is served by a different Azure
+    /// deployment than the base's. Unset inherits `[api]`'s value, and
+    /// the name is consulted only when the entry's own `api_type` is
+    /// `azure`.
+    pub azure_resource: Option<String>,
+
+    /// Thinking budget replacing `[api] reasoning_effort`.
+    ///
+    /// The field most in need of clearing: a base budget inherited by a model
+    /// that cannot carry it is a request the provider rejects, so an entry
+    /// whose model has no dial names this empty.
+    pub reasoning_effort: Option<String>,
+
+    /// Prompt-cache breakpoints replacing `[api] prompt_cache`.
+    ///
+    /// An Anthropic-protocol entry on an endpoint that rejects the
+    /// breakpoints' extra field names this `false` without touching the
+    /// shared base setting; unset inherits `[api]`'s value.
+    pub prompt_cache: Option<bool>,
+}
+
+impl ModelProfile {
+    /// The bundle this entry selects: `base` with each field the entry states
+    /// taking the place of `[api]`'s.
+    ///
+    /// Pure over the two values, so the caller decides whether the result
+    /// replaces the config's bundle. Fields the entry leaves unset keep
+    /// `base`'s value; [`cleared`] is how an entry drops one it names empty.
+    fn apply_onto(&self, base: &ApiConfig) -> ApiConfig {
+        ApiConfig {
+            model: self.model.clone(),
+            base_url: self
+                .base_url
+                .clone()
+                .unwrap_or_else(|| base.base_url.clone()),
+            api_type: self.api_type.unwrap_or(base.api_type),
+            api_key: cleared(self.api_key.as_ref(), base.api_key.as_deref()),
+            max_tokens: self.max_tokens.unwrap_or(base.max_tokens),
+            context_window: self.context_window.or(base.context_window),
+            request_timeout_secs: self
+                .request_timeout_secs
+                .unwrap_or(base.request_timeout_secs),
+            fallback_model: cleared(self.fallback_model.as_ref(), base.fallback_model.as_deref()),
+            azure_resource: cleared(self.azure_resource.as_ref(), base.azure_resource.as_deref()),
+            reasoning_effort: cleared(
+                self.reasoning_effort.as_ref(),
+                base.reasoning_effort.as_deref(),
+            ),
+            prompt_cache: self.prompt_cache.unwrap_or(base.prompt_cache),
+        }
+    }
+}
+
+/// The effective value of an optional setting an entry may replace or drop.
+///
+/// Unset inherits `base`; a stated non-empty value replaces it; a stated empty
+/// string states "none". Whitespace-only counts as empty — a value typed in
+/// order to clear is clearing, whatever the editor left around it.
+fn cleared(declared: Option<&String>, base: Option<&str>) -> Option<String> {
+    match declared {
+        None => base.map(str::to_string),
+        Some(text) if text.trim().is_empty() => None,
+        Some(text) => Some(text.clone()),
+    }
 }
 
 /// Display / rendering preferences.
@@ -829,6 +1050,15 @@ pub struct DisplayConfig {
     /// to the right end and then clears left-to-right. See
     /// [`StripStyle`].
     pub strip_style: StripStyle,
+
+    /// How the TUI spells the working directory in the place row
+    /// above the composer.
+    ///
+    /// `full` (the default) shows the absolute path the host named;
+    /// `relative` spells it `~/`-relative to the user's home
+    /// directory, falling back to the full path outside home. See
+    /// [`PathStyle`].
+    pub path_style: PathStyle,
 
     /// Let the TUI capture the mouse.
     ///
@@ -1256,6 +1486,7 @@ impl Default for DisplayConfig {
             theme: "default".to_string(),
             strip_position: StripPosition::default(),
             strip_style: StripStyle::default(),
+            path_style: PathStyle::default(),
             diff_layout: DiffLayout::default(),
             mouse_capture: true,
             copy_command: None,
@@ -1369,6 +1600,113 @@ impl DchConfig {
         Ok(config)
     }
 
+    /// The model names `--model` can choose among, in file order.
+    ///
+    /// `[api]`'s own model leads only when no entry claims that name — an
+    /// entry answering it is the model's real config, and listing the name
+    /// twice would read as two selectable models with one identity. So this is
+    /// the file's order, top first, with `[api]`'s own name leading whenever
+    /// the entries leave it out. It is the closed set
+    /// [`select_model`](Self::select_model) checks a requested name against and
+    /// what its error lists. Empty for every config written before `[[models]]`
+    /// existed with nothing configured to lead: that is the open case, where a
+    /// requested name passes through unvalidated instead of being refused for
+    /// matching nothing.
+    #[must_use]
+    pub fn model_names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = Vec::with_capacity(self.models.len().saturating_add(1));
+        let base = self.api.model.trim();
+        if !base.is_empty()
+            && !self
+                .models
+                .iter()
+                .any(|entry| entry.model.eq_ignore_ascii_case(base))
+        {
+            names.push(base);
+        }
+        names.extend(self.models.iter().map(|entry| entry.model.as_str()));
+        names
+    }
+
+    /// Point the run at one of the configured `[[models]]` entries.
+    ///
+    /// `Some(name)` selects the entry whose [`model`](ModelProfile::model)
+    /// matches it, ignoring case, and that entry's stated fields replace
+    /// `[api]`'s. That is the whole reason entries exist: a different model
+    /// usually means a different endpoint, protocol, and credential, which a
+    /// bare name could never reach. The resolved bundle lands in
+    /// [`ApiConfig`] — the field every consumer already reads — so selecting
+    /// changes nothing downstream of here.
+    ///
+    /// `None` selects the **first entry**: the list is ordered and the top of
+    /// it is the default run, which is what makes a `[[models]]` config —
+    /// one block per model, switchable by name — readable top-down. `[api]` stays
+    /// the default only while the config declares no entries, so every config
+    /// written before entries existed keeps behaving as it always did, and
+    /// `[api]` keeps supplying the settings an entry leaves unstated. An entry
+    /// named the same as `[api] model` is not a conflict: it *is* that model's
+    /// own config, and being at the top of the list makes it the default.
+    ///
+    /// A name no entry answers but `[api] model` does resolves to the
+    /// settings `[api]` already carries, so listing entries cannot strand the
+    /// model `[api]` names.
+    ///
+    /// With no entries declared, `Some(name)` renames
+    /// [`ApiConfig::model`] exactly as the flag always has — a name of
+    /// only whitespace is refused outright either way — and `None`
+    /// changes nothing, so a config without entries behaves identically
+    /// to every config written before entries existed.
+    ///
+    /// One selection per run is the contract: a second call layers its entry
+    /// over the first's result rather than over `[api]`, so a runner that
+    /// switches models after startup re-reads the config first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DchConfigError::UnknownModel`] when entries are declared
+    /// and `requested` matches none of them: a typo caught at startup
+    /// naming the names that exist, rather than a request spent against
+    /// the wrong endpoint. A name of only whitespace errors the same
+    /// way — a blank selection must never silently fall back to the
+    /// default entry, whose profile the user may believe served the run.
+    pub fn select_model(&mut self, requested: Option<&str>) -> Result<(), DchConfigError> {
+        let Some(wanted) = requested else {
+            if let Some(first) = self.models.first().cloned() {
+                self.api = first.apply_onto(&self.api);
+            }
+            return Ok(());
+        };
+        if wanted.trim().is_empty() {
+            return Err(DchConfigError::UnknownModel {
+                requested: wanted.to_string(),
+                available: self.model_names().join(", "),
+            });
+        }
+        let wanted = wanted.trim();
+        if self.models.is_empty() {
+            self.api.model = wanted.to_string();
+            return Ok(());
+        }
+        let selected = self
+            .models
+            .iter()
+            .find(|entry| entry.model.eq_ignore_ascii_case(wanted))
+            .cloned();
+        match selected {
+            Some(entry) => {
+                self.api = entry.apply_onto(&self.api);
+                Ok(())
+            }
+            // An entry list may leave [api]'s own model off it — the name still
+            // means the settings [api] already carries.
+            None if self.api.model.eq_ignore_ascii_case(wanted) => Ok(()),
+            None => Err(DchConfigError::UnknownModel {
+                requested: wanted.to_string(),
+                available: self.model_names().join(", "),
+            }),
+        }
+    }
+
     /// Reject values whose silently-substituted behavior would contradict
     /// the documented contract.
     ///
@@ -1400,6 +1738,49 @@ impl DchConfig {
                  read's own continuation marker could name where reading continues",
                 self.runner.read_max_bytes
             )));
+        }
+        self.validate_models()?;
+        Ok(())
+    }
+
+    /// Reject `[[models]]` entries that could not be selected unambiguously.
+    ///
+    /// An entry naming no model can never match a request, and two entries
+    /// sharing a name make `--model NAME` a coin flip between two providers.
+    /// Both are startup errors naming the entry, the way the rest of
+    /// validation turns a silently-rewritten value into a message. Names are
+    /// compared case-insensitively because that is how [`select_model`](Self::select_model)
+    /// matches them.
+    ///
+    /// Two entries sharing `[api]`'s model name is not a conflict — that entry
+    /// is the model's own config, and it wins both as the default (top of the
+    /// list) and under `--model`, since entries are searched first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DchConfigError::Invalid`] for an entry naming no model or for
+    /// two entries sharing one name.
+    fn validate_models(&self) -> Result<(), DchConfigError> {
+        let mut seen: Vec<&str> = Vec::new();
+        for entry in &self.models {
+            if entry.model.trim().is_empty() {
+                return Err(DchConfigError::Invalid(
+                    "a [[models]] entry names no model: add model = \"...\" so --model can \
+                     select it"
+                        .to_string(),
+                ));
+            }
+            if seen
+                .iter()
+                .any(|named| named.eq_ignore_ascii_case(&entry.model))
+            {
+                return Err(DchConfigError::Invalid(format!(
+                    "duplicate [[models]] entry for model {:?}: --model could not choose \
+                     between them",
+                    entry.model
+                )));
+            }
+            seen.push(entry.model.as_str());
         }
         Ok(())
     }
@@ -1517,6 +1898,14 @@ pub fn config_dir() -> PathBuf {
     clippy::expect_used
 )]
 mod tests {
+    /// A one-field wrapper so serde rendering of a bare enum value
+    /// can be asserted without a full config document.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct TestWrap {
+        /// The variant under render.
+        api_type: ApiType,
+    }
+
     use super::*;
     use std::io::Write;
 
@@ -1610,6 +1999,10 @@ mod tests {
             test: None,
             lint: None,
             conventions: None,
+        });
+        config.models.push(ModelProfile {
+            model: "a-hosted-model".to_string(),
+            ..ModelProfile::default()
         });
         config
     }
@@ -1862,6 +2255,26 @@ mod tests {
         assert!(
             toml::from_str::<DisplayConfig>(r#"strip_position = "middle""#).is_err(),
             "an unknown placement fails the load instead of falling back"
+        );
+    }
+
+    #[test]
+    fn path_style_parses_with_a_full_default() {
+        let display: DisplayConfig = toml::from_str(r#"theme = "dracula""#).unwrap();
+        assert_eq!(
+            display.path_style,
+            PathStyle::Full,
+            "a config without the field keeps the full path"
+        );
+        let display: DisplayConfig = toml::from_str(r#"path_style = "relative""#).unwrap();
+        assert_eq!(
+            display.path_style,
+            PathStyle::Relative,
+            "the home-relative shape parses from its lowercase name"
+        );
+        assert!(
+            toml::from_str::<DisplayConfig>(r#"path_style = "short""#).is_err(),
+            "an unknown style fails the load instead of falling back"
         );
     }
 
@@ -2241,6 +2654,7 @@ redact_secrets = false
             (ApiType::OpenAi, "https://api.openai.com/v1"),
             (ApiType::Anthropic, "https://api.anthropic.com"),
             (ApiType::Gemini, "https://generativelanguage.googleapis.com"),
+            (ApiType::SelfHosted, "http://localhost:8080/v1"),
         ];
         for api_type in ApiType::ALL {
             match stock.iter().find(|(variant, _)| *variant == api_type) {
@@ -2262,6 +2676,21 @@ redact_secrets = false
                 "{variant:?} must stay in ALL for its host pin to run"
             );
         }
+    }
+
+    #[test]
+    fn self_hosted_round_trips_its_snake_case_spelling() {
+        let wrap: TestWrap =
+            toml::from_str("api_type = \"self_hosted\"").expect("the snake_case spelling parses");
+        assert_eq!(wrap.api_type, super::ApiType::SelfHosted);
+        let rendered = toml::to_string(&TestWrap {
+            api_type: super::ApiType::SelfHosted,
+        })
+        .expect("renders");
+        assert!(
+            rendered.contains("self_hosted"),
+            "the rendered TOML keeps the snake_case spelling: {rendered}"
+        );
     }
 
     #[test]
@@ -2390,5 +2819,309 @@ redact_secrets = false
         assert_eq!(PermissionMode::Plan.as_str(), "plan");
         assert_eq!(PermissionMode::AcceptEdits.as_str(), "accept_edits");
         assert_eq!(PermissionMode::Interactive.as_str(), "interactive");
+    }
+
+    /// One local server plus one hosted provider, the shape `[[models]]`
+    /// exists to describe: `[api]` carries the shared settings and the default
+    /// model, and each entry states only where it differs.
+    fn config_with_two_models() -> DchConfig {
+        DchConfig::from_toml_str(
+            r#"
+[api]
+model = "qwen-local"
+base_url = "http://localhost:8080/v1"
+api_type = "ollama"
+max_tokens = 16_384
+request_timeout_secs = 600
+reasoning_effort = "high"
+
+[[models]]
+model = "glm-5.3"
+base_url = "https://api.z.ai/api/anthropic"
+api_type = "anthropic"
+api_key = "zk-one"
+context_window = 999_999
+
+[[models]]
+model = "qwen-fast"
+context_window = 210_000
+"#,
+        )
+        .expect("the two-entry fixture parses")
+    }
+
+    #[test]
+    fn a_config_without_entries_keeps_the_api_section_alone() {
+        let mut config =
+            DchConfig::from_toml_str("[api]\nmodel = \"m\"\nbase_url = \"http://h/v1\"\n")
+                .expect("a pre-entries config parses");
+        assert!(
+            config.models.is_empty(),
+            "a config that never heard of [[models]] has none to choose among"
+        );
+
+        config.select_model(None).expect("nothing to select");
+        assert_eq!(config.api.model, "m", "[api] stays in force");
+
+        config
+            .select_model(Some("brand-new"))
+            .expect("no closed set");
+        assert_eq!(config.api.model, "brand-new");
+        assert_eq!(
+            config.api.base_url, "http://h/v1",
+            "with no entries declared the flag renames and leaves the endpoint alone, exactly \
+             as it did before entries existed"
+        );
+    }
+
+    #[test]
+    fn a_selected_entry_brings_its_own_endpoint_protocol_and_key() {
+        let mut config = config_with_two_models();
+        config
+            .select_model(Some("glm-5.3"))
+            .expect("a declared name");
+        assert_eq!(config.api.model, "glm-5.3");
+        assert_eq!(config.api.base_url, "https://api.z.ai/api/anthropic");
+        assert_eq!(config.api.api_type, ApiType::Anthropic);
+        assert_eq!(config.api.api_key.as_deref(), Some("zk-one"));
+        assert_eq!(config.api.context_window, Some(999_999));
+        assert_eq!(
+            config.api.max_tokens, 16_384,
+            "a field the entry never names inherits [api]"
+        );
+        assert_eq!(config.api.request_timeout_secs, 600);
+        assert_eq!(
+            config.api.reasoning_effort.as_deref(),
+            Some("high"),
+            "a shared thinking budget reaches an entry that says nothing about it"
+        );
+    }
+
+    #[test]
+    fn selection_ignores_case_and_sends_the_configured_spelling() {
+        let mut config = config_with_two_models();
+        config
+            .select_model(Some("GLM-5.3"))
+            .expect("a case-insensitive match");
+        assert_eq!(
+            config.api.model, "glm-5.3",
+            "the match is forgiving, but what the provider receives is the spelling it knows"
+        );
+    }
+
+    #[test]
+    fn a_second_selection_layers_over_the_firsts_result() {
+        // One selection per run is the contract, but the call itself is
+        // pure config math: an entry replaces the fields it names and
+        // inherits the rest from the bundle as it stands. A second
+        // selection therefore stacks on the first's result — a runner
+        // that switches models after startup re-reads the config
+        // first — with every field the second entry names standing on
+        // its own value.
+        let mut config = config_with_two_models();
+        config
+            .select_model(Some("glm-5.3"))
+            .expect("the first declared name");
+        config
+            .select_model(Some("qwen-fast"))
+            .expect("the second declared name");
+        assert_eq!(config.api.model, "qwen-fast");
+        assert_eq!(
+            config.api.context_window,
+            Some(210_000),
+            "a field the second entry names stands on its own value"
+        );
+        assert_eq!(
+            config.api.base_url, "https://api.z.ai/api/anthropic",
+            "a field the second entry leaves out keeps the first selection's value, not [api]'s"
+        );
+        assert_eq!(
+            config.api.api_type,
+            ApiType::Anthropic,
+            "the protocol rides with the endpoint it arrived with"
+        );
+        assert_eq!(
+            config.api.api_key.as_deref(),
+            Some("zk-one"),
+            "the first selection's credential survives a second that names none"
+        );
+    }
+
+    #[test]
+    fn an_entry_drops_a_base_setting_its_model_cannot_carry() {
+        let mut config = config_with_two_models();
+        config.models[1].reasoning_effort = Some(String::new());
+        config
+            .select_model(Some("qwen-fast"))
+            .expect("the second entry");
+        assert_eq!(
+            config.api.reasoning_effort, None,
+            "an entry naming an optional setting empty clears the inherited one, rather than \
+             sending a dial the selected model cannot carry"
+        );
+    }
+
+    #[test]
+    fn an_unknown_name_is_refused_naming_the_models_that_exist() {
+        let mut config = config_with_two_models();
+        let before = config.api.clone();
+        let message = config
+            .select_model(Some("cloude-haiku"))
+            .expect_err("a declared set closes the name")
+            .to_string();
+        for named in ["qwen-local", "glm-5.3", "qwen-fast"] {
+            assert!(
+                message.contains(named),
+                "the error lists {named}: {message}"
+            );
+        }
+        assert_eq!(
+            config.api, before,
+            "a refused selection leaves the configured bundle exactly as it was"
+        );
+    }
+
+    #[test]
+    fn a_blank_model_name_is_refused_like_an_unknown_one() {
+        // A name of only whitespace must not fall back to the head
+        // entry: the user asked for a model, and silently running the
+        // default would leave them believing a named profile served
+        // the run.
+        let mut config = config_with_two_models();
+        let before = config.api.clone();
+        let message = config
+            .select_model(Some("   "))
+            .expect_err("a blank name selects nothing")
+            .to_string();
+        assert!(
+            message.contains("glm-5.3"),
+            "the error names the models that exist, like any unknown: {message}"
+        );
+        assert_eq!(
+            config.api, before,
+            "the refused blank leaves the configured bundle untouched"
+        );
+    }
+
+    #[test]
+    fn the_default_model_is_selectable_by_name() {
+        let mut config = config_with_two_models();
+        config
+            .select_model(Some("qwen-local"))
+            .expect("the default answers its own name");
+        assert_eq!(config.api.base_url, "http://localhost:8080/v1");
+        assert_eq!(config.api.api_type, ApiType::Ollama);
+    }
+
+    #[test]
+    fn the_top_entry_is_the_default_run() {
+        let mut config = config_with_two_models();
+        config.select_model(None).expect("the top entry defaults");
+        assert_eq!(
+            config.api.model, "glm-5.3",
+            "the list is ordered and the top of it is what a bare `dch` runs"
+        );
+        assert_eq!(
+            config.api.base_url, "https://api.z.ai/api/anthropic",
+            "the default run is that entry's provider, not [api]'s"
+        );
+        assert_eq!(
+            config.api.request_timeout_secs, 600,
+            "and it still inherits what [api] supplies for everyone"
+        );
+    }
+
+    #[test]
+    fn model_names_leads_with_the_base_when_no_entry_claims_it() {
+        let config = config_with_two_models();
+        assert_eq!(
+            config.model_names(),
+            vec!["qwen-local", "glm-5.3", "qwen-fast"],
+            "order is the file's order, so the default leads rather than the name that sorts \
+             first — a map of tables would have alphabetized this"
+        );
+    }
+
+    #[test]
+    fn model_names_lists_a_padded_base_model_trimmed() {
+        // The list is what a refusal tells the user they can type, and
+        // the comparisons around it read the trimmed name — a base
+        // model carrying editor padding would otherwise be listed
+        // under a spelling no selection could ever match.
+        let config = DchConfig::from_toml_str("[api]\nmodel = \"  glm-5.3  \"\n")
+            .expect("a padded base parses");
+        assert_eq!(
+            config.model_names(),
+            vec!["glm-5.3"],
+            "the base is listed by the name a selection matches, not the raw padding"
+        );
+    }
+
+    #[test]
+    fn two_entries_sharing_a_name_fail_the_load() {
+        let err = DchConfig::from_toml_str(
+            "[api]\nmodel = \"base\"\n\
+             [[models]]\nmodel = \"twin\"\n[[models]]\nmodel = \"TWIN\"\n",
+        )
+        .expect_err("case folds together, so these are the same name");
+        assert!(
+            err.to_string().to_lowercase().contains("twin"),
+            "the error names the entry, in whichever spelling came second: {err}"
+        );
+    }
+
+    #[test]
+    fn an_entry_naming_no_model_fails_the_load() {
+        let err = DchConfig::from_toml_str("[[models]]\ncontext_window = 4096\n")
+            .expect_err("an unnamed entry could never be selected");
+        assert!(
+            err.to_string().contains("no model"),
+            "the error says what to add: {err}"
+        );
+    }
+
+    #[test]
+    fn an_entry_carrying_the_bases_own_model_name_wins() {
+        // The shape a hand-written config actually takes: [api] names a model
+        // that also has a full entry of its own. Rejecting that would refuse a
+        // file whose entries are complete per-model configs.
+        let mut config = DchConfig::from_toml_str(
+            r#"
+[api]
+model = "shared"
+request_timeout_secs = 600
+
+[[models]]
+model = "shared"
+base_url = "http://localhost:8080/v1"
+api_type = "ollama"
+"#,
+        )
+        .expect("an entry may carry [api]'s model name");
+        config
+            .select_model(None)
+            .expect("as the top entry it is the default");
+        assert_eq!(config.api.base_url, "http://localhost:8080/v1");
+        assert_eq!(
+            config.api.request_timeout_secs, 600,
+            "the entry overrides the endpoint and still inherits the shared timeout"
+        );
+        assert_eq!(
+            config.model_names(),
+            vec!["shared"],
+            "one model, one name — listed once even though two blocks spell it"
+        );
+    }
+
+    #[test]
+    fn entries_round_trip_through_serialization() {
+        let config = config_with_two_models();
+        let text = toml::to_string(&config).expect("the config serializes");
+        let back = DchConfig::from_toml_str(&text).expect("it reads back");
+        assert_eq!(back.model_names(), config.model_names());
+        assert_eq!(
+            back.models, config.models,
+            "an entry survives the round trip"
+        );
     }
 }

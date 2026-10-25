@@ -225,21 +225,14 @@ fn word_to_spans(word: &Word, base_style: Style, theme: &MarkdownTheme) -> Vec<S
     }
 }
 
-/// The continuation marker a soft-wrapped code row opens with.
-///
-/// A code line wider than the panel splits onto continuation rows; each
-/// one keeps the panel background and opens with this glyph in the dim
-/// tone, so a reflowed row reads as the tail of the line above rather
-/// than a new source line.
-const CODE_CONTINUATION_MARKER: &str = "↪ ";
-
 /// Render a code block, one framed line per source line.
 ///
 /// Every line is wrapped in a leading and trailing space column
 /// painted in the code-block background so the block reads as a solid
 /// panel. A line wider than the panel soft-wraps onto continuation
-/// rows that keep the panel background and open with
-/// [`CODE_CONTINUATION_MARKER`]; source characters are never dropped
+/// rows that keep the panel background and draw nothing the source
+/// did not carry — a marker glyph would ride a selection's copy out
+/// of the panel; source characters are never dropped
 /// or reordered, and a span the break cuts in two keeps its style on
 /// both sides. With the `syntax-highlight` feature the tree-sitter
 /// highlighter runs here over the block's source; without it every
@@ -303,7 +296,7 @@ fn render_code_block(
                 if !current_row.is_empty() {
                     rows.push(current_row);
                 }
-                wrap_code_rows(rows, wrap_width, panel_bg, markdown_theme.dim, lines);
+                wrap_code_rows(rows, wrap_width, panel_bg, lines);
             }
             HighlightInfo::Unhighlighted => {
                 render_plain_code_block(code, panel_bg, plain_fg, wrap_width, lines);
@@ -346,7 +339,7 @@ fn render_plain_code_block(
     if rows.last().is_some_and(Vec::is_empty) {
         rows.pop();
     }
-    wrap_code_rows(rows, wrap_width, panel_bg, plain_fg, lines);
+    wrap_code_rows(rows, wrap_width, panel_bg, lines);
 }
 
 /// Soft-wrap styled code rows into framed panel lines.
@@ -354,31 +347,22 @@ fn render_plain_code_block(
 /// Each source row renders inside the panel's padding columns — one
 /// leading and one trailing space on the block background. A row wider
 /// than that budget breaks at a display-width boundary onto
-/// continuation rows that open with [`CODE_CONTINUATION_MARKER`] in
-/// the dim tone; the marker's columns come out of the continuation
-/// budget so every row's trailing padding lands on the same terminal
-/// column. A span the break cuts in two keeps its style on both
-/// pieces, and a single glyph wider than the whole budget owns its row
-/// unsplittably — the same carve-out character splitting applies
-/// elsewhere in this module's layout.
+/// continuation rows that carry nothing the source did not — no
+/// marker glyph, because a selection copies span text verbatim and
+/// the copy must be the code the model wrote. A span the break cuts
+/// in two keeps its style on both pieces, and a single glyph wider
+/// than the whole budget owns its row unsplittably — the same
+/// carve-out character splitting applies elsewhere in this module's
+/// layout.
 fn wrap_code_rows(
     rows: Vec<Vec<Span<'static>>>,
     wrap_width: u16,
     panel_bg: Color,
-    dim: Color,
     lines: &mut Vec<Line<'static>>,
 ) {
-    let first_budget = usize::from(wrap_width).saturating_sub(2).max(1);
-    let continuation_budget = first_budget
-        .saturating_sub(UnicodeWidthStr::width(CODE_CONTINUATION_MARKER))
-        .max(1);
+    let budget = usize::from(wrap_width).saturating_sub(2).max(1);
     let pad = Style::default().bg(panel_bg);
-    let marker = Span::styled(
-        CODE_CONTINUATION_MARKER,
-        Style::default().fg(dim).bg(panel_bg),
-    );
     for row in rows {
-        let mut budget = first_budget;
         let mut used: usize = 0;
         let mut out: Vec<Span<'static>> = vec![Span::styled(" ", pad)];
         for span in row {
@@ -392,8 +376,7 @@ fn wrap_code_rows(
                     }
                     out.push(Span::styled(" ", pad));
                     lines.push(Line::from(std::mem::take(&mut out)));
-                    out = vec![Span::styled(" ", pad), marker.clone()];
-                    budget = continuation_budget;
+                    out = vec![Span::styled(" ", pad)];
                     used = 0;
                 }
                 piece.push(ch);
@@ -666,7 +649,7 @@ mod tests {
         // glyph, not on the one after it.
         let rows = vec![vec![Span::raw("abcdef"), Span::raw("gh")]];
         let mut lines = Vec::new();
-        wrap_code_rows(rows, 8, Color::Reset, Color::Reset, &mut lines);
+        wrap_code_rows(rows, 8, Color::Reset, &mut lines);
         let rendered: Vec<String> = lines
             .iter()
             .map(|line| {

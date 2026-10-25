@@ -28,6 +28,7 @@ pub(crate) fn transcript_from(
     let mut messages = vec![TuiMessage::User {
         text: prompt.to_string(),
         timestamp: now,
+        steered: false,
     }];
     for output in turn_outputs {
         if output.trim().is_empty() {

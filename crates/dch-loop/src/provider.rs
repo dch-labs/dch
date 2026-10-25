@@ -253,6 +253,29 @@ pub fn create_client(config: &ApiConfig) -> Result<DchClient, RunnerError> {
             .build()
             .map_err(client_error)?,
         ),
+        ApiType::SelfHosted => {
+            let base_url = if config.base_url.is_empty() {
+                ApiType::SelfHosted
+                    .default_base_url()
+                    .map_or_else(|| config.base_url.clone(), str::to_string)
+            } else {
+                config.base_url.clone()
+            };
+            let api_key = config
+                .api_key
+                .clone()
+                .unwrap_or_else(|| "self-hosted".to_string());
+            let mut builder = OpenAiClient::builder()
+                .with_api_key(api_key)
+                .with_base_url(base_url)
+                .with_model(config.model.as_str())
+                .with_timeout(timeout)
+                .replay_reasoning(true);
+            if let Some(effort) = effort {
+                builder = builder.thinking_effort(effort);
+            }
+            DchClient::OpenAi(builder.build().map_err(client_error)?)
+        }
         ApiType::DeepSeek => DchClient::OpenAi(
             profiled(loopctl::provider::deepseek_builder(), config, effort)
                 .build()
@@ -523,20 +546,24 @@ fn profiled<B: Profiled>(builder: B, config: &ApiConfig, effort: Option<Thinking
 /// # Errors
 ///
 /// Returns [`RunnerError::Config`] when the configured spelling is not
-/// one of `low`, `medium`, `high`, or `max`.
+/// one of `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or
+/// `max` — the seven rungs the ladder ships.
 fn effort_from_config(config: &ApiConfig) -> Result<Option<ThinkingEffort>, RunnerError> {
     let Some(name) = config.reasoning_effort.as_deref() else {
         return Ok(None);
     };
     let effort = match name {
+        "none" => ThinkingEffort::None,
+        "minimal" => ThinkingEffort::Minimal,
         "low" => ThinkingEffort::Low,
         "medium" => ThinkingEffort::Medium,
         "high" => ThinkingEffort::High,
+        "xhigh" => ThinkingEffort::Xhigh,
         "max" => ThinkingEffort::Max,
         other => {
             return Err(RunnerError::Config(format!(
                 "api.reasoning_effort: unknown level {other:?}; expected one of \
-                 low, medium, high, max"
+                 none, minimal, low, medium, high, xhigh, max"
             )));
         }
     };
@@ -661,6 +688,7 @@ fn candidate_env_vars(api_type: ApiType) -> Vec<&'static str> {
         ApiType::Anthropic => vec!["ANTHROPIC_API_KEY"],
         ApiType::Gemini => vec!["GEMINI_API_KEY", "GOOGLE_API_KEY"],
         ApiType::Ollama
+        | ApiType::SelfHosted
         | ApiType::DeepSeek
         | ApiType::Grok
         | ApiType::Azure
@@ -705,7 +733,15 @@ mod tests {
 
     #[test]
     fn effort_mapping_accepts_each_level_and_rejects_the_unknown() {
-        for (name, _) in [("low", 0), ("medium", 1), ("high", 2), ("max", 3)] {
+        for (name, _) in [
+            ("none", 0),
+            ("minimal", 1),
+            ("low", 2),
+            ("medium", 3),
+            ("high", 4),
+            ("xhigh", 5),
+            ("max", 6),
+        ] {
             let mut c = cfg(ApiType::OpenAi, "https://api.openai.com/v1", Some("k"));
             c.reasoning_effort = Some(name.to_string());
             let effort = effort_from_config(&c)
@@ -736,6 +772,27 @@ mod tests {
     fn anthropic_happy_path() {
         let c = cfg(ApiType::Anthropic, "https://api.anthropic.com", Some("k"));
         let client = create_client(&c).expect("anthropic builds");
+        assert_eq!(client.model(), "test-model");
+    }
+
+    #[test]
+    fn self_hosted_builds_without_a_key_on_the_local_port() {
+        // The bring-your-own-server arm: no credential configured, no
+        // environment consulted — the placeholder key rides the header
+        // the OpenAI wire requires, and the endpoint lands on the
+        // local default when config names none.
+        let c = cfg(ApiType::SelfHosted, "", None);
+        let client = create_client(&c).expect("self-hosted builds with no key");
+        assert_eq!(client.model(), "test-model");
+        assert_eq!(
+            client.base_url(),
+            "http://localhost:8080/v1",
+            "the empty-config endpoint is the config table's stock host, \
+             not a second spelling of it"
+        );
+        let c = cfg(ApiType::SelfHosted, "http://127.0.0.1:9/v1", None);
+        let client = create_client(&c).expect("self-hosted builds on a named endpoint");
+        assert_eq!(client.base_url(), "http://127.0.0.1:9/v1");
         assert_eq!(client.model(), "test-model");
     }
 

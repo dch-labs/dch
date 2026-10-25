@@ -5,3 +5,5 @@
 .DS_Store
 run.err
 run.out
+
+.cargo/config.toml

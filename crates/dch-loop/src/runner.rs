@@ -291,6 +291,21 @@ impl Runner {
         self.inner.cancel_signal()
     }
 
+    /// The shared steering slot, cloned from the inner loop.
+    ///
+    /// For the host that lets a user speak to a run already in flight:
+    /// the returned handle reaches the slot the loop itself drains at
+    /// each turn boundary, so guidance joins the conversation the model
+    /// continues instead of opening another one. It is a clone rather
+    /// than a borrow for the same reason as
+    /// [`cancel_signal`](Runner::cancel_signal) — the task driving a
+    /// session lives inside [`run`](Runner::run)'s mutable borrow, so a
+    /// seam into the run has to reach it from outside the loop.
+    #[must_use]
+    pub fn steering(&self) -> Arc<loopctl::engine::Steering> {
+        self.inner.steering()
+    }
+
     /// A reference to the shared runner context.
     ///
     /// The returned `RunnerContext` exposes the shared todo list (behind an
@@ -314,6 +329,38 @@ impl Runner {
     #[must_use]
     pub fn committed_history(&self) -> Vec<Message> {
         self.inner.machine().history().to_vec()
+    }
+
+    /// Cut the committed history back to a length seen before a turn.
+    ///
+    /// The host's way to un-ask a prompt: `rewind_to` on the loop's own
+    /// machine, so the turn appended after `len` leaves the conversation
+    /// the model reads, and the session goes on reading it as though that
+    /// turn never ran. dch uses it when the user commits an edit to a
+    /// prompt the run had already claimed — the corrected wording
+    /// replaces the turn that went out rather than arguing with it in the
+    /// same context.
+    ///
+    /// Valid between runs only: the machine refuses while a turn is in
+    /// flight, and a cancelled run has to resolve first. The cut snaps to
+    /// a turn boundary, so no tool result is orphaned from its call, and
+    /// the loop keeps its machine, its observers, and every
+    /// [`cancel_signal`](Self::cancel_signal) clone already handed out —
+    /// nothing is rebuilt, which is the whole reason this exists instead
+    /// of a fresh loop seeded with shorter history.
+    ///
+    /// Returns the number of messages removed; a `len` at or beyond the
+    /// current length removes nothing and reports so.
+    ///
+    /// # Errors
+    ///
+    /// [`LoopError::InvalidInput`] when a turn is in flight — the run has
+    /// to be cancelled and allowed to resolve first. Everything else is an
+    /// `Ok`: a `len` past the end of the history is a no-op, not a failure.
+    ///
+    /// [`rewind_to`]: loopctl::engine::core::LoopMachine::rewind_to
+    pub fn rewind_history_to(&mut self, len: usize) -> Result<usize, LoopError> {
+        self.inner.rewind_history_to(len)
     }
 
     /// The context window this runner's thresholds divide by.
@@ -3102,6 +3149,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_refused_write_leaves_the_baseline_armed_for_the_revert() {
+        // read → external change → write (refused) → byte-identical
+        // revert → write: only a successful write refreshes the
+        // recorded baseline, so the refused write in the middle arms
+        // nothing — the revert restores exactly the bytes the model
+        // last saw, and the write over them lands.
+        let dir = TempDir::new().expect("tempdir");
+        let target = dir.path().join("watched.txt");
+        std::fs::write(&target, "v1").expect("seed target");
+        let pipeline = fs_pipeline(dir.path(), false);
+
+        let read = drive(
+            &pipeline,
+            "Read",
+            serde_json::json!({"path": "watched.txt"}),
+        )
+        .await;
+        assert!(!read.is_error, "{}", read.output);
+
+        std::fs::write(&target, "external").expect("external change");
+        let refused = drive(
+            &pipeline,
+            "Write",
+            serde_json::json!({"file_path": "watched.txt", "content": "ours"}),
+        )
+        .await;
+        assert!(refused.is_error, "a stale write is refused: {refused:?}");
+        assert!(
+            refused.output.to_string().contains("changed on disk"),
+            "the refusal names the staleness it refused: {refused:?}"
+        );
+
+        std::fs::write(&target, "v1").expect("byte-identical revert");
+        let reverted = drive(
+            &pipeline,
+            "Write",
+            serde_json::json!({"file_path": "watched.txt", "content": "ours"}),
+        )
+        .await;
+        assert!(
+            !reverted.is_error,
+            "the refusal refreshed nothing, so the revert reads as unchanged: {}",
+            reverted.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap_or_default(),
+            "ours",
+            "the write lands over the reverted content"
+        );
+    }
+
+    #[tokio::test]
     async fn a_conflict_on_the_second_write_leaves_the_first_write_landed() {
         // Two writes in one model turn: the fresh file lands, the stale one
         // is held. Dispatches are independent — one call's refusal never
@@ -3596,6 +3695,120 @@ mod tests {
             std::fs::read_to_string(dir.path().join("env.conf")).unwrap_or_default(),
             "api_key=abcdefghijklmnop\nport = 8080\n",
             "the true bytes survive the refused write"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_write_over_a_redacted_read_sent_through_the_path_alias_is_refused() {
+        // The alias the fs family documents — `path` where the schemas
+        // advertise `file_path` — serves the write tool as surely as the
+        // canonical spelling, so the overwrite guard reads the field the
+        // same way: a whole-file write spelled through the drift's key
+        // is refused over redacted content, and the true bytes survive
+        // exactly as the canonical spelling's refusal leaves them.
+        let dir = TempDir::new().expect("tempdir");
+        std::fs::write(
+            dir.path().join("env.conf"),
+            "api_key=abcdefghijklmnop\nport = 8080\n",
+        )
+        .expect("seed the secret-bearing file");
+        let pipeline = fs_pipeline(dir.path(), true);
+
+        let read = drive(&pipeline, "Read", serde_json::json!({"path": "env.conf"})).await;
+        assert!(!read.is_error, "{}", read.output);
+        assert!(
+            read.output.to_string().contains("[REDACTED:"),
+            "the redaction layer must be scrubbing the read: {read:?}"
+        );
+
+        let write = drive(
+            &pipeline,
+            "Write",
+            serde_json::json!({
+                "path": "env.conf",
+                "content": "api_key=[REDACTED:api_key_kv]\nport = 8080\n"
+            }),
+        )
+        .await;
+        assert!(
+            write.is_error,
+            "the alias spelling names the same target the canonical does: {write:?}"
+        );
+        let refusal = write.output.to_string();
+        assert!(
+            refusal.contains("env.conf") && refusal.contains("Edit"),
+            "the refusal names the target and the surgical path whatever key spelled it: {refusal}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("env.conf")).unwrap_or_default(),
+            "api_key=abcdefghijklmnop\nport = 8080\n",
+            "the true bytes survive the alias-spelled refusal too"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_alias_spelled_write_at_a_pipe_is_refused_by_the_target_gate() {
+        // The gate's contract in the drift's own spelling: a write whose
+        // destination is a FIFO would rename an ordinary file over the
+        // endpoint another process waits on, and a target read through
+        // the `path` alias meets the same refusal — the gate settles
+        // the destination the way the tool resolves it.
+        let dir = TempDir::new().expect("tempdir");
+        let fifo = dir.path().join("pipe.conf");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo runs");
+        assert!(status.success(), "the fifo fixture exists");
+        let pipeline = fs_pipeline(dir.path(), true);
+
+        let write = drive(
+            &pipeline,
+            "Write",
+            serde_json::json!({"path": "pipe.conf", "content": "payload"}),
+        )
+        .await;
+        assert!(
+            write.is_error,
+            "a pipe destination refuses the write through the alias: {write:?}"
+        );
+        let refusal = write.output.to_string();
+        assert!(
+            refusal.contains("pipe.conf") && refusal.contains("FIFO"),
+            "the gate names the target and its kind whatever key spelled it: {refusal}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_alias_spelled_multi_edit_entry_meets_the_same_target_gate() {
+        // One batch names several files, and each entry may spell its
+        // target through the alias: the gate walks the array resolving
+        // the field the way the tool does, so a per-edit `path` at an
+        // unreplaceable destination is refused like the canonical —
+        // and a passable entry ahead of it does not hide the bad one.
+        let dir = TempDir::new().expect("tempdir");
+        std::fs::create_dir(dir.path().join("nested")).expect("a directory target");
+        let pipeline = fs_pipeline(dir.path(), true);
+
+        let batch = drive(
+            &pipeline,
+            "MultiEdit",
+            serde_json::json!({
+                "edits": [
+                    {"path": "plain.txt", "old_text": "a", "new_text": "b"},
+                    {"path": "nested", "old_text": "a", "new_text": "b"},
+                ]
+            }),
+        )
+        .await;
+        assert!(
+            batch.is_error,
+            "a directory destination refuses the batch through the alias: {batch:?}"
+        );
+        let refusal = batch.output.to_string();
+        assert!(
+            refusal.contains("nested") && refusal.contains("directory"),
+            "the gate names the walked entry's target and kind: {refusal}"
         );
     }
 
@@ -4816,6 +5029,69 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unset_window_adopts_the_model_listing_answer() {
+        // The servers without a /props document — vLLM and its kin —
+        // publish each model's window on the listing route instead;
+        // discovery reads it there when the capability document has
+        // no answer.
+        let server = SseServer::start(vec![
+            r#"{"unrelated": true}"#.to_string(),
+            r#"{"object":"list","data":[{"id":"test-model","max_model_len":262144,"meta":{"n_ctx":262144}}]}"#
+                .to_string(),
+            sse_text_turn("answer"),
+        ])
+        .await;
+        let dir = TempDir::new().expect("tempdir");
+        let mut config = wire_config(server.port, 7);
+        config.api.context_window = None;
+        let mut runner = Runner::builder(&config, dir.path())
+            .build()
+            .await
+            .expect("constructs");
+        assert_eq!(
+            runner.context_window(),
+            262_144,
+            "the listing's answer sizes the session when /props has none - unscaled, \
+             this family reports usage and calibrates"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("hi"))
+            .await
+            .expect("run completes")
+            .expect("run succeeds");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unset_window_adopts_the_known_model_table() {
+        // A cloud provider publishes no window anywhere its client can
+        // ask; after both live questions go unanswered, the
+        // documented-model table sizes the session.
+        let server = SseServer::start(vec![
+            r#"{"unrelated": true}"#.to_string(),
+            r#"{"object":"list","data":[{"id":"other-model"}]}"#.to_string(),
+            sse_text_turn("answer"),
+        ])
+        .await;
+        let dir = TempDir::new().expect("tempdir");
+        let mut config = wire_config(server.port, 7);
+        config.api.model = "glm-5.3".to_string();
+        config.api.context_window = None;
+        let mut runner = Runner::builder(&config, dir.path())
+            .build()
+            .await
+            .expect("constructs");
+        assert_eq!(
+            runner.context_window(),
+            1_000_000,
+            "the documented table sizes a model the server never names - unscaled, \
+             this family reports usage and calibrates"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("hi"))
+            .await
+            .expect("run completes")
+            .expect("run succeeds");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unset_window_adopts_the_discovered_one() {
         let props = r#"{"n_ctx": 520000, "total_slots": 4}"#.to_string();
         let chunk = "payload line for the context budget\n".repeat(400);
@@ -4854,7 +5130,8 @@ mod tests {
         assert_eq!(
             runner.context_window(),
             130_000,
-            "the provider's per-request share becomes the window"
+            "the provider's per-request share becomes the window - unscaled, \
+             this family reports usage and calibrates"
         );
         let run = tokio::time::timeout(std::time::Duration::from_secs(20), runner.run("grow"))
             .await
@@ -5354,6 +5631,166 @@ mod tests {
             matches!(result, Ok(Err(_))),
             "expected an Err from run against a refused endpoint, got {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn the_steering_handle_is_the_loops_own_shared_slot() {
+        // The handle is the whole seam, so it has to be one slot: a fresh
+        // slot per call would let a host steer a loop that never reads it.
+        let dir = TempDir::new().expect("tempdir");
+        let runner = Runner::builder(&offline_config(), dir.path())
+            .build()
+            .await
+            .expect("Runner::new constructs");
+        let handle = runner.steering();
+        assert!(
+            Arc::ptr_eq(&handle, &runner.steering()),
+            "every call hands out the loop's own slot, not another one"
+        );
+        assert!(
+            handle.is_empty(),
+            "a session that never ran has nothing waiting"
+        );
+        assert!(
+            !handle.push(loopctl::message::Message::user("too early")),
+            "with no run in flight the loop refuses the offer rather than storing it"
+        );
+        assert!(
+            handle.take_all().is_empty(),
+            "a refused offer is not stored anywhere: the caller still holds the \
+             text, which is what lets a host deliver it another way"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn guidance_reaches_the_model_at_the_next_turn_boundary() {
+        // The first response is held back, so the offer provably lands while
+        // the run is open and before any boundary — and the law says where it
+        // goes next: not into the request already in flight, but into the one
+        // after the tool result.
+        let dir = TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join("seed.txt"), "seeded").expect("seed the workdir");
+        let server = SseServer::start_with_delay(
+            vec![
+                sse_tool_call_turn("Read", &serde_json::json!({"path": "seed.txt"})),
+                sse_text_turn("guided"),
+            ],
+            std::time::Duration::from_millis(700),
+        )
+        .await;
+        let runner = Runner::builder(&wire_config(server.port, 10), dir.path())
+            .build()
+            .await
+            .expect("constructs");
+        let seam = runner.steering();
+        let task = tokio::spawn(async move {
+            let mut runner = runner;
+            tokio::time::timeout(std::time::Duration::from_secs(30), runner.run("read it"))
+                .await
+                .expect("the run settles within its budget")
+        });
+
+        // Wait until the first request has been sent and is sitting on the
+        // held-back response: from here the guidance cannot reach that
+        // request by any legitimate route, which is the half of the timing
+        // law worth pinning.
+        for _ in 0..400 {
+            if !recorded_requests(&server).is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            recorded_requests(&server).len(),
+            1,
+            "the first request is in flight when the guidance is offered"
+        );
+        // A sentinel rather than a phrase: the request body carries the
+        // system prompt and the tool schemas, where ordinary words appear
+        // by coincidence and a negative assertion would prove nothing.
+        assert!(
+            seam.push(loopctl::message::Message::user(
+                "the file it reads next is generated, steer-9v4q"
+            )),
+            "the run in flight took the guidance"
+        );
+
+        let run = task
+            .await
+            .expect("the task joins")
+            .expect("the run succeeds");
+        assert_eq!(run.output.as_deref(), Some("guided"));
+        assert!(
+            seam.is_empty(),
+            "the loop drained its slot at the boundary, so nothing is owed back"
+        );
+        let requests = recorded_requests(&server);
+        assert!(
+            requests.len() >= 2,
+            "a tool turn then the answer: {requests:?}"
+        );
+        assert!(
+            !requests[0].contains("steer-9v4q"),
+            "the guidance cannot retroactively enter the request already sent"
+        );
+        assert!(
+            requests[1].contains("steer-9v4q"),
+            "the guidance rides the follow-up request, in the conversation the \
+             model continues: {:?}",
+            requests[1]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn guidance_the_run_never_reads_is_left_for_the_host() {
+        // One turn, no boundary after it: the guidance was accepted, and the
+        // run ended anyway. The seam's other law — the host gets it back, so
+        // nothing the user typed dies in a slot nobody will drain again.
+        let server = SseServer::start_with_delay(
+            vec![sse_text_turn("answered")],
+            std::time::Duration::from_millis(700),
+        )
+        .await;
+        let dir = TempDir::new().expect("tempdir");
+        let runner = Runner::builder(&wire_config(server.port, 10), dir.path())
+            .build()
+            .await
+            .expect("constructs");
+        let seam = runner.steering();
+        let task = tokio::spawn(async move {
+            let mut runner = runner;
+            tokio::time::timeout(std::time::Duration::from_secs(30), runner.run("answer"))
+                .await
+                .expect("the run settles within its budget")
+        });
+
+        let mut offered = false;
+        for _ in 0..400 {
+            if seam.push(loopctl::message::Message::user("advice that arrived late")) {
+                offered = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(offered, "the run in flight took the guidance");
+
+        let run = task
+            .await
+            .expect("the task joins")
+            .expect("the run succeeds");
+        assert_eq!(run.output.as_deref(), Some("answered"));
+        let left = seam.take_all();
+        let texts: Vec<String> = left
+            .iter()
+            .map(loopctl::message::Message::text_content)
+            .collect();
+        assert_eq!(
+            texts,
+            ["advice that arrived late"],
+            "what the run never reached comes back to the host, in the order it \
+             arrived"
+        );
+        assert!(seam.is_empty(), "taking it clears the slot");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
