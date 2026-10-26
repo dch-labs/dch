@@ -3813,6 +3813,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_multi_edit_entry_falling_onto_the_batch_default_is_gated_too() {
+        // The batch default is a destination like any other: an entry
+        // that carries no path of its own resolves onto the top-level
+        // `file_path`, so a batch defaulting onto a FIFO must be
+        // refused even though no entry names it — the schema
+        // advertises that default, a model sends it, and the walk
+        // that skipped it would let the tool read the FIFO or rename
+        // an ordinary file over the endpoint. A passable entry ahead
+        // of the pathless one must not hide it, exactly as the
+        // walked-alias pin holds for spelled targets.
+        let dir = TempDir::new().expect("tempdir");
+        let fifo = dir.path().join("notify");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo runs");
+        assert!(status.success(), "the fifo fixture exists");
+        std::fs::write(dir.path().join("plain.txt"), "a").expect("seed a plain file");
+        let pipeline = fs_pipeline(dir.path(), true);
+
+        let batch = drive(
+            &pipeline,
+            "MultiEdit",
+            serde_json::json!({
+                "file_path": "notify",
+                "edits": [
+                    {"file_path": "plain.txt", "old_text": "a", "new_text": "b"},
+                    {"old_text": "a", "new_text": "c"},
+                ]
+            }),
+        )
+        .await;
+        assert!(
+            batch.is_error,
+            "an entry defaulting onto the pipe is refused before anything runs: {batch:?}"
+        );
+        let refusal = batch.output.to_string();
+        assert!(
+            refusal.contains("notify") && refusal.contains("FIFO"),
+            "the refusal names the default-leg target and its kind: {refusal}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mistyped_entry_path_does_not_borrow_the_gated_default() {
+        // The default is only for entries that name nothing. An entry
+        // mistyping its own `file_path` is refused by the tool on the
+        // entry itself, before the default is consulted — so a gate
+        // that mirrored that fallthrough would refuse on the default
+        // target where the batch never reaches it. The batch is still
+        // an error either way; this pin is about which hand answers:
+        // the tool's teaching error on the mistyped entry, not the
+        // gate's verdict on a destination this call cannot land on.
+        let dir = TempDir::new().expect("tempdir");
+        std::fs::create_dir(dir.path().join("nested")).expect("a directory target");
+        let pipeline = fs_pipeline(dir.path(), true);
+
+        let batch = drive(
+            &pipeline,
+            "MultiEdit",
+            serde_json::json!({
+                "file_path": "nested",
+                "edits": [{"file_path": 42, "old_text": "a", "new_text": "b"}]
+            }),
+        )
+        .await;
+        assert!(
+            batch.is_error,
+            "a mistyped entry path is refused: {batch:?}"
+        );
+        let refusal = batch.output.to_string();
+        assert!(
+            refusal.contains("must be a string"),
+            "the tool answers on the mistyped entry, the hand the tool itself raises: {refusal}"
+        );
+        assert!(
+            !refusal.contains("not a regular file"),
+            "the gate does not judge the default for an entry that never reaches it: {refusal}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_write_to_a_file_the_redactor_does_not_match_still_lands_under_redaction() {
         let dir = TempDir::new().expect("tempdir");
         std::fs::write(dir.path().join("plain.conf"), "port = 8080\n").expect("seed plain file");

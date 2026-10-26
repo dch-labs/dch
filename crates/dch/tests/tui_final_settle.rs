@@ -49,13 +49,16 @@ fn the_final_answer_renders_with_no_input_after_the_run_ends() {
             break;
         }
         if std::time::Instant::now() >= deadline {
-            let i = screen
-                .find("duration")
-                .or_else(|| screen.find("s\x1b["))
-                .unwrap_or(0);
-            let lo = i.saturating_sub(160);
-            println!("RAWTAIL {:?}", &screen[lo..screen.len().min(i + 160)]);
-            panic!("deadline");
+            let plain = strip_escapes(&screen);
+            let tail: String = plain
+                .chars()
+                .rev()
+                .take(400)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            panic!("the run never showed its graduated duration; screen tail: {tail:?}");
         }
         std::thread::sleep(Duration::from_millis(50));
     }

@@ -363,7 +363,7 @@ async fn run_headless_inner(
                     .saturating_add(compaction_counter.load(std::sync::atomic::Ordering::SeqCst)),
             );
             bridge.stop().await;
-            Err(outcome)
+            Ok(outcome)
         }
     }
 }

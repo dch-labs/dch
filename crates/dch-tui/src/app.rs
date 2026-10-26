@@ -1286,6 +1286,18 @@ pub struct TuiApp {
     /// both halves of it.
     quit: QuitState,
 
+    /// The flag the engine driver gates every claim and start on.
+    ///
+    /// The exit's share of the quit contract: the press that fires
+    /// the ladder raises this before calling the canceller, so the
+    /// cancel the exit itself causes cannot release the driver's
+    /// claim on the queue's next prompt — a claim made after the
+    /// fire spends a prompt the exit still believes waiting, and
+    /// resumes it forever as a stop no one asked for. Hosts that
+    /// never install one (tests, headless) carry a flag nobody
+    /// raises.
+    shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
+
     /// How a double Esc cancels the run in flight, when one is.
     ///
     /// Installed by the mode driver alongside the shared running
@@ -1685,6 +1697,7 @@ impl TuiApp {
             conversation_generation: 1,
             conversation_cache_generation: 0,
             quit: QuitState::default(),
+            shutdown_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             run_canceller: None,
             cancel_arm: false,
             expanded_tools: std::collections::HashSet::new(),
@@ -2020,6 +2033,19 @@ impl TuiApp {
     /// submission in flight.
     pub fn set_run_canceller(&mut self, canceller: Box<dyn Fn()>) {
         self.run_canceller = Some(canceller);
+    }
+
+    /// Install the shared shutdown flag the engine driver gates on.
+    ///
+    /// The display's half of the exit contract: the press that fires
+    /// the quit ladder stores this flag before calling the run
+    /// canceller, so the driver — whose next claim the exit's own
+    /// cancel would otherwise release — refuses every submission
+    /// queued behind a quitting user. An ordinary cancel, Esc-Esc
+    /// or a correction's, never touches it: those release the queue
+    /// by design.
+    pub fn set_shutdown_flag(&mut self, flag: Arc<std::sync::atomic::AtomicBool>) {
+        self.shutdown_flag = flag;
     }
 
     /// Install a whole prior conversation as the session's starting
@@ -3312,9 +3338,6 @@ impl TuiApp {
                 true
             }
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                // The draft clears first, run or not: the press that
-                // would arm a running exit drops a paste the user
-                // never offered to it — clearing is not consenting.
                 if !self.input.is_empty() {
                     self.input.clear();
                     if self
@@ -3333,13 +3356,8 @@ impl TuiApp {
                     .agent_running
                     .load(std::sync::atomic::Ordering::SeqCst)
                 {
-                    // The Esc-Esc shape, with the exit riding the
-                    // fire: the first press only arms — a stray key
-                    // still stands it down — and the second is one
-                    // action that cancels the run exactly as Esc-Esc
-                    // does and terminates the program beside it. No
-                    // intermediate state, no separate cancel press.
                     if self.quit.armed {
+                        self.shutdown_flag.store(true, Ordering::SeqCst);
                         if let Some(cancel) = &self.run_canceller {
                             cancel();
                         }
@@ -3350,6 +3368,7 @@ impl TuiApp {
                         self.quit.arm();
                     }
                 } else if self.quit.armed {
+                    self.shutdown_flag.store(true, Ordering::SeqCst);
                     self.quit.requested = true;
                 } else {
                     self.quit.arm();

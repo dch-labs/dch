@@ -50,14 +50,20 @@ const EDIT_TOOL: &str = "Edit";
 /// The registered name of the batched edit tool.
 ///
 /// One call names several targets, each read before it is written, so the
-/// gate examines every path the batch carries rather than the first.
+/// gate examines every path the batch carries rather than the first —
+/// including the batch default a pathless entry falls onto, which the
+/// tool would otherwise read, stall on, or rename over.
 const MULTI_EDIT_TOOL: &str = "MultiEdit";
 
 /// The input field carrying the file a `Write` or `Edit` call replaces.
 ///
 /// Both tools name their single destination here, which is what lets one
 /// lookup serve them; a call whose input omits it has no target for the
-/// gate to settle, so it passes through for the tool to reject.
+/// gate to settle, so it passes through for the tool to reject. Under
+/// `MultiEdit` the same field carries the batch default instead — the
+/// destination every pathless entry falls onto — and the gate settles it
+/// through [`dispatch_targets`]' default leg, in this canonical spelling
+/// only, because that is the only spelling the tool resolves it under.
 const FILE_PATH_FIELD: &str = "file_path";
 
 /// The alias spelling the fs family also serves for the path field.
@@ -70,9 +76,12 @@ const PATH_FIELD: &str = "path";
 
 /// The input field carrying a `MultiEdit` call's edit operations.
 ///
-/// A batch spans files, so this tool carries no top-level destination —
-/// each entry of the array names its own, and the gate walks the array for
-/// the same reason the tool does.
+/// A batch spans files: each entry names its own target, and an entry
+/// that names none falls onto the top-level `file_path` — the batch
+/// default. The gate walks the array for the same reason the tool does,
+/// and consults that default for every pathless entry, so the
+/// destination the batch would actually write is the destination the
+/// gate settled.
 const EDITS_FIELD: &str = "edits";
 
 /// Refuse write-family calls whose target exists and is not a regular file.
@@ -144,10 +153,13 @@ impl ToolMiddleware for WriteTargetGate {
 
 /// The file paths a write-family dispatch would overwrite, in call order.
 ///
-/// `Write` and `Edit` name one target at the top level; a `MultiEdit` call
-/// carries a path per entry of its `edits` array, because one batch spans
-/// several files. Both spellings the fs family serves — the canonical
-/// `file_path` and the `path` alias — name the target here, read through
+/// `Write` and `Edit` name one target at the top level; a `MultiEdit`
+/// call carries a path per entry of its `edits` array, falling back to
+/// the top-level `file_path` for any entry naming none — the batch
+/// default the tool would write, so the gate settles it too (canonical
+/// spelling only, as the tool resolves it only there). Both spellings
+/// the fs family serves — the canonical `file_path` and the `path`
+/// alias — name an entry's own target, read through
 /// [`write_family_path`] so a destination cannot slip the gate by its
 /// spelling. Any other dispatch returns nothing, which is how the gate
 /// stays out of every call it was not asked to police.
@@ -157,19 +169,45 @@ fn dispatch_targets(ctx: &ToolDispatchContext) -> Vec<String> {
             .map(str::to_string)
             .into_iter()
             .collect(),
-        MULTI_EDIT_TOOL => ctx
-            .input
-            .get(EDITS_FIELD)
-            .and_then(|value| value.as_array())
-            .map(|edits| {
-                edits
-                    .iter()
-                    .filter_map(write_family_path)
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default(),
+        MULTI_EDIT_TOOL => {
+            let batch_default = ctx
+                .input
+                .get(FILE_PATH_FIELD)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            ctx.input
+                .get(EDITS_FIELD)
+                .and_then(|value| value.as_array())
+                .map(|edits| {
+                    edits
+                        .iter()
+                        .filter_map(|edit| edit_target(edit, batch_default.as_deref()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
         _ => Vec::new(),
+    }
+}
+
+/// The file one `MultiEdit` entry would overwrite, default leg included.
+///
+/// The batch resolves an entry with no path of its own onto the
+/// top-level `file_path`, so the gate mirrors the tool's precedence
+/// exactly: the entry's own path when it names one (canonical first,
+/// alias when the canonical is absent entirely), the batch default when
+/// the entry names nothing at all, and nothing only when the entry
+/// mistypes its own `file_path` — a call the tool refuses on the entry
+/// itself, before the default is ever consulted, so the default is no
+/// target that batch reaches.
+fn edit_target(edit: &serde_json::Value, batch_default: Option<&str>) -> Option<String> {
+    match write_family_path(edit) {
+        Some(path) => Some(path.to_string()),
+        None => edit
+            .get(FILE_PATH_FIELD)
+            .is_none()
+            .then(|| batch_default.map(str::to_string))
+            .flatten(),
     }
 }
 

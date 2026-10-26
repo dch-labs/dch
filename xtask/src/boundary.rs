@@ -91,6 +91,13 @@ fn is_bridge_family(name: &str) -> bool {
 /// header string — is what the parsed lookup keys on.
 const LOOPCTL_GIT_URL: &str = "https://github.com/dch-labs/loopctl.git";
 
+/// The binary's exact `dch-*` dependency set, the one place it is named.
+///
+/// Rule 4 enforces this set against `cargo metadata`, and the tests
+/// hold the binary's own manifest to it — a widening edits this list
+/// and every check reads the same names.
+const BINARY_DCH_DEPS: [&str; 4] = ["dch-config", "dch-loop", "dch-tools", "dch-tui"];
+
 /// Whether config text declares the local bridge.
 ///
 /// Declaration means a live TOML `[patch]` table keyed by
@@ -306,19 +313,15 @@ impl<'a> Checker<'a> {
             });
         }
 
-        let dch_binary_expected = vec![
-            "dch-config".to_string(),
-            "dch-loop".to_string(),
-            "dch-tools".to_string(),
-            "dch-tui".to_string(),
-        ];
+        let dch_binary_expected: Vec<String> = BINARY_DCH_DEPS.map(String::from).to_vec();
         if let Some(pkg) = find(self.pkgs, "dch") {
             let actual = dch_deps_of(pkg);
             if actual != dch_binary_expected {
                 out.push(Violation {
                     crate_name: "dch".into(),
                     detail: format!(
-                        "dch-* deps must be exactly {{dch-config, dch-loop, dch-tools, dch-tui}}, but are {{{}}}",
+                        "dch-* deps must be exactly {{{}}}, but are {{{}}}",
+                        BINARY_DCH_DEPS.join(", "),
                         actual.join(", ")
                     ),
                 });
@@ -831,22 +834,39 @@ mod tests {
     }
 
     #[test]
-    fn agents_table_names_the_enforced_binary_dependency_set() {
-        // The canon table and the enforcer must name the same set: a
-        // widening that updates one and not the other leaves a reader
-        // following AGENTS.md to call a legal dependency a violation.
-        let agents = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../AGENTS.md"))
-            .expect("AGENTS.md sits at the workspace root");
-        let row = agents
-            .lines()
-            .find(|line| line.starts_with("| `dch` (bin) |"))
-            .expect("the boundary table carries the binary's row");
-        for dep in ["dch-config", "dch-loop", "dch-tools", "dch-tui"] {
-            assert!(
-                row.contains(dep),
-                "AGENTS.md's binary row must name {dep} the enforcer \
-                 admits: {row}"
-            );
+    fn the_binary_manifest_names_the_enforced_dependency_set() {
+        // The enforced set and the binary's own manifest must agree:
+        // a widening that edits one and not the other ships a boundary
+        // the enforcer immediately flags as a violation.
+        let manifest = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../crates/dch/Cargo.toml"
+        ))
+        .expect("the binary's manifest sits in the workspace");
+        let mut section = "";
+        let mut declared: Vec<&str> = Vec::new();
+        for line in manifest.lines() {
+            if let Some(header) = line.strip_prefix('[') {
+                section = header.trim_end_matches(']');
+                continue;
+            }
+            if line.trim_start().starts_with('#') {
+                continue;
+            }
+            let Some((name, _)) = line.split_once('=') else {
+                continue;
+            };
+            if section == "dependencies" && name.trim().starts_with("dch-") {
+                declared.push(name.trim());
+            }
         }
+        declared.sort_unstable();
+        let mut enforced: Vec<&str> = BINARY_DCH_DEPS.to_vec();
+        enforced.sort_unstable();
+        assert_eq!(
+            declared, enforced,
+            "the binary's manifest and the boundary rules must name one \
+             dch-* dependency set"
+        );
     }
 }

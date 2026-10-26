@@ -180,17 +180,74 @@ struct TodoSubmission {
     todos: Vec<TodoEntryInput>,
 }
 
+/// Normalize a submission to the tool's accepted shape, in place.
+///
+/// The two repairs `TodoWrite` performs before its own parse, mirrored
+/// here so the display reads exactly the list the run acted on: a
+/// `todos` array that arrived double-encoded as a JSON string is
+/// decoded to the array it names, and each entry whose subject is
+/// absent, null, or blank has the derived subject written in — the
+/// same derivation the entry's row would fall back to, applied
+/// before the typed parse so the null spelling no longer fails it.
+fn normalize_submission(value: &mut serde_json::Value) {
+    if let Some(todos) = value.get_mut("todos")
+        && let Some(encoded) = todos.as_str()
+        && let Ok(decoded) = serde_json::from_str::<serde_json::Value>(encoded)
+    {
+        *todos = decoded;
+    }
+    let Some(todos) = value
+        .get_mut("todos")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    for entry in todos {
+        let Some(object) = entry.as_object_mut() else {
+            continue;
+        };
+        let subject_needs_deriving = object.get("subject").is_none_or(|subject| {
+            subject.is_null()
+                || subject
+                    .as_str()
+                    .is_none_or(|subject| subject.trim().is_empty())
+        });
+        if subject_needs_deriving {
+            let description = object
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let id = object
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            object.insert(
+                "subject".to_string(),
+                serde_json::Value::String(derived_subject(description, id)),
+            );
+        }
+    }
+}
+
 /// Parse a `TodoWrite` submission's input JSON into display rows.
 ///
 /// The tool's input is the whole truth: every call carries the
 /// complete list, so the newest call's rows are the current list and
 /// any older call's rows are that moment's snapshot — the same parse
 /// feeds the conversation's per-update blocks and the plan section's
-/// standing list. `None` when the text is not a submission the tool could
-/// have sent (not JSON, no `todos` array): the caller renders the
+/// standing list. The input is normalized to the tool's own
+/// acceptance first, so every shape `TodoWrite` repairs rather than
+/// rejects parses here too: a `todos` value that arrived JSON-encoded
+/// as a string is decoded, and a subject that is absent, null, or
+/// blank is derived from the entry's description — a submission the
+/// run accepted must never leave the plan panel stale. `None` when
+/// the text is not a submission the tool could have sent (not JSON,
+/// no `todos` array even after decoding): the caller renders the
 /// call the way any other tool renders.
 pub(crate) fn parse_submission(input_json: &str) -> Option<Vec<TodoRow>> {
-    let parsed: TodoSubmission = serde_json::from_str(input_json).ok()?;
+    let mut value: serde_json::Value = serde_json::from_str(input_json).ok()?;
+    normalize_submission(&mut value);
+    let parsed: TodoSubmission = serde_json::from_value(value).ok()?;
     Some(
         parsed
             .todos
@@ -494,6 +551,60 @@ pub(crate) fn section_lines(
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_null_subject_parses_to_the_derived_row() {
+        // The tool repairs a null subject rather than rejecting the
+        // call, so the run acted on the derived wording — the display
+        // must read the same list, or the plan panel keeps the last
+        // snapshot standing while the run moved on.
+        let rows = parse_submission(
+            r#"{"todos": [{"id": "t1", "subject": null,
+                          "description": "ship the fix\nthen rest",
+                          "status": "pending"}]}"#,
+        )
+        .expect("a null subject parses the way the tool accepts it");
+        assert_eq!(
+            rows.first().map(|row| row.subject.as_str()),
+            Some("ship the fix"),
+            "the row carries the derived subject the run acted on"
+        );
+    }
+
+    #[test]
+    fn a_json_encoded_todos_array_parses_to_its_rows() {
+        // A double-encoded list — the whole array riding as a JSON
+        // string — is the other shape the tool repairs before its own
+        // parse; the display decodes it the same way, so the plan
+        // panel renders the update the run accepted instead of
+        // skipping it as unparseable.
+        let encoded = serde_json::to_string(&[serde_json::json!({
+            "id": "t1",
+            "subject": "close the list",
+            "status": "in_progress"
+        })])
+        .expect("the fixture encodes");
+        let input = serde_json::json!({ "todos": encoded }).to_string();
+        let rows =
+            parse_submission(&input).expect("an encoded array parses the way the tool accepts it");
+        assert_eq!(
+            rows.first().map(|row| row.subject.as_str()),
+            Some("close the list"),
+            "the decoded array's rows are the plan"
+        );
+    }
+
+    #[test]
+    fn a_submission_without_a_todos_key_still_refuses() {
+        // The repairs widen acceptance only to what the tool itself
+        // accepts: a payload with no `todos` at all — before or after
+        // decoding — is not a submission, and the caller renders it
+        // as an ordinary tool block.
+        assert!(
+            parse_submission(r#"{"note": "not a list"}"#).is_none(),
+            "the normalization does not invent a list"
+        );
+    }
 
     #[test]
     fn a_budget_that_pays_for_no_rows_names_every_task() {

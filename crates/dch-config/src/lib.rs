@@ -1595,9 +1595,31 @@ impl DchConfig {
     /// assert_eq!(config.api.model, "m");
     /// ```
     pub fn from_toml_str(text: &str) -> Result<Self, DchConfigError> {
-        let config: Self = toml::from_str(text)?;
+        let mut config: Self = toml::from_str(text)?;
+        config.trim_model_names();
         config.validate()?;
         Ok(config)
+    }
+
+    /// Fold model-name whitespace out of the names as stored.
+    ///
+    /// A model name is an identity, and an identity a stray space can
+    /// hide is one every later comparison can misread: the selection
+    /// match, the base-model fallback, the duplicate check, and the
+    /// list a refusal prints all speak the trimmed spelling — a base
+    /// carrying editor padding would be listed under one spelling and
+    /// refused under another. So the padding is folded away once here,
+    /// at the single point a file becomes a config, and the name that
+    /// later rides a provider request is the model, never the space
+    /// beside it. The comparisons themselves trim too (see
+    /// [`select_model`](Self::select_model) and
+    /// [`validate_models`](Self::validate_models)), so a config
+    /// assembled in code rather than parsed behaves like one loaded.
+    fn trim_model_names(&mut self) {
+        self.api.model = self.api.model.trim().to_string();
+        for entry in &mut self.models {
+            entry.model = entry.model.trim().to_string();
+        }
     }
 
     /// The model names `--model` can choose among, in file order.
@@ -1697,9 +1719,7 @@ impl DchConfig {
                 self.api = entry.apply_onto(&self.api);
                 Ok(())
             }
-            // An entry list may leave [api]'s own model off it — the name still
-            // means the settings [api] already carries.
-            None if self.api.model.eq_ignore_ascii_case(wanted) => Ok(()),
+            None if self.api.model.trim().eq_ignore_ascii_case(wanted) => Ok(()),
             None => Err(DchConfigError::UnknownModel {
                 requested: wanted.to_string(),
                 available: self.model_names().join(", "),
@@ -1761,7 +1781,7 @@ impl DchConfig {
     /// Returns [`DchConfigError::Invalid`] for an entry naming no model or for
     /// two entries sharing one name.
     fn validate_models(&self) -> Result<(), DchConfigError> {
-        let mut seen: Vec<&str> = Vec::new();
+        let mut seen: Vec<String> = Vec::new();
         for entry in &self.models {
             if entry.model.trim().is_empty() {
                 return Err(DchConfigError::Invalid(
@@ -1770,9 +1790,10 @@ impl DchConfig {
                         .to_string(),
                 ));
             }
+            let named = entry.model.trim();
             if seen
                 .iter()
-                .any(|named| named.eq_ignore_ascii_case(&entry.model))
+                .any(|seen: &String| seen.eq_ignore_ascii_case(named))
             {
                 return Err(DchConfigError::Invalid(format!(
                     "duplicate [[models]] entry for model {:?}: --model could not choose \
@@ -1780,7 +1801,7 @@ impl DchConfig {
                     entry.model
                 )));
             }
-            seen.push(entry.model.as_str());
+            seen.push(named.to_string());
         }
         Ok(())
     }
@@ -3054,6 +3075,44 @@ context_window = 210_000
             config.model_names(),
             vec!["glm-5.3"],
             "the base is listed by the name a selection matches, not the raw padding"
+        );
+    }
+
+    #[test]
+    fn a_padded_base_model_selects_by_the_name_it_is_listed_under() {
+        // Listing and selecting are one contract: the name the refusal
+        // prints is the name `select_model` takes, whatever padding
+        // the file carried. Compared raw, a padded base is listed as
+        // `glm-5.3` and then refused as unknown — an error naming the
+        // model as available while refusing it.
+        let mut config = DchConfig::from_toml_str(
+            "[api]\nmodel = \"  glm-5.3  \"\n\
+             [[models]]\nmodel = \"other\"\n",
+        )
+        .expect("a padded base parses");
+        config
+            .select_model(Some("glm-5.3"))
+            .expect("the listed name selects its own base model");
+        assert_eq!(
+            config.api.model, "glm-5.3",
+            "selection keeps [api]'s settings for the base's own name"
+        );
+    }
+
+    #[test]
+    fn two_entries_sharing_a_name_under_padding_fail_the_load() {
+        // "glm" and "glm " name one model to `--model`, and the
+        // duplicate check folds names the way selection does — an
+        // editor's stray space must not mint a second identity no
+        // selection could ever tell from the first.
+        let err = DchConfig::from_toml_str(
+            "[api]\nmodel = \"base\"\n\
+             [[models]]\nmodel = \"glm\"\n[[models]]\nmodel = \"glm \"\n",
+        )
+        .expect_err("padding folds away, so these are the same name");
+        assert!(
+            err.to_string().to_lowercase().contains("glm"),
+            "the error names the doubled model: {err}"
         );
     }
 

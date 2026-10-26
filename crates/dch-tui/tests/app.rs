@@ -582,6 +582,112 @@ fn ctrl_c_ctrl_c_under_a_run_is_one_cancel_and_exit_action() {
     assert!(!app.is_quitting(), "nothing fires from stale intent");
 }
 #[test]
+fn the_ladder_press_raises_the_shutdown_flag_before_the_cancel() {
+    // The exit's own cancel releases the driver's next claim: the
+    // run resolves cancelled, and the driver reads the shutdown
+    // flag before it takes the queue's next prompt. The ladder
+    // therefore raises the flag in the same press, ahead of the
+    // canceller — and the pin is that order itself: the canceller,
+    // called by the fire, must find the flag already up. Raised
+    // only after the loop instead, a prompt queued behind the
+    // quitting user is claimed after the fire, missing from the
+    // exit's own snapshot, and resumed forever as a stop no one
+    // asked for.
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    kept.agent_running
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    app.set_shutdown_flag(Arc::clone(&flag));
+    let saw: Arc<std::sync::Mutex<Vec<bool>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&saw);
+    let at_cancel = Arc::clone(&flag);
+    app.set_run_canceller(Box::new(move || {
+        sink.lock()
+            .expect("sink")
+            .push(at_cancel.load(std::sync::atomic::Ordering::SeqCst));
+    }));
+
+    app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(
+        !flag.load(std::sync::atomic::Ordering::SeqCst),
+        "the arming press raises nothing — the flag belongs to the fire"
+    );
+    app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert_eq!(
+        *saw.lock().expect("sink"),
+        [true],
+        "the canceller was called once, and found the flag already raised beside it"
+    );
+    assert!(
+        flag.load(std::sync::atomic::Ordering::SeqCst) && app.is_quitting(),
+        "the flag stands with the exit requested"
+    );
+}
+
+#[test]
+fn the_esc_cancel_leaves_the_shutdown_flag_alone() {
+    // Cancel is not exit. Esc-Esc stops the run in flight and the
+    // session stays up, so the prompts queued behind the cancelled
+    // one are the designed next turns — the driver must keep
+    // claiming them. A flag raised by this press would strand the
+    // very backlog the cancel exists to release.
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    kept.agent_running
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    app.set_shutdown_flag(Arc::clone(&flag));
+    let cancels: Arc<std::sync::Mutex<usize>> = Arc::new(std::sync::Mutex::new(0));
+    let sink = Arc::clone(&cancels);
+    app.set_run_canceller(Box::new(move || {
+        *sink.lock().expect("sink") += 1;
+    }));
+
+    app.handle_event(&key(KeyCode::Esc, KeyModifiers::NONE));
+    app.handle_event(&key(KeyCode::Esc, KeyModifiers::NONE));
+    assert_eq!(
+        *cancels.lock().expect("sink"),
+        1,
+        "Esc-Esc cancelled the run as ever"
+    );
+    assert!(
+        !flag.load(std::sync::atomic::Ordering::SeqCst),
+        "a cancel that is not an exit never raises the driver's gate"
+    );
+    assert!(
+        !app.is_quitting(),
+        "and the session stays up to run what waits"
+    );
+}
+
+#[test]
+fn quitting_at_rest_raises_the_shutdown_flag_too() {
+    // The no-run half of the chord requests the exit with no run to
+    // cancel — and the flag still belongs up whatever the display
+    // sent last: a correction or prompt the driver has not pulled
+    // yet must not start into an exit that has already begun.
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    app.set_shutdown_flag(Arc::clone(&flag));
+
+    app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(app.is_quitting(), "the idle chord quits as ever");
+    assert!(
+        flag.load(std::sync::atomic::Ordering::SeqCst),
+        "and the same press gates the driver"
+    );
+}
+
+#[test]
 fn ctrl_c_clears_the_draft_before_arming_a_running_exit() {
     // The ladder under a run is clear, arm, fire — the same order it
     // keeps at rest. A press that armed the exit over a standing

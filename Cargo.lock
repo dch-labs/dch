@@ -1627,7 +1627,6 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 [[package]]
 name = "loopctl"
 version = "0.4.1"
-source = "git+https://github.com/dch-labs/loopctl.git?branch=master#e56d8712fcafb1440ace2e822635156cff6e444c"
 dependencies = [
  "async-stream",
  "base64 0.23.1",
@@ -1658,7 +1657,6 @@ dependencies = [
 [[package]]
 name = "loopctl-derive"
 version = "0.4.1"
-source = "git+https://github.com/dch-labs/loopctl.git?branch=master#e56d8712fcafb1440ace2e822635156cff6e444c"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",

@@ -200,11 +200,10 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
     dch_tui::arm_fatal_signal_restore();
 
     let cancel = runner.cancel_signal();
-    {
-        let cancel_for_app = Arc::clone(&cancel);
-        app.set_run_canceller(Box::new(move || cancel_for_app.cancel()));
-    }
     let shutting_down = Arc::new(AtomicBool::new(false));
+    let cancel_for_app = Arc::clone(&cancel);
+    app.set_run_canceller(Box::new(move || cancel_for_app.cancel()));
+    app.set_shutdown_flag(Arc::clone(&shutting_down));
     if let Some(machine) = &resumed_machine {
         let adopted = Arc::new(machine.clone());
         *state
@@ -1129,8 +1128,11 @@ fn apply_correction_cut(
 ///
 /// The loop ends when the channel closes or
 /// the shutdown flag is set: the engine clears its cancel signal at
-/// the end of every run, so the flag — raised before the cancel — is
-/// what keeps submissions queued behind a quitting user from ever
+/// the end of every run, so the flag — raised by the display at the
+/// very moment the quit ladder fires, before its cancel lands on
+/// the run in flight, and stored once more after the display loop
+/// as the backstop for every other route out — is what keeps
+/// submissions queued behind a quitting user from ever
 /// starting. The flag gates the loop condition, so it is checked
 /// before a queued submission is admitted, not only after a run
 /// returns — and once more when a parked receive wakes, so a
