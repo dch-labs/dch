@@ -48,32 +48,25 @@ fn the_final_answer_renders_with_no_input_after_the_run_ends() {
         if screen_shows_graduated_duration(&screen) {
             break;
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the pty never showed the graduated duration line; screen so far:\n{screen}"
-        );
+        if std::time::Instant::now() >= deadline {
+            let plain = strip_escapes(&screen);
+            let tail: String = plain
+                .chars()
+                .rev()
+                .take(400)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            panic!("the run never showed its graduated duration; screen tail: {tail:?}");
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
     // Now idle long enough for several blink frames (500 ms each) with
     // no input, then snapshot: the answer must already be visible.
     std::thread::sleep(Duration::from_millis(2500));
     let screen = session.snapshot();
-    let plain = {
-        let mut out = String::new();
-        let mut chars = screen.chars().peekable();
-        while let Some(c) = chars.next() {
-            if c == '\u{1b}' {
-                for next in chars.by_ref() {
-                    if next.is_ascii_alphabetic() {
-                        break;
-                    }
-                }
-            } else {
-                out.push(c);
-            }
-        }
-        out
-    };
+    let plain = strip_escapes(&screen);
     // The assertion matches the answer's words in order rather than
     // as a spaced phrase: a diff-driven repaint can position words by
     // cursor move instead of space glyphs, and the stripper cannot
@@ -92,35 +85,38 @@ fn the_final_answer_renders_with_no_input_after_the_run_ends() {
     session.quit_and_finish(Duration::from_secs(20));
 }
 
-/// Whether the screen shows a reply's graduated duration span.
+/// Strip the raw snapshot's escape sequences to plain text.
 ///
-/// The duration line graduates only with the run's end — the live
-/// stream never paints it — so it is the one marker that proves the
-/// engine finished rather than merely that answer text arrived. The
-/// snapshot is a raw cursor-addressed stream, not reconstructed rows,
-/// so the scan reads the span's own shape on the wire: an SGR
-/// terminator (`m`), the duration glyphs (`<1s`, `4s`, `2m 30s`), and
-/// the escape that closes the standalone span — a shape the live
-/// thinking row's `· <1s`, preceded by a space, cannot match.
+/// The snapshot is a cursor-addressed stream, not reconstructed rows;
+/// dropping every escape leaves the painted glyphs in paint order,
+/// which is what the answer-word scan above and the duration marker
+/// both read.
+fn strip_escapes(screen: &str) -> String {
+    let mut out = String::new();
+    let mut chars = screen.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for next in chars.by_ref() {
+                if next.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Whether the screen shows a reply's graduated duration line.
+///
+/// The duration line — the `duration` label and its elapsed total —
+/// graduates only with the run's end; the live stream never paints
+/// it. So its plain-text presence in the snapshot proves the engine
+/// finished rather than merely that answer text arrived. A diff
+/// repaint can address the line's cells by cursor move alone, and a
+/// restyle cannot insert letters into the label: the glyph sequence,
+/// not its byte neighbourhood, is the durable marker.
 fn screen_shows_graduated_duration(screen: &str) -> bool {
-    screen.match_indices('m').any(|(index, _)| {
-        let Some(after_style) = index
-            .checked_add(1)
-            .and_then(|after_style| screen.get(after_style..))
-        else {
-            return false;
-        };
-        let rest = after_style.strip_prefix('<').unwrap_or(after_style);
-        let measured = rest
-            .chars()
-            .take_while(|c| c.is_ascii_digit() || *c == ' ')
-            .count();
-        measured > 0
-            && rest
-                .get(measured..)
-                .is_some_and(|suffix| suffix.starts_with('s'))
-            && rest
-                .get(measured.saturating_add(1)..)
-                .is_some_and(|suffix| suffix.starts_with('\u{1b}'))
-    })
+    strip_escapes(screen).contains("duration ")
 }

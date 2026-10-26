@@ -49,6 +49,43 @@ fn app() -> TuiApp {
     TuiApp::new(config_with_theme("dracula"))
 }
 
+/// An app over observer state the test keeps a handle to, plus that state.
+///
+/// The shared queue is the seam between the two halves of a session, so a
+/// test that cares what is waiting reads it off the state rather than off
+/// what the channel happens to carry.
+fn app_with_state() -> (TuiApp, dch_tui::TuiObserverState) {
+    let (observer, kept) = dch_tui::TuiObserverState::new().into_observer();
+    drop(observer);
+    (
+        TuiApp::from_observer_state(config_with_theme("dracula"), kept.clone()),
+        kept,
+    )
+}
+
+/// The waiting prompt a submission names.
+///
+/// Enter hands the driver a `Run`; the channel's other message is a
+/// different test's subject, and naming it here beats a bare unwrap that
+/// says nothing when the wrong one turns up.
+fn run_id(submission: dch_tui::Submission) -> u64 {
+    match submission {
+        dch_tui::Submission::Run { id } => id,
+        other @ dch_tui::Submission::Correct { .. } => {
+            panic!("a plain submit hands over a run, got {other:?}")
+        }
+    }
+}
+
+/// What the shared queue holds, as `(id, text)` pairs in send order.
+fn waiting(kept: &dch_tui::TuiObserverState) -> Vec<(u64, String)> {
+    let queue = kept.queued.lock().unwrap();
+    (0..queue.len())
+        .filter_map(|index| queue.get(index))
+        .map(|entry| (entry.id, entry.text.clone()))
+        .collect()
+}
+
 fn key(code: KeyCode, modifiers: KeyModifiers) -> Event {
     Event::Key(KeyEvent::new(code, modifiers))
 }
@@ -97,6 +134,7 @@ fn seeded_messages_become_the_conversation_pinned_to_the_newest() {
         dch_tui::TuiMessage::User {
             text: "earlier turn".to_string(),
             timestamp: now,
+            steered: false,
         },
         dch_tui::TuiMessage::Assistant {
             blocks: vec![dch_tui::ContentBlock::Text {
@@ -148,10 +186,10 @@ fn typing_echoes_into_the_input() {
     }
     assert_eq!(app.input(), "hello");
 
-    let terminal = render_to_buffer(&mut app, 80, 30);
+    let terminal = render_to_buffer(&mut app, 80, 31);
     let buffer = terminal.backend().buffer();
     let row: String = (0..buffer.area.width)
-        .map(|x| buffer[(x, 26)].symbol().to_string())
+        .map(|x| buffer[(x, 25)].symbol().to_string())
         .collect();
     assert!(row.contains("hello"), "input field shows the typed text");
 }
@@ -236,17 +274,21 @@ fn enter_submits_appends_and_clears() {
 
 #[test]
 fn enter_sends_the_submitted_text_through_the_channel() {
-    let mut app = app();
+    let (mut app, kept) = app_with_state();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     app.set_submit_tx(tx);
     for c in ['h', 'i'] {
         app.handle_event(&plain(KeyCode::Char(c)));
     }
     assert!(app.handle_event(&plain(KeyCode::Enter)));
+    let handed_over = run_id(rx.try_recv().unwrap());
     assert_eq!(
-        rx.try_recv().unwrap(),
-        "hi",
-        "Enter forwards the submitted text to the agent driver"
+        waiting(&kept),
+        vec![(handed_over, "hi".to_string())],
+        "Enter hands the driver an id and leaves the text itself in the shared \
+         queue for the driver to read at its turn's start — the id is the \
+         handle, the queue holds the words, and this is what lets a prompt be \
+         fixed after it has been handed over"
     );
 
     for c in [' ', '\t'] {
@@ -257,11 +299,12 @@ fn enter_sends_the_submitted_text_through_the_channel() {
         rx.try_recv().is_err(),
         "a whitespace-only submit sends nothing"
     );
+    assert_eq!(waiting(&kept).len(), 1, "and it queues nothing either");
 }
 
 #[test]
 fn submissions_queue_in_order_while_the_driver_is_busy() {
-    let mut app = app();
+    let (mut app, kept) = app_with_state();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     app.set_submit_tx(tx);
     for text in ["first task", "second task"] {
@@ -271,15 +314,20 @@ fn submissions_queue_in_order_while_the_driver_is_busy() {
         app.handle_event(&plain(KeyCode::Enter));
     }
 
-    assert_eq!(
-        rx.try_recv().unwrap(),
-        "first task",
-        "submits buffer while nothing drains the channel"
+    let first = run_id(rx.try_recv().unwrap());
+    let second = run_id(rx.try_recv().unwrap());
+    assert!(
+        first < second,
+        "ids travel the channel in the order their prompts were submitted"
     );
     assert_eq!(
-        rx.try_recv().unwrap(),
-        "second task",
-        "queued submits keep their arrival order"
+        waiting(&kept),
+        vec![
+            (first, "first task".to_string()),
+            (second, "second task".to_string()),
+        ],
+        "submits buffer while nothing drains the channel, and queued submits \
+         keep their arrival order"
     );
     assert!(rx.try_recv().is_err(), "two submits yield two messages");
 }
@@ -301,6 +349,7 @@ fn scroll_keys_adjust_without_underflow() {
         app.push_message(TuiMessage::User {
             text: format!("line {i}"),
             timestamp: chrono::Utc::now(),
+            steered: false,
         });
     }
     app.handle_event(&plain(KeyCode::PageDown));
@@ -309,19 +358,20 @@ fn scroll_keys_adjust_without_underflow() {
         0,
         "back at the bottom before rendering"
     );
-    let at_bottom = render_to_buffer(&mut app, 40, 10);
-    let bottom_view = view_text(&at_bottom, 40, 10);
+    let at_bottom = render_to_buffer(&mut app, 40, 16);
+    let bottom_view = view_text(&at_bottom, 40, 16);
     assert!(
         bottom_view.contains("line 59"),
         "the bottom view shows the newest message: {bottom_view:?}"
     );
 
     assert!(app.handle_event(&plain(KeyCode::PageUp)));
-    let scrolled = render_to_buffer(&mut app, 40, 10);
-    let scrolled_view = view_text(&scrolled, 40, 10);
+    let scrolled = render_to_buffer(&mut app, 40, 16);
+    let scrolled_view = view_text(&scrolled, 40, 16);
     // Each user turn renders pad, text, pad — three lines — so at
-    // height 10 the pane's two content rows (under its own padding
-    // row) land inside turns after PageUp lifts ten lines.
+    // three content rows (under the pane's own padding row) the
+    // PageUp lift of ten lines lands the window inside turns three
+    // back from the newest.
     assert!(
         !scrolled_view.contains("line 59") && scrolled_view.contains("line 56"),
         "scrolling up shifts the visible window: {scrolled_view:?}"
@@ -463,16 +513,17 @@ fn seeded_tool_blocks_stay_expandable_after_a_resume() {
 }
 
 #[test]
-fn ctrl_c_cancels_a_running_agent_without_touching_the_quit_chord() {
-    // While a submission is in flight the press serves the run: a
-    // draft clears first, then an empty-composer press cancels —
-    // arming nothing, so exiting after the cancel takes its own two
-    // presses.
+fn ctrl_c_ctrl_c_under_a_run_is_one_cancel_and_exit_action() {
+    // The Esc-Esc shape with the exit riding the fire: the first
+    // press only arms — nothing stops, nothing leaves — and the
+    // second press is one action: the run cancels exactly as Esc-Esc
+    // cancels it, and the program terminates. A stray key between
+    // the presses stands the whole thing down.
     let state = dch_tui::TuiObserverState::new();
     let (observer, kept) = state.into_observer();
     drop(observer);
-    let running = Arc::clone(&kept.agent_running);
-    running.store(true, std::sync::atomic::Ordering::SeqCst);
+    kept.agent_running
+        .store(true, std::sync::atomic::Ordering::SeqCst);
     let cancels: Arc<std::sync::Mutex<Vec<()>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&cancels);
     let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
@@ -480,30 +531,220 @@ fn ctrl_c_cancels_a_running_agent_without_touching_the_quit_chord() {
         sink.lock().expect("sink").push(());
     }));
 
-    app.handle_event(&Event::Paste("draft".to_string()));
     app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL));
-    assert!(app.input().is_empty(), "the draft clears first");
     assert_eq!(
         cancels.lock().expect("sink").len(),
         0,
-        "the clear cancels nothing"
+        "the first press only arms — the run keeps going"
     );
-    assert!(!app.is_quitting());
+    assert!(!app.is_quitting(), "the arming press leaves nothing");
+    let armed = render_to_buffer(&mut app, 80, 24);
+    assert!(
+        row_texts(&armed)
+            .iter()
+            .any(|row| row.contains("press ctrl+c again to cancel and exit")),
+        "the arming press names the one action it arms: {:?}",
+        row_texts(&armed)
+    );
 
     app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL));
     assert_eq!(
         cancels.lock().expect("sink").len(),
         1,
-        "the empty-composer press cancels the run"
+        "the second press fires the cancel — the Esc-Esc cancel itself"
     );
-    assert!(!app.is_quitting(), "a cancel never quits");
+    assert!(
+        app.is_quitting(),
+        "and the same press terminates the program — one action"
+    );
 
-    // The run lands; the quit chord resumes from scratch.
-    running.store(false, std::sync::atomic::Ordering::SeqCst);
+    // A stray key between the presses stands it down: the second
+    // pair re-arms rather than firing on a stale intent.
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    kept.agent_running
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let cancels: Arc<std::sync::Mutex<Vec<()>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&cancels);
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    app.set_run_canceller(Box::new(move || {
+        sink.lock().expect("sink").push(());
+    }));
     app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL));
-    assert!(!app.is_quitting(), "the first idle press only arms");
+    app.handle_event(&plain(KeyCode::Char('x')));
     app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL));
-    assert!(app.is_quitting(), "the second idle press quits");
+    assert_eq!(
+        cancels.lock().expect("sink").len(),
+        0,
+        "the stray key stood the action down"
+    );
+    assert!(!app.is_quitting(), "nothing fires from stale intent");
+}
+#[test]
+fn the_ladder_press_raises_the_shutdown_flag_before_the_cancel() {
+    // The exit's own cancel releases the driver's next claim: the
+    // run resolves cancelled, and the driver reads the shutdown
+    // flag before it takes the queue's next prompt. The ladder
+    // therefore raises the flag in the same press, ahead of the
+    // canceller — and the pin is that order itself: the canceller,
+    // called by the fire, must find the flag already up. Raised
+    // only after the loop instead, a prompt queued behind the
+    // quitting user is claimed after the fire, missing from the
+    // exit's own snapshot, and resumed forever as a stop no one
+    // asked for.
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    kept.agent_running
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    app.set_shutdown_flag(Arc::clone(&flag));
+    let saw: Arc<std::sync::Mutex<Vec<bool>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&saw);
+    let at_cancel = Arc::clone(&flag);
+    app.set_run_canceller(Box::new(move || {
+        sink.lock()
+            .expect("sink")
+            .push(at_cancel.load(std::sync::atomic::Ordering::SeqCst));
+    }));
+
+    app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(
+        !flag.load(std::sync::atomic::Ordering::SeqCst),
+        "the arming press raises nothing — the flag belongs to the fire"
+    );
+    app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert_eq!(
+        *saw.lock().expect("sink"),
+        [true],
+        "the canceller was called once, and found the flag already raised beside it"
+    );
+    assert!(
+        flag.load(std::sync::atomic::Ordering::SeqCst) && app.is_quitting(),
+        "the flag stands with the exit requested"
+    );
+}
+
+#[test]
+fn the_esc_cancel_leaves_the_shutdown_flag_alone() {
+    // Cancel is not exit. Esc-Esc stops the run in flight and the
+    // session stays up, so the prompts queued behind the cancelled
+    // one are the designed next turns — the driver must keep
+    // claiming them. A flag raised by this press would strand the
+    // very backlog the cancel exists to release.
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    kept.agent_running
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    app.set_shutdown_flag(Arc::clone(&flag));
+    let cancels: Arc<std::sync::Mutex<usize>> = Arc::new(std::sync::Mutex::new(0));
+    let sink = Arc::clone(&cancels);
+    app.set_run_canceller(Box::new(move || {
+        *sink.lock().expect("sink") += 1;
+    }));
+
+    app.handle_event(&key(KeyCode::Esc, KeyModifiers::NONE));
+    app.handle_event(&key(KeyCode::Esc, KeyModifiers::NONE));
+    assert_eq!(
+        *cancels.lock().expect("sink"),
+        1,
+        "Esc-Esc cancelled the run as ever"
+    );
+    assert!(
+        !flag.load(std::sync::atomic::Ordering::SeqCst),
+        "a cancel that is not an exit never raises the driver's gate"
+    );
+    assert!(
+        !app.is_quitting(),
+        "and the session stays up to run what waits"
+    );
+}
+
+#[test]
+fn quitting_at_rest_raises_the_shutdown_flag_too() {
+    // The no-run half of the chord requests the exit with no run to
+    // cancel — and the flag still belongs up whatever the display
+    // sent last: a correction or prompt the driver has not pulled
+    // yet must not start into an exit that has already begun.
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    app.set_shutdown_flag(Arc::clone(&flag));
+
+    app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(app.is_quitting(), "the idle chord quits as ever");
+    assert!(
+        flag.load(std::sync::atomic::Ordering::SeqCst),
+        "and the same press gates the driver"
+    );
+}
+
+#[test]
+fn ctrl_c_clears_the_draft_before_arming_a_running_exit() {
+    // The ladder under a run is clear, arm, fire — the same order it
+    // keeps at rest. A press that armed the exit over a standing
+    // draft would lose the draft to the second press: the paste was
+    // never offered to the exit, and clearing is not consenting, so
+    // the composer empties first and the exit needs its presses
+    // behind an empty buffer like everywhere else.
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    kept.agent_running
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let cancels: Arc<std::sync::Mutex<Vec<()>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&cancels);
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    app.set_run_canceller(Box::new(move || {
+        sink.lock().expect("sink").push(());
+    }));
+    for character in "a paste with somewhere to go".chars() {
+        app.handle_event(&plain(KeyCode::Char(character)));
+    }
+
+    app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(
+        app.input().is_empty(),
+        "the first press clears the draft — the run never sees it"
+    );
+    assert_eq!(
+        cancels.lock().expect("sink").len(),
+        0,
+        "nothing cancels on the clearing press"
+    );
+    assert!(!app.is_quitting(), "clearing arms nothing under a run");
+    let cleared = render_to_buffer(&mut app, 80, 24);
+    assert!(
+        row_texts(&cleared)
+            .iter()
+            .any(|row| row.contains("press ctrl+c twice to cancel and exit")),
+        "the cleared draft names the ladder it did not arm: {:?}",
+        row_texts(&cleared)
+    );
+
+    app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert_eq!(
+        cancels.lock().expect("sink").len(),
+        0,
+        "the second press only arms — the run keeps going"
+    );
+    assert!(!app.is_quitting(), "the arming press leaves nothing");
+
+    app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert_eq!(
+        cancels.lock().expect("sink").len(),
+        1,
+        "the third press fires the cancel"
+    );
+    assert!(app.is_quitting(), "and terminates beside it");
 }
 
 #[test]
@@ -520,7 +761,7 @@ fn the_status_bar_shows_the_model_and_the_session_id() {
     let rows = row_texts(&bar);
     let status = rows
         .iter()
-        .find(|r| r.contains("testmodel"))
+        .find(|r| r.contains("f005d097-c4ce-477a-88c0-2fc2cec5a466"))
         .expect("the bar renders");
     assert!(
         status.contains("f005d097-c4ce-477a-88c0-2fc2cec5a466"),
@@ -574,7 +815,8 @@ fn a_cancelled_agent_notices_and_the_notice_expires() {
         .store(true, std::sync::atomic::Ordering::SeqCst);
     let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
     app.set_run_canceller(Box::new(|| {}));
-    app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    app.handle_event(&plain(KeyCode::Esc));
+    app.handle_event(&plain(KeyCode::Esc));
     let noticed = render_to_buffer(&mut app, 80, 24);
     assert!(
         row_texts(&noticed)
@@ -606,6 +848,7 @@ fn ctrl_shift_c_copies_the_selection_without_quitting() {
     app.push_message(TuiMessage::User {
         text: "abcdefghij".to_string(),
         timestamp: now,
+        steered: false,
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
@@ -669,9 +912,9 @@ fn key_releases_are_ignored() {
 }
 
 #[test]
-fn the_status_bar_names_the_current_permission_mode() {
-    // The mode segment rides the left cluster with the model and the
-    // token counts, in the config's own spelling, so what the bar
+fn the_composer_info_row_names_the_current_permission_mode() {
+    // The mode segment rides the composer's info row with the model
+    // and its effort, in the config's own spelling, so what the box
     // shows is exactly what the user set.
     for (mode, segment) in [
         (dch_config::PermissionMode::Auto, "mode: auto"),
@@ -685,14 +928,14 @@ fn the_status_bar_names_the_current_permission_mode() {
         let mut config = config_with_theme("dracula");
         config.runner.permission_mode = mode;
         let mut app = TuiApp::new(config);
-        let terminal = render_to_buffer(&mut app, 80, 30);
-        let buffer = terminal.backend().buffer();
-        let status_row: String = (0..80)
-            .map(|x| buffer[(x, 29)].symbol().to_string())
-            .collect();
+        let rows = row_texts(&render_to_buffer(&mut app, 80, 30));
+        let info = rows
+            .iter()
+            .find(|row| row.contains("testmodel"))
+            .expect("the composer's info row renders");
         assert!(
-            status_row.contains(segment),
-            "the bar names `{segment}`: {status_row:?}"
+            info.contains(segment),
+            "the info row names `{segment}`: {info:?}"
         );
     }
 }
@@ -792,7 +1035,7 @@ fn clicking_the_session_id_segment_copies_it() {
 }
 
 #[test]
-fn the_status_bar_parenthesizes_the_reasoning_effort_beside_the_model() {
+fn the_composer_info_row_parenthesizes_the_reasoning_effort_beside_the_model() {
     // The model segment carries the effort — one glance, one fact —
     // with the level capitalized beside the model name and `Auto`
     // standing in when no level is configured: the provider's own
@@ -806,64 +1049,76 @@ fn the_status_bar_parenthesizes_the_reasoning_effort_beside_the_model() {
         let mut config = config_with_theme("dracula");
         config.api.reasoning_effort = Some(level.to_string());
         let mut app = TuiApp::new(config);
-        let terminal = render_to_buffer(&mut app, 80, 30);
-        let buffer = terminal.backend().buffer();
-        let status_row: String = (0..80)
-            .map(|x| buffer[(x, 29)].symbol().to_string())
-            .collect();
+        let rows = row_texts(&render_to_buffer(&mut app, 80, 30));
+        let info = rows
+            .iter()
+            .find(|row| row.contains("testmodel"))
+            .expect("the composer's info row renders");
         assert!(
-            status_row.contains(&format!("testmodel ({label})")),
-            "the model names its effort `({label})`: {status_row:?}"
+            info.contains(&format!("testmodel ({label})")),
+            "the model names its effort `({label})`: {info:?}"
         );
     }
     let config = config_with_theme("dracula");
     let mut app = TuiApp::new(config);
-    let terminal = render_to_buffer(&mut app, 80, 30);
-    let buffer = terminal.backend().buffer();
-    let status_row: String = (0..80)
-        .map(|x| buffer[(x, 29)].symbol().to_string())
-        .collect();
+    let rows = row_texts(&render_to_buffer(&mut app, 80, 30));
+    let info = rows
+        .iter()
+        .find(|row| row.contains("testmodel"))
+        .expect("the composer's info row renders");
     assert!(
-        status_row.contains("testmodel (Auto)"),
-        "an unset effort reads as `(Auto)`: {status_row:?}"
+        info.contains("testmodel (Auto)"),
+        "an unset effort reads as `(Auto)`: {info:?}"
     );
 }
 
 #[test]
-fn the_status_bar_names_the_working_folder_and_its_branch() {
-    // The directory rides the bar between the mode and the session
-    // id as its own name — the leaf alone, never the path — with
-    // the git branch in parentheses when the host named one.
+fn the_place_row_names_the_working_directory_above_the_composer() {
+    // The session's where rides its own row directly above the
+    // composer, outside the box: the path spelled per the config's
+    // `path_style` — full by default, `~/`-relative on request — with
+    // the git branch in parentheses when the host named one, and a
+    // row the frame never spends until a directory is named.
     let mut app = app();
     let unset = render_to_buffer(&mut app, 100, 24);
     assert!(
         !row_texts(&unset).iter().any(|row| row.contains("repos")),
-        "no folder renders until the host names one"
+        "no place row renders until the host names a directory"
     );
 
-    app.set_session_id("f005d097-c4ce-477a-88c0-2fc2cec5a466".to_string());
     app.set_working_dir(std::path::Path::new("/home/tester/repos/dch"));
     app.set_git_branch(Some("master".to_string()));
-    let bar = render_to_buffer(&mut app, 100, 24);
-    let rows = row_texts(&bar);
-    let status = rows
+    let terminal = render_to_buffer(&mut app, 100, 24);
+    let buffer = terminal.backend().buffer();
+    let rows = row_texts(&terminal);
+    let place_at = rows
         .iter()
-        .find(|row| row.contains("testmodel"))
-        .expect("the status bar renders");
+        .position(|row| row.contains("/home/tester/repos/dch (master)"))
+        .expect("the place row renders the full path with its branch");
     assert!(
-        status.contains("dch (master)"),
-        "the folder names its branch: {status:?}"
+        !rows[place_at].contains("/home/tester/repos/dch/"),
+        "the branch closes the path's parenthesis, not the path: {:?}",
+        rows[place_at]
     );
-    assert!(
-        !status.contains("/home/tester"),
-        "the path never shows, only the folder: {status:?}"
+    let place_row = u16::try_from(place_at).unwrap_or(0);
+    assert_eq!(
+        buffer[(10, place_row)].bg,
+        ratatui::style::Color::Reset,
+        "the place row sits on the plain background, outside the box"
     );
-    let mode_at = status.find("mode: ").expect("the mode segment");
-    let dir_at = status.find("dch (master)").expect("the directory segment");
-    let id_at = status.find("f005d097").expect("the session id segment");
+    assert_eq!(
+        buffer[(10, place_row + 1)].bg,
+        app.theme.ui.surface,
+        "the caption closes tight against the box: the surface opens on the very next row"
+    );
+    let numbers_at = rows
+        .iter()
+        .position(|row| row.contains("0k/200k"))
+        .expect("the footer's bottom row renders");
     assert!(
-        mode_at < dir_at && dir_at < id_at,
-        "mode, then folder, then session id: {status:?}"
+        !rows[numbers_at].contains("repos"),
+        "the footer carries no directory: {:?}",
+        rows[numbers_at]
     );
 
     app.set_git_branch(None);
@@ -871,8 +1126,34 @@ fn the_status_bar_names_the_working_folder_and_its_branch() {
     assert!(
         row_texts(&bare)
             .iter()
-            .any(|row| row.contains("  │  dch  │")),
-        "no branch renders as the bare folder"
+            .any(|row| row.trim() == "/home/tester/repos/dch"),
+        "no branch renders as the bare path"
+    );
+
+    // The relative style spells the path from home: a directory under
+    // the user's actual home keeps its tail under the tilde, and one
+    // outside home falls back to the full path.
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/home".to_string());
+    let mut relative_config = config_with_theme("dracula");
+    relative_config.display.path_style = dch_config::PathStyle::Relative;
+    let mut relative = TuiApp::new(relative_config);
+    relative.set_working_dir(std::path::Path::new(&format!("{home}/repos/dch")));
+    relative.set_git_branch(Some("master".to_string()));
+    let spelled = row_texts(&render_to_buffer(&mut relative, 100, 24));
+    assert!(
+        spelled
+            .iter()
+            .any(|row| row.contains("~/repos/dch (master)")),
+        "the relative style spells the path from home: {spelled:?}"
+    );
+    let mut outside_config = config_with_theme("dracula");
+    outside_config.display.path_style = dch_config::PathStyle::Relative;
+    let mut outside = TuiApp::new(outside_config);
+    outside.set_working_dir(std::path::Path::new("/srv/work"));
+    let spelled = row_texts(&render_to_buffer(&mut outside, 100, 24));
+    assert!(
+        spelled.iter().any(|row| row.contains("/srv/work")),
+        "a directory outside home falls back to the full path: {spelled:?}"
     );
 }
 
@@ -882,21 +1163,21 @@ fn layout_shows_three_panes() {
     let terminal = render_to_buffer(&mut app, 80, 30);
     let buffer = terminal.backend().buffer();
 
-    let status_row: String = (0..80)
-        .map(|x| buffer[(x, 29)].symbol().to_string())
+    let info_row: String = (0..80)
+        .map(|x| buffer[(x, 26)].symbol().to_string())
         .collect();
     assert!(
-        status_row.contains("testmodel"),
-        "status bar names the model: {status_row:?}"
+        info_row.contains("testmodel"),
+        "the composer's identity row names the model: {info_row:?}"
     );
 
     // A blank spacer row separates the conversation from the input
-    // field; the field is the five rows above the status bar — a
-    // pure background tint (one padding row, three text rows, one
-    // padding row), no glyphs anywhere on its edge, no text of its
-    // own.
+    // field; the field is the four rows above the footer — a padding
+    // row, the text row, another padding row, and the identity row
+    // on the box's bottom edge — a pure background tint with glyphs
+    // nowhere on its edge, no text of its own in the middle.
     let spacer_row: String = (0..80)
-        .map(|x| buffer[(x, 24)].symbol().to_string())
+        .map(|x| buffer[(x, 22)].symbol().to_string())
         .collect();
     assert!(
         spacer_row.trim().is_empty(),
@@ -914,8 +1195,8 @@ fn layout_shows_three_panes() {
             })
             .collect()
     };
-    let top_pad = field_row(25);
-    let bottom_pad = field_row(28);
+    let top_pad = field_row(23);
+    let bottom_pad = field_row(25);
     for row in [top_pad, bottom_pad] {
         assert!(
             row.iter().all(|c| *c == ' '),
@@ -926,22 +1207,22 @@ fn layout_shows_three_panes() {
     // to the pane's left edge, where the primary accent column opens
     // the composer; no clipping and no glyphs.
     assert_eq!(
-        buffer[(1, 25)].bg,
-        buffer[(2, 25)].bg,
+        buffer[(1, 23)].bg,
+        buffer[(2, 23)].bg,
         "the fill beside the accent edge carries one continuous tint"
     );
     assert_eq!(
-        buffer[(0, 25)].bg,
+        buffer[(0, 23)].bg,
         app.theme.ui.primary,
         "the corner cell opens the composer's primary edge column"
     );
-    let first_text = field_row(26);
+    let first_text = field_row(24);
     assert!(
         first_text.iter().take(2).all(|c| *c == ' '),
         "the field's first text row starts after horizontal padding: {:?}",
         first_text
     );
-    for row in [field_row(25), field_row(26), field_row(28)] {
+    for row in [field_row(23), field_row(24), field_row(25)] {
         assert!(
             !row.iter().any(|c| {
                 matches!(
@@ -1714,10 +1995,12 @@ fn a_drag_selects_characters_and_copies_silently() {
     app.push_message(TuiMessage::User {
         text: "abcdefghij".to_string(),
         timestamp: now,
+        steered: false,
     });
     app.push_message(TuiMessage::User {
         text: "klmnopqrst".to_string(),
         timestamp: now,
+        steered: false,
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
@@ -1785,6 +2068,7 @@ fn a_user_turn_opens_with_the_primary_chevron() {
     app.push_message(TuiMessage::User {
         text: "first line of the question\nsecond line".to_string(),
         timestamp: chrono::Utc::now(),
+        steered: false,
     });
     app.push_message(TuiMessage::Assistant {
         blocks: vec![ContentBlock::Text {
@@ -1858,6 +2142,7 @@ fn a_drag_shows_the_highlight_before_release() {
     app.push_message(TuiMessage::User {
         text: "abcdefghij".to_string(),
         timestamp: now,
+        steered: false,
     });
     let _ = render_to_buffer(&mut app, 80, 24);
     let probe = render_to_buffer(&mut app, 80, 24);
@@ -1889,29 +2174,39 @@ fn a_drag_shows_the_highlight_before_release() {
 fn the_transparent_theme_underlines_its_composer() {
     // The paintless chrome's composer marking: hairline rules the
     // terminal draws itself — underlined spacer above, underlined
-    // last row below — thin and solid on every terminal, glyphs and
-    // paint nowhere.
+    // padding row below — thin and solid on every terminal, glyphs
+    // and paint nowhere. The bottom rule rides one row above the
+    // identity line, so the model and mode hang below the box rather
+    // than sitting on their own border.
     let mut ruled = TuiApp::new(config_with_theme("transparent"));
-    let frame = render_to_buffer(&mut ruled, 80, 24);
+    let frame = render_to_buffer(&mut ruled, 80, 25);
     let buffer = frame.backend().buffer();
     for x in [1u16, 40, 78] {
-        let top = buffer[(x, 18)].style();
+        let top = buffer[(x, 17)].style();
         assert!(
             top.add_modifier
                 .contains(ratatui::style::Modifier::UNDERLINED),
             "the spacer row carries the top rule"
         );
         assert_eq!(top.fg, Some(ratatui::style::Color::Indexed(8)));
-        let bottom = buffer[(x, 21)].style();
+        let bottom = buffer[(x, 20)].style();
         assert!(
             bottom
                 .add_modifier
                 .contains(ratatui::style::Modifier::UNDERLINED),
-            "the composer's last row carries the bottom rule"
+            "the composer's padding row carries the bottom rule"
         );
-        assert_eq!(bottom.fg, Some(ratatui::style::Color::Indexed(8)));
     }
-    for cell in [(40u16, 19u16), (40, 20)] {
+    // The identity row hangs below the rule — outside the box — and
+    // keeps the terminal's own canvas, no underline crossing it.
+    let identity = buffer[(40, 21)].style();
+    assert!(
+        !identity
+            .add_modifier
+            .contains(ratatui::style::Modifier::UNDERLINED),
+        "the identity text sits clear of the rule it once rode"
+    );
+    for cell in [(40u16, 19u16), (40, 21)] {
         let style = buffer[cell].style();
         assert_eq!(
             style.bg,
@@ -1928,7 +2223,7 @@ fn the_transparent_theme_underlines_its_composer() {
 
     // opaque themes keep their painted, borderless composer
     let mut plain = app();
-    let plain_frame = render_to_buffer(&mut plain, 80, 24);
+    let plain_frame = render_to_buffer(&mut plain, 80, 25);
     let buffer = plain_frame.backend().buffer();
     let style = buffer[(40, 20)].style();
     assert_eq!(style.bg, Some(ratatui::style::Color::Rgb(68, 71, 90)));
@@ -1936,14 +2231,85 @@ fn the_transparent_theme_underlines_its_composer() {
 }
 
 #[test]
+fn the_transparent_theme_stands_its_captions_outside_the_rules() {
+    // The transparent theme's rules draw a box around the composer,
+    // and captions that lived inside it read as crossing their own
+    // borders: the directory's name sat between the top rule and the
+    // box, and the model and mode sat on the underlined bottom row
+    // itself. Ruled themes seat both outside — the caption above the
+    // top rule, the identity below the bottom one — while painted
+    // themes keep the caption tight against the composer's surface,
+    // where nothing crosses anything.
+    let mut ruled = TuiApp::new(config_with_theme("transparent"));
+    ruled.set_working_dir(std::path::Path::new("/home/tester/repos/dch"));
+    let rows = row_texts(&render_to_buffer(&mut ruled, 80, 25));
+    let caption_row = rows
+        .iter()
+        .position(|row| row.contains("/home/tester/repos/dch"))
+        .expect("the caption renders");
+    let spacer_row = rows
+        .iter()
+        .position(|row| row.contains("testmodel"))
+        .map(|identity| identity.saturating_sub(3))
+        .expect("the identity renders");
+    assert!(
+        caption_row < spacer_row,
+        "the caption stands above the top rule, outside the box: {rows:?}"
+    );
+
+    // The identity hangs below the bottom rule: the row above it is
+    // underlined, its own row is not.
+    let frame = render_to_buffer(&mut ruled, 80, 25);
+    let buffer = frame.backend().buffer();
+    let identity_row: u16 = u16::try_from(
+        rows.iter()
+            .position(|row| row.contains("testmodel"))
+            .expect("the identity renders"),
+    )
+    .unwrap_or(0);
+    let above = buffer[(40, identity_row.saturating_sub(1))].style();
+    assert!(
+        above
+            .add_modifier
+            .contains(ratatui::style::Modifier::UNDERLINED),
+        "the bottom rule rides the padding row above the identity"
+    );
+    let identity = buffer[(40, identity_row)].style();
+    assert!(
+        !identity
+            .add_modifier
+            .contains(ratatui::style::Modifier::UNDERLINED),
+        "the model and mode hang below the rule, clear of it"
+    );
+
+    // Painted themes keep the caption against the composer's paint,
+    // unchanged: the surface opens on the very row after the caption.
+    let mut painted = app();
+    painted.set_working_dir(std::path::Path::new("/home/tester/repos/dch"));
+    let frame = render_to_buffer(&mut painted, 80, 25);
+    let buffer = frame.backend().buffer();
+    let rows = row_texts(&frame);
+    let caption_row = rows
+        .iter()
+        .position(|row| row.contains("/home/tester/repos/dch"))
+        .expect("the caption renders");
+    let caption_row = u16::try_from(caption_row).unwrap_or(0);
+    assert_eq!(
+        buffer[(10, caption_row.saturating_add(1))].bg,
+        painted.theme.ui.surface,
+        "painted themes keep the caption tight against the composer's surface"
+    );
+}
+
+#[test]
 fn the_composer_carries_a_solid_primary_column_on_its_left_edge() {
-    // 24 rows put the composer pane on rows 19..=21 with the text
-    // window on row 20, starting two columns in — the edge column owns
+    // 25 rows put the composer pane on rows 18..=21 with the text
+    // window on row 19, starting two columns in — the edge column owns
     // column 0 alone, thick by construction (paint, not glyphs).
     let mut plain = app();
-    let frame = render_to_buffer(&mut plain, 80, 24);
+    let frame = render_to_buffer(&mut plain, 80, 25);
     let buffer = frame.backend().buffer();
-    for y in 19..=21u16 {
+    for y in 18..=21u16 {
         assert_eq!(
             buffer[(0, y)].bg,
             plain.theme.ui.primary,
@@ -1951,33 +2317,38 @@ fn the_composer_carries_a_solid_primary_column_on_its_left_edge() {
         );
     }
     assert_eq!(
-        buffer[(1, 19)].bg,
+        buffer[(1, 18)].bg,
         plain.theme.ui.surface,
         "the composer body beside the edge keeps the surface color"
     );
 
-    // The status rows below sit on the plain background, so the raised
-    // composer — edge and all — ends where the prompt box ends.
+    // The composer's bottom margin is air: the row beneath it carries
+    // no paint at all — the terminal's own background — and the
+    // numbers row at the bottom sits on the bar's canvas, skipping the
+    // bar's row between them, which carries the track's own fill.
     assert_ne!(
         plain.theme.ui.background, plain.theme.ui.surface,
         "the palettes keep the bar's canvas distinct from the raised surface"
     );
-    for y in 22..=23u16 {
-        assert_eq!(
-            buffer[(0, y)].bg,
-            plain.theme.ui.background,
-            "the status bar sits on the theme background below the composer"
-        );
-    }
+    assert_eq!(
+        buffer[(0, 22)].bg,
+        ratatui::style::Color::Reset,
+        "the air beneath the composer stays unpainted — a margin, not a band"
+    );
+    assert_eq!(
+        buffer[(0, 24)].bg,
+        plain.theme.ui.background,
+        "the numbers row sits on the bar's canvas at the frame's bottom"
+    );
 
     // The paintless chrome stays paintless: no edge column, the pane
     // keeps the terminal's own background down its whole left side
     // (its primary is Reset — a bg of Reset would be the invisible
     // null mark, so the theme opts out of the edge entirely).
     let mut ruled = TuiApp::new(config_with_theme("transparent"));
-    let frame = render_to_buffer(&mut ruled, 80, 24);
+    let frame = render_to_buffer(&mut ruled, 80, 25);
     let buffer = frame.backend().buffer();
-    for y in 19..=21u16 {
+    for y in 18..=21u16 {
         assert_eq!(
             buffer[(0, y)].bg,
             ratatui::style::Color::Reset,
@@ -1985,7 +2356,7 @@ fn the_composer_carries_a_solid_primary_column_on_its_left_edge() {
         );
     }
     assert_eq!(
-        buffer[(1, 19)].bg,
+        buffer[(1, 18)].bg,
         ratatui::style::Color::Reset,
         "beside the absent edge the paintless composer stays unpainted"
     );
@@ -1993,15 +2364,15 @@ fn the_composer_carries_a_solid_primary_column_on_its_left_edge() {
 
 #[test]
 fn a_press_in_the_composer_places_the_caret_where_it_landed() {
-    // 24 rows put the composer pane on rows 19..=22 with its text
-    // window on row 20, text starting two columns in.
+    // 25 rows put the composer pane on rows 18..=21 with its text
+    // window on row 19, text starting two columns in.
     let mut app = app();
     app.handle_event(&Event::Paste("hello world".to_string()));
-    let mut first = render_to_buffer(&mut app, 80, 24);
+    let mut first = render_to_buffer(&mut app, 80, 25);
     let caret = first.backend_mut().get_cursor_position().unwrap();
     assert_eq!(
         (caret.x, caret.y),
-        (2 + 11, 20),
+        (2 + 11, 19),
         "after the paste the caret sits at the text's end"
     );
 
@@ -2009,13 +2380,13 @@ fn a_press_in_the_composer_places_the_caret_where_it_landed() {
     assert!(app.handle_event(&mouse_event(
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
         2 + 4,
-        20,
+        19,
     )));
-    let mut clicked = render_to_buffer(&mut app, 80, 24);
+    let mut clicked = render_to_buffer(&mut app, 80, 25);
     let caret = clicked.backend_mut().get_cursor_position().unwrap();
     assert_eq!(
         (caret.x, caret.y),
-        (6, 20),
+        (6, 19),
         "the caret lands on the pressed cell"
     );
 
@@ -2023,13 +2394,13 @@ fn a_press_in_the_composer_places_the_caret_where_it_landed() {
     assert!(app.handle_event(&mouse_event(
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
         70,
-        21,
+        20,
     )));
-    let mut clamped = render_to_buffer(&mut app, 80, 24);
+    let mut clamped = render_to_buffer(&mut app, 80, 25);
     let caret = clamped.backend_mut().get_cursor_position().unwrap();
     assert_eq!(
         (caret.x, caret.y),
-        (2 + 11, 20),
+        (2 + 11, 19),
         "the padding row and the empty column clamp onto the text"
     );
 }
@@ -2044,6 +2415,7 @@ fn a_released_selection_stays_highlighted_until_the_next_press() {
     app.push_message(TuiMessage::User {
         text: "abcdefghij".to_string(),
         timestamp: now,
+        steered: false,
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
@@ -2120,6 +2492,7 @@ fn a_released_selection_copy_confirms_on_the_notice_row() {
     app.push_message(TuiMessage::User {
         text: "abcdefghij".to_string(),
         timestamp: now,
+        steered: false,
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
@@ -2176,6 +2549,7 @@ fn a_click_without_travel_copies_and_notices_nothing() {
     app.push_message(TuiMessage::User {
         text: "abcdefghij".to_string(),
         timestamp: now,
+        steered: false,
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
@@ -2226,6 +2600,7 @@ fn a_copy_no_transport_delivers_notices_the_failure() {
     app.push_message(TuiMessage::User {
         text: "abcdefghij".to_string(),
         timestamp: now,
+        steered: false,
     });
     app.set_selection_copier(Box::new(|_attempt, _text| dch_tui::CopyAnswer::Failed));
 
@@ -2283,6 +2658,7 @@ fn a_hanging_copy_command_never_blocks_the_render_task() {
     app.push_message(TuiMessage::User {
         text: "abcdefghij".to_string(),
         timestamp: now,
+        steered: false,
     });
 
     let probe = render_to_buffer(&mut app, 80, 24);
@@ -2343,6 +2719,7 @@ fn a_pending_transport_copy_posts_no_row_until_the_verdict() {
     app.push_message(TuiMessage::User {
         text: "abcdefghij".to_string(),
         timestamp: now,
+        steered: false,
     });
 
     let probe = render_to_buffer(&mut app, 80, 24);
@@ -2388,6 +2765,7 @@ fn the_copy_chord_confirms_on_the_notice_row() {
     app.push_message(TuiMessage::User {
         text: "abcdefghij".to_string(),
         timestamp: now,
+        steered: false,
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
@@ -2446,6 +2824,7 @@ fn a_shift_arrow_recopy_confirms_on_the_notice_row() {
     app.push_message(TuiMessage::User {
         text: "abcdefghij".to_string(),
         timestamp: now,
+        steered: false,
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
@@ -2496,21 +2875,22 @@ fn a_shift_arrow_recopy_confirms_on_the_notice_row() {
 
 #[test]
 fn a_drag_running_past_the_bottom_edge_scrolls_with_the_selection() {
-    // 24 rows put the conversation pane on rows 0..=16.
+    // 25 rows put the conversation pane on rows 0..=14.
     let mut app = app();
     let now = chrono::Utc::now();
     for i in 0..30 {
         app.push_message(TuiMessage::User {
             text: format!("line{i:02}"),
             timestamp: now,
+            steered: false,
         });
     }
-    let _ = render_to_buffer(&mut app, 80, 24);
+    let _ = render_to_buffer(&mut app, 80, 25);
 
     for _ in 0..5 {
         app.handle_event(&wheel_event(MouseEventKind::ScrollUp));
     }
-    let _ = render_to_buffer(&mut app, 80, 24);
+    let _ = render_to_buffer(&mut app, 80, 25);
     assert_eq!(app.scroll_offset(), 5);
 
     app.handle_event(&mouse_event(
@@ -2522,7 +2902,7 @@ fn a_drag_running_past_the_bottom_edge_scrolls_with_the_selection() {
         app.handle_event(&mouse_event(
             MouseEventKind::Drag(crossterm::event::MouseButton::Left),
             5,
-            16,
+            15,
         )),
         "the edge drag reports a redraw"
     );
@@ -2531,9 +2911,9 @@ fn a_drag_running_past_the_bottom_edge_scrolls_with_the_selection() {
         4,
         "sitting on the pane's bottom line steps the view down one line"
     );
-    let scrolled = render_to_buffer(&mut app, 80, 24);
+    let scrolled = render_to_buffer(&mut app, 80, 25);
     assert!(
-        reversed_cells_on_row(&scrolled, 16) >= 1,
+        reversed_cells_on_row(&scrolled, 15) >= 1,
         "the selection reaches the pane's bottom line as the view moves"
     );
 }
@@ -2550,13 +2930,14 @@ fn a_parked_edge_drag_keeps_scrolling_on_the_tick_until_the_document_ends() {
         app.push_message(TuiMessage::User {
             text: format!("line{i:02}"),
             timestamp: now,
+            steered: false,
         });
     }
-    let _ = render_to_buffer(&mut app, 80, 24);
+    let _ = render_to_buffer(&mut app, 80, 25);
     for _ in 0..5 {
         app.handle_event(&wheel_event(MouseEventKind::ScrollUp));
     }
-    let _ = render_to_buffer(&mut app, 80, 24);
+    let _ = render_to_buffer(&mut app, 80, 25);
     app.handle_event(&mouse_event(
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
         5,
@@ -2565,7 +2946,7 @@ fn a_parked_edge_drag_keeps_scrolling_on_the_tick_until_the_document_ends() {
     app.handle_event(&mouse_event(
         MouseEventKind::Drag(crossterm::event::MouseButton::Left),
         5,
-        16,
+        15,
     ));
     assert_eq!(
         app.scroll_offset(),
@@ -2582,7 +2963,7 @@ fn a_parked_edge_drag_keeps_scrolling_on_the_tick_until_the_document_ends() {
             ticks < 10,
             "the parked push reaches the bottom in bounded ticks"
         );
-        let _ = render_to_buffer(&mut app, 80, 24);
+        let _ = render_to_buffer(&mut app, 80, 25);
     }
     assert_eq!(
         app.scroll_offset(),
@@ -2590,9 +2971,9 @@ fn a_parked_edge_drag_keeps_scrolling_on_the_tick_until_the_document_ends() {
         "the parked push walks the view back to the bottom"
     );
     assert!(app.auto_scroll(), "reaching the bottom re-arms stickiness");
-    let settled = render_to_buffer(&mut app, 80, 24);
+    let settled = render_to_buffer(&mut app, 80, 25);
     assert!(
-        reversed_cells_on_row(&settled, 15) >= 1,
+        reversed_cells_on_row(&settled, 14) >= 1,
         "the selection follows the edge all the way down"
     );
     for _ in 0..6 {
@@ -2618,6 +2999,7 @@ fn buttonless_motion_ends_a_parked_edge_drag() {
         app.push_message(TuiMessage::User {
             text: format!("line{i:02}"),
             timestamp: now,
+            steered: false,
         });
     }
     let _ = render_to_buffer(&mut app, 80, 24);
@@ -2661,14 +3043,15 @@ fn a_drag_running_past_the_top_edge_scrolls_upward() {
         app.push_message(TuiMessage::User {
             text: format!("line{i:02}"),
             timestamp: now,
+            steered: false,
         });
     }
-    let _ = render_to_buffer(&mut app, 80, 24);
+    let _ = render_to_buffer(&mut app, 80, 25);
 
     app.handle_event(&mouse_event(
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
         5,
-        5,
+        4,
     ));
     assert!(
         app.handle_event(&mouse_event(
@@ -2684,14 +3067,18 @@ fn a_drag_running_past_the_top_edge_scrolls_upward() {
         "sitting on the pane's top line steps the view up one line"
     );
     assert!(!app.auto_scroll(), "the upward edge drag detaches");
-    let scrolled = render_to_buffer(&mut app, 80, 24);
+    let scrolled = render_to_buffer(&mut app, 80, 25);
+    // The selection runs from the pane's top edge down to its anchor:
+    // the wording rows the reverse paint reaches, and the anchor's
+    // moved down one line with the view's step.
     assert!(
-        reversed_cells_on_row(&scrolled, 1) >= 1,
-        "the selection reaches the pane's top content line as the view moves"
+        reversed_cells_on_row(&scrolled, 3) >= 1,
+        "the selection reaches from the pane's top edge to its anchor as \\
+         the view moves"
     );
     // the push parks: ticks carry it upward, bounded by the
-    // document's first line — 30 three-line turns over 16 content
-    // rows end at offset 74
+    // document's first line — 30 three-line turns over 15 content
+    // rows end at offset 75
     let mut ticks = 0;
     while app.tick_wake(std::time::Instant::now()) {
         ticks += 1;
@@ -2699,10 +3086,10 @@ fn a_drag_running_past_the_top_edge_scrolls_upward() {
             ticks < 100,
             "the parked push reaches the document top in bounded ticks"
         );
-        let _ = render_to_buffer(&mut app, 80, 24);
+        let _ = render_to_buffer(&mut app, 80, 25);
     }
-    assert_eq!(app.scroll_offset(), 74, "the walk ends pinned at the top");
-    let settled = render_to_buffer(&mut app, 80, 24);
+    assert_eq!(app.scroll_offset(), 75, "the walk ends pinned at the top");
+    let settled = render_to_buffer(&mut app, 80, 25);
     assert!(
         reversed_cells_on_row(&settled, 2) >= 1,
         "the selection follows the edge all the way up"
@@ -2720,10 +3107,12 @@ fn shift_arrows_extend_and_shrink_a_released_selection() {
     app.push_message(TuiMessage::User {
         text: "abcdefghij".to_string(),
         timestamp: now,
+        steered: false,
     });
     app.push_message(TuiMessage::User {
         text: "klmnopqrst".to_string(),
         timestamp: now,
+        steered: false,
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
@@ -2795,13 +3184,14 @@ fn shift_arrows_walk_the_view_to_follow_the_head() {
         app.push_message(TuiMessage::User {
             text: format!("line{i:02}"),
             timestamp: now,
+            steered: false,
         });
     }
-    let _ = render_to_buffer(&mut app, 80, 24);
+    let _ = render_to_buffer(&mut app, 80, 25);
     for _ in 0..5 {
         app.handle_event(&wheel_event(MouseEventKind::ScrollUp));
     }
-    let _ = render_to_buffer(&mut app, 80, 24);
+    let _ = render_to_buffer(&mut app, 80, 25);
     app.handle_event(&mouse_event(
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
         5,
@@ -2821,7 +3211,7 @@ fn shift_arrows_walk_the_view_to_follow_the_head() {
 
     for _ in 0..20 {
         app.handle_event(&key(KeyCode::Down, KeyModifiers::SHIFT));
-        let _ = render_to_buffer(&mut app, 80, 24);
+        let _ = render_to_buffer(&mut app, 80, 25);
     }
     assert_eq!(
         app.scroll_offset(),
@@ -2829,9 +3219,9 @@ fn shift_arrows_walk_the_view_to_follow_the_head() {
         "the view followed the head all the way down"
     );
     assert!(app.auto_scroll(), "the walk re-arms at the bottom");
-    let settled = render_to_buffer(&mut app, 80, 24);
+    let settled = render_to_buffer(&mut app, 80, 25);
     assert!(
-        reversed_cells_on_row(&settled, 15) >= 1,
+        reversed_cells_on_row(&settled, 14) >= 1,
         "the head sits on the document's last, visible line"
     );
 }
@@ -2847,6 +3237,7 @@ fn plain_arrows_still_scroll_while_a_selection_is_up() {
         app.push_message(TuiMessage::User {
             text: format!("line{i:02}"),
             timestamp: now,
+            steered: false,
         });
     }
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -2855,21 +3246,24 @@ fn plain_arrows_still_scroll_while_a_selection_is_up() {
         sink.lock().expect("sink").push(text.to_string());
         dch_tui::CopyAnswer::Verified
     }));
-    let _ = render_to_buffer(&mut app, 80, 24);
+    let probe = render_to_buffer(&mut app, 80, 25);
+    let rows = row_texts(&probe);
+    let text_row =
+        u16::try_from(rows.iter().rposition(|r| r.contains("line2")).unwrap_or(0)).unwrap_or(0);
     app.handle_event(&mouse_event(
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
         5,
-        3,
+        text_row,
     ));
     app.handle_event(&mouse_event(
         MouseEventKind::Drag(crossterm::event::MouseButton::Left),
         5,
-        4,
+        text_row + 1,
     ));
     app.handle_event(&mouse_event(
         MouseEventKind::Up(crossterm::event::MouseButton::Left),
         5,
-        4,
+        text_row + 1,
     ));
     assert_eq!(copied.lock().expect("sink").len(), 1);
 
@@ -2896,6 +3290,7 @@ fn a_rebuilt_line_space_forfeits_the_selection() {
         app.push_message(TuiMessage::User {
             text: text.to_string(),
             timestamp: now,
+            steered: false,
         });
     }
     let probe = render_to_buffer(&mut app, 80, 24);
@@ -2978,6 +3373,7 @@ fn a_press_on_a_running_tool_row_anchors_on_the_selectable_transcript() {
     app.push_message(TuiMessage::User {
         text: "abcdefghij".to_string(),
         timestamp: now,
+        steered: false,
     });
     app.active_tools()
         .lock()
@@ -3142,6 +3538,7 @@ fn a_streaming_delta_preserves_a_selection_in_the_settled_transcript() {
     app.push_message(TuiMessage::User {
         text: "abcdefghij".to_string(),
         timestamp: now,
+        steered: false,
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
@@ -3213,6 +3610,7 @@ fn a_release_over_blank_cells_copies_nothing() {
     app.push_message(TuiMessage::User {
         text: "abcdefghij\n\nklmnopqrst".to_string(),
         timestamp: now,
+        steered: false,
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
@@ -3285,6 +3683,7 @@ fn combining_marks_carry_with_their_base_and_line_up_with_the_rendered_cells() {
     app.push_message(TuiMessage::User {
         text: "e\u{301}x".to_string(),
         timestamp: now,
+        steered: false,
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
@@ -3354,6 +3753,7 @@ fn a_press_outside_the_conversation_retires_the_selection_without_recopying() {
     app.push_message(TuiMessage::User {
         text: "abcdefghij".to_string(),
         timestamp: now,
+        steered: false,
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
@@ -3427,6 +3827,7 @@ fn an_interior_blank_line_stays_in_a_multi_row_copy() {
     app.push_message(TuiMessage::User {
         text: "abcdefghij\n\nklmnopqrst".to_string(),
         timestamp: now,
+        steered: false,
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
@@ -3480,6 +3881,7 @@ fn a_selection_landing_on_a_wide_characters_second_cell_takes_it() {
     app.push_message(TuiMessage::User {
         text: "日x".to_string(),
         timestamp: now,
+        steered: false,
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
@@ -3619,21 +4021,23 @@ fn a_paste_event_lands_atomically_in_the_editor() {
 
 #[test]
 fn a_submit_increments_the_shared_queue_depth() {
-    let state = dch_tui::TuiObserverState::new();
-    let (observer, kept) = state.into_observer();
-    drop(observer);
-    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept.clone());
+    let (mut app, kept) = app_with_state();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     app.set_submit_tx(tx);
     for c in "hi".chars() {
         app.handle_event(&plain(KeyCode::Char(c)));
     }
     assert!(app.handle_event(&plain(KeyCode::Enter)));
-    assert_eq!(rx.try_recv().unwrap(), "hi");
+    let handed_over = run_id(rx.try_recv().unwrap());
     assert_eq!(
-        kept.queued.load(std::sync::atomic::Ordering::SeqCst),
+        kept.queued.lock().unwrap().len(),
         1,
-        "the send bumps the depth the driver will decrement"
+        "the send deepens the queue the driver draws prompts from"
+    );
+    assert_eq!(
+        waiting(&kept),
+        vec![(handed_over, "hi".to_string())],
+        "and the entry it added is the one the handed-over id names"
     );
 }
 
@@ -3644,9 +4048,11 @@ fn the_input_field_grows_with_its_buffer_up_to_the_cap() {
     drop(observer);
     let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
 
-    // empty composer: one text row — the pane is three rows
-    // (padding, text, padding), rows 19..21, and the field is blank.
-    let empty = render_to_buffer(&mut app, 40, 24);
+    // empty composer: one text row — the pane is four rows (a
+    // padding row, the text row, another padding row, and the
+    // identity row on the box's bottom edge), rows 19..22, and the
+    // field is blank on 20.
+    let empty = render_to_buffer(&mut app, 40, 26);
     let rows = row_texts(&empty);
     assert!(
         !rows[20].contains("enter"),
@@ -3654,11 +4060,11 @@ fn the_input_field_grows_with_its_buffer_up_to_the_cap() {
         rows[20]
     );
 
-    // two lines: the pane grows to four rows and the conversation
+    // two lines: the pane grows to five rows and the conversation
     // yields one — the composer now starts a row higher (18) with
     // its text on 19 and 20
     app.handle_event(&Event::Paste("one\ntwo".to_string()));
-    let two = render_to_buffer(&mut app, 40, 24);
+    let two = render_to_buffer(&mut app, 40, 26);
     let rows = row_texts(&two);
     assert!(
         rows[19].contains("one") && rows[20].contains("two"),
@@ -3666,26 +4072,34 @@ fn the_input_field_grows_with_its_buffer_up_to_the_cap() {
         rows[19],
         rows[20]
     );
+    let identity_at = rows
+        .iter()
+        .position(|row| row.contains("testmodel"))
+        .expect("the identity row renders");
     assert!(
-        !rows[23].contains("2/2"),
+        !rows[identity_at].contains("2/2"),
         "a buffer that fits carries no line-position tag: {}",
-        rows[23]
+        rows[identity_at]
     );
 
     // five lines: the pane caps at three text rows, the window keeps
     // the caret's tail visible, and the tag reports the overflow
     app.handle_event(&Event::Paste("\nfour\nfive\nsix".to_string()));
-    let capped = render_to_buffer(&mut app, 40, 24);
+    let capped = render_to_buffer(&mut app, 40, 26);
     let rows = row_texts(&capped);
     assert!(
         rows[20].contains("six"),
         "the window keeps the caret's line visible: {}",
         rows[20]
     );
+    let identity_at = rows
+        .iter()
+        .position(|row| row.contains("testmodel"))
+        .expect("the identity row renders");
     assert!(
-        rows[23].contains("5/5") || rows[23].contains("5/6"),
-        "a buffer past the cap carries the line-position tag: {}",
-        rows[23]
+        rows[identity_at].contains("5/5") || rows[identity_at].contains("5/6"),
+        "a buffer past the cap carries the line-position tag at the identity row's right: {}",
+        rows[identity_at]
     );
 }
 
@@ -3699,7 +4113,7 @@ fn an_exactly_filled_line_stays_visible_with_its_caret_at_the_end() {
     // exactly, with the caret on the fresh continuation row behind
     // it. The multi-row window shows the filled line and the caret
     // on the row beneath it.
-    let mut terminal = render_to_buffer(&mut app, 12, 10);
+    let mut terminal = render_to_buffer(&mut app, 12, 14);
     let rows = row_texts(&terminal);
     let text_row = rows
         .iter()
@@ -3712,15 +4126,19 @@ fn an_exactly_filled_line_stays_visible_with_its_caret_at_the_end() {
 
 /// The composer chunk [`TuiApp::render`] lays out, mirrored here so the
 /// undersize pins can name the rows each pane owns at a starved height.
-fn composer_chunk(width: u16, height: u16) -> Rect {
+/// `composer_rows` is the pane's height for the buffer the test staged
+/// — margin, place row, padding, the text rows, padding, margin,
+/// identity row — and the status chunk below it is the footer's own
+/// three.
+fn composer_chunk(width: u16, height: u16, composer_rows: u16) -> Rect {
     Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(0),
             Constraint::Length(1),
             Constraint::Length(1),
-            Constraint::Length(4),
-            Constraint::Length(1),
+            Constraint::Length(composer_rows),
+            Constraint::Length(3),
         ])
         .split(Rect {
             x: 0,
@@ -3742,7 +4160,7 @@ fn the_caret_stays_inside_the_composer_in_undersized_terminals() {
         let mut app = app();
         app.handle_event(&Event::Paste("one\ntwo".to_string()));
         let mut terminal = render_to_buffer(&mut app, 40, height);
-        let composer = composer_chunk(40, height);
+        let composer = composer_chunk(40, height, 5);
         let (_x, y) = {
             let position = terminal
                 .backend_mut()
@@ -3764,14 +4182,17 @@ fn the_caret_stays_inside_the_composer_in_undersized_terminals() {
 }
 
 #[test]
-fn the_status_bar_paints_only_its_own_row_in_undersized_terminals() {
-    // Whatever the height, the bar may paint at most one row — the
-    // frame's last — so a starved composer keeps every row it was
-    // given and never cedes its last one to the bar. The bar is
-    // detected by its own paint, foreground and background together:
-    // the composer's rows share the bar's surface background on their
-    // text cells, so the pair — and the padding cells the composer
-    // leaves at a Reset foreground — is what isolates the bar's row.
+fn the_status_bar_paints_only_its_own_rows_in_undersized_terminals() {
+    // Whatever the height, the bar's paint is one contiguous block
+    // anchored to the frame's bottom — the rows it was granted and no
+    // more — so a starved composer keeps every row it was given and
+    // never cedes its own last row to the bar. The bar is detected by
+    // its own paint, foreground and background together: the
+    // composer's rows share the bar's surface background on their text
+    // cells, so the pair — and the padding cells the composer leaves
+    // at a Reset foreground — is what isolates the bar's rows. The
+    // block grows with the width's demand — air, the context bar, the
+    // numbers, and wrapped status text above them on narrow frames.
     for height in [2u16, 3, 4, 5, 6] {
         let mut app = app();
         let terminal = render_to_buffer(&mut app, 40, height);
@@ -3782,9 +4203,11 @@ fn the_status_bar_paints_only_its_own_row_in_undersized_terminals() {
                     && buffer[(0, y)].bg == app.theme.ui.status_bar_bg
             })
             .collect();
-        assert!(
-            bar_rows.iter().all(|&y| y + 1 == height),
-            "h={height}: the bar must paint only the frame's last row, found {bar_rows:?}"
+        let count = u16::try_from(bar_rows.len()).unwrap_or(0);
+        let expected: Vec<u16> = (height.saturating_sub(count)..height).collect();
+        assert_eq!(
+            bar_rows, expected,
+            "h={height}: the bar paints one bottom-anchored block, no row above its own"
         );
     }
 }
@@ -3799,7 +4222,7 @@ fn the_conversation_pane_renders_on_the_terminal_s_own_background() {
     // raised surfaces paint: the composer on `surface`, the bar on its
     // own row.
     let mut app = app();
-    let terminal = render_to_buffer(&mut app, 40, 10);
+    let terminal = render_to_buffer(&mut app, 40, 14);
     let buffer = terminal.backend().buffer();
     assert_eq!(
         buffer[(5, 2)].bg,
@@ -3807,62 +4230,77 @@ fn the_conversation_pane_renders_on_the_terminal_s_own_background() {
         "the conversation pane leaves its cells to the terminal default — \
          painting them is what shows a seam against the margin"
     );
-    let composer = composer_chunk(40, 10);
+    let composer = composer_chunk(40, 14, 4);
     assert_eq!(
         buffer[(1, composer.y)].bg,
         app.theme.ui.surface,
         "the composer body beside its primary edge draws on the surface color"
     );
     assert_eq!(
-        buffer[(0, 9)].bg,
+        buffer[(0, 13)].bg,
         app.theme.ui.status_bar_bg,
         "the status bar paints its own row"
     );
 }
 
 #[test]
-fn the_status_tag_claims_its_columns_from_the_status_text() {
-    // On a narrow frame the right-aligned tag owns its columns
-    // outright: the model/tokens text clips one column short of the
-    // tag, so a long model name never renders beneath the tag and a
-    // blank column separates the two.
+fn the_state_tag_claims_the_identity_row_s_right_edge() {
+    // The composer's state — submissions queued behind the driver,
+    // or the caret's line over the buffer's total — closes the
+    // identity row at its very right. The identity clips short of
+    // the tag's columns so the two never paint over each other; the
+    // tag — state the user can act on — never clips first. The
+    // footer carries none of it: its numbers run unclipped at any
+    // width the frame can give them, its right edge holds no state
+    // text in any case — not the tag, not the waiting count. The
+    // queue counts itself in its own section.
     let state = dch_tui::TuiObserverState::new();
     let (observer, kept) = state.into_observer();
     drop(observer);
     let mut config = config_with_theme("dracula");
     config.api.model = "a-very-long-model-name".to_string();
     let mut app = TuiApp::from_observer_state(config, kept.clone());
-    kept.queued.store(2, std::sync::atomic::Ordering::SeqCst);
+    {
+        // Two waiting prompts — the queue's own section counts these.
+        let mut queue = kept.queued.lock().unwrap();
+        queue.push("one waiting".to_string());
+        queue.push("two waiting".to_string());
+    }
+    app.handle_event(&Event::Paste(
+        "a prompt\nthat spans\nseveral\nlines\nnow".to_string(),
+    ));
 
-    let terminal = render_to_buffer(&mut app, 20, 8);
+    let terminal = render_to_buffer(&mut app, 20, 14);
     let rows = row_texts(&terminal);
-    let status = rows.last().expect("the status row");
-    assert!(status.contains("2 queued"), "the tag renders: {status}");
+    let identity_at = rows
+        .iter()
+        .position(|row| row.contains("a-very"))
+        .expect("the identity row renders its readable prefix");
     assert!(
-        !status.contains("a-very-long-model-name"),
-        "a model name this long must clip short of the tag: {status}"
-    );
-    // "2 queued" is 8 cells inside a 10-cell tag area anchored at the
-    // right edge (columns 10-19); the left text clips at column 9, so
-    // that column — the gutter, not the tag area's own right-alignment
-    // padding — must be blank. Unclipped, the model name's tenth
-    // character renders there, beneath the tag's edge.
-    let columns = status.chars().collect::<Vec<_>>();
-    let gap_at = 20 - 10 - 1;
-    assert!(
-        columns
-            .get(gap_at)
-            .is_some_and(|column| column.is_whitespace()),
-        "a blank column must separate the text from the tag: {status}"
-    );
-    assert_eq!(
-        columns.get(9),
-        Some(&' '),
-        "the clipped text ends one column short of the tag area: {status}"
+        rows[identity_at].contains("5/5") || rows[identity_at].contains("5/6"),
+        "the line-position tag closes the identity row: {:?}",
+        rows[identity_at]
     );
     assert!(
-        status.starts_with(" a-very-l"),
-        "the clipped model text keeps its readable prefix: {status}"
+        !rows.iter().any(|row| row.contains("queued")),
+        "the waiting count is the queue section's own, never a tag: {rows:?}"
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row.contains("a-very-long-model-name")),
+        "a model name this long never renders whole: {rows:?}"
+    );
+    // The footer's bottom row carries the readout whole — the tag
+    // no longer takes columns from it.
+    let status = rows.last().expect("the footer's bottom row");
+    assert!(
+        status.contains("0k/200k (0%)"),
+        "the readout runs unclipped, whatever the composer holds: {status}"
+    );
+    assert!(
+        !status.contains("5/5"),
+        "the footer's rows carry no state text at their right edge: {status}"
     );
 }
 
@@ -3876,6 +4314,7 @@ fn the_conversation_pane_holds_still_once_the_composer_reaches_its_cap() {
         app.push_message(TuiMessage::User {
             text: format!("line {i:02}"),
             timestamp: chrono::Utc::now(),
+            steered: false,
         });
     }
     // fill the composer past its three-row cap first
@@ -3940,14 +4379,15 @@ fn ctrl_p_recalls_history_from_a_multiline_buffer() {
 #[test]
 fn late_pushed_messages_appear_in_the_next_render() {
     let mut app = app();
-    let _ = render_to_buffer(&mut app, 40, 12);
+    let _ = render_to_buffer(&mut app, 40, 16);
     app.push_message(TuiMessage::User {
         text: "arrived between frames".to_string(),
         timestamp: chrono::Utc::now(),
+        steered: false,
     });
-    let terminal = render_to_buffer(&mut app, 40, 12);
+    let terminal = render_to_buffer(&mut app, 40, 16);
     assert!(
-        view_text(&terminal, 40, 12).contains("arrived between frames"),
+        view_text(&terminal, 40, 16).contains("arrived between frames"),
         "a message pushed after a cached render must still show up"
     );
 }
@@ -3962,13 +4402,13 @@ fn a_width_change_reflows_the_cached_conversation() {
         timestamp: chrono::Utc::now(),
         duration_ms: None,
     });
-    let wide = render_to_buffer(&mut app, 60, 12);
+    let wide = render_to_buffer(&mut app, 60, 16);
     assert!(
         row_texts(&wide)[1].contains("dddddddddd"),
         "at width 60 the message fits the first content row"
     );
 
-    let narrow = render_to_buffer(&mut app, 24, 12);
+    let narrow = render_to_buffer(&mut app, 24, 18);
     let narrow_rows = row_texts(&narrow);
     assert!(
         !narrow_rows[1].contains("dddddddddd")
@@ -4048,10 +4488,7 @@ fn typing_during_a_live_code_block_stays_inside_the_frame_budget() {
 
 #[test]
 fn a_failed_send_rolls_the_queue_increment_back() {
-    let state = dch_tui::TuiObserverState::new();
-    let (observer, kept) = state.into_observer();
-    drop(observer);
-    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept.clone());
+    let (mut app, kept) = app_with_state();
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     app.set_submit_tx(tx);
     drop(rx);
@@ -4060,12 +4497,28 @@ fn a_failed_send_rolls_the_queue_increment_back() {
         app.handle_event(&plain(KeyCode::Char(c)));
     }
     assert!(app.handle_event(&plain(KeyCode::Enter)));
-    assert_eq!(
-        kept.queued.load(std::sync::atomic::Ordering::SeqCst),
-        0,
-        "a send no receiver takes must not stay counted as queued"
+    assert!(
+        waiting(&kept).is_empty(),
+        "a send no receiver takes must not stay counted as queued — an entry \
+         behind a dead channel would sit in the waiting section inviting edits \
+         to a prompt that can never run"
     );
-    assert_eq!(app.conversation().len(), 1, "the echo still lands");
+    assert!(
+        app.conversation().is_empty(),
+        "and it is not recorded as sent: the transcript's user row is the \
+         claim echo now, so a prompt no driver ever claimed has no row"
+    );
+    assert_eq!(
+        app.input(),
+        "gone",
+        "the draft comes back rather than vanishing with a driver that quit"
+    );
+    let rows = row_texts(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        rows.iter().any(|row| row.contains("the driver has gone")),
+        "the reason is said out loud, in the user\'s words rather than the \
+         mechanism\'s: {rows:?}"
+    );
 }
 
 #[test]
@@ -4074,6 +4527,7 @@ fn multiline_user_and_system_echoes_render_on_separate_rows() {
     app.push_message(TuiMessage::User {
         text: "first\nsecond".to_string(),
         timestamp: chrono::Utc::now(),
+        steered: false,
     });
     app.push_message(TuiMessage::System {
         text: "alpha\nbeta".to_string(),
@@ -4681,6 +5135,7 @@ fn long_user_lines_wrap_in_the_conversation_instead_of_clipping() {
     app.push_message(TuiMessage::User {
         text: long,
         timestamp: now,
+        steered: false,
     });
     let terminal = render_to_buffer(&mut app, 80, 24);
     let rows = row_texts(&terminal);
@@ -4710,6 +5165,7 @@ fn a_pad_row_and_a_blank_line_breathe_between_user_turns_and_agent_material() {
     app.push_message(TuiMessage::User {
         text: "the question".to_string(),
         timestamp: now,
+        steered: false,
     });
     app.push_message(TuiMessage::Assistant {
         blocks: vec![ContentBlock::Text {
@@ -4718,7 +5174,7 @@ fn a_pad_row_and_a_blank_line_breathe_between_user_turns_and_agent_material() {
         timestamp: now,
         duration_ms: None,
     });
-    let terminal = render_to_buffer(&mut app, 40, 12);
+    let terminal = render_to_buffer(&mut app, 40, 17);
     let buffer = terminal.backend().buffer();
     let rows = row_texts(&terminal);
     let question = rows
@@ -4757,8 +5213,9 @@ fn a_pad_row_and_a_blank_line_breathe_between_user_turns_and_agent_material() {
     app.push_message(TuiMessage::User {
         text: "the follow-up".to_string(),
         timestamp: now,
+        steered: false,
     });
-    let follow_terminal = render_to_buffer(&mut app, 40, 16);
+    let follow_terminal = render_to_buffer(&mut app, 40, 18);
     let follow_rows = row_texts(&follow_terminal);
     let answer_now = follow_rows
         .iter()
@@ -4791,7 +5248,7 @@ fn an_agent_reply_s_code_block_sits_on_the_regular_background() {
         timestamp: chrono::Utc::now(),
         duration_ms: None,
     });
-    let terminal = render_to_buffer(&mut app, 40, 12);
+    let terminal = render_to_buffer(&mut app, 40, 18);
     let buffer = terminal.backend().buffer();
     let rows = row_texts(&terminal);
     let code_row = rows
@@ -4822,7 +5279,7 @@ fn an_agent_sentence_s_inline_code_sits_on_the_regular_background() {
         timestamp: chrono::Utc::now(),
         duration_ms: None,
     });
-    let terminal = render_to_buffer(&mut app, 40, 12);
+    let terminal = render_to_buffer(&mut app, 40, 14);
     let buffer = terminal.backend().buffer();
     let rows = row_texts(&terminal);
     let sentence_row = rows
@@ -4853,8 +5310,9 @@ fn the_conversation_opens_one_row_below_the_pane_s_top_edge() {
     app.push_message(TuiMessage::User {
         text: "the first line".to_string(),
         timestamp: chrono::Utc::now(),
+        steered: false,
     });
-    let terminal = render_to_buffer(&mut app, 40, 12);
+    let terminal = render_to_buffer(&mut app, 40, 16);
     let buffer = terminal.backend().buffer();
     for row in [0u16, 1] {
         let text: String = (0..buffer.area.width)
@@ -4894,8 +5352,9 @@ fn wrapped_lines_keep_a_right_margin_before_the_scrollbar_gutter() {
     app.push_message(TuiMessage::User {
         text: "x".repeat(120),
         timestamp: chrono::Utc::now(),
+        steered: false,
     });
-    let terminal = render_to_buffer(&mut app, 40, 12);
+    let terminal = render_to_buffer(&mut app, 40, 18);
     let buffer = terminal.backend().buffer();
     let wrapped_row = (0..buffer.area.height)
         .find(|&y| (0..buffer.area.width).any(|x| buffer[(x, y)].symbol() == "x"))
@@ -5114,6 +5573,7 @@ fn dragging_from_a_summary_row_still_selects_instead_of_toggling() {
     app.push_message(TuiMessage::User {
         text: "abcdefghij".to_string(),
         timestamp: now,
+        steered: false,
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
@@ -5440,21 +5900,22 @@ fn the_scrollbar_owns_its_gutter_and_never_touches_text() {
         app.push_message(TuiMessage::User {
             text: format!("message {i:02}"),
             timestamp: chrono::Utc::now(),
+            steered: false,
         });
     }
     // 20 one-line messages over the conversation pane make the
     // document scrollable; the pinned view sits at its bottom.
-    let terminal = render_to_buffer(&mut app, 20, 12);
+    let terminal = render_to_buffer(&mut app, 20, 15);
     let buffer = terminal.backend().buffer();
     let thumb = app.theme.ui.scrollbar_thumb;
     let track = app.theme.ui.scrollbar_track;
-    // 12 rows: 4 content rows for the conversation below its padding
-    // row (notice row, spacer, padded two-row input field, status
-    // bar). thumb = 4 * 4 / 20 clamps to 1 row, flush with the
-    // track's bottom.
-    for y in 1..5u16 {
+    // 20 rows: 6 conversation rows — 5 content rows for the
+    // conversation below its padding row, above the notice, spacer,
+    // composer, and footer. thumb = 5 * 5 / 60 clamps to 1 row,
+    // flush with the track's bottom.
+    for y in 1..6u16 {
         let cell = &buffer[(19, y)];
-        let in_thumb = y >= 4;
+        let in_thumb = y >= 5;
         assert_eq!(
             cell.symbol(),
             " ",
@@ -5478,7 +5939,7 @@ fn the_scrollbar_owns_its_gutter_and_never_touches_text() {
         ratatui::style::Color::Reset,
         "the scrollbar track starts below the padding row"
     );
-    for y in 1..5u16 {
+    for y in 1..6u16 {
         for x in 0..19u16 {
             let cell = &buffer[(x, y)];
             assert!(
@@ -5488,7 +5949,7 @@ fn the_scrollbar_owns_its_gutter_and_never_touches_text() {
         }
     }
     assert!(
-        (0..19u16).any(|x| buffer[(x, 3)].symbol() != " "),
+        (1..6u16).any(|y| (0..19u16).any(|x| buffer[(x, y)].symbol() != " ")),
         "the text area still carries content beside the gutter"
     );
 }
@@ -5499,10 +5960,11 @@ fn the_gutter_stays_blank_when_the_document_fits() {
     app.push_message(TuiMessage::User {
         text: "hello".to_string(),
         timestamp: chrono::Utc::now(),
+        steered: false,
     });
-    let terminal = render_to_buffer(&mut app, 20, 12);
+    let terminal = render_to_buffer(&mut app, 20, 18);
     let buffer = terminal.backend().buffer();
-    for y in 0..6u16 {
+    for y in 0..7u16 {
         let cell = &buffer[(19, y)];
         assert_eq!(
             cell.symbol(),
@@ -5692,6 +6154,7 @@ fn the_permission_sheet_sits_over_the_prompt_box() {
     app.push_message(TuiMessage::User {
         text: "top of the conversation".to_string(),
         timestamp: chrono::Utc::now(),
+        steered: false,
     });
     let terminal = render_to_buffer(&mut app, 80, 30);
     let title_row = row_of(&terminal, "Permission required");
@@ -5704,7 +6167,7 @@ fn the_permission_sheet_sits_over_the_prompt_box() {
         title_row >= 30 - 2 - 7,
         "the sheet must sit in the prompt-box region, not mid-conversation ({title_row})"
     );
-    let status_row = row_of(&terminal, "mode:");
+    let status_row = row_of(&terminal, "0k/200k");
     assert!(
         status_row > title_row,
         "the status bar must stay visible below the sheet ({status_row} vs {title_row})"
@@ -5946,7 +6409,7 @@ fn the_question_sheet_reserves_its_rows_above_the_conversation() {
         text: "TAIL MARKER the last word".to_string(),
         timestamp: chrono::Utc::now(),
     });
-    let terminal = render_to_buffer(&mut app, 80, 24);
+    let terminal = render_to_buffer(&mut app, 80, 25);
     let screen = screen_text(&terminal);
     assert!(
         screen.contains("TAIL MARKER"),
@@ -6027,8 +6490,8 @@ fn a_pending_question_keeps_the_status_bar() {
     }]);
     let screen = screen_text(&render_to_buffer(&mut app, 80, 24));
     assert!(
-        screen.contains("mode:"),
-        "the status bar survives a pending ask: {screen}"
+        screen.contains("0k/200k"),
+        "the status bar's readout survives a pending ask: {screen}"
     );
 }
 
@@ -7408,7 +7871,7 @@ fn a_click_behind_a_pending_prompt_leaves_the_hidden_caret_alone() {
     assert!(app.handle_event(&mouse_event(
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
         2 + 4,
-        20,
+        19,
     )));
 
     assert!(app.handle_event(&plain(KeyCode::Char('y'))));
@@ -7417,11 +7880,11 @@ fn a_click_behind_a_pending_prompt_leaves_the_hidden_caret_alone() {
         Ok(true),
         "the prompt still answers after the swallowed click"
     );
-    let mut answered = render_to_buffer(&mut app, 80, 24);
+    let mut answered = render_to_buffer(&mut app, 80, 25);
     let caret = answered.backend_mut().get_cursor_position().unwrap();
     assert_eq!(
         (caret.x, caret.y),
-        (2 + 11, 20),
+        (2 + 11, 19),
         "the click behind the overlay never moved the draft's caret"
     );
 }
@@ -7437,6 +7900,7 @@ fn a_parked_drag_does_not_scroll_behind_a_pending_prompt() {
         app.push_message(TuiMessage::User {
             text: format!("line{i:02}"),
             timestamp: now,
+            steered: false,
         });
     }
     let _ = render_to_buffer(&mut app, 80, 24);
@@ -7548,26 +8012,21 @@ fn modifier_decorated_keys_do_not_answer_the_prompt() {
 }
 
 #[test]
-fn ctrl_c_under_a_pending_prompt_serves_the_run_as_ever() {
+fn ctrl_c_ctrl_c_under_a_pending_prompt_is_one_action_as_ever() {
+    // A permission ask passes the chord (it owns Esc, not Ctrl+C):
+    // the double action behaves exactly as it does without the
+    // sheet — arm, then the one fire that cancels and exits.
     let state = dch_tui::TuiObserverState::new();
     let (observer, kept) = state.into_observer();
     drop(observer);
-    let running = Arc::clone(&kept.agent_running);
-    running.store(true, std::sync::atomic::Ordering::SeqCst);
+    kept.agent_running
+        .store(true, std::sync::atomic::Ordering::SeqCst);
     let cancels: Arc<std::sync::Mutex<Vec<()>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&cancels);
     let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
     app.set_run_canceller(Box::new(move || {
         sink.lock().expect("sink").push(());
     }));
-
-    // A draft written while the run is in flight, before the ask
-    // lands — the chord's first press must clear it, cancel comes on
-    // the second, exactly as without a prompt.
-    for c in ['n', 'o', 't', 'e'] {
-        app.handle_event(&plain(KeyCode::Char(c)));
-    }
-    assert_eq!(app.input(), "note", "the draft predates the ask");
 
     let (requests_tx, requests_rx) = tokio::sync::mpsc::unbounded_channel();
     let (reply, _reply_rx) = tokio::sync::oneshot::channel();
@@ -7585,91 +8044,18 @@ fn ctrl_c_under_a_pending_prompt_serves_the_run_as_ever() {
     assert_eq!(
         cancels.lock().expect("sink").len(),
         0,
-        "the first press clears the draft, cancelling nothing"
+        "through the sheet the first press still only arms"
     );
-    assert_eq!(app.input(), "", "the draft is gone");
-    let terminal = render_to_buffer(&mut app, 80, 30);
-    assert!(
-        screen_text(&terminal).contains("allow bash?"),
-        "the prompt stays up for the second press"
-    );
+    assert!(!app.is_quitting(), "the arming press leaves nothing");
 
     assert!(app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL)));
     assert_eq!(
         cancels.lock().expect("sink").len(),
         1,
-        "the second press passes through the prompt and cancels the run"
+        "the fire cancels through the sheet as without it"
     );
-    assert!(!app.is_quitting(), "a cancel never quits");
-
-    running.store(false, std::sync::atomic::Ordering::SeqCst);
-    assert!(
-        app.tick_wake(std::time::Instant::now()),
-        "the run's landing retires the prompt with a redraw"
-    );
-    let terminal = render_to_buffer(&mut app, 80, 30);
-    assert!(
-        !screen_text(&terminal).contains("Permission required"),
-        "no prompt outlives its run"
-    );
+    assert!(app.is_quitting(), "and the same fire terminates");
 }
-
-/// A state-split app for the thinking-lane pins.
-///
-/// The tests below drive the observer directly — deltas and responses —
-/// and render through the real frame path, so the lane's capture,
-/// graduation, and interaction all exercise the shipped wiring.
-fn thinking_app() -> (dch_tui::TuiObserver, TuiApp) {
-    let (observer, state) = dch_tui::TuiObserverState::new().into_observer();
-    (
-        observer,
-        TuiApp::from_observer_state(config_with_theme("dracula"), state),
-    )
-}
-
-/// A thinking app whose agent run is live.
-///
-/// Live reasoning renders only while the run does — the flag this
-/// helper sets before the app takes the state.
-fn live_thinking_app() -> (dch_tui::TuiObserver, TuiApp) {
-    let (observer, state) = dch_tui::TuiObserverState::new().into_observer();
-    state
-        .agent_running
-        .store(true, std::sync::atomic::Ordering::Relaxed);
-    (
-        observer,
-        TuiApp::from_observer_state(config_with_theme("dracula"), state),
-    )
-}
-
-fn thinking_delta(turn: usize, delta: &str) -> loopctl::observer::ThinkingDeltaContext {
-    loopctl::observer::ThinkingDeltaContext {
-        turn,
-        delta: delta.to_string(),
-    }
-}
-
-fn responded(turn: usize, text: &str) -> loopctl::observer::ResponseContext {
-    loopctl::observer::ResponseContext {
-        turn,
-        text: text.to_string(),
-        usage: None,
-    }
-}
-
-fn click(app: &mut TuiApp, column: u16, row: u16) {
-    app.handle_event(&mouse_event(
-        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
-        column,
-        row,
-    ));
-    app.handle_event(&mouse_event(
-        crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
-        column,
-        row,
-    ));
-}
-
 #[test]
 fn an_empty_reply_text_never_becomes_an_empty_text_block() {
     let (observer, mut app) = thinking_app();
@@ -8548,15 +8934,15 @@ fn a_click_on_the_question_sheet_leaves_the_hidden_caret_alone() {
     let mut app = app();
     app.handle_event(&Event::Paste("hello world".to_string()));
     let _answer = staged_question(&mut app, "which one?", &[("one", None)], false);
-    let mut before = render_to_buffer(&mut app, 80, 24);
+    let mut before = render_to_buffer(&mut app, 80, 25);
     let before_caret = before.backend_mut().get_cursor_position().unwrap();
 
     assert!(app.handle_event(&mouse_event(
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
         2 + 4,
-        20,
+        19,
     )));
-    let mut clicked = render_to_buffer(&mut app, 80, 24);
+    let mut clicked = render_to_buffer(&mut app, 80, 25);
     let clicked_caret = clicked.backend_mut().get_cursor_position().unwrap();
     assert_eq!(
         (clicked_caret.x, clicked_caret.y),
@@ -8565,11 +8951,11 @@ fn a_click_on_the_question_sheet_leaves_the_hidden_caret_alone() {
     );
 
     assert!(app.handle_event(&plain(KeyCode::Enter)));
-    let mut answered = render_to_buffer(&mut app, 80, 24);
+    let mut answered = render_to_buffer(&mut app, 80, 25);
     let caret = answered.backend_mut().get_cursor_position().unwrap();
     assert_eq!(
         (caret.x, caret.y),
-        (2 + 11, 20),
+        (2 + 11, 19),
         "the composer comes back exactly where the press landed on the sheet"
     );
 }
@@ -8588,6 +8974,7 @@ fn the_wheel_still_pages_under_a_question() {
         app.push_message(TuiMessage::User {
             text: format!("line{i:02}"),
             timestamp: now,
+            steered: false,
         });
     }
     let _ = render_to_buffer(&mut app, 80, 24);
@@ -8619,6 +9006,7 @@ fn page_keys_page_the_transcript_under_a_question() {
         app.push_message(TuiMessage::User {
             text: format!("line{i:02}"),
             timestamp: now,
+            steered: false,
         });
     }
     let mut before_render = render_to_buffer(&mut app, 80, 24);
@@ -8696,6 +9084,7 @@ fn page_keys_page_the_transcript_behind_a_permission_ask() {
         app.push_message(TuiMessage::User {
             text: format!("line{i:02}"),
             timestamp: now,
+            steered: false,
         });
     }
     let (requests_tx, requests_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -8749,7 +9138,7 @@ fn a_click_behind_the_permission_sheet_moves_nothing() {
         app.handle_event(&mouse_event(
             MouseEventKind::Down(crossterm::event::MouseButton::Left),
             6,
-            20,
+            19,
         ))
     };
 
@@ -8757,16 +9146,16 @@ fn a_click_behind_the_permission_sheet_moves_nothing() {
     // the composer's text, and the caret goes where it was pointed.
     let mut bare = app();
     bare.handle_event(&Event::Paste("hello world".to_string()));
-    let _ = render_to_buffer(&mut bare, 80, 24);
+    let _ = render_to_buffer(&mut bare, 80, 25);
     assert!(click_the_composer(&mut bare));
-    let mut moved = render_to_buffer(&mut bare, 80, 24);
+    let mut moved = render_to_buffer(&mut bare, 80, 25);
     let landed = moved
         .backend_mut()
         .get_cursor_position()
         .expect("the composer owns the caret");
     assert_eq!(
         (landed.x, landed.y),
-        (6, 20),
+        (6, 19),
         "the same press is the composer's whenever nothing is on screen"
     );
 
@@ -8775,17 +9164,17 @@ fn a_click_behind_the_permission_sheet_moves_nothing() {
     let mut app = app();
     app.handle_event(&Event::Paste("hello world".to_string()));
     stage(&mut app);
-    let _ = render_to_buffer(&mut app, 80, 24);
+    let _ = render_to_buffer(&mut app, 80, 25);
     assert!(click_the_composer(&mut app));
     assert!(app.handle_event(&plain(KeyCode::Char('y'))));
-    let mut after = render_to_buffer(&mut app, 80, 24);
+    let mut after = render_to_buffer(&mut app, 80, 25);
     let held = after
         .backend_mut()
         .get_cursor_position()
         .expect("the composer owns the caret");
     assert_eq!(
         (held.x, held.y),
-        (2 + 11, 20),
+        (2 + 11, 19),
         "the caret the sheet hid never moved"
     );
 }
@@ -9218,4 +9607,2018 @@ fn a_strip_at_the_top_keeps_its_row_from_the_sheet() {
             "the sheet's box never reaches into the status bar:\n{screen}"
         );
     }
+}
+
+/// Feed one `TodoWrite` graduation through the shared state the way the
+/// observer would, with a submission naming the whole list — the
+/// display's drain picks it up on the next frame.
+fn todo_graduation(app: &TuiApp, call_id: &str, submission: &str) {
+    app.graduations()
+        .lock()
+        .unwrap()
+        .push(dch_tui::observer::Graduation::Tool(
+            dch_tui::observer::ToolResultDisplay {
+                name: "TodoWrite".to_string(),
+                call_id: call_id.to_string(),
+                is_error: false,
+                duration: std::time::Duration::ZERO,
+                input_summary: String::new(),
+                output_preview: String::new(),
+                full_input: submission.to_string(),
+                full_output: String::new(),
+            },
+        ));
+}
+
+#[test]
+fn a_todo_update_renders_as_checkbox_rows_in_the_conversation() {
+    // The list is the point of the call: the block opens with the done
+    // fraction and one checkbox row per task — ☑ completed, ◐ running,
+    // ☐ pending — and the moved rows still standing wear the accent so
+    // a scrolling reader sees what moved without diffing lists by eye.
+    let mut app = app();
+    todo_graduation(
+        &app,
+        "call-1",
+        r#"{"todos":[
+            {"id":"1","subject":"survey the land","status":"completed"},
+            {"id":"2","subject":"dig the trench","status":"pending"}
+        ]}"#,
+    );
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&terminal);
+    let flat: String = rows.join("\n");
+    assert!(
+        flat.contains("1/2 done"),
+        "the block heads with the done fraction: {flat:?}"
+    );
+    assert!(
+        flat.contains("\u{2611} survey the land"),
+        "completed tasks render as checked boxes: {flat:?}"
+    );
+    assert!(
+        flat.contains("\u{2610} dig the trench"),
+        "pending tasks render as empty boxes: {flat:?}"
+    );
+
+    // The second update moves the trench to in-progress and finishes the
+    // survey's neighbour: exactly the moved rows still standing accent,
+    // the rest settle.
+    todo_graduation(
+        &app,
+        "call-2",
+        r#"{"todos":[
+            {"id":"1","subject":"survey the land","status":"completed"},
+            {"id":"2","subject":"dig the trench","status":"in_progress"}
+        ]}"#,
+    );
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&terminal);
+    let trench = rows
+        .iter()
+        .find(|row| row.contains("\u{25d0}") && row.contains("dig the trench"))
+        .expect("the moved trench renders in progress");
+    assert!(
+        trench.contains("\u{25d0}"),
+        "the in-progress task carries the half-filled mark: {trench:?}"
+    );
+    let buffer = terminal.backend().buffer();
+    let accent = app.theme.ui.primary;
+    let _ = &accent;
+    let trench_row = rows
+        .iter()
+        .position(|row| row.contains("\u{25d0}") && row.contains("dig the trench"))
+        .expect("the moved trench's row");
+    let accent_cells = (0..80u16)
+        .filter(|&x| buffer[(x, u16::try_from(trench_row).unwrap())].fg == accent)
+        .count();
+    assert!(
+        accent_cells > 0,
+        "the row this update moved wears the accent: {trench:?}"
+    );
+}
+
+#[test]
+fn the_plan_stands_pinned_while_tasks_do() {
+    // The plan is furniture, not a sheet: while tasks stand, the
+    // section holds its rows above the composer with no key asked or
+    // taken — the fraction and the checkbox rows are simply part of
+    // the frame — and a display with no tasks spends no rows on it
+    // at all: an empty plan is no plan, not a plan that says
+    // nothing.
+    let mut app = app();
+    todo_graduation(
+        &app,
+        "call-1",
+        r#"{"todos":[
+            {"id":"1","subject":"first thing","status":"completed"},
+            {"id":"2","subject":"second thing","status":"in_progress"}
+        ]}"#,
+    );
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let flat: String = row_texts(&terminal).join("\n");
+    assert_eq!(
+        flat.matches("1/2 done").count(),
+        2,
+        "the fraction stands twice — the transcript's own block and the \
+         pinned section above the composer: {flat:?}"
+    );
+    assert!(
+        flat.contains("\u{25d0} second thing"),
+        "the section carries the run's current task: {flat:?}"
+    );
+
+    // Ctrl+T walks the section's postures — capped, full, hidden. A
+    // list that already fits the cap opens without changing a thing;
+    // the next press folds the section away (the transcript's block
+    // keeps the record, the conversation takes the rows back); the
+    // press after that stands it back up.
+    assert!(app.handle_event(&Event::Key(KeyEvent::new(
+        KeyCode::Char('t'),
+        KeyModifiers::CONTROL,
+    ))));
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let flat: String = row_texts(&terminal).join("\n");
+    assert_eq!(
+        flat.matches("1/2 done").count(),
+        2,
+        "a list that fits the cap opens unchanged: {flat:?}"
+    );
+    assert!(app.handle_event(&Event::Key(KeyEvent::new(
+        KeyCode::Char('t'),
+        KeyModifiers::CONTROL,
+    ))));
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let flat: String = row_texts(&terminal).join("\n");
+    assert_eq!(
+        flat.matches("1/2 done").count(),
+        1,
+        "the next press hides the section — the fraction stands in the \
+         transcript's block alone: {flat:?}"
+    );
+    assert!(
+        flat.contains("1/2 · ctrl+t") && flat.contains(" TODO "),
+        "the folded section leaves its badge row: the pill, the count, \
+         and the chord that opens the list again: {flat:?}"
+    );
+    assert!(app.handle_event(&Event::Key(KeyEvent::new(
+        KeyCode::Char('t'),
+        KeyModifiers::CONTROL,
+    ))));
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let flat: String = row_texts(&terminal).join("\n");
+    assert_eq!(
+        flat.matches("1/2 done").count(),
+        2,
+        "and the walk returns to the capped posture: {flat:?}"
+    );
+
+    // A display with no tasks filed spends no rows on a plan.
+    let mut bare = TuiApp::new(config_with_theme("dracula"));
+    bare.post_notice("the anchor".to_string());
+    let bare_rows = row_texts(&render_to_buffer(&mut bare, 80, 30));
+    assert!(
+        !bare_rows.iter().any(|row| row.contains("done")),
+        "no tasks, no section: {bare_rows:?}"
+    );
+}
+
+#[test]
+fn a_rejected_todo_update_is_not_state() {
+    // The tool refused the submission — an illegal transition, a
+    // duplicate in-progress, whatever the validation caught — so its
+    // list never became the run's state. The display must not take
+    // the captured input as truth: the block reads as the failure it
+    // was (a plain error line, not auto-opened checkbox rows), and
+    // the sheet keeps the last accepted list instead of flipping to
+    // the rejected one — a rejected
+    // "complete everything" update must never render
+    // as if it had completed everything.
+    let mut app = app();
+    todo_graduation(
+        &app,
+        "call-1",
+        r#"{"todos":[
+            {"id":"1","subject":"one thing","status":"in_progress"},
+            {"id":"2","subject":"another thing","status":"pending"}
+        ]}"#,
+    );
+
+    // The rejected update: everything completed in one call — the
+    // shape the tool's one-rung rule exists to refuse.
+    app.graduations()
+        .lock()
+        .unwrap()
+        .push(dch_tui::observer::Graduation::Tool(
+            dch_tui::observer::ToolResultDisplay {
+                name: "TodoWrite".to_string(),
+                call_id: "call-rejected".to_string(),
+                is_error: true,
+                duration: std::time::Duration::ZERO,
+                input_summary: String::new(),
+                output_preview: String::new(),
+                full_input: r#"{"todos":[
+                {"id":"1","subject":"one thing","status":"completed"},
+                {"id":"2","subject":"another thing","status":"completed"}
+            ]}"#
+                .to_string(),
+                full_output: "Todo '1' cannot move from in_progress to completed".to_string(),
+            },
+        ));
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let flat: String = row_texts(&terminal).join("\n");
+    assert!(
+        !flat.contains("\u{2611} one thing"),
+        "the rejected update renders as the failure it was, not as ··· checkbox rows claiming completion: {flat:?}"
+    );
+
+    // The pinned section keeps the last accepted list — the run's
+    // actual state — standing where it stood.
+    assert!(
+        flat.contains("\u{25d0} one thing"),
+        "the last accepted list stands, one thing still in progress: {flat:?}"
+    );
+    assert_eq!(
+        flat.matches("0/2 done").count(),
+        2,
+        "the section counts the accepted list, not the rejected one: {flat:?}"
+    );
+}
+
+#[test]
+fn a_description_only_todo_list_still_fills_the_display() {
+    // The schema asks for `subject`, the run repairs its absence from
+    // `description`, and the display used to refuse what the run had
+    // accepted: the conversation rendered a bare tool block and
+    // Ctrl+T answered "no tasks filed" while the run kept the tasks.
+    // The display now reads the same recovery the run applies — this
+    // payload is a real session's submission shape, extra schema
+    // fields included.
+    let mut app = app();
+    todo_graduation(
+        &app,
+        "call-desc",
+        r#"{"todos":[
+            {"description":"Run the baseline gate","id":"gate","status":"in_progress","active_form":"Running the gate","owner":"lead"},
+            {"description":"Read every changed file\nend to end, no skimming","id":"read","status":"pending"},
+            {"id":"lone","status":"pending"},
+            {"id":"bare","subject":"already subjectful","status":"pending"}
+        ]}"#,
+    );
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let flat: String = row_texts(&terminal).join("\n");
+    assert!(
+        flat.contains("\u{25d0} Run the baseline gate"),
+        "a description-only task renders under its derived subject: {flat:?}"
+    );
+    assert!(
+        flat.contains("\u{2610} Read every changed file"),
+        "the description's first line is the subject, the rest is not: {flat:?}"
+    );
+    assert!(
+        flat.contains("\u{2610} Task lone"),
+        "an entry with neither field names itself by its id: {flat:?}"
+    );
+    assert!(
+        flat.contains("\u{2610} already subjectful"),
+        "an explicit subject still wins over any recovery: {flat:?}"
+    );
+    assert!(
+        flat.contains("0/4 done"),
+        "the list counts the recovered rows with the spelled ones: {flat:?}"
+    );
+    assert_eq!(
+        flat.matches("0/4 done").count(),
+        2,
+        "the pinned section carries the recovered list beside the \
+         transcript's block: {flat:?}"
+    );
+}
+
+#[test]
+fn a_long_plan_caps_its_section_and_names_the_cut() {
+    // The section is the plan's window, not its archive: past its four
+    // task rows it says exactly what it cut, and the conversation
+    // keeps the composer's furniture where it always stands — the cap
+    // spends conversation rows, never the frame's own.
+    let mut app = app();
+    let tasks: Vec<String> = (0..9)
+        .map(|index| {
+            format!("{{\"id\":\"{index}\",\"subject\":\"task {index}\",\"status\":\"pending\"}}")
+        })
+        .collect();
+    todo_graduation(
+        &app,
+        "call-long",
+        &format!("{{\"todos\":[{}]}}", tasks.join(",")),
+    );
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let flat: String = row_texts(&terminal).join("\n");
+    assert!(
+        flat.contains("0/9 done"),
+        "the fraction counts the whole plan, not the window: {flat:?}"
+    );
+    assert!(
+        flat.contains("… +5 more (ctrl+t for all)"),
+        "nine tasks, four shown: the section names its cut and the chord \
+         that opens the whole list: {flat:?}"
+    );
+    assert!(
+        flat.contains("\u{2610} task 3"),
+        "the window holds the plan's first tasks in order: {flat:?}"
+    );
+    assert_eq!(
+        flat.matches("\u{2610} task 8").count(),
+        1,
+        "the tasks past the cap live in the transcript's block alone — \
+         the section is a window, not the archive: {flat:?}"
+    );
+
+    // The chord walks the postures: capped → the whole list → hidden.
+    assert!(app.handle_event(&Event::Key(KeyEvent::new(
+        KeyCode::Char('t'),
+        KeyModifiers::CONTROL,
+    ))));
+    let terminal = render_to_buffer(&mut app, 80, 40);
+    let flat: String = row_texts(&terminal).join("\n");
+    assert_eq!(
+        flat.matches("\u{2610} task 8").count(),
+        2,
+        "opened, the section carries the whole plan beside the block: {flat:?}"
+    );
+    assert!(
+        !flat.contains("more (ctrl+t"),
+        "nothing is cut when nothing is capped: {flat:?}"
+    );
+    assert!(app.handle_event(&Event::Key(KeyEvent::new(
+        KeyCode::Char('t'),
+        KeyModifiers::CONTROL,
+    ))));
+    let terminal = render_to_buffer(&mut app, 80, 40);
+    let flat: String = row_texts(&terminal).join("\n");
+    assert_eq!(
+        flat.matches("0/9 done").count(),
+        1,
+        "hidden, the block alone carries the plan: {flat:?}"
+    );
+    assert_eq!(
+        flat.matches("\u{2610} task 3").count(),
+        1,
+        "the folded section's rows are gone — the block alone carries \
+         them: {flat:?}"
+    );
+    assert!(
+        flat.contains("0/9 · ctrl+t") && flat.contains(" TODO "),
+        "and the badge row stands in the section's place — the pill, the \
+         count, and the chord: {flat:?}"
+    );
+    assert!(app.handle_event(&Event::Key(KeyEvent::new(
+        KeyCode::Char('t'),
+        KeyModifiers::CONTROL,
+    ))));
+    let terminal = render_to_buffer(&mut app, 80, 40);
+    let flat: String = row_texts(&terminal).join("\n");
+    assert!(
+        flat.contains("… +5 more (ctrl+t for all)"),
+        "the walk returns to the capped posture: {flat:?}"
+    );
+}
+
+#[test]
+fn a_steered_echo_surviving_in_a_transcript_keeps_the_plan_standing() {
+    // The nudge fires on every run that lands with work left, and its
+    // echo is a steer — mid-run, not a boundary — so the live display
+    // keeps the plan standing through it. The resumed session owes
+    // the same: the steered row in the transcript must not retire the
+    // plan beside it, exactly as the live drain's flag rule holds.
+    // Only a real claim — an unflagged user row — retires.
+    let tool_block = TuiMessage::Assistant {
+        blocks: vec![ContentBlock::Tool {
+            call_id: "call-1".to_string(),
+            name: "TodoWrite".to_string(),
+            input_preview: "1 item".to_string(),
+            success: true,
+            elapsed_secs: 0.1,
+            output_preview: "Updated 1 todo task".to_string(),
+            retained_input: r#"{"todos":[
+                {"id":"1","subject":"the owed work","status":"pending"}
+            ]}"#
+            .to_string(),
+        }],
+        timestamp: chrono::Utc::now(),
+        duration_ms: None,
+    };
+    let mut app = app();
+    app.seed_messages(vec![
+        tool_block,
+        TuiMessage::User {
+            text: "reminder: 1 todo item still not completed".to_string(),
+            timestamp: chrono::Utc::now(),
+            steered: true,
+        },
+        TuiMessage::Assistant {
+            blocks: vec![ContentBlock::Text {
+                text: "noted, but not closing it".to_string(),
+            }],
+            timestamp: chrono::Utc::now(),
+            duration_ms: None,
+        },
+    ]);
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let flat: String = row_texts(&terminal).join("\n");
+    assert!(
+        flat.matches("0/1 done").count() >= 2,
+        "the steered echo retires nothing — the plan a resumed session \
+         owes stands beside it, block and section: {flat:?}"
+    );
+
+    // An unflagged user row is a claim and retires, as ever.
+    app.seed_messages(vec![TuiMessage::User {
+        text: "the next claim".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+    }]);
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let flat: String = row_texts(&terminal).join("\n");
+    assert!(
+        flat.matches("0/1 done").count() < 2,
+        "a plain claim's row still retires the plan on reconstruction"
+    );
+}
+
+#[test]
+fn a_cancelled_session_restores_into_its_own_plan() {
+    // The cancelled-restore shape, exactly: a run lands cancelled with its plan
+    // half-done, the session is saved and restored, and the user
+    // prompts "resume". The transcript's error row is the
+    // cancellation's record — the claim after it is a claim into owed
+    // work, and the plan stands, so the display keeps naming what the
+    // resumed session owes. Only a clean run's close retires a plan,
+    // and the resumed run will file its own when it gets there.
+    let tool_block = TuiMessage::Assistant {
+        blocks: vec![ContentBlock::Tool {
+            call_id: "call-1".to_string(),
+            name: "TodoWrite".to_string(),
+            input_preview: "2 items".to_string(),
+            success: true,
+            elapsed_secs: 0.1,
+            output_preview: "Updated 2 todo tasks".to_string(),
+            retained_input: r#"{"todos":[
+                {"id":"1","subject":"the finished half","status":"completed"},
+                {"id":"2","subject":"the interrupted half","status":"in_progress"}
+            ]}"#
+            .to_string(),
+        }],
+        timestamp: chrono::Utc::now(),
+        duration_ms: None,
+    };
+    let mut app = app();
+    app.seed_messages(vec![
+        tool_block,
+        TuiMessage::Error {
+            text: "Agent cancelled".to_string(),
+            timestamp: chrono::Utc::now(),
+        },
+        TuiMessage::User {
+            text: "resume".to_string(),
+            timestamp: chrono::Utc::now(),
+            steered: false,
+        },
+    ]);
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let flat: String = row_texts(&terminal).join("\n");
+    assert_eq!(
+        flat.matches("1/2 done").count(),
+        2,
+        "the cancelled session restores into its own plan — the claim \
+         after the error row is a claim into owed work, not a \
+         retirement: {flat:?}"
+    );
+    assert!(
+        flat.contains("\u{25d0} the interrupted half"),
+        "the section names what the resumed session still owes: {flat:?}"
+    );
+}
+
+#[test]
+fn a_restored_session_shows_the_last_run_s_plan() {
+    // The resume path seeds the conversation directly — no graduations
+    // to drain — and a restored session stands between runs, exactly
+    // where a live one stands after its run lands: the last run's plan
+    // is still up, its final state there to read, because the next
+    // claim is what retires a plan. The transcript keeps the record
+    // beside it: the seeded block renders its checkbox rows, accented
+    // by the same replay the live drain uses.
+    let tool_block = |call_id: &str, retained: &str| TuiMessage::Assistant {
+        blocks: vec![ContentBlock::Tool {
+            call_id: call_id.to_string(),
+            name: "TodoWrite".to_string(),
+            input_preview: "2 items".to_string(),
+            success: true,
+            elapsed_secs: 0.1,
+            output_preview: "Updated 2 todo tasks".to_string(),
+            retained_input: retained.to_string(),
+        }],
+        timestamp: chrono::Utc::now(),
+        duration_ms: None,
+    };
+
+    let mut restored_app = app();
+    restored_app.seed_messages(vec![tool_block(
+        "call-1",
+        r#"{"todos":[
+            {"id":"1","subject":"survey the land","status":"completed"},
+            {"id":"2","subject":"dig the trench","status":"in_progress"}
+        ]}"#,
+    )]);
+    let terminal = render_to_buffer(&mut restored_app, 80, 30);
+    let flat: String = row_texts(&terminal).join("\n");
+    assert_eq!(
+        flat.matches("1/2 done").count(),
+        2,
+        "a restored session stands between runs — the last run's plan \
+         stays up, block and section both: {flat:?}"
+    );
+    assert!(
+        flat.contains("\u{25d0} dig the trench"),
+        "the section carries the restored run's final state: {flat:?}"
+    );
+}
+
+#[test]
+fn the_plan_badge_names_the_section_in_the_queue_s_own_style() {
+    // The plan opens with the waiting section's badge — a filled pill
+    // stood in from the frame, the done fraction dim beside it — over
+    // the secondary accent rather than the primary, so the two panels
+    // read as one family of chrome with two names. A theme that defers
+    // to the terminal fills nothing: the badge degrades to plain text,
+    // the same concession the queue's makes.
+    let mut app = app();
+    todo_graduation(
+        &app,
+        "call-1",
+        r#"{"todos":[
+            {"id":"1","subject":"first thing","status":"completed"},
+            {"id":"2","subject":"second thing","status":"in_progress"}
+        ]}"#,
+    );
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&terminal);
+    let badge_row = rows
+        .iter()
+        .position(|row| row.contains(" TODO "))
+        .expect("the badge names the section");
+    assert!(
+        badge_row >= 1 && rows[badge_row - 1].trim().is_empty(),
+        "one blank row stands the badge off the transcript above — the \
+         same air the queue's pill keeps: {rows:?}"
+    );
+    assert!(
+        rows[badge_row].contains("1/2 done"),
+        "the fraction rides the badge's row, dim beside the pill: {:?}",
+        rows[badge_row]
+    );
+    let column = u16::try_from(rows[badge_row].find(" TODO ").expect("located above")).unwrap_or(0);
+    let row = u16::try_from(badge_row).unwrap_or(0);
+    let buffer = terminal.backend().buffer();
+    for offset in 0..6u16 {
+        assert_eq!(
+            buffer[(column + offset, row)].bg,
+            app.theme.ui.secondary,
+            "the word rides the secondary fill — the queue's pill, another name"
+        );
+    }
+    for letters in 1..5u16 {
+        assert_eq!(
+            buffer[(column + letters, row)].fg,
+            app.theme.ui.background,
+            "the canvas color keeps the letters legible on the accent"
+        );
+    }
+    // The badge rides flush with the rows it heads: the pill's left
+    // fill edge shares the checkbox column, not a stand-off to the
+    // right of it.
+    let badge_untrimmed: String = (0..80u16)
+        .map(|x| buffer[(x, row)].symbol().to_string())
+        .collect();
+    let pill_edge = badge_untrimmed.find("TODO").map_or(usize::MAX, |byte| {
+        badge_untrimmed[..byte].chars().count().saturating_sub(1)
+    });
+    // The section's rows — below the badge; the transcript's own todo
+    // block renders the same glyphs at a deeper inset above it.
+    let task_row = rows
+        .iter()
+        .skip(badge_row.saturating_add(1))
+        .position(|r| r.contains('\u{2610}') || r.contains('\u{25d0}'))
+        .map(|offset| badge_row.saturating_add(1) + offset)
+        .expect("a task row renders below the badge");
+    let task_row = u16::try_from(task_row).unwrap_or(0);
+    let task_untrimmed: String = (0..80u16)
+        .map(|x| buffer[(x, task_row)].symbol().to_string())
+        .collect();
+    let icon_col = task_untrimmed
+        .find(['\u{2610}', '\u{25d0}'])
+        .map_or(usize::MAX, |byte| task_untrimmed[..byte].chars().count());
+    assert_eq!(
+        pill_edge, icon_col,
+        "the TODO pill aligns with the checkbox column — left, not stood off"
+    );
+
+    // A deferring theme fills nothing: the badge becomes plain text.
+    app.theme = Theme::by_name("transparent").expect("the transparent theme is shipped");
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&terminal);
+    let badge_row = rows
+        .iter()
+        .position(|row| row.contains(" TODO "))
+        .expect("the badge still names the section");
+    let column = u16::try_from(rows[badge_row].find(" TODO ").expect("located above")).unwrap_or(0);
+    let row = u16::try_from(badge_row).unwrap_or(0);
+    let buffer = terminal.backend().buffer();
+    for offset in 0..6u16 {
+        assert_eq!(
+            buffer[(column + offset, row)].bg,
+            ratatui::style::Color::Reset,
+            "the badge defers to the terminal's own canvas — no block of paint"
+        );
+    }
+}
+
+/// A slot whose run always takes the offer — the steer path, live.
+struct AcceptingGuidance;
+
+impl dch_tui::Guidance for AcceptingGuidance {
+    fn steer(&self, _text: String) -> bool {
+        true
+    }
+
+    fn take_returned(&self) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+#[test]
+fn a_mid_run_steer_keeps_the_plan_standing() {
+    // The steer's echo rode the same graduation shape as the claim's,
+    // so the drain retired the plan on a steer — the section vanished
+    // mid-run while the runner's own todo store kept standing, the
+    // display out of step with the store. The steer's echo is flagged
+    // apart now: the plan keeps standing through the steer exactly as
+    // the store does, and only the claim's echo — a real run boundary —
+    // retires it.
+    let mut app = app();
+    // The chord goes through the live slot — the delivery seam itself,
+    // not a hand-pushed graduation standing in for it.
+    app.set_guidance(Some(Arc::new(AcceptingGuidance)));
+    todo_graduation(
+        &app,
+        "call-1",
+        r#"{"todos":[
+            {"id":"1","subject":"the only task","status":"pending"}
+        ]}"#,
+    );
+    for character in "steered into the run".chars() {
+        app.handle_event(&plain(KeyCode::Char(character)));
+    }
+    assert!(
+        app.handle_event(&key(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+        "the chord is consumed whether or not a run takes the text"
+    );
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let flat: String = row_texts(&terminal).join("\n");
+    assert_eq!(
+        flat.matches("0/1 done").count(),
+        2,
+        "a steer is not a run boundary — the plan keeps standing, block \
+         and section both, while the run it rode into continues: {flat:?}"
+    );
+    assert!(
+        flat.contains("steered into the run"),
+        "the steer's echo still lands its transcript row: {flat:?}"
+    );
+
+    // The claim's echo — the boundary — is what retires the plan.
+    app.graduations()
+        .lock()
+        .unwrap()
+        .push(dch_tui::observer::Graduation::Sent {
+            text: "the next prompt".to_string(),
+            steered: false,
+        });
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let flat: String = row_texts(&terminal).join("\n");
+    assert_eq!(
+        flat.matches("0/1 done").count(),
+        1,
+        "the claim's echo retires the plan — the fraction stands in the \
+         transcript's block alone: {flat:?}"
+    );
+}
+
+#[test]
+fn an_interrupted_run_s_plan_survives_the_next_claim() {
+    // The cancelled-and-resumed shape: a run lands cancelled with its
+    // plan half-done, the user prompts again to continue the work —
+    // and the plan must stand, because it is the map of the work the
+    // session still owes. Only a clean run's plan retires at the next
+    // claim; an interrupted run's plan stands until the resumed run
+    // files its own (which it will — the model reads the transcript's
+    // TodoWrite blocks and the system prompt says maintain the list).
+    let mut app = app();
+    todo_graduation(
+        &app,
+        "call-1",
+        r#"{"todos":[
+            {"id":"1","subject":"the finished half","status":"completed"},
+            {"id":"2","subject":"the interrupted half","status":"in_progress"}
+        ]}"#,
+    );
+    app.graduations()
+        .lock()
+        .unwrap()
+        .push(dch_tui::observer::Graduation::RunEnded {
+            duration_ms: 4000,
+            success: false,
+        });
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let flat: String = row_texts(&terminal).join("\n");
+    assert_eq!(
+        flat.matches("1/2 done").count(),
+        2,
+        "the interrupted plan stays up after the cancelled run lands: {flat:?}"
+    );
+
+    // The resume prompt claims — and the plan survives the claim.
+    app.graduations()
+        .lock()
+        .unwrap()
+        .push(dch_tui::observer::Graduation::Sent {
+            text: "resume".to_string(),
+            steered: false,
+        });
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let flat: String = row_texts(&terminal).join("\n");
+    assert_eq!(
+        flat.matches("1/2 done").count(),
+        2,
+        "the claim after an interrupted run retires nothing — the plan \
+         is the map of the work the session owes: {flat:?}"
+    );
+
+    // The resumed run ends cleanly: its plan — the same one, or a new
+    // filing — now retires at the next claim, the ordinary rule back.
+    app.graduations()
+        .lock()
+        .unwrap()
+        .push(dch_tui::observer::Graduation::RunEnded {
+            duration_ms: 2000,
+            success: true,
+        });
+    app.graduations()
+        .lock()
+        .unwrap()
+        .push(dch_tui::observer::Graduation::Sent {
+            text: "the prompt after".to_string(),
+            steered: false,
+        });
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let flat: String = row_texts(&terminal).join("\n");
+    assert_eq!(
+        flat.matches("1/2 done").count(),
+        1,
+        "a clean run closes the story — the next claim retires the \
+         plan again: {flat:?}"
+    );
+}
+
+#[test]
+fn a_plan_stays_after_its_run_and_leaves_at_the_next_claim() {
+    // The plan stays up after its run lands — the final state, done or
+    // not, is the thing to read in the quiet after the run — and the
+    // next claim retires it, half-done or finished alike, at the same
+    // edge the runner resets its own store. The transcript keeps every
+    // update in full; only the pinned window goes. Steering delivers
+    // mid-run without claiming, so a plan keeps updating through its
+    // own run.
+    let mut app = app();
+    todo_graduation(
+        &app,
+        "call-1",
+        r#"{"todos":[
+            {"id":"1","subject":"finished thing","status":"completed"},
+            {"id":"2","subject":"half-done thing","status":"in_progress"}
+        ]}"#,
+    );
+    app.graduations()
+        .lock()
+        .unwrap()
+        .push(dch_tui::observer::Graduation::RunEnded {
+            duration_ms: 800,
+            success: true,
+        });
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let flat: String = row_texts(&terminal).join("\n");
+    assert_eq!(
+        flat.matches("1/2 done").count(),
+        2,
+        "the landing leaves the plan standing — its final state is the \
+         thing to read in the quiet after the run: {flat:?}"
+    );
+
+    // The next claim retires it: the section shows the last run's
+    // plan, never an older one's.
+    app.graduations()
+        .lock()
+        .unwrap()
+        .push(dch_tui::observer::Graduation::Sent {
+            text: "the next prompt".to_string(),
+            steered: false,
+        });
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let flat: String = row_texts(&terminal).join("\n");
+    assert_eq!(
+        flat.matches("1/2 done").count(),
+        1,
+        "the next claim retires the plan — the fraction stands in the \
+         transcript's block alone: {flat:?}"
+    );
+}
+
+#[test]
+fn the_readout_leads_the_footer_and_the_session_id_centers_it() {
+    // The footer's order: the context pair is its head — the bar at
+    // the left edge of its row, standing exactly over the numbers
+    // that lead the bottom row — and the session id rides that same
+    // bar row, right-aligned: the footer's middle row, vertically
+    // centered between the air above and the numbers below. A frame
+    // too narrow for the id to clear the bar forgoes it rather than
+    // truncating it, and the directory the bar once carried rides
+    // the place row above the composer instead.
+    let mut app = app();
+    app.set_working_dir(std::path::Path::new("/home/tester/repos/dch"));
+    app.set_git_branch(Some("master".to_string()));
+    app.set_session_id("f005d097-c4ce-477a-88c0-2fc2fc000000".to_string());
+    let rows = row_texts(&render_to_buffer(&mut app, 60, 30));
+    let numbers_row = rows
+        .iter()
+        .position(|row| row.contains("0k/200k"))
+        .expect("the numbers render");
+    assert_eq!(
+        numbers_row,
+        rows.len() - 1,
+        "the numbers stand on the bottom row: {rows:?}"
+    );
+    assert!(
+        rows[numbers_row].trim_start().starts_with("0k/200k (0%)"),
+        "the readout leads from the bar's left edge: {:?}",
+        rows[numbers_row]
+    );
+    let bar_row = numbers_row - 1;
+    let columns = rows[bar_row].chars().collect::<Vec<_>>();
+    assert!(
+        rows[bar_row]
+            .trim_end()
+            .ends_with("f005d097-c4ce-477a-88c0-2fc2fc000000"),
+        "the id closes the bar's row at the right edge, centered in the footer: {:?}",
+        rows[bar_row]
+    );
+    assert_eq!(
+        columns.last(),
+        Some(&' '),
+        "the id stands a cell of air off the frame's right edge: {:?}",
+        rows[bar_row]
+    );
+    assert!(
+        !rows[bar_row].contains("dch (master)") && !rows[numbers_row].contains("dch (master)"),
+        "the directory moved off the footer onto the place row: {rows:?}"
+    );
+    let place_row = rows
+        .iter()
+        .position(|row| row.contains("dch (master)"))
+        .expect("the place row renders");
+    assert!(
+        place_row < bar_row - 1,
+        "the place row rides above the composer, clear of the footer: {rows:?}"
+    );
+
+    // Narrower than the bar plus the id, the id steps aside whole —
+    // never truncated, never run into the bar — and the readout
+    // keeps its claim on the left edge.
+    let narrow = row_texts(&render_to_buffer(&mut app, 20, 30));
+    let narrow_numbers = narrow
+        .iter()
+        .position(|row| row.contains("0k/200k"))
+        .expect("the numbers still render");
+    assert_eq!(
+        narrow_numbers,
+        narrow.len() - 1,
+        "the numbers still stand on the bottom row: {narrow:?}"
+    );
+    assert!(
+        narrow[narrow_numbers].trim_start().starts_with("0k/200k"),
+        "the readout keeps the left edge at any width: {:?}",
+        narrow[narrow_numbers]
+    );
+    assert!(
+        !narrow.iter().any(|row| row.contains("f005d097")),
+        "an id without the room is forgone, not clipped into the bar: {narrow:?}"
+    );
+}
+
+#[test]
+fn autumn_night_keeps_its_track_a_visible_step_off_the_bar() {
+    // The theme's track came upstream at (14,14,14) against a (9,9,9)
+    // bar — five units apart, invisible: the context bar's empty half
+    // read as nothing, and a usage bar whose unfilled half reports
+    // nothing is not a bar. The lifted neutral must stay a perceptible
+    // step — every channel at least sixteen off the bar's background —
+    // and the empty track must actually paint on the bar's row.
+    let mut app = TuiApp::new(config_with_theme("autumn_night"));
+    let (track, bar_bg) = (app.theme.ui.scrollbar_track, app.theme.ui.status_bar_bg);
+    let (track_rgb, bar_rgb) = (rgb_of(track), rgb_of(bar_bg));
+    let delta = std::iter::zip(track_rgb, bar_rgb)
+        .map(|(t, b)| t.abs_diff(b))
+        .max();
+    assert!(
+        delta.is_some_and(|delta| delta >= 16),
+        "the track stands a visible step off the bar's background: \
+         {track:?} vs {bar_bg:?}"
+    );
+    let terminal = render_to_buffer(&mut app, 100, 30);
+    let buffer = terminal.backend().buffer();
+    let bar_row = 28u16;
+    let track_cells = (0..100u16)
+        .filter(|&x| buffer[(x, bar_row)].bg == track)
+        .count();
+    assert!(
+        track_cells >= 16,
+        "the empty track paints on the bar's row — the unfilled half \
+         reports the bar's shape"
+    );
+}
+
+/// An `Rgb` color as its channels, or a failure naming the shape that
+/// broke the contrast pin.
+fn rgb_of(color: ratatui::style::Color) -> [u8; 3] {
+    match color {
+        ratatui::style::Color::Rgb(r, g, b) => [r, g, b],
+        other => panic!("expected an Rgb track, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_scrolled_view_never_severs_a_todo_block() {
+    // The plan badge keeps the fraction on screen at every scroll, so
+    // a transcript window that cuts an expanded todo block mid-list
+    // shows a count and a list that disagree — the badge says twelve,
+    // the frame carries eleven rows, and nothing marks the cut. The
+    // scrolled view moves a fitting block's cut up to the block's own
+    // head instead: the block renders whole or not at all.
+    let mut app = app();
+    let items: Vec<String> = (1..=12)
+        .map(|n| format!(r#"{{"id":"t{n}","subject":"item {n} of the plan","status":"pending"}}"#))
+        .collect();
+    todo_graduation(
+        &app,
+        "call-1",
+        &format!(r#"{{"todos":[{}]}}"#, items.join(",")),
+    );
+    // Long replies below the block, so the block sits well above the
+    // bottom and every scroll step crosses it.
+    for turn in 0..6 {
+        app.graduations()
+            .lock()
+            .unwrap()
+            .push(dch_tui::observer::Graduation::Reply {
+                text: format!("reply {turn}: {}", "settled prose fills the width. ").repeat(8),
+                thinking: None,
+            });
+    }
+    // Fold the plan section to its badge — the fraction the reader
+    // reconciles the rows against stays on screen either way.
+    app.handle_event(&key(KeyCode::Char('t'), KeyModifiers::CONTROL));
+    app.handle_event(&key(KeyCode::Char('t'), KeyModifiers::CONTROL));
+
+    let fragments: Vec<String> = (1..=12).map(|n| format!("item {n} of the plan")).collect();
+    let mut saw_whole = false;
+    let mut saw_none = false;
+    for step in 0..24u32 {
+        let terminal = render_to_buffer(&mut app, 80, 30);
+        let flat: String = row_texts(&terminal).join("\n");
+        let visible = fragments
+            .iter()
+            .filter(|fragment| flat.contains(fragment.as_str()))
+            .count();
+        assert!(
+            visible == 0 || visible == fragments.len(),
+            "scroll step {step}: the todo block must render whole or not at all, \
+             saw {visible} of {} rows in frame:\n{flat}",
+            fragments.len()
+        );
+        saw_whole |= visible == fragments.len();
+        saw_none |= visible == 0;
+        app.handle_event(&plain(KeyCode::Up));
+    }
+    assert!(
+        saw_whole && saw_none,
+        "the walk must cross the block both ways for the pin to bite"
+    );
+}
+
+#[test]
+fn completed_rows_retire_uniformly_with_an_unstruck_box() {
+    // Finished work reads as retired the moment it finishes: a row
+    // completed in this update renders exactly like every older
+    // completed row — no change-accent lingering on the words — and
+    // the strike-through belongs to the subject alone, never the
+    // checkbox, whose plain checked box stays legible as the row's
+    // status at a glance.
+    let mut app = app();
+    todo_graduation(
+        &app,
+        "call-1",
+        r#"{"todos":[
+            {"id":"1","subject":"the earlier work","status":"completed"},
+            {"id":"2","subject":"the last stretch","status":"pending"}
+        ]}"#,
+    );
+    todo_graduation(
+        &app,
+        "call-2",
+        r#"{"todos":[
+            {"id":"1","subject":"the earlier work","status":"completed"},
+            {"id":"2","subject":"the last stretch","status":"completed"}
+        ]}"#,
+    );
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&terminal);
+    let buffer = terminal.backend().buffer();
+    let dim = app.theme.ui.dim;
+    let accent = app.theme.ui.primary;
+    for subject in ["the earlier work", "the last stretch"] {
+        let row = rows
+            .iter()
+            .position(|row| row.contains('\u{2611}') && row.contains(subject))
+            .unwrap_or_else(|| panic!("the completed row for {subject} renders"));
+        let row = u16::try_from(row).unwrap_or(0);
+        // The untrimmed row, cell by cell: the icon's column is where
+        // the buffer actually holds it, inset and all.
+        let untrimmed: String = (0..80u16)
+            .map(|x| buffer[(x, row)].symbol().to_string())
+            .collect();
+        let icon_column = untrimmed.find('\u{2611}').map_or(0, |chars| {
+            u16::try_from(untrimmed[..chars].chars().count()).unwrap_or(0)
+        });
+        let icon_cell = &buffer[(icon_column, row)];
+        assert_eq!(
+            icon_cell.fg, dim,
+            "the checked box sits in the dim register: {subject}"
+        );
+        assert!(
+            !icon_cell
+                .modifier
+                .contains(ratatui::style::Modifier::CROSSED_OUT),
+            "the checkbox itself is never struck through: {subject}"
+        );
+        let subject_cell = &buffer[(icon_column.saturating_add(2), row)];
+        assert_eq!(
+            subject_cell.fg, dim,
+            "a completed row carries no accent, fresh or old: {subject}"
+        );
+        assert!(
+            subject_cell
+                .modifier
+                .contains(ratatui::style::Modifier::CROSSED_OUT),
+            "the subject's words retire under the strike: {subject}"
+        );
+        assert!(
+            subject_cell.fg != accent,
+            "finishing is not the thing happening now: {subject}"
+        );
+    }
+}
+
+#[test]
+fn the_capped_plan_badge_names_the_chord_that_opens_it() {
+    // The capped posture is the section most sessions live in, and
+    // its badge row is the one place every posture reads: a plan that
+    // fits the cap shows no ellipsis, so without the chord on the
+    // badge the reader has no way to learn the list opens. The full
+    // view needs no such nudge — it is the open list.
+    let mut app = app();
+    todo_graduation(
+        &app,
+        "call-1",
+        r#"{"todos":[
+            {"id":"1","subject":"one thing","status":"pending"},
+            {"id":"2","subject":"two thing","status":"pending"}
+        ]}"#,
+    );
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&terminal);
+    let badge_row = rows
+        .iter()
+        .find(|row| row.contains(" TODO "))
+        .expect("the badge names the section");
+    assert!(
+        badge_row.contains("0/2 done"),
+        "the fraction rides the badge: {badge_row:?}"
+    );
+    assert!(
+        badge_row.contains("ctrl+t"),
+        "the capped badge names the chord that opens the whole list, \
+         even when the cap cut nothing: {badge_row:?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row.contains("more (ctrl+t")),
+        "a plan that fits the cap shows no ellipsis: {rows:?}"
+    );
+
+    app.handle_event(&key(KeyCode::Char('t'), KeyModifiers::CONTROL));
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&terminal);
+    let badge_row = rows
+        .iter()
+        .find(|row| row.contains(" TODO "))
+        .expect("the badge still names the section");
+    assert!(
+        !badge_row.contains("ctrl+t"),
+        "the open list is its own answer — the full view carries no \
+         chord nudge: {badge_row:?}"
+    );
+}
+
+/// A state-split app for the thinking-lane pins.
+///
+/// The tests below drive the observer directly — deltas and responses —
+/// and render through the real frame path, so the lane's capture,
+/// graduation, and interaction all exercise the shipped wiring.
+fn thinking_app() -> (dch_tui::TuiObserver, TuiApp) {
+    let (observer, state) = dch_tui::TuiObserverState::new().into_observer();
+    (
+        observer,
+        TuiApp::from_observer_state(config_with_theme("dracula"), state),
+    )
+}
+
+/// A thinking app whose agent run is live.
+///
+/// Live reasoning renders only while the run does — the flag this
+/// helper sets before the app takes the state.
+fn live_thinking_app() -> (dch_tui::TuiObserver, TuiApp) {
+    let (observer, state) = dch_tui::TuiObserverState::new().into_observer();
+    state
+        .agent_running
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    (
+        observer,
+        TuiApp::from_observer_state(config_with_theme("dracula"), state),
+    )
+}
+
+fn thinking_delta(turn: usize, delta: &str) -> loopctl::observer::ThinkingDeltaContext {
+    loopctl::observer::ThinkingDeltaContext {
+        turn,
+        delta: delta.to_string(),
+    }
+}
+
+fn responded(turn: usize, text: &str) -> loopctl::observer::ResponseContext {
+    loopctl::observer::ResponseContext {
+        turn,
+        text: text.to_string(),
+        usage: None,
+    }
+}
+
+fn click(app: &mut TuiApp, column: u16, row: u16) {
+    app.handle_event(&mouse_event(
+        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column,
+        row,
+    ));
+    app.handle_event(&mouse_event(
+        crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        column,
+        row,
+    ));
+}
+
+#[test]
+fn both_chords_cancel_the_same_way_and_only_ctrl_c_exits() {
+    // The two ladders share the cancel — the same canceller, the same
+    // record — and differ only in what the fire carries: Esc-Esc's
+    // fire stops the run and the session stands; Ctrl+C Ctrl+C's
+    // fire stops the run and terminates. Both arm before they fire,
+    // and a stray key between either ladder's presses stands it down.
+    let (mut app, kept) = app_with_state();
+    kept.agent_running
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = Arc::clone(&cancelled);
+    app.set_run_canceller(Box::new(move || {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    }));
+    app.handle_event(&plain(KeyCode::Esc));
+    assert!(
+        !cancelled.load(std::sync::atomic::Ordering::SeqCst),
+        "one Esc alone cancels nothing"
+    );
+    app.handle_event(&plain(KeyCode::Char('x')));
+    app.handle_event(&plain(KeyCode::Esc));
+    assert!(
+        !cancelled.load(std::sync::atomic::Ordering::SeqCst),
+        "a stray key between the presses stands the cancel down"
+    );
+    app.handle_event(&plain(KeyCode::Esc));
+    app.handle_event(&plain(KeyCode::Esc));
+    assert!(
+        cancelled.load(std::sync::atomic::Ordering::SeqCst),
+        "two Esc presses with nothing between fire the canceller"
+    );
+    assert!(!app.is_quitting(), "a cancel is not an exit");
+
+    let (mut app, kept) = app_with_state();
+    kept.agent_running
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = Arc::clone(&cancelled);
+    app.set_run_canceller(Box::new(move || {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    }));
+    app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(
+        !cancelled.load(std::sync::atomic::Ordering::SeqCst),
+        "the first press only arms"
+    );
+    assert!(!app.is_quitting(), "the arming press leaves nothing");
+    app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(
+        cancelled.load(std::sync::atomic::Ordering::SeqCst),
+        "the fire is the same cancel Esc-Esc fires"
+    );
+    assert!(app.is_quitting(), "and the same fire terminates");
+}
+#[test]
+fn a_cleared_draft_with_no_run_names_the_exit_ladder() {
+    // With nothing running, the clearing press is still the ladder's
+    // first rung: the frame says the exit is two presses away rather
+    // than leaving the cleared draft to guess.
+    let mut app = app();
+    for character in "words that will not be sent".chars() {
+        app.handle_event(&plain(KeyCode::Char(character)));
+    }
+    app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(app.input().is_empty(), "the draft clears");
+    assert!(!app.is_quitting(), "clearing arms nothing");
+    let cleared = render_to_buffer(&mut app, 80, 24);
+    assert!(
+        row_texts(&cleared)
+            .iter()
+            .any(|row| row.contains("press ctrl+c twice to quit")),
+        "the cleared draft names the exit it did not arm: {:?}",
+        row_texts(&cleared)
+    );
+}
+
+#[test]
+fn the_running_elapsed_line_opens_with_a_spinning_frame() {
+    // The live line says two things at once: that something is
+    // happening (the spinning dot, advancing with the elapsed clock
+    // itself) and how long it has been happening (the duration, the
+    // completed line's own format). The glyph leads, the number
+    // follows, and both leave together when the run lands.
+    let (mut app, kept) = app_with_state();
+    kept.mark_run_started();
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the clock reads")
+        .as_millis();
+    let started = u64::try_from(started).unwrap_or(u64::MAX);
+    kept.run_started_ms.store(
+        started.saturating_sub(65_000),
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    let terminal = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&terminal);
+    let timer_row = rows
+        .iter()
+        .find(|row| row.contains("1m 5s"))
+        .expect("the elapsed line renders");
+    let first = timer_row
+        .trim_start()
+        .chars()
+        .next()
+        .expect("a glyph leads");
+    assert!(
+        ('\u{2800}'..='\u{28ff}').contains(&first),
+        "a braille spinner frame leads the duration — the prototype's \
+         own orbit: {timer_row:?}"
+    );
+    kept.mark_run_ended();
+}
+
+#[test]
+fn the_running_turn_carries_its_elapsed_time() {
+    // The completed reply prints how long it took as a dim line at
+    // its foot; the running turn owes the same line while it runs —
+    // the total so far, in the completed line's own format, ticking
+    // at the frame cadence — so the question "how long has this been
+    // going" never waits for the end to be answered.
+    let (mut app, kept) = app_with_state();
+    kept.mark_run_started();
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the clock reads")
+        .as_millis();
+    let started = u64::try_from(started).unwrap_or(u64::MAX);
+    kept.run_started_ms.store(
+        started.saturating_sub(65_000),
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    let terminal = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&terminal);
+    assert!(
+        rows.iter().any(|row| row.contains("1m 5s")),
+        "the live elapsed line rides the running turn's tail: {rows:?}"
+    );
+
+    // The line leaves with the run: nothing ticks between turns.
+    kept.mark_run_ended();
+    let terminal = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&terminal);
+    assert!(
+        !rows.iter().any(|row| row.trim() == "1m 5s"),
+        "no elapsed line stands over an idle composer: {rows:?}"
+    );
+}
+
+#[test]
+fn cancel_run_in_flight_fires_only_under_a_run() {
+    // The exit handshake's own half: the method fires the canceller
+    // exactly when a run is in flight and is a no-op at rest — an
+    // exit with nothing running arms nothing and cancels nothing.
+    let (mut app, kept) = app_with_state();
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = Arc::clone(&cancelled);
+    app.set_run_canceller(Box::new(move || {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    }));
+    assert!(
+        !app.cancel_run_in_flight(),
+        "at rest there is nothing to stop"
+    );
+    assert!(
+        !cancelled.load(std::sync::atomic::Ordering::SeqCst),
+        "the idle call fires nothing"
+    );
+    kept.agent_running
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        app.cancel_run_in_flight(),
+        "under a run the handshake fires"
+    );
+    assert!(
+        cancelled.load(std::sync::atomic::Ordering::SeqCst),
+        "the canceller ran"
+    );
+}
+
+#[test]
+fn a_resume_requeues_the_bare_unanswered_claims_standing_at_the_end() {
+    // The queue a resume opens with is the truth, not a phantom: a
+    // transcript ending on bare claims — the run in flight's prompt,
+    // caught before it could record anything, and the waiting ones the
+    // exit wrote there because no turn ever spent them — each waits
+    // again in the section, in the order they were typed. They wait
+    // for the user: the section shows them at rest, `e` fixes a
+    // wording, `d` takes one out, `s` aims one at a later run — none of
+    // them runs on its own. A claim followed by its cancellation
+    // record is a deliberate stop and owes nothing, and an answered
+    // claim is done. Resurrecting cancelled prompts would put words in
+    // the queue the user explicitly took back.
+    let now = chrono::Utc::now();
+
+    // The bare claim: owed, requeued.
+    let (mut app, kept) = app_with_state();
+    app.seed_messages(vec![TuiMessage::User {
+        text: "the interrupted run's prompt".to_string(),
+        timestamp: now,
+        steered: false,
+    }]);
+    let queued: Vec<String> = {
+        let queue = kept
+            .queued
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (0..queue.len())
+            .filter_map(|index| queue.get(index))
+            .map(|entry| entry.text.clone())
+            .collect()
+    };
+    assert_eq!(
+        queued,
+        ["the interrupted run's prompt".to_string()],
+        "the bare unanswered claim waits again"
+    );
+
+    // A run of bare claims: every one owed, in the order they were
+    // typed — the exit wrote the waiting backlog behind the record of
+    // the run it stopped, and the resume carries all of it.
+    let (mut app, kept) = app_with_state();
+    app.seed_messages(vec![
+        TuiMessage::User {
+            text: "stopped mid-run".to_string(),
+            timestamp: now,
+            steered: false,
+        },
+        TuiMessage::Error {
+            text: "Agent cancelled".to_string(),
+            timestamp: now,
+        },
+        TuiMessage::User {
+            text: "first waiting word".to_string(),
+            timestamp: now,
+            steered: false,
+        },
+        TuiMessage::User {
+            text: "second waiting word".to_string(),
+            timestamp: now,
+            steered: false,
+        },
+    ]);
+    let queued: Vec<String> = {
+        let queue = kept
+            .queued
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (0..queue.len())
+            .filter_map(|index| queue.get(index))
+            .map(|entry| entry.text.clone())
+            .collect()
+    };
+    assert_eq!(
+        queued,
+        [
+            "first waiting word".to_string(),
+            "second waiting word".to_string()
+        ],
+        "the trailing run waits whole — the recorded cancel above it stays \
+         stopped, the unspent words behind it wait in their typed order"
+    );
+
+    // The cancelled claim: deliberate, owes nothing.
+    let (mut app, kept) = app_with_state();
+    app.seed_messages(vec![
+        TuiMessage::User {
+            text: "stopped mid-run".to_string(),
+            timestamp: now,
+            steered: false,
+        },
+        TuiMessage::Error {
+            text: "Agent cancelled".to_string(),
+            timestamp: now,
+        },
+    ]);
+    let queue = kept
+        .queued
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        queue.is_empty(),
+        "a cancelled prompt is not resurrected into the queue"
+    );
+
+    // Answered claims owe nothing.
+    let (mut app, kept) = app_with_state();
+    app.seed_messages(vec![
+        TuiMessage::User {
+            text: "answered".to_string(),
+            timestamp: now,
+            steered: false,
+        },
+        TuiMessage::Assistant {
+            blocks: vec![ContentBlock::Text {
+                text: "here is the answer".to_string(),
+            }],
+            timestamp: now,
+            duration_ms: None,
+        },
+    ]);
+    let queue = kept
+        .queued
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(queue.is_empty(), "an answered claim owes nothing");
+
+    // A steered echo was never a claim.
+    let (mut app, kept) = app_with_state();
+    app.seed_messages(vec![
+        TuiMessage::Assistant {
+            blocks: vec![],
+            timestamp: now,
+            duration_ms: None,
+        },
+        TuiMessage::User {
+            text: "a steer's echo".to_string(),
+            timestamp: now,
+            steered: true,
+        },
+    ]);
+    let queue = kept
+        .queued
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(queue.is_empty(), "a steered echo claims nothing");
+}
+
+#[test]
+fn the_exit_writes_waiting_prompts_into_the_transcript_as_unclaimed_rows() {
+    // The queue dies with the process, so words waiting in it need a
+    // row to survive: the exit reads the unclaimed entries inside the
+    // window between the shutdown flag rising and the cancel firing —
+    // the run in flight's entry is already out, the requeues have not
+    // landed — and writes them, in queue order, as the rows a resume
+    // seeds the waiting section from. Nothing waiting writes nothing:
+    // the exit owes no row to a queue that held none.
+    let (mut app, kept) = app_with_state();
+    {
+        let mut queue = kept
+            .queued
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        queue.push("first waiting".to_string());
+        queue.push("second waiting".to_string());
+    }
+    let texts = app.waiting_prompt_texts_at_exit();
+    assert_eq!(
+        texts,
+        ["first waiting".to_string(), "second waiting".to_string()],
+        "the snapshot is the unclaimed set, in the order they were typed"
+    );
+    let before = app.conversation().len();
+    app.echo_waiting_prompts_at_exit(texts);
+    let conversation = app.conversation();
+    let echoed: Vec<&str> = conversation
+        .get(before..)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|message| match message {
+            TuiMessage::User {
+                text,
+                steered: false,
+                ..
+            } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        echoed,
+        ["first waiting", "second waiting"],
+        "each waiting prompt becomes an unclaimed user row, in queue order"
+    );
+
+    let (mut app, kept) = app_with_state();
+    {
+        let queue = kept
+            .queued
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(queue.is_empty(), "an idle exit with nothing waiting");
+    }
+    let before = app.conversation().len();
+    app.echo_waiting_prompts_at_exit(Vec::new());
+    assert_eq!(
+        app.conversation().len(),
+        before,
+        "an empty queue leaves no rows — there were no words to owe"
+    );
+}
+
+#[test]
+fn the_exit_echoes_rescued_corrections_as_unclaimed_rows() {
+    // The drain half of the exit's correction rescue: the driver
+    // collects each correction still buffered at its exit breaks —
+    // words that travelled only in the channel — and the exit writes
+    // them back as unclaimed rows, in collection order, so the
+    // transcript ends on everything the user typed that no turn
+    // spent and a resume seeds each row into the waiting section. An
+    // empty rescue writes nothing.
+    let (mut app, kept) = app_with_state();
+    {
+        let mut rescued = kept
+            .rescued_corrections
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        rescued.push("the newest wording".to_string());
+        rescued.push("a different prompt's wording".to_string());
+    }
+    let before = app.conversation().len();
+    app.echo_rescued_corrections_at_exit();
+    let conversation = app.conversation();
+    let echoed: Vec<&str> = conversation
+        .get(before..)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|message| match message {
+            TuiMessage::User {
+                text,
+                steered: false,
+                ..
+            } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        echoed,
+        ["the newest wording", "a different prompt's wording"],
+        "each rescued correction becomes an unclaimed user row, in \
+         collection order"
+    );
+    assert!(
+        kept.rescued_corrections
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty(),
+        "the drain takes the buffer whole — a second drain writes nothing"
+    );
+    let before = app.conversation().len();
+    app.echo_rescued_corrections_at_exit();
+    assert_eq!(
+        app.conversation().len(),
+        before,
+        "an empty rescue leaves no rows"
+    );
+}
+
+#[test]
+fn the_timer_spinner_advances_with_the_elapsed_clock() {
+    // The dot's frame is a function of run time alone: 80ms per
+    // frame, the prototype's ten-cell orbit in order, sampled by
+    // every redraw. A quiet tool lane cannot freeze it, and it never
+    // desyncs from the ticking duration it leads.
+    let (mut app, kept) = app_with_state();
+    kept.mark_run_started();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the clock reads")
+        .as_millis();
+    let now = u64::try_from(now).unwrap_or(u64::MAX);
+    // Mid-frame elapsed values: the clock drift between the test's
+    // read and the render's own can never cross a frame boundary.
+    for (elapsed, expected) in [
+        (40u64, "\u{280b}"),
+        (120, "\u{2819}"),
+        (200, "\u{2839}"),
+        (440, "\u{2834}"),
+        (750, "\u{280f}"),
+    ] {
+        kept.run_started_ms.store(
+            now.saturating_sub(elapsed),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        let terminal = render_to_buffer(&mut app, 80, 24);
+        let rows = row_texts(&terminal);
+        let timer_row = rows
+            .iter()
+            .find(|row| {
+                let first = row.trim_start().chars().next();
+                first.is_some_and(|c| ('\u{2800}'..='\u{28ff}').contains(&c))
+            })
+            .unwrap_or_else(|| panic!("the timer row renders at {elapsed}ms"));
+        let first = timer_row.trim_start().chars().next().expect("a glyph");
+        assert_eq!(
+            first.to_string(),
+            expected,
+            "at {elapsed}ms elapsed the orbit shows {expected:?}: {timer_row:?}"
+        );
+    }
+}
+
+#[test]
+fn the_timer_row_names_its_count_with_a_quiet_elapsed_word() {
+    // The lane's other live rows carry their word — Thinking,
+    // Compacting — and the bare figure beside them read as a stray
+    // number. The word sits between the orbit and the figure; when
+    // the run lands, the settled footer names the same figure as a
+    // `duration` — the total is final, and a record's row says what
+    // it holds. A breathing row of margin stands above the ticking
+    // line, so it never touches the transcript it closes.
+    let (mut app, kept) = app_with_state();
+    app.seed_messages(vec![TuiMessage::User {
+        text: "the turn above the timer".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+    }]);
+    kept.mark_run_started();
+    let terminal = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&terminal);
+    let timer_at = rows
+        .iter()
+        .position(|row| {
+            row.trim_start()
+                .starts_with(|c| ('\u{2800}'..='\u{28ff}').contains(&c))
+        })
+        .expect("the timer row renders");
+    assert!(
+        rows.get(timer_at.wrapping_sub(1))
+            .is_some_and(|row| row.trim().is_empty()),
+        "a breathing row of margin stands between the transcript and the ticking \
+         figure: {rows:?}"
+    );
+    let timer_row = rows
+        .get(timer_at)
+        .expect("the position the finder just named");
+    let after_orbit: String = timer_row
+        .trim_start()
+        .chars()
+        .skip(1)
+        .skip_while(|c| c.is_whitespace())
+        .collect();
+    assert!(
+        after_orbit.starts_with("elapsed "),
+        "the word names the figure, right after the orbit: {timer_row:?}"
+    );
+
+    let (mut app, _) = app_with_state();
+    let now = chrono::Utc::now();
+    app.seed_messages(vec![
+        TuiMessage::User {
+            text: "answered".to_string(),
+            timestamp: now,
+            steered: false,
+        },
+        TuiMessage::Assistant {
+            blocks: vec![ContentBlock::Text {
+                text: "here is the answer".to_string(),
+            }],
+            timestamp: now,
+            duration_ms: Some(84_000),
+        },
+    ]);
+    let terminal = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&terminal);
+    assert!(
+        rows.iter().any(|row| row.trim() == "duration 1m 24s"),
+        "the settled footer names its total — the duration word beside the figure: {rows:?}"
+    );
+}
+
+#[test]
+fn the_running_tool_stands_above_the_turn_s_timer_footer() {
+    // The running turn reads in content order — the in-flight tool
+    // rows, then the elapsed footer closing the turn exactly where
+    // the completed reply's own duration line lands — and the tool
+    // sits one breathing row under the content above it, no further.
+    let (mut app, kept) = app_with_state();
+    kept.mark_run_started();
+    app.active_tools()
+        .lock()
+        .expect("the tools lock")
+        .push(dch_tui::ActiveTool {
+            call_id: "call-9".to_string(),
+            name: "Bash".to_string(),
+            input_summary: "cargo build".to_string(),
+            start: std::time::Instant::now(),
+        });
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&terminal);
+    let tool_row = rows
+        .iter()
+        .position(|row| row.contains("Running: cargo build"))
+        .expect("the running tool renders");
+    let timer_row = rows
+        .iter()
+        .position(|row| {
+            row.trim_start()
+                .starts_with(|c| ('\u{2800}'..='\u{28ff}').contains(&c))
+        })
+        .expect("the timer renders");
+    assert!(
+        tool_row < timer_row,
+        "the tool stands above the timer footer: {rows:?}"
+    );
+    assert_eq!(
+        timer_row,
+        tool_row.saturating_add(2),
+        "the timer closes the turn one breathing row beneath the tool"
+    );
+}
+
+#[test]
+fn the_notice_row_aligns_right_above_the_composer() {
+    // The row is glance-worthy furniture, not transcript register:
+    // its message closes at the frame's right edge, where the status
+    // bar's own identity sits — never flush left under the composer's
+    // edge column, where it reads as conversation continuing.
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    kept.agent_running
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    app.set_run_canceller(Box::new(|| {}));
+    app.handle_event(&plain(KeyCode::Esc));
+    app.handle_event(&plain(KeyCode::Esc));
+    let terminal = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&terminal);
+    let notice_row = rows
+        .iter()
+        .position(|row| row.contains("Agent cancelled"))
+        .expect("the cancel's record shows on the notice row");
+    let untrimmed: String = (0..80u16)
+        .map(|x| {
+            terminal.backend().buffer()[(x, u16::try_from(notice_row).unwrap())]
+                .symbol()
+                .to_string()
+        })
+        .collect();
+    let first_text = untrimmed
+        .trim_start()
+        .chars()
+        .next()
+        .expect("the row carries text");
+    assert!(
+        first_text == 'A',
+        "the message closes at the right edge — nothing trails it: {untrimmed:?}"
+    );
+    let leading = untrimmed
+        .find('A')
+        .map_or(0, |byte| untrimmed[..byte].chars().count());
+    assert!(
+        leading > 40,
+        "the message sits in the row's right half, not flush left: {untrimmed:?}"
+    );
+}
+
+#[test]
+fn the_exit_record_lands_below_the_captured_work() {
+    // The transcript reads in the order the run happened: the
+    // prompt, the work that stood on screen when the fire landed
+    // (the thinking the exit captures), and the cancel's record
+    // closing the turn beneath it — never the record floating above
+    // work that preceded it.
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    kept.agent_running
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept.clone());
+    app.set_run_canceller(Box::new(|| {}));
+    // The run streamed thinking that never graduated — the same
+    // writes the observer's thinking-delta hook makes.
+    {
+        let mut stream = kept
+            .thinking
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        stream.text.push_str("partial reasoning that was on screen");
+        stream.began = Some(std::time::Instant::now());
+    }
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    app.settle_exit_stop(&mut terminal);
+    let conversation = app.conversation();
+    let thinking_row = conversation
+        .iter()
+        .position(|message| {
+            matches!(message, TuiMessage::Assistant { blocks, .. } if blocks
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Thinking { text, .. } if text.contains("partial reasoning"))))
+        })
+        .expect("the captured thinking row landed");
+    let record_row = conversation
+        .iter()
+        .position(|message| matches!(message, TuiMessage::Error { text, .. } if text == "Agent cancelled"))
+        .expect("the record row landed");
+    assert!(
+        thinking_row < record_row,
+        "the work precedes the record — the run's own order: {conversation:?}"
+    );
+}
+
+#[test]
+fn settle_exit_stop_at_rest_appends_nothing() {
+    // With nothing running the exit handshake is a no-op: no captured
+    // lanes, no record row, no flush — at rest the turn-end hook has
+    // already fired from the live frames, and the exit owns nothing.
+    let (mut app, kept) = app_with_state();
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    let before = app.conversation().len();
+    app.settle_exit_stop(&mut terminal);
+    assert_eq!(
+        app.conversation().len(),
+        before,
+        "nothing lands over an idle session"
+    );
+    drop(kept);
+}
+
+#[test]
+fn settle_exit_stop_does_not_duplicate_an_instant_settles_record() {
+    // A run whose cancel resolved before the exit got there posts
+    // its own record row — the drain carries it, and the exit's
+    // deterministic write stays silent: one row, never two.
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    kept.agent_running
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept.clone());
+    app.set_run_canceller(Box::new(|| {}));
+    // The driver's settle already posted its row into the lane.
+    kept.errors
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(loopctl::error::LoopError::Cancelled.to_string());
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    app.settle_exit_stop(&mut terminal);
+    let records = app
+        .conversation()
+        .iter()
+        .filter(|message| matches!(message, TuiMessage::Error { text, .. } if text == "Agent cancelled"))
+        .count();
+    assert_eq!(
+        records, 1,
+        "the settled run's own record lands — the exit adds no twin"
+    );
+}
+
+#[test]
+fn settle_exit_stop_captures_the_partial_reply_text_beside_the_thinking() {
+    // Both unfinished lanes ride together in one assistant row — the
+    // thinking and whatever reply text had begun — so a resumed
+    // session reads the turn exactly as far as it got.
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    kept.agent_running
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept.clone());
+    app.set_run_canceller(Box::new(|| {}));
+    {
+        let mut stream = kept
+            .thinking
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        stream.text.push_str("the reasoning so far");
+        stream.began = Some(std::time::Instant::now());
+    }
+    kept.streaming_text
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push_str("the answer had begun");
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    app.settle_exit_stop(&mut terminal);
+    let row = app
+        .conversation()
+        .iter()
+        .find(
+            |message| matches!(message, TuiMessage::Assistant { blocks, .. } if blocks.len() == 2),
+        )
+        .expect("one assistant row carries both lanes");
+    if let TuiMessage::Assistant { blocks, .. } = row {
+        assert!(
+            blocks.iter().any(|b| matches!(b, ContentBlock::Thinking { text, .. } if text == "the reasoning so far")),
+            "the thinking lane rides: {blocks:?}"
+        );
+        assert!(
+            blocks.iter().any(
+                |b| matches!(b, ContentBlock::Text { text, .. } if text == "the answer had begun")
+            ),
+            "the partial reply lane rides beside it: {blocks:?}"
+        );
+    }
+}
+
+#[test]
+fn flush_turn_end_hands_the_worker_the_whole_conversation() {
+    // The flush is the exit's persistence contract: whatever the
+    // conversation holds at the moment of leaving — claim rows,
+    // captured lanes, the record — is what the worker saves, run
+    // settled or not.
+    use std::sync::Mutex as StdMutex;
+    let (mut app, _kept) = app_with_state();
+    app.seed_messages(vec![TuiMessage::User {
+        text: "the last row".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+    }]);
+    let seen: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    app.set_turn_end_hook(Box::new(move |conversation, _machine| {
+        let texts: Vec<String> = conversation
+            .iter()
+            .filter_map(|message| match message {
+                TuiMessage::User { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        *sink.lock().unwrap() = texts;
+    }));
+    app.flush_turn_end();
+    assert_eq!(
+        seen.lock().unwrap().as_slice(),
+        ["the last row".to_string()],
+        "the flush fires the hook with the conversation as it stands"
+    );
 }

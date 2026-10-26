@@ -396,6 +396,16 @@ impl InputEditor {
         self.text = text;
     }
 
+    /// Record `entry` in the recall history without typing it.
+    ///
+    /// The Enter path records what it sends on its way out; a chord that
+    /// sends the draft without going through [`InputEditor::handle_key`]
+    /// bypasses that, so it records the submission itself. Recall is the
+    /// list of prompts actually sent, however they were sent.
+    pub fn remember(&mut self, entry: String) {
+        self.history.push(entry);
+    }
+
     /// Clear the buffer and any in-progress history navigation.
     ///
     /// The submit path and the whitespace-only Enter both land here;

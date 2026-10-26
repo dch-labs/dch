@@ -6,24 +6,29 @@
 pub mod app;
 pub mod diff;
 pub mod events;
+pub mod guidance;
 pub mod input;
 pub mod markdown;
 pub mod message;
 pub mod observer;
 pub mod permission;
 pub mod question;
+pub mod queue;
 pub mod terminal;
 pub mod theme;
+pub mod todo_view;
 pub mod tool_capture;
 pub mod tool_render;
 
 pub use app::{CopyAnswer, TuiApp};
 pub use events::TerminalEvents;
+pub use guidance::Guidance;
 pub use input::{InputAction, InputEditor, InputHistory};
 pub use message::{ActiveTool, ContentBlock, TokenCounts, TuiMessage};
 pub use observer::{Graduation, HealthNotice, ToolResultDisplay, TuiObserver, TuiObserverState};
 pub use permission::PermissionRequest;
 pub use question::{QuestionChoice, QuestionPrompt};
+pub use queue::{PromptQueue, QueuedPrompt, Submission};
 pub use terminal::{
     TerminalGuard, arm_fatal_signal_restore, enter_signal_deaf_window, exit_signal_deaf_window,
     init_terminal, restore_terminal, sync_default_background,

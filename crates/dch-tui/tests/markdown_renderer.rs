@@ -515,7 +515,6 @@ fn code_source(line: &Line<'_>) -> String {
     let text = joined(line);
     let text = text.as_str();
     let text = text.strip_prefix(' ').unwrap_or(text);
-    let text = text.strip_prefix("↪ ").unwrap_or(text);
     let text = text.strip_suffix(' ').unwrap_or(text);
     text.to_string()
 }
@@ -537,12 +536,20 @@ fn a_wide_code_line_soft_wraps_onto_continuation_rows() {
         "the first row keeps its panel padding: {:?}",
         joined(&lines[0])
     );
-    for line in lines.iter().skip(1) {
+    for line in &lines {
         assert!(
-            joined(line).starts_with(" ↪ "),
-            "continuation rows carry the marker: {:?}",
+            joined(line).starts_with(' ') && joined(line).ends_with(' '),
+            "every row of the panel keeps its padding: {:?}",
             joined(line)
         );
+        for span in &line.spans {
+            assert!(
+                !span.content.contains('↪'),
+                "a wrapped code row draws only what the source carried — \
+                 a selection copies span text verbatim: {:?}",
+                span.content
+            );
+        }
     }
     let reconstructed: String = lines.iter().map(code_source).collect();
     assert_eq!(reconstructed, source, "wrapping drops no characters");
@@ -550,6 +557,10 @@ fn a_wide_code_line_soft_wraps_onto_continuation_rows() {
 
 #[test]
 fn code_soft_wrapping_preserves_every_source_line() {
+    // Wrapping must not reorder or invent content: 45 columns of `b`
+    // at a 30-column pane split 28/17 across two rows, the empty
+    // source line keeps its own padding-only row, and `short` keeps
+    // its row — the rows read in order reassemble the source exactly.
     let long = "b".repeat(45);
     let source = format!("{long}\n\nshort");
     let lines = render(&format!("```text\n{source}\n```"), 30);
@@ -560,17 +571,18 @@ fn code_soft_wrapping_preserves_every_source_line() {
             joined(line)
         );
     }
-    let mut reconstructed = String::new();
-    for line in &lines {
-        if joined(line).starts_with(" ↪ ") {
-            reconstructed.push_str(&code_source(line));
-        } else {
-            reconstructed.push('\n');
-            reconstructed.push_str(&code_source(line));
-        }
-    }
-    let reconstructed = reconstructed.trim_start_matches('\n').to_string();
-    assert_eq!(reconstructed, source, "wrapping reorders nothing");
+    let rows: Vec<String> = lines.iter().map(code_source).collect();
+    assert_eq!(
+        rows,
+        vec![
+            "b".repeat(28),
+            "b".repeat(17),
+            String::new(),
+            "short".to_string(),
+        ],
+        "the rows reassemble the source in order: {rows:?}"
+    );
+    assert_eq!(rows.join(""), source.replace('\n', ""), "no column lost");
 }
 
 #[test]

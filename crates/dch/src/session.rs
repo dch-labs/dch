@@ -735,6 +735,7 @@ mod tests {
             TuiMessage::User {
                 text: "fix the leak".to_string(),
                 timestamp: now,
+                steered: false,
             },
             TuiMessage::Assistant {
                 blocks: vec![
@@ -920,6 +921,7 @@ mod tests {
         let second = vec![TuiMessage::User {
             text: "second".to_string(),
             timestamp: chrono::Utc::now(),
+            steered: false,
         }];
         saver
             .save(&second, SessionTokens::default())

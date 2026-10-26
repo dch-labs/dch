@@ -48,6 +48,7 @@ name = "tui_final_settle"
 dch-loop = { workspace = true }
 dch-tui = { workspace = true }
 dch-config = { workspace = true }
+dch-tools   = { workspace = true }
 loopctl    = { workspace = true }
 clap       = { workspace = true }
 tokio      = { workspace = true, features = ["signal", "net", "io-util"] }
@@ -61,8 +62,10 @@ tracing    = { workspace = true }
 tempfile   = { workspace = true }
 
 [dev-dependencies]
+crossterm    = { workspace = true }
 libc        = { workspace = true }
 portable-pty = { workspace = true }
+ratatui      = { workspace = true }
 
 [lints]
 workspace = true

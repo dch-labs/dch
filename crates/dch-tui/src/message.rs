@@ -34,6 +34,17 @@ pub enum TuiMessage {
         ///
         /// Recorded at submit time.
         timestamp: DateTime<Utc>,
+
+        /// Whether this row is a steer's echo rather than a claim.
+        ///
+        /// A steer rides into a run already in flight — not a run
+        /// boundary — so the plan it lands beside keeps standing, the
+        /// way the live drain's own flag rule holds. Persisted so a
+        /// resumed session reconstructs the same distinction;
+        /// `#[serde(default)]` keeps transcripts written before the
+        /// field existed reading as plain claims.
+        #[serde(default)]
+        steered: bool,
     },
 
     /// A completed assistant reply.
@@ -338,6 +349,7 @@ mod tests {
             TuiMessage::User {
                 text: "hi\nthere".to_string(),
                 timestamp: now,
+                steered: false,
             },
             TuiMessage::Assistant {
                 blocks: vec![

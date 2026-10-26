@@ -107,7 +107,7 @@ fn at6_tui_cancel_renders_and_exits_clean() {
     session.expect("test-model", Duration::from_secs(20));
     submit(&mut session, "hello");
     await_first_request(&sb, Duration::from_secs(20));
-    session.send(b"\x03");
+    session.cancel_run();
     session.expect("cancel", Duration::from_secs(20));
     let status = session.quit_and_finish(Duration::from_secs(20));
     assert!(

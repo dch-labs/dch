@@ -798,6 +798,18 @@ impl PtySession {
         })
     }
 
+    /// Cancel the run in flight the way a user does: two Esc presses
+    /// with a beat between them.
+    ///
+    /// Two escape bytes in one write parse as a single key at the
+    /// terminal layer, so the presses go out separately — the same
+    /// rhythm a keyboard delivers.
+    pub fn cancel_run(&mut self) {
+        self.send(b"\x1b");
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        self.send(b"\x1b");
+    }
+
     /// Quit the TUI and reap it: send Ctrl-C, keep sending while the
     /// child lives, and return its exit status.
     ///

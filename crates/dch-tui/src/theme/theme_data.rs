@@ -1532,7 +1532,7 @@ impl Theme {
                 status_warning: Color::Rgb(255, 255, 159),
                 status_error: Color::Rgb(240, 94, 72),
                 scrollbar_thumb: Color::Rgb(98, 108, 102),
-                scrollbar_track: Color::Rgb(14, 14, 14),
+                scrollbar_track: Color::Rgb(33, 35, 34),
             },
         }
     }

@@ -20,6 +20,7 @@ use loopctl::observer::{
 };
 
 use crate::message::{ActiveTool, ContentBlock, TokenCounts, TuiMessage};
+use crate::queue::PromptQueue;
 
 /// The longest an input summary renders.
 ///
@@ -148,11 +149,20 @@ pub struct ToolResultDisplay {
 
 /// One conversation-ordered completion event.
 ///
-/// Replies and tool completions graduate through a single queue so
-/// the conversation preserves the order the events actually
-/// happened — separate per-kind buffers would drain in buffer order,
-/// not event order, and a reply could land above the tool that
-/// produced it.
+/// Replies, tool completions, and the transcript's own prompt rows all
+/// graduate through a single queue so the conversation preserves the
+/// order the events actually happened — separate per-kind buffers
+/// would drain in buffer order, not event order, and a reply could
+/// land above the tool that produced it.
+///
+/// The prompt row is the case that proves the rule. A run's reply
+/// graduates during the run while the next prompt's echo is written
+/// microseconds after that run resolves, and background frames are
+/// capped at the render interval, so one frame routinely finds both
+/// pending: drained from a buffer of its own the newer prompt would
+/// land above the older reply, and the misorder would persist into
+/// every saved session. Traveling this queue, total order is push
+/// order, which is what happened.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Graduation {
     /// A finalized reply's committed text with its turn's reasoning.
@@ -176,6 +186,40 @@ pub enum Graduation {
         thinking: Option<ContentBlock>,
     },
 
+    /// A prompt entering the transcript at the moment its text reached a run.
+    ///
+    /// Two writers, one rule about where the row lands: the mode driver writes
+    /// it when a run claims a waiting prompt, with the text as that claim
+    /// resolved it, and the display writes it the instant a steering offer is
+    /// accepted mid-turn. Either way the row records what the model is about to
+    /// read rather than the draft as it happened to be typed — an edit saved
+    /// before the claim reads as its edit, and a prompt the user
+    /// dropped is never claimed and so never appears. A cancelled
+    /// turn's own prompt keeps the echo row its claim wrote: a cancel
+    /// stops the turn in flight and throws nothing away.
+    ///
+    /// The flag is the one seam where the two writers differ: a claim is a run
+    /// boundary — the run before it is over, and everything scoped to a run
+    /// retires — while a steer rides into the run already going, which is not
+    /// a boundary to anything. The drain reads it for exactly that call.
+    Sent {
+        /// The text as the run that took it received it.
+        ///
+        /// The whole prompt, since the row is the transcript's record of what
+        /// was asked; a correction carries its corrected text rather than the
+        /// wording it replaced.
+        text: String,
+
+        /// Whether the display steered this text into a run already going,
+        /// rather than the driver claiming it for a run of its own.
+        ///
+        /// `true` from [`push_steered`](TuiObserverState::push_steered) —
+        /// the steer's echo, mid-run, not a boundary; `false` from
+        /// [`push_sent`](TuiObserverState::push_sent) — the claim's echo,
+        /// the boundary the plan retires at.
+        steered: bool,
+    },
+
     /// A completed tool call.
     ///
     /// Carries the input summary stashed at dispatch, so the
@@ -194,6 +238,17 @@ pub enum Graduation {
         /// The engine-measured wall time from run start to run end —
         /// the same figure the engine reports to every observer.
         duration_ms: u64,
+
+        /// Whether the run completed on its own terms.
+        ///
+        /// `false` for a cancelled or failed run — its plan is
+        /// interrupted work, not finished work, and the display reads
+        /// this to decide whether the next claim retires the plan: a
+        /// clean run's plan goes with the claim that follows it, an
+        /// interrupted run's plan stands until a new one is filed,
+        /// because the work it names is still the work the session
+        /// owes.
+        success: bool,
     },
 }
 
@@ -424,7 +479,7 @@ pub struct TuiObserverState {
     /// a late stale publish would overwrite it. Entries left behind
     /// by a slow frame are superseded, not replayed: the persistence
     /// layer keeps only the newest machine half anyway. Not cleared
-    /// by [`reset`](TuiObserver::reset) — like the queued counter, it
+    /// by [`reset`](TuiObserver::reset) — like the prompt queue, it
     /// is persistence-bound state that outlives the turn it came
     /// from.
     pub turn_histories: Arc<Mutex<Vec<Arc<Vec<loopctl::message::Message>>>>>,
@@ -454,6 +509,54 @@ pub struct TuiObserverState {
     /// cancel, an idle session takes it as the quit chord's first
     /// half.
     pub agent_running: Arc<std::sync::atomic::AtomicBool>,
+
+    /// When the run in flight started, in Unix-epoch milliseconds.
+    ///
+    /// Written beside [`agent_running`](Self::agent_running) by the
+    /// same marks — never alone, so the pair cannot disagree — and
+    /// read by the display to tick the running turn's elapsed line,
+    /// the live twin of the completed reply's own duration footer.
+    /// Zero while nothing runs.
+    pub run_started_ms: Arc<std::sync::atomic::AtomicU64>,
+
+    /// The correction whose save raised the runner's cancel, by id.
+    ///
+    /// Written by the display at the gone-arm of an edit's commit —
+    /// stored before the cancel fires, so the driver reading it after
+    /// a cancelled run settles can tell the correction's hand from
+    /// the user's: the named correction is already in the channel and
+    /// its turn is the next story, so the cancel of the run it names
+    /// reports no error row of its own — a settle goes quiet only for
+    /// a run whose own claim the flag carries, and a flag naming any
+    /// other turn cannot hush it. `u64::MAX` means no correction
+    /// caused a cancel —
+    /// the queue's ids start at zero, so zero itself is a name a real
+    /// prompt can hold — and the driver clears the slot to the empty
+    /// name beside the signal reset before every run, so a stale name
+    /// cannot outlive the turn it was set for.
+    pub correction_cancel: Arc<std::sync::atomic::AtomicU64>,
+
+    /// The prompt whose turn the driver has in flight, if any.
+    ///
+    /// Written by the driver at each claim and cleared when that turn
+    /// lands, so the display can tell a correction naming the live
+    /// turn from one naming a prompt whose turn already finished: the
+    /// first stops the superseded wording mid-run, the second is a
+    /// turn of its own and must not touch the unrelated run that
+    /// happens to be going. `u64::MAX` means no turn is in flight —
+    /// the queue's ids start at zero, so zero itself is a name a real
+    /// prompt can hold.
+    ///
+    /// The display's check-then-cancel against this mirror is not
+    /// atomic; the guard that follows its cancel re-reads the mirror
+    /// and stands the flag down when the claim has moved on. The
+    /// sliver that remains — a claim landing between that second read
+    /// and the driver's pre-run clear — cannot spend a prompt
+    /// silently: a settle goes quiet only for a run whose own claim
+    /// the flag carries, so the wrongly cancelled run posts its error
+    /// row and the buffered correction runs as its own turn behind
+    /// it.
+    pub live_claim: Arc<std::sync::atomic::AtomicU64>,
 
     /// Full tool calls captured at dispatch, keyed by call id.
     ///
@@ -489,17 +592,30 @@ pub struct TuiObserverState {
     /// falls back to the config value while it holds.
     pub context_window: Arc<std::sync::atomic::AtomicU64>,
 
-    /// Submitted tasks the agent driver has not taken yet.
+    /// The prompts submitted while a turn runs, waiting for theirs.
     ///
-    /// Incremented by the display before the submit is sent and
-    /// decremented by the driver after its receive, so
-    /// increment-before-send-before-receive-before-decrement is
-    /// totally ordered under any scheduler and the count can never
-    /// wrap. The input area's title renders it so a
-    /// mid-run submit is visibly queued. Not cleared by
-    /// [`reset`](TuiObserver::reset) — queued submissions outlive
-    /// turn state.
-    pub queued: Arc<std::sync::atomic::AtomicUsize>,
+    /// The queue itself rather than a count of it: the panel renders
+    /// these entries and the driver takes a prompt's text at the
+    /// moment its turn claims it, so words fixed after the submit are
+    /// the words that send. Both sides reach the same queue through
+    /// this one lock, which is what stops the row on screen and the
+    /// prompt about to run from being two copies of one sentence. The
+    /// display pushes before sending the id and the driver removes by
+    /// id, so a prompt claimed twice — or dropped while its id sat in
+    /// the channel — resolves to nothing rather than to a neighbour's
+    /// text. Not cleared by [`reset`](TuiObserver::reset): a waiting
+    /// prompt outlives the turn state it was typed over.
+    pub queued: Arc<Mutex<PromptQueue>>,
+
+    /// Correction wordings the exit collected for the transcript echo.
+    ///
+    /// The driver pushes each correction still buffered at its exit
+    /// breaks — words that left the queue with the claim and would
+    /// otherwise die with the channel — and the exit path drains the
+    /// buffer once the driver task has settled, writing each text
+    /// back as an unclaimed transcript row a resume seeds into the
+    /// waiting section.
+    pub rescued_corrections: Arc<Mutex<Vec<String>>>,
 
     /// Token usage counters, per-turn and cumulative.
     ///
@@ -588,6 +704,36 @@ pub enum HealthNotice {
 }
 
 impl TuiObserverState {
+    /// Mark a run as started, stamping when.
+    ///
+    /// The display's live elapsed line reads the stamp; call this at
+    /// the same edge the running flag itself rises, which every mode
+    /// driver does — the pair is written only here so it cannot
+    /// disagree.
+    pub fn mark_run_started(&self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| {
+                u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+            });
+        self.run_started_ms
+            .store(now, std::sync::atomic::Ordering::SeqCst);
+        self.agent_running
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Mark the run as ended, clearing the stamp.
+    ///
+    /// The completed reply carries its own duration from the run's
+    /// end event; the live line's stamp has nothing more to say and
+    /// leaves with the flag.
+    pub fn mark_run_ended(&self) {
+        self.run_started_ms
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        self.agent_running
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Create empty shared state.
     ///
     /// The single construction entry point — the observer and the
@@ -604,11 +750,15 @@ impl TuiObserverState {
             machine_history: Arc::new(Mutex::new(None)),
             active_tools: Arc::new(Mutex::new(Vec::new())),
             agent_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            run_started_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            correction_cancel: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
+            live_claim: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
             tool_captures: Arc::new(Mutex::new(HashMap::new())),
             errors: Arc::new(Mutex::new(Vec::new())),
             compactions: Arc::new(Mutex::new(Vec::new())),
             context_window: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            queued: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            queued: Arc::new(Mutex::new(PromptQueue::default())),
+            rescued_corrections: Arc::new(Mutex::new(Vec::new())),
             tokens: Arc::new(Mutex::new(TokenCounts::default())),
             render_notify: Arc::new(event_listener::Event::new()),
             current_turn: Arc::new(Mutex::new(None)),
@@ -618,6 +768,45 @@ impl TuiObserverState {
             retry_episode: Arc::new(Mutex::new(None)),
             retry_episode_counter: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Record that `text` reached a run, as its transcript row will show it.
+    ///
+    /// The one way a prompt's echo enters the display, and the reason it is a
+    /// method rather than a write into a public buffer: the row belongs in
+    /// [`graduations`](Self::graduations), where its place among the replies is
+    /// decided by when it happened. Held anywhere else it drains on its own
+    /// schedule, and a prompt that reached a run a moment after another run
+    /// answered would be drawn above that answer — in the transcript, and in
+    /// every save taken after it.
+    ///
+    /// The mode driver calls it at a claim, the one sender of an
+    /// unsteered prompt; a steering offer the display lands on a run
+    /// already going goes through [`push_steered`](Self::push_steered)
+    /// instead, so the two writers never meet. Survives
+    /// [`reset`](TuiObserver::reset) — a prompt sent while a run was
+    /// being torn down still has a row owed to it.
+    pub fn push_sent(&self, text: String) {
+        recover(&self.graduations).push(Graduation::Sent {
+            text,
+            steered: false,
+        });
+        self.render_notify.notify(1);
+    }
+
+    /// Record a steered prompt's echo the moment the offer is accepted.
+    ///
+    /// The same transcript row [`push_sent`](Self::push_sent) writes —
+    /// the model is about to read this text — flagged as the steer's:
+    /// mid-run, not a run boundary, so nothing scoped to the run
+    /// retires on it. The pinned plan keeps standing through the
+    /// steer, the way the runner's own todo store does.
+    pub fn push_steered(&self, text: String) {
+        recover(&self.graduations).push(Graduation::Sent {
+            text,
+            steered: true,
+        });
+        self.render_notify.notify(1);
     }
 
     /// Arm secret scrubbing of tool input summaries.
@@ -1093,6 +1282,7 @@ impl LoopObserver for TuiObserver {
         *recover(&self.state.health) = HealthNotice::Idle;
         recover(&self.state.graduations).push(Graduation::RunEnded {
             duration_ms: ctx.duration_ms,
+            success: ctx.success,
         });
         self.notify();
     }
@@ -1100,7 +1290,12 @@ impl LoopObserver for TuiObserver {
     fn reset(&self) {
         recover(&self.state.streaming_text).clear();
         *recover(&self.state.thinking) = ThinkingStream::default();
-        recover(&self.state.graduations).clear();
+        // A prompt whose text reached a run owes the transcript a row, and
+        // that debt is not run state: the send happened, whatever this reset
+        // is clearing away for the next run. Rows of every other kind are the
+        // run's own work and go with it.
+        recover(&self.state.graduations)
+            .retain(|graduation| matches!(graduation, Graduation::Sent { .. }));
         recover(&self.state.active_tools).clear();
         recover(&self.state.errors).clear();
         recover(&self.state.compactions).clear();
@@ -1134,7 +1329,8 @@ mod tests {
         assert_eq!(
             state.graduations.lock().unwrap().clone(),
             vec![Graduation::RunEnded {
-                duration_ms: 84_000
+                duration_ms: 84_000,
+                success: true,
             }],
             "the run-end event graduates the engine-measured total"
         );

@@ -128,12 +128,18 @@ pub struct Args {
     #[arg(long, value_name = "NAME", help_heading = "Display")]
     pub theme: Option<String>,
 
-    /// Override the configured model.
+    /// Use a configured model instead of the default one.
     ///
-    /// The only provider-setting override on the CLI: the `[api]` config
-    /// section remains the single source of truth for base URL, credentials,
-    /// and provider type. The value is not validated here; an unknown model
-    /// surfaces at the first API call.
+    /// With `[[models]]` entries in the config this *selects*: the matching
+    /// entry brings its own base URL, provider type, credential, and limits,
+    /// and a name matching none of them is a startup error listing the
+    /// configured models. A name of only whitespace is refused the same
+    /// way — it names nothing, and silently running the default entry
+    /// would leave the user believing a named profile served the run.
+    /// With no entries the name simply replaces
+    /// `[api] model`, keeping the configured endpoint and credentials — and
+    /// nothing is validated here, so an unknown model surfaces at the first
+    /// API call.
     #[arg(long, short = 'm', value_name = "MODEL", help_heading = "Display")]
     pub model: Option<String>,
 
@@ -254,15 +260,17 @@ pub struct ConfigArgs {
 
     /// Override the configured thinking budget for this run.
     ///
-    /// One of `low`, `medium`, `high`, or `max`, riding the provider's
-    /// native effort parameter — the Anthropic `budget_tokens` ladder,
-    /// the OpenAI `reasoning_effort`. Overrides
-    /// `[api] reasoning_effort`; without the flag the configured value
-    /// (default unset, provider defaults) stands.
+    /// One of `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or
+    /// `max`, riding the provider's native effort parameter — the
+    /// OpenAI `reasoning_effort` label verbatim, the Anthropic
+    /// `budget_tokens` ladder. `none` is the explicit off; overriding
+    /// with it beats a configured default the same as any level.
+    /// Overrides `[api] reasoning_effort`; without the flag the
+    /// configured value (default unset, provider defaults) stands.
     #[arg(
         long,
         value_name = "LEVEL",
-        value_parser = ["low", "medium", "high", "max"],
+        value_parser = ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
         help_heading = "Config"
     )]
     pub reasoning_effort: Option<String>,
@@ -448,7 +456,7 @@ mod tests {
 
     #[test]
     fn reasoning_effort_flag_parses_each_level_and_refuses_junk() {
-        for level in ["low", "medium", "high", "max"] {
+        for level in ["none", "minimal", "low", "medium", "high", "xhigh", "max"] {
             let args = parse(&["--reasoning-effort", level]).unwrap();
             assert_eq!(args.config.reasoning_effort.as_deref(), Some(level));
         }

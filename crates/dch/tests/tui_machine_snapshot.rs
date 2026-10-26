@@ -52,7 +52,7 @@ fn a_cancelled_run_still_leaves_the_machine_history_sibling() {
     // Let the request reach the held-open endpoint before cancelling,
     // so the interrupt resolves a genuinely in-flight run.
     std::thread::sleep(Duration::from_secs(2));
-    session.send(b"\x03");
+    session.cancel_run();
     session.expect("Agent cancelled", Duration::from_secs(15));
     session.quit_and_finish(Duration::from_secs(20));
 
@@ -191,7 +191,7 @@ fn a_compacted_machine_half_survives_a_cancelled_run_and_resumes_clean() {
     session.send(b"one more");
     session.send(b"\r");
     std::thread::sleep(Duration::from_secs(2));
-    session.send(b"\x03");
+    session.cancel_run();
     session.expect("Agent cancelled", Duration::from_secs(15));
     session.quit_and_finish(Duration::from_secs(20));
 
@@ -272,4 +272,108 @@ fn an_error_ended_session_resumes_from_the_machine_snapshot_without_recompacting
         "a machine-restored resume must not re-derive and re-compact: {screen}"
     );
     second.quit_and_finish(Duration::from_secs(20));
+}
+
+#[test]
+fn a_wedged_run_still_exits_promptly() {
+    // The exit's promptness does not depend on the run dying
+    // politely: a response that never arrives cannot hold the
+    // process open — the settle pump lands what it can, the
+    // teardown's bounded wait tears the driver down, and the binary
+    // leaves well inside the test's own patience.
+    let sb = common::Sandbox::with_server(common::CannedServer::sse_scheduled(vec![(
+        common::sse_text_turn("a turn that never lands"),
+        std::time::Duration::from_secs(600),
+    )]));
+    let mut session = sb.dch_pty(&[]);
+    session.expect("test-model", Duration::from_secs(20));
+    session.send(b"hold everything");
+    session.send(b"\r");
+    let start = std::time::Instant::now();
+    // The exit ladder: arm, then confirm.
+    session.send(b"\x03");
+    session.send(b"\x03");
+    let status = session.quit_and_finish(Duration::from_secs(15));
+    assert!(
+        start.elapsed() < Duration::from_secs(12),
+        "the exit completes promptly even over a wedged run: {:?}",
+        start.elapsed()
+    );
+    assert!(status.success(), "the binary leaves cleanly: {status}");
+}
+
+#[test]
+fn an_exit_mid_run_resumes_with_the_prompt_waiting() {
+    // The user's whole contract in one PTY run: a prompt is in
+    // flight against a server that holds its answer, a second waits
+    // behind it, Ctrl+C twice leaves promptly, and the resumed
+    // session carries both halves — the interrupted claim as the
+    // transcript's row with its cancel record beside it (a deliberate
+    // stop that does not run again), and the prompt no turn ever took
+    // written as an unclaimed row and waiting in the section again.
+    let sb = common::Sandbox::with_server(common::CannedServer::sse_scheduled(vec![(
+        common::sse_text_turn("a turn that never lands"),
+        std::time::Duration::from_secs(600),
+    )]));
+    let mut session = sb.dch_pty(&[]);
+    session.expect("test-model", Duration::from_secs(20));
+    session.send(b"the prompt that was in flight");
+    session.send(b"\r");
+    // Let the claim land and the run reach the provider before the
+    // exit ladder fires — the run must be provably in flight.
+    let deadline = std::time::Instant::now()
+        .checked_add(Duration::from_secs(20))
+        .expect("deadline computable");
+    while sb.requests().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the run never reached the provider"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    session.send(b"the prompt that waits behind");
+    session.send(b"\r");
+    let start = std::time::Instant::now();
+    session.send(b"\x03");
+    session.send(b"\x03");
+    let status = session.quit_and_finish(Duration::from_secs(15));
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "the exit ladder leaves promptly over a held run: {elapsed:?}"
+    );
+    assert!(status.success(), "the binary leaves cleanly: {status}");
+
+    // The saved transcript carries the claim row and the backlog's
+    // unclaimed rows alike.
+    let id = sole_session_id(&sb);
+    let session_json = std::fs::read_to_string(sb.sessions_dir().join(&id).join("session.json"))
+        .expect("the session file exists");
+    assert!(
+        session_json.contains("the prompt that was in flight"),
+        "the claim row persisted for the resume; the file holds: {}",
+        &session_json[session_json.len().saturating_sub(600)..]
+    );
+    assert!(
+        session_json.contains("Agent cancelled"),
+        "the cancel's record persisted too — the same row a manual \
+         cancel leaves; the file holds: {}",
+        &session_json[session_json.len().saturating_sub(600)..]
+    );
+    assert!(
+        session_json.contains("the prompt that waits behind"),
+        "the waiting prompt persisted as an unclaimed row — the \
+         backlog leaves a trace; the file holds: {}",
+        &session_json[session_json.len().saturating_sub(600)..]
+    );
+
+    // The resume carries the interrupted claim as the transcript's
+    // row — a recorded cancel, so it does not re-enter the section —
+    // while the prompt that never ran waits in the section again,
+    // visible with no run up.
+    let resumed = sb.dch_pty(&["--resume", &id]);
+    resumed.expect("the prompt that was in flight", Duration::from_secs(20));
+    resumed.expect("QUEUED", Duration::from_secs(20));
+    resumed.expect("the prompt that waits behind", Duration::from_secs(20));
+    let _ = resumed.quit_and_finish(Duration::from_secs(15));
 }
