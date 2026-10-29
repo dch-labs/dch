@@ -343,6 +343,11 @@ async fn run_headless_inner(
                 resumed_compactions
                     .saturating_add(compaction_counter.load(std::sync::atomic::Ordering::SeqCst)),
             );
+            let undone = runner.todo_undone();
+            if undone > 0 {
+                let plural = if undone == 1 { "" } else { "s" };
+                eprintln!("warning: {undone} todo item{plural} left unfinished");
+            }
             bridge.stop().await;
             Ok(outcome)
         }
@@ -368,8 +373,9 @@ async fn run_headless_inner(
     }
 }
 
-/// Persist the run's transcript and the engine's committed history;
-/// a failed save never fails the run.
+/// Persist the run's transcript, the engine's committed history,
+/// and the loop's context estimate as the run left it; a failed save
+/// never fails the run.
 ///
 /// The machine history lands first, so a crash between the two writes
 /// leaves the older display file beside it — the stale-pair rule then
@@ -387,10 +393,16 @@ fn save_transcript(
     compactions: u32,
 ) {
     let stamp = chrono::Utc::now();
-    if let Err(err) = saver.save_machine(&runner.committed_history(), stamp, compactions) {
+    let history: Vec<loopctl::message::Message> =
+        dch_loop::history_without_nudge(&runner.committed_history());
+    if let Err(err) = saver.save_machine(&history, stamp, compactions) {
         tracing::warn!(error = %err, "machine history could not be saved");
     }
-    if let Err(err) = saver.save_at(transcript, crate::session::SessionTokens::default(), stamp) {
+    let tokens = crate::session::SessionTokens {
+        context_tokens: runner.context_tokens(),
+        ..crate::session::SessionTokens::default()
+    };
+    if let Err(err) = saver.save_at(transcript, tokens, stamp) {
         tracing::warn!(error = %err, "session transcript could not be saved");
     }
 }
@@ -498,7 +510,8 @@ async fn construct_run(
         crate::resume::ResumeControl::Fresh { .. } => 0,
     };
     let mut builder = dch_loop::Runner::builder(&config, &workdir)
-        .with_observer(Arc::clone(&observer) as Arc<dyn loopctl::observer::LoopObserver>);
+        .with_observer(Arc::clone(&observer) as Arc<dyn loopctl::observer::LoopObserver>)
+        .with_todo_nudge(|_reminder| {}, || true);
     if let crate::resume::ResumeControl::Resumed(outcome) = control {
         builder = builder.with_history(crate::resume::history_for_resume(
             outcome,

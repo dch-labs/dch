@@ -416,6 +416,15 @@ fn scrub_json_strings(
 /// resume flow.
 pub(crate) fn load_for_resume_in(id: Uuid, base: &Path) -> Result<ResumeOutcome, ResumeError> {
     let (messages, _model, tokens, saved_at) = crate::session::load_with_meta_in(id, base)?;
+    let messages: Vec<TuiMessage> = messages
+        .into_iter()
+        .filter(|message| match message {
+            TuiMessage::User { text, steered, .. } => {
+                !(*steered && dch_loop::is_nudge_wording(text))
+            }
+            _ => true,
+        })
+        .collect();
     let (machine, machine_compactions) = match crate::session::load_machine_in(id, base, saved_at) {
         Some((messages, compactions)) => (Some(messages), compactions),
         None => (None, 0),
@@ -827,7 +836,7 @@ pub(crate) fn render_sessions(
             fit_column(&summary.model, MODEL_WIDTH),
             summary.last_activity.format("%Y-%m-%d %H:%M"),
             summary.user_message_count,
-            summary.token_total,
+            summary.context_tokens,
         )?;
     }
     Ok(())
@@ -872,6 +881,14 @@ mod tests {
             text: text.to_string(),
             timestamp: now(),
             steered: false,
+        }
+    }
+
+    fn user_steered(text: &str) -> TuiMessage {
+        TuiMessage::User {
+            text: text.to_string(),
+            timestamp: now(),
+            steered: true,
         }
     }
 
@@ -1301,6 +1318,90 @@ mod tests {
     }
 
     #[test]
+    fn a_typed_prompt_reading_the_reminder_wording_stays() {
+        // The steered flag is the corpse's tell: a prompt the user
+        // actually typed — even one quoting the reminder's own
+        // wording — is the user's words and keeps its place.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.keep();
+        let id = uuid::Uuid::new_v4();
+        crate::session::SessionSaver::with_base_dir(id, "m".to_string(), root.clone())
+            .save_at(
+                &[
+                    user(
+                        "reminder: 2 todo items still not completed — finish the \
+                          remaining work",
+                    ),
+                    user_steered(
+                        "reminder: 1 todo item still not completed — finish the \
+                         remaining work",
+                    ),
+                ],
+                crate::session::SessionTokens::default(),
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        let outcome = load_for_resume_in(id, &root).unwrap();
+        let texts: Vec<&str> = outcome
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                TuiMessage::User { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["reminder: 2 todo items still not completed — finish the remaining work"],
+            "the typed prompt stays whole, the steered corpse drops: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn a_persisted_reminder_row_is_dropped_on_load() {
+        // Reminder rows written before the hide are corpses in older
+        // display files — user-shaped, steered-flagged, replaying into
+        // the transcript on every resume as if the user had said them.
+        // The load drops them by their wording; everything the user
+        // actually said, steered or typed, keeps its place.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.keep();
+        let id = uuid::Uuid::new_v4();
+        let now = chrono::Utc::now();
+        crate::session::SessionSaver::with_base_dir(id, "m".to_string(), root.clone())
+            .save_at(
+                &[
+                    user("do the work"),
+                    user_steered(
+                        "reminder: 1 todo item still not completed — finish the \
+                         remaining work, or mark the entries done / remove them \
+                         with TodoWrite, then finish",
+                    ),
+                    assistant(vec![text_block("on it")]),
+                    user_steered("take the other branch"),
+                ],
+                crate::session::SessionTokens::default(),
+                now,
+            )
+            .unwrap();
+        let outcome = load_for_resume_in(id, &root).unwrap();
+        let texts: Vec<&str> = outcome
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                TuiMessage::User { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["do the work", "take the other branch"],
+            "the corpse is gone; the typed prompt and the real steer \
+             keep their places: {texts:?}"
+        );
+    }
+
+    #[test]
     fn missing_machine_json_falls_back_to_derive() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.keep();
@@ -1429,6 +1530,52 @@ mod tests {
         assert_eq!(
             call_ids, result_ids,
             "every call keeps its result, in emission order"
+        );
+    }
+
+    #[test]
+    fn a_steered_row_resumes_as_the_user_message_the_run_read() {
+        // The steered flag separates the session's own words (a steer, a
+        // steer the run read) from the user's submissions for the
+        // listing's count — but the row still names text the model read,
+        // so the reconstructed history must carry it as a user message.
+        // Dropping it here would orphan the follow-up turn that answered
+        // it from the conversation a resume continues.
+        let transcript = vec![
+            user("the first prompt"),
+            TuiMessage::User {
+                text: "reminder: 1 todo item still not completed".to_string(),
+                timestamp: now(),
+                steered: true,
+            },
+            assistant(vec![text_block("the follow-up's answer")]),
+        ];
+        let converted = tui_messages_to_loopctl(&transcript, false);
+        let user_texts: Vec<String> = converted
+            .iter()
+            .filter(|message| message.role == Role::User)
+            .flat_map(|message| message.parts.iter())
+            .filter_map(|part| match part {
+                MessagePart::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            user_texts.contains(&"reminder: 1 todo item still not completed".to_string()),
+            "the steered row rides the history the model continues from, \
+             flagged or not: {converted:?}"
+        );
+        assert_eq!(
+            converted[0].role,
+            Role::User,
+            "the prompt and the reminder that followed mid-run resume as one \
+             user turn — the shape the engine itself read: {converted:?}"
+        );
+        assert_eq!(
+            converted.len(),
+            2,
+            "prompt-plus-reminder as one user turn, the answer as the other: \
+             {converted:?}"
         );
     }
 
@@ -2011,7 +2158,7 @@ mod tests {
                 model: "m".to_string(),
                 last_activity: now(),
                 user_message_count: 1,
-                token_total: 0,
+                context_tokens: 0,
             }
         }
         let sessions: Vec<_> = (0..13).map(summary).collect();
@@ -2121,7 +2268,7 @@ mod tests {
                 )
                 .unwrap(),
             user_message_count: count,
-            token_total: 0,
+            context_tokens: 0,
         }
     }
 
@@ -2153,7 +2300,7 @@ mod tests {
         let total = sessions
             .first()
             .expect("the fixture row")
-            .token_total
+            .context_tokens
             .to_string();
         let data_row = table.lines().last().expect("the data row");
         let digits_end = data_row

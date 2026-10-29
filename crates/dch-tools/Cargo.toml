@@ -29,6 +29,7 @@ lsp-types  = "0.97"
 futures    = { workspace = true }
 
 [dev-dependencies]
+proptest = { workspace = true }
 tokio = { workspace = true, features = ["net"] }
 
 [lints]

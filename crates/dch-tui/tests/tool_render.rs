@@ -129,7 +129,6 @@ fn quiet_running_is_a_braille_frame_without_elapsed() {
     let theme = Theme::default();
     let lines = running_tool_lines(
         &active("Read", r#"{"file_path":"a.rs"}"#),
-        0,
         &theme,
         Verbosity::Quiet,
     );
@@ -150,7 +149,6 @@ fn normal_running_shows_the_hourglass_summary_and_elapsed() {
     let theme = Theme::default();
     let lines = running_tool_lines(
         &active("Read", r#"{"file_path":"a.rs"}"#),
-        3,
         &theme,
         Verbosity::Normal,
     );
@@ -166,6 +164,17 @@ fn normal_running_shows_the_hourglass_summary_and_elapsed() {
         "the summary is humanized: {text:?}"
     );
     assert!(text.contains("s)"), "elapsed time shows: {text:?}");
+    let elapsed_span = lines[0]
+        .spans
+        .iter()
+        .find(|span| span.content.contains("s)"))
+        .expect("the elapsed span");
+    assert_eq!(
+        elapsed_span.style.fg,
+        Some(theme.ui.assistant_message_fg),
+        "while the call runs, the elapsed reads light — the theme's \
+         reply color, its lightest text"
+    );
 }
 
 #[test]
@@ -173,7 +182,6 @@ fn verbose_running_shows_the_raw_name_and_input_line() {
     let theme = Theme::default();
     let lines = running_tool_lines(
         &active("Read", r#"{"file_path":"a.rs"}"#),
-        0,
         &theme,
         Verbosity::Verbose,
     );
@@ -315,14 +323,23 @@ fn a_capped_stash_still_humanizes() {
 }
 
 #[test]
-fn the_spinner_index_drives_the_frame() {
+fn elapsed_time_drives_the_frame() {
     let theme = Theme::default();
-    let first = running_tool_lines(&active("Read", "a"), 0, &theme, Verbosity::Quiet);
-    let second = running_tool_lines(&active("Read", "a"), 1, &theme, Verbosity::Quiet);
+    // Elapsed-derived frames: two tools started a frame apart render
+    // different glyphs on the same redraw — the dot turns on each
+    // row's own clock, not a shared tick.
+    let mut fresh = active("Read", "a");
+    fresh.start = std::time::Instant::now();
+    let mut aged = active("Read", "a");
+    aged.start = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_millis(80))
+        .unwrap_or_else(std::time::Instant::now);
+    let first = running_tool_lines(&fresh, &theme, Verbosity::Quiet);
+    let second = running_tool_lines(&aged, &theme, Verbosity::Quiet);
     assert_ne!(
         text_of(&first[0]),
         text_of(&second[0]),
-        "advancing the index advances the frame"
+        "a frame of elapsed time between starts advances the glyph"
     );
 }
 

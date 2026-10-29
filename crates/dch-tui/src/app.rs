@@ -69,16 +69,55 @@ const MAX_ELAPSED_SECS: f64 = 9.0e18;
 /// frame whatever the token rate.
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
+/// The frame lane's per-second counters.
+///
+/// Reset each time a second's line is logged; the clock is the
+/// animation wake's own, so an idle lane reports zeros honestly.
+#[derive(Default)]
+struct FrameStats {
+    /// Animation-lane wakes this second.
+    ///
+    /// Only beats whose gate found something animating are counted,
+    /// so the figure measures drawn frames rather than raw timer
+    /// ticks; it feeds the per-second frame-lane debug line and
+    /// drops back to zero once that line is logged.
+    anim_wakes: u32,
+
+    /// Terminal draws this second.
+    ///
+    /// Counted after each draw the run loop puts on screen, whatever
+    /// lane requested the frame; the number feeds the per-second
+    /// frame-lane debug line and resets to zero when that line is
+    /// logged.
+    draws: u32,
+
+    /// The slowest single draw's duration this second.
+    ///
+    /// `None` until the second's first draw completes, then the
+    /// running maximum over every measured draw; the debug line
+    /// reports it in whole milliseconds — zero while `None` — and
+    /// the per-second reset returns it to `None`.
+    worst_draw: Option<std::time::Duration>,
+
+    /// When the current second started.
+    ///
+    /// `None` until the run's first draw, whose instant becomes the
+    /// epoch; each later draw compares its own clock against that
+    /// instant, and the rollover that logs a second's line moves the
+    /// epoch to the rollover instant so the next window measures a
+    /// full second.
+    second_start: Option<std::time::Instant>,
+}
+
 /// The periodic beat the run loop wakes on.
 ///
-/// The animation cadence while tools run — the spinner advances and
-/// the elapsed stamps move one display step (a tenth of a second)
-/// per tick, matching the stamps' finest shown digit so they march
-/// uniformly whether or not input is redrawing — and the scroll beat
-/// a drag parked at the conversation pane's edge and the composer
-/// caret's blink phase step with. An idle tick between events draws
-/// nothing: it claims a parked background redraw, and neither that,
-/// a drag, nor a blink flip being due, the loop sleeps on.
+/// The loop's coarse chores ride this beat: claiming a redraw a
+/// capped background request parked, stepping a drag resting on the
+/// conversation pane's edge, flipping the composer caret's blink
+/// phase, and retiring lapsed notices and prompts. A tick with tool
+/// calls in flight also draws, keeping their elapsed stamps' tenth
+/// of a second live; every other idle tick draws nothing, and the
+/// loop sleeps on.
 const TICK_INTERVAL: Duration = Duration::from_millis(100);
 
 /// The frame cadence the activity strip animates at while the agent
@@ -93,12 +132,6 @@ const ANIMATION_INTERVAL: Duration = Duration::from_millis(20);
 
 /// How much run time one spinner frame stands for.
 ///
-/// The timer line's leading dot turns at this cadence — a full
-/// ten-frame revolution per 800ms of run time, the prototype's own
-/// rhythm, sampled by every redraw so the motion is continuous
-/// however the wakes fall.
-const SPINNER_FRAME_MS: u64 = 80;
-
 /// Ticks per caret blink phase.
 ///
 /// Half a second on, half a second off — the cadence editors settle
@@ -996,6 +1029,21 @@ pub struct TuiApp {
     /// reach no agent.
     submit_tx: Option<tokio::sync::mpsc::UnboundedSender<Submission>>,
 
+    /// The prompt whose claim is one channel hop away, hidden from the
+    /// queue section for that window.
+    ///
+    /// A submit into an idle session pushes the prompt into the shared
+    /// queue and hands its id to the driver; the claim lands a moment
+    /// later, and a frame drawn in that window would show the prompt
+    /// under the QUEUED title — the flash every fresh session's first
+    /// prompt makes. The recorded id is that window's row: the queue
+    /// was empty when it was pushed, so it is the section's last row,
+    /// and the display simply pays one fewer row until the driver
+    /// takes it. The next submit clears it before pushing (at most one
+    /// row hides at a time), and a claim or drop retires it through
+    /// [`settle_handed`](Self::settle_handed) at the next frame.
+    handed: Option<u64>,
+
     /// The running loop's steering slot, where this session has one.
     ///
     /// Installed by the host beside the submit channel. With it, `Ctrl+S`
@@ -1025,7 +1073,6 @@ pub struct TuiApp {
     /// Advanced one frame per render tick while any tool runs;
     /// running lines rebuild every frame anyway, so the pulse costs
     /// nothing extra.
-    spinner_idx: usize,
 
     /// The input editor: multi-line buffer, cursor, and history.
     ///
@@ -1247,6 +1294,24 @@ pub struct TuiApp {
     /// streaming freeze cache has.
     conversation_cache: Vec<Line<'static>>,
 
+    /// The baked prefix of [`conversation_cache`], growing by append.
+    ///
+    /// [`conversation_cache`] is this bake plus the last message's
+    /// fresh tail, recomposed per rebuild — the bake is the only
+    /// long-lived buffer, so a graduation never re-renders the baked
+    /// lines' sources, only composes them beside a fresh tail.
+    conversation_bake: Vec<Line<'static>>,
+
+    /// The frame lane's own bookkeeping, for the log.
+    ///
+    /// One line per second under `RUST_LOG=dch_tui::frames=debug`:
+    /// how many animation wakes fired, how many terminal draws ran,
+    /// and the slowest draw's duration — the three numbers that
+    /// separate a stalled wake lane (wakes low), a blocked loop
+    /// (wakes high, draws low), and a slow terminal (draws high with
+    /// a large worst draw) at a glance.
+    frame_stats: FrameStats,
+
     /// The pane width the conversation cache was built for.
     ///
     /// Settled markdown re-flows with the pane; a width change
@@ -1269,6 +1334,29 @@ pub struct TuiApp {
     /// past this stamp, whatever caused the bump.
     conversation_cache_generation: u64,
 
+    /// How many leading messages the cache has baked, never to
+    /// re-render.
+    ///
+    /// Messages are immutable once a newer one follows — only the
+    /// last is ever patched — so the bake grows by appending, and a
+    /// graduation re-renders only the messages after it. A width
+    /// change or a truncation below it resets the bake whole.
+    conversation_baked_through: usize,
+
+    /// The speaker of the last baked message, for the seam rule.
+    ///
+    /// The blank row between speaker changes is decided by the
+    /// previous message's kind; the incremental bake needs the baked
+    /// prefix's answer to render the next message's seam correctly.
+    conversation_baked_prev_user: Option<bool>,
+
+    /// The bake's own index metadata, in bake-absolute rows.
+    ///
+    /// Grown only as messages bake and cleared with the bake itself;
+    /// the per-frame view products the painters and click paths read
+    /// are rebuilt from it and the rebased tail every frame.
+    conversation_bake_meta: BakeMeta,
+
     /// Conversation-cache line ranges spanned by user turns, as
     /// `(tint_start, tint_end, mark_row)`.
     ///
@@ -1277,7 +1365,9 @@ pub struct TuiApp {
     /// text, its padding rows included, and overlays the chevron at the
     /// turn's first text row. Chrome beside and beneath the content,
     /// never spans inside it, so selections and copies walk only the
-    /// text. Rebuilt together with the conversation cache.
+    /// text. Rebuilt together with the conversation cache: the bake's
+    /// absolute ranges plus the tail's, rebased onto the cache's own
+    /// rows, so a tail user turn is boxed the frame it lands.
     user_turn_ranges: Vec<(usize, usize, usize)>,
 
     /// The quit lifecycle.
@@ -1319,6 +1409,17 @@ pub struct TuiApp {
     /// Running calls share the key with their completed block, so an
     /// expansion opened while the tool runs survives its graduation.
     expanded_tools: std::collections::HashSet<String>,
+
+    /// The todo block the last update auto-expanded, folded again
+    /// once the conversation moves on.
+    ///
+    /// A `TodoWrite` result expands so the reader sees the plan as it
+    /// stands; the expansion is momentary — the next graduation, or
+    /// the next tool starting, folds it back to its summary row (the
+    /// standing plan panel carries the list from there). Manual
+    /// expansions never ride this: the field tracks only the one
+    /// auto-expanded block, and once folded it is done.
+    auto_expanded_todo: Option<String>,
 
     /// The session's thinking-display preference.
     ///
@@ -1447,19 +1548,19 @@ pub struct TuiApp {
     /// `None` when no id is displayed or the segment is fully clipped.
     session_id_span: std::cell::Cell<Option<(u16, u16, u16)>>,
 
-    /// The newest todo list the run has filed, for the plan section.
+    /// The session's standing todo list, for the plan section.
     ///
-    /// Updated at every accepted `TodoWrite` graduation from the
-    /// call's own submission — the complete list every call carries —
-    /// so the pinned section shows the run's current tasks however
-    /// many updates the transcript holds. A rejected update is not
-    /// state: the tool refused the submission and the last accepted
-    /// list stands. The plan stays up after its run lands — the final
-    /// state, done or not, is the thing to read in the quiet after
-    /// the run — and the next claim retires it, half-done or finished
-    /// alike, at the same edge the runner resets its own store.
-    /// Steering delivers mid-run and never claims, so a plan keeps
-    /// updating through its own run.
+    /// Updated at every accepted `TodoWrite` graduation — the enforced
+    /// render first, the submission as fallback — so the pinned section
+    /// shows the plan the run actually holds, however many updates the
+    /// transcript holds. A rejected update is not state: the tool
+    /// refused the submission and the last accepted list stands. The
+    /// plan belongs to the session, not the run: it stays up after its
+    /// run lands and stands across claims while work remains — carried
+    /// exactly as the runner carries its own store — and a claim
+    /// retires it only when every entry stands completed, the same
+    /// edge the runner clears its store at. Steering delivers mid-run
+    /// and never claims, so a plan keeps updating through its own run.
     latest_todos: Vec<todo_view::TodoRow>,
 
     /// The rows each todo update changed, by the update's call id.
@@ -1621,6 +1722,95 @@ pub struct TuiApp {
     full_repaint_due: Option<Instant>,
 }
 
+/// The accumulators one conversation render pass fills.
+///
+/// A render of a message range produces the styled rows themselves
+/// and the five index structures the app's press resolution and
+/// lane overlays read — one output, always filled together, so it
+/// folds into a single struct the pass fills. The bake pass owns
+/// the half the app keeps between frames; the tail pass starts
+/// empty each time and merges its result over the baked half.
+#[derive(Default)]
+struct BakeOutputs {
+    /// The rendered rows, in conversation order.
+    ///
+    /// One entry per visual line; every index structure below keys
+    /// positions in this vector.
+    lines: Vec<Line<'static>>,
+
+    /// Row spans registered under their tool-call id.
+    ///
+    /// Every row a foldable tool block produced maps to the call it
+    /// belongs to, so a press on any of them resolves the toggle.
+    tool_summary_lines: HashMap<usize, String>,
+
+    /// Row spans registered under their thinking section's key.
+    ///
+    /// The completed thinking sections' fold rows, keyed the way the
+    /// tool rows are for the same press resolution.
+    thinking_summary_lines: HashMap<usize, String>,
+
+    /// Row spans registered under their compaction notice's key.
+    ///
+    /// A notice's rows map to its message key so a press anywhere on
+    /// the notice resolves its own toggle.
+    compaction_summary_lines: HashMap<usize, String>,
+
+    /// Each user turn's row span, with its mark row.
+    ///
+    /// `(tint_start, turn_end, mark_row)` triples: the span the
+    /// caller tints as the turn's box, and the row the prompt mark
+    /// draws on.
+    user_turn_ranges: Vec<(usize, usize, usize)>,
+
+    /// The row spans of the conversation's inline todo blocks.
+    ///
+    /// Whole-block ranges, so the scroll can keep an inline plan
+    /// render visible in full or not at all.
+    todo_block_ranges: Vec<std::ops::Range<usize>>,
+}
+
+/// The bake's own index metadata, in bake-absolute rows.
+///
+/// What [`BakeOutputs`] carries for one render pass, kept for the
+/// baked prefix alone: the index structures the frame's merged view
+/// products are rebuilt from every frame, each rebased by the bake's
+/// line count before the painters or the click paths ever see them.
+#[derive(Default)]
+struct BakeMeta {
+    /// Row spans registered under their tool-call id.
+    ///
+    /// Every row a foldable baked tool block produced maps to the
+    /// call it belongs to, so a press on any of them resolves the
+    /// toggle.
+    tool_summary_lines: HashMap<usize, String>,
+
+    /// Row spans registered under their thinking section's key.
+    ///
+    /// The baked thinking sections' fold rows, keyed the way the
+    /// tool rows are for the same press resolution.
+    thinking_summary_lines: HashMap<usize, String>,
+
+    /// Row spans registered under their compaction notice's key.
+    ///
+    /// A baked notice's rows map to its message key so a press
+    /// anywhere on the notice resolves its own toggle.
+    compaction_summary_lines: HashMap<usize, String>,
+
+    /// Each baked user turn's row span, with its mark row.
+    ///
+    /// `(tint_start, turn_end, mark_row)` triples in bake-absolute
+    /// rows, grown as turns bake and never holding the tail's
+    /// relative rows.
+    user_turn_ranges: Vec<(usize, usize, usize)>,
+
+    /// The row spans of the baked conversation's inline todo blocks.
+    ///
+    /// Whole-block ranges in bake-absolute rows, for the scroll's
+    /// whole-or-nothing todo-block rule.
+    todo_block_ranges: Vec<std::ops::Range<usize>>,
+}
+
 impl TuiApp {
     /// Construct the shell with freshly-allocated, empty shared state.
     ///
@@ -1654,10 +1844,10 @@ impl TuiApp {
             conversation: Vec::new(),
             state,
             submit_tx: None,
+            handed: None,
             guidance: None,
             turn_end_hook: None,
             verbosity: config.display.verbosity,
-            spinner_idx: 0,
             input: InputEditor::new(),
             input_wrap_width: 80,
             input_view: None,
@@ -1692,15 +1882,21 @@ impl TuiApp {
             live_frozen_upto: 0,
             live_width: 0,
             conversation_cache: Vec::new(),
+            conversation_bake: Vec::new(),
+            frame_stats: FrameStats::default(),
             conversation_cache_width: 0,
             user_turn_ranges: Vec::new(),
             conversation_generation: 1,
             conversation_cache_generation: 0,
+            conversation_baked_through: 0,
+            conversation_baked_prev_user: None,
+            conversation_bake_meta: BakeMeta::default(),
             quit: QuitState::default(),
             shutdown_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             run_canceller: None,
             cancel_arm: false,
             expanded_tools: std::collections::HashSet::new(),
+            auto_expanded_todo: None,
             thinking_mode: ThinkingMode::Follow,
             expanded_thinking: std::collections::HashSet::new(),
             expanded_compactions: std::collections::HashSet::new(),
@@ -1753,6 +1949,9 @@ impl TuiApp {
     /// the view; submitting from the input line goes through the same
     /// path internally.
     pub fn push_message(&mut self, message: TuiMessage) {
+        if let Some(id) = self.auto_expanded_todo.take() {
+            self.expanded_tools.remove(&id);
+        }
         self.conversation.push(message);
         self.conversation_generation = self.conversation_generation.saturating_add(1);
     }
@@ -2048,6 +2247,26 @@ impl TuiApp {
         self.shutdown_flag = flag;
     }
 
+    /// Retire the plan section when its work is finished.
+    ///
+    /// The plan belongs to the session, not the run: a claim retires it
+    /// only when every entry stands completed — the same edge the runner
+    /// clears its own carried store at — while an unfinished plan keeps
+    /// standing across the claim exactly as the store carries it, so the
+    /// section never desyncs from the plan the model and the belts are
+    /// working against. An empty plan retires trivially; an interrupted
+    /// run's caller never reaches here at all.
+    fn retire_finished_plan(&mut self) {
+        if self
+            .latest_todos
+            .iter()
+            .all(|row| row.status == todo_view::TodoStatus::Completed)
+        {
+            self.latest_todos.clear();
+            self.todo_section_changes.clear();
+        }
+    }
+
     /// Install a whole prior conversation as the session's starting
     /// state.
     ///
@@ -2074,8 +2293,7 @@ impl TuiApp {
                 if let TuiMessage::User { steered: false, .. } = message
                     && !last_row_was_error
                 {
-                    self.latest_todos.clear();
-                    self.todo_section_changes.clear();
+                    self.retire_finished_plan();
                 }
                 last_row_was_error = matches!(message, TuiMessage::Error { .. });
                 continue;
@@ -2108,6 +2326,7 @@ impl TuiApp {
                     self.todo_section_changes = changes;
                     self.latest_todos = rows;
                     self.expanded_tools.insert(call_id.clone());
+                    self.auto_expanded_todo = Some(call_id.clone());
                 }
             }
         }
@@ -2904,6 +3123,7 @@ impl TuiApp {
     pub fn set_verbosity(&mut self, verbosity: Verbosity) {
         self.verbosity = verbosity;
         self.conversation_generation = self.conversation_generation.saturating_add(1);
+        self.rebake_whole();
         self.live_stamp = 0;
     }
 
@@ -3006,7 +3226,22 @@ impl TuiApp {
                     }
                 }
                 _instant = tick.tick() => self.tick_wake(Instant::now()),
-                _anim = animation.tick(), if self.pulse_animation_living() => true,
+                // The animation heartbeat: unconditional. The tick
+                // fires every 20ms whether or not anything else is
+                // happening — streaming, typing, a stopwatch ticking —
+                // and each beat draws whenever something animates.
+                // The gate decides only whether THIS beat draws, so
+                // an idle-but-running session re-renders the spinner
+                // at the same cadence a running tool's stopwatch
+                // enjoys, never waiting on another lane's traffic.
+                _anim = animation.tick() => {
+                    let animating = self.pulse_animation_living();
+                    if animating {
+                        self.frame_stats.anim_wakes =
+                            self.frame_stats.anim_wakes.saturating_add(1);
+                    }
+                    animating
+                }
                 maybe_request = async {
                     match permission_rx.as_mut() {
                         Some(rx) => rx.recv().await,
@@ -3043,24 +3278,54 @@ impl TuiApp {
                 needs_redraw = true;
             }
             if needs_redraw {
+                let started = Instant::now();
                 terminal.draw(|frame| self.render(frame))?;
+                let took = started.elapsed();
+                let stats = &mut self.frame_stats;
+                stats.draws = stats.draws.saturating_add(1);
+                stats.worst_draw = Some(match stats.worst_draw {
+                    Some(worst) if worst >= took => worst,
+                    _ => took,
+                });
+                let now = Instant::now();
+                let second = stats.second_start.unwrap_or(now);
+                if now.duration_since(second) >= std::time::Duration::from_secs(1) {
+                    tracing::debug!(
+                        target: "dch_tui::frames",
+                        anim_wakes = stats.anim_wakes,
+                        draws = stats.draws,
+                        worst_draw_ms =
+                            u64::try_from(stats.worst_draw.map_or(0, |d| d.as_millis()))
+                                .unwrap_or(u64::MAX),
+                        "frame lane"
+                    );
+                    *stats = FrameStats {
+                        second_start: Some(now),
+                        ..FrameStats::default()
+                    };
+                }
             }
         }
         Ok(())
     }
 
-    /// Whether the run loop's animation wake should run this iteration.
+    /// Whether the run loop's animation wake should draw this beat.
     ///
-    /// The strip renders for the whole run — thinking or not — so the
-    /// fast frame cadence follows the agent-running flag, standing
-    /// down only for the configured-off strip, which never has a
-    /// frame to animate; an idle session never pays for it.
+    /// The lane draws while anything on screen animates. A running
+    /// turn's elapsed row — the spinner and its counting figure —
+    /// ticks from the claim that starts the run to the event that
+    /// lands it, thinking phases included. A tool call's stopwatch
+    /// and spinner tick while the call is in flight. The activity
+    /// strip rides the same beats without ever gating them: its off
+    /// style paints nothing, and the elapsed row still needs its
+    /// frames. A fully idle session pays for none of it.
     #[must_use]
     pub fn pulse_animation_living(&self) -> bool {
-        self.state
-            .agent_running
-            .load(std::sync::atomic::Ordering::Relaxed)
-            && !matches!(self.strip_style, StripStyle::Off)
+        self.any_tools_running()
+            || self
+                .state
+                .agent_running
+                .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Render the pinned pulse strip into its row.
@@ -3840,6 +4105,7 @@ impl TuiApp {
                 self.stick = Stick::Hold;
             }
             self.conversation_generation = self.conversation_generation.saturating_add(1);
+            self.rebake_whole();
             self.selection = None;
             self.drag_position = None;
         }
@@ -3892,17 +4158,23 @@ impl TuiApp {
         let dim = self.theme.ui.dim;
         let expanded = !folded && matches!(self.thinking_mode, ThinkingMode::Follow);
         let marker = if expanded { "▾" } else { "▸" };
+        // The title rides the running register — the same foreground a
+        // running tool's title carries — while the stream is live; the
+        // completed block grey-outs in the dim tone, and so does every
+        // auxiliary span here (marker, elapsed, body). Only the word
+        // itself stands at full voice while there is thinking to read.
         let row = Line::from(vec![
             Span::styled(format!("{marker} "), Style::default().fg(dim)),
             Span::styled(
                 "Thinking",
-                Style::default()
-                    .fg(dim)
-                    .add_modifier(ratatui::style::Modifier::ITALIC),
+                Style::default().add_modifier(ratatui::style::Modifier::ITALIC),
             ),
             Span::styled(
                 format!(" · {}", format_duration(elapsed)),
-                Style::default().fg(dim),
+                // The elapsed reads light while the stream runs — the
+                // theme's reply color — and grey-outs with the whole
+                // block once it settles.
+                Style::default().fg(self.theme.ui.assistant_message_fg),
             ),
         ]);
         let mut lines = vec![row];
@@ -4009,6 +4281,7 @@ impl TuiApp {
             self.stick = Stick::Hold;
         }
         self.conversation_generation = self.conversation_generation.saturating_add(1);
+        self.rebake_whole();
         self.selection = None;
         self.drag_position = None;
         true
@@ -4043,6 +4316,7 @@ impl TuiApp {
             self.stick = Stick::Hold;
         }
         self.conversation_generation = self.conversation_generation.saturating_add(1);
+        self.rebake_whole();
         self.selection = None;
         self.drag_position = None;
         true
@@ -4154,8 +4428,21 @@ impl TuiApp {
     /// the thing that throws them away.
     fn submit_text(&mut self, text: String) {
         if self.submit_tx.is_some() {
+            // The handoff window: an empty queue in a session at rest
+            // — no claim standing, no run going — means this prompt is
+            // the driver's very next claim, one channel hop away, and
+            // the row hides until the claim takes it, so no frame draws
+            // it as waiting. Anything else (a backlog, a claim, a run
+            // in flight) is genuinely waiting and shows.
+            let was_empty = self.queued_len() == 0;
+            let idle = self.state.live_claim.load(Ordering::SeqCst) == u64::MAX
+                && !self.state.agent_running.load(Ordering::SeqCst);
+            self.handed = None;
             let id = self.push_queued(text.clone());
             if self.send_queued_id(id) {
+                if was_empty && idle {
+                    self.handed = Some(id);
+                }
                 self.scroll_to_bottom();
                 return;
             }
@@ -4285,6 +4572,64 @@ impl TuiApp {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .replace(id, text)
+    }
+
+    /// The queue's display length: every waiting prompt, minus the one
+    /// whose claim is a channel hop away.
+    ///
+    /// The handoff hide is display-only — the shared queue still holds
+    /// the prompt for the driver to claim, and the exit and resume
+    /// paths read the queue directly, unaffected. The hidden row is
+    /// the queue's last (its window only opens on a queue that was
+    /// empty), so earlier rows keep their display positions.
+    fn queued_display_len(&self) -> usize {
+        let total = self.queued_len();
+        if self
+            .handed
+            .is_some_and(|id| self.queued_index_of(id).is_some())
+        {
+            total.saturating_sub(1)
+        } else {
+            total
+        }
+    }
+
+    /// Fold the auto-expanded todo block when the next tool is
+    /// running.
+    ///
+    /// The graduation fold covers the conversation's next completed
+    /// step; this covers its next *started* one — a tool in flight is
+    /// the conversation moving on even before its result graduates.
+    /// Manual expansions are untouched: only the tracked block folds.
+    fn settle_todo_expansion(&mut self) {
+        let Some(id) = self.auto_expanded_todo.as_ref() else {
+            return;
+        };
+        let running = self
+            .state
+            .active_tools
+            .lock()
+            .is_ok_and(|tools| !tools.is_empty());
+        if running {
+            let id = id.clone();
+            self.expanded_tools.remove(&id);
+            self.auto_expanded_todo = None;
+        }
+    }
+
+    /// Retire the handoff hide once its prompt left the queue.
+    ///
+    /// A claimed or dropped prompt is gone from the shared queue, and
+    /// the window its hide justified is over. A prompt still waiting
+    /// keeps its hide — that shape means a driver that stopped
+    /// claiming, and the next submit clears the field before its own
+    /// push, so at most one row hides at a time.
+    fn settle_handed(&mut self) {
+        if let Some(id) = self.handed
+            && self.queued_index_of(id).is_none()
+        {
+            self.handed = None;
+        }
     }
 
     /// How many prompts wait.
@@ -4461,7 +4806,7 @@ impl TuiApp {
     /// a first entry meets the queue at the front, the prompt that runs
     /// next.
     fn focus_queue(&mut self) -> bool {
-        if self.queued_len() == 0 {
+        if self.queued_display_len() == 0 {
             return false;
         }
         self.queue_mode = QueueMode::Focused;
@@ -4797,7 +5142,9 @@ impl TuiApp {
     /// than the prompt that slid into the row. An emptied queue takes the
     /// view home to zero, which is also where the next prompt is met.
     fn clamp_queue_view(&mut self) {
-        self.queue_view = self.queue_view.min(self.queued_len().saturating_sub(1));
+        self.queue_view = self
+            .queue_view
+            .min(self.queued_display_len().saturating_sub(1));
     }
 
     /// Reconcile the section's view and mode with what the queue holds.
@@ -4939,14 +5286,6 @@ impl TuiApp {
     /// above draws nothing.
     pub fn tick_wake(&mut self, now: Instant) -> bool {
         let claimed = self.take_pending_redraw(now);
-        if self.any_tools_running() {
-            let next = self.spinner_idx.saturating_add(1);
-            self.spinner_idx = if next >= SPINNER_FRAMES.len() {
-                0
-            } else {
-                next
-            };
-        }
         let dragged = if self.pending_permissions.front().is_some() {
             self.drag_position = None;
             false
@@ -5099,6 +5438,8 @@ impl TuiApp {
     /// text-row cap and then holds: the conversation pane reflows
     /// while the composer grows and holds still once it has.
     pub fn render(&mut self, frame: &mut Frame) {
+        self.settle_handed();
+        self.settle_todo_expansion();
         self.drain_shared_state();
         self.sync_queue_view();
         let area = frame.area();
@@ -5119,7 +5460,7 @@ impl TuiApp {
             .len()
             .checked_sub(1)
             .filter(|_| self.pending_permissions.is_empty());
-        let queue_shown = self.queued_len() > 0;
+        let queue_shown = self.queued_display_len() > 0;
         // The waiting section stands whenever anything waits, not only
         // under a run: prompts a resume owes wait with no run up, and
         // hiding them behind the run gate would put them back in the
@@ -5127,10 +5468,12 @@ impl TuiApp {
         // section below makes the same argument for its own rows.
         // The plan stands between the conversation and everything else
         // while any task does — no run gate: a list with work left is
-        // worth keeping in view between runs too, and a finished list
-        // leaves at the claim that follows it (the same edge the runner
-        // resets its own store at), so the section never ghosts done
-        // work across runs. Ctrl+T walks its postures — capped, full,
+        // worth keeping in view between runs too, carried across claims
+        // exactly as the runner carries its own store, and a finished
+        // list leaves at the claim that follows it — the same edge the
+        // runner clears the carried store at — so the section never
+        // ghosts done work across runs and never drops work the
+        // session still owes. Ctrl+T walks its postures — capped, full,
         // hidden — a view preference, not a mode: it owns no keys and
         // the plan keeps updating underneath either way. Hidden keeps
         // one row of itself standing: the folded marker names the
@@ -5285,6 +5628,7 @@ impl TuiApp {
         let colors = todo_view::TodoColors {
             dim: self.theme.ui.dim,
             accent: self.theme.ui.primary,
+            moved: self.theme.ui.secondary,
             badge_fill: self.theme.ui.secondary,
             badge_letters: self.theme.ui.background,
         };
@@ -5328,6 +5672,7 @@ impl TuiApp {
         let colors = todo_view::TodoColors {
             dim: self.theme.ui.dim,
             accent: self.theme.ui.primary,
+            moved: self.theme.ui.secondary,
             badge_fill: self.theme.ui.secondary,
             badge_letters: self.theme.ui.background,
         };
@@ -5856,6 +6201,138 @@ impl TuiApp {
     /// the padded content window it measures. A pinned view
     /// re-anchors to the newest line; a detached view holds its
     /// place while content streams in below it or collapses away.
+    /// Invalidate the bake whole, keeping the width.
+    ///
+    /// For the shapes that change how already-baked messages render —
+    /// a verbosity switch re-shapes every tool body, an expansion
+    /// click re-renders one block — the bake cannot stand: it froze
+    /// the old shape. Rare by nature (a key press, a click), so the
+    /// full re-render they cost is the price they always paid.
+    fn rebake_whole(&mut self) {
+        self.conversation_bake.clear();
+        self.conversation_bake_meta = BakeMeta::default();
+        self.conversation_baked_through = 0;
+        self.conversation_baked_prev_user = None;
+    }
+
+    /// Bake the conversation cache incrementally.
+    ///
+    /// Messages are immutable once a newer one follows — only the
+    /// last is ever patched, a run's duration landing on it — so the
+    /// cache bakes each message once and a graduation re-renders only
+    /// the tail. A full-transcript rebuild cost seconds on
+    /// markdown-heavy sessions, freezing the frame — spinner included
+    /// — on every tool result that landed. Width changes and
+    /// truncations below the bake are the two shapes that invalidate
+    /// it. The tail renders alone, so its row indexes are
+    /// tail-relative; the frame's merged view products are rebuilt
+    /// with the tail rebased by the bake's line count, and the bake's
+    /// own metadata lives in [`Self::conversation_bake_meta`].
+    fn bake_conversation_cache(&mut self, text_area: Rect, width: u16) {
+        if self.conversation_cache_width != width
+            || self.conversation.len() < self.conversation_baked_through
+        {
+            self.conversation_cache.clear();
+            self.conversation_bake.clear();
+            self.conversation_bake_meta = BakeMeta::default();
+            self.conversation_baked_through = 0;
+            self.conversation_baked_prev_user = None;
+            self.conversation_cache_width = width;
+        }
+        // Every rebuild forfeits the selection, as it always did:
+        // line indexes shift under it.
+        self.selection = None;
+        self.drag_position = None;
+        let bake_end = self.conversation.len().saturating_sub(1);
+        if bake_end > self.conversation_baked_through {
+            let mut prev_user = self.conversation_baked_prev_user;
+            let baked_start = self.conversation_baked_through;
+            let mut baked = BakeOutputs {
+                lines: std::mem::take(&mut self.conversation_bake),
+                ..BakeOutputs::default()
+            };
+            self.conversation_lines(text_area, baked_start, bake_end, &mut prev_user, &mut baked);
+            self.conversation_baked_prev_user = prev_user;
+            self.conversation_baked_through = bake_end;
+            self.conversation_bake = baked.lines;
+            self.conversation_bake_meta
+                .tool_summary_lines
+                .extend(baked.tool_summary_lines);
+            self.conversation_bake_meta
+                .thinking_summary_lines
+                .extend(baked.thinking_summary_lines);
+            self.conversation_bake_meta
+                .compaction_summary_lines
+                .extend(baked.compaction_summary_lines);
+            self.conversation_bake_meta
+                .user_turn_ranges
+                .extend(baked.user_turn_ranges);
+            self.conversation_bake_meta
+                .todo_block_ranges
+                .extend(baked.todo_block_ranges);
+        }
+        let mut tail = BakeOutputs::default();
+        let mut tail_prev = self.conversation_baked_prev_user;
+        let tail_start = self.conversation.len().saturating_sub(1);
+        self.conversation_lines(
+            text_area,
+            tail_start,
+            self.conversation.len(),
+            &mut tail_prev,
+            &mut tail,
+        );
+        let mut cache = self.conversation_bake.clone();
+        cache.extend(tail.lines);
+        self.conversation_cache = cache;
+        let tail_base = self.conversation_bake.len();
+        self.tool_summary_lines = self.conversation_bake_meta.tool_summary_lines.clone();
+        for (index, id) in tail.tool_summary_lines {
+            self.tool_summary_lines
+                .insert(index.saturating_add(tail_base), id);
+        }
+        self.thinking_summary_lines = self.conversation_bake_meta.thinking_summary_lines.clone();
+        for (index, id) in tail.thinking_summary_lines {
+            self.thinking_summary_lines
+                .insert(index.saturating_add(tail_base), id);
+        }
+        self.compaction_summary_lines =
+            self.conversation_bake_meta.compaction_summary_lines.clone();
+        for (index, id) in tail.compaction_summary_lines {
+            self.compaction_summary_lines
+                .insert(index.saturating_add(tail_base), id);
+        }
+        self.user_turn_ranges = self.conversation_bake_meta.user_turn_ranges.clone();
+        self.user_turn_ranges
+            .extend(tail.user_turn_ranges.iter().map(|(start, end, mark)| {
+                (
+                    start.saturating_add(tail_base),
+                    end.saturating_add(tail_base),
+                    mark.saturating_add(tail_base),
+                )
+            }));
+        self.todo_block_ranges = self.conversation_bake_meta.todo_block_ranges.clone();
+        self.todo_block_ranges
+            .extend(tail.todo_block_ranges.iter().map(|range| {
+                range.start.saturating_add(tail_base)..range.end.saturating_add(tail_base)
+            }));
+        self.conversation_cache_generation = self.conversation_generation;
+    }
+
+    /// Render the conversation pane: the transcript's windowed view
+    /// and everything live that rides it.
+    ///
+    /// The pane is the layered stack the reader scrolls — the baked
+    /// conversation cache, the speaker-change seam, the live lanes in
+    /// conversation order (thinking rows, the streaming reply's
+    /// frozen and live regions, compaction notices), the running tool
+    /// rows, and the turn's ticking timer footer — windowed to the
+    /// pane's height around the scroll position, so a keystroke's
+    /// cost tracks the window, never the session. The settled turns'
+    /// chrome (their raised boxes and chevrons) paints from the
+    /// cached turn ranges over the same window; the selection
+    /// reverses in place; the scrollbar rides the gutter when the
+    /// stack outgrows the pane. The view state this records is the
+    /// click-mapping every later pointer event trusts.
     fn render_conversation(&mut self, frame: &mut Frame, area: Rect) {
         let padded = Rect {
             y: area.y.saturating_add(CONVERSATION_TOP_INSET),
@@ -5889,28 +6366,7 @@ impl TuiApp {
         if self.conversation_cache_generation != self.conversation_generation
             || self.conversation_cache_width != width
         {
-            let mut summary_lines = HashMap::new();
-            let mut thinking_lines = HashMap::new();
-            let mut compaction_lines = HashMap::new();
-            let mut user_turns = Vec::new();
-            let mut todo_blocks = Vec::new();
-            self.conversation_cache = self.conversation_lines(
-                text_area,
-                &mut summary_lines,
-                &mut thinking_lines,
-                &mut compaction_lines,
-                &mut user_turns,
-                &mut todo_blocks,
-            );
-            self.tool_summary_lines = summary_lines;
-            self.todo_block_ranges = todo_blocks;
-            self.thinking_summary_lines = thinking_lines;
-            self.compaction_summary_lines = compaction_lines;
-            self.user_turn_ranges = user_turns;
-            self.conversation_cache_width = width;
-            self.conversation_cache_generation = self.conversation_generation;
-            self.selection = None;
-            self.drag_position = None;
+            self.bake_conversation_cache(text_area, width);
         }
 
         let conversation_len = self.conversation_cache.len();
@@ -6135,14 +6591,14 @@ impl TuiApp {
                 u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
             });
         let elapsed = now.saturating_sub(started);
-        // The frame derives from the elapsed clock itself: one frame
-        // per 80ms of run time, advancing on every redraw in
-        // lockstep with the ticking duration — never frozen by a
-        // quiet tool lane, never desynced from the number it leads.
-        let frame_index = usize::try_from(elapsed.checked_div(SPINNER_FRAME_MS).unwrap_or(0))
-            .unwrap_or(0)
-            .checked_rem(SPINNER_FRAMES.len())
-            .unwrap_or(0);
+        let frame_index = usize::try_from(
+            elapsed
+                .checked_div(crate::tool_render::SPINNER_FRAME_MS)
+                .unwrap_or(0),
+        )
+        .unwrap_or(0)
+        .checked_rem(SPINNER_FRAMES.len())
+        .unwrap_or(0);
         let frame = SPINNER_FRAMES
             .get(frame_index)
             .or_else(|| SPINNER_FRAMES.first())
@@ -6215,7 +6671,9 @@ impl TuiApp {
     /// file carried. A retried call graduates once per attempt
     /// under the same id, so the queue is requeued rather than
     /// duplicated and the detail ages from its newest attempt; the
-    /// oldest entry retires past the cap with its toggle state.
+    /// oldest entry retires past the cap with its toggle state — and
+    /// a retirement that cleared an expanded flag rebakes at once,
+    /// so baked rows cannot keep showing a shape no toggle backs.
     fn retain_tool_detail(&mut self, call_id: &str, input_json: &str, output: &str) {
         if call_id.is_empty() || input_json.is_empty() {
             return;
@@ -6226,7 +6684,10 @@ impl TuiApp {
             && let Some(retired) = self.tool_detail_order.pop_front()
         {
             self.tool_details.remove(&retired);
-            self.expanded_tools.remove(&retired);
+            if self.expanded_tools.remove(&retired) {
+                self.conversation_generation = self.conversation_generation.saturating_add(1);
+                self.rebake_whole();
+            }
         }
         self.tool_details.insert(
             call_id.to_string(),
@@ -6284,17 +6745,8 @@ impl TuiApp {
                         timestamp: now,
                         steered,
                     });
-                    // Every claim starts a run of its own, and a plan
-                    // belongs to the run that filed it: the claim
-                    // retires the list outright — half-done or finished
-                    // alike — at the same edge the runner resets its
-                    // own store. A steer's echo is flagged apart: it
-                    // rides into the run already going, which is no
-                    // boundary, so the plan keeps standing through the
-                    // steer exactly as the runner's own store does.
                     if !steered && !self.plan_interrupted {
-                        self.latest_todos.clear();
-                        self.todo_section_changes.clear();
+                        self.retire_finished_plan();
                     }
                     self.plan_interrupted = false;
                 }
@@ -6314,11 +6766,6 @@ impl TuiApp {
                     duration_ms,
                     success,
                 } => {
-                    // Whether the next claim retires the plan depends
-                    // on how this run ended: a clean run closed its
-                    // plan, an interrupted run's plan is owed work —
-                    // the session resumes into it, and only a newly
-                    // filed plan replaces it.
                     self.plan_interrupted = !success;
                     if let Some(TuiMessage::Assistant {
                         duration_ms: reply_duration,
@@ -6329,6 +6776,7 @@ impl TuiApp {
                     }
                 }
                 Graduation::Tool(result) => {
+                    let mut todo_armed: Option<String> = None;
                     self.retain_tool_detail(
                         &result.call_id,
                         &result.full_input,
@@ -6341,7 +6789,8 @@ impl TuiApp {
                     }
                     if result.name == "TodoWrite"
                         && !result.is_error
-                        && let Some(rows) = crate::todo_view::parse_submission(&result.full_input)
+                        && let Some(rows) = crate::todo_view::parse_rendered(&result.full_output)
+                            .or_else(|| crate::todo_view::parse_submission(&result.full_input))
                     {
                         let changes = crate::todo_view::status_changes(&rows, &self.latest_todos);
                         self.todo_changes
@@ -6349,6 +6798,7 @@ impl TuiApp {
                         self.todo_section_changes = changes;
                         self.latest_todos = rows;
                         self.expanded_tools.insert(result.call_id.clone());
+                        todo_armed = Some(result.call_id.clone());
                     }
                     self.push_message(TuiMessage::Assistant {
                         blocks: vec![ContentBlock::Tool {
@@ -6363,6 +6813,9 @@ impl TuiApp {
                         timestamp: now,
                         duration_ms: None,
                     });
+                    if let Some(id) = todo_armed {
+                        self.auto_expanded_todo = Some(id);
+                    }
                 }
             }
         }
@@ -6410,23 +6863,28 @@ impl TuiApp {
     fn conversation_lines(
         &self,
         area: Rect,
-        summary_lines: &mut HashMap<usize, String>,
-        thinking_lines: &mut HashMap<usize, String>,
-        compaction_lines: &mut HashMap<usize, String>,
-        user_turns: &mut Vec<(usize, usize, usize)>,
-        todo_blocks: &mut Vec<std::ops::Range<usize>>,
-    ) -> Vec<Line<'static>> {
+        start: usize,
+        end: usize,
+        previous_was_user: &mut Option<bool>,
+        outputs: &mut BakeOutputs,
+    ) {
+        let BakeOutputs {
+            lines,
+            tool_summary_lines: summary_lines,
+            thinking_summary_lines: thinking_lines,
+            compaction_summary_lines: compaction_lines,
+            user_turn_ranges: user_turns,
+            todo_block_ranges: todo_blocks,
+        } = outputs;
         let width = area.width.max(1);
         let markdown_theme = markdown::MarkdownTheme::from(&self.theme);
         let syntax_theme = markdown::SyntaxTheme::from(&self.theme);
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        let mut previous_was_user: Option<bool> = None;
-        for (message_index, message) in self.conversation.iter().enumerate() {
+        for (message_index, message) in self.conversation.iter().enumerate().take(end).skip(start) {
             let is_user = matches!(message, TuiMessage::User { .. });
             if previous_was_user.is_some_and(|was_user| was_user != is_user) {
                 lines.push(Line::default());
             }
-            previous_was_user = Some(is_user);
+            *previous_was_user = Some(is_user);
             match message {
                 TuiMessage::User { text, .. } => {
                     let tint_start = lines.len();
@@ -6481,7 +6939,7 @@ impl TuiApp {
                                 self.push_tool_block_lines(
                                     block,
                                     width,
-                                    &mut lines,
+                                    lines,
                                     summary_lines,
                                     todo_blocks,
                                 );
@@ -6523,7 +6981,6 @@ impl TuiApp {
                 }
             }
         }
-        lines
     }
 
     /// Render one completed tool block into the conversation rows.
@@ -6595,11 +7052,13 @@ impl TuiApp {
                         crate::diff::diff_colors(&self.theme),
                     ));
                 } else if name == "TodoWrite"
-                    && let Some(rows) = crate::todo_view::parse_submission(&detail.input_json)
+                    && let Some(rows) = crate::todo_view::parse_rendered(&detail.output)
+                        .or_else(|| crate::todo_view::parse_submission(&detail.input_json))
                 {
                     let colors = crate::todo_view::TodoColors {
                         dim: self.theme.ui.dim,
                         accent: self.theme.ui.primary,
+                        moved: self.theme.ui.secondary,
                         badge_fill: self.theme.ui.secondary,
                         badge_letters: self.theme.ui.background,
                     };
@@ -6853,7 +7312,6 @@ impl TuiApp {
             let first = lines.len();
             lines.extend(crate::tool_render::running_tool_lines(
                 tool,
-                self.spinner_idx,
                 &self.theme,
                 self.verbosity,
             ));
@@ -6953,7 +7411,7 @@ impl TuiApp {
     /// section only as far as the two prompt rows the cap allows, so
     /// the conversation pays for words, not for air.
     fn queue_section_height(&self, width: u16) -> u16 {
-        let total = self.queued_len();
+        let total = self.queued_display_len();
         if total == 0 {
             return 0;
         }
@@ -7007,7 +7465,7 @@ impl TuiApp {
         if area.height == 0 || area.width == 0 {
             return;
         }
-        let total = self.queued_len();
+        let total = self.queued_display_len();
         let shown = self.queue_view.min(total.saturating_sub(1));
         let Some((_, text)) = self.queued_at(shown) else {
             return;
@@ -7102,10 +7560,6 @@ impl TuiApp {
             return;
         }
         let text = if self.quit.armed {
-            // The arming press posts its own wording — the one action
-            // the next press fires, cancel-and-exit under a run, the
-            // plain exit at rest — and that wording outranks the
-            // generic hint while it holds.
             Some(self.transient_notice.as_ref().map_or_else(
                 || "press ctrl+c again to quit".to_string(),
                 |(notice, _)| notice.clone(),
@@ -10025,6 +10479,298 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn the_auto_expanded_todo_block_folds_when_the_conversation_moves_on() {
+        // The plan's inline expansion is momentary: the update
+        // expands so the reader sees where the list stands, and the
+        // conversation's next step — a reply, another tool's result —
+        // folds it back to its summary row. The standing panel carries
+        // the list from there.
+        let mut subject = TuiApp::new(dch_config::DchConfig::default());
+        subject.expanded_tools.insert("call_todo".to_string());
+        subject.auto_expanded_todo = Some("call_todo".to_string());
+        subject.push_message(TuiMessage::Assistant {
+            blocks: vec![ContentBlock::Text {
+                text: "working on it".to_string(),
+            }],
+            timestamp: chrono::Utc::now(),
+            duration_ms: None,
+        });
+        assert!(
+            !subject.expanded_tools.contains("call_todo"),
+            "the next graduation folds the auto-expanded block"
+        );
+        assert!(
+            subject.auto_expanded_todo.is_none(),
+            "and retires the fold's tracking"
+        );
+    }
+
+    #[test]
+    fn the_auto_expanded_todo_block_folds_when_the_next_tool_starts() {
+        // A tool in flight is the conversation moving on even before
+        // its result lands: the frame-start settle folds the block the
+        // moment something is running.
+        let mut subject = TuiApp::new(dch_config::DchConfig::default());
+        subject.expanded_tools.insert("call_todo".to_string());
+        subject.auto_expanded_todo = Some("call_todo".to_string());
+        subject.settle_todo_expansion();
+        assert!(
+            subject.expanded_tools.contains("call_todo"),
+            "nothing running — the block still shows the plan"
+        );
+        subject
+            .active_tools()
+            .lock()
+            .expect("the tools lock")
+            .push(crate::message::ActiveTool {
+                call_id: "call_next".to_string(),
+                name: "Bash".to_string(),
+                input_summary: String::new(),
+                start: std::time::Instant::now(),
+            });
+        subject.settle_todo_expansion();
+        assert!(
+            !subject.expanded_tools.contains("call_todo"),
+            "the next tool starting folds it"
+        );
+    }
+
+    #[test]
+    fn a_manual_expansion_outlives_the_auto_fold() {
+        // The reader's own expansions are theirs: only the one block
+        // the auto-expand armed ever folds.
+        let mut subject = TuiApp::new(dch_config::DchConfig::default());
+        subject.expanded_tools.insert("call_mine".to_string());
+        subject.push_message(TuiMessage::Assistant {
+            blocks: vec![ContentBlock::Text {
+                text: "next step".to_string(),
+            }],
+            timestamp: chrono::Utc::now(),
+            duration_ms: None,
+        });
+        assert!(
+            subject.expanded_tools.contains("call_mine"),
+            "a manual expansion is never folded by the auto rule"
+        );
+    }
+
+    #[test]
+    fn a_graduation_re_renders_only_the_tail() {
+        // The bake is the spinner's autonomy: messages are immutable
+        // once a newer one follows, so a graduation re-renders only
+        // the messages after the bake — a full-transcript re-render
+        // cost seconds on markdown-heavy sessions and froze the frame,
+        // spinner included, on every tool result that landed.
+        let mut subject = TuiApp::new(dch_config::DchConfig::default());
+        let now = chrono::Utc::now();
+        for turn in 0..5 {
+            subject.push_message(TuiMessage::User {
+                text: format!("prompt {turn}"),
+                timestamp: now,
+                steered: false,
+            });
+            subject.push_message(TuiMessage::Assistant {
+                blocks: vec![ContentBlock::Text {
+                    text: format!("## reply {turn}\n\n```rust\nfn f{turn}() {{}}\n```"),
+                }],
+                timestamp: now,
+                duration_ms: Some(900),
+            });
+        }
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| subject.render(frame)).unwrap();
+        let baked = subject.conversation_baked_through;
+        let prefix: Vec<String> = subject
+            .conversation_cache
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.to_string())
+                    .collect::<String>()
+            })
+            .collect();
+        assert_eq!(baked, 9, "all but the last message bakes");
+        subject.push_message(TuiMessage::User {
+            text: "next".to_string(),
+            timestamp: now,
+            steered: false,
+        });
+        terminal.draw(|frame| subject.render(frame)).unwrap();
+        assert_eq!(
+            subject.conversation_baked_through, 10,
+            "the bake advances by appending — one message re-rendered"
+        );
+        let after: Vec<String> = subject
+            .conversation_cache
+            .iter()
+            .take(prefix.len())
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.to_string())
+                    .collect::<String>()
+            })
+            .collect();
+        assert_eq!(
+            prefix, after,
+            "the baked prefix is byte-identical across the graduation"
+        );
+    }
+
+    #[test]
+    fn the_incremental_bake_matches_a_full_rebuild() {
+        // The optimization may not change what the reader sees: the
+        // incrementally baked cache and a from-scratch rebuild of the
+        // same conversation render identical lines.
+        let mut subject = TuiApp::new(dch_config::DchConfig::default());
+        let now = chrono::Utc::now();
+        subject.push_message(TuiMessage::User {
+            text: "do it".to_string(),
+            timestamp: now,
+            steered: false,
+        });
+        subject.push_message(TuiMessage::Assistant {
+            blocks: vec![
+                ContentBlock::Text {
+                    text: "## done\n\n**bold** and `code`".to_string(),
+                },
+                ContentBlock::Tool {
+                    name: "Read".to_string(),
+                    call_id: "c1".to_string(),
+                    input_preview: "a.rs".to_string(),
+                    success: true,
+                    elapsed_secs: 0.5,
+                    output_preview: "ok".to_string(),
+                    retained_input: String::new(),
+                },
+            ],
+            timestamp: now,
+            duration_ms: Some(1200),
+        });
+        subject.push_message(TuiMessage::User {
+            text: "again".to_string(),
+            timestamp: now,
+            steered: false,
+        });
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| subject.render(frame)).unwrap();
+        let incremental = subject.conversation_cache.clone();
+        // Force a whole-transcript rebake: clear the bake and lie
+        // about the generation.
+        subject.conversation_cache.clear();
+        subject.conversation_bake.clear();
+        subject.conversation_baked_through = 0;
+        subject.conversation_baked_prev_user = None;
+        subject.conversation_cache_generation =
+            subject.conversation_cache_generation.wrapping_sub(1);
+        terminal.draw(|frame| subject.render(frame)).unwrap();
+        let full = subject.conversation_cache.clone();
+        assert_eq!(
+            texts_of(&incremental),
+            texts_of(&full),
+            "the bake and the rebuild render identical lines"
+        );
+    }
+
+    #[test]
+    fn a_truncation_below_the_bake_rebakes_whole() {
+        // A correction cut removes messages the bake already rendered:
+        // the bake cannot keep lines for messages that no longer
+        // exist, so a truncation below it resets and rebakes.
+        let mut subject = TuiApp::new(dch_config::DchConfig::default());
+        let now = chrono::Utc::now();
+        for turn in 0..4 {
+            subject.push_message(TuiMessage::User {
+                text: format!("p{turn}"),
+                timestamp: now,
+                steered: false,
+            });
+        }
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| subject.render(frame)).unwrap();
+        assert!(subject.conversation_baked_through >= 3);
+        subject.conversation.truncate(2);
+        subject.conversation_generation = subject.conversation_generation.wrapping_add(1);
+        terminal.draw(|frame| subject.render(frame)).unwrap();
+        assert_eq!(
+            subject.conversation.len(),
+            2,
+            "the conversation holds the truncated tail"
+        );
+        let texts: Vec<String> = texts_of(&subject.conversation_cache);
+        assert!(
+            texts.iter().any(|text| text.contains("p0")),
+            "the rebake renders the surviving messages from scratch"
+        );
+    }
+
+    /// The joined text of rendered lines, for line-by-line compares.
+    fn texts_of(lines: &[ratatui::text::Line<'_>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.to_string())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_fresh_session_first_prompt_never_shows_as_queued() {
+        // The handoff window: a submit into an idle session is the
+        // driver's very next claim, one channel hop away, and the
+        // queue section must not draw the prompt as waiting in
+        // between — the flash of QUEUED a fresh session's first
+        // prompt made. The shared queue still holds the prompt for
+        // the driver; only the display pays one fewer row.
+        let mut subject = TuiApp::new(dch_config::DchConfig::default());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        subject.submit_tx = Some(tx);
+        subject.submit_text("first prompt".to_string());
+        assert_eq!(
+            subject.queued_len(),
+            1,
+            "the driver finds the prompt in the shared queue"
+        );
+        assert_eq!(
+            subject.queued_display_len(),
+            0,
+            "the handoff window hides the row from the section"
+        );
+        assert_eq!(
+            subject.queue_section_height(60),
+            0,
+            "no rows to show — no section, no flash"
+        );
+        // The claim lands: the prompt leaves the queue and the next
+        // frame retires the hide.
+        let claimed = subject
+            .remove_queued(0)
+            .expect("the first pushed id is the driver's claim");
+        assert_eq!(claimed, "first prompt");
+        subject.settle_handed();
+        assert!(subject.handed.is_none(), "the window died with the claim");
+        // A busy session queues visibly: a run in flight means the
+        // new row genuinely waits, and waiting rows show.
+        subject
+            .state
+            .live_claim
+            .store(7, std::sync::atomic::Ordering::SeqCst);
+        subject.submit_text("second prompt".to_string());
+        assert_eq!(
+            subject.queued_display_len(),
+            1,
+            "genuinely waiting rows show under the title"
+        );
+    }
+
     fn app() -> TuiApp {
         TuiApp::new(dch_config::DchConfig::default())
     }
@@ -10146,6 +10892,75 @@ mod tests {
         assert!(
             subject.expanded_tools.contains("call_live"),
             "a live parsed edit diff expands its own row"
+        );
+    }
+
+    #[test]
+    fn an_evicted_expansion_rebakes_off_the_baked_rows() {
+        // Past the cap the oldest call's expansion retires with its
+        // detail, and the rows it baked in the expanded shape must
+        // not outlive the flag that backed them: the retirement
+        // rebakes, so the next draw renders the block collapsed —
+        // mid-conversation, where the tail re-render cannot reach it.
+        let mut subject = app();
+        let receipt = [
+            "Changed: src/lib.rs (modified)",
+            "│ 1 line removed, 1 added",
+            "@@ -1,2 +1,2 @@",
+            "  fn main() {",
+            "-     old();",
+            "+     new();",
+            "  }",
+        ]
+        .join("\n");
+        subject.retain_tool_detail("call_old", "{\"k\":1}", &receipt);
+        subject.expanded_tools.insert("call_old".to_string());
+        subject.push_message(TuiMessage::Assistant {
+            blocks: vec![ContentBlock::Tool {
+                name: "Edit".to_string(),
+                call_id: "call_old".to_string(),
+                input_preview: "src/lib.rs".to_string(),
+                output_preview: String::new(),
+                retained_input: String::new(),
+                success: true,
+                elapsed_secs: 0.1,
+            }],
+            timestamp: chrono::Utc::now(),
+            duration_ms: None,
+        });
+        subject.push_message(TuiMessage::User {
+            text: "after the block".to_string(),
+            timestamp: chrono::Utc::now(),
+            steered: false,
+        });
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24)).expect("terminal");
+        terminal.draw(|frame| subject.render(frame)).expect("draw");
+        let expanded = buffer_text(terminal.backend().buffer());
+        assert!(
+            expanded.contains("old();"),
+            "the expanded block draws its diff while the flag stands: {expanded}"
+        );
+        // TOOL_DETAIL_CAP later graduations retire the oldest call.
+        for index in 0..TOOL_DETAIL_CAP {
+            subject.retain_tool_detail(&format!("call_{index}"), "{\"k\":1}", "plain output");
+        }
+        assert!(
+            !subject.expanded_tools.contains("call_old"),
+            "the cap retired the oldest call's toggle state"
+        );
+        terminal
+            .draw(|frame| subject.render(frame))
+            .expect("redraw");
+        let collapsed = buffer_text(terminal.backend().buffer());
+        assert!(
+            !collapsed.contains("old();"),
+            "the retirement rebakes — the baked diff rows do not outlive \
+             the flag they rode: {collapsed}"
+        );
+        assert!(
+            collapsed.contains("src/lib.rs"),
+            "the block's own summary row stands: {collapsed}"
         );
     }
 
@@ -10296,6 +11111,66 @@ mod tests {
         assert!(
             expanded.contains("durable state is the findings file and todo list"),
             "the expanded details remind the reader what survived: {expanded}"
+        );
+    }
+
+    #[test]
+    fn a_baked_compaction_notice_expands_on_its_click() {
+        // The notice sits mid-conversation — a later message follows
+        // it — so its rows were baked once with the collapsed flag;
+        // only the tail re-renders each frame. The click must rebake,
+        // else the expansion never shows: the shape the lone-tail pin
+        // above cannot distinguish.
+        let mut app = app();
+        app.push_message(TuiMessage::Compacted {
+            tokens_before: 16_686,
+            tokens_after: 4_231,
+            reason: "threshold".to_string(),
+            evicted: 7,
+            duration_ms: 312,
+            compactor: Some("qa".to_string()),
+            compression_ratio: Some(3.9),
+            timestamp: chrono::Utc::now(),
+        });
+        app.push_message(TuiMessage::User {
+            text: "after the notice".to_string(),
+            timestamp: chrono::Utc::now(),
+            steered: false,
+        });
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24)).expect("terminal");
+        terminal.draw(|frame| app.render(frame)).expect("draw");
+        let collapsed = buffer_text(terminal.backend().buffer());
+        assert!(
+            collapsed.contains("Compacted · <1s"),
+            "the baked notice draws collapsed: {collapsed}"
+        );
+        assert!(
+            !collapsed.contains("16686"),
+            "the token counts wait for the expansion: {collapsed}"
+        );
+        // The click lands on the notice's own summary row, resolved
+        // through the same map and view the handler reads.
+        let (&line, _) = app
+            .compaction_summary_lines
+            .iter()
+            .next()
+            .expect("the notice registered its summary row");
+        let view = app.last_view.expect("the render left its view");
+        let row = view
+            .area
+            .y
+            .saturating_add(u16::try_from(line.saturating_sub(view.skip)).expect("row on screen"));
+        assert!(
+            app.toggle_compaction_at(view.area.x, row),
+            "the press belongs to the notice"
+        );
+        terminal.draw(|frame| app.render(frame)).expect("redraw");
+        let expanded = buffer_text(terminal.backend().buffer());
+        assert!(
+            expanded.contains("16686 → 4231 tokens"),
+            "the click rebakes the notice's rows — a mid-conversation \
+             expansion cannot ride the tail re-render: {expanded}"
         );
     }
 
@@ -10866,7 +11741,7 @@ mod tests {
     }
 
     #[test]
-    fn an_off_strip_draws_nothing_and_stands_the_wake_down() {
+    fn an_off_strip_paints_nothing_but_the_wake_stays_up() {
         let (_observer, state) = crate::observer::TuiObserverState::new().into_observer();
         state
             .agent_running
@@ -10875,8 +11750,8 @@ mod tests {
         config.display.strip_style = dch_config::StripStyle::Off;
         let app = TuiApp::from_observer_state(config, state);
         assert!(
-            !app.pulse_animation_living(),
-            "an off strip never pays the animation cadence, even mid-run"
+            app.pulse_animation_living(),
+            "an off strip still owes the elapsed row its cadence, mid-run"
         );
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 1)).unwrap();
@@ -12100,6 +12975,80 @@ mod tests {
                 .iter()
                 .any(|span| span.content.contains(THINKING_REDACTED_PLACEHOLDER))),
             "withheld reasoning renders the placeholder, not a blank body"
+        );
+    }
+
+    #[test]
+    fn the_live_thinking_title_reads_the_running_register() {
+        // While the stream runs, the title answers to the same
+        // register a running tool's title carries — the default
+        // foreground, italic as thinking's identity — and the
+        // auxiliary spans stay dim; the completed block greys the
+        // title out with everything else.
+        let (_observer, state) = crate::observer::TuiObserverState::new().into_observer();
+        let app = TuiApp::from_observer_state(dch_config::DchConfig::default(), state.clone());
+        state
+            .agent_running
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        *state.thinking.lock().expect("the thinking lock") = crate::observer::ThinkingStream {
+            text: "reasoning in flight".to_string(),
+            began: Some(Instant::now()),
+            ..Default::default()
+        };
+        let (lines, _) = app.live_thinking_lines(80);
+        let row = lines.first().expect("the marker row");
+        let title = row
+            .spans
+            .iter()
+            .find(|span| span.content.contains("Thinking"))
+            .expect("the title span");
+        assert_eq!(
+            title.style.fg, None,
+            "the title carries the default foreground while running — \
+             the running tool's register, not the dim"
+        );
+        assert!(
+            title
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::ITALIC),
+            "italic stays thinking's identity"
+        );
+        let elapsed = row
+            .spans
+            .iter()
+            .find(|span| span.content.contains("·"))
+            .expect("the elapsed span");
+        assert_eq!(
+            elapsed.style.fg,
+            Some(app.theme.ui.assistant_message_fg),
+            "the elapsed reads light while the stream runs — the \
+             theme's reply color"
+        );
+        let marker = row
+            .spans
+            .iter()
+            .find(|span| span.content.contains("▾") || span.content.contains("▸"))
+            .expect("the marker span");
+        assert_eq!(
+            marker.style.fg,
+            Some(app.theme.ui.dim),
+            "the marker keeps the dim tone"
+        );
+        // Completed: the transcript's block greys the title out.
+        let settled =
+            thinking_section_lines("done reasoning", false, 1200, false, 80, app.theme.ui.dim);
+        let settled_title = settled
+            .first()
+            .expect("the settled marker row")
+            .spans
+            .iter()
+            .find(|span| span.content.contains("Thinking"))
+            .expect("the settled title");
+        assert_eq!(
+            settled_title.style.fg,
+            Some(app.theme.ui.dim),
+            "the completed block's title is greyed out"
         );
     }
 

@@ -549,9 +549,15 @@ fn s_guides_a_prompt_that_is_already_waiting() {
 fn s_refuses_to_guide_when_nothing_is_running() {
     let (mut app, kept, _rx, guidance) = app_steerable();
     // A slot that would take the text: the refusal has to come from the
-    // app's own gate, not from an empty slot.
+    // app's own gate, not from an empty slot. The waiting prompt is
+    // seeded the way a resume seeds owed prompts — an idle submit's
+    // row hides for its handoff window, and this harness has no
+    // driver to retire it, while a seeded prompt genuinely waits.
     guidance.live.store(true, Ordering::SeqCst);
-    submit(&mut app, "queued while idle");
+    kept.queued
+        .lock()
+        .unwrap()
+        .push("queued while idle".to_string());
 
     press(&mut app, &ctrl(KeyCode::Char('q')));
     press(&mut app, &plain(KeyCode::Char('s')));
@@ -816,5 +822,95 @@ fn a_steered_row_lands_below_a_reply_that_came_first() {
         kinds,
         ["assistant", "user"],
         "the answer that finished first keeps the place it finished in"
+    );
+}
+
+#[test]
+fn a_steered_row_carries_its_chrome_the_frame_it_lands() {
+    // The steered row is the conversation's tail from the moment it
+    // lands until the run's next reply graduates below it, and its
+    // chrome — the prompt box, the chevron — must paint on its own
+    // rows that first frame: the tail's rows rebased onto the cache,
+    // not tail-relative indexes that box the pane's top and leave the
+    // guided words unmarked until a reply bakes them.
+    let (mut app, kept, _rx, guidance) = app_steerable();
+    guidance.live.store(true, Ordering::SeqCst);
+    running(&kept, true);
+    kept.graduations
+        .lock()
+        .unwrap()
+        .push(dch_tui::Graduation::Reply {
+            text: "an earlier answer bakes below before the steer                    lands, so the guided row is not the only content \
+                   the pane holds"
+                .to_string(),
+            thinking: None,
+        });
+
+    steer(&mut app, "check the other file too");
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let rows: Vec<String> = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect();
+    let steered_row = rows
+        .iter()
+        .position(|row| row.contains("check the other file too"))
+        .expect("the steered row");
+    let steered_row_u16 = u16::try_from(steered_row).unwrap_or(0);
+    let marks: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.contains('❯'))
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(
+        marks,
+        vec![steered_row],
+        "the steered row is the only user turn, and its chevron rides \
+         its own row the frame it lands: {rows:?}"
+    );
+    assert_eq!(
+        buffer[(5, steered_row_u16)].bg,
+        app.theme.ui.surface,
+        "the steered row rides the prompt box from its first frame"
+    );
+
+    kept.graduations
+        .lock()
+        .unwrap()
+        .push(dch_tui::Graduation::Reply {
+            text: "the answer that followed".to_string(),
+            thinking: None,
+        });
+    let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
+    terminal.draw(|frame| app.render(frame)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let rows: Vec<String> = (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect();
+    let steered_row = rows
+        .iter()
+        .position(|row| row.contains("check the other file too"))
+        .expect("the steered row after the reply");
+    let marks: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.contains('❯'))
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(
+        marks,
+        vec![steered_row],
+        "the reply baking below the steered row moves no mark: {rows:?}"
     );
 }

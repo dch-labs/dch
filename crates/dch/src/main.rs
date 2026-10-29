@@ -49,7 +49,30 @@ fn selects_single_run(task: Option<&str>, stdin_is_terminal: bool) -> bool {
     task.is_some() || !stdin_is_terminal
 }
 
+/// Install a tracing subscriber when `RUST_LOG` asks for one.
+///
+/// Silent by default — no flag, no subscriber, no output — so the
+/// quiet contract holds for every ordinary run. With `RUST_LOG` set
+/// (`dch=info`, `RUST_LOG=dch_loop::todo_nudge=debug`), the
+/// invisible machinery becomes observable: every reminder the
+/// contributor contributes, every follow-up the hook offers or
+/// declines, named with the turn and the count. The belt's whole
+/// "is it nudging?" question answers from the log instead of a wire
+/// proxy.
+fn install_log_when_asked() {
+    if std::env::var_os("RUST_LOG").is_some_and(|value| !value.is_empty()) {
+        use tracing_subscriber::EnvFilter;
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_target(false)
+            .with_writer(std::io::stderr)
+            .init();
+    }
+}
+
 fn main() -> std::process::ExitCode {
+    install_log_when_asked();
     let args = args::parse_args();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

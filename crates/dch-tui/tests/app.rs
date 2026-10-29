@@ -8342,6 +8342,72 @@ fn the_animation_wake_runs_only_while_the_agent_runs() {
 }
 
 #[test]
+fn an_idle_running_session_beats_on_its_own_heartbeat() {
+    // The heartbeat is unconditional and its gate is strip-blind: a
+    // run in flight with nothing else rendering — no tool, no
+    // streaming chunk, no keystroke, strip configured off — still
+    // redraws at the animation step, so the spinner never waits on
+    // another lane's traffic to move.
+    let (_observer, state) = dch_tui::TuiObserverState::new().into_observer();
+    let mut config = dch_config::DchConfig::default();
+    config.display.strip_style = dch_config::StripStyle::Off;
+    let app = TuiApp::from_observer_state(config, state.clone());
+    assert!(
+        !app.pulse_animation_living(),
+        "agent idle — nothing animates, strip off included"
+    );
+    drop(app);
+    state
+        .agent_running
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut config = dch_config::DchConfig::default();
+    config.display.strip_style = dch_config::StripStyle::Off;
+    let running = TuiApp::from_observer_state(config, state);
+    assert!(
+        running.pulse_animation_living(),
+        "agent running with the strip off — the heartbeat still draws: \
+         the spinner owns its cadence, borrowed from nobody"
+    );
+}
+
+#[test]
+fn a_running_tool_rides_the_fast_cadence_whatever_the_strip_says() {
+    // The tool rows' spinners turn on the animation step, not the
+    // coarse tick: with the strip off — no bar to animate — a call in
+    // flight still wakes the fast cadence on its own, or its dot
+    // beats against the frame clock and the tenth-of-a-second lands
+    // late.
+    let (_observer, state) = dch_tui::TuiObserverState::new().into_observer();
+    let mut config = dch_config::DchConfig::default();
+    config.display.strip_style = dch_config::StripStyle::Off;
+    let app = TuiApp::from_observer_state(config, state.clone());
+    assert!(
+        !app.pulse_animation_living(),
+        "idle with the strip off pays no cadence at all"
+    );
+    drop(app);
+    state
+        .active_tools
+        .lock()
+        .unwrap()
+        .push(dch_tui::message::ActiveTool {
+            call_id: "call-1".to_string(),
+            name: "Bash".to_string(),
+            input_summary: String::new(),
+            start: std::time::Instant::now(),
+        });
+    let mut config = dch_config::DchConfig::default();
+    config.display.strip_style = dch_config::StripStyle::Off;
+    let working = TuiApp::from_observer_state(config, state);
+    assert!(
+        working.pulse_animation_living(),
+        "a tool in flight, run idle, strip off — the call still drives \
+         the fast cadence and its elapsed row refreshes at the \
+         animation step"
+    );
+}
+
+#[test]
 fn a_stale_living_buffer_after_the_run_draws_nothing() {
     let (observer, state) = dch_tui::TuiObserverState::new().into_observer();
     state
@@ -8874,10 +8940,6 @@ fn thinking_rows_render_in_the_theme_dim_tone() {
         .position(|row| row.contains("Thinking ·"))
         .expect("the live row renders");
     let column = cell_col(&rows[row], "Thinking");
-    let dim = dch_tui::theme::Theme::by_name("dracula")
-        .expect("the theme exists")
-        .ui
-        .dim;
     let buffer = terminal.backend().buffer();
     let column_u16 = u16::try_from(column).unwrap_or(0);
     let row_u16 = u16::try_from(row).unwrap_or(0);
@@ -8885,8 +8947,23 @@ fn thinking_rows_render_in_the_theme_dim_tone() {
         .cell((column_u16, row_u16))
         .expect("the probed cell renders");
     assert_eq!(
-        cell.fg, dim,
-        "the thinking row carries the theme's dim tone, not the assistant color"
+        cell.fg,
+        ratatui::style::Color::Reset,
+        "while the stream runs, the title reads the running register — \
+         the default foreground a running tool's title carries"
+    );
+    let elapsed_col = cell_col(&rows[row], "·");
+    let elapsed_cell = buffer
+        .cell((u16::try_from(elapsed_col).unwrap_or(0), row_u16))
+        .expect("the elapsed span renders");
+    let light = dch_tui::theme::Theme::by_name("dracula")
+        .expect("the theme exists")
+        .ui
+        .assistant_message_fg;
+    assert_eq!(
+        elapsed_cell.fg, light,
+        "the elapsed reads light while the stream runs — the theme's \
+         reply color; grey comes with completion"
     );
 }
 
@@ -9613,6 +9690,12 @@ fn a_strip_at_the_top_keeps_its_row_from_the_sheet() {
 /// observer would, with a submission naming the whole list — the
 /// display's drain picks it up on the next frame.
 fn todo_graduation(app: &TuiApp, call_id: &str, submission: &str) {
+    todo_graduation_with_output(app, call_id, submission, "");
+}
+
+/// Feed one `TodoWrite` graduation carrying the tool's rendered result,
+/// the enforced truth a rung-law adjustment produces.
+fn todo_graduation_with_output(app: &TuiApp, call_id: &str, submission: &str, output: &str) {
     app.graduations()
         .lock()
         .unwrap()
@@ -9625,7 +9708,7 @@ fn todo_graduation(app: &TuiApp, call_id: &str, submission: &str) {
                 input_summary: String::new(),
                 output_preview: String::new(),
                 full_input: submission.to_string(),
-                full_output: String::new(),
+                full_output: output.to_string(),
             },
         ));
 }
@@ -9634,8 +9717,10 @@ fn todo_graduation(app: &TuiApp, call_id: &str, submission: &str) {
 fn a_todo_update_renders_as_checkbox_rows_in_the_conversation() {
     // The list is the point of the call: the block opens with the done
     // fraction and one checkbox row per task — ☑ completed, ◐ running,
-    // ☐ pending — and the moved rows still standing wear the accent so
-    // a scrolling reader sees what moved without diffing lists by eye.
+    // ☐ pending — and the rung in progress alone wears the accent,
+    // while rows an update touched still standing wear the moved
+    // register, so a scrolling reader sees what moved without reading
+    // it as the rung running.
     let mut app = app();
     todo_graduation(
         &app,
@@ -9661,9 +9746,8 @@ fn a_todo_update_renders_as_checkbox_rows_in_the_conversation() {
         "pending tasks render as empty boxes: {flat:?}"
     );
 
-    // The second update moves the trench to in-progress and finishes the
-    // survey's neighbour: exactly the moved rows still standing accent,
-    // the rest settle.
+    // The second update moves the trench to in-progress: the rung
+    // running wears the accent, and only it does.
     todo_graduation(
         &app,
         "call-2",
@@ -9674,27 +9758,84 @@ fn a_todo_update_renders_as_checkbox_rows_in_the_conversation() {
     );
     let terminal = render_to_buffer(&mut app, 80, 30);
     let rows = row_texts(&terminal);
-    let trench = rows
-        .iter()
-        .find(|row| row.contains("\u{25d0}") && row.contains("dig the trench"))
-        .expect("the moved trench renders in progress");
-    assert!(
-        trench.contains("\u{25d0}"),
-        "the in-progress task carries the half-filled mark: {trench:?}"
-    );
     let buffer = terminal.backend().buffer();
-    let accent = app.theme.ui.primary;
-    let _ = &accent;
     let trench_row = rows
         .iter()
         .position(|row| row.contains("\u{25d0}") && row.contains("dig the trench"))
         .expect("the moved trench's row");
     let accent_cells = (0..80u16)
-        .filter(|&x| buffer[(x, u16::try_from(trench_row).unwrap())].fg == accent)
+        .filter(|&x| buffer[(x, u16::try_from(trench_row).unwrap())].fg == app.theme.ui.primary)
+        .count();
+    assert!(accent_cells > 0, "the rung in progress wears the accent");
+
+    // A third update files a newborn beside standing work: the newborn
+    // wears the moved register for the update that touched it — never
+    // the in-progress accent — while the untouched standing row reads
+    // plain, so color never claims a rung nobody is running.
+    todo_graduation(
+        &app,
+        "call-3",
+        r#"{"todos":[
+            {"id":"1","subject":"survey the land","status":"completed"},
+            {"id":"2","subject":"dig the trench","status":"in_progress"},
+            {"id":"3","subject":"lay the pipe","status":"pending"}
+        ]}"#,
+    );
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&terminal);
+    let buffer = terminal.backend().buffer();
+    let newborn_row = rows
+        .iter()
+        .position(|row| row.contains("\u{2610}") && row.contains("lay the pipe"))
+        .expect("the newborn's row");
+    let newborn_row = u16::try_from(newborn_row).unwrap_or(0);
+    let newborn_moved = (0..80u16)
+        .filter(|&x| buffer[(x, newborn_row)].fg == app.theme.ui.secondary)
+        .count();
+    let newborn_accent = (0..80u16)
+        .filter(|&x| buffer[(x, newborn_row)].fg == app.theme.ui.primary)
         .count();
     assert!(
-        accent_cells > 0,
-        "the row this update moved wears the accent: {trench:?}"
+        newborn_moved > 0 && newborn_accent == 0,
+        "the newborn wears the moved register, never the in-progress \
+         accent: {} moved cells, {} accent cells",
+        newborn_moved,
+        newborn_accent
+    );
+}
+
+#[test]
+fn the_conversation_block_shows_the_enforced_fraction() {
+    // The closing-sweep shape the live sessions exposed: the model
+    // submits three completed, the rung law lands the skipper one rung
+    // short, and the conversation block renders the enforced list —
+    // "2/3 done" with the skipper half-filled — never the request that
+    // would read "3/3 done".
+    let mut app = app();
+    todo_graduation_with_output(
+        &app,
+        "call-1",
+        r#"{"todos":[
+            {"id":"1","subject":"first thing","status":"completed"},
+            {"id":"2","subject":"second thing","status":"completed"},
+            {"id":"3","subject":"third thing","status":"completed"}
+        ]}"#,
+        "# Task List\n\nSummary: 0 pending, 1 in progress, 2 completed\n\n\u{25d0} [3] third thing\n\n\u{25cf} [1] first thing\n\n\u{25cf} [2] second thing\n\n",
+    );
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&terminal);
+    let flat: String = rows.join("\n");
+    assert!(
+        flat.contains("2/3 done"),
+        "the fraction reports the enforced list, not the request: {flat:?}"
+    );
+    assert!(
+        !flat.contains("3/3 done"),
+        "the model's requested statuses never render as the plan's truth: {flat:?}"
+    );
+    assert!(
+        flat.contains("\u{25d0} third thing"),
+        "the skipped entry renders in the rung it landed on: {flat:?}"
     );
 }
 
@@ -9840,8 +9981,9 @@ fn a_rejected_todo_update_is_not_state() {
     );
     assert_eq!(
         flat.matches("0/2 done").count(),
-        2,
-        "the section counts the accepted list, not the rejected one: {flat:?}"
+        1,
+        "the section counts the accepted list, not the rejected one — \
+         the accepted block folded at the rejected update's row: {flat:?}"
     );
 }
 
@@ -10032,7 +10174,9 @@ fn a_steered_echo_surviving_in_a_transcript_keeps_the_plan_standing() {
          owes stands beside it, block and section: {flat:?}"
     );
 
-    // An unflagged user row is a claim and retires, as ever.
+    // An unflagged user row is a claim — and a claim retires only a
+    // finished plan. The owed work stands across it, carried exactly as
+    // the runner carries its own store.
     app.seed_messages(vec![TuiMessage::User {
         text: "the next claim".to_string(),
         timestamp: chrono::Utc::now(),
@@ -10041,8 +10185,9 @@ fn a_steered_echo_surviving_in_a_transcript_keeps_the_plan_standing() {
     let terminal = render_to_buffer(&mut app, 80, 30);
     let flat: String = row_texts(&terminal).join("\n");
     assert!(
-        flat.matches("0/1 done").count() < 2,
-        "a plain claim's row still retires the plan on reconstruction"
+        flat.matches("0/1 done").count() >= 2,
+        "a claim retires only a finished plan — the owed work stands \
+         across it, carried like the store: {flat:?}"
     );
 }
 
@@ -10288,16 +10433,20 @@ fn a_mid_run_steer_keeps_the_plan_standing() {
     let flat: String = row_texts(&terminal).join("\n");
     assert_eq!(
         flat.matches("0/1 done").count(),
-        2,
-        "a steer is not a run boundary — the plan keeps standing, block \
-         and section both, while the run it rode into continues: {flat:?}"
+        1,
+        "a steer is not a run boundary — the plan keeps standing in the \
+         section while the run it rode into continues, the transcript's \
+         block folded at the steer's row (expand it to read the list \
+         again): {flat:?}"
     );
     assert!(
         flat.contains("steered into the run"),
         "the steer's echo still lands its transcript row: {flat:?}"
     );
 
-    // The claim's echo — the boundary — is what retires the plan.
+    // The claim's echo is the run boundary — but the plan is the
+    // session's now: open work stands across it, carried like the
+    // store, and only a finished plan leaves at a claim.
     app.graduations()
         .lock()
         .unwrap()
@@ -10310,8 +10459,34 @@ fn a_mid_run_steer_keeps_the_plan_standing() {
     assert_eq!(
         flat.matches("0/1 done").count(),
         1,
-        "the claim's echo retires the plan — the fraction stands in the \
-         transcript's block alone: {flat:?}"
+        "the claim's echo retires nothing — the open plan carries into \
+         the next run, section standing: {flat:?}"
+    );
+
+    // Finish the work, and the very next claim retires the plan: the
+    // section goes and the block folds; the list lives behind its
+    // expand gesture.
+    todo_graduation(
+        &app,
+        "call-2",
+        r#"{"todos":[
+            {"id":"1","subject":"the only task","status":"completed"}
+        ]}"#,
+    );
+    app.graduations()
+        .lock()
+        .unwrap()
+        .push(dch_tui::observer::Graduation::Sent {
+            text: "the prompt after".to_string(),
+            steered: false,
+        });
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let flat: String = row_texts(&terminal).join("\n");
+    assert_eq!(
+        flat.matches("done").count(),
+        0,
+        "a finished plan leaves at the claim that follows it — the \
+         section never ghosts done work across runs: {flat:?}"
     );
 }
 
@@ -10360,13 +10535,17 @@ fn an_interrupted_run_s_plan_survives_the_next_claim() {
     let flat: String = row_texts(&terminal).join("\n");
     assert_eq!(
         flat.matches("1/2 done").count(),
-        2,
+        1,
         "the claim after an interrupted run retires nothing — the plan \
-         is the map of the work the session owes: {flat:?}"
+         is the map of the work the session owes, standing in the \
+         section, its transcript block folded at the claim's row: \
+         {flat:?}"
     );
 
-    // The resumed run ends cleanly: its plan — the same one, or a new
-    // filing — now retires at the next claim, the ordinary rule back.
+    // The resumed run ends cleanly with the plan still half-done —
+    // and the claim after it retires nothing: the plan is the
+    // session's, its open work carries, and the section keeps naming
+    // what is owed until the work actually finishes.
     app.graduations()
         .lock()
         .unwrap()
@@ -10386,20 +10565,47 @@ fn an_interrupted_run_s_plan_survives_the_next_claim() {
     assert_eq!(
         flat.matches("1/2 done").count(),
         1,
-        "a clean run closes the story — the next claim retires the \
-         plan again: {flat:?}"
+        "a clean close retires only finished work — the half-done plan \
+         carries past its claim, section standing: {flat:?}"
+    );
+
+    // Finish the owed half, and the next claim retires the plan — the
+    // ordinary rule, at its new edge.
+    todo_graduation(
+        &app,
+        "call-2",
+        r#"{"todos":[
+            {"id":"1","subject":"the finished half","status":"completed"},
+            {"id":"2","subject":"the interrupted half","status":"completed"}
+        ]}"#,
+    );
+    app.graduations()
+        .lock()
+        .unwrap()
+        .push(dch_tui::observer::Graduation::Sent {
+            text: "the last prompt".to_string(),
+            steered: false,
+        });
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let flat: String = row_texts(&terminal).join("\n");
+    assert_eq!(
+        flat.matches("done").count(),
+        0,
+        "the finished plan leaves at the claim that follows it — block \
+         folded and section gone: {flat:?}"
     );
 }
 
 #[test]
-fn a_plan_stays_after_its_run_and_leaves_at_the_next_claim() {
+fn a_plan_stands_past_claims_until_its_work_is_finished() {
     // The plan stays up after its run lands — the final state, done or
-    // not, is the thing to read in the quiet after the run — and the
-    // next claim retires it, half-done or finished alike, at the same
-    // edge the runner resets its own store. The transcript keeps every
-    // update in full; only the pinned window goes. Steering delivers
-    // mid-run without claiming, so a plan keeps updating through its
-    // own run.
+    // not, is the thing to read in the quiet after the run — and it
+    // stands across the claims that follow while work remains, carried
+    // exactly as the runner carries its own store; a claim retires it
+    // only once every entry stands completed, the same edge the runner
+    // clears the carried store at. The transcript keeps every update in
+    // full; only the pinned window goes. Steering delivers mid-run
+    // without claiming, so a plan keeps updating through its own run.
     let mut app = app();
     todo_graduation(
         &app,
@@ -10421,12 +10627,15 @@ fn a_plan_stays_after_its_run_and_leaves_at_the_next_claim() {
     assert_eq!(
         flat.matches("1/2 done").count(),
         2,
-        "the landing leaves the plan standing — its final state is the \
-         thing to read in the quiet after the run: {flat:?}"
+        "the landing leaves the plan standing — the final state is the \
+         thing to read in the quiet after the run, block and section \
+         both, the fold waiting for the conversation's next step: \
+         {flat:?}"
     );
 
-    // The next claim retires it: the section shows the last run's
-    // plan, never an older one's.
+    // The next claim retires nothing: the plan is the session's and
+    // its open work carries into the next run, the section standing
+    // over it so the reader never loses the map.
     app.graduations()
         .lock()
         .unwrap()
@@ -10439,8 +10648,34 @@ fn a_plan_stays_after_its_run_and_leaves_at_the_next_claim() {
     assert_eq!(
         flat.matches("1/2 done").count(),
         1,
-        "the next claim retires the plan — the fraction stands in the \
-         transcript's block alone: {flat:?}"
+        "the claim carries the half-done plan — the section stands, the \
+         transcript's block folded at the claim's row: {flat:?}"
+    );
+
+    // The work finishes, and the claim after that retires the plan —
+    // the section goes, the block folded; the list lives behind its
+    // expand key.
+    todo_graduation(
+        &app,
+        "call-2",
+        r#"{"todos":[
+            {"id":"1","subject":"finished thing","status":"completed"},
+            {"id":"2","subject":"half-done thing","status":"completed"}
+        ]}"#,
+    );
+    app.graduations()
+        .lock()
+        .unwrap()
+        .push(dch_tui::observer::Graduation::Sent {
+            text: "the prompt after".to_string(),
+            steered: false,
+        });
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let flat: String = row_texts(&terminal).join("\n");
+    assert_eq!(
+        flat.matches("done").count(),
+        0,
+        "a finished plan leaves at the claim that follows it: {flat:?}"
     );
 }
 
@@ -10584,7 +10819,10 @@ fn a_scrolled_view_never_severs_a_todo_block() {
         &format!(r#"{{"todos":[{}]}}"#, items.join(",")),
     );
     // Long replies below the block, so the block sits well above the
-    // bottom and every scroll step crosses it.
+    // bottom and every scroll step crosses it. They also fold its
+    // auto-expansion — the contract elsewhere — so the walk below
+    // tests the reader's own expansion: a click on the summary row
+    // reopens the block, and a manual expansion is never auto-folded.
     for turn in 0..6 {
         app.graduations()
             .lock()
@@ -10594,6 +10832,36 @@ fn a_scrolled_view_never_severs_a_todo_block() {
                 thinking: None,
             });
     }
+    // The replies pushed the folded block out of the bottom-anchored
+    // frame — walk up until its summary row is on screen, then open
+    // it with the reader's click.
+    let mut block_row = None;
+    for _ in 0..60 {
+        app.handle_event(&plain(KeyCode::Up));
+        let folded = render_to_buffer(&mut app, 80, 30);
+        let folded_rows = row_texts(&folded);
+        if let Some(row) = folded_rows
+            .iter()
+            .position(|row| row.contains("Updating todo list"))
+        {
+            block_row = Some(row);
+            break;
+        }
+    }
+    let block_row = block_row.expect("the folded summary row reaches the frame");
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        5,
+        u16::try_from(block_row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        5,
+        u16::try_from(block_row).unwrap_or(0),
+    ));
+    // The walk below starts at the bottom — the hunt above left the
+    // view scrolled up, so land it home before walking.
+    app.handle_event(&plain(KeyCode::End));
     // Fold the plan section to its badge — the fraction the reader
     // reconciles the rows against stays on screen either way.
     app.handle_event(&key(KeyCode::Char('t'), KeyModifiers::CONTROL));
@@ -11267,11 +11535,11 @@ fn the_timer_spinner_advances_with_the_elapsed_clock() {
     // Mid-frame elapsed values: the clock drift between the test's
     // read and the render's own can never cross a frame boundary.
     for (elapsed, expected) in [
-        (40u64, "\u{280b}"),
-        (120, "\u{2819}"),
-        (200, "\u{2839}"),
-        (440, "\u{2834}"),
-        (750, "\u{280f}"),
+        (60u64, "\u{2819}"),
+        (100, "\u{2839}"),
+        (180, "\u{283c}"),
+        (260, "\u{2826}"),
+        (380, "\u{280f}"),
     ] {
         kept.run_started_ms.store(
             now.saturating_sub(elapsed),
@@ -11620,5 +11888,133 @@ fn flush_turn_end_hands_the_worker_the_whole_conversation() {
         seen.lock().unwrap().as_slice(),
         ["the last row".to_string()],
         "the flush fires the hook with the conversation as it stands"
+    );
+}
+
+#[test]
+fn a_tail_user_row_paints_its_own_chrome() {
+    // The newest user turn renders as the conversation's tail — the
+    // steered shape mid-run, the moment after any submit — and its
+    // chrome must land on its own rows the frame it appears: the box
+    // and the chevron painted from the tail's rows rebased onto the
+    // cache, never from tail-relative indexes that box the pane's top
+    // instead and leave the real row unmarked.
+    let mut app = app();
+    app.push_message(TuiMessage::User {
+        text: "the first question".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+    });
+    app.push_message(TuiMessage::Assistant {
+        blocks: vec![ContentBlock::Text {
+            text: "an answer several lines tall so the tail begins well \
+                   below the pane's top rows, wrapping on purpose to \
+                   push the next turn down the screen"
+                .to_string(),
+        }],
+        timestamp: chrono::Utc::now(),
+        duration_ms: None,
+    });
+    app.push_message(TuiMessage::User {
+        text: "the tail question".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+    });
+    let probe = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&probe);
+    let buffer = probe.backend().buffer();
+    let tail_row = rows
+        .iter()
+        .position(|row| row.contains("the tail question"))
+        .expect("the tail turn's row");
+    let tail_row = u16::try_from(tail_row).unwrap_or(0);
+    assert!(
+        tail_row > 4,
+        "the transcript stands above the tail: {rows:?}"
+    );
+    let marks: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.contains('❯'))
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(
+        marks,
+        vec![
+            rows.iter()
+                .position(|row| row.contains("the first question"))
+                .expect("the first turn's row"),
+            usize::from(tail_row),
+        ],
+        "one chevron per user turn, each on its own turn's row — no \
+         ghost beside the first turn: {rows:?}"
+    );
+    assert_eq!(
+        buffer[(5, tail_row)].bg,
+        app.theme.ui.surface,
+        "the tail turn's row rides the prompt box the frame it lands"
+    );
+}
+
+#[test]
+fn a_layout_rebake_leaves_no_stale_chrome() {
+    // A rebake re-renders the whole conversation — a verbosity switch,
+    // an expansion click — and the chrome must follow the new layout:
+    // the bake's index metadata is cleared with the bake, so no stale
+    // range from the old layout paints its chevron or box at rows the
+    // new layout gave to other content.
+    let mut app = app();
+    app.push_message(TuiMessage::User {
+        text: "the first question".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+    });
+    app.push_message(TuiMessage::Assistant {
+        blocks: vec![ContentBlock::Tool {
+            name: "Read".to_string(),
+            call_id: "call-1".to_string(),
+            input_preview: "a file".to_string(),
+            success: true,
+            elapsed_secs: 1.0,
+            output_preview: "one\ntwo\nthree".to_string(),
+            retained_input: "{}".to_string(),
+        }],
+        timestamp: chrono::Utc::now(),
+        duration_ms: None,
+    });
+    app.push_message(TuiMessage::User {
+        text: "the second question".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+    });
+    let _ = render_to_buffer(&mut app, 80, 30);
+    app.set_verbosity(dch_config::Verbosity::Quiet);
+    let probe = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&probe);
+    let buffer = probe.backend().buffer();
+    let marks: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.contains('❯'))
+        .map(|(index, _)| index)
+        .collect();
+    let expected: Vec<usize> = ["the first question", "the second question"]
+        .iter()
+        .map(|needle| {
+            rows.iter()
+                .position(|row| row.contains(*needle))
+                .expect("a user turn's row")
+        })
+        .collect();
+    assert_eq!(
+        marks, expected,
+        "after the rebake every chevron sits on its own turn's row: \
+         {rows:?}"
+    );
+    let second_row = u16::try_from(*expected.last().expect("the second turn's row")).unwrap_or(0);
+    assert_eq!(
+        buffer[(5, second_row)].bg,
+        app.theme.ui.surface,
+        "the rebaked layout boxes each turn on its new rows"
     );
 }

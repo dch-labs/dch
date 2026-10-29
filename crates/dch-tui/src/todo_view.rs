@@ -2,13 +2,15 @@
 //!
 //! The `TodoWrite` tool's output is prose the model reads back; the
 //! display's question is different — at a glance, which tasks stand,
-//! which one runs, which finished with this update. This module parses
-//! the tool's own submission JSON (the authoritative list, straight
-//! from the call the transcript carries) and renders checkbox rows:
-//! `☑` completed, `◐` in progress, `☐` pending — completed rows
-//! uniform in the dim register with the strike on the words alone,
-//! moved rows still standing accented, so a scrolling reader sees
-//! what moved without diffing two lists by eye.
+//! which one runs, which finished with this update. This module reads
+//! that rendered output back — the authoritative list, since the
+//! enforced read-back names every entry the store holds, omission
+//! included — with the call's submission JSON as the fallback when no
+//! render survives, and renders checkbox rows:
+//! `☑` completed, `◐` in progress, `☐` pending — pending rows plain,
+//! completed rows dim with the strike on the words alone, moved rows
+//! still standing in the moved register, so a scrolling reader sees
+//! what moved without reading it as the rung in progress.
 
 use std::collections::HashMap;
 
@@ -95,18 +97,21 @@ impl TodoStatus {
 
 /// The subject an entry without one is read under.
 ///
-/// The twin of the tool's own recovery (`derive_subject` in
-/// dch-tools): first line of the description, trimmed, cut at fifty
-/// characters with an ellipsis, the id when the description has
-/// nothing to say — so the display names a description-only task
-/// the same way the run that accepted it does. Keep the two in
-/// step: a display that derived differently would show a list the
-/// run never acted on.
+/// The display's lenient twin of the tool's derivation: first non-blank
+/// line of the description, trimmed, cut at fifty characters with an
+/// ellipsis, the id when the description has nothing to say. The tool
+/// itself now refuses entries with neither a subject nor a description,
+/// so this fallback serves the transcripts recorded before that gate —
+/// a replayed list the run accepted in an older build still renders
+/// rows rather than no rows at all.
 fn derived_subject(description: &str, id: &str) -> String {
-    let first_line = description.lines().next().map_or("", str::trim);
-    if first_line.is_empty() {
+    let first_line = description
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty());
+    let Some(first_line) = first_line else {
         return format!("Task {id}");
-    }
+    };
     if first_line.chars().count() > 50 {
         format!("{}...", first_line.chars().take(47).collect::<String>())
     } else {
@@ -268,6 +273,51 @@ pub(crate) fn parse_submission(input_json: &str) -> Option<Vec<TodoRow>> {
     )
 }
 
+/// Parse a `TodoWrite` tool result's rendered list into display rows.
+///
+/// The enforced truth: after the tool applies the rung law, this is
+/// the list the run actually holds — the submission may say `completed`
+/// where the enforced list says in
+/// progress, and the plan panel must not believe the request over the
+/// result. Reads the render's own icons (`○` pending, `◐` in
+/// progress, `●` completed) and ids from the entry lines; `None` when
+/// the output carries no task list (a cleared list, an error) so the
+/// caller falls back to whatever it can read of the request.
+pub(crate) fn parse_rendered(output: &str) -> Option<Vec<TodoRow>> {
+    if !output.contains("# Task List") {
+        return None;
+    }
+    let mut rows = Vec::new();
+    for line in output.lines() {
+        let (icon, rest) = if let Some(rest) = line.strip_prefix('○') {
+            ('○', rest)
+        } else if let Some(rest) = line.strip_prefix('◐') {
+            ('◐', rest)
+        } else if let Some(rest) = line.strip_prefix('●') {
+            ('●', rest)
+        } else {
+            continue;
+        };
+        let Some(rest) = rest.strip_prefix(" [") else {
+            continue;
+        };
+        let Some((id, subject)) = rest.split_once("] ") else {
+            continue;
+        };
+        let status = match icon {
+            '●' => TodoStatus::Completed,
+            '◐' => TodoStatus::InProgress,
+            _ => TodoStatus::Pending,
+        };
+        rows.push(TodoRow {
+            id: id.to_string(),
+            subject: subject.to_string(),
+            status,
+        });
+    }
+    Some(rows)
+}
+
 /// The rows a submission changed, by id.
 ///
 /// Every entry whose status is not what the previous snapshot
@@ -290,22 +340,34 @@ pub(crate) fn status_changes(
 
 /// The colors the todo rows render in.
 ///
-/// Two registers are all the rows need: the dim of finished work
-/// and hints, and the accent of the current rung and every row an
-/// update moved. Passed in by the caller so the module stays a
-/// renderer with no theme of its own.
+/// Four registers are all the rows need: the plain of standing work
+/// (the terminal's own text color — a task not yet started is not
+/// de-emphasized, it is simply waiting), the dim of finished work and
+/// hints, the accent of the current rung, and the moved register a
+/// row wears for the update that touched it. Passed in by the caller
+/// so the module stays a renderer with no theme of its own.
 pub(crate) struct TodoColors {
     /// De-emphasized text — completed subjects and hints.
     ///
     /// Finished work stays readable but retired; the summary line
     /// rides it too.
     pub dim: ratatui::style::Color,
-    /// The accent — the in-progress mark and every changed row.
+
+    /// The accent — the in-progress mark alone.
     ///
-    /// The one loud register the list has: what is happening now and
-    /// what this update moved both wear it, so a scrolling reader
-    /// finds them without diffing two lists by eye.
+    /// The register of the rung currently running, so a reader
+    /// scanning for the live work finds exactly it; a row this update
+    /// moved wears [`Self::moved`] instead, never this one.
     pub accent: ratatui::style::Color,
+
+    /// The moved register — rows this update touched.
+    ///
+    /// The secondary accent: a touched-but-standing row (a newborn, a
+    /// reopen) stays visible to a scrolling reader without borrowing
+    /// the in-progress accent it never earned. Distinct from
+    /// [`Self::accent`] so color never lies about the rung.
+    pub moved: ratatui::style::Color,
+
     /// The fill the plan section's badge rides on.
     ///
     /// The secondary accent — the queue's badge wears the primary,
@@ -313,6 +375,7 @@ pub(crate) struct TodoColors {
     /// names. In a theme that defers to the terminal this is
     /// `Reset`, and the pill becomes plain text.
     pub badge_fill: ratatui::style::Color,
+
     /// The letters on the badge's fill.
     ///
     /// The canvas color, keeping the word legible on the accent —
@@ -326,13 +389,14 @@ pub(crate) struct TodoColors {
 /// space, the subject — completed rows uniform in the dim register,
 /// their subjects struck through and their checked boxes plain, so
 /// finished work reads as retired the moment it finishes and the box
-/// stays legible as the row's status. The accent marks moved rows
-/// still standing — the rung in progress and the tasks this update
-/// newly filed — so a scrolling reader sees what moved without
-/// diffing two lists by eye. Long subjects wrap under their icon,
-/// indented to the subject's column. `changes` may be empty; the
-/// caller owns what a "change" is (it is [`status_changes`] against
-/// the previous snapshot).
+/// stays legible as the row's status. Pending rows read plain —
+/// standing work is not retired work, and greying an untouched task
+/// reads as demotion — unless this update moved them, in which case
+/// they wear the moved register: still standing, still touched, and
+/// never mistaken for the rung in progress. Long subjects wrap under
+/// their icon, indented to the subject's column. `changes` may be
+/// empty; the caller owns what a "change" is (it is
+/// [`status_changes`] against the previous snapshot).
 pub(crate) fn render_rows(
     rows: &[TodoRow],
     changes: &HashMap<String, TodoStatus>,
@@ -357,7 +421,11 @@ pub(crate) fn render_rows(
                 Style::default().fg(colors.accent),
             ),
             TodoStatus::Pending => {
-                let register = if moved { colors.accent } else { colors.dim };
+                let register = if moved {
+                    colors.moved
+                } else {
+                    ratatui::style::Color::Reset
+                };
                 (
                     "\u{2610}",
                     Style::default().fg(register),
@@ -473,11 +541,6 @@ pub(crate) fn section_lines(
     body_cap: usize,
     chord_hint: Option<&'static str>,
 ) -> Vec<Line<'static>> {
-    // The badge row: the pill, the fraction, and — in the capped
-    // posture, the one most sessions live in — the chord that opens
-    // the whole list, dim beside the count the way the folded hint
-    // carries it. A plan that fits the cap shows no ellipsis, so the
-    // badge is the only place the chord can be learned.
     let mut badge_spans = vec![
         Span::styled(
             format!(" {TODO_TITLE} "),
@@ -498,13 +561,7 @@ pub(crate) fn section_lines(
             Style::default().fg(colors.dim),
         ));
     }
-    let mut lines = vec![
-        // The stand-off from the transcript above: one blank row, so
-        // the pill reads as a chip over the pane rather than a line
-        // of it.
-        Line::from(Vec::new()),
-        Line::from(badge_spans),
-    ];
+    let mut lines = vec![Line::from(Vec::new()), Line::from(badge_spans)];
     let groups: Vec<Vec<Line<'static>>> = rows
         .iter()
         .map(|row| render_rows(std::slice::from_ref(row), changes, colors, width))
@@ -513,11 +570,6 @@ pub(crate) fn section_lines(
     let mut shown = 0usize;
     for (index, group) in groups.into_iter().enumerate() {
         if used.saturating_add(group.len()) > body_cap {
-            // The first task's head only counts as shown when the
-            // budget actually paid for a row: at `body_cap` of zero
-            // nothing is appended, and counting the task anyway
-            // would shave one off the ellipsis for rows no reader
-            // ever sees.
             if used == 0 && body_cap > 0 && !group.is_empty() {
                 lines.extend(group.into_iter().take(body_cap));
                 shown = index.saturating_add(1);
@@ -607,6 +659,131 @@ mod tests {
     }
 
     #[test]
+    fn the_rendered_result_parses_as_the_enforced_truth() {
+        // A live session's shape: the model requested eight completed,
+        // the rung law advanced six of them to in progress, and the
+        // rendered result is the list the run holds — the panel reads
+        // this, not the request that preceded it.
+        let rendered = "Adjusted: 'modrs' requested completed from pending — \
+advanced to in progress (one rung per call)\n\n# Task List\n\n\
+Summary: 9 pending, 1 in progress, 2 completed\n\n\
+◐ [origin] Strip origin metadata\n\n\
+● [audit] Audit the tree\n\n\
+○ [impl] Implement the list module\n\n";
+        let rows = parse_rendered(rendered).expect("the task list renders rows");
+        let statuses: Vec<(&str, TodoStatus)> = rows
+            .iter()
+            .map(|row| (row.id.as_str(), row.status))
+            .collect();
+        assert_eq!(
+            statuses,
+            vec![
+                ("origin", TodoStatus::InProgress),
+                ("audit", TodoStatus::Completed),
+                ("impl", TodoStatus::Pending),
+            ],
+            "the enforced statuses ride the icons, the sorted order kept"
+        );
+        assert_eq!(
+            rows.first().map(|row| row.subject.as_str()),
+            Some("Strip origin metadata"),
+            "the subject follows the id bracket"
+        );
+    }
+
+    #[test]
+    fn a_result_without_a_task_list_parses_to_none() {
+        // The cleared list and any error answer None, so the caller
+        // falls back to reading the request — never to inventing rows.
+        assert!(parse_rendered("Todo list cleared.").is_none());
+        assert!(parse_rendered("Invalid input: nope").is_none());
+    }
+
+    #[test]
+    fn the_four_registers_keep_standing_work_plain() {
+        // Grey means retired: a completed row reads dim and struck, a
+        // pending row the update did not touch reads in the terminal's
+        // own register — standing work is not demoted — a moved row
+        // wears the moved register, and the rung in progress wears the
+        // accent alone. An earlier spelling dimmed unmoved pending rows
+        // (a reader met a freshly-filed task going grey the moment the
+        // next update landed), and a later one lent the accent to moved
+        // rows too — a newborn read as running the moment it was filed.
+        let rows = vec![
+            TodoRow {
+                id: "done".to_string(),
+                subject: "finished work".to_string(),
+                status: TodoStatus::Completed,
+            },
+            TodoRow {
+                id: "idle".to_string(),
+                subject: "standing work".to_string(),
+                status: TodoStatus::Pending,
+            },
+            TodoRow {
+                id: "new".to_string(),
+                subject: "newly filed work".to_string(),
+                status: TodoStatus::Pending,
+            },
+            TodoRow {
+                id: "now".to_string(),
+                subject: "current rung".to_string(),
+                status: TodoStatus::InProgress,
+            },
+        ];
+        let mut changes = HashMap::new();
+        changes.insert("now".to_string(), TodoStatus::InProgress);
+        changes.insert("new".to_string(), TodoStatus::Pending);
+        let colors = TodoColors {
+            dim: ratatui::style::Color::DarkGray,
+            accent: ratatui::style::Color::Cyan,
+            moved: ratatui::style::Color::Yellow,
+            badge_fill: ratatui::style::Color::Reset,
+            badge_letters: ratatui::style::Color::Reset,
+        };
+        let lines = render_rows(&rows, &changes, &colors, 60);
+        let registers: Vec<(Option<ratatui::style::Color>, bool)> = lines
+            .iter()
+            .map(|line| {
+                let icon = line.spans.first().expect("an icon leads each row");
+                (
+                    icon.style.fg,
+                    icon.style
+                        .add_modifier
+                        .contains(ratatui::style::Modifier::CROSSED_OUT),
+                )
+            })
+            .collect();
+        assert_eq!(
+            registers,
+            vec![
+                (Some(ratatui::style::Color::DarkGray), false),
+                (Some(ratatui::style::Color::Reset), false),
+                (Some(ratatui::style::Color::Yellow), false),
+                (Some(ratatui::style::Color::Cyan), false),
+            ],
+            "retired dim, standing plain, moved in its own register, \
+             running accented — and no register borrows another's meaning"
+        );
+        let struck: Vec<bool> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .get(1)
+                    .expect("a subject follows the icon")
+                    .style
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::CROSSED_OUT)
+            })
+            .collect();
+        assert_eq!(
+            struck,
+            vec![true, false, false, false],
+            "the strike rides the retired subject alone"
+        );
+    }
+
+    #[test]
     fn a_budget_that_pays_for_no_rows_names_every_task() {
         // The ellipsis counts what the reader cannot see. At a zero
         // budget no task row is rendered at all, so every task must
@@ -626,6 +803,7 @@ mod tests {
         let colors = TodoColors {
             dim: ratatui::style::Color::Reset,
             accent: ratatui::style::Color::Reset,
+            moved: ratatui::style::Color::Reset,
             badge_fill: ratatui::style::Color::Reset,
             badge_letters: ratatui::style::Color::Reset,
         };

@@ -16,7 +16,18 @@ use crate::ToolResultDisplay;
 use crate::message::ActiveTool;
 use crate::theme::Theme;
 
-/// Spinner frames, advanced by the render tick while a tool runs.
+/// How much run time one spinner frame stands for.
+///
+/// The running rows' dot turns at this cadence, derived from each
+/// tool's own elapsed clock on every redraw — never a tick-advanced
+/// index, which a coarse tick between redraws leaves frozen or
+/// skipping. Forty milliseconds is exactly two animation wakes, so
+/// the turn lands a fresh frame on every other 20ms redraw — a 25fps
+/// revolution, twice the prototype's beat, without asking the
+/// lane for wakes it does not already pay.
+pub const SPINNER_FRAME_MS: u64 = 40;
+
+/// Spinner frames, one per beat of a running tool's elapsed clock.
 ///
 /// One animation beat for every running indicator; each frame is one
 /// display column wide (pinned by test). The braille orbit the
@@ -268,13 +279,23 @@ fn batch_subject(first: &str, rest: usize) -> String {
 #[must_use]
 pub fn running_tool_lines(
     tool: &ActiveTool,
-    spinner_idx: usize,
     theme: &Theme,
     verbosity: Verbosity,
 ) -> Vec<Line<'static>> {
-    let elapsed = format_elapsed(tool.start.elapsed().as_secs_f64());
+    let elapsed_secs = tool.start.elapsed().as_secs_f64();
+    let elapsed = format_elapsed(elapsed_secs);
+    let frame_index = usize::try_from(
+        tool.start
+            .elapsed()
+            .as_millis()
+            .checked_div(u128::from(SPINNER_FRAME_MS))
+            .unwrap_or(0),
+    )
+    .unwrap_or(0)
+    .checked_rem(SPINNER_FRAMES.len())
+    .unwrap_or(0);
     let frame = SPINNER_FRAMES
-        .get(spinner_idx)
+        .get(frame_index)
         .or_else(|| SPINNER_FRAMES.first())
         .unwrap_or(&"");
     match verbosity {
@@ -291,7 +312,10 @@ pub fn running_tool_lines(
                 " {} ",
                 humanize_tool_summary(&tool.name, &tool.input_summary)
             )),
-            Span::styled(format!("({elapsed})"), Style::default().fg(theme.ui.dim)),
+            Span::styled(
+                format!("({elapsed})"),
+                Style::default().fg(theme.ui.assistant_message_fg),
+            ),
         ])],
         Verbosity::Verbose => vec![
             Line::from(vec![
@@ -302,7 +326,10 @@ pub fn running_tool_lines(
                         .fg(theme.ui.assistant_message_fg)
                         .add_modifier(ratatui::style::Modifier::BOLD),
                 ),
-                Span::styled(format!("({elapsed})"), Style::default().fg(theme.ui.dim)),
+                Span::styled(
+                    format!("({elapsed})"),
+                    Style::default().fg(theme.ui.assistant_message_fg),
+                ),
             ]),
             Line::styled(
                 format!("    Input: {}", tool.input_summary),

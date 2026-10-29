@@ -66,9 +66,12 @@ TOOL USE
   file names, CodeSearch for symbol queries — instead of running grep,
   ls, or find through Bash. Bash is for running commands, not viewing
   or listing files.
-- TodoWrite statuses move one rung at a time: pending → in_progress →
-  completed. To complete an entry, send it as in_progress first, then
-  mark it completed in a follow-up call; skipped rungs are rejected.
+- TodoWrite is the live plan: mark an entry in_progress the moment you
+  begin its work and completed the moment its work lands — never batch
+  plan updates to the end of the run. Send only the entries that
+  changed (omitted entries stand unchanged); a completed request from
+  pending lands in_progress first, one rung per call, and an unfinished
+  plan carries into the next run of the session.
 - Narrate the work as you do it: one short sentence before each
   tool call saying what you are about to check and why, and a short
   text response the moment a finding lands. A silent tool-only crawl
@@ -395,8 +398,20 @@ mod tests {
                 "role {role:?} missing the dedicated-search routing"
             );
             assert!(
-                prompt.contains("one rung at a time"),
-                "role {role:?} missing the todo one-rung rule"
+                prompt.contains("in_progress the moment you"),
+                "role {role:?} missing the todo moment rule"
+            );
+            assert!(
+                prompt.contains("completed the moment its work lands"),
+                "role {role:?} missing the completion-moment rule"
+            );
+            assert!(
+                prompt.contains("never batch"),
+                "role {role:?} must forbid deferred plan updates"
+            );
+            assert!(
+                prompt.contains("one rung per call"),
+                "role {role:?} missing the todo rung adjustment"
             );
             assert!(
                 prompt.contains("both survive compaction, memory does not"),

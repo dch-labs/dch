@@ -108,11 +108,13 @@ dch --list-sessions 30       # the 30 most recent
 dch --list-sessions all      # everything
 ```
 
-The MSGS column counts your messages — your submissions, with tool
-calls and replies left out. CONTEXT is the session's cumulative
-input-plus-output spend in tokens — the whole conversation's
-accounting, not the live-context estimate the TUI's context bar
-tracks while a run is going.
+The MSGS column counts your submitted prompts — tool calls, replies,
+error rows, and steered echo rows (a steer the run read, a hook's
+reminder) all stay out. CONTEXT is the engine's context-size estimate
+at the moment of the last save — the figure a running TUI's context
+bar fills against and a headless run's save records from the loop
+itself, and approximately the context a resume re-loads — not the
+session's lifetime token spend.
 
 A missing session id warns and starts fresh; a corrupt file warns
 loudly, starts fresh, and is never modified; a session file that

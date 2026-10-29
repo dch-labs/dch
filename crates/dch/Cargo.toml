@@ -39,6 +39,9 @@ name = "compaction_context_bar"
 name = "tui_final_answer"
 
 [[test]]
+name = "todo_followup"
+
+[[test]]
 name = "resume_stale_real"
 
 [[test]]
@@ -59,6 +62,7 @@ toml       = { workspace = true }
 chrono     = { workspace = true }
 thiserror  = { workspace = true }
 tracing    = { workspace = true }
+tracing-subscriber = { workspace = true }
 tempfile   = { workspace = true }
 
 [dev-dependencies]

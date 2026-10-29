@@ -253,29 +253,17 @@ pub fn create_client(config: &ApiConfig) -> Result<DchClient, RunnerError> {
             .build()
             .map_err(client_error)?,
         ),
-        ApiType::SelfHosted => {
-            let base_url = if config.base_url.is_empty() {
-                ApiType::SelfHosted
-                    .default_base_url()
-                    .map_or_else(|| config.base_url.clone(), str::to_string)
-            } else {
-                config.base_url.clone()
-            };
-            let api_key = config
-                .api_key
-                .clone()
-                .unwrap_or_else(|| "self-hosted".to_string());
-            let mut builder = OpenAiClient::builder()
-                .with_api_key(api_key)
-                .with_base_url(base_url)
-                .with_model(config.model.as_str())
-                .with_timeout(timeout)
-                .replay_reasoning(true);
-            if let Some(effort) = effort {
-                builder = builder.thinking_effort(effort);
-            }
-            DchClient::OpenAi(builder.build().map_err(client_error)?)
-        }
+        ApiType::SelfHosted => DchClient::OpenAi(
+            profiled(
+                loopctl::provider::self_hosted_builder(config.model.as_str()),
+                config,
+                effort,
+            )
+            .with_timeout(timeout)
+            .with_stream_usage(true)
+            .build()
+            .map_err(client_error)?,
+        ),
         ApiType::DeepSeek => DchClient::OpenAi(
             profiled(loopctl::provider::deepseek_builder(), config, effort)
                 .build()

@@ -218,10 +218,11 @@ fn the_waiting_section_rises_whenever_prompts_wait_run_or_not() {
     // The section is not the run's shadow. Prompts a resume owes wait
     // with no run up, and hiding them behind a run gate would put them
     // back in the invisible backlog the seeding exists to clear — so
-    // anything waiting raises the panel, idle or not. A fresh submit
-    // shows it for the frame or two before the driver's claim takes
-    // the entry; that flash is the cost of the owed prompts being
-    // visible, and the claim still takes the prompt exactly as before.
+    // anything genuinely waiting raises the panel, idle or not. The
+    // one thing that does not raise it is the handoff window: a submit
+    // into a session at rest is the driver's next claim, one channel
+    // hop away, and its row stays hidden for that hop instead of
+    // flashing under the title — the claim takes it exactly as before.
     let (mut app, kept) = app_with_state();
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     app.set_submit_tx(tx);
@@ -230,15 +231,29 @@ fn the_waiting_section_rises_whenever_prompts_wait_run_or_not() {
 
     let rendered = rows(&mut app, 80, 24);
     assert!(
-        !marker_rows(&rendered).is_empty(),
-        "no run is up and one prompt waits — the panel is up with it: {rendered:?}"
+        marker_rows(&rendered).is_empty(),
+        "the fresh submit is one claim hop from running — no flash \
+         under the title: {rendered:?}"
     );
     assert_eq!(
         waiting(&kept).len(),
         1,
         "the prompt itself is still in the queue for the driver's claim"
     );
-    drop(rx);
+
+    // An owed prompt — seeded the way a resume seeds, not submitted —
+    // waits with no claim coming for it, and the panel carries it.
+    std::mem::drop(rx);
+    let (mut app, kept) = app_with_state();
+    kept.queued
+        .lock()
+        .unwrap()
+        .push("owed by the resume".to_string());
+    let rendered = rows(&mut app, 80, 24);
+    assert!(
+        !marker_rows(&rendered).is_empty(),
+        "an owed prompt waits visibly, run or not: {rendered:?}"
+    );
 }
 
 #[test]

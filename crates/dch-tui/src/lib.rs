@@ -31,6 +31,6 @@ pub use question::{QuestionChoice, QuestionPrompt};
 pub use queue::{PromptQueue, QueuedPrompt, Submission};
 pub use terminal::{
     TerminalGuard, arm_fatal_signal_restore, enter_signal_deaf_window, exit_signal_deaf_window,
-    init_terminal, restore_terminal, sync_default_background,
+    ignore_fatal_signals, init_terminal, restore_terminal, sync_default_background,
 };
 pub use tool_capture::{CapturingMiddleware, ToolCapture, ToolCaptureSink};

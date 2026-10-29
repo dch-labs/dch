@@ -104,6 +104,7 @@ pub fn clear_cache() {
 )]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicU64;
     use std::sync::atomic::Ordering;
@@ -123,6 +124,54 @@ mod tests {
     #[must_use]
     fn cache_size() -> usize {
         cache().lock().map_or(0, |c| c.len())
+    }
+
+    proptest::proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn the_cache_matches_a_fresh_compile_on_miss_and_hit(
+            pattern in "[a-zA-Z ]{1,12}",
+            case_insensitive in proptest::bool::ANY,
+            haystack in "[a-zA-Z ]{0,16}",
+        ) {
+            use regex::Regex;
+            // Mixed case is what makes the flag dimension live: over
+            // lowercase-only text a (?i)-wrapped pattern matches
+            // exactly where its case-sensitive twin does, and an
+            // implementation that dropped the flag would pass
+            // unchanged. The flipped twin of the pattern is the probe
+            // that realizes the divergence every time — a wrapped
+            // pattern matches its own case-flip, an unwrapped one does
+            // not. The lock is the module's one discipline: the
+            // property inserts into the process-global cache, and the
+            // locked tests' size reads must not race it.
+            let _guard = TEST_LOCK.lock().unwrap();
+            let wrapped = if case_insensitive {
+                format!("(?i){pattern}")
+            } else {
+                pattern.clone()
+            };
+            let fresh = Regex::new(&wrapped).expect("a literal pattern compiles");
+            let missed = get_or_compile(&pattern, case_insensitive)
+                .expect("the cache serves a valid pattern");
+            let hit = get_or_compile(&pattern, case_insensitive)
+                .expect("the second call is a hit and serves too");
+            let flipped: String = pattern
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_uppercase() {
+                        c.to_ascii_lowercase()
+                    } else {
+                        c.to_ascii_uppercase()
+                    }
+                })
+                .collect();
+            for probe in [&haystack, &flipped] {
+                prop_assert_eq!(missed.is_match(probe), fresh.is_match(probe));
+                prop_assert_eq!(hit.is_match(probe), fresh.is_match(probe));
+            }
+        }
     }
 
     #[test]

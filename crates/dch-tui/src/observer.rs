@@ -558,6 +558,15 @@ pub struct TuiObserverState {
     /// it.
     pub live_claim: Arc<std::sync::atomic::AtomicU64>,
 
+    /// Plan entries left not completed when the driver's last run
+    /// settled.
+    ///
+    /// Captured once at the driver's end — the runner leaves with it —
+    /// so the session's exit lines can state unfinished work as a fact
+    /// for the user reading them. Zero when the plan ended clean or no
+    /// plan was ever filed.
+    pub todos_undone_at_exit: Arc<std::sync::atomic::AtomicUsize>,
+
     /// Full tool calls captured at dispatch, keyed by call id.
     ///
     /// Written by the capture middleware on the dispatch pipeline
@@ -753,6 +762,7 @@ impl TuiObserverState {
             run_started_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             correction_cancel: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
             live_claim: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
+            todos_undone_at_exit: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             tool_captures: Arc::new(Mutex::new(HashMap::new())),
             errors: Arc::new(Mutex::new(Vec::new())),
             compactions: Arc::new(Mutex::new(Vec::new())),
