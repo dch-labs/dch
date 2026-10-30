@@ -2642,14 +2642,18 @@ mod tests {
         buf.windows(4).position(|w| w == b"\r\n\r\n")
     }
 
-    /// The prompt echoes waiting to become transcript rows.
+    /// The prompt echoes the display owes or has landed as rows.
     ///
-    /// Read off the graduation stream rather than any buffer of their own,
-    /// because an echo's place in the transcript is its place among the
-    /// replies: a test that checked them separately would pass however
-    /// they were ordered against everything else.
+    /// Read off the graduation stream and the waiting pin together,
+    /// because an echo's place in the transcript is its place among
+    /// the replies: a test that checked them separately would pass
+    /// however they were ordered against everything else. The pin's
+    /// half is the steers a run accepted but no boundary has read —
+    /// rows the display owes and holds at its edge until then, among
+    /// them a nudge's echo, whose harness may hold no observer to
+    /// fire the boundary that would land it.
     fn claimed(state: &TuiObserverState) -> Vec<String> {
-        state
+        let mut echoes = state
             .graduations
             .lock()
             .expect("graduation lock")
@@ -2658,7 +2662,16 @@ mod tests {
                 dch_tui::observer::Graduation::Sent { text, .. } => Some(text.clone()),
                 _ => None,
             })
-            .collect()
+            .collect::<Vec<_>>();
+        echoes.extend(
+            state
+                .pending_steers
+                .lock()
+                .expect("the pending-steer lock")
+                .iter()
+                .cloned(),
+        );
+        echoes
     }
 
     /// The assistant turns' text blocks across a resolved history.
@@ -3591,12 +3604,13 @@ mod tests {
              one more: the nudged run left the list as it was and the \
              driver moved on"
         );
-        // The nudge's echo is in the transcript, flagged as not a
-        // plan boundary.
+        // The nudge's echo is the display's record — held at the edge
+        // until a boundary reads it, and flagged as not a plan
+        // boundary when it lands.
         let echoes = claimed(&state);
         assert!(
             echoes.iter().any(|text| text.contains("reminder: 1 todo")),
-            "the nudge's wording is the transcript's record: {echoes:?}"
+            "the nudge's wording is the display's record: {echoes:?}"
         );
         // The nudge's echo rode the steered flag, so the display's
         // plan survived it — the Graduation::Sent drain clears the

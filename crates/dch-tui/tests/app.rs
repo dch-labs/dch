@@ -10464,10 +10464,11 @@ fn a_mid_run_steer_keeps_the_plan_standing() {
     // The steer's echo rode the same graduation shape as the claim's,
     // so the drain retired the plan on a steer — the section vanished
     // mid-run while the runner's own todo store kept standing, the
-    // display out of step with the store. The steer's echo is flagged
-    // apart now: the plan keeps standing through the steer exactly as
-    // the store does, and only the claim's echo — a real run boundary —
-    // retires it.
+    // display out of step with the store. The echo is flagged apart
+    // now and comes only at the boundary that reads the steer: the
+    // words wait pinned at the edge until then, and the plan keeps
+    // standing through the steer exactly as the store does — only the
+    // claim's echo, a real run boundary, could retire it.
     let mut app = app();
     // The chord goes through the live slot — the delivery seam itself,
     // not a hand-pushed graduation standing in for it.
@@ -10490,15 +10491,36 @@ fn a_mid_run_steer_keeps_the_plan_standing() {
     let flat: String = row_texts(&terminal).join("\n");
     assert_eq!(
         flat.matches("0/1 done").count(),
-        1,
-        "a steer is not a run boundary — the plan keeps standing in the \
-         section while the run it rode into continues, the transcript's \
-         block folded at the steer's row (expand it to read the list \
-         again): {flat:?}"
+        2,
+        "a steer is not a run boundary — no echo drains at the key, so \
+         the plan block keeps standing open in the transcript and the \
+         section keeps standing below, while the words wait at the \
+         edge: {flat:?}"
     );
     assert!(
         flat.contains("steered into the run"),
-        "the steer's echo still lands its transcript row: {flat:?}"
+        "the waiting words are on screen at the edge, in the user's own \
+         row: {flat:?}"
+    );
+
+    // The boundary that reads the steer graduates its echo — flagged
+    // apart from the claim's, so even now the drain retires nothing:
+    // the plan stands through the steer exactly as the store does.
+    app.graduations()
+        .lock()
+        .unwrap()
+        .push(dch_tui::observer::Graduation::Sent {
+            text: "steered into the run".to_string(),
+            steered: true,
+        });
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let flat: String = row_texts(&terminal).join("\n");
+    assert_eq!(
+        flat.matches("0/1 done").count(),
+        1,
+        "the steer's echo retires nothing — the plan keeps standing when \
+         the boundary reads it: the block folds at the row the boundary \
+         lands, the section keeps the list: {flat:?}"
     );
 
     // The claim's echo is the run boundary — but the plan is the

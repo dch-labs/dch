@@ -16,7 +16,7 @@ use loopctl::observer::{
     AttemptResetContext, CompactedContext, CompactionFailedContext, LoopObserver,
     PreCompactionContext, ResponseContext, RunEndContext, StreamContext, StreamFailureContext,
     TextDeltaContext, ThinkingDeltaContext, ToolCallReceivedContext, ToolPreContext,
-    TransportFallbackContext, TurnEndContext,
+    TransportFallbackContext, TurnEndContext, TurnStartContext,
 };
 
 use crate::message::{ActiveTool, ContentBlock, TokenCounts, TuiMessage};
@@ -484,6 +484,18 @@ pub struct TuiObserverState {
     /// from.
     pub turn_histories: Arc<Mutex<Vec<Arc<Vec<loopctl::message::Message>>>>>,
 
+    /// Steers a run accepted but no turn boundary has read yet, in
+    /// send order.
+    ///
+    /// The display pins these just above the running turn's timer as
+    /// user rows — the model has not read the words, so they are not
+    /// yet part of the conversation — and the turn-start observer
+    /// graduates each into the transcript the moment the loop drains
+    /// its slot into a request. A run that ends before any boundary
+    /// reads them hands them back through the guidance seam, and the
+    /// pin empties with that return.
+    pub pending_steers: Arc<Mutex<Vec<String>>>,
+
     /// The newest engine-truth history, however it was last known.
     ///
     /// Written at every successful turn end and by the mode driver
@@ -813,6 +825,7 @@ impl TuiObserverState {
             thinking: Arc::new(Mutex::new(ThinkingStream::default())),
             graduations: Arc::new(Mutex::new(Vec::new())),
             turn_histories: Arc::new(Mutex::new(Vec::new())),
+            pending_steers: Arc::new(Mutex::new(Vec::new())),
             machine_history: Arc::new(Mutex::new(None)),
             active_tools: Arc::new(Mutex::new(Vec::new())),
             agent_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -863,18 +876,21 @@ impl TuiObserverState {
         self.render_notify.notify(1);
     }
 
-    /// Record a steered prompt's echo the moment the offer is accepted.
+    /// Hold a steered prompt for the transcript until the model reads it.
     ///
-    /// The same transcript row [`push_sent`](Self::push_sent) writes —
-    /// the model is about to read this text — flagged as the steer's:
-    /// mid-run, not a run boundary, so nothing scoped to the run
-    /// retires on it. The pinned plan keeps standing through the
-    /// steer, the way the runner's own todo store does.
+    /// The offer was accepted, but acceptance is not reading: the text
+    /// waits in the run's steering slot until the loop drains it at its
+    /// next turn boundary, and a row in the conversation would claim
+    /// the model had already heard words it has not. The text is held
+    /// here instead — pinned just above the running turn's timer,
+    /// drawn as a user message, kept out of the transcript — until the
+    /// turn-start observer graduates it at the boundary that reads it,
+    /// where it lands after the tool or reply that was running when it
+    /// was sent. A run that ends before any boundary reads it returns
+    /// the text through the guidance seam, and the pin empties with
+    /// that return.
     pub fn push_steered(&self, text: String) {
-        recover(&self.graduations).push(Graduation::Sent {
-            text,
-            steered: true,
-        });
+        recover(&self.pending_steers).push(text);
         self.render_notify.notify(1);
     }
 
@@ -1279,6 +1295,21 @@ impl LoopObserver for TuiObserver {
         self.notify();
     }
 
+    fn on_turn_start(&self, _ctx: &TurnStartContext) {
+        let steered = std::mem::take(&mut *recover(&self.state.pending_steers));
+        if steered.is_empty() {
+            return;
+        }
+        let mut graduations = recover(&self.state.graduations);
+        for text in steered {
+            graduations.push(Graduation::Sent {
+                text,
+                steered: true,
+            });
+        }
+        self.notify();
+    }
+
     fn on_turn_end(&self, ctx: &TurnEndContext) {
         if !ctx.success {
             // A dead turn's partial reply text never graduates — the
@@ -1402,6 +1433,46 @@ mod tests {
                 success: true,
             }],
             "the run-end event graduates the engine-measured total"
+        );
+    }
+
+    #[test]
+    fn a_held_steer_graduates_at_the_turn_start_and_only_there() {
+        // Acceptance parks the text at the edge — no transcript row for
+        // words the model has not read — and the turn-start cue, which
+        // the loop emits after draining its slot, is the one moment the
+        // row is owed: it moves to the ordered lane there, in send
+        // order, and the pin empties with the same take.
+        let (observer, state) = TuiObserverState::new().into_observer();
+        state.push_steered("read this at the boundary".to_string());
+        assert!(
+            state.graduations.lock().unwrap().is_empty(),
+            "an accepted steer holds at the edge, not in the ordered lane"
+        );
+        observer.on_turn_start(&TurnStartContext {
+            turn: 1,
+            query: String::new(),
+        });
+        assert_eq!(
+            state.graduations.lock().unwrap().clone(),
+            vec![Graduation::Sent {
+                text: "read this at the boundary".to_string(),
+                steered: true,
+            }],
+            "the boundary that read the words owes the transcript its row"
+        );
+        assert!(
+            state.pending_steers.lock().unwrap().is_empty(),
+            "the pin empties with the graduation, so the row cannot land twice"
+        );
+        observer.on_turn_start(&TurnStartContext {
+            turn: 2,
+            query: String::new(),
+        });
+        assert_eq!(
+            state.graduations.lock().unwrap().len(),
+            1,
+            "an empty pin graduates nothing at a later boundary"
         );
     }
 

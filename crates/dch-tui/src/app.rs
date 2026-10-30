@@ -5006,9 +5006,12 @@ impl TuiApp {
     /// retired before delivery — so a whitespace-only draft would drop a real
     /// waiting prompt to deliver text nobody typed.
     ///
-    /// The row is written here rather than at a claim: unlike a queued
-    /// prompt, this one is sent by the hand that writes it, so the
-    /// transcript records it the moment it leaves.
+    /// The row is owed from here rather than at a claim: unlike a
+    /// queued prompt, this one is sent by the hand that writes it.
+    /// The transcript itself records it only when the model reads it
+    /// — the row waits pinned just above the timer until the boundary
+    /// that drains it — so the send and the record are two moments,
+    /// and both are the sender's own.
     fn steer_now(&mut self) -> bool {
         if self.input.text().trim().is_empty() {
             return true;
@@ -5030,10 +5033,14 @@ impl TuiApp {
     ///
     /// The one delivery path behind both entrances to steering — the
     /// composer's `Ctrl+S` and the waiting section's `s` — so the two can
-    /// never mean different things. Accepted, it is the loop's to read at
-    /// its next boundary; its transcript row then enters the conversation
-    /// with the other events, at the place the moment it was sent gives it.
-    /// Refused, it takes the ordinary path.
+    /// never mean different things. Accepted, it is the loop's to read
+    /// at its next boundary; its transcript row is not written at the
+    /// send, though — the model has not read the words yet — but pinned
+    /// just above the running turn's timer as a user row, in the spot
+    /// the boundary that reads it will land it in, after the work that
+    /// was running. A run that ends before any boundary reads it
+    /// hands the text to the waiting section instead. Refused, it
+    /// takes the ordinary path.
     ///
     /// Recording on recall stays with the callers: a prompt that arrives
     /// out of the queue was already recorded when it was submitted, and
@@ -5118,6 +5125,15 @@ impl TuiApp {
         if taken.is_empty() {
             return;
         }
+        // The pin held the same words the seam returns: those rows
+        // leave the edge with their texts, the waiting section their
+        // one home now. Anything the seam did not return stays pinned
+        // — a boundary may still owe it a row.
+        self.state
+            .pending_steers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|text| !taken.contains(text));
         let count = taken.len();
         let mut promised = 0usize;
         for text in taken {
@@ -6399,14 +6415,17 @@ impl TuiApp {
     /// conversation cache, the speaker-change seam, the live lanes in
     /// conversation order (thinking rows, the streaming reply's
     /// frozen and live regions, compaction notices), the running tool
-    /// rows, and the turn's ticking timer footer — windowed to the
-    /// pane's height around the scroll position, so a keystroke's
-    /// cost tracks the window, never the session. The settled turns'
-    /// chrome (their raised boxes and chevrons) paints from the
-    /// cached turn ranges over the same window; the selection
-    /// reverses in place; the scrollbar rides the gutter when the
-    /// stack outgrows the pane. The view state this records is the
-    /// click-mapping every later pointer event trusts.
+    /// rows, the turn's ticking timer footer, and — just above that
+    /// timer, in the spot they will land in — a steer waiting for the
+    /// model to read it, pinned as a user row — windowed to the pane's
+    /// height around
+    /// the scroll position, so a keystroke's cost tracks the window,
+    /// never the session. The settled turns' chrome (their raised
+    /// boxes and chevrons) paints from the cached turn ranges over
+    /// the same window; the selection reverses in place; the
+    /// scrollbar rides the gutter when the stack outgrows the pane.
+    /// The view state this records is the click-mapping every later
+    /// pointer event trusts.
     fn render_conversation(&mut self, frame: &mut Frame, area: Rect) {
         let padded = Rect {
             y: area.y.saturating_add(CONVERSATION_TOP_INSET),
@@ -6456,16 +6475,6 @@ impl TuiApp {
         let (tools, running_rows) = self.active_tool_lines(width);
         let thinking_rows = self.live_thinking_lines(width);
         let compaction_rows = self.live_compaction_lines();
-        // The in-flight turn opens the way a settled one does. The batch
-        // render puts a blank row between a user message and the
-        // assistant content answering it — the speaker-change row — and
-        // the live lanes owe that row from their first frame: without
-        // it a running thinking or tool row rides one row tighter under
-        // the prompt than the same content sits the moment it
-        // graduates, so the gap would open as a jump. The row is
-        // chrome, not content — it counts toward the physical line
-        // space and never the selectable one, exactly the thinking
-        // rows' own accounting.
         let live_open = !thinking_rows.0.is_empty()
             || !self.frozen_lines.is_empty()
             || !self.live_lines.is_empty()
@@ -6481,9 +6490,6 @@ impl TuiApp {
             .len()
             .saturating_add(self.frozen_lines.len())
             .saturating_add(self.live_lines.len());
-        // The thinking row sits above the streaming reply it precedes:
-        // its content arrived before the text, so the live lane reads in
-        // conversation order — thinking, then the reply it introduced.
         self.thinking_live_rows = thinking_rows.1.map(|row| {
             let start = row
                 .saturating_add(self.conversation_cache.len())
@@ -6502,17 +6508,17 @@ impl TuiApp {
             .into_iter()
             .map(|(index, call_id)| (index.saturating_add(pre_tool_offset), call_id))
             .collect();
-        // The live elapsed line: the running turn's own duration
-        // footer, ticking at the frame cadence, in the completed
-        // reply's format and register — the tail of the streaming
-        // region, where the settled line will take over when the run
-        // lands.
         let run_timer = self.live_run_timer();
-        let total_lines = selectable_lines
+        let pending_steer_rows = self.pending_steer_lines(width);
+        let lane_end = selectable_lines
             .saturating_add(seam.len())
             .saturating_add(thinking_rows.0.len())
             .saturating_add(compaction_rows.len())
-            .saturating_add(tools.len())
+            .saturating_add(tools.len());
+        let pinned_steer = (!pending_steer_rows.is_empty())
+            .then(|| (lane_end, lane_end.saturating_add(pending_steer_rows.len())));
+        let total_lines = lane_end
+            .saturating_add(pending_steer_rows.len())
             .saturating_add(run_timer.len());
         self.settle_scroll_offset(total_lines, conversation_height);
         let skip = self.snap_skip_to_whole_todo_blocks(
@@ -6521,10 +6527,6 @@ impl TuiApp {
                 .saturating_sub(self.scroll_offset),
             conversation_height,
         );
-        // The timer closes the running turn — its footer, exactly
-        // where the completed reply's own duration line lands — so
-        // the in-flight tool rows stand above it, the live region's
-        // content in reading order with the total ticking beneath.
         let segments: Vec<&[Line<'_>]> = vec![
             &self.conversation_cache,
             &seam,
@@ -6533,6 +6535,7 @@ impl TuiApp {
             &self.live_lines,
             &compaction_rows,
             &tools,
+            &pending_steer_rows,
             &run_timer,
         ];
         let mut visible = visible_window(&segments, skip, conversation_height);
@@ -6545,7 +6548,14 @@ impl TuiApp {
         if let Some(selection) = &self.selection {
             reverse_selection(&mut visible, skip, selection);
         }
-        self.paint_user_turn_chrome(frame, pane, mark_gutter, skip, conversation_height);
+        self.paint_user_turn_chrome(
+            frame,
+            pane,
+            mark_gutter,
+            skip,
+            conversation_height,
+            pinned_steer,
+        );
         frame.render_widget(Paragraph::new(visible), text_area);
         if let Some(gutter) = scrollbar_area
             && let Some((thumb_pos, thumb_len)) =
@@ -6578,8 +6588,13 @@ impl TuiApp {
         mark_gutter: Option<Rect>,
         skip: usize,
         conversation_height: usize,
+        pinned_steer: Option<(usize, usize)>,
     ) {
-        for &(start, end, _) in &self.user_turn_ranges {
+        let mut turns = self.user_turn_ranges.clone();
+        if let Some((start, end)) = pinned_steer {
+            turns.push((start, end, start.saturating_add(1)));
+        }
+        for &(start, end, _) in &turns {
             let first_visible = start.max(skip);
             let last_visible = end.min(skip.saturating_add(conversation_height));
             if first_visible >= last_visible {
@@ -6612,7 +6627,7 @@ impl TuiApp {
         let Some(gutter) = mark_gutter else {
             return;
         };
-        for &(_, _, mark) in &self.user_turn_ranges {
+        for &(_, _, mark) in &turns {
             let Some(on_screen) = mark.checked_sub(skip) else {
                 continue;
             };
@@ -6631,6 +6646,39 @@ impl TuiApp {
                     .set_fg(self.theme.ui.primary);
             }
         }
+    }
+
+    /// The steers a run accepted but no turn boundary has read, as
+    /// user rows pinned just above the live lane's timer.
+    ///
+    /// Each held steer renders exactly as a settled user turn renders
+    /// — a breathing row, wrapped text in the user's own color,
+    /// another breathing row — but just above the running turn's
+    /// timer, in the spot the boundary that reads it will land it in:
+    /// the model has not read the words, so they hold no place in the
+    /// conversation yet, and nothing jumps when they graduate. A run
+    /// that ends unread hands them to the waiting section instead,
+    /// and the pin empties with that return.
+    fn pending_steer_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let steers = self
+            .state
+            .pending_steers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let mut lines = Vec::new();
+        for text in steers {
+            lines.push(Line::default());
+            for segment in text.split('\n') {
+                lines.extend(plain_wrapped_lines(
+                    segment,
+                    usize::from(width.max(1)),
+                    self.theme.ui.user_message_fg,
+                ));
+            }
+            lines.push(Line::default());
+        }
+        lines
     }
 
     /// The running turn's live elapsed line, when one runs.
