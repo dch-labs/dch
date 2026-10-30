@@ -11584,18 +11584,15 @@ fn the_timer_spinner_advances_with_the_elapsed_clock() {
     // desyncs from the ticking duration it leads.
     let (mut app, kept) = app_with_state();
     kept.mark_run_started();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("the clock reads")
-        .as_millis();
-    let now = u64::try_from(now).unwrap_or(u64::MAX);
     // The elapsed values sit 20ms under a frame boundary, and the
     // render reads its own clock — always at least as late as the one
-    // read here, since the frame work happens after the store. So the
-    // cell shown is the one this elapsed maps to, or the next one
-    // forward if the frame was slow; it is never the cell behind. The
-    // literals below pin the mapping itself, which is what the orbit's
-    // order is for.
+    // read just before the store, since the frame work happens after
+    // it. The clock is read fresh on every pass, so a slow render
+    // costs its own sample the tolerance, never a later one the
+    // accumulated drift. The cell shown is therefore the one this
+    // elapsed maps to, or the next one forward if the frame was slow;
+    // it is never the cell behind. The literals below pin the mapping
+    // itself, which is what the orbit's order is for.
     for (elapsed, expected) in [
         (60u64, "\u{2819}"),
         (100, "\u{2839}"),
@@ -11611,6 +11608,11 @@ fn the_timer_spinner_advances_with_the_elapsed_clock() {
         let forward = spinner_frame_at(std::time::Duration::from_millis(
             elapsed.saturating_add(SPINNER_FRAME_MS),
         ));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock reads")
+            .as_millis();
+        let now = u64::try_from(now).unwrap_or(u64::MAX);
         kept.run_started_ms.store(
             now.saturating_sub(elapsed),
             std::sync::atomic::Ordering::SeqCst,

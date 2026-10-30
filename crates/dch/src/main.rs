@@ -100,23 +100,45 @@ fn log_sink(tui_mode: bool, stderr_is_terminal: bool, config_dir: &std::path::Pa
 
 /// Open the log file for appending, making its directory when needed.
 ///
+/// Both are private to the operator on Unix — the directory at
+/// `0o700`, the file at `0o600` — because the lines the file gathers
+/// can carry a session's own words, and the default creation mask
+/// would leave a world-readable log beside the sessions it describes.
+/// A file that already exists with broader bits is tightened by the
+/// open, so an earlier, looser creation does not outlive the run that
+/// notices it.
+///
 /// # Errors
 ///
-/// The OS error behind a directory that cannot be made or a file that
-/// cannot be opened. It reaches the caller on purpose: an unwritable
-/// log must cost the run its log file and nothing else, so the
-/// installer keeps stderr rather than losing the observability the
-/// operator asked for.
+/// The OS error behind a directory that cannot be made, a file that
+/// cannot be opened, or permissions that cannot be set. It reaches
+/// the caller on purpose: an unwritable log must cost the run its log
+/// file and nothing else, so the installer keeps stderr rather than
+/// losing the observability the operator asked for.
 fn open_log_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
-    if let Some(parent) = path.parent()
-        && let Err(err) = std::fs::create_dir_all(parent)
-    {
-        return Err(err);
+    if let Some(parent) = path.parent() {
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            builder.mode(0o700);
+        }
+        builder.recursive(true).create(parent)?;
     }
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
 }
 
 /// Whether `RUST_LOG` asks for a log at all.
@@ -345,6 +367,47 @@ mod tests {
             std::fs::read_to_string(&path).expect("the log is readable"),
             "first\nsecond\n",
             "the log appends across opens instead of truncating"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_log_file_and_its_directory_stay_private_to_the_operator() {
+        // The lines the file gathers can carry a session's own words:
+        // both it and the directory made for it are owner-only, and a
+        // file left broader by an earlier, looser creation is
+        // tightened by the open rather than outliving it.
+        use std::os::unix::fs::PermissionsExt as _;
+        let home = tempfile::TempDir::new().expect("a temporary config home");
+        let path = home.path().join(".dch").join("dch.log");
+        drop(open_log_file(&path).expect("the log opens, making its directory"));
+        let dir = std::fs::metadata(path.parent().expect("the directory"))
+            .expect("the directory is made");
+        assert_eq!(
+            dir.permissions().mode() & 0o777,
+            0o700,
+            "the directory the log is made in is owner-only"
+        );
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("the log is made")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "the log file is owner-only"
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("the permissions widen for the setup");
+        drop(open_log_file(&path).expect("the log opens again"));
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("the log remains")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "broader bits from before the open do not outlive it"
         );
     }
 

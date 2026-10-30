@@ -1259,6 +1259,7 @@ async fn drive_submissions(
     let mut last_claim: Option<(u64, usize)> = None;
     let mut revived: std::collections::VecDeque<Submission> = std::collections::VecDeque::new();
     let mut interrupted_for: Option<u64> = None;
+    state.record_todos_undone(runner.todo_undone());
     loop {
         if shutting_down.load(Ordering::SeqCst) {
             break;
