@@ -102,3 +102,31 @@ fn a_session_that_closes_its_plan_exits_without_an_unfinished_word() {
         "a plan walked to completed leaves no unfinished word: {screen}"
     );
 }
+
+#[test]
+fn the_exit_screen_waits_for_the_reader_thread_to_catch_up() {
+    // Reaping outruns the reader: the child is gone while its last
+    // bytes are still on the way into the screen buffer, so a wait that
+    // compares two reads taken back-to-back settles on an empty buffer
+    // and the exit lines above are read off a screen that never got
+    // them. The probe plays that ordering — the buffer's first content
+    // lands on the third read, after two empty ones.
+    let reads = std::cell::Cell::new(0usize);
+    let screen = common::settle_screen(
+        &|| {
+            let seen = reads.get();
+            reads.set(seen.saturating_add(1));
+            if seen >= 2 {
+                "Resume with:\ndch --resume x\n1 todo item left unfinished".to_string()
+            } else {
+                String::new()
+            }
+        },
+        std::time::Duration::from_millis(500),
+        std::time::Duration::from_millis(10),
+    );
+    assert!(
+        screen.contains("1 todo item left unfinished"),
+        "a trailing line that lands late is still on the returned screen: {screen:?}"
+    );
+}

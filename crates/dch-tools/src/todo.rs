@@ -136,9 +136,11 @@ struct TodoListInput {
 /// One todo entry as the model submits it.
 ///
 /// Carries two wire-only fields the stored [`TodoEntry`] does not keep:
-/// `blocked_by` is validated against the submission's ids and `blocks` is
-/// rendered in the summary; neither is stored. The schema additionally
-/// advertises `owner`, which is accepted for compatibility and ignored.
+/// `blocked_by` is validated against the ids this call carries plus the
+/// ones the standing plan already holds, and `blocks` is rendered in the
+/// summary; neither is stored. The schema advertises no `owner` field —
+/// an unlisted one deserializes to nothing and is dropped, so a model
+/// sending it gets no signal that it landed nowhere.
 #[derive(Debug, Clone, Deserialize)]
 struct TodoEntryInput {
     /// Stable identifier for the entry.
@@ -182,8 +184,10 @@ struct TodoEntryInput {
 
     /// Ids that must complete before this entry.
     ///
-    /// Validated against the ids in the same submission, rendered in the
-    /// summary, and not stored on the entry.
+    /// Validated against the ids this call carries together with the ids
+    /// the standing plan already holds — a patch may depend on an entry it
+    /// does not restate — then rendered in the summary, and not stored on
+    /// the entry.
     #[serde(default)]
     blocked_by: Vec<String>,
 

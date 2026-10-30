@@ -192,6 +192,17 @@ fn verbose_running_shows_the_raw_name_and_input_line() {
         !text.contains("Reading"),
         "no humanization in Verbose: {text:?}"
     );
+    let elapsed_span = lines[0]
+        .spans
+        .iter()
+        .find(|span| span.content.contains("s)"))
+        .expect("the elapsed span");
+    assert_eq!(
+        elapsed_span.style.fg,
+        Some(theme.ui.assistant_message_fg),
+        "Verbose styles the elapsed time like the other levels — the \
+         theme's reply color, not an unstyled default"
+    );
     assert!(
         text_of(&lines[1]).starts_with("    Input:"),
         "the input renders indented: {:?}",

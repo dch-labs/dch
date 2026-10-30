@@ -302,9 +302,11 @@ pub enum StripStyle {
 
     /// Draws no strip at all.
     ///
-    /// The configured row stays empty for the whole run, the
-    /// composer's hairline returns in the spacer, and the animation
-    /// wake stands down entirely.
+    /// The configured row stays empty for the whole run and the
+    /// composer's hairline returns in the spacer. The animation wake
+    /// is not part of the bargain: a run in flight keeps waking it,
+    /// because the tool rows' spinners and their elapsed counts beat
+    /// on that clock whether or not there is a strip to draw.
     Off,
 
     /// Holds a full-width bar that never moves, its color slowly

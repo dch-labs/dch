@@ -151,7 +151,9 @@ fn log_filter(rust_log: Option<&std::ffi::OsStr>) -> tracing_subscriber::EnvFilt
 ///
 /// Silent by default — no flag, no subscriber, no output — so the
 /// quiet contract holds for every ordinary run. With `RUST_LOG` set
-/// (`dch=info`, `RUST_LOG=dch_loop::todo_nudge=debug`), the
+/// (`dch=debug` for everything this binary emits,
+/// `dch_loop::todo_nudge=debug` for the belt alone — its events are
+/// debug-level, so an `info` ceiling leaves them unheard), the
 /// invisible machinery becomes observable: every reminder the
 /// contributor contributes, every follow-up the hook offers or
 /// declines, named with the turn and the count. The belt's whole
@@ -183,14 +185,25 @@ fn install_log_when_asked(tui_mode: bool) {
                 })
                 .init(),
             Err(err) => {
+                let notice = log_open_failure_notice(&path, &err);
+                crate::signals::report(&notice);
                 format.with_writer(std::io::stderr).init();
-                tracing::warn!(
-                    "cannot log to {}: {err} — tracing to stderr instead",
-                    path.display()
-                );
             }
         },
     }
+}
+
+/// The word about a log file that could not be opened.
+///
+/// Names the path that failed, the reason, and where the traces went
+/// instead — the three facts that decide whether to fix permissions or
+/// ignore the run. Kept apart from the branch that prints it so the
+/// wording has a shape a test can hold.
+fn log_open_failure_notice(path: &std::path::Path, err: &std::io::Error) -> String {
+    format!(
+        "cannot log to {}: {err} — tracing to stderr instead",
+        path.display()
+    )
 }
 
 /// Whether this invocation hosts the interactive TUI.
@@ -399,5 +412,24 @@ mod tests {
     fn single_run_invocations_take_the_bootstrap_marker() {
         let piped = args::Args::try_parse_from(["dch"]).unwrap();
         assert!(bootstrap_marker_applies(&piped, false));
+    }
+
+    #[test]
+    fn the_log_open_failure_word_names_the_path_the_reason_and_the_channel() {
+        // It is printed before any subscriber exists, so nothing else
+        // carries these facts: which file could not be opened, why, and
+        // where the traces are going instead of there.
+        let err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied");
+        let notice =
+            log_open_failure_notice(std::path::Path::new("/home/user/.config/dch/dch.log"), &err);
+        assert!(
+            notice.contains("/home/user/.config/dch/dch.log"),
+            "the path that failed is named: {notice}"
+        );
+        assert!(notice.contains("permission denied"), "the reason: {notice}");
+        assert!(
+            notice.contains("stderr"),
+            "the channel the traces fall back to: {notice}"
+        );
     }
 }

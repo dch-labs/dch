@@ -284,8 +284,11 @@ pub(crate) fn parse_submission(input_json: &str) -> Option<Vec<TodoRow>> {
 /// the output carries no task list (a cleared list, an error) so the
 /// caller falls back to whatever it can read of the request. An id
 /// carrying `] ` is ambiguous on the page — the format escapes nothing —
-/// and reads back as its shortest prefix; [`parse_submission`] is the
-/// authority wherever both reads are at hand.
+/// and reads back as its shortest prefix. This is the read a caller
+/// takes first where both are at hand — the request says what was
+/// asked, the render what the tool settled for — and
+/// [`parse_submission`] answers only where this one cannot, a resumed
+/// transcript keeping the request and not the render.
 pub(crate) fn parse_rendered(output: &str) -> Option<Vec<TodoRow>> {
     if !output.contains("# Task List") {
         return None;
@@ -708,7 +711,8 @@ Summary: 9 pending, 1 in progress, 2 completed\n\n\
         // page for two different plans and no parse rule can prefer one.
         // The pin holds what this parser really does — close the id at the
         // first `] ` — rather than a promise the format cannot keep; the
-        // submission's parse is the authority wherever both are at hand.
+        // ambiguity is this parser's to answer for, since a caller with
+        // both reads takes this one.
         let rows = parse_rendered("# Task List\n\n\u{25cb} [a] b] the tail\n")
             .expect("the header marks a task list");
         assert_eq!(rows.len(), 1, "{rows:?}");

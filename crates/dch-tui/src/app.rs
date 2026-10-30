@@ -71,8 +71,9 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
 /// The frame lane's per-second counters.
 ///
-/// Reset each time a second's line is logged; the clock is the
-/// animation wake's own, so an idle lane reports zeros honestly.
+/// Reset each time a second's line is logged; the second opens on the
+/// first draw measured into it, so a lane that never draws reports
+/// zeros honestly.
 #[derive(Default)]
 struct FrameStats {
     /// Animation-lane wakes this second.
@@ -1146,12 +1147,6 @@ pub struct TuiApp {
     /// invalidates the conversation and live caches so completed
     /// bodies re-render in the new mode on the next frame.
     verbosity: Verbosity,
-
-    /// The braille spinner's current frame.
-    ///
-    /// Advanced one frame per render tick while any tool runs;
-    /// running lines rebuild every frame anyway, so the pulse costs
-    /// nothing extra.
 
     /// The input editor: multi-line buffer, cursor, and history.
     ///
@@ -13281,9 +13276,9 @@ mod tests {
     fn the_live_thinking_title_reads_the_running_register() {
         // While the stream runs, the title answers to the same
         // register a running tool's title carries — the default
-        // foreground, italic as thinking's identity — and the
-        // auxiliary spans stay dim; the completed block greys the
-        // title out with everything else.
+        // foreground, italic as thinking's identity — while its
+        // elapsed span reads the light reply register; the completed
+        // block greys both out with everything else.
         let (_observer, state) = crate::observer::TuiObserverState::new().into_observer();
         let app = TuiApp::from_observer_state(dch_config::DchConfig::default(), state.clone());
         state

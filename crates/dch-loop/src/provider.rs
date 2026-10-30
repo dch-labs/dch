@@ -43,9 +43,10 @@ pub enum DchClient {
     /// An OpenAI-protocol provider client.
     ///
     /// Selected for the OpenAI wire-protocol family: `OpenAi`, `Ollama`,
-    /// `DeepSeek`, and `Grok` all speak the OpenAI chat-completions API (the
-    /// latter three via a custom `base_url`). Wraps loopctl's `OpenAiClient`,
-    /// which the other `ApiClient` methods forward to.
+    /// `SelfHosted`, `DeepSeek`, `Grok`, `Azure`, and `Moonshot` all speak
+    /// the OpenAI chat-completions API (all but the first via a custom
+    /// `base_url`). Wraps loopctl's `OpenAiClient`, which the other
+    /// `ApiClient` methods forward to.
     OpenAi(OpenAiClient),
 
     /// An Anthropic-protocol provider client.

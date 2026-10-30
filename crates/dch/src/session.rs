@@ -258,8 +258,9 @@ struct StoredSession {
 ///
 /// What the status bar's running total shows. The TUI persists and
 /// restores it, so a resumed session continues the count instead of
-/// restarting it at zero; headless single-runs keep no live counter
-/// and record zeros.
+/// restarting it at zero. A headless single-run has no live counter to
+/// carry, so it saves the spend halves as zeros — the context figure is
+/// the exception, read off the run that just finished.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SessionTokens {
     /// Input tokens since the session began.

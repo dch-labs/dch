@@ -722,8 +722,12 @@ impl TuiObserverState {
     /// The display's live elapsed line reads the stamp; call this at
     /// the same edge the running flag itself rises, which every mode
     /// driver does — the pair is written only here so it cannot
-    /// disagree.
+    /// disagree. The plan's exit figure is put back to "no answer"
+    /// beside it: a count is a statement about the run that ends the
+    /// session, so what an earlier run settled stops being true the
+    /// moment a new one begins.
     pub fn mark_run_started(&self) {
+        self.mark_todos_undone_uncaptured();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |since| {
@@ -778,6 +782,22 @@ impl TuiObserverState {
             .todos_undone_at_exit
             .load(std::sync::atomic::Ordering::SeqCst);
         (stored != Self::UNDONE_NOT_CAPTURED).then_some(stored)
+    }
+
+    /// Put the recorded figure back to "no answer" for the exit lines.
+    ///
+    /// A figure is only worth printing for the run that ended the
+    /// session, so [`Self::mark_run_started`] calls this as each new
+    /// run begins: what an older run settled says nothing about the
+    /// plan as it now stands, and a run that never reaches its settle
+    /// must leave the exit silent rather than repeat that. A run that
+    /// does record one keeps it, whatever becomes of the task
+    /// afterwards.
+    pub fn mark_todos_undone_uncaptured(&self) {
+        self.todos_undone_at_exit.store(
+            Self::UNDONE_NOT_CAPTURED,
+            std::sync::atomic::Ordering::SeqCst,
+        );
     }
 
     /// Create empty shared state.
@@ -1433,6 +1453,13 @@ mod tests {
             state.todos_undone_captured(),
             Some(3),
             "the last settled run's figure wins"
+        );
+        state.mark_todos_undone_uncaptured();
+        assert_eq!(
+            state.todos_undone_captured(),
+            None,
+            "a run cut down before settling answers nothing, even after a \
+             run that did settle one"
         );
     }
 

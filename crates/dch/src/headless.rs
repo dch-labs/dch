@@ -5,11 +5,12 @@
 //! logic — everything turn/stream/dispatch lives in loopctl via the runner —
 //! and prints nothing of its own beyond the answer the task asked for:
 //! the model's reply reaches stdout through the [`ConsoleObserver`]
-//! stream, and the only unsolicited word is the one warning line a run
-//! leaves on stderr when it ends with todos still open (reported
-//! panic-proof, as every other stderr word here is). This module
-//! resolves the prompt, maps the outcome to the process exit code, and
-//! writes the `--done-file` marker.
+//! stream, and stderr carries only the run's own trouble — a session
+//! that could not be built, a resume that had to degrade, a run that
+//! ends with todos still open, a `--done-file` that refused to be
+//! written (each reported panic-proof, as every stderr word here is).
+//! This module resolves the prompt, maps the outcome to the process
+//! exit code, and writes the `--done-file` marker.
 
 use std::io::{IsTerminal, Read};
 use std::path::Path;

@@ -140,12 +140,13 @@ mod tests {
             // lowercase-only text a (?i)-wrapped pattern matches
             // exactly where its case-sensitive twin does, and an
             // implementation that dropped the flag would pass
-            // unchanged. The flipped twin of the pattern is the probe
-            // that realizes the divergence every time — a wrapped
-            // pattern matches its own case-flip, an unwrapped one does
-            // not. The lock is the module's one discipline: the
-            // property inserts into the process-global cache, and the
-            // locked tests' size reads must not race it.
+            // unchanged. The flipped twin is the probe the divergence
+            // shows up on whenever the pattern carries a letter: a
+            // wrapped pattern matches its own case-flip, an unwrapped
+            // one does not. A letter-free pattern is its own flip and
+            // tests nothing here. The lock is the module's one
+            // discipline: the property inserts into the process-global
+            // cache, and the locked tests' size reads must not race it.
             let _guard = TEST_LOCK.lock().unwrap();
             let wrapped = if case_insensitive {
                 format!("(?i){pattern}")

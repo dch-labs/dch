@@ -45,10 +45,15 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 /// providers publish nothing on the wire, so their own pages are the
 /// only source left. Returns `None` when neither has an answer,
 /// leaving the caller on its configured window. The answer rides
-/// whole whatever family answered it: a server that reports usage
-/// anchors the counter to the real count each turn, and one that
-/// never does leaves the compaction threshold as the safety between
-/// a light estimate and the ceiling.
+/// whole whatever family answered it, and what protects it differs by
+/// family: a server that reports usage anchors the counter to the real
+/// count each turn, while one that never does leaves that counter a
+/// local estimate of the payload rather than a count of it. Nothing
+/// holds the trigger under such a window's real edge, so an estimate
+/// running light reaches the ceiling before compaction is asked. The
+/// exposure is taken deliberately rather than margined away — a margin
+/// would shrink the anchored families' window as well, and their
+/// counter already reads the server's own number.
 pub(crate) async fn discover_window(config: &ApiConfig, client: &dyn ApiClient) -> Option<u64> {
     let model = client.model();
     probe_context_window(config, &client.base_url(), &model)
@@ -245,11 +250,13 @@ mod tests {
         // where the server reports usage the counter is anchored to
         // the real count each turn, and where it never does — the
         // ollama client disables usage parsing by construction, and a
-        // self-hosted endpoint is whatever server answers — the
-        // compaction threshold is the safety that stands between a
-        // light estimate and the ceiling. A drift margin on the
-        // window double-discounts the usage-reporting families: the
-        // 1M-window model whose bar read 800k.
+        // self-hosted endpoint is whatever server answers — the counter
+        // stays a local estimate, which makes the threshold a trigger
+        // rather than headroom under the ceiling: a light estimate
+        // reaches that edge before compaction is asked. No drift margin
+        // is applied to any family, because it would discount the
+        // anchored ones, whose counter needs none — the 1M-window model
+        // whose bar read 800k.
         let (port, _) = serve_bodies(vec![
             r#"{"unrelated": true}"#.to_string(),
             r#"{"object":"list","data":[{"id":"endpoint-only","max_model_len":16384}]}"#

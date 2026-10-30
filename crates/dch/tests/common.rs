@@ -846,27 +846,18 @@ impl PtySession {
     ///
     /// The session's exit lines print *after* the terminal is restored,
     /// so a scenario asserting them needs the drained buffer rather than
-    /// the exit status alone. The reader keeps draining until the
-    /// process is gone and the buffer stops moving, then returns the raw
-    /// stream — strip it with [`strip_ansi`] before matching words.
+    /// the exit status alone. Reaping does not mean the bytes arrived:
+    /// the reader thread is still moving the child's last output into
+    /// the screen, so the wait is settled through [`settle_screen`] and
+    /// is best-effort — capped at [`SCREEN_STABLE_CAP`], returning what
+    /// arrived if a process keeps writing past it. Strip the result with
+    /// [`strip_ansi`] before matching words.
     pub fn quit_and_read(
         mut self,
         timeout: std::time::Duration,
     ) -> (portable_pty::ExitStatus, String) {
         let status = self.quit_until_gone(timeout);
-        let mut screen = self.snapshot();
-        let deadline = std::time::Instant::now()
-            .checked_add(std::time::Duration::from_millis(500))
-            .expect("deadline computable");
-        loop {
-            let next = self.snapshot();
-            if next == screen || std::time::Instant::now() >= deadline {
-                screen = next;
-                break;
-            }
-            screen = next;
-            std::thread::sleep(std::time::Duration::from_millis(25));
-        }
+        let screen = settle_screen(&|| self.snapshot(), SCREEN_STABLE_CAP, SCREEN_POLL);
         (status, screen)
     }
 
@@ -893,6 +884,52 @@ impl PtySession {
             );
         }
     }
+}
+
+/// How long a settled screen must hold still before it counts as done.
+pub const SCREEN_STABLE_CAP: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The gap between two reads of the screen buffer.
+pub const SCREEN_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// The number of unchanged reads that settle the screen.
+const STABLE_READS: usize = 2;
+
+/// Read until the screen stops growing, then hand it back.
+///
+/// A reaped child is not a drained one: the reader thread is still
+/// moving its last bytes into the buffer when the process is gone, so
+/// the exit lines a scenario asserts on can still be in flight. Every
+/// read is taken after `poll` has passed and the buffer must come back
+/// unchanged `STABLE_READS` times running to count as settled — two
+/// reads with no sleep between them agree just as readily on an empty
+/// buffer, which is how a late trailing line gets missed. The wait is
+/// capped at `cap` and best-effort: output still arriving when it
+/// expires is returned as far as it got.
+pub fn settle_screen(
+    read: &dyn Fn() -> String,
+    cap: std::time::Duration,
+    poll: std::time::Duration,
+) -> String {
+    let mut screen = read();
+    let Some(deadline) = std::time::Instant::now().checked_add(cap) else {
+        return screen;
+    };
+    let mut unchanged = 0usize;
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(poll);
+        let next = read();
+        if next == screen {
+            unchanged = unchanged.saturating_add(1);
+            if unchanged >= STABLE_READS {
+                return next;
+            }
+        } else {
+            unchanged = 0;
+            screen = next;
+        }
+    }
+    screen
 }
 
 /// Strip ANSI escape sequences from a raw terminal stream.

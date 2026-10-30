@@ -23,6 +23,7 @@ use dch_config::DchConfig;
 use dch_tui::TuiApp;
 use dch_tui::message::{ActiveTool, ContentBlock, TuiMessage};
 use dch_tui::theme::Theme;
+use dch_tui::tool_render::{SPINNER_FRAME_MS, spinner_frame_at};
 use loopctl::observer::LoopObserver as _;
 use ratatui::Terminal;
 use ratatui::backend::Backend as _;
@@ -8930,7 +8931,7 @@ fn the_strip_and_live_row_survive_a_graduation_and_new_stream() {
 }
 
 #[test]
-fn thinking_rows_render_in_the_theme_dim_tone() {
+fn the_live_thinking_row_reads_the_running_register() {
     let (observer, mut app) = live_thinking_app();
     observer.on_thinking_delta(&thinking_delta(0, "dim thoughts"));
     let terminal = render_to_buffer(&mut app, 80, 24);
@@ -10188,6 +10189,62 @@ fn a_steered_echo_surviving_in_a_transcript_keeps_the_plan_standing() {
         flat.matches("0/1 done").count() >= 2,
         "a claim retires only a finished plan — the owed work stands \
          across it, carried like the store: {flat:?}"
+    );
+}
+
+#[test]
+fn a_claim_after_a_finished_plan_takes_the_section_down() {
+    // The other side of the same edge, and the only one that clears
+    // the section: a resumed session whose last run walked every entry
+    // to completed stands with the plan still up, and the next claim —
+    // an unflagged user row — is what retires it. The transcript's own
+    // record of the call keeps its checkbox rows; only the standing
+    // section goes.
+    let tool_block = TuiMessage::Assistant {
+        blocks: vec![ContentBlock::Tool {
+            call_id: "call-1".to_string(),
+            name: "TodoWrite".to_string(),
+            input_preview: "2 items".to_string(),
+            success: true,
+            elapsed_secs: 0.1,
+            output_preview: "Updated 2 todo tasks".to_string(),
+            retained_input: r#"{"todos":[
+                {"id":"1","subject":"survey the land","status":"completed"},
+                {"id":"2","subject":"dig the trench","status":"completed"}
+            ]}"#
+            .to_string(),
+        }],
+        timestamp: chrono::Utc::now(),
+        duration_ms: None,
+    };
+    let mut app = app();
+    app.seed_messages(vec![tool_block]);
+    let before = render_to_buffer(&mut app, 80, 30);
+    let before_flat: String = row_texts(&before).join("\n");
+    assert_eq!(
+        before_flat.matches("2/2 done").count(),
+        2,
+        "a finished plan still stands between runs, block and section: \
+         {before_flat:?}"
+    );
+
+    app.seed_messages(vec![TuiMessage::User {
+        text: "the next claim".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+    }]);
+    let after = render_to_buffer(&mut app, 80, 30);
+    let after_flat: String = row_texts(&after).join("\n");
+    assert_eq!(
+        after_flat.matches("2/2 done").count(),
+        1,
+        "the claim retires the finished plan — the section is down and \
+         only the call's own record still reads 2/2: {after_flat:?}"
+    );
+    assert!(
+        after_flat.contains("dig the trench"),
+        "the retired plan's transcript record keeps its rows to read: \
+         {after_flat:?}"
     );
 }
 
@@ -11532,8 +11589,13 @@ fn the_timer_spinner_advances_with_the_elapsed_clock() {
         .expect("the clock reads")
         .as_millis();
     let now = u64::try_from(now).unwrap_or(u64::MAX);
-    // Mid-frame elapsed values: the clock drift between the test's
-    // read and the render's own can never cross a frame boundary.
+    // The elapsed values sit 20ms under a frame boundary, and the
+    // render reads its own clock — always at least as late as the one
+    // read here, since the frame work happens after the store. So the
+    // cell shown is the one this elapsed maps to, or the next one
+    // forward if the frame was slow; it is never the cell behind. The
+    // literals below pin the mapping itself, which is what the orbit's
+    // order is for.
     for (elapsed, expected) in [
         (60u64, "\u{2819}"),
         (100, "\u{2839}"),
@@ -11541,6 +11603,14 @@ fn the_timer_spinner_advances_with_the_elapsed_clock() {
         (260, "\u{2826}"),
         (380, "\u{280f}"),
     ] {
+        let at = spinner_frame_at(std::time::Duration::from_millis(elapsed));
+        assert_eq!(
+            at, expected,
+            "the elapsed-to-cell mapping the golden pins: {elapsed}ms"
+        );
+        let forward = spinner_frame_at(std::time::Duration::from_millis(
+            elapsed.saturating_add(SPINNER_FRAME_MS),
+        ));
         kept.run_started_ms.store(
             now.saturating_sub(elapsed),
             std::sync::atomic::Ordering::SeqCst,
@@ -11555,10 +11625,12 @@ fn the_timer_spinner_advances_with_the_elapsed_clock() {
             })
             .unwrap_or_else(|| panic!("the timer row renders at {elapsed}ms"));
         let first = timer_row.trim_start().chars().next().expect("a glyph");
-        assert_eq!(
-            first.to_string(),
-            expected,
-            "at {elapsed}ms elapsed the orbit shows {expected:?}: {timer_row:?}"
+        let shown = first.to_string();
+        assert!(
+            shown == expected || shown == forward,
+            "at {elapsed}ms elapsed the orbit shows {expected:?} — or \
+             {forward:?}, the next cell, since the render's clock only \
+             runs ahead of this one: {timer_row:?}"
         );
     }
 }

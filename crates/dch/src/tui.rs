@@ -322,7 +322,9 @@ fn assemble_runner_builder<'a>(
 /// The exit is prompt even when the run will not die politely: a
 /// wedged tool or a stubborn stream gets a bounded wait, then the
 /// task is torn down — the session's halves were persisted by the
-/// settle above, so nothing more can be saved by waiting.
+/// settle above, so nothing more can be saved by waiting. Whatever the
+/// run had already settled for the exit lines stands: the bound is on
+/// the join, not on what the run reported before it.
 async fn tear_down_driver_bounded(driver: tokio::task::JoinHandle<()>) {
     let mut driver = driver;
     if tokio::time::timeout(std::time::Duration::from_millis(500), &mut driver)
@@ -2041,6 +2043,51 @@ mod tests {
             dir.path().to_path_buf(),
         ));
         (saver, dir, id)
+    }
+
+    #[tokio::test]
+    async fn a_run_that_never_settles_leaves_no_undone_figure() {
+        // The undone count is recorded beside a settled run, and a new
+        // run's start is where an older run's answer stops being about
+        // this session's plan: a run taken before it settles must leave
+        // the exit silent, not repeating what came before it.
+        let (_, state) = TuiObserverState::new().into_observer();
+        state.record_todos_undone(2);
+        state.mark_run_started();
+        assert_eq!(
+            state.todos_undone_captured(),
+            None,
+            "the new run's start retires the old run's figure"
+        );
+        let wedged = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        tear_down_driver_bounded(wedged).await;
+        assert_eq!(
+            state.todos_undone_captured(),
+            None,
+            "an aborted run states no figure of its own"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_settled_figure_survives_a_driver_cut_down_late() {
+        // The bound is on the join, not on what the run reported: a run
+        // that settled its plan and then stalled going out still owns
+        // the exit lines. Clearing the figure at the abort would tell
+        // the user nothing about the work the run really left open.
+        let (_, state) = TuiObserverState::new().into_observer();
+        state.mark_run_started();
+        state.record_todos_undone(1);
+        let wedged = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        tear_down_driver_bounded(wedged).await;
+        assert_eq!(
+            state.todos_undone_captured(),
+            Some(1),
+            "a settled figure stands whatever the teardown does after"
+        );
     }
 
     #[test]
