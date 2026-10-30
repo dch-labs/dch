@@ -493,7 +493,9 @@ pub struct TuiObserverState {
     /// graduates each into the transcript the moment the loop drains
     /// its slot into a request. A run that ends before any boundary
     /// reads them hands them back through the guidance seam, and the
-    /// pin empties with that return.
+    /// pin empties with that return; an exit that overtakes the run
+    /// takes them into the transcript's waiting rows with the
+    /// queue's own, so typed words never leave no trace.
     pub pending_steers: Arc<Mutex<Vec<String>>>,
 
     /// The newest engine-truth history, however it was last known.
@@ -888,7 +890,9 @@ impl TuiObserverState {
     /// where it lands after the tool or reply that was running when it
     /// was sent. A run that ends before any boundary reads it returns
     /// the text through the guidance seam, and the pin empties with
-    /// that return.
+    /// that return; an exit that overtakes the run takes it into the
+    /// transcript's waiting rows instead, so typed words never leave
+    /// no trace.
     pub fn push_steered(&self, text: String) {
         recover(&self.pending_steers).push(text);
         self.render_notify.notify(1);

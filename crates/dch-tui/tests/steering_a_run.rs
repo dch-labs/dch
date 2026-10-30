@@ -1086,3 +1086,76 @@ fn an_unread_steer_returns_to_the_waiting_section_and_leaves_the_pin() {
         "the returned prompt comes back with its turn promised"
     );
 }
+
+#[test]
+fn a_pinned_steer_survives_the_exit_as_a_waiting_prompt() {
+    // The exit overtakes the run with the steer still at the edge:
+    // the run never ended, so the seam never returned the words, and
+    // they are in neither the queue nor the transcript. The exit's
+    // snapshot takes the pin with the waiting prompts — typed words no
+    // turn spent — and the echo writes each its unclaimed row, the
+    // shape a resume seeds back into the waiting section.
+    let (mut app, kept, _rx, guidance) = app_steerable();
+    running(&kept, true);
+    guidance.live.store(true, Ordering::SeqCst);
+    kept.queued
+        .lock()
+        .unwrap()
+        .push("queued before the steer".to_string());
+    steer(&mut app, "steered just before the exit");
+    assert_eq!(
+        pinned(&kept),
+        ["steered just before the exit"],
+        "the precondition: the words wait at the edge"
+    );
+
+    let unclaimed = app.waiting_prompt_texts_at_exit();
+
+    assert_eq!(
+        unclaimed,
+        ["queued before the steer", "steered just before the exit"],
+        "the snapshot carries the pinned steer with the waiting prompts, \
+         queue order first, edge order after"
+    );
+    assert!(
+        pinned(&kept).is_empty(),
+        "the snapshot takes the pin whole — the words have one home now"
+    );
+    app.echo_waiting_prompts_at_exit(unclaimed);
+    assert_eq!(
+        user_rows(&app),
+        ["queued before the steer", "steered just before the exit"],
+        "and the echo writes each its unclaimed row, the resume's seed"
+    );
+}
+
+#[test]
+fn an_exit_snapshot_never_duplicates_a_steer_the_seam_returned() {
+    // The seam already returned the steer and the return's requeue put
+    // it in the waiting section: the pin was pruned with that return,
+    // so the exit's snapshot lists the words once, from the queue, and
+    // the pin contributes nothing.
+    let (mut app, kept, _rx, guidance) = app_steerable();
+    running(&kept, true);
+    guidance.live.store(true, Ordering::SeqCst);
+    steer(&mut app, "returned before the exit");
+    *guidance.owed.lock().unwrap() = vec!["returned before the exit".to_string()];
+    running(&kept, false);
+    rows(&mut app, 80, 24);
+    assert!(
+        pinned(&kept).is_empty(),
+        "the precondition: the return emptied the pin"
+    );
+    assert_eq!(
+        waiting(&kept),
+        ["returned before the exit"],
+        "and the requeue holds the words"
+    );
+
+    let unclaimed = app.waiting_prompt_texts_at_exit();
+    assert_eq!(
+        unclaimed,
+        ["returned before the exit"],
+        "once from the queue, never twice: {unclaimed:?}"
+    );
+}

@@ -2106,9 +2106,14 @@ impl TuiApp {
     /// entry when it started, the exit's requeues land only after the
     /// cancel, and a claim reaching the driver inside the window
     /// declines under the queue's own lock rather than taking its
-    /// entry. The snapshot is therefore exactly the set of words the
-    /// user typed that no turn spent — the set the transcript owes
-    /// rows to, because the queue they wait in dies with the process.
+    /// entry. The steers still pinned at the transcript's edge join
+    /// them — words the user aimed at a run that read none of them,
+    /// and whose seam never handed them back, or the pin would have
+    /// emptied with that return — taken off the pin here so they hold
+    /// one home from this moment. The snapshot is therefore exactly
+    /// the set of words the user typed that no turn spent — the set
+    /// the transcript owes rows to, because the queue they wait in
+    /// dies with the process.
     #[must_use]
     pub fn waiting_prompt_texts_at_exit(&self) -> Vec<String> {
         let queue = self
@@ -2116,9 +2121,18 @@ impl TuiApp {
             .queued
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        (0..queue.len())
+        let mut texts = (0..queue.len())
             .filter_map(|index| queue.get(index).map(|entry| entry.text.clone()))
-            .collect()
+            .collect::<Vec<_>>();
+        drop(queue);
+        texts.extend(std::mem::take(
+            &mut *self
+                .state
+                .pending_steers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        ));
+        texts
     }
 
     /// Write the still-waiting prompts into the transcript as
