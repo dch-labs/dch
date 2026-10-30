@@ -6730,11 +6730,129 @@ mod tests {
         );
     }
 
+    /// Offers one piece of guidance from inside the run, at a turn's start.
+    ///
+    /// The loop emits `on_turn_start` after it has drained the steering slot
+    /// for that turn and before it sends that turn's request, so an offer
+    /// made here stands provably behind the boundary that could have read it.
+    /// A wall-clock poll cannot establish that: an offer accepted while the
+    /// run opens is still ahead of the first drain and rides the first
+    /// request, which is the loop behaving correctly rather than the guidance
+    /// going unread.
+    struct TurnStartGuidance {
+        /// The loop's slot, attached once the built runner hands it out.
+        slot: Mutex<Option<Arc<loopctl::engine::Steering>>>,
+        /// The guidance the observer offers.
+        text: String,
+        /// Whether the run in flight accepted the offer.
+        accepted: std::sync::atomic::AtomicBool,
+    }
+
+    impl TurnStartGuidance {
+        /// A guide holding `text`, with no slot yet and no offer made.
+        fn new(text: &str) -> Arc<Self> {
+            Arc::new(Self {
+                slot: Mutex::new(None),
+                text: text.to_string(),
+                accepted: std::sync::atomic::AtomicBool::new(false),
+            })
+        }
+
+        /// Hand the observer the slot the built runner owns.
+        fn attach(&self, steering: Arc<loopctl::engine::Steering>) {
+            *self.slot.lock().expect("the slot lock") = Some(steering);
+        }
+
+        /// Whether the run in flight took the offer.
+        fn accepted(&self) -> bool {
+            self.accepted.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl LoopObserver for TurnStartGuidance {
+        fn name(&self) -> &'static str {
+            "turn-start-guidance"
+        }
+
+        fn on_turn_start(&self, ctx: &loopctl::observer::TurnStartContext) {
+            if ctx.turn > 0 || self.accepted() {
+                return;
+            }
+            let offered = self
+                .slot
+                .lock()
+                .expect("the slot lock")
+                .as_ref()
+                .is_some_and(|slot| slot.push(Message::user(self.text.clone())));
+            if offered {
+                self.accepted
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn guidance_the_run_never_reads_is_left_for_the_host() {
-        // One turn, no boundary after it: the guidance was accepted, and the
-        // run ended anyway. The seam's other law — the host gets it back, so
-        // nothing the user typed dies in a slot nobody will drain again.
+        // One turn, so the run has exactly one boundary and nothing behind
+        // it: the offer is placed after that boundary by the loop's own turn
+        // event rather than raced for, which is what makes the run's failure
+        // to reach it a fact of the shape rather than of the machine's speed.
+        // A sentinel rather than a phrase — the request body carries the
+        // system prompt and the tool schemas, where ordinary words appear by
+        // coincidence and a negative assertion would prove nothing.
+        let server = SseServer::start(vec![sse_text_turn("answered")]).await;
+        let dir = TempDir::new().expect("tempdir");
+        let guide = TurnStartGuidance::new("the answer is stale, late-4w7s");
+        let mut runner = Runner::builder(&wire_config(server.port, 10), dir.path())
+            .with_observer(Arc::clone(&guide) as Arc<dyn LoopObserver>)
+            .build()
+            .await
+            .expect("constructs");
+        let seam = runner.steering();
+        guide.attach(Arc::clone(&seam));
+
+        let run = tokio::time::timeout(std::time::Duration::from_secs(30), runner.run("answer"))
+            .await
+            .expect("the run settles within its budget")
+            .expect("the run succeeds");
+        assert_eq!(run.output.as_deref(), Some("answered"));
+        assert!(
+            guide.accepted(),
+            "the run in flight took the guidance at its turn's start"
+        );
+
+        let requests = recorded_requests(&server);
+        assert_eq!(
+            requests.len(),
+            1,
+            "one turn and no boundary after it: {requests:?}"
+        );
+        assert!(
+            !requests[0].contains("late-4w7s"),
+            "an offer behind the drain cannot retroactively enter the request \
+             its turn sent: {:?}",
+            requests[0]
+        );
+
+        let left = seam.take_all();
+        let texts: Vec<String> = left.iter().map(Message::text_content).collect();
+        assert_eq!(
+            texts,
+            ["the answer is stale, late-4w7s"],
+            "what the run never reached comes back to the host, in the order it \
+             arrived"
+        );
+        assert!(seam.is_empty(), "taking it clears the slot");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn guidance_is_delivered_or_handed_back_but_never_lost() {
+        // The law a host relies on, with no timing assumption in it: an offer
+        // landing while a run is open — whenever in the run it lands, and the
+        // moment it lands is what a loaded machine moves — either reaches the
+        // model or comes back. So the earliest accepted moment is raced for
+        // here rather than placed, and both outcomes pass while neither, and
+        // especially both, cannot.
         let server = SseServer::start_with_delay(
             vec![sse_text_turn("answered")],
             std::time::Duration::from_millis(700),
@@ -6755,31 +6873,30 @@ mod tests {
 
         let mut offered = false;
         for _ in 0..400 {
-            if seam.push(loopctl::message::Message::user("advice that arrived late")) {
+            if seam.push(Message::user("lost-2k9d")) {
                 offered = true;
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            tokio::time::sleep(std::time::Duration::ZERO).await;
         }
-        assert!(offered, "the run in flight took the guidance");
+        assert!(offered, "the run in flight took the offer");
 
         let run = task
             .await
             .expect("the task joins")
             .expect("the run succeeds");
         assert_eq!(run.output.as_deref(), Some("answered"));
-        let left = seam.take_all();
-        let texts: Vec<String> = left
+        let delivered = recorded_requests(&server)
             .iter()
-            .map(loopctl::message::Message::text_content)
-            .collect();
-        assert_eq!(
-            texts,
-            ["advice that arrived late"],
-            "what the run never reached comes back to the host, in the order it \
-             arrived"
+            .any(|request| request.contains("lost-2k9d"));
+        let returned = seam.take_all();
+        assert_ne!(
+            delivered,
+            !returned.is_empty(),
+            "the guidance either rode a request or came back, never both and \
+             never neither: delivered {delivered}, returned {} message(s)",
+            returned.len()
         );
-        assert!(seam.is_empty(), "taking it clears the slot");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

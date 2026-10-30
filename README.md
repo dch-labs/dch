@@ -297,8 +297,11 @@ mind. It reads at a glance where the run is;
 the transcript's own todo blocks hold every update in full for the
 detail. The plan stays up after its run lands —
 the final state, done or not, is there to read in the quiet after the
-run — and the next prompt's claim retires it, so the section always
-shows the last run's plan, never an older one's. A steer delivers
+run — and the next prompt's claim retires it once every entry stands
+completed. A run that ends with work still open carries its plan into the
+next run instead, where the rows keep updating under the new prompt, so
+the section always shows the plan the session actually stands on — never
+one it has finished leaving behind. A steer delivers
 mid-run without claiming, so the plan keeps updating through its own
 run.
 

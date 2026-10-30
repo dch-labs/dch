@@ -109,6 +109,87 @@ struct FrameStats {
     second_start: Option<std::time::Instant>,
 }
 
+impl FrameStats {
+    /// Count one draw, and hand out the frame lane when its second ends.
+    ///
+    /// Every draw joins the count and the running worst. The window
+    /// opens on the draw that finds it shut, and its epoch is that
+    /// draw's own instant: the window always measures a full span of
+    /// draws, so a second of quiet reports an honest zero rather than
+    /// closing on the draw that happened to stand there. Once an epoch
+    /// has stood [`FRAME_REPORT_SECONDS`] its counters go out as a
+    /// [`FrameLane`] and a fresh window opens at that draw; until then
+    /// nothing is reported.
+    fn note_draw(
+        &mut self,
+        took: std::time::Duration,
+        now: std::time::Instant,
+    ) -> Option<FrameLane> {
+        self.draws = self.draws.saturating_add(1);
+        self.worst_draw = Some(match self.worst_draw {
+            Some(worst) if worst >= took => worst,
+            _ => took,
+        });
+        let Some(epoch) = self.second_start else {
+            self.second_start = Some(now);
+            return None;
+        };
+        if now.duration_since(epoch) < FRAME_REPORT_SECONDS {
+            return None;
+        }
+        let lane = FrameLane {
+            anim_wakes: self.anim_wakes,
+            draws: self.draws,
+            worst_draw_ms: u64::try_from(self.worst_draw.map_or(0, |d| d.as_millis()))
+                .unwrap_or(u64::MAX),
+        };
+        *self = FrameStats {
+            second_start: Some(now),
+            ..FrameStats::default()
+        };
+        Some(lane)
+    }
+}
+
+/// One closed second of frame-lane counters, ready for the log.
+///
+/// The numbers the per-second line carries, read off the window as it
+/// closes: what animated, what was drawn, and the slowest single draw
+/// in whole milliseconds.
+struct FrameLane {
+    /// Wakes the animation lane asked for during the window.
+    ///
+    /// Counted only on beats whose gate found something on screen
+    /// animating, so the figure measures frames the lane actually
+    /// requested rather than raw timer ticks; it reaches the log as
+    /// the window closes and the reopened window starts again at zero.
+    anim_wakes: u32,
+
+    /// Draws the run loop put on screen during the window.
+    ///
+    /// Counted after every draw whatever lane requested it, so the
+    /// figure reads as painted frames rather than requested ones —
+    /// the two differ whenever a beat's work coalesced into a single
+    /// frame.
+    draws: u32,
+
+    /// The window's slowest single draw, in whole milliseconds.
+    ///
+    /// The maximum over every measured draw, not the last one, so a
+    /// laggy frame early in the second is still what the line reports;
+    /// whole milliseconds is the resolution the lane is worth reading
+    /// at, and a window that measured no draw reports zero.
+    worst_draw_ms: u64,
+}
+
+/// How long a frame-lane window stands before it reports and reopens.
+///
+/// One second: long enough that a slow frame shows up as a rate a
+/// reader can act on rather than as one sample, short enough that the
+/// lane answers a question asked about the moment just now. Chosen to
+/// match the log line's own promise, which names the figure per second.
+const FRAME_REPORT_SECONDS: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// The periodic beat the run loop wakes on.
 ///
 /// The loop's coarse chores ride this beat: claiming a redraw a
@@ -130,8 +211,6 @@ const TICK_INTERVAL: Duration = Duration::from_millis(100);
 /// per frame — whatever the wire's granularity.
 const ANIMATION_INTERVAL: Duration = Duration::from_millis(20);
 
-/// How much run time one spinner frame stands for.
-///
 /// Ticks per caret blink phase.
 ///
 /// Half a second on, half a second off — the cadence editors settle
@@ -1947,10 +2026,16 @@ impl TuiApp {
     ///
     /// The observer and the session-resume path use this to populate
     /// the view; submitting from the input line goes through the same
-    /// path internally.
+    /// path internally. A fold of the auto-expanded plan retires the
+    /// rows it baked while the flag stood: a mid-conversation block is
+    /// past the tail the incremental bake re-renders, so the fold
+    /// invalidates the whole bake rather than leave an expanded shape
+    /// standing on a flag it just cleared.
     pub fn push_message(&mut self, message: TuiMessage) {
-        if let Some(id) = self.auto_expanded_todo.take() {
-            self.expanded_tools.remove(&id);
+        if let Some(id) = self.auto_expanded_todo.take()
+            && self.expanded_tools.remove(&id)
+        {
+            self.rebake_whole();
         }
         self.conversation.push(message);
         self.conversation_generation = self.conversation_generation.saturating_add(1);
@@ -3281,28 +3366,14 @@ impl TuiApp {
                 let started = Instant::now();
                 terminal.draw(|frame| self.render(frame))?;
                 let took = started.elapsed();
-                let stats = &mut self.frame_stats;
-                stats.draws = stats.draws.saturating_add(1);
-                stats.worst_draw = Some(match stats.worst_draw {
-                    Some(worst) if worst >= took => worst,
-                    _ => took,
-                });
-                let now = Instant::now();
-                let second = stats.second_start.unwrap_or(now);
-                if now.duration_since(second) >= std::time::Duration::from_secs(1) {
+                if let Some(lane) = self.frame_stats.note_draw(took, Instant::now()) {
                     tracing::debug!(
                         target: "dch_tui::frames",
-                        anim_wakes = stats.anim_wakes,
-                        draws = stats.draws,
-                        worst_draw_ms =
-                            u64::try_from(stats.worst_draw.map_or(0, |d| d.as_millis()))
-                                .unwrap_or(u64::MAX),
+                        anim_wakes = lane.anim_wakes,
+                        draws = lane.draws,
+                        worst_draw_ms = lane.worst_draw_ms,
                         "frame lane"
                     );
-                    *stats = FrameStats {
-                        second_start: Some(now),
-                        ..FrameStats::default()
-                    };
                 }
             }
         }
@@ -4601,6 +4672,10 @@ impl TuiApp {
     /// step; this covers its next *started* one — a tool in flight is
     /// the conversation moving on even before its result graduates.
     /// Manual expansions are untouched: only the tracked block folds.
+    /// A fold that clears a flag rebakes the whole bake, the way an
+    /// eviction does: the block sits mid-conversation, past the tail
+    /// the incremental bake re-renders, so its expanded rows would
+    /// otherwise keep painting a detail no toggle backs any more.
     fn settle_todo_expansion(&mut self) {
         let Some(id) = self.auto_expanded_todo.as_ref() else {
             return;
@@ -4612,8 +4687,12 @@ impl TuiApp {
             .is_ok_and(|tools| !tools.is_empty());
         if running {
             let id = id.clone();
-            self.expanded_tools.remove(&id);
+            let folded = self.expanded_tools.remove(&id);
             self.auto_expanded_todo = None;
+            if folded {
+                self.conversation_generation = self.conversation_generation.saturating_add(1);
+                self.rebake_whole();
+            }
         }
     }
 
@@ -10533,6 +10612,226 @@ mod tests {
         assert!(
             !subject.expanded_tools.contains("call_todo"),
             "the next tool starting folds it"
+        );
+    }
+
+    #[test]
+    fn an_automatic_fold_on_push_rebakes_off_the_baked_rows() {
+        // The sibling of the eviction pin, from the graduation side: a
+        // plan's expansion is armed for folding, and the next message
+        // folds it. By then the block sits mid-conversation, past the
+        // tail the incremental bake re-renders, so the fold has to
+        // retire the rows it baked while the flag stood — a collapsed
+        // toggle must not keep painting an expanded block.
+        let mut subject = app();
+        let receipt = [
+            "Changed: src/lib.rs (modified)",
+            "│ 1 line removed, 1 added",
+            "@@ -1,2 +1,2 @@",
+            "  fn main() {",
+            "-     old();",
+            "+     new();",
+            "  }",
+        ]
+        .join("\n");
+        subject.retain_tool_detail("call_todo", "{\"k\":1}", &receipt);
+        subject.push_message(TuiMessage::Assistant {
+            blocks: vec![ContentBlock::Tool {
+                name: "TodoWrite".to_string(),
+                call_id: "call_todo".to_string(),
+                input_preview: "src/lib.rs".to_string(),
+                output_preview: String::new(),
+                retained_input: String::new(),
+                success: true,
+                elapsed_secs: 0.1,
+            }],
+            timestamp: chrono::Utc::now(),
+            duration_ms: None,
+        });
+        subject.push_message(TuiMessage::User {
+            text: "after the block".to_string(),
+            timestamp: chrono::Utc::now(),
+            steered: false,
+        });
+        subject.expanded_tools.insert("call_todo".to_string());
+        subject.auto_expanded_todo = Some("call_todo".to_string());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24)).expect("terminal");
+        terminal
+            .draw(|frame| subject.render(frame))
+            .expect("first draw");
+        let expanded = buffer_text(terminal.backend().buffer());
+        assert!(
+            expanded.contains("old();"),
+            "the armed block draws its expanded detail: {expanded}"
+        );
+        subject.push_message(TuiMessage::Assistant {
+            blocks: vec![ContentBlock::Text {
+                text: "working on it".to_string(),
+            }],
+            timestamp: chrono::Utc::now(),
+            duration_ms: None,
+        });
+        assert!(
+            !subject.expanded_tools.contains("call_todo"),
+            "the next message folds the auto-expanded block"
+        );
+        terminal
+            .draw(|frame| subject.render(frame))
+            .expect("redraw");
+        let collapsed = buffer_text(terminal.backend().buffer());
+        assert!(
+            !collapsed.contains("old();"),
+            "the fold rebakes — the baked detail rows do not outlive the \
+             flag they rode: {collapsed}"
+        );
+        assert!(
+            collapsed.contains("src/lib.rs"),
+            "the block's own summary row stands: {collapsed}"
+        );
+    }
+
+    #[test]
+    fn a_settled_expansion_folds_rebake_off_the_baked_rows() {
+        // The same retirement from the frame's head: a tool starting to
+        // run folds the plan block, and the rows baked in its expanded
+        // shape go with the flag rather than outliving it.
+        let mut subject = app();
+        let receipt = [
+            "Changed: src/lib.rs (modified)",
+            "│ 1 line removed, 1 added",
+            "@@ -1,2 +1,2 @@",
+            "  fn main() {",
+            "-     old();",
+            "+     new();",
+            "  }",
+        ]
+        .join("\n");
+        subject.retain_tool_detail("call_todo", "{\"k\":1}", &receipt);
+        subject.push_message(TuiMessage::Assistant {
+            blocks: vec![ContentBlock::Tool {
+                name: "TodoWrite".to_string(),
+                call_id: "call_todo".to_string(),
+                input_preview: "src/lib.rs".to_string(),
+                output_preview: String::new(),
+                retained_input: String::new(),
+                success: true,
+                elapsed_secs: 0.1,
+            }],
+            timestamp: chrono::Utc::now(),
+            duration_ms: None,
+        });
+        subject.push_message(TuiMessage::User {
+            text: "after the block".to_string(),
+            timestamp: chrono::Utc::now(),
+            steered: false,
+        });
+        subject.expanded_tools.insert("call_todo".to_string());
+        subject.auto_expanded_todo = Some("call_todo".to_string());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24)).expect("terminal");
+        terminal
+            .draw(|frame| subject.render(frame))
+            .expect("first draw");
+        let expanded = buffer_text(terminal.backend().buffer());
+        assert!(
+            expanded.contains("old();"),
+            "the armed block draws its expanded detail: {expanded}"
+        );
+        subject
+            .active_tools()
+            .lock()
+            .expect("the tools lock")
+            .push(ActiveTool {
+                call_id: "call_next".to_string(),
+                name: "Bash".to_string(),
+                input_summary: String::new(),
+                start: Instant::now(),
+            });
+        subject.settle_todo_expansion();
+        assert!(
+            !subject.expanded_tools.contains("call_todo"),
+            "the tool starting to run folds it"
+        );
+        terminal
+            .draw(|frame| subject.render(frame))
+            .expect("redraw");
+        let collapsed = buffer_text(terminal.backend().buffer());
+        assert!(
+            !collapsed.contains("old();"),
+            "the fold rebakes — the baked detail rows do not outlive the \
+             flag they rode: {collapsed}"
+        );
+        assert!(
+            collapsed.contains("src/lib.rs"),
+            "the block's own summary row stands: {collapsed}"
+        );
+    }
+
+    #[test]
+    fn the_frame_window_opens_on_the_first_draw() {
+        // The per-second lane measures from the first draw it counts,
+        // not from the draw standing at its close — the difference
+        // between a second that can pass and one that never does. So
+        // the opening draw seeds the window and says nothing, and the
+        // counters go out whole when the window falls.
+        let epoch = Instant::now();
+        let mut stats = FrameStats {
+            anim_wakes: 4,
+            ..FrameStats::default()
+        };
+        assert!(
+            stats.note_draw(Duration::from_millis(5), epoch).is_none(),
+            "the opening draw seeds the window and reports nothing"
+        );
+        assert_eq!(stats.draws, 1, "and is counted itself");
+        assert!(
+            stats
+                .note_draw(Duration::from_millis(5), epoch + Duration::from_millis(900))
+                .is_none(),
+            "a draw inside the second leaves it standing"
+        );
+        let lane = stats
+            .note_draw(
+                Duration::from_millis(5),
+                epoch + Duration::from_millis(1_100),
+            )
+            .expect("a draw past the second closes the window");
+        assert_eq!(
+            (lane.anim_wakes, lane.draws),
+            (4, 3),
+            "the closed window reports everything it counted"
+        );
+        assert_eq!(stats.draws, 0, "the reopened window starts empty");
+        assert_eq!(stats.anim_wakes, 0, "in every counter");
+        assert!(stats.worst_draw.is_none(), "including the worst draw");
+        assert_eq!(
+            stats.second_start,
+            Some(epoch + Duration::from_millis(1_100)),
+            "the next window opens at the draw that closed the last"
+        );
+    }
+
+    #[test]
+    fn the_worst_draw_survives_the_second() {
+        // The lane carries the slowest draw the window saw, not the
+        // draw that happened to be standing when it closed.
+        let epoch = Instant::now();
+        let mut stats = FrameStats::default();
+        stats.note_draw(Duration::from_millis(3), epoch);
+        stats.note_draw(
+            Duration::from_millis(120),
+            epoch + Duration::from_millis(200),
+        );
+        let lane = stats
+            .note_draw(
+                Duration::from_millis(4),
+                epoch + Duration::from_millis(1_000),
+            )
+            .expect("the second closes");
+        assert_eq!(
+            lane.worst_draw_ms, 120,
+            "the window's maximum, not its last draw"
         );
     }
 

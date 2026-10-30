@@ -561,10 +561,14 @@ pub struct TuiObserverState {
     /// Plan entries left not completed when the driver's last run
     /// settled.
     ///
-    /// Captured once at the driver's end — the runner leaves with it —
-    /// so the session's exit lines can state unfinished work as a fact
-    /// for the user reading them. Zero when the plan ended clean or no
-    /// plan was ever filed.
+    /// Written by the driver beside every settled run and once more as
+    /// its task ends, so the session's exit lines can state unfinished
+    /// work as a fact for the user reading them. The field holds
+    /// [`UNDONE_NOT_CAPTURED`](Self::UNDONE_NOT_CAPTURED) until a run
+    /// records a real figure — a driver taken by the exit's bounded join
+    /// reaches no store at all, and the exit must not turn that silence
+    /// into a clean plan. Read it through
+    /// [`todos_undone_captured`](Self::todos_undone_captured).
     pub todos_undone_at_exit: Arc<std::sync::atomic::AtomicUsize>,
 
     /// Full tool calls captured at dispatch, keyed by call id.
@@ -743,6 +747,39 @@ impl TuiObserverState {
             .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// The figure the unfinished-work field holds until a run records
+    /// a real one.
+    ///
+    /// A count of plan entries cannot reach this — an entry count is
+    /// bounded by the store's own cap, orders of magnitude below
+    /// `usize::MAX` — so the sentinel cannot be confused with a
+    /// settled run's answer.
+    pub const UNDONE_NOT_CAPTURED: usize = usize::MAX;
+
+    /// Record what the run just settled left undone, for the exit lines.
+    ///
+    /// The driver calls this beside each settled run and once more as its
+    /// task ends; the exit reads the result through
+    /// [`Self::todos_undone_captured`].
+    pub fn record_todos_undone(&self, undone: usize) {
+        self.todos_undone_at_exit
+            .store(undone, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The recorded count, or `None` while no run has settled one.
+    ///
+    /// Keeping the two apart is the point: a driver taken by the exit's
+    /// bounded join stores nothing, and reading the field's built-in
+    /// figure as a count would tell the user the plan ended clean over a
+    /// session the save still carries as unfinished.
+    #[must_use]
+    pub fn todos_undone_captured(&self) -> Option<usize> {
+        let stored = self
+            .todos_undone_at_exit
+            .load(std::sync::atomic::Ordering::SeqCst);
+        (stored != Self::UNDONE_NOT_CAPTURED).then_some(stored)
+    }
+
     /// Create empty shared state.
     ///
     /// The single construction entry point — the observer and the
@@ -762,7 +799,9 @@ impl TuiObserverState {
             run_started_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             correction_cancel: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
             live_claim: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
-            todos_undone_at_exit: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            todos_undone_at_exit: Arc::new(std::sync::atomic::AtomicUsize::new(
+                Self::UNDONE_NOT_CAPTURED,
+            )),
             tool_captures: Arc::new(Mutex::new(HashMap::new())),
             errors: Arc::new(Mutex::new(Vec::new())),
             compactions: Arc::new(Mutex::new(Vec::new())),
@@ -1366,6 +1405,34 @@ mod tests {
         assert!(
             unfit.contains("the pass completed but the history still did not fit"),
             "a causeless failure names its own shape: {unfit}"
+        );
+    }
+
+    #[test]
+    fn the_unfinished_count_keeps_no_answer_apart_from_a_clean_plan() {
+        // The session's exit line turns this figure into a claim about
+        // the user's plan, so the shared state has to hold "the plan
+        // closed clean" apart from "no run ever settled a count" — a
+        // driver taken by the exit's bounded join records nothing, and
+        // its silence printed as zero would read as the clean verdict
+        // over a session the save still carries as unfinished.
+        let state = TuiObserverState::new();
+        assert_eq!(
+            state.todos_undone_captured(),
+            None,
+            "a fresh state carries no answer"
+        );
+        state.record_todos_undone(0);
+        assert_eq!(
+            state.todos_undone_captured(),
+            Some(0),
+            "a clean plan records a real zero"
+        );
+        state.record_todos_undone(3);
+        assert_eq!(
+            state.todos_undone_captured(),
+            Some(3),
+            "the last settled run's figure wins"
         );
     }
 

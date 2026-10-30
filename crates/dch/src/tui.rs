@@ -243,7 +243,7 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
         transcript_worker,
         guard,
         session_id,
-        state.todos_undone_at_exit.load(Ordering::SeqCst),
+        state.todos_undone_captured(),
     );
     session.map_err(|err| format!("terminal error: {err}"))
 }
@@ -258,12 +258,13 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
 /// stdout still buffers, the resume command included. The exit lines
 /// carry the session's last fact beside the command: plan entries the
 /// final run left undone, stated for the user who decides whether to
-/// resume.
+/// resume. `None` means no run settled a figure to state — the exit says
+/// the plan was never read rather than claiming it finished clean.
 fn restore_and_print_exit(
     transcript_worker: TranscriptWorker,
     guard: dch_tui::TerminalGuard,
     session_id: uuid::Uuid,
-    todos_undone: usize,
+    todos_undone: Option<usize>,
 ) {
     dch_tui::enter_signal_deaf_window();
     transcript_worker.join();
@@ -421,13 +422,17 @@ fn snapshot_tokens(
 /// exists however the session ended; printed after the transcript
 /// writer joins and the terminal is restored, on clean exits and
 /// failures alike.
-fn session_exit_line(session_id: uuid::Uuid, todos_undone: usize) -> String {
-    let plural = if todos_undone == 1 { "" } else { "s" };
+fn session_exit_line(session_id: uuid::Uuid, todos_undone: Option<usize>) -> String {
+    let resume = format!("Resume with:\ndch --resume {session_id}");
     match todos_undone {
-        0 => format!("Resume with:\ndch --resume {session_id}"),
-        undone => format!(
-            "Resume with:\ndch --resume {session_id}\
-             \n{undone} todo item{plural} left unfinished"
+        Some(0) => resume,
+        Some(undone) => {
+            let plural = if undone == 1 { "" } else { "s" };
+            format!("{resume}\n{undone} todo item{plural} left unfinished")
+        }
+        None => format!(
+            "{resume}\nthe run ended before its plan was read — dch cannot \
+             say whether todo items stand open"
         ),
     }
 }
@@ -443,7 +448,7 @@ fn session_exit_line(session_id: uuid::Uuid, todos_undone: usize) -> String {
 /// the label standing over a command that never printed. One
 /// `write_all` of the whole two-line string leaves through a single
 /// flush, so the lines reach the terminal together or not at all.
-fn print_session_exit(session_id: uuid::Uuid, todos_undone: usize) {
+fn print_session_exit(session_id: uuid::Uuid, todos_undone: Option<usize>) {
     use std::io::Write as _;
 
     let mut lines = session_exit_line(session_id, todos_undone);
@@ -1317,6 +1322,7 @@ async fn drive_submissions(
             .machine_history
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(resolved);
+        state.record_todos_undone(runner.todo_undone());
         if let Err(err) = &result {
             state
                 .active_tools
@@ -1377,11 +1383,7 @@ async fn drive_submissions(
         rescue_stranded_corrections(&mut revived, &mut receiver, &state);
     }
     state.mark_run_ended();
-    // The exit summary's fact: whatever the last settled run left
-    // undone, captured here because the runner leaves with this task.
-    state
-        .todos_undone_at_exit
-        .store(runner.todo_undone(), Ordering::SeqCst);
+    state.record_todos_undone(runner.todo_undone());
 }
 
 #[cfg(test)]
@@ -2048,7 +2050,7 @@ mod tests {
         // entries still undone and no further nudge coming — the exit
         // line owes the user that fact, beside the resume command.
         let id = uuid::Uuid::new_v4();
-        let lines = session_exit_line(id, 4);
+        let lines = session_exit_line(id, Some(4));
         let command = format!("dch --resume {id}");
         assert!(
             lines.contains(&command),
@@ -2058,12 +2060,12 @@ mod tests {
             lines.contains("4 todo items left unfinished"),
             "the unfinished count rides the exit lines: {lines}"
         );
-        let single = session_exit_line(id, 1);
+        let single = session_exit_line(id, Some(1));
         assert!(
             single.contains("1 todo item left unfinished"),
             "the singular spelling for one entry: {single}"
         );
-        let clean = session_exit_line(id, 0);
+        let clean = session_exit_line(id, Some(0));
         assert!(
             !clean.contains("unfinished"),
             "a clean plan's exit stays the plain two lines: {clean}"
@@ -2071,9 +2073,33 @@ mod tests {
     }
 
     #[test]
+    fn an_unread_plan_is_never_reported_as_a_clean_one() {
+        // The figure the exit lines print comes from the driver, and a
+        // driver taken by the exit's bounded join records nothing. The
+        // absence has to arrive as its own answer: printed as zero it
+        // would tell the user the plan closed clean over a session the
+        // save still carries as unfinished.
+        let id = uuid::Uuid::new_v4();
+        let unknown = session_exit_line(id, None);
+        let command = format!("dch --resume {id}");
+        assert!(
+            unknown.contains(&command),
+            "the resume command survives an unread plan: {unknown}"
+        );
+        assert!(
+            !unknown.contains("left unfinished") && !unknown.contains("clean"),
+            "the exit states its uncertainty rather than either verdict: {unknown}"
+        );
+        assert!(
+            unknown.contains("before its plan was read"),
+            "the unknown names itself as such: {unknown}"
+        );
+    }
+
+    #[test]
     fn the_exit_lines_label_and_name_the_resume_command() {
         let id = uuid::Uuid::new_v4();
-        let lines = session_exit_line(id, 0);
+        let lines = session_exit_line(id, Some(0));
         let mut printed = lines.split('\n');
         assert_eq!(
             printed.next(),
@@ -2506,6 +2532,18 @@ mod tests {
         /// count is the number of provider requests runs have made.
         fn request_count(&self) -> usize {
             self.requests.lock().map_or(0, |reqs| reqs.len())
+        }
+
+        /// The body of every request received, oldest first.
+        ///
+        /// The count says how many runs reached the provider; the
+        /// bodies say what they carried, which is what a pin needs to
+        /// show that a piece of text was *not* among them.
+        fn bodies(&self) -> Vec<String> {
+            self.requests
+                .lock()
+                .map(|reqs| reqs.clone())
+                .unwrap_or_default()
         }
     }
 
@@ -4115,21 +4153,86 @@ mod tests {
         driver.abort();
     }
 
+    /// Steers through the app's seam at a turn's start, from inside the run.
+    ///
+    /// The loop emits `on_turn_start` after it has drained its steering slot
+    /// for that turn and before it sends that turn's request, so a steer
+    /// offered here provably missed the boundary that could have read it.
+    /// A poll from the test task cannot establish that while the run opens:
+    /// a steer accepted that early is still ahead of the first drain and
+    /// rides the first request.
+    struct TurnStartSteer {
+        /// The app's seam, attached once the built runner hands out its slot.
+        guidance: std::sync::Mutex<Option<Arc<dyn dch_tui::Guidance>>>,
+        /// The text the observer steers.
+        text: &'static str,
+        /// Whether the run in flight accepted the steer.
+        accepted: AtomicBool,
+    }
+
+    impl TurnStartSteer {
+        /// A steer holding `text`, with no seam attached yet.
+        fn new(text: &'static str) -> Arc<Self> {
+            Arc::new(Self {
+                guidance: std::sync::Mutex::new(None),
+                text,
+                accepted: AtomicBool::new(false),
+            })
+        }
+
+        /// Attach the seam the observer steers through.
+        fn attach(&self, guidance: Arc<dyn dch_tui::Guidance>) {
+            *self.guidance.lock().expect("the seam lock") = Some(guidance);
+        }
+
+        /// Whether the run in flight took the steer.
+        fn accepted(&self) -> bool {
+            self.accepted.load(Ordering::SeqCst)
+        }
+    }
+
+    impl loopctl::observer::LoopObserver for TurnStartSteer {
+        fn name(&self) -> &'static str {
+            "turn-start-steer"
+        }
+
+        fn on_turn_start(&self, ctx: &loopctl::observer::TurnStartContext) {
+            if ctx.turn > 0 || self.accepted() {
+                return;
+            }
+            let offered = self
+                .guidance
+                .lock()
+                .expect("the seam lock")
+                .as_ref()
+                .is_some_and(|guidance| guidance.steer(self.text.to_string()));
+            if offered {
+                self.accepted.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_host_seam_reaches_a_running_loop_and_gives_back_what_it_missed() {
         // The response is held far longer than the test needs, so the run is
-        // provably in flight on both sides of the seam. This is the only test
-        // that crosses the whole host path — app trait object, adapter,
-        // engine slot, live loop — and it is the one that earns the
-        // translation: text in, engine message out, and what no run delivered
-        // back out as text again.
+        // provably in flight around the steer. This is the only test that
+        // crosses the whole host path — app trait object, adapter, engine
+        // slot, live loop — and it is the one that earns the translation:
+        // text in, engine message out, and what no run delivered back out as
+        // text again. The steer is placed by the loop's own turn event, so
+        // the run's never having read it is a fact of the run's shape rather
+        // than of the machine's speed. A sentinel rides the text because the
+        // request body carries the system prompt and the tool schemas, where
+        // ordinary words appear by coincidence.
         let server = SseServer::start_with_delay(
             vec![sse_text_turn("too late")],
             std::time::Duration::from_secs(30),
         )
         .await;
         let dir = tempfile::tempdir().expect("temp workdir");
+        let steer = TurnStartSteer::new("the report is in the other directory, host-3j8f");
         let runner = dch_loop::Runner::builder(&sse_config(server.port), dir.path())
+            .with_observer(Arc::clone(&steer) as Arc<dyn loopctl::observer::LoopObserver>)
             .build()
             .await
             .expect("runner construction");
@@ -4139,20 +4242,19 @@ mod tests {
         let seam: Arc<dyn dch_tui::Guidance> = Arc::new(LoopGuidance {
             steering: runner.steering(),
         });
+        steer.attach(Arc::clone(&seam));
         let task = tokio::spawn(async move {
             let mut runner = runner;
             drop(runner.run("go").await);
         });
 
-        let mut accepted = false;
-        for _ in 0..400 {
-            if seam.steer("the report is in the other directory".to_string()) {
-                accepted = true;
-                break;
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while !steer.accepted() || server.request_count() < 1 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(accepted, "the seam reached the loop while it ran");
+        })
+        .await
+        .expect("the seam reached the loop while its request was in flight");
 
         cancel.cancel();
         tokio::time::timeout(std::time::Duration::from_secs(10), task)
@@ -4160,9 +4262,16 @@ mod tests {
             .expect("the cancelled run settles promptly")
             .expect("the driving task does not panic");
 
+        let bodies = server.bodies();
+        assert_eq!(bodies.len(), 1, "one request was in flight: {bodies:?}");
+        assert!(
+            !bodies[0].contains("host-3j8f"),
+            "a steer behind the drain cannot retroactively enter the request \
+             its turn sent: {bodies:?}"
+        );
         assert_eq!(
             seam.take_returned(),
-            ["the report is in the other directory"],
+            ["the report is in the other directory, host-3j8f"],
             "what the run never read comes back through the adapter as text — \
              including the guidance the ended run left in its live queue, not \
              only what an earlier run sealed away"

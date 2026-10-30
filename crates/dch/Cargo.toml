@@ -42,6 +42,9 @@ name = "tui_final_answer"
 name = "todo_followup"
 
 [[test]]
+name = "todo_exit_summary"
+
+[[test]]
 name = "resume_stale_real"
 
 [[test]]

@@ -16,8 +16,8 @@ use dch_tui::ToolResultDisplay;
 use dch_tui::message::ActiveTool;
 use dch_tui::theme::Theme;
 use dch_tui::tool_render::{
-    ERR_GLYPH, OK_GLYPH, RUNNING_GLYPH, SPINNER_FRAMES, completed_tool_lines,
-    humanize_tool_summary, running_tool_lines,
+    ERR_GLYPH, OK_GLYPH, RUNNING_GLYPH, SPINNER_FRAME_MS, SPINNER_FRAMES, completed_tool_lines,
+    humanize_tool_summary, running_tool_lines, spinner_frame_at,
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -323,23 +323,57 @@ fn a_capped_stash_still_humanizes() {
 }
 
 #[test]
-fn elapsed_time_drives_the_frame() {
+fn elapsed_time_selects_the_spinner_frame() {
+    // The dot turns on the row's own elapsed clock, so the frame is a
+    // plain function of that duration: one cell per period, the orbit
+    // wrapping on itself. Driven by durations rather than by the wall
+    // gap between two renders — a loaded runner can stretch that gap
+    // by a whole revolution, which is how this pin used to fail.
+    let period = std::time::Duration::from_millis(SPINNER_FRAME_MS);
+    let orbit = u32::try_from(SPINNER_FRAMES.len()).unwrap_or(10);
+    assert_eq!(
+        spinner_frame_at(std::time::Duration::ZERO),
+        SPINNER_FRAMES[0],
+        "a call that has not run shows the orbit's first cell"
+    );
+    assert_eq!(
+        spinner_frame_at(
+            period
+                .checked_sub(std::time::Duration::from_millis(1))
+                .expect("a period is longer than a millisecond"),
+        ),
+        SPINNER_FRAMES[0],
+        "inside the period the cell holds"
+    );
+    assert_eq!(
+        spinner_frame_at(period),
+        SPINNER_FRAMES[1],
+        "one period turns one cell"
+    );
+    assert_eq!(
+        spinner_frame_at(period * 2),
+        SPINNER_FRAMES[2],
+        "two periods turn two cells"
+    );
+    assert_eq!(
+        spinner_frame_at(period * orbit),
+        SPINNER_FRAMES[0],
+        "a full revolution wraps back to the first cell"
+    );
+    assert_eq!(
+        spinner_frame_at(period * orbit.saturating_add(1)),
+        SPINNER_FRAMES[1],
+        "and the orbit keeps turning past the wrap"
+    );
+
+    // The wiring the index feeds: a running row leads with one of the
+    // orbit's cells, whichever one its clock happens to stand on.
     let theme = Theme::default();
-    // Elapsed-derived frames: two tools started a frame apart render
-    // different glyphs on the same redraw — the dot turns on each
-    // row's own clock, not a shared tick.
-    let mut fresh = active("Read", "a");
-    fresh.start = std::time::Instant::now();
-    let mut aged = active("Read", "a");
-    aged.start = std::time::Instant::now()
-        .checked_sub(std::time::Duration::from_millis(80))
-        .unwrap_or_else(std::time::Instant::now);
-    let first = running_tool_lines(&fresh, &theme, Verbosity::Quiet);
-    let second = running_tool_lines(&aged, &theme, Verbosity::Quiet);
-    assert_ne!(
-        text_of(&first[0]),
-        text_of(&second[0]),
-        "a frame of elapsed time between starts advances the glyph"
+    let lines = running_tool_lines(&active("Read", "a"), &theme, Verbosity::Quiet);
+    let text = text_of(&lines[0]);
+    assert!(
+        SPINNER_FRAMES.iter().any(|frame| text.starts_with(*frame)),
+        "the running line leads with the frame the clock selects: {text:?}"
     );
 }
 

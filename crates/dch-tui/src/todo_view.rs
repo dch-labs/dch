@@ -282,7 +282,10 @@ pub(crate) fn parse_submission(input_json: &str) -> Option<Vec<TodoRow>> {
 /// result. Reads the render's own icons (`○` pending, `◐` in
 /// progress, `●` completed) and ids from the entry lines; `None` when
 /// the output carries no task list (a cleared list, an error) so the
-/// caller falls back to whatever it can read of the request.
+/// caller falls back to whatever it can read of the request. An id
+/// carrying `] ` is ambiguous on the page — the format escapes nothing —
+/// and reads back as its shortest prefix; [`parse_submission`] is the
+/// authority wherever both reads are at hand.
 pub(crate) fn parse_rendered(output: &str) -> Option<Vec<TodoRow>> {
     if !output.contains("# Task List") {
         return None;
@@ -697,6 +700,20 @@ Summary: 9 pending, 1 in progress, 2 completed\n\n\
         // falls back to reading the request — never to inventing rows.
         assert!(parse_rendered("Todo list cleared.").is_none());
         assert!(parse_rendered("Invalid input: nope").is_none());
+    }
+
+    #[test]
+    fn an_id_carrying_the_closing_bracket_reads_back_as_its_shortest_prefix() {
+        // The render escapes nothing, so `○ [a] b] the tail` is the same
+        // page for two different plans and no parse rule can prefer one.
+        // The pin holds what this parser really does — close the id at the
+        // first `] ` — rather than a promise the format cannot keep; the
+        // submission's parse is the authority wherever both are at hand.
+        let rows = parse_rendered("# Task List\n\n\u{25cb} [a] b] the tail\n")
+            .expect("the header marks a task list");
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].id, "a", "the first `] ` closes the id");
+        assert_eq!(rows[0].subject, "b] the tail");
     }
 
     #[test]

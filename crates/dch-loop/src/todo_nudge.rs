@@ -53,9 +53,8 @@ type PlanState = Vec<(String, String, TodoStatus)>;
 /// Set by [`TodoNudgeHook`]'s post-tool consult when a successful
 /// non-`TodoWrite` tool call lands while the plan holds undone work and
 /// nothing stands in progress — the exact moment the start discipline
-/// broke — and cleared by any successful `TodoWrite`, at every run's
-/// first turn, and by [`Self::record_tool_call`] itself whenever the
-/// plan no longer matches the violation. The contributor reads it at
+/// broke — and cleared by any successful `TodoWrite` or at every run's
+/// first turn. The contributor reads it at
 /// the next turn top, so the reminder lands on the first request after
 /// the break.
 pub(crate) struct PlanGate {
@@ -220,10 +219,11 @@ impl Hook for TodoNudgeHook {
             );
             return None;
         }
-        let reminder = reminder_text(&self.todos)?;
+        let (undone, reminder) = reminder_text(&self.todos)?;
         tracing::debug!(
             target: "dch_loop::todo_nudge",
-            "{reminder}"
+            undone,
+            "end-of-run follow-up offered"
         );
         (self.echo)(reminder.clone());
         Some(PostRunAction::FollowUp {
@@ -456,6 +456,10 @@ impl TodoReminderContributor {
         let none_running = state
             .iter()
             .all(|entry| !matches!(entry.2, TodoStatus::InProgress));
+        let undone = state
+            .iter()
+            .filter(|entry| !matches!(entry.2, TodoStatus::Completed))
+            .count();
         if none_running && self.gate.work_unmarked() {
             let damped = dampers.start.is_some_and(|answered| {
                 turn >= answered && turn.saturating_sub(answered) <= STALE_REARM_TURNS
@@ -466,7 +470,8 @@ impl TodoReminderContributor {
                 tracing::debug!(
                     target: "dch_loop::todo_nudge",
                     turn,
-                    "{reminder}"
+                    undone,
+                    "start-discipline reminder contributed"
                 );
                 return Some(reminder);
             }
@@ -481,11 +486,14 @@ impl TodoReminderContributor {
                 return None;
             }
             dampers.stale = Some(turn);
-            let reminder = stale_wording(&state, turn.saturating_sub(birth));
+            let age = turn.saturating_sub(birth);
+            let reminder = stale_wording(&state, age);
             tracing::debug!(
                 target: "dch_loop::todo_nudge",
                 turn,
-                "{reminder}"
+                age,
+                undone,
+                "stale-plan reminder contributed"
             );
             return Some(reminder);
         }
@@ -635,13 +643,17 @@ fn plan_state(todos: &Mutex<Vec<TodoEntry>>) -> PlanState {
         .collect()
 }
 
-/// The reminder wording for a list with undone work, if there is any.
+/// The undone count and the reminder wording naming it, if any work
+/// stands.
 ///
 /// The end-of-run half's gate: the count names what stands, `None`
-/// stays `None` for a finished or empty list so a clean run ends clean.
-pub(crate) fn reminder_text(todos: &Mutex<Vec<TodoEntry>>) -> Option<String> {
+/// stays `None` for a finished or empty list so a clean run ends
+/// clean. Count and wording travel together because the log reports
+/// the number while the wire carries the sentence, and the two must
+/// never disagree about what stands.
+pub(crate) fn reminder_text(todos: &Mutex<Vec<TodoEntry>>) -> Option<(usize, String)> {
     let undone = count_undone(todos);
-    (undone > 0).then(|| closing_wording(undone))
+    (undone > 0).then(|| (undone, closing_wording(undone)))
 }
 
 /// Whether a message's text is one of this module's reminder wordings.
@@ -997,7 +1009,7 @@ mod tests {
                 .iter()
                 .filter(|entry| !matches!(entry.status, TodoStatus::Completed))
                 .count();
-            let reminder = reminder_text(&std::sync::Mutex::new(list));
+            let reminder = reminder_text(&std::sync::Mutex::new(list)).map(|(_n, text)| text);
             if undone == 0 {
                 prop_assert!(reminder.is_none());
             } else {
@@ -1019,8 +1031,9 @@ mod tests {
             entry("b", TodoStatus::Pending),
             entry("c", TodoStatus::InProgress),
         ];
-        let reminder =
+        let (undone, reminder) =
             reminder_text(&Mutex::new(mixed.to_vec())).expect("undone work earns a reminder");
+        assert_eq!(undone, 2, "the count the log carries");
         assert!(
             reminder.starts_with("reminder: 2 todo items still not completed"),
             "the count names every non-completed entry and takes the plural: {reminder}"

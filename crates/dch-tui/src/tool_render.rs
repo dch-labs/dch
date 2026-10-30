@@ -38,6 +38,29 @@ pub const SPINNER_FRAMES: &[&str] = &[
     "\u{2807}", "\u{280f}",
 ];
 
+/// The spinner frame an elapsed clock shows.
+///
+/// Each full [`SPINNER_FRAME_MS`] of the call's own elapsed time turns
+/// the orbit one cell, and a full revolution wraps back to the first
+/// cell. Every running row reads its frame from its own duration on
+/// each redraw rather than from a shared tick, so two calls a period
+/// apart show two cells on one frame and a coarse beat between draws
+/// can neither freeze the turn nor skip a beat.
+#[must_use]
+pub fn spinner_frame_at(elapsed: std::time::Duration) -> &'static str {
+    let periods = elapsed
+        .as_millis()
+        .checked_div(u128::from(SPINNER_FRAME_MS))
+        .unwrap_or(0);
+    let orbit = u128::try_from(SPINNER_FRAMES.len()).unwrap_or(1);
+    let index = usize::try_from(periods.checked_rem(orbit).unwrap_or(0)).unwrap_or(0);
+    SPINNER_FRAMES
+        .get(index)
+        .or_else(|| SPINNER_FRAMES.first())
+        .copied()
+        .unwrap_or("")
+}
+
 /// The running indicator for the per-tool line.
 ///
 /// The static hourglass the spec names for in-flight calls; the
@@ -282,22 +305,9 @@ pub fn running_tool_lines(
     theme: &Theme,
     verbosity: Verbosity,
 ) -> Vec<Line<'static>> {
-    let elapsed_secs = tool.start.elapsed().as_secs_f64();
-    let elapsed = format_elapsed(elapsed_secs);
-    let frame_index = usize::try_from(
-        tool.start
-            .elapsed()
-            .as_millis()
-            .checked_div(u128::from(SPINNER_FRAME_MS))
-            .unwrap_or(0),
-    )
-    .unwrap_or(0)
-    .checked_rem(SPINNER_FRAMES.len())
-    .unwrap_or(0);
-    let frame = SPINNER_FRAMES
-        .get(frame_index)
-        .or_else(|| SPINNER_FRAMES.first())
-        .unwrap_or(&"");
+    let since_start = tool.start.elapsed();
+    let elapsed = format_elapsed(since_start.as_secs_f64());
+    let frame = spinner_frame_at(since_start);
     match verbosity {
         Verbosity::Quiet => vec![Line::from(Span::styled(
             format!(

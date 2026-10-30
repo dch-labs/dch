@@ -117,8 +117,11 @@ fn run_id(submission: dch_tui::Submission) -> u64 {
 /// a dropped one makes every later submit a failed send, which is a different
 /// test's subject. The agent is staged as running so the mid-run shapes
 /// these tests drive (steering into a live turn, chords that serve it)
-/// stand on their real precondition; the section itself no longer hangs
-/// on the flag — it rises whenever anything waits, run or not.
+/// stand on their real precondition. The waiting panel itself does not
+/// hang on that flag: it rises for a prompt the *next* run still owes
+/// (no run in flight to take it) and stays down for one already handed to
+/// the in-flight run, which is a claim away from running rather than a
+/// prompt waiting on nobody.
 fn app_with_waiting(
     texts: &[&str],
 ) -> (
@@ -214,7 +217,7 @@ fn an_idle_submit_with_no_driver_still_echoes_at_once() {
 }
 
 #[test]
-fn the_waiting_section_rises_whenever_prompts_wait_run_or_not() {
+fn the_section_rises_for_an_owed_prompt_and_stays_down_for_a_claim_hop() {
     // The section is not the run's shadow. Prompts a resume owes wait
     // with no run up, and hiding them behind a run gate would put them
     // back in the invisible backlog the seeding exists to clear — so

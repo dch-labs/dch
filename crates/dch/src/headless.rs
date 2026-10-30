@@ -3,9 +3,13 @@
 //! This is the dispatch target for task-mode invocations — a task
 //! argument or a piped stdin. It owns no agent-loop
 //! logic — everything turn/stream/dispatch lives in loopctl via the runner —
-//! and prints nothing of its own: the model's answer reaches stdout through
-//! the [`ConsoleObserver`] stream. This module resolves the prompt, maps the
-//! outcome to the process exit code, and writes the `--done-file` marker.
+//! and prints nothing of its own beyond the answer the task asked for:
+//! the model's reply reaches stdout through the [`ConsoleObserver`]
+//! stream, and the only unsolicited word is the one warning line a run
+//! leaves on stderr when it ends with todos still open (reported
+//! panic-proof, as every other stderr word here is). This module
+//! resolves the prompt, maps the outcome to the process exit code, and
+//! writes the `--done-file` marker.
 
 use std::io::{IsTerminal, Read};
 use std::path::Path;
@@ -260,7 +264,7 @@ async fn run_headless_inner(
         ..
     } = &control
     {
-        eprintln!("dch: {warning}");
+        crate::signals::report(&format!("dch: {warning}"));
     }
     if let Some(path) = &args.done_file {
         match std::fs::remove_file(path) {
@@ -271,10 +275,6 @@ async fn run_headless_inner(
                     "cannot clear the stale done-file at {}: {err}",
                     path.display()
                 );
-                // The rename-based write needs directory permission the
-                // removal just proved absent; an in-place overwrite needs
-                // only file permission and at minimum invalidates the
-                // previous run's outcome.
                 drop(overwrite_done_file(path, &DoneStatus::failure(&message)));
                 let outcome = construction_failure(args, message, inherited_mode.as_ref());
                 startup_bridge.stop().await;
@@ -346,7 +346,9 @@ async fn run_headless_inner(
             let undone = runner.todo_undone();
             if undone > 0 {
                 let plural = if undone == 1 { "" } else { "s" };
-                eprintln!("warning: {undone} todo item{plural} left unfinished");
+                crate::signals::report(&format!(
+                    "warning: {undone} todo item{plural} left unfinished"
+                ));
             }
             bridge.stop().await;
             Ok(outcome)

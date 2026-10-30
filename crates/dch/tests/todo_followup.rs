@@ -75,9 +75,17 @@ fn a_headless_run_with_an_undone_plan_gets_one_reminder_turn() {
         .expect("the one saved session");
     let machine = std::fs::read_to_string(session_dir.join("machine.json"))
         .expect("the machine history file");
+    // The law is the wording, not one run's spelling of it: no reminder
+    // the belts contribute — at any count, mid-run or at the end — is
+    // allowed to persist as a user message. The specific phrase alone
+    // would pass a save that kept a different reminder turn.
     assert!(
-        !machine.contains("reminder: 1 todo item"),
-        "the follow-up prompt never persists as a user message: {machine}"
+        !machine.contains("reminder:"),
+        "no contributed reminder persists in the machine history: {machine}"
+    );
+    assert!(
+        !machine.contains("still not completed"),
+        "nor does any spelling of the end-of-run offer: {machine}"
     );
     assert!(
         machine.contains("noted, but not closing it"),
@@ -331,12 +339,33 @@ fn a_headless_planless_run_gets_one_creation_note_that_never_persists() {
         .find(|path| path.join("session.json").is_file())
         .expect("the one saved session");
     for file in ["session.json", "machine.json"] {
-        let body = std::fs::read_to_string(session_dir.join(file)).unwrap_or_default();
+        // The read cannot fall back to an empty string: a file the
+        // save never wrote would satisfy "no trace of the note"
+        // without being read at all, and the pin would pass on the
+        // absence it is meant to catch.
+        let body = std::fs::read_to_string(session_dir.join(file))
+            .expect("the save writes both files before the run ends");
         assert!(
             !body.contains("file one with TodoWrite now"),
             "the {file} file holds no trace of the note"
         );
     }
+    // The same entry's save carries the loop's own context figure —
+    // the number the listing's CONTEXT column and a resumed status bar
+    // read — where a hand-written headless envelope used to record a
+    // flat zero.
+    let saved: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(session_dir.join("session.json")).expect("session.json"),
+    )
+    .expect("session.json is JSON");
+    let context = saved
+        .get("tokens")
+        .and_then(|tokens| tokens.get("context_tokens"))
+        .and_then(serde_json::Value::as_u64);
+    assert!(
+        context.is_some_and(|tokens| tokens > 0),
+        "the headless save carries the run's context figure: {saved:?}"
+    );
 }
 
 #[test]
@@ -344,22 +373,25 @@ fn the_machinery_speaks_to_the_log_when_rust_log_names_it() {
     // The belts answer the "is it nudging?" question from the log
     // instead of a wire proxy: with RUST_LOG naming the nudge target,
     // the real binary's stderr carries every contribution and offer,
-    // named and counted.
-    // SAFETY: tests run multi-threaded, but this env is set before
-    // the child spawns and read by no other test in this binary.
-    unsafe { std::env::set_var("RUST_LOG", "dch_loop::todo_nudge=debug") };
+    // each named by its own event and counted — and no plan text in
+    // sight. The wording itself stays where the transcript pins read
+    // it: on the wire.
     let sb = Sandbox::sse(vec![
         sse_tool_call_turn(
             "TodoWrite",
             &json!({"todos": [{"id": "only", "subject": "the work",
                                "status": "pending"}]}),
         ),
+        // Work without a runner: the successful call after the plan is
+        // what arms the start-discipline belt.
+        sse_tool_call_turn("Bash", &json!({"command": "echo working"})),
         sse_text_turn("working on it"),
         sse_text_turn("noted, but not closing it"),
     ]);
-    let out = sb.dch(&["do the thing"]);
-    // SAFETY: no other test in this binary reads RUST_LOG.
-    unsafe { std::env::remove_var("RUST_LOG") };
+    let out = sb.dch_env(
+        &["do the thing"],
+        &[("RUST_LOG", "dch_loop::todo_nudge=debug")],
+    );
     assert!(
         out.status.success(),
         "the run completes: stderr: {}",
@@ -367,12 +399,35 @@ fn the_machinery_speaks_to_the_log_when_rust_log_names_it() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("still not completed"),
-        "the mid-run reminder's contribution is named in the log: {stderr}"
+        stderr.contains("start-discipline reminder contributed"),
+        "the mid-run belt's own event stands in the log: {stderr}"
     );
     assert!(
-        stderr.contains("1 todo item still not completed"),
-        "the end-of-run offer is named with its count: {stderr}"
+        stderr.contains("end-of-run follow-up offered"),
+        "the end-of-run offer reports under its own event, not the \
+         mid-run one's: {stderr}"
+    );
+    assert!(
+        stderr.contains("undone=1"),
+        "the offer line carries the count in place of the plan's words: {stderr}"
+    );
+    assert!(
+        stderr.contains("1 todo item left unfinished"),
+        "the same run's exit tells the terminal the count the log \
+         holds: {stderr}"
+    );
+    assert!(
+        !stderr.contains("the work"),
+        "the log names events, never the subjects the plan carries: {stderr}"
+    );
+    let wire = sb.requests().join("\n");
+    assert!(
+        wire.contains("work is underway with no plan entry in progress"),
+        "the mid-run reminder still reaches the model in its wording: {wire}"
+    );
+    assert!(
+        wire.contains("1 todo item still not completed"),
+        "the end-of-run offer still reaches the model in its wording: {wire}"
     );
 }
 

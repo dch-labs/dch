@@ -162,7 +162,8 @@ impl ApiClient for DchClient {
 /// Build a [`DchClient`] for the provider named by `config.api_type`.
 ///
 /// Variants are mapped by wire-protocol family: OpenAI-compatible providers
-/// (`OpenAi`, `Ollama`, `DeepSeek`, `Grok`, `Azure`, `Moonshot`) wrap an
+/// (`OpenAi`, `Ollama`, `SelfHosted`, `DeepSeek`, `Grok`, `Azure`,
+/// `Moonshot`) wrap an
 /// [`OpenAiClient`]; Anthropic-compatible providers (`Anthropic`, `Zai`)
 /// wrap an [`AnthropicClient`]; `Gemini` wraps a [`GeminiClient`]. The
 /// profiled providers start from loopctl's pre-seeded profile builders,
@@ -185,8 +186,9 @@ impl ApiClient for DchClient {
 /// (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY` or
 /// `GOOGLE_API_KEY`); the profiled providers inherit their profile's
 /// seeded variable (for example `DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY`)
-/// from the builder; a keyless Ollama configuration carries its
-/// profile's seeded dummy credential. If a required
+/// from the builder; a keyless Ollama or self-hosted configuration
+/// carries its profile's seeded dummy credential — the placeholder the
+/// OpenAI wire demands of a route that asks for no secret. If a required
 /// key is missing, returns [`RunnerError::Client`] naming the expected
 /// environment variable.
 ///

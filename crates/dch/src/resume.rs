@@ -66,9 +66,12 @@ pub(crate) enum ResumeControl {
 /// A loaded session: everything both run modes need to continue it.
 ///
 /// Built by [`load_for_resume_in`] from one file read. The display
-/// model is verbatim — what was saved is what renders; the agent
-/// history is derived from it through [`tui_messages_to_loopctl`],
-/// which is lossy by design.
+/// model is verbatim — what was saved is what renders — with one
+/// exception: the retired reminder rows [`load_for_resume_in`] drops
+/// by wording, from the transcript and the machine snapshot alike, so
+/// neither a pre-hide file nor a post-hide one replays a note the mode
+/// no longer owns. The agent history is derived from the display model
+/// through [`tui_messages_to_loopctl`], which is lossy by design.
 #[derive(Debug)]
 pub(crate) struct ResumeOutcome {
     /// The resumed session's UUID, echoed from the id asked for.
@@ -78,7 +81,8 @@ pub(crate) struct ResumeOutcome {
     /// under a fresh identity.
     pub(crate) session_id: Uuid,
 
-    /// The saved conversation in display form, verbatim.
+    /// The saved conversation in display form, verbatim but for the
+    /// retired reminder rows the load drops.
     ///
     /// What was saved is what renders; the agent history is seeded from
     /// the machine snapshot when one is fresh, and only derived from
@@ -426,7 +430,10 @@ pub(crate) fn load_for_resume_in(id: Uuid, base: &Path) -> Result<ResumeOutcome,
         })
         .collect();
     let (machine, machine_compactions) = match crate::session::load_machine_in(id, base, saved_at) {
-        Some((messages, compactions)) => (Some(messages), compactions),
+        Some((messages, compactions)) => (
+            Some(dch_loop::history_without_nudge(&messages)),
+            compactions,
+        ),
         None => (None, 0),
     };
     Ok(ResumeOutcome {
@@ -1398,6 +1405,68 @@ mod tests {
             vec!["do the work", "take the other branch"],
             "the corpse is gone; the typed prompt and the real steer \
              keep their places: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn a_pre_hide_machine_snapshot_loads_without_its_reminder_rows() {
+        // The display-side pin above has a machine-side twin. A file
+        // saved while the belts still stored their notes carries those
+        // rows on the machine half while the transcript half has always
+        // been filtered — and the two halves are exactly what the
+        // staleness guard counts against each other, so a basis that
+        // diverges by however many notes a session happened to attract
+        // misreads a healthy snapshot. The same filter runs on both, so
+        // a resumed run never replays a retired reminder either.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.keep();
+        let id = uuid::Uuid::new_v4();
+        let stamp = chrono::Utc::now();
+        let saver = crate::session::SessionSaver::with_base_dir(id, "m".to_string(), root.clone());
+        saver
+            .save_at(
+                &[user("do the work"), assistant(vec![text_block("on it")])],
+                crate::session::SessionTokens::default(),
+                stamp,
+            )
+            .unwrap();
+        let note = loopctl::message::Message::new(
+            loopctl::message::Role::User,
+            vec![loopctl::message::MessagePart::text(
+                "reminder: 1 todo item still not completed — finish the \
+                 remaining work, or mark the entries done / remove them \
+                 with TodoWrite, then finish",
+            )],
+        );
+        saver
+            .save_machine(
+                &[
+                    loopctl::message::Message::new(
+                        loopctl::message::Role::User,
+                        vec![loopctl::message::MessagePart::text("do the work")],
+                    ),
+                    note,
+                    loopctl::message::Message::new(
+                        loopctl::message::Role::Assistant,
+                        vec![loopctl::message::MessagePart::text("on it")],
+                    ),
+                ],
+                stamp,
+                0,
+            )
+            .unwrap();
+        let outcome = load_for_resume_in(id, &root).unwrap();
+        let machine = outcome.machine.expect("a fresh snapshot is adopted");
+        assert!(
+            !machine
+                .iter()
+                .any(|message| dch_loop::is_nudge_wording(&message.text_content())),
+            "the machine half loads on the transcript's basis: {machine:?}"
+        );
+        assert_eq!(
+            machine.len(),
+            2,
+            "the conversation the snapshot really held survives the filter: {machine:?}"
         );
     }
 
