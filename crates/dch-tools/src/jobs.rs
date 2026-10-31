@@ -620,6 +620,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spawned_job_ids_are_never_reused() {
+        use proptest::test_runner::Config;
+        use proptest::test_runner::TestRunner;
+
+        let _guard = JOB_TEST_GUARD.lock().await;
+        // The contract is cross-batch: an id-recycling implementation
+        // (a free-slot list, a counter reset) hands fresh batches the
+        // same ids it already spent, every batch internally distinct —
+        // so the oracle accumulates every batch's ids into one set and
+        // demands global distinctness, and the table reset between
+        // batches is the hostile condition it must survive.
+        let mut runner = TestRunner::new(Config::with_cases(16));
+        // Interior mutability because the runner's closure is `Fn`: the
+        // set accumulates across cases, which is where the oracle lives.
+        let seen = std::cell::RefCell::new(std::collections::HashSet::<u64>::new());
+        runner
+            .run(&(1usize..8), |batch| {
+                reset_job_table();
+                let mut seen = seen.borrow_mut();
+                for _ in 0..batch {
+                    let id = spawn_background_job("true", ".", 5);
+                    if !seen.insert(id) {
+                        return Err(proptest::test_runner::TestCaseError::fail(
+                            "an id served a second job across batches",
+                        ));
+                    }
+                }
+                Ok(())
+            })
+            .expect("the id property holds over every generated batch");
+    }
+
+    #[tokio::test]
     async fn job_status_after_completion() {
         let _guard = JOB_TEST_GUARD.lock().await;
         let tmp = tempfile::TempDir::new().unwrap();

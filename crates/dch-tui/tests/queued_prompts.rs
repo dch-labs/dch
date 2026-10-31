@@ -117,8 +117,11 @@ fn run_id(submission: dch_tui::Submission) -> u64 {
 /// a dropped one makes every later submit a failed send, which is a different
 /// test's subject. The agent is staged as running so the mid-run shapes
 /// these tests drive (steering into a live turn, chords that serve it)
-/// stand on their real precondition; the section itself no longer hangs
-/// on the flag — it rises whenever anything waits, run or not.
+/// stand on their real precondition. The waiting panel itself does not
+/// hang on that flag: it rises for a prompt the *next* run still owes
+/// (no run in flight to take it) and stays down for one already handed to
+/// the in-flight run, which is a claim away from running rather than a
+/// prompt waiting on nobody.
 fn app_with_waiting(
     texts: &[&str],
 ) -> (
@@ -214,14 +217,17 @@ fn an_idle_submit_with_no_driver_still_echoes_at_once() {
 }
 
 #[test]
-fn the_waiting_section_rises_whenever_prompts_wait_run_or_not() {
-    // The section is not the run's shadow. Prompts a resume owes wait
-    // with no run up, and hiding them behind a run gate would put them
-    // back in the invisible backlog the seeding exists to clear — so
-    // anything waiting raises the panel, idle or not. A fresh submit
-    // shows it for the frame or two before the driver's claim takes
-    // the entry; that flash is the cost of the owed prompts being
-    // visible, and the claim still takes the prompt exactly as before.
+fn the_section_rises_for_an_owed_prompt_and_stays_down_for_a_claim_hop() {
+    // The section is not the run's shadow. A queued prompt can stand
+    // with no run up — the moment between one run settling and the
+    // driver claiming the next id — and hiding that behind a run gate
+    // would blank the panel exactly when the user looks to see what
+    // still stands, so anything genuinely waiting raises the panel,
+    // idle or not. The one thing that does not raise it is the
+    // handoff window: a submit into a session at rest is the driver's
+    // next claim, one channel hop away, and its row stays hidden for
+    // that hop instead of flashing under the title — the claim takes
+    // it exactly as before.
     let (mut app, kept) = app_with_state();
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     app.set_submit_tx(tx);
@@ -230,15 +236,79 @@ fn the_waiting_section_rises_whenever_prompts_wait_run_or_not() {
 
     let rendered = rows(&mut app, 80, 24);
     assert!(
-        !marker_rows(&rendered).is_empty(),
-        "no run is up and one prompt waits — the panel is up with it: {rendered:?}"
+        marker_rows(&rendered).is_empty(),
+        "the fresh submit is one claim hop from running — no flash \
+         under the title: {rendered:?}"
     );
     assert_eq!(
         waiting(&kept).len(),
         1,
         "the prompt itself is still in the queue for the driver's claim"
     );
-    drop(rx);
+
+    // A prompt still queued with no run up — the settle-to-claim
+    // moment above — has no claim coming this frame, and the panel
+    // carries it.
+    std::mem::drop(rx);
+    let (mut app, kept) = app_with_state();
+    kept.queued
+        .lock()
+        .unwrap()
+        .push("waiting with no run up".to_string());
+    let rendered = rows(&mut app, 80, 24);
+    assert!(
+        !marker_rows(&rendered).is_empty(),
+        "a waiting prompt shows with no run up: {rendered:?}"
+    );
+}
+
+#[test]
+fn the_resume_s_empty_queue_takes_the_user_s_next_prompt_cleanly() {
+    // The kill-then-resume shape end to end, at the seam the mess
+    // lived in: the transcript carries the exit's echoed rows, the
+    // queue opens empty, and the first submit after the resume is the
+    // driver's next claim — one entry, one submission, nothing
+    // resurrected in front of it and nothing left waiting behind it.
+    let (mut app, kept) = app_with_state();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    app.set_submit_tx(tx);
+    let now = chrono::Utc::now();
+    app.seed_messages(vec![
+        TuiMessage::Error {
+            text: "Agent cancelled".to_string(),
+            timestamp: now,
+        },
+        TuiMessage::User {
+            text: "queued when the kill came".to_string(),
+            timestamp: now,
+            steered: false,
+            unsent: false,
+        },
+    ]);
+    assert!(
+        waiting(&kept).is_empty(),
+        "the resume opens with the queue the kill left: empty"
+    );
+
+    submit(&mut app, "the user's real next words");
+
+    let queued = waiting(&kept);
+    assert_eq!(
+        queued.len(),
+        1,
+        "the fresh submit is the queue's only entry: {queued:?}"
+    );
+    let id = queued.first().map(|(id, _)| *id).unwrap();
+    assert_eq!(
+        run_id(rx.try_recv().expect("the submit hands the driver a Run")),
+        id,
+        "the submission names the fresh prompt — no resurrected id rides ahead of it"
+    );
+    assert_eq!(
+        claim(&kept, id).as_deref(),
+        Some("the user's real next words"),
+        "the driver's claim takes exactly the user's fresh words"
+    );
 }
 
 #[test]

@@ -3,9 +3,14 @@
 //! This is the dispatch target for task-mode invocations — a task
 //! argument or a piped stdin. It owns no agent-loop
 //! logic — everything turn/stream/dispatch lives in loopctl via the runner —
-//! and prints nothing of its own: the model's answer reaches stdout through
-//! the [`ConsoleObserver`] stream. This module resolves the prompt, maps the
-//! outcome to the process exit code, and writes the `--done-file` marker.
+//! and prints nothing of its own beyond the answer the task asked for:
+//! the model's reply reaches stdout through the [`ConsoleObserver`]
+//! stream, and stderr carries only the run's own trouble — a session
+//! that could not be built, a resume that had to degrade, a run that
+//! ends with todos still open, a `--done-file` that refused to be
+//! written (each reported panic-proof, as every stderr word here is).
+//! This module resolves the prompt, maps the outcome to the process
+//! exit code, and writes the `--done-file` marker.
 
 use std::io::{IsTerminal, Read};
 use std::path::Path;
@@ -260,7 +265,7 @@ async fn run_headless_inner(
         ..
     } = &control
     {
-        eprintln!("dch: {warning}");
+        crate::signals::report(&format!("dch: {warning}"));
     }
     if let Some(path) = &args.done_file {
         match std::fs::remove_file(path) {
@@ -271,10 +276,6 @@ async fn run_headless_inner(
                     "cannot clear the stale done-file at {}: {err}",
                     path.display()
                 );
-                // The rename-based write needs directory permission the
-                // removal just proved absent; an in-place overwrite needs
-                // only file permission and at minimum invalidates the
-                // previous run's outcome.
                 drop(overwrite_done_file(path, &DoneStatus::failure(&message)));
                 let outcome = construction_failure(args, message, inherited_mode.as_ref());
                 startup_bridge.stop().await;
@@ -343,6 +344,13 @@ async fn run_headless_inner(
                 resumed_compactions
                     .saturating_add(compaction_counter.load(std::sync::atomic::Ordering::SeqCst)),
             );
+            let undone = runner.todo_undone();
+            if undone > 0 {
+                let plural = if undone == 1 { "" } else { "s" };
+                crate::signals::report(&format!(
+                    "warning: {undone} todo item{plural} left unfinished"
+                ));
+            }
             bridge.stop().await;
             Ok(outcome)
         }
@@ -368,8 +376,9 @@ async fn run_headless_inner(
     }
 }
 
-/// Persist the run's transcript and the engine's committed history;
-/// a failed save never fails the run.
+/// Persist the run's transcript, the engine's committed history,
+/// and the loop's context estimate as the run left it; a failed save
+/// never fails the run.
 ///
 /// The machine history lands first, so a crash between the two writes
 /// leaves the older display file beside it — the stale-pair rule then
@@ -387,10 +396,16 @@ fn save_transcript(
     compactions: u32,
 ) {
     let stamp = chrono::Utc::now();
-    if let Err(err) = saver.save_machine(&runner.committed_history(), stamp, compactions) {
+    let history: Vec<loopctl::message::Message> =
+        dch_loop::history_without_nudge(&runner.committed_history());
+    if let Err(err) = saver.save_machine(&history, stamp, compactions) {
         tracing::warn!(error = %err, "machine history could not be saved");
     }
-    if let Err(err) = saver.save_at(transcript, crate::session::SessionTokens::default(), stamp) {
+    let tokens = crate::session::SessionTokens {
+        context_tokens: runner.context_tokens(),
+        ..crate::session::SessionTokens::default()
+    };
+    if let Err(err) = saver.save_at(transcript, tokens, stamp) {
         tracing::warn!(error = %err, "session transcript could not be saved");
     }
 }
@@ -498,7 +513,8 @@ async fn construct_run(
         crate::resume::ResumeControl::Fresh { .. } => 0,
     };
     let mut builder = dch_loop::Runner::builder(&config, &workdir)
-        .with_observer(Arc::clone(&observer) as Arc<dyn loopctl::observer::LoopObserver>);
+        .with_observer(Arc::clone(&observer) as Arc<dyn loopctl::observer::LoopObserver>)
+        .with_todo_nudge(|_reminder| {}, || true);
     if let crate::resume::ResumeControl::Resumed(outcome) = control {
         builder = builder.with_history(crate::resume::history_for_resume(
             outcome,

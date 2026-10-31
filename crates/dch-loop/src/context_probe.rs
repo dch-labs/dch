@@ -30,42 +30,6 @@ use loopctl::api::ApiClient;
 /// and a timeout reads as no answer.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// The safety margin held back from a discovered window, as a
-/// fraction of it in hundredths — applied to the answers of the
-/// families that can run usage-less.
-///
-/// The discovered window is the server's own tokenization; the
-/// session's token estimates are the heuristic counter's, which
-/// under-counts real tokens by roughly a quarter (the calibration
-/// that turned a true 262,144-token window into a configured
-/// 210,000). Where usage reports come back the counter is trued up
-/// against the real count, so the drift self-corrects and the
-/// discovered window stands. A server that reports no usage leaves
-/// its counter drifting unchecked, and comparing the drifted
-/// estimate against the raw discovered window spends the drift as if
-/// it were headroom — a session can sit at "83%" while the true
-/// prompt already exceeds the ceiling and the model's generation
-/// room has gone to zero. Ollama never reports usage; a self-hosted
-/// endpoint is whatever server answers, and the shims behind those
-/// endpoints routinely omit usage too — so both families' answers
-/// are held back by the drift margin [`scale_for_drift`] applies,
-/// and for a self-hosted server that does report usage the held-back
-/// window is the conservative error, corrected per turn by the usage
-/// the counter receives. An explicitly configured `context_window`
-/// is the user's own calibration and is never scaled, whatever the
-/// family.
-const DISCOVERED_WINDOW_DRIFT_PERCENT: u64 = 80;
-
-/// Scale a discovered window by the drift margin, in whole tokens.
-///
-/// Pure so the scaling is pinnable without a server; hundredths
-/// arithmetic keeps it exact for every u64 window a server can name.
-pub(crate) fn scale_for_drift(window: u64) -> u64 {
-    (window / 100)
-        .saturating_mul(DISCOVERED_WINDOW_DRIFT_PERCENT)
-        .saturating_add((window % 100).saturating_mul(DISCOVERED_WINDOW_DRIFT_PERCENT) / 100)
-}
-
 /// Ask the server this session's client resolved for the window one
 /// request may carry, and the table where the server has none.
 ///
@@ -80,26 +44,20 @@ pub(crate) fn scale_for_drift(window: u64) -> u64 {
 /// documented cloud-model windows is consulted next — the cloud
 /// providers publish nothing on the wire, so their own pages are the
 /// only source left. Returns `None` when neither has an answer,
-/// leaving the caller on its configured window. The answer rides
-/// whole for the families that report usage: their counters are
-/// trued up against the real count each turn, so their discovered
-/// window is honest as it stands. Ollama never reports usage, and a
-/// self-hosted endpoint is whatever server answers — the shims
-/// behind those endpoints routinely omit usage too — so both
-/// families' answers are held back by the drift margin
-/// [`scale_for_drift`] applies, and only there does the caller see
-/// the window the drifted estimates can be honestly compared
-/// against.
+/// leaving the caller on its configured window. Every answer rides
+/// whole, whatever family served it and whichever witness gave it:
+/// the window is the server's own tokenization and is honest as it
+/// stands. The heuristic counter compared against it may run light
+/// of the real count until a usage report trues it up, but that bias
+/// belongs to the counter, not to the window — shaving the server's
+/// answer to fit an estimate's error would tax every family alike,
+/// so the number passes through untouched, and an operator who
+/// wants an earlier trigger sets `compact_threshold` themselves.
 pub(crate) async fn discover_window(config: &ApiConfig, client: &dyn ApiClient) -> Option<u64> {
     let model = client.model();
-    let discovered = probe_context_window(config, &client.base_url(), &model)
+    probe_context_window(config, &client.base_url(), &model)
         .await
-        .or_else(|| crate::known_windows::known_model_window(&model));
-    if matches!(config.api_type, ApiType::Ollama | ApiType::SelfHosted) {
-        discovered.map(scale_for_drift)
-    } else {
-        discovered
-    }
+        .or_else(|| crate::known_windows::known_model_window(&model))
 }
 
 /// Ask `config`'s server for the window one request may carry.
@@ -184,12 +142,11 @@ async fn props_window(root: &str) -> Option<u64> {
 /// whole budget under `meta.n_ctx` from one serving its per-request
 /// share. A slots-sharing server that answers only the listing can
 /// therefore over-report the window by the slot factor — the compaction
-/// threshold sits later than the honest budget — and the drift margin
-/// claws back only the heuristic counter's share, not the slots'. The
-/// per-request assumption is the right default (vLLM and Ollama mean
-/// it exactly that way); the `--parallel` listing-only shape is the
-/// one configuration it can misread, and naming that here is the
-/// honest record of the bound.
+/// threshold sits later than the honest budget, and nothing shaves the
+/// answer back. The per-request assumption is the right default (vLLM
+/// and Ollama mean it exactly that way); the `--parallel` listing-only
+/// shape is the one configuration it can misread, and naming that here
+/// is the honest record of the bound.
 async fn listing_window(base: &str, model: &str) -> Option<u64> {
     let base = base.trim_end_matches('/');
     let listing = if base.ends_with("/v1") {
@@ -286,87 +243,18 @@ mod tests {
     use std::io::Write as _;
     use std::pin::Pin;
 
-    #[test]
-    fn a_discovered_window_is_scaled_by_the_drift_margin() {
-        // The discovered number is the server's tokenization; the
-        // session's estimates are the heuristic counter's, which runs
-        // about a quarter light. A real session sat at "83%" of
-        // a discovered 262,144 while its true prompt was past the
-        // ceiling and the model died mid-thought — the drift margin,
-        // not headroom. Scaling keeps the percentage honest; the
-        // calibration constant matches the hand-tuned 262,144 to
-        // 210,000 the drift was first measured by.
-        assert_eq!(scale_for_drift(262_144), 209_715);
-        assert_eq!(scale_for_drift(0), 0, "a window of nothing stays nothing");
-        assert_eq!(
-            scale_for_drift(u64::MAX),
-            u64::MAX / 100 * 80 + u64::MAX % 100 * 80 / 100,
-            "the scaling stays exact rather than overflowing"
-        );
-    }
-
     #[tokio::test]
-    async fn the_drift_margin_rides_a_listing_answer_on_the_usage_less_family_too() {
-        // The margin belongs to the family, not to the route that
-        // answered: the ollama client never reports usage whichever
-        // question its server answered, so a listing-served window
-        // carries it exactly a /props-served one does. The matrix cell
-        // [usage-less family × listing route] — a vLLM-shaped server
-        // with no capability document at all — is the shape this pins.
+    async fn every_family_rides_its_discovered_window_whole() {
+        // The window is the server's own tokenization, honest as it
+        // stands whatever family asked; the estimate compared against
+        // it is the instrument with the bias, and an instrument's
+        // error is never paid for by shaving the number it measures
+        // against. Every family's answer rides whole.
         let (port, _) = serve_bodies(vec![
             r#"{"unrelated": true}"#.to_string(),
             r#"{"object":"list","data":[{"id":"endpoint-only","max_model_len":16384}]}"#
                 .to_string(),
         ]);
-        let config = probe_config(ApiType::Ollama);
-        let client = EndpointOnlyClient {
-            url: format!("http://127.0.0.1:{port}/v1"),
-            model: "endpoint-only".to_string(),
-        };
-        assert_eq!(
-            discover_window(&config, &client).await,
-            Some(scale_for_drift(16_384)),
-            "whichever route answered, the family that never reports \
-             usage sizes the session at the honest window"
-        );
-    }
-
-    #[tokio::test]
-    async fn self_hosted_discovers_its_window_and_rides_the_drift_margin() {
-        // The self-hosted arm speaks the OpenAI wire, but the endpoint
-        // is whatever server answers: usage reporting cannot be
-        // assumed of it — the shims behind self-hosted endpoints
-        // routinely omit usage, and an unanchored counter drifting
-        // against the raw window is the exact pathology the margin
-        // exists for. The local questions are asked, and the answer
-        // carries the drift margin; a server that does report usage
-        // calibrates the counter per turn, so the held-back window is
-        // the conservative error there, never an under-report.
-        let port = serve_once(r#"{"n_ctx": 16384}"#.to_string());
-        let config = probe_config(ApiType::SelfHosted);
-        let client = EndpointOnlyClient {
-            url: format!("http://127.0.0.1:{port}/v1"),
-            model: "endpoint-only".to_string(),
-        };
-        assert_eq!(
-            discover_window(&config, &client).await,
-            Some(scale_for_drift(16_384)),
-            "the self-hosted family probes its server, and the answer rides \
-             the drift margin — its usage reporting cannot be assumed"
-        );
-    }
-
-    #[tokio::test]
-    async fn the_drift_margin_rides_the_families_that_can_run_usage_less() {
-        // The margin exists for the families whose usage may never
-        // return: the ollama client disables usage parsing by
-        // construction, and a self-hosted endpoint is whatever server
-        // answers — the shims behind those routinely omit usage too,
-        // so nothing can be assumed to anchor their estimates. A
-        // family that reports usage calibrates the counter at
-        // runtime, and scaling it too would double-discount - the
-        // 1M-window model whose bar read 800k.
-        let port = serve_once(r#"{"n_ctx": 16384}"#.to_string());
         let ollama = probe_config(ApiType::Ollama);
         let client = EndpointOnlyClient {
             url: format!("http://127.0.0.1:{port}/v1"),
@@ -374,8 +262,8 @@ mod tests {
         };
         assert_eq!(
             discover_window(&ollama, &client).await,
-            Some(scale_for_drift(16_384)),
-            "ollama carries the margin: no usage ever anchors it"
+            Some(16_384),
+            "ollama's answer rides whole — the server's own number, unscaled"
         );
         let port = serve_once(r#"{"n_ctx": 16384}"#.to_string());
         let selfhosted = probe_config(ApiType::SelfHosted);
@@ -385,10 +273,9 @@ mod tests {
         };
         assert_eq!(
             discover_window(&selfhosted, &client).await,
-            Some(scale_for_drift(16_384)),
-            "a self-hosted endpoint is whatever server answers — its \
-             usage reporting cannot be assumed, so the margin rides the \
-             answer rather than the counter drifting unseen"
+            Some(16_384),
+            "a self-hosted endpoint's answer rides whole — calibrated or \
+             not, the window is the server's own number"
         );
         // A third server for the reporting family's question.
         let port = serve_once(r#"{"n_ctx": 16384}"#.to_string());
@@ -400,7 +287,7 @@ mod tests {
         assert_eq!(
             discover_window(&openai, &client).await,
             Some(16_384),
-            "the reporting family rides its reported usage unscaled"
+            "the reporting family rides its reported window unscaled"
         );
     }
 
@@ -709,10 +596,10 @@ mod tests {
         };
         assert_eq!(
             discover_window(&config, &client).await,
-            Some(scale_for_drift(16_384)),
+            Some(16_384),
             "discovery follows the client's endpoint, not the empty config \
-             field — Ollama's answer rides the drift margin, like every \
-             window it discovers"
+             field — and the answer rides whole, like every window it \
+             discovers"
         );
     }
 
@@ -881,6 +768,23 @@ mod tests {
             Some(1_000_000),
             "the table answers for a provider that publishes nothing, \
              unscaled - this family reports usage and calibrates"
+        );
+        // The table's answer rides whole for the usage-less family
+        // too: the figure is the model's documented window, honest as
+        // it stands, and no family's estimate error is paid for by
+        // shaving whichever witness sized the session. The endpoint
+        // here is remote, so the probe answers nothing and the table
+        // is the only witness — deterministically, by the loopback
+        // gate, without a dial.
+        let config = probe_config(ApiType::Ollama);
+        let client = EndpointOnlyClient {
+            url: "https://ollama.internal.example".to_string(),
+            model: "glm-5.3".to_string(),
+        };
+        assert_eq!(
+            discover_window(&config, &client).await,
+            Some(1_000_000),
+            "the table's answer rides whole whatever the family asks for it"
         );
     }
 

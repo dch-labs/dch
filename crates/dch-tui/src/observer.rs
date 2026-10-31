@@ -16,7 +16,7 @@ use loopctl::observer::{
     AttemptResetContext, CompactedContext, CompactionFailedContext, LoopObserver,
     PreCompactionContext, ResponseContext, RunEndContext, StreamContext, StreamFailureContext,
     TextDeltaContext, ThinkingDeltaContext, ToolCallReceivedContext, ToolPreContext,
-    TransportFallbackContext, TurnEndContext,
+    TransportFallbackContext, TurnEndContext, TurnStartContext,
 };
 
 use crate::message::{ActiveTool, ContentBlock, TokenCounts, TuiMessage};
@@ -484,6 +484,20 @@ pub struct TuiObserverState {
     /// from.
     pub turn_histories: Arc<Mutex<Vec<Arc<Vec<loopctl::message::Message>>>>>,
 
+    /// Steers a run accepted but no turn boundary has read yet, in
+    /// send order.
+    ///
+    /// The display pins these just above the running turn's timer as
+    /// user rows — the model has not read the words, so they are not
+    /// yet part of the conversation — and the turn-start observer
+    /// graduates each into the transcript the moment the loop drains
+    /// its slot into a request. A run that ends before any boundary
+    /// reads them hands them back through the guidance seam, and the
+    /// pin empties with that return; an exit that overtakes the run
+    /// takes them into the transcript's waiting rows with the
+    /// queue's own, so typed words never leave no trace.
+    pub pending_steers: Arc<Mutex<Vec<String>>>,
+
     /// The newest engine-truth history, however it was last known.
     ///
     /// Written at every successful turn end and by the mode driver
@@ -558,6 +572,19 @@ pub struct TuiObserverState {
     /// it.
     pub live_claim: Arc<std::sync::atomic::AtomicU64>,
 
+    /// Plan entries left not completed when the driver's last run
+    /// settled.
+    ///
+    /// Written by the driver beside every settled run and once more as
+    /// its task ends, so the session's exit lines can state unfinished
+    /// work as a fact for the user reading them. The field holds
+    /// [`UNDONE_NOT_CAPTURED`](Self::UNDONE_NOT_CAPTURED) until a run
+    /// records a real figure — a driver taken by the exit's bounded join
+    /// reaches no store at all, and the exit must not turn that silence
+    /// into a clean plan. Read it through
+    /// [`todos_undone_captured`](Self::todos_undone_captured).
+    pub todos_undone_at_exit: Arc<std::sync::atomic::AtomicUsize>,
+
     /// Full tool calls captured at dispatch, keyed by call id.
     ///
     /// Written by the capture middleware on the dispatch pipeline
@@ -613,8 +640,8 @@ pub struct TuiObserverState {
     /// breaks — words that left the queue with the claim and would
     /// otherwise die with the channel — and the exit path drains the
     /// buffer once the driver task has settled, writing each text
-    /// back as an unclaimed transcript row a resume seeds into the
-    /// waiting section.
+    /// back as an unclaimed transcript row: the durable record of
+    /// words the channel carried but no turn spent.
     pub rescued_corrections: Arc<Mutex<Vec<String>>>,
 
     /// Token usage counters, per-turn and cumulative.
@@ -709,8 +736,12 @@ impl TuiObserverState {
     /// The display's live elapsed line reads the stamp; call this at
     /// the same edge the running flag itself rises, which every mode
     /// driver does — the pair is written only here so it cannot
-    /// disagree.
+    /// disagree. The plan's exit figure is put back to "no answer"
+    /// beside it: a count is a statement about the run that ends the
+    /// session, so what an earlier run settled stops being true the
+    /// moment a new one begins.
     pub fn mark_run_started(&self) {
+        self.mark_todos_undone_uncaptured();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |since| {
@@ -734,6 +765,55 @@ impl TuiObserverState {
             .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// The figure the unfinished-work field holds until a run records
+    /// a real one.
+    ///
+    /// A count of plan entries cannot reach this — an entry count is
+    /// bounded by the store's own cap, orders of magnitude below
+    /// `usize::MAX` — so the sentinel cannot be confused with a
+    /// settled run's answer.
+    pub const UNDONE_NOT_CAPTURED: usize = usize::MAX;
+
+    /// Record what the run just settled left undone, for the exit lines.
+    ///
+    /// The driver calls this beside each settled run and once more as its
+    /// task ends; the exit reads the result through
+    /// [`Self::todos_undone_captured`].
+    pub fn record_todos_undone(&self, undone: usize) {
+        self.todos_undone_at_exit
+            .store(undone, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The recorded count, or `None` while no run has settled one.
+    ///
+    /// Keeping the two apart is the point: a driver taken by the exit's
+    /// bounded join stores nothing, and reading the field's built-in
+    /// figure as a count would tell the user the plan ended clean over a
+    /// session the save still carries as unfinished.
+    #[must_use]
+    pub fn todos_undone_captured(&self) -> Option<usize> {
+        let stored = self
+            .todos_undone_at_exit
+            .load(std::sync::atomic::Ordering::SeqCst);
+        (stored != Self::UNDONE_NOT_CAPTURED).then_some(stored)
+    }
+
+    /// Put the recorded figure back to "no answer" for the exit lines.
+    ///
+    /// A figure is only worth printing for the run that ended the
+    /// session, so [`Self::mark_run_started`] calls this as each new
+    /// run begins: what an older run settled says nothing about the
+    /// plan as it now stands, and a run that never reaches its settle
+    /// must leave the exit silent rather than repeat that. A run that
+    /// does record one keeps it, whatever becomes of the task
+    /// afterwards.
+    pub fn mark_todos_undone_uncaptured(&self) {
+        self.todos_undone_at_exit.store(
+            Self::UNDONE_NOT_CAPTURED,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
+
     /// Create empty shared state.
     ///
     /// The single construction entry point — the observer and the
@@ -747,12 +827,16 @@ impl TuiObserverState {
             thinking: Arc::new(Mutex::new(ThinkingStream::default())),
             graduations: Arc::new(Mutex::new(Vec::new())),
             turn_histories: Arc::new(Mutex::new(Vec::new())),
+            pending_steers: Arc::new(Mutex::new(Vec::new())),
             machine_history: Arc::new(Mutex::new(None)),
             active_tools: Arc::new(Mutex::new(Vec::new())),
             agent_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             run_started_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             correction_cancel: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
             live_claim: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
+            todos_undone_at_exit: Arc::new(std::sync::atomic::AtomicUsize::new(
+                Self::UNDONE_NOT_CAPTURED,
+            )),
             tool_captures: Arc::new(Mutex::new(HashMap::new())),
             errors: Arc::new(Mutex::new(Vec::new())),
             compactions: Arc::new(Mutex::new(Vec::new())),
@@ -794,18 +878,23 @@ impl TuiObserverState {
         self.render_notify.notify(1);
     }
 
-    /// Record a steered prompt's echo the moment the offer is accepted.
+    /// Hold a steered prompt for the transcript until the model reads it.
     ///
-    /// The same transcript row [`push_sent`](Self::push_sent) writes —
-    /// the model is about to read this text — flagged as the steer's:
-    /// mid-run, not a run boundary, so nothing scoped to the run
-    /// retires on it. The pinned plan keeps standing through the
-    /// steer, the way the runner's own todo store does.
+    /// The offer was accepted, but acceptance is not reading: the text
+    /// waits in the run's steering slot until the loop drains it at its
+    /// next turn boundary, and a row in the conversation would claim
+    /// the model had already heard words it has not. The text is held
+    /// here instead — pinned just above the running turn's timer,
+    /// drawn as a user message, kept out of the transcript — until the
+    /// turn-start observer graduates it at the boundary that reads it,
+    /// where it lands after the tool or reply that was running when it
+    /// was sent. A run that ends before any boundary reads it returns
+    /// the text through the guidance seam, and the pin empties with
+    /// that return; an exit that overtakes the run takes it into the
+    /// transcript's waiting rows instead, so typed words never leave
+    /// no trace.
     pub fn push_steered(&self, text: String) {
-        recover(&self.graduations).push(Graduation::Sent {
-            text,
-            steered: true,
-        });
+        recover(&self.pending_steers).push(text);
         self.render_notify.notify(1);
     }
 
@@ -1210,6 +1299,21 @@ impl LoopObserver for TuiObserver {
         self.notify();
     }
 
+    fn on_turn_start(&self, _ctx: &TurnStartContext) {
+        let steered = std::mem::take(&mut *recover(&self.state.pending_steers));
+        if steered.is_empty() {
+            return;
+        }
+        let mut graduations = recover(&self.state.graduations);
+        for text in steered {
+            graduations.push(Graduation::Sent {
+                text,
+                steered: true,
+            });
+        }
+        self.notify();
+    }
+
     fn on_turn_end(&self, ctx: &TurnEndContext) {
         if !ctx.success {
             // A dead turn's partial reply text never graduates — the
@@ -1337,6 +1441,46 @@ mod tests {
     }
 
     #[test]
+    fn a_held_steer_graduates_at_the_turn_start_and_only_there() {
+        // Acceptance parks the text at the edge — no transcript row for
+        // words the model has not read — and the turn-start cue, which
+        // the loop emits after draining its slot, is the one moment the
+        // row is owed: it moves to the ordered lane there, in send
+        // order, and the pin empties with the same take.
+        let (observer, state) = TuiObserverState::new().into_observer();
+        state.push_steered("read this at the boundary".to_string());
+        assert!(
+            state.graduations.lock().unwrap().is_empty(),
+            "an accepted steer holds at the edge, not in the ordered lane"
+        );
+        observer.on_turn_start(&TurnStartContext {
+            turn: 1,
+            query: String::new(),
+        });
+        assert_eq!(
+            state.graduations.lock().unwrap().clone(),
+            vec![Graduation::Sent {
+                text: "read this at the boundary".to_string(),
+                steered: true,
+            }],
+            "the boundary that read the words owes the transcript its row"
+        );
+        assert!(
+            state.pending_steers.lock().unwrap().is_empty(),
+            "the pin empties with the graduation, so the row cannot land twice"
+        );
+        observer.on_turn_start(&TurnStartContext {
+            turn: 2,
+            query: String::new(),
+        });
+        assert_eq!(
+            state.graduations.lock().unwrap().len(),
+            1,
+            "an empty pin graduates nothing at a later boundary"
+        );
+    }
+
+    #[test]
     fn compaction_failure_text_names_the_cause_or_the_unfit_pass() {
         let with_cause = compaction_failure_text(
             207_686,
@@ -1356,6 +1500,41 @@ mod tests {
         assert!(
             unfit.contains("the pass completed but the history still did not fit"),
             "a causeless failure names its own shape: {unfit}"
+        );
+    }
+
+    #[test]
+    fn the_unfinished_count_keeps_no_answer_apart_from_a_clean_plan() {
+        // The session's exit line turns this figure into a claim about
+        // the user's plan, so the shared state has to hold "the plan
+        // closed clean" apart from "no run ever settled a count" — a
+        // driver taken by the exit's bounded join records nothing, and
+        // its silence printed as zero would read as the clean verdict
+        // over a session the save still carries as unfinished.
+        let state = TuiObserverState::new();
+        assert_eq!(
+            state.todos_undone_captured(),
+            None,
+            "a fresh state carries no answer"
+        );
+        state.record_todos_undone(0);
+        assert_eq!(
+            state.todos_undone_captured(),
+            Some(0),
+            "a clean plan records a real zero"
+        );
+        state.record_todos_undone(3);
+        assert_eq!(
+            state.todos_undone_captured(),
+            Some(3),
+            "the last settled run's figure wins"
+        );
+        state.mark_todos_undone_uncaptured();
+        assert_eq!(
+            state.todos_undone_captured(),
+            None,
+            "a run cut down before settling answers nothing, even after a \
+             run that did settle one"
         );
     }
 

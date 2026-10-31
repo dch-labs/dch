@@ -25,6 +25,7 @@ pub struct Package {
     /// rules read declared edges, which any version of a crate states the
     /// same way.
     pub name: String,
+
     /// The runtime dependency names, workspace crates and externals alike.
     ///
     /// Dev- and build-dependencies are dropped before this view is built:

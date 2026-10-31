@@ -303,14 +303,17 @@ fn a_wedged_run_still_exits_promptly() {
 }
 
 #[test]
-fn an_exit_mid_run_resumes_with_the_prompt_waiting() {
+fn an_exit_mid_run_resumes_with_the_backlog_as_history() {
     // The user's whole contract in one PTY run: a prompt is in
     // flight against a server that holds its answer, a second waits
     // behind it, Ctrl+C twice leaves promptly, and the resumed
-    // session carries both halves — the interrupted claim as the
-    // transcript's row with its cancel record beside it (a deliberate
-    // stop that does not run again), and the prompt no turn ever took
-    // written as an unclaimed row and waiting in the section again.
+    // session carries both halves as transcript rows — the
+    // interrupted claim with its cancel record beside it (a
+    // deliberate stop that does not run again) and the prompt no
+    // turn ever took as an unclaimed row. The waiting queue is
+    // process state and dies with the kill: the resume opens with the
+    // section down, so the user's next submit is the driver's next
+    // claim with no phantom row standing over it.
     let sb = common::Sandbox::with_server(common::CannedServer::sse_scheduled(vec![(
         common::sse_text_turn("a turn that never lands"),
         std::time::Duration::from_secs(600),
@@ -367,13 +370,17 @@ fn an_exit_mid_run_resumes_with_the_prompt_waiting() {
         &session_json[session_json.len().saturating_sub(600)..]
     );
 
-    // The resume carries the interrupted claim as the transcript's
-    // row — a recorded cancel, so it does not re-enter the section —
-    // while the prompt that never ran waits in the section again,
-    // visible with no run up.
+    // The resume renders both halves as history: the interrupted
+    // claim's row and the unclaimed row behind it, with no waiting
+    // section over the composer — the queue died with the process,
+    // and nothing resurrects into it.
     let resumed = sb.dch_pty(&["--resume", &id]);
     resumed.expect("the prompt that was in flight", Duration::from_secs(20));
-    resumed.expect("QUEUED", Duration::from_secs(20));
-    resumed.expect("the prompt that waits behind", Duration::from_secs(20));
+    let snapshot = resumed.expect("the prompt that waits behind", Duration::from_secs(20));
+    assert!(
+        !common::strip_ansi(&snapshot).contains("QUEUED"),
+        "the resumed session opens with no waiting section — the kill took \
+         the queue with it; screen so far:\n{snapshot}"
+    );
     let _ = resumed.quit_and_finish(Duration::from_secs(15));
 }

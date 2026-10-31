@@ -95,20 +95,23 @@ pub struct SessionSummary {
 
     /// How many messages the transcript holds.
     ///
-    /// The user's messages — their submissions, one per prompt.
-    ///
-    /// Not the raw entry count: tool calls, replies, and error rows
-    /// stay out of the figure, so tool-heavy turns do not inflate
-    /// it.
+    /// The user's submissions, one per prompt — not the raw entry
+    /// count: tool calls, replies, and error rows stay out, and so do
+    /// steered echo rows, which carry the session's own words (a
+    /// steer, a hook-injected reminder) rather than a prompt the user
+    /// submitted.
     pub user_message_count: usize,
 
-    /// The session's total token accounting, shown as its context
-    /// size.
+    /// The engine's context-size estimate at the last save.
     ///
-    /// Cumulative input plus output — exactly the figure the status
-    /// bar shows, and shows again on resume, so the listing's
-    /// CONTEXT column and the running session never disagree.
-    pub token_total: u64,
+    /// The same figure a running TUI's usage bar fills against and a
+    /// headless run's save records from the loop itself, so the
+    /// listing's CONTEXT column and the session agree on what
+    /// "context" means — approximately the context a resume
+    /// re-loads, since a resume replays capped previews and
+    /// re-estimates — not the session's lifetime token spend, which
+    /// grows monotonically and can dwarf any window.
+    pub context_tokens: u64,
 }
 
 /// The machine-history sibling's on-disk shape; private like
@@ -255,8 +258,9 @@ struct StoredSession {
 ///
 /// What the status bar's running total shows. The TUI persists and
 /// restores it, so a resumed session continues the count instead of
-/// restarting it at zero; headless single-runs keep no live counter
-/// and record zeros.
+/// restarting it at zero. A headless single-run has no live counter to
+/// carry, so it saves the spend halves as zeros — the context figure is
+/// the exception, read off the run that just finished.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SessionTokens {
     /// Input tokens since the session began.
@@ -269,9 +273,8 @@ pub(crate) struct SessionTokens {
     /// Output tokens since the session began.
     ///
     /// The output half of the same accounting; added to
-    /// [`cumulative_input`](Self::cumulative_input) it is exactly
-    /// the figure the status bar shows and the listing's CONTEXT
-    /// column repeats.
+    /// [`cumulative_input`](Self::cumulative_input) it is exactly the
+    /// figure the status bar's total shows.
     pub(crate) cumulative_output: u64,
 
     /// The input tokens of the most recent turn.
@@ -694,12 +697,18 @@ pub(crate) fn list_sessions_in(base: &Path) -> Result<Vec<SessionSummary>, Sessi
             user_message_count: stored
                 .messages
                 .iter()
-                .filter(|message| matches!(message, dch_tui::TuiMessage::User { .. }))
+                .filter(|message| {
+                    matches!(
+                        message,
+                        dch_tui::TuiMessage::User {
+                            steered: false,
+                            unsent: false,
+                            ..
+                        }
+                    )
+                })
                 .count(),
-            token_total: stored
-                .tokens
-                .cumulative_input
-                .saturating_add(stored.tokens.cumulative_output),
+            context_tokens: stored.tokens.context_tokens,
         });
     }
     sessions.sort_by_key(|summary| std::cmp::Reverse(summary.last_activity));
@@ -736,6 +745,7 @@ mod tests {
                 text: "fix the leak".to_string(),
                 timestamp: now,
                 steered: false,
+                unsent: false,
             },
             TuiMessage::Assistant {
                 blocks: vec![
@@ -813,6 +823,47 @@ mod tests {
     }
 
     #[test]
+    fn the_message_count_skips_steered_rows() {
+        // The listing's MSGS column names the user's submissions —
+        // one per prompt. Steered echo rows are the session's own
+        // words riding the transcript as user rows (a steer the run
+        // read, a hook-injected reminder), and counting them would
+        // tell the user they submitted prompts they never typed.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let id = Uuid::new_v4();
+        let messages = vec![
+            dch_tui::TuiMessage::User {
+                text: "the first prompt".to_string(),
+                timestamp: chrono::Utc::now(),
+                steered: false,
+                unsent: false,
+            },
+            dch_tui::TuiMessage::User {
+                text: "a steer the run read".to_string(),
+                timestamp: chrono::Utc::now(),
+                steered: true,
+                unsent: false,
+            },
+            dch_tui::TuiMessage::User {
+                text: "the second prompt".to_string(),
+                timestamp: chrono::Utc::now(),
+                steered: false,
+                unsent: false,
+            },
+        ];
+        crate::session::SessionSaver::with_base_dir(id, "m".to_string(), dir.path().to_path_buf())
+            .save(&messages, crate::session::SessionTokens::default())
+            .expect("save");
+        let listed = list_sessions_in(dir.path()).expect("list");
+        assert_eq!(
+            listed.first().expect("the one session").user_message_count,
+            2,
+            "only the submitted prompts count — the steered row is \
+             the session's own word, not the user's"
+        );
+    }
+
+    #[test]
     fn token_totals_survive_a_save_and_default_for_legacy_files() {
         let dir = tempfile::tempdir().expect("tempdir");
         let id = Uuid::new_v4();
@@ -833,9 +884,10 @@ mod tests {
         assert_eq!(loaded, totals, "the accounting rides the envelope");
         let listed = list_sessions_in(dir.path()).expect("list");
         assert_eq!(
-            listed.first().expect("the one session").token_total,
-            12_345 + 678,
-            "the listing carries the same total the status bar shows"
+            listed.first().expect("the one session").context_tokens,
+            45_678,
+            "the listing carries the context estimate the status bar \
+             fills against — not the lifetime spend"
         );
 
         // A file saved before totals existed parses to zeros: the
@@ -922,6 +974,7 @@ mod tests {
             text: "second".to_string(),
             timestamp: chrono::Utc::now(),
             steered: false,
+            unsent: false,
         }];
         saver
             .save(&second, SessionTokens::default())

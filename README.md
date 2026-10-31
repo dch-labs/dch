@@ -108,11 +108,13 @@ dch --list-sessions 30       # the 30 most recent
 dch --list-sessions all      # everything
 ```
 
-The MSGS column counts your messages — your submissions, with tool
-calls and replies left out. CONTEXT is the session's cumulative
-input-plus-output spend in tokens — the whole conversation's
-accounting, not the live-context estimate the TUI's context bar
-tracks while a run is going.
+The MSGS column counts your submitted prompts — tool calls, replies,
+error rows, and steered echo rows (a steer the run read, a hook's
+reminder) all stay out. CONTEXT is the engine's context-size estimate
+at the moment of the last save — the figure a running TUI's context
+bar fills against and a headless run's save records from the loop
+itself, and approximately the context a resume re-loads — not the
+session's lifetime token spend.
 
 A missing session id warns and starts fresh; a corrupt file warns
 loudly, starts fresh, and is never modified; a session file that
@@ -201,7 +203,7 @@ Anywhere:
 | Key | Action |
 | --- | --- |
 | `F2` | Cycle tool-line verbosity (Quiet → Normal → Verbose; initial mode from `display.verbosity`) |
-| `Ctrl-C` `Ctrl-C` | While a run is in flight — through a permission ask too, which passes the chord but owns Esc — the double press is one action: the fire cancels the run exactly as `Esc Esc` cancels it (same stop, same `Agent cancelled` record) and terminates the program on the same press. The first press only arms and says so; a stray key between the presses stands the whole action down. Text in the composer clears first wherever it stands, run or not — clearing is not consenting, and a paste never feeds an exit it was not offered to — so the ladder is always clear, then arm, then fire. At rest, with an empty composer, first press arms, second press quits. The interrupted prompt waits again only when the exit's flush caught it before its run could record anything; a prompt with its `Agent cancelled` record beside it was stopped deliberately and stays stopped — the queue a resume opens with is the truth, never a phantom. The prompts still waiting when the exit fires were never sent at all, and do not vanish with the process: each is written into the transcript as an unclaimed row, and the resume opens with them waiting in the section again |
+| `Ctrl-C` `Ctrl-C` | While a run is in flight — through a permission ask too, which passes the chord but owns Esc — the double press is one action: the fire cancels the run exactly as `Esc Esc` cancels it (same stop, same `Agent cancelled` record) and terminates the program on the same press. The first press only arms and says so; a stray key between the presses stands the whole action down. Text in the composer clears first wherever it stands, run or not — clearing is not consenting, and a paste never feeds an exit it was not offered to — so the ladder is always clear, then arm, then fire. At rest, with an empty composer, first press arms, second press quits. A prompt with its `Agent cancelled` record beside it was stopped deliberately and stays stopped. The prompts still waiting when the exit fires were never sent at all, and do not vanish with the process: each is written into the transcript as an unclaimed row — the record a resume reads, because the waiting queue itself is process state and dies with the process. The row renders dimmed: the model never read those words, so lift them from the transcript and re-send them if you still want them |
 | `Esc` `Esc` | Cancel the run in flight — only that turn, and the prompts waiting behind it keep their place in the queue and run next (see [Waiting prompts](#waiting-prompts)). One press arms and says so on the notice row, the next fires, any other key between stands it down. Permission asks, questions, and the waiting section own Esc first — under them, close the sheet or release the section and the cancel is two presses away |
 | `Ctrl-Shift-C` | Copy the selected transcript text (where the terminal reports the modifier) |
 | `Ctrl-S` | Send the composer now: to the turn in flight as guidance when a run is running, as an ordinary prompt when one is not |
@@ -222,12 +224,13 @@ While a permission prompt is on screen (see
 A prompt submitted while a run holds the agent waits in the queue, and
 the section above the composer shows the one the queue is standing on,
 numbered `[2/3]` — where it stands in the queue out of how many wait.
-The section stands whenever anything waits, not only under a run:
-prompts a resume owes — the backlog the exit wrote into the transcript
-because no turn ever spent it — wait with no run up, in the section,
-readable and editable like any waiting prompt. They wait for you: none
-of them runs on its own, so fix a wording with `e`, aim one at your
-next run with `s`, or take one out with `d`.
+The section stands whenever anything waits, not only under a
+run — a prompt can sit queued in the settle-to-claim moment between one
+run ending and the next claiming it. Nothing waits after a resume: the
+queue is process state and dies with the process, and the exit's
+unclaimed rows are history to read, not a backlog to run. While they
+wait, prompts are yours: fix a wording with `e`, aim one at your next
+run with `s`, or take one out with `d`.
 Nothing enters the transcript until a prompt is actually sent — the
 one exception is the exit's unclaimed rows above — the user
 row a prompt gets is written at the moment its turn starts, with the
@@ -295,8 +298,11 @@ mind. It reads at a glance where the run is;
 the transcript's own todo blocks hold every update in full for the
 detail. The plan stays up after its run lands —
 the final state, done or not, is there to read in the quiet after the
-run — and the next prompt's claim retires it, so the section always
-shows the last run's plan, never an older one's. A steer delivers
+run — and the next prompt's claim retires it once every entry stands
+completed. A run that ends with work still open carries its plan into the
+next run instead, where the rows keep updating under the new prompt, so
+the section always shows the plan the session actually stands on — never
+one it has finished leaving behind. A steer delivers
 mid-run without claiming, so the plan keeps updating through its own
 run.
 

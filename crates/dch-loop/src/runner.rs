@@ -60,6 +60,7 @@ use loopctl::mcp::CommandSpec;
 use loopctl::mcp::McpClient;
 use loopctl::mcp::McpToolProvider;
 use loopctl::message::Message;
+use loopctl::message::MessagePart;
 use loopctl::middleware::AskResolverFn;
 use loopctl::middleware::OutputLimitMiddleware;
 use loopctl::middleware::PermissionMiddleware;
@@ -90,15 +91,16 @@ use crate::with_context;
 /// client, a tool registry whose every dispatch sees the shared
 /// [`RunnerContext`], a session config carrying the composed system prompt,
 /// and the observer-bearing managers bundle) into one [`BareLoop`], and the
-/// public surface stays thin: runs reset the per-run todo list and delegate
-/// to the loop, the rest are accessors.
+/// public surface stays thin: runs carry or retire the session's todo plan
+/// and delegate to the loop, the rest are accessors.
 ///
 /// Construct once per agent identity with [`Runner::builder`]…`.build()`,
 /// then drive it with [`Runner::run`]: each call is one prompt → loop →
 /// final answer against the configured provider, sharing one conversation
-/// across calls. Each run starts by resetting the per-run todo list (a new
-/// prompt plans fresh). Cancellation is cooperative via [`Runner::cancel`]
-/// or [`Runner::cancel_signal`].
+/// across calls. Each run starts by carrying the standing plan forward when
+/// it holds unfinished entries — the plan belongs to the session — and
+/// clearing it when the prior run finished everything. Cancellation is
+/// cooperative via [`Runner::cancel`] or [`Runner::cancel_signal`].
 pub struct Runner {
     /// The agent loop, monomorphized over the concrete [`DchClient`].
     ///
@@ -179,15 +181,17 @@ impl Runner {
             mcp_providers: Vec::new(),
             history: Vec::new(),
             permission_resolver: None,
+            todo_nudge: None,
         }
     }
 
     /// Run one prompt → loop → final answer, with the session-default policy.
     ///
     /// Uses the run policy mapped from `DchConfig` at construction (turn
-    /// budget, dispatch policy). The per-run todo list is reset at the start
-    /// of the run — a new prompt plans fresh. Returns when the model signals
-    /// end-of-turn, the budget is exhausted, the loop detector aborts, or
+    /// budget, dispatch policy). The session's todo plan carries into this
+    /// run when it holds unfinished entries and retires when the prior run
+    /// finished everything. Returns when the model signals end-of-turn, the
+    /// budget is exhausted, the loop detector aborts, or
     /// [`Runner::cancel`] is called. Equivalent to [`Runner::run_with`] with
     /// the default config; the conversation is shared across `run`/`run_with`
     /// calls on the same `Runner`.
@@ -209,10 +213,11 @@ impl Runner {
     /// The variation point for per-run budgets: `run_with` overrides the
     /// session default for this one call without rebuilding the `Runner` (a
     /// rebuild constructs a fresh `BareLoop` and discards the conversation).
-    /// The per-run todo list is reset at the start of the run. The returned
-    /// [`Run`] records `run_config` as its own snapshot, so per-call overrides
-    /// are visible in the run's accounting. This mirrors loopctl's own
-    /// default/override pairing (`stream_messages` vs
+    /// The session's todo plan carries into this run when it holds unfinished
+    /// entries and retires when the prior run finished everything. The
+    /// returned [`Run`] records `run_config` as its own snapshot, so per-call
+    /// overrides are visible in the run's accounting. This mirrors loopctl's
+    /// own default/override pairing (`stream_messages` vs
     /// `stream_messages_with_options`).
     ///
     /// # Errors
@@ -227,11 +232,19 @@ impl Runner {
         input: &str,
         run_config: &RunConfig,
     ) -> Result<Run, LoopError> {
-        self.context
-            .todos
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
+        {
+            let mut store = self
+                .context
+                .todos
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if store
+                .iter()
+                .all(|entry| matches!(entry.status, dch_tools::TodoStatus::Completed))
+            {
+                store.clear();
+            }
+        }
         self.inner.run(input, run_config).await
     }
 
@@ -277,6 +290,36 @@ impl Runner {
             .map(|turn| turn.output.clone())
             .filter(|output| !output.trim().is_empty())
             .collect()
+    }
+
+    /// How many plan entries stand not completed, as the run left
+    /// them.
+    ///
+    /// Read from the todo store the run's own `TodoWrite` calls filed —
+    /// the same list every reminder counted. A host printing a session
+    /// exit summary reports it so unfinished work is a fact the owner
+    /// reads, not a nag the model receives.
+    #[must_use]
+    pub fn todo_undone(&self) -> usize {
+        self.context
+            .todos
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|entry| !matches!(entry.status, dch_tools::TodoStatus::Completed))
+            .count()
+    }
+
+    /// The engine's context-size estimate, as the run left it.
+    ///
+    /// The same figure the engine reports per turn to observers — the
+    /// estimated payload the provider would receive for the
+    /// conversation as it stands. Readable between runs; a host
+    /// saving session state after a run records it so a listing or a
+    /// resumed session shows the context the run ended on.
+    #[must_use]
+    pub fn context_tokens(&self) -> u64 {
+        self.inner.context_tokens()
     }
 
     /// The shared cancel signal, cloned from the inner loop.
@@ -465,7 +508,32 @@ pub struct RunnerBuilder<'a> {
     /// must not block — and a pending resolution races the run's cancel
     /// signal, so a cancelled run denies rather than waits.
     permission_resolver: Option<AskResolverFn>,
+
+    /// How the host echoes an accepted todo-nudge reminder, and
+    /// whether it will still take one.
+    ///
+    /// Set together by [`with_todo_nudge`](Self::with_todo_nudge);
+    /// their presence is what arms the nudge at all — a host that
+    /// passes none builds a runner whose runs end where the model
+    /// leaves them. The predicate is asked at every clean run end
+    /// the turn budget leaves room to offer a follow-up at, and at
+    /// every turn top the mid-run reminder's contributor consults —
+    /// before the plan is read in both — so a host that begins
+    /// leaving mid-session declines without unwinding anything.
+    todo_nudge: Option<TodoNudgeRegistration>,
 }
+
+/// The host-supplied halves of the todo nudge.
+///
+/// The echo an accepted end-of-run reminder owes the transcript, and
+/// the leave-to-extend asked at every clean run end the turn budget
+/// leaves room to offer at and at every turn-top consult the mid-run
+/// reminder's contributor makes — carried as one registration because
+/// they arm together and neither makes sense without the other.
+type TodoNudgeRegistration = (
+    Arc<dyn Fn(String) + Send + Sync>,
+    Arc<dyn Fn() -> bool + Send + Sync>,
+);
 
 impl RunnerBuilder<'_> {
     /// Register a lifecycle observer.
@@ -537,6 +605,35 @@ impl RunnerBuilder<'_> {
     #[must_use]
     pub fn with_permission_resolver(mut self, resolver: AskResolverFn) -> Self {
         self.permission_resolver = Some(resolver);
+        self
+    }
+
+    /// Arm the todo nudge, with the echo an accepted reminder owes
+    /// and the host's leave to extend a run.
+    ///
+    /// The halves and their wordings are the module doc's own; what
+    /// this registration alone owns are the two contracts the host
+    /// codes against. `echo` fires once, with the reminder text, at
+    /// the moment a follow-up turn is injected — observation, not
+    /// display; the TUI passes a no-op so the reminder surfaces
+    /// nowhere a user reads. `may_extend` is the decline lane: asked
+    /// at every consult — clean run ends the turn budget leaves room
+    /// to offer at, and every turn-top the contributor makes —
+    /// before the plan is read, so it answers even when no offer can
+    /// materialize; `false` declines whatever the plan would have
+    /// offered, unspent and unechoed. One accepted window remains: a
+    /// quit racing between the predicate's acceptance and the
+    /// engine's cancel may still echo and pay for a reminder turn
+    /// the teardown then stops — the same window a flag check beside
+    /// any engine turn leaves. Without the pair the runner builds
+    /// without the nudge and runs end where the model leaves them.
+    #[must_use]
+    pub fn with_todo_nudge(
+        mut self,
+        echo: impl Fn(String) + Send + Sync + 'static,
+        may_extend: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.todo_nudge = Some((Arc::new(echo), Arc::new(may_extend)));
         self
     }
 
@@ -630,13 +727,39 @@ impl RunnerBuilder<'_> {
             core_registry,
         )?);
 
-        let inner = BareLoop::<DchClient>::from_machine_with_managers(
+        let mut reminder_contributor: Option<crate::todo_nudge::TodoReminderContributor> = None;
+        if let Some((echo, may_extend)) = self.todo_nudge {
+            let gate = Arc::new(crate::todo_nudge::PlanGate::new());
+            managers = managers.with_hook_executor(Arc::new(
+                loopctl::hooks::HookExecutor::new().with_hook(Arc::new(
+                    crate::todo_nudge::TodoNudgeHook::new(
+                        Arc::clone(&context.todos),
+                        Arc::clone(&gate),
+                        echo,
+                        Arc::clone(&may_extend),
+                    ),
+                )),
+            ));
+            reminder_contributor = Some(crate::todo_nudge::TodoReminderContributor::new(
+                Arc::clone(&context.todos),
+                gate,
+                may_extend,
+            ));
+        }
+
+        seed_standing_plan(&context, &self.history);
+
+        let mut inner = BareLoop::<DchClient>::from_machine_with_managers(
             LoopMachine::from_history(self.history),
             session_config,
             client,
             registry,
             managers,
         );
+        if let Some(contributor) = reminder_contributor {
+            let steering = inner.steering();
+            inner.add_contributor(Box::new(contributor.with_steering(steering)));
+        }
 
         Ok(Runner {
             context_window: resolved_window,
@@ -645,6 +768,42 @@ impl RunnerBuilder<'_> {
             fs_session,
             run_config,
         })
+    }
+}
+
+/// Seed the todo store from the history a resume installed.
+///
+/// Walks the restored conversation's tool results backwards for the
+/// last `TodoWrite` render; a list holding unfinished entries becomes
+/// the standing plan — the prior session's open work carries, ids and
+/// rungs intact — while a completed list, an empty plan notice, or no
+/// list at all leaves the store empty: a finished plan retires with
+/// its run. Fresh sessions pass an empty history and seed nothing.
+fn seed_standing_plan(context: &Arc<dch_tools::context::RunnerContext>, history: &[Message]) {
+    let Some(render) = history.iter().rev().find_map(|message| {
+        message.parts.iter().rev().find_map(|part| match part {
+            MessagePart::ToolResult {
+                name,
+                output,
+                is_error,
+                ..
+            } if name == "TodoWrite" && !matches!(is_error, Some(true)) => Some(output.to_string()),
+            _ => None,
+        })
+    }) else {
+        return;
+    };
+    let Some(entries) = dch_tools::todo::parse_task_list_render(&render) else {
+        return;
+    };
+    if entries
+        .iter()
+        .any(|entry| !matches!(entry.status, dch_tools::TodoStatus::Completed))
+    {
+        *context
+            .todos
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = entries;
     }
 }
 
@@ -1667,6 +1826,669 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_working_without_a_runner_gets_the_start_reminder() {
+        // The root-flow catch, at the engine: the model files an
+        // all-pending plan, then fires a work tool without claiming any
+        // entry. The start-discipline reminder rides the next request's
+        // tail as steered guidance — a user message after the standing
+        // conversation, never a mutation of it — and, once committed,
+        // the episode stays quiet inside its window; the end-of-run
+        // follow-up carries its own closing wording beside it (the
+        // staleness clock is still inside grace there).
+        let script = vec![
+            sse_tool_call_turn(
+                "TodoWrite",
+                &serde_json::json!({
+                    "todos": [{"id": "only", "subject": "the work",
+                               "status": "pending"}]
+                }),
+            ),
+            sse_tool_call_turn("Read", &serde_json::json!({"path": "note.txt"})),
+            sse_text_turn("done for now"),
+            sse_text_turn("noted, but not closing it"),
+        ];
+        let server = SseServer::start(script).await;
+        let dir = TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join("note.txt"), "x\n").expect("note");
+        let echoed: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let echo_sink = Arc::clone(&echoed);
+        let mut runner = Runner::builder(&wire_config(server.port, 10), dir.path())
+            .with_todo_nudge(
+                move |reminder| {
+                    echo_sink.lock().expect("echo lock").push(reminder);
+                },
+                || true,
+            )
+            .build()
+            .await
+            .expect("constructs");
+        let run = tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("do it"))
+            .await
+            .expect("run settles within timeout")
+            .expect("the run succeeds");
+        assert_eq!(
+            run.output.as_deref(),
+            Some("noted, but not closing it"),
+            "the run's output is the follow-up's answer — the plan still \
+             stood at the end, so the end-of-run nudge fired too"
+        );
+        let requests = recorded_requests(&server);
+        assert_eq!(
+            requests.len(),
+            4,
+            "three model calls plus the end-of-run follow-up: {requests:?}"
+        );
+        let start = |request: &str| request.matches("no plan entry in progress").count();
+        assert_eq!(
+            start(&requests[0]),
+            0,
+            "the plan-filing turn predates any work: {requests:?}"
+        );
+        assert_eq!(
+            start(&requests[1]),
+            0,
+            "the turn after filing is quiet — the work tool has not \
+             fired yet: {requests:?}"
+        );
+        assert_eq!(
+            start(&requests[2]),
+            1,
+            "the request after the Read carries the steered start reminder \
+             at its tail: {requests:?}"
+        );
+        assert_eq!(
+            message_roles(&requests[2], "no plan entry in progress"),
+            vec!["user".to_string()],
+            "the reminder travels as steered user guidance at the tail — \
+             never a system insertion ahead of history: {requests:?}"
+        );
+        assert_eq!(
+            start(&requests[3]),
+            1,
+            "the steered reminder is committed once — the follow-up replays \
+             it exactly once and nothing more: {requests:?}"
+        );
+        let stacked = requests[3].matches("still not completed").count();
+        assert_eq!(
+            stacked, 1,
+            "the follow-up carries its own closing wording alone — the \
+             staleness clock is still inside grace there: {requests:?}"
+        );
+        let echoed = echoed.lock().expect("echo lock").clone();
+        assert_eq!(
+            echoed.len(),
+            1,
+            "the mid-run reminder echoes nothing — only the end-of-run \
+             nudge owes the display a row: {echoed:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_frozen_plan_gets_the_item_list_reminder() {
+        // The staleness belt, at the engine: a plan filed, one work
+        // tool fired (earning the start reminder), then the plan frozen
+        // through the grace window. The request past the grace edge
+        // carries the staleness reminder naming the undone entry —
+        // icon, id, subject — as steered user guidance at the tail,
+        // and the follow-up carries its own closing wording beside it.
+        let script = vec![
+            sse_tool_call_turn(
+                "TodoWrite",
+                &serde_json::json!({
+                    "todos": [{"id": "only", "subject": "the work",
+                               "status": "pending"}]
+                }),
+            ),
+            sse_tool_call_turn("Read", &serde_json::json!({"path": "note.txt"})),
+            sse_tool_call_turn("Read", &serde_json::json!({"path": "note.txt"})),
+            sse_tool_call_turn("Read", &serde_json::json!({"path": "note.txt"})),
+            sse_text_turn("done for now"),
+            sse_text_turn("noted, but not closing it"),
+        ];
+        let server = SseServer::start(script).await;
+        let dir = TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join("note.txt"), "x\n").expect("note");
+        let mut runner = Runner::builder(&wire_config(server.port, 10), dir.path())
+            .with_todo_nudge(|_| {}, || true)
+            .build()
+            .await
+            .expect("constructs");
+        let run = tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("do it"))
+            .await
+            .expect("run settles within timeout")
+            .expect("the run succeeds");
+        assert_eq!(
+            run.output.as_deref(),
+            Some("noted, but not closing it"),
+            "the follow-up's answer is the run's output"
+        );
+        let requests = recorded_requests(&server);
+        assert_eq!(
+            requests.len(),
+            6,
+            "five model calls plus the end-of-run follow-up: {requests:?}"
+        );
+        let stale = |request: &str| request.matches("the plan unchanged").count();
+        for turn in 0..4 {
+            assert_eq!(
+                stale(&requests[turn]),
+                0,
+                "turn {turn} is inside the grace window — quiet: {requests:?}"
+            );
+        }
+        assert_eq!(
+            stale(&requests[4]),
+            1,
+            "past the grace window the frozen plan reminds, riding that \
+             request's tail: {requests:?}"
+        );
+        assert!(
+            requests[4].contains("○ [only] the work"),
+            "the staleness reminder names the undone entry itself: {requests:?}"
+        );
+        assert_eq!(
+            message_roles(&requests[4], "the plan unchanged"),
+            vec!["user".to_string()],
+            "the item-list reminder rides the tail as steered user \
+             guidance: {requests:?}"
+        );
+        assert_eq!(
+            stale(&requests[5]),
+            1,
+            "the steered reminder is committed once — the follow-up replays \
+             it exactly once and nothing more: {requests:?}"
+        );
+        assert!(
+            requests[5].contains("then finish"),
+            "the end-of-run nudge closed the run as the final backstop: \
+             {requests:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_clean_plan_earns_no_mid_run_reminder() {
+        // A plan in good standing never interrupts the work: a run
+        // whose list is filed complete, then worked through, carries
+        // no reminder text in any request.
+        let script = vec![
+            sse_tool_call_turn(
+                "TodoWrite",
+                &serde_json::json!({
+                    "todos": [{"id": "only", "subject": "the work",
+                               "status": "completed"}]
+                }),
+            ),
+            sse_tool_call_turn("Read", &serde_json::json!({"path": "note.txt"})),
+            sse_text_turn("done"),
+        ];
+        let server = SseServer::start(script).await;
+        let dir = TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join("note.txt"), "x\n").expect("note");
+        let mut runner = Runner::builder(&wire_config(server.port, 10), dir.path())
+            .with_todo_nudge(|_| {}, || true)
+            .build()
+            .await
+            .expect("constructs");
+        tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("do it"))
+            .await
+            .expect("run settles within timeout")
+            .expect("the run succeeds");
+        let requests = recorded_requests(&server);
+        assert_eq!(requests.len(), 3, "three model calls: {requests:?}");
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.contains("reminder:")),
+            "a clean plan reminds nothing mid-run: {requests:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_planless_multistep_run_earns_one_creation_note() {
+        // The third belt, at the engine: a run four turns deep with no
+        // plan at all — the shape no stale-reminder can touch — gets
+        // one note suggesting it file one, steered onto the next
+        // request's tail as user guidance the model sees once.
+        let script = vec![
+            sse_tool_call_turn("Grep", &serde_json::json!({"pattern": "one"})),
+            sse_tool_call_turn("Grep", &serde_json::json!({"pattern": "two"})),
+            sse_tool_call_turn("Grep", &serde_json::json!({"pattern": "three"})),
+            sse_tool_call_turn("Grep", &serde_json::json!({"pattern": "four"})),
+            sse_text_turn("done"),
+        ];
+        let server = SseServer::start(script).await;
+        let dir = TempDir::new().expect("tempdir");
+        let mut runner = Runner::builder(&wire_config(server.port, 10), dir.path())
+            .with_todo_nudge(|_| {}, || true)
+            .build()
+            .await
+            .expect("constructs");
+        let run = tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("do it"))
+            .await
+            .expect("run settles within timeout")
+            .expect("the run succeeds");
+        assert_eq!(
+            run.output.as_deref(),
+            Some("done"),
+            "a planless clean run ends where the model left it"
+        );
+        let requests = recorded_requests(&server);
+        assert_eq!(
+            requests.len(),
+            5,
+            "four work turns and the final answer: {requests:?}"
+        );
+        let note = |request: &str| request.matches("file one with TodoWrite now").count();
+        for turn in 0..3 {
+            assert_eq!(
+                note(&requests[turn]),
+                0,
+                "the first three turns stay quiet — short work meets no \
+                 note: {requests:?}"
+            );
+        }
+        assert_eq!(
+            note(&requests[3]),
+            1,
+            "the fourth planless turn is told, once, at that request's \
+             tail: {requests:?}"
+        );
+        assert_eq!(
+            message_roles(&requests[3], "file one with TodoWrite now"),
+            vec!["user".to_string()],
+            "the note rides the tail as steered user guidance, never a \
+             system insertion ahead of history: {requests:?}"
+        );
+        assert_eq!(
+            note(&requests[4]),
+            1,
+            "the steered note is committed once — the final request replays \
+             it exactly once and nothing more: {requests:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_runner_reports_the_plan_entries_left_undone() {
+        // The exit summary's source of truth: whatever the last
+        // settled run left on the plan, readable after the run for a
+        // host to state as a fact — the follow-up's own refusal to
+        // close the list still standing.
+        let script = vec![
+            sse_tool_call_turn(
+                "TodoWrite",
+                &serde_json::json!({
+                    "todos": [{"id": "only", "subject": "the work",
+                               "status": "pending"}]
+                }),
+            ),
+            sse_text_turn("done for now"),
+            sse_text_turn("noted, but not closing it"),
+        ];
+        let server = SseServer::start(script).await;
+        let dir = TempDir::new().expect("tempdir");
+        let mut runner = Runner::builder(&wire_config(server.port, 10), dir.path())
+            .with_todo_nudge(|_| {}, || true)
+            .build()
+            .await
+            .expect("constructs");
+        tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("do it"))
+            .await
+            .expect("run settles within timeout")
+            .expect("the run succeeds");
+        assert_eq!(
+            runner.todo_undone(),
+            1,
+            "the plan stands with one entry undone for the exit summary"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_runner_reports_the_loops_context_estimate_after_a_run() {
+        // The figure a host saves with the transcript: nonzero once a
+        // turn has run, so a listing that repeats it does not read a
+        // zero the conversation's own size contradicts.
+        let script = vec![sse_text_turn("done")];
+        let server = SseServer::start(script).await;
+        let dir = TempDir::new().expect("tempdir");
+        let mut runner = Runner::builder(&wire_config(server.port, 10), dir.path())
+            .build()
+            .await
+            .expect("constructs");
+        let before = runner.context_tokens();
+        tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("do it"))
+            .await
+            .expect("run settles within timeout")
+            .expect("the run succeeds");
+        assert_eq!(
+            before, 0,
+            "a fresh session's empty conversation estimates nothing"
+        );
+        assert!(
+            runner.context_tokens() > 0,
+            "the run's conversation stands — the estimate with it"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_followup_turn_carries_its_own_wording_alone() {
+        // The engine prepares the injected follow-up through the
+        // contributors, and a plan that changed during the run's last
+        // turn starts a fresh staleness clock — nothing is due at the
+        // follow-up's consult, so its request carries the closing
+        // wording alone. The mid-run belts stay clock-keyed across the
+        // injection boundary.
+        let script = vec![
+            sse_tool_call_turn(
+                "TodoWrite",
+                &serde_json::json!({
+                    "todos": [{"id": "one", "subject": "first",
+                               "status": "pending"}]
+                }),
+            ),
+            sse_tool_call_turn(
+                "TodoWrite",
+                &serde_json::json!({
+                    "todos": [{"id": "one", "subject": "first",
+                               "status": "pending"},
+                              {"id": "two", "subject": "second",
+                               "status": "pending"}]
+                }),
+            ),
+            sse_text_turn("done for now"),
+            sse_text_turn("noted, but not closing it"),
+        ];
+        let server = SseServer::start(script).await;
+        let dir = TempDir::new().expect("tempdir");
+        let mut runner = Runner::builder(&wire_config(server.port, 10), dir.path())
+            .with_todo_nudge(|_| {}, || true)
+            .build()
+            .await
+            .expect("constructs");
+        tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("do it"))
+            .await
+            .expect("run settles within timeout")
+            .expect("the run succeeds");
+        let requests = recorded_requests(&server);
+        assert_eq!(
+            requests.len(),
+            4,
+            "three model turns plus the follow-up: {requests:?}"
+        );
+        let followup = &requests[3];
+        assert!(
+            followup.contains("then finish"),
+            "the follow-up's own closing wording rides its prompt: {requests:?}"
+        );
+        assert!(
+            !requests[2].contains("reminder:"),
+            "a plan that just changed owes nothing — the clock restarted \
+             with the write: {requests:?}"
+        );
+        let stacked = followup.matches("still not completed").count();
+        assert_eq!(
+            stacked, 1,
+            "the follow-up carries its own wording alone — nothing was \
+             due at its consult: {requests:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_nudged_builder_runs_exactly_one_engine_followup() {
+        // The builder wiring every host rides: with a nudge callback
+        // registered, a run that files a plan and leaves it undone is
+        // extended by exactly one engine-injected reminder turn — the
+        // callback fires with the reminder at the turn's injection,
+        // the third request carries the reminder text as its prompt,
+        // and the follow-up's own clean end earns nothing further,
+        // whatever its answer left on the list.
+        let script = vec![
+            sse_tool_call_turn(
+                "TodoWrite",
+                &serde_json::json!({
+                    "todos": [{"id": "only", "subject": "the work",
+                               "status": "pending"}]
+                }),
+            ),
+            sse_text_turn("working on it"),
+            sse_text_turn("noted, but not closing it"),
+        ];
+        let server = SseServer::start(script).await;
+        let dir = TempDir::new().expect("tempdir");
+        let echoed: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let echo_sink = Arc::clone(&echoed);
+        let mut runner = Runner::builder(&wire_config(server.port, 10), dir.path())
+            .with_todo_nudge(
+                move |reminder| {
+                    echo_sink.lock().expect("echo lock").push(reminder);
+                },
+                || true,
+            )
+            .build()
+            .await
+            .expect("constructs");
+        let run = tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("do it"))
+            .await
+            .expect("run settles within timeout")
+            .expect("the run succeeds, follow-up included");
+        assert_eq!(
+            run.output.as_deref(),
+            Some("noted, but not closing it"),
+            "the follow-up's answer is the run's output — it joined the run"
+        );
+        let requests = recorded_requests(&server);
+        assert_eq!(
+            requests.len(),
+            3,
+            "the prompt's two turns and exactly one reminder: {requests:?}"
+        );
+        assert!(
+            requests[2].contains("reminder: 1 todo item"),
+            "the injected turn's prompt is the reminder wording: {requests:?}"
+        );
+        let echoed = echoed.lock().expect("echo lock").clone();
+        assert_eq!(
+            echoed,
+            vec![
+                "reminder: 1 todo item still not completed — finish the \
+                  remaining work, or mark the entries done with TodoWrite, \
+                  then finish (a completed request from pending lands \
+                  in_progress — walk it with a follow-up call)"
+                    .to_string()
+            ],
+            "the callback fired once, with the reminder, at the injection"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_declined_offer_runs_no_followup_and_writes_no_row() {
+        // The leave-to-extend lane: a host that answers false at the
+        // offer spends nothing — no reminder request leaves, no echo
+        // fires, and the run's output is the model's own last word.
+        // The gate is asked before the reminder is even built, so a
+        // leaving session cannot pay for a turn its teardown would
+        // abort.
+        let script = vec![
+            sse_tool_call_turn(
+                "TodoWrite",
+                &serde_json::json!({
+                    "todos": [{"id": "only", "subject": "the work",
+                               "status": "pending"}]
+                }),
+            ),
+            sse_text_turn("working on it"),
+            sse_text_turn("never served"),
+        ];
+        let server = SseServer::start(script).await;
+        let dir = TempDir::new().expect("tempdir");
+        let echoed: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let echo_sink = Arc::clone(&echoed);
+        let mut runner = Runner::builder(&wire_config(server.port, 10), dir.path())
+            .with_todo_nudge(
+                move |reminder| {
+                    echo_sink.lock().expect("echo lock").push(reminder);
+                },
+                || false,
+            )
+            .build()
+            .await
+            .expect("constructs");
+        let run = tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("do it"))
+            .await
+            .expect("run settles within timeout")
+            .expect("the run succeeds on its own turns");
+        assert_eq!(
+            run.output.as_deref(),
+            Some("working on it"),
+            "the model's own last word is the output — no reminder ran"
+        );
+        assert_eq!(
+            recorded_requests(&server).len(),
+            2,
+            "the declined offer spent no request"
+        );
+        assert!(
+            echoed.lock().expect("echo lock").is_empty(),
+            "the declined offer echoed nothing"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_builder_without_a_nudge_callback_runs_plain() {
+        // The opt-out is the host's decision: no callback, no hook,
+        // and a run that files and abandons a plan ends where the
+        // model left it — the same requests a nudge-free runner
+        // always made.
+        let script = vec![
+            sse_tool_call_turn(
+                "TodoWrite",
+                &serde_json::json!({
+                    "todos": [{"id": "only", "subject": "the work",
+                               "status": "pending"}]
+                }),
+            ),
+            sse_text_turn("working on it"),
+        ];
+        let server = SseServer::start(script).await;
+        let dir = TempDir::new().expect("tempdir");
+        let mut runner = Runner::builder(&wire_config(server.port, 10), dir.path())
+            .build()
+            .await
+            .expect("constructs");
+        let run = tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("do it"))
+            .await
+            .expect("run settles within timeout")
+            .expect("the run succeeds");
+        assert_eq!(run.output.as_deref(), Some("working on it"));
+        assert_eq!(
+            recorded_requests(&server).len(),
+            2,
+            "no callback registered, no reminder turn"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_ending_exactly_at_its_turn_budget_is_offered_no_followup() {
+        // The offer's budget room: the engine consults the hook only when
+        // the run's own turns left room — `turns_taken() < max_turns` — so
+        // a run that files a plan and speaks its last word on the final
+        // allowed turn lands clean with the plan undone and still earns no
+        // reminder. The pin holds the boundary from the roomless side.
+        let script = vec![
+            sse_tool_call_turn(
+                "TodoWrite",
+                &serde_json::json!({
+                    "todos": [{"id": "only", "subject": "the work",
+                               "status": "pending"}]
+                }),
+            ),
+            sse_text_turn("working on it"),
+        ];
+        let server = SseServer::start(script).await;
+        let dir = TempDir::new().expect("tempdir");
+        let echoed: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let echo_sink = Arc::clone(&echoed);
+        let mut runner = Runner::builder(&wire_config(server.port, 2), dir.path())
+            .with_todo_nudge(
+                move |reminder| {
+                    echo_sink.lock().expect("echo lock").push(reminder);
+                },
+                || true,
+            )
+            .build()
+            .await
+            .expect("constructs");
+        let run = tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("do it"))
+            .await
+            .expect("run settles within timeout")
+            .expect("the run completes on its own turns");
+        assert_eq!(
+            run.output.as_deref(),
+            Some("working on it"),
+            "the budget-exact end is a clean completion, not a budget error"
+        );
+        let requests = recorded_requests(&server);
+        assert_eq!(
+            requests.len(),
+            2,
+            "the run's two turns and no reminder — the budget had no room for \
+             one: {requests:?}"
+        );
+        assert!(
+            echoed.lock().expect("echo lock").is_empty(),
+            "no echo is owed for an offer that was never made"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_with_one_turn_of_budget_room_gets_the_followup() {
+        // The same clean end with one turn of room: the plan is equally
+        // undone, the answer equally landed, and the engine now has budget
+        // for the reminder — the offer depends on the room, not on the
+        // plan alone. The boundary's other side, one turn apart.
+        let script = vec![
+            sse_tool_call_turn(
+                "TodoWrite",
+                &serde_json::json!({
+                    "todos": [{"id": "only", "subject": "the work",
+                               "status": "pending"}]
+                }),
+            ),
+            sse_text_turn("working on it"),
+            sse_text_turn("noted, but not closing it"),
+        ];
+        let server = SseServer::start(script).await;
+        let dir = TempDir::new().expect("tempdir");
+        let mut runner = Runner::builder(&wire_config(server.port, 3), dir.path())
+            .with_todo_nudge(|_| {}, || true)
+            .build()
+            .await
+            .expect("constructs");
+        let run = tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("do it"))
+            .await
+            .expect("run settles within timeout")
+            .expect("the run succeeds, reminder included");
+        assert_eq!(
+            run.output.as_deref(),
+            Some("noted, but not closing it"),
+            "the reminder's answer is the run's output"
+        );
+        let requests = recorded_requests(&server);
+        assert_eq!(
+            requests.len(),
+            3,
+            "one turn of room, one reminder: {requests:?}"
+        );
+        assert!(
+            requests[2].contains("reminder: 1 todo item"),
+            "the third request is the reminder: {requests:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reasoning_content_deltas_reach_the_observer_through_the_engine() {
         // The canned stream's `reasoning_content` deltas parse as
         // thinking parts, the engine forwards them as
@@ -2609,6 +3431,39 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// The roles of every message in a recorded request whose text
+    /// contains `needle`.
+    ///
+    /// Reads the request's JSON body, so a pin can assert not only
+    /// that a wording reached the provider but in whose name it
+    /// traveled.
+    fn message_roles(request: &str, needle: &str) -> Vec<String> {
+        let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+        let parsed: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+        parsed
+            .get("messages")
+            .and_then(serde_json::Value::as_array)
+            .map(|messages| {
+                messages
+                    .iter()
+                    .filter(|message| {
+                        message
+                            .get("content")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|content| content.contains(needle))
+                    })
+                    .map(|message| {
+                        message
+                            .get("role")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                            .to_string()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn plan_mode_blocks_a_write_end_to_end() {
         let server = SseServer::start(vec![
@@ -3325,6 +4180,58 @@ mod tests {
             std::fs::read_to_string(dir.path().join("b.txt")).unwrap_or_default(),
             "rewritten\n",
             "the follow-up write lands its content"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_batch_arms_no_baseline_a_later_write_judges() {
+        // The preview reads its targets to build the diff but records no
+        // observation: only a landed write refreshes a baseline. So a
+        // dry-run over a file the session never read leaves that file in
+        // the never-read class — a later Write lands even after an
+        // external change, judged by no baseline the preview armed. The
+        // pin guards the neutrality: a preview that silently armed the
+        // guard would hold writes the model never verified a view of.
+        let dir = TempDir::new().expect("tempdir");
+        let target = dir.path().join("previewed.txt");
+        std::fs::write(&target, "alpha\n").expect("seed target");
+        let pipeline = fs_pipeline(dir.path(), false);
+
+        let preview = drive(
+            &pipeline,
+            "MultiEdit",
+            serde_json::json!({
+                "edits": [
+                    {"file_path": "previewed.txt", "old_text": "alpha", "new_text": "ALPHA"}
+                ],
+                "dry_run": true
+            }),
+        )
+        .await;
+        assert!(!preview.is_error, "{}", preview.output);
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap_or_default(),
+            "alpha\n",
+            "the preview writes nothing"
+        );
+
+        std::fs::write(&target, "external\n").expect("external change after the preview");
+        let write = drive(
+            &pipeline,
+            "Write",
+            serde_json::json!({"file_path": "previewed.txt", "content": "ours\n"}),
+        )
+        .await;
+        assert!(
+            !write.is_error,
+            "the preview armed no baseline, so the never-read write is judged \
+             by none: {}",
+            write.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap_or_default(),
+            "ours\n",
+            "the write lands over the externally changed bytes"
         );
     }
 
@@ -5823,11 +6730,129 @@ mod tests {
         );
     }
 
+    /// Offers one piece of guidance from inside the run, at a turn's start.
+    ///
+    /// The loop emits `on_turn_start` after it has drained the steering slot
+    /// for that turn and before it sends that turn's request, so an offer
+    /// made here stands provably behind the boundary that could have read it.
+    /// A wall-clock poll cannot establish that: an offer accepted while the
+    /// run opens is still ahead of the first drain and rides the first
+    /// request, which is the loop behaving correctly rather than the guidance
+    /// going unread.
+    struct TurnStartGuidance {
+        /// The loop's slot, attached once the built runner hands it out.
+        slot: Mutex<Option<Arc<loopctl::engine::Steering>>>,
+        /// The guidance the observer offers.
+        text: String,
+        /// Whether the run in flight accepted the offer.
+        accepted: std::sync::atomic::AtomicBool,
+    }
+
+    impl TurnStartGuidance {
+        /// A guide holding `text`, with no slot yet and no offer made.
+        fn new(text: &str) -> Arc<Self> {
+            Arc::new(Self {
+                slot: Mutex::new(None),
+                text: text.to_string(),
+                accepted: std::sync::atomic::AtomicBool::new(false),
+            })
+        }
+
+        /// Hand the observer the slot the built runner owns.
+        fn attach(&self, steering: Arc<loopctl::engine::Steering>) {
+            *self.slot.lock().expect("the slot lock") = Some(steering);
+        }
+
+        /// Whether the run in flight took the offer.
+        fn accepted(&self) -> bool {
+            self.accepted.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl LoopObserver for TurnStartGuidance {
+        fn name(&self) -> &'static str {
+            "turn-start-guidance"
+        }
+
+        fn on_turn_start(&self, ctx: &loopctl::observer::TurnStartContext) {
+            if ctx.turn > 0 || self.accepted() {
+                return;
+            }
+            let offered = self
+                .slot
+                .lock()
+                .expect("the slot lock")
+                .as_ref()
+                .is_some_and(|slot| slot.push(Message::user(self.text.clone())));
+            if offered {
+                self.accepted
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn guidance_the_run_never_reads_is_left_for_the_host() {
-        // One turn, no boundary after it: the guidance was accepted, and the
-        // run ended anyway. The seam's other law — the host gets it back, so
-        // nothing the user typed dies in a slot nobody will drain again.
+        // One turn, so the run has exactly one boundary and nothing behind
+        // it: the offer is placed after that boundary by the loop's own turn
+        // event rather than raced for, which is what makes the run's failure
+        // to reach it a fact of the shape rather than of the machine's speed.
+        // A sentinel rather than a phrase — the request body carries the
+        // system prompt and the tool schemas, where ordinary words appear by
+        // coincidence and a negative assertion would prove nothing.
+        let server = SseServer::start(vec![sse_text_turn("answered")]).await;
+        let dir = TempDir::new().expect("tempdir");
+        let guide = TurnStartGuidance::new("the answer is stale, late-4w7s");
+        let mut runner = Runner::builder(&wire_config(server.port, 10), dir.path())
+            .with_observer(Arc::clone(&guide) as Arc<dyn LoopObserver>)
+            .build()
+            .await
+            .expect("constructs");
+        let seam = runner.steering();
+        guide.attach(Arc::clone(&seam));
+
+        let run = tokio::time::timeout(std::time::Duration::from_secs(30), runner.run("answer"))
+            .await
+            .expect("the run settles within its budget")
+            .expect("the run succeeds");
+        assert_eq!(run.output.as_deref(), Some("answered"));
+        assert!(
+            guide.accepted(),
+            "the run in flight took the guidance at its turn's start"
+        );
+
+        let requests = recorded_requests(&server);
+        assert_eq!(
+            requests.len(),
+            1,
+            "one turn and no boundary after it: {requests:?}"
+        );
+        assert!(
+            !requests[0].contains("late-4w7s"),
+            "an offer behind the drain cannot retroactively enter the request \
+             its turn sent: {:?}",
+            requests[0]
+        );
+
+        let left = seam.take_all();
+        let texts: Vec<String> = left.iter().map(Message::text_content).collect();
+        assert_eq!(
+            texts,
+            ["the answer is stale, late-4w7s"],
+            "what the run never reached comes back to the host, in the order it \
+             arrived"
+        );
+        assert!(seam.is_empty(), "taking it clears the slot");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn guidance_is_delivered_or_handed_back_but_never_lost() {
+        // The law a host relies on, with no timing assumption in it: an offer
+        // landing while a run is open — whenever in the run it lands, and the
+        // moment it lands is what a loaded machine moves — either reaches the
+        // model or comes back. So the earliest accepted moment is raced for
+        // here rather than placed, and both outcomes pass while neither, and
+        // especially both, cannot.
         let server = SseServer::start_with_delay(
             vec![sse_text_turn("answered")],
             std::time::Duration::from_millis(700),
@@ -5848,37 +6873,134 @@ mod tests {
 
         let mut offered = false;
         for _ in 0..400 {
-            if seam.push(loopctl::message::Message::user("advice that arrived late")) {
+            if seam.push(Message::user("lost-2k9d")) {
                 offered = true;
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            tokio::time::sleep(std::time::Duration::ZERO).await;
         }
-        assert!(offered, "the run in flight took the guidance");
+        assert!(offered, "the run in flight took the offer");
 
         let run = task
             .await
             .expect("the task joins")
             .expect("the run succeeds");
         assert_eq!(run.output.as_deref(), Some("answered"));
-        let left = seam.take_all();
-        let texts: Vec<String> = left
+        let delivered = recorded_requests(&server)
             .iter()
-            .map(loopctl::message::Message::text_content)
-            .collect();
-        assert_eq!(
-            texts,
-            ["advice that arrived late"],
-            "what the run never reached comes back to the host, in the order it \
-             arrived"
+            .any(|request| request.contains("lost-2k9d"));
+        let returned = seam.take_all();
+        assert_ne!(
+            delivered,
+            !returned.is_empty(),
+            "the guidance either rode a request or came back, never both and \
+             never neither: delivered {delivered}, returned {} message(s)",
+            returned.len()
         );
-        assert!(seam.is_empty(), "taking it clears the slot");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn run_clears_the_todo_list_at_the_start_of_each_run() {
-        // A dead endpoint makes the run fail, but the reset happens before the
-        // request — proving the clear is tied to run start, not to success.
+    async fn a_mid_run_nudge_rides_the_tail_and_keeps_the_prefix_stable() {
+        // The cache contract: a provider with a prefix cache pays nothing
+        // for the reminder. The start-discipline break lands mid-run — a
+        // Bash call fires against a seeded plan whose entry stands
+        // pending — and the reminder the engine raises must ride the
+        // request as a TAIL user message, appended after the
+        // conversation that already stands. A head-side reminder (a
+        // system message inserted ahead of history) mutates the prefix
+        // and re-prefills the whole context on every nudged turn; this
+        // pin holds the earlier request's messages as an untouched
+        // prefix of the next one.
+        let script = vec![
+            sse_tool_call_turn("Bash", &serde_json::json!({"command": "true"})),
+            sse_text_turn("working"),
+            sse_text_turn("closing out"),
+        ];
+        let server = SseServer::start(script).await;
+        let dir = TempDir::new().expect("tempdir");
+        let mut runner = Runner::builder(&wire_config(server.port, 10), dir.path())
+            .with_todo_nudge(|_| {}, || true)
+            .build()
+            .await
+            .expect("constructs");
+        runner
+            .context()
+            .todos
+            .lock()
+            .expect("todos lock")
+            .push(dch_tools::TodoEntry {
+                id: "only".to_string(),
+                subject: "the work".to_string(),
+                description: String::new(),
+                status: dch_tools::TodoStatus::Pending,
+                active_form: None,
+            });
+        tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("go"))
+            .await
+            .expect("the run settles")
+            .expect("the run succeeds");
+
+        let requests = recorded_requests(&server);
+        assert!(
+            requests.len() >= 2,
+            "the run made at least two requests, got {}",
+            requests.len()
+        );
+        let messages_of = |body: &str| -> Vec<serde_json::Value> {
+            let json_body = match body.split_once("\r\n\r\n") {
+                Some((_, json_body)) => json_body,
+                None => body,
+            };
+            serde_json::from_str::<serde_json::Value>(json_body)
+                .expect("request body parses")
+                .get("messages")
+                .and_then(|messages| messages.as_array())
+                .expect("messages array")
+                .clone()
+        };
+        let first = messages_of(&requests[0]);
+        let second = messages_of(&requests[1]);
+        assert!(
+            second.len() > first.len(),
+            "the second request carries the turn's growth"
+        );
+        assert_eq!(
+            &second[..first.len()],
+            &first[..],
+            "the first request's messages stand as an untouched prefix of the second — \
+             a nudge inserted ahead of history breaks every prefix cache"
+        );
+        let message_text = |message: &serde_json::Value| -> String {
+            message
+                .get("content")
+                .map(|content| match content.as_str() {
+                    Some(text) => text.to_string(),
+                    None => content.to_string(),
+                })
+                .unwrap_or_default()
+        };
+        let reminder_at_tail = second[first.len()..].iter().any(|message| {
+            message.get("role").and_then(|role| role.as_str()) == Some("user")
+                && message_text(message).contains("no plan entry in progress")
+        });
+        assert!(
+            reminder_at_tail,
+            "the start-discipline reminder rides the tail as a user message"
+        );
+        assert!(
+            !second[..first.len()]
+                .iter()
+                .any(|message| message_text(message).contains("no plan entry in progress")),
+            "no reminder text stands inside the stable prefix"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unfinished_plan_carries_into_the_next_run() {
+        // A dead endpoint makes the run fail, but the carry decision
+        // happens before the request — proving the rule is tied to run
+        // start, not to success. The prior run's open work stands into
+        // the next run of the same session, ids and rungs intact.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
@@ -5896,9 +7018,121 @@ mod tests {
             .expect("todos lock")
             .push(dch_tools::TodoEntry {
                 id: "1".to_string(),
-                subject: "stale plan".to_string(),
+                subject: "open work".to_string(),
                 description: String::new(),
                 status: dch_tools::TodoStatus::Pending,
+                active_form: None,
+            });
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("hi")).await;
+        let store = runner.context().todos.lock().expect("todos lock").clone();
+        assert_eq!(
+            store.len(),
+            1,
+            "an unfinished plan carries into the session's next run"
+        );
+        assert_eq!(
+            store.first().map(|entry| entry.status),
+            Some(dch_tools::TodoStatus::Pending),
+            "the carried entry stands in its rung"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_second_run_inherits_the_undone_plan() {
+        // The carry rule on the wire: the first run files a pending plan
+        // and refuses to close it; the second run, on the same runner,
+        // adds one new entry — and its conversation shows the carried
+        // entry standing beside the newborn, the rung and id intact.
+        // Nothing re-files; the plan simply survived the run boundary.
+        let script = vec![
+            sse_tool_call_turn(
+                "TodoWrite",
+                &serde_json::json!({
+                    "todos": [{"id": "only", "subject": "the work",
+                               "status": "pending"}]
+                }),
+            ),
+            sse_text_turn("done for now"),
+            sse_text_turn("noted, but not closing it"),
+            sse_tool_call_turn(
+                "TodoWrite",
+                &serde_json::json!({
+                    "todos": [{"id": "fresh", "subject": "the new work",
+                               "status": "pending"}]
+                }),
+            ),
+            sse_text_turn("all handled"),
+            sse_text_turn("closed out"),
+        ];
+        let server = SseServer::start(script).await;
+        let dir = TempDir::new().expect("tempdir");
+        let mut runner = Runner::builder(&wire_config(server.port, 10), dir.path())
+            .with_todo_nudge(|_| {}, || true)
+            .build()
+            .await
+            .expect("constructs");
+        let first = tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("one"))
+            .await
+            .expect("the first run settles")
+            .expect("the first run succeeds");
+        assert_eq!(
+            first.output.as_deref(),
+            Some("noted, but not closing it"),
+            "the first run ends on the follow-up's answer, plan still open"
+        );
+        let second = tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("two"))
+            .await
+            .expect("the second run settles")
+            .expect("the second run succeeds");
+        assert_eq!(
+            second.output.as_deref(),
+            Some("closed out"),
+            "the second run ends on its follow-up's answer — the carried \
+             plan still earns its nudge"
+        );
+        let requests = recorded_requests(&server);
+        assert_eq!(
+            requests.len(),
+            6,
+            "each run's turns plus its follow-up: {requests:?}"
+        );
+        let last = requests.last().expect("the second run's final request");
+        assert!(
+            last.contains("\u{25cb} [only] the work"),
+            "the carried entry stands in the second run's conversation, id \
+             and rung intact: {requests:?}"
+        );
+        assert!(
+            last.contains("\u{25cb} [fresh] the new work"),
+            "the newborn joined it without replacing anything: {requests:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_completed_plan_clears_for_the_next_run() {
+        // The other half of the carry rule: a plan whose every entry the
+        // prior run finished retires with it — the next run starts
+        // fresh, not inheriting a wall of completed rows.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        let dir = TempDir::new().expect("tempdir");
+        let mut runner = Runner::builder(&wire_config(port, 7), dir.path())
+            .build()
+            .await
+            .expect("constructs");
+        runner
+            .context()
+            .todos
+            .lock()
+            .expect("todos lock")
+            .push(dch_tools::TodoEntry {
+                id: "1".to_string(),
+                subject: "finished work".to_string(),
+                description: String::new(),
+                status: dch_tools::TodoStatus::Completed,
                 active_form: None,
             });
         let _ = tokio::time::timeout(std::time::Duration::from_secs(10), runner.run("hi")).await;
@@ -5909,7 +7143,68 @@ mod tests {
                 .lock()
                 .expect("todos lock")
                 .is_empty(),
-            "each run must start with a fresh todo list"
+            "a completed plan retires — the next run starts fresh"
+        );
+    }
+
+    #[test]
+    fn seed_standing_plan_adopted_iff_undone() {
+        // The resume half: a restored history whose last TodoWrite render
+        // holds undone entries seeds the store; a completed list (or no
+        // list at all) leaves it empty — the finished plan retired with
+        // its session, the unfinished one carried across the process
+        // boundary.
+        let undone_render = "# Task List\n\nSummary: 1 pending, 0 in progress, 0 \
+             completed\n\n○ [only] the work\n\n";
+        let undone_history = vec![
+            loopctl::message::Message::user("do it"),
+            loopctl::message::Message::new(
+                loopctl::message::Role::User,
+                vec![loopctl::message::MessagePart::tool_result(
+                    "c1",
+                    "TodoWrite",
+                    undone_render,
+                    false,
+                )],
+            ),
+        ];
+        let context = sample_context("/tmp/tx51-seed-undone");
+        seed_standing_plan(&context, &undone_history);
+        let store = context.todos.lock().expect("todos lock").clone();
+        assert_eq!(
+            store.len(),
+            1,
+            "the undone plan seeds the resumed session's store"
+        );
+        assert_eq!(
+            store.first().map(|entry| entry.id.as_str()),
+            Some("only"),
+            "ids and statuses carry from the render"
+        );
+
+        let completed_render = "# Task List\n\nSummary: 0 pending, 0 in progress, 1 \
+             completed\n\n● [done] the work\n\n";
+        let completed_history = vec![loopctl::message::Message::new(
+            loopctl::message::Role::User,
+            vec![loopctl::message::MessagePart::tool_result(
+                "c2",
+                "TodoWrite",
+                completed_render,
+                false,
+            )],
+        )];
+        let clean = sample_context("/tmp/tx51-seed-complete");
+        seed_standing_plan(&clean, &completed_history);
+        assert!(
+            clean.todos.lock().expect("todos lock").is_empty(),
+            "a completed plan retires — nothing seeds"
+        );
+
+        let bare = sample_context("/tmp/tx51-seed-bare");
+        seed_standing_plan(&bare, &[]);
+        assert!(
+            bare.todos.lock().expect("todos lock").is_empty(),
+            "a history with no plan seeds nothing"
         );
     }
 

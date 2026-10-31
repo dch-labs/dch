@@ -796,6 +796,42 @@ fn discard_pending_input() {
 #[cfg(not(unix))]
 fn discard_pending_input() {}
 
+/// Stand the fatal-signal net down for an exit that has begun.
+///
+/// SIGINT and SIGTERM become ignored, process-wide, from the moment
+/// the ordered teardown takes over. The multi-press quit chord
+/// invites straggler presses, and once the ordinary restore has run
+/// the fatal handler meets them deaf — restore bytes out, then
+/// `_exit(130)` with whatever stdout still buffers dropped on the
+/// floor. The exit lines print in that exact window, so a straggler
+/// there can swallow the resume command the label names. Ignored
+/// instead, a straggler changes nothing: the teardown finishes, the
+/// exit lines print whole, and the process exits on its own. The
+/// ignore outlives nothing — the process exits moments later, and no
+/// children survive it to inherit the disposition.
+#[cfg(unix)]
+pub fn ignore_fatal_signals() {
+    // SAFETY: a zeroed sigaction is a valid `sa_flags = 0` record, and
+    // sigaction installs it for the whole process; the calls only
+    // touch this frame and kernel state.
+    unsafe {
+        for signal in [libc::SIGINT, libc::SIGTERM] {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = libc::SIG_IGN;
+            libc::sigemptyset(&raw mut action.sa_mask);
+            libc::sigaction(signal, &raw const action, std::ptr::null_mut());
+        }
+    }
+}
+
+/// The non-unix counterpart: no POSIX dispositions to stand down.
+///
+/// The ordered teardown alone owns these platforms' exit; nothing to
+/// ignore, nothing that could `_exit` between the restore and the
+/// exit lines.
+#[cfg(not(unix))]
+pub fn ignore_fatal_signals() {}
+
 /// RAII ownership of an initialized TUI terminal.
 ///
 /// Constructing the guard initializes the terminal (see
@@ -860,6 +896,62 @@ impl Drop for TerminalGuard {
 mod tests {
     use super::*;
 
+    /// Serializes tests that touch process-global signal state: the
+    /// deaf flag and the fatal dispositions are one shared process,
+    /// so parallel signal tests would race each other's stores.
+    #[cfg(unix)]
+    static SIGNAL_STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Reads one signal's current disposition record.
+    #[cfg(unix)]
+    fn current_disposition(signal: libc::c_int) -> libc::sigaction {
+        let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+        // SAFETY: a null act changes no disposition; the call only
+        // fills the frame-owned record.
+        unsafe { libc::sigaction(signal, std::ptr::null(), &raw mut current) };
+        current
+    }
+
+    /// Reinstalls a captured disposition record for one signal.
+    #[cfg(unix)]
+    fn reinstall_disposition(signal: libc::c_int, action: libc::sigaction) {
+        // SAFETY: the record is the kernel's own prior answer for
+        // this signal, frame-owned plain data.
+        unsafe { libc::sigaction(signal, &raw const action, std::ptr::null_mut()) };
+    }
+
+    /// Consumes one signal left pending by an ignored delivery.
+    ///
+    /// An ignored signal a blocked thread holds stays pending instead
+    /// of being discarded, and restoring a terminate disposition would
+    /// deliver that orphan; the zero-timeout wait drains it.
+    #[cfg(unix)]
+    fn drain_pending(signal: libc::c_int) {
+        let mut awaited: libc::sigset_t = unsafe { std::mem::zeroed() };
+        // SAFETY: the set is frame-owned plain data and the two calls
+        // only empty it and add the one signal.
+        unsafe {
+            libc::sigemptyset(&raw mut awaited);
+            libc::sigaddset(&raw mut awaited, signal);
+        }
+        loop {
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let timeout = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // SAFETY: the record is frame-owned plain data; a zero
+            // timeout makes the call a nonblocking poll that removes
+            // one pending instance or fails with EAGAIN.
+            let taken = unsafe {
+                libc::sigtimedwait(&raw const awaited, &raw mut info, &raw const timeout)
+            };
+            if taken != signal {
+                return;
+            }
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn each_displaced_disposition_gets_its_own_action() {
@@ -917,12 +1009,58 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn arming_is_idempotent_and_deaf_windows_toggle() {
+        let _signal_state = SIGNAL_STATE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         arm_fatal_signal_restore();
         arm_fatal_signal_restore();
         enter_signal_deaf_window();
         assert!(SIGNAL_RESTORE_DEAF.load(Ordering::SeqCst));
         exit_signal_deaf_window();
         assert!(!SIGNAL_RESTORE_DEAF.load(Ordering::SeqCst));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_ignored_signal_cannot_take_the_deaf_exit() {
+        // The exact interleaving the exit lines live in: the handler
+        // armed, the deaf flag the ordinary restore leaves standing,
+        // and the stand-down that must own whatever arrives next. A
+        // delivered SIGINT there must not run the deaf path — this
+        // test's own survival is the assertion, so a regression shows
+        // as the test process dying 130 mid-run.
+        let _signal_state = SIGNAL_STATE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prior_sigint = current_disposition(libc::SIGINT);
+        let prior_sigterm = current_disposition(libc::SIGTERM);
+        arm_fatal_signal_restore();
+        SIGNAL_RESTORE_DEAF.store(true, Ordering::SeqCst);
+        ignore_fatal_signals();
+        // SAFETY: the pid is this process, and SIGINT's disposition is
+        // SIG_IGN; if the stand-down failed, the deaf handler's
+        // `_exit(130)` ends the test binary here.
+        unsafe { libc::kill(libc::getpid(), libc::SIGINT) };
+        // The signal was ignored, so the process is alive to continue.
+        // A thread blocking SIGINT may hold the delivery pending
+        // instead of discarded — drain it before the dispositions it
+        // ignored go back to what this test found, or the orphan would
+        // land on the restored terminate disposition.
+        drain_pending(libc::SIGINT);
+        drain_pending(libc::SIGTERM);
+        reinstall_disposition(libc::SIGINT, prior_sigint);
+        reinstall_disposition(libc::SIGTERM, prior_sigterm);
+        assert_eq!(
+            current_disposition(libc::SIGINT).sa_sigaction,
+            prior_sigint.sa_sigaction,
+            "SIGINT's disposition stands where the test found it"
+        );
+        assert_eq!(
+            current_disposition(libc::SIGTERM).sa_sigaction,
+            prior_sigterm.sa_sigaction,
+            "SIGTERM's disposition stands where the test found it"
+        );
+        SIGNAL_RESTORE_DEAF.store(false, Ordering::SeqCst);
     }
 
     #[cfg(unix)]

@@ -43,9 +43,10 @@ pub enum DchClient {
     /// An OpenAI-protocol provider client.
     ///
     /// Selected for the OpenAI wire-protocol family: `OpenAi`, `Ollama`,
-    /// `DeepSeek`, and `Grok` all speak the OpenAI chat-completions API (the
-    /// latter three via a custom `base_url`). Wraps loopctl's `OpenAiClient`,
-    /// which the other `ApiClient` methods forward to.
+    /// `SelfHosted`, `DeepSeek`, `Grok`, `Azure`, and `Moonshot` all speak
+    /// the OpenAI chat-completions API (all but the first via a custom
+    /// `base_url`). Wraps loopctl's `OpenAiClient`, which the other
+    /// `ApiClient` methods forward to.
     OpenAi(OpenAiClient),
 
     /// An Anthropic-protocol provider client.
@@ -162,7 +163,8 @@ impl ApiClient for DchClient {
 /// Build a [`DchClient`] for the provider named by `config.api_type`.
 ///
 /// Variants are mapped by wire-protocol family: OpenAI-compatible providers
-/// (`OpenAi`, `Ollama`, `DeepSeek`, `Grok`, `Azure`, `Moonshot`) wrap an
+/// (`OpenAi`, `Ollama`, `SelfHosted`, `DeepSeek`, `Grok`, `Azure`,
+/// `Moonshot`) wrap an
 /// [`OpenAiClient`]; Anthropic-compatible providers (`Anthropic`, `Zai`)
 /// wrap an [`AnthropicClient`]; `Gemini` wraps a [`GeminiClient`]. The
 /// profiled providers start from loopctl's pre-seeded profile builders,
@@ -185,8 +187,9 @@ impl ApiClient for DchClient {
 /// (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY` or
 /// `GOOGLE_API_KEY`); the profiled providers inherit their profile's
 /// seeded variable (for example `DEEPSEEK_API_KEY`, `MOONSHOT_API_KEY`)
-/// from the builder; a keyless Ollama configuration carries its
-/// profile's seeded dummy credential. If a required
+/// from the builder; a keyless Ollama or self-hosted configuration
+/// carries its profile's seeded dummy credential — the placeholder the
+/// OpenAI wire demands of a route that asks for no secret. If a required
 /// key is missing, returns [`RunnerError::Client`] naming the expected
 /// environment variable.
 ///
@@ -253,29 +256,17 @@ pub fn create_client(config: &ApiConfig) -> Result<DchClient, RunnerError> {
             .build()
             .map_err(client_error)?,
         ),
-        ApiType::SelfHosted => {
-            let base_url = if config.base_url.is_empty() {
-                ApiType::SelfHosted
-                    .default_base_url()
-                    .map_or_else(|| config.base_url.clone(), str::to_string)
-            } else {
-                config.base_url.clone()
-            };
-            let api_key = config
-                .api_key
-                .clone()
-                .unwrap_or_else(|| "self-hosted".to_string());
-            let mut builder = OpenAiClient::builder()
-                .with_api_key(api_key)
-                .with_base_url(base_url)
-                .with_model(config.model.as_str())
-                .with_timeout(timeout)
-                .replay_reasoning(true);
-            if let Some(effort) = effort {
-                builder = builder.thinking_effort(effort);
-            }
-            DchClient::OpenAi(builder.build().map_err(client_error)?)
-        }
+        ApiType::SelfHosted => DchClient::OpenAi(
+            profiled(
+                loopctl::provider::self_hosted_builder(config.model.as_str()),
+                config,
+                effort,
+            )
+            .with_timeout(timeout)
+            .with_stream_usage(true)
+            .build()
+            .map_err(client_error)?,
+        ),
         ApiType::DeepSeek => DchClient::OpenAi(
             profiled(loopctl::provider::deepseek_builder(), config, effort)
                 .build()

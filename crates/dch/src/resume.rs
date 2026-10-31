@@ -66,9 +66,12 @@ pub(crate) enum ResumeControl {
 /// A loaded session: everything both run modes need to continue it.
 ///
 /// Built by [`load_for_resume_in`] from one file read. The display
-/// model is verbatim — what was saved is what renders; the agent
-/// history is derived from it through [`tui_messages_to_loopctl`],
-/// which is lossy by design.
+/// model is verbatim — what was saved is what renders — with one
+/// exception: the retired reminder rows [`load_for_resume_in`] drops
+/// by wording, from the transcript and the machine snapshot alike, so
+/// neither a pre-hide file nor a post-hide one replays a note the mode
+/// no longer owns. The agent history is derived from the display model
+/// through [`tui_messages_to_loopctl`], which is lossy by design.
 #[derive(Debug)]
 pub(crate) struct ResumeOutcome {
     /// The resumed session's UUID, echoed from the id asked for.
@@ -78,7 +81,8 @@ pub(crate) struct ResumeOutcome {
     /// under a fresh identity.
     pub(crate) session_id: Uuid,
 
-    /// The saved conversation in display form, verbatim.
+    /// The saved conversation in display form, verbatim but for the
+    /// retired reminder rows the load drops.
     ///
     /// What was saved is what renders; the agent history is seeded from
     /// the machine snapshot when one is fresh, and only derived from
@@ -416,8 +420,20 @@ fn scrub_json_strings(
 /// resume flow.
 pub(crate) fn load_for_resume_in(id: Uuid, base: &Path) -> Result<ResumeOutcome, ResumeError> {
     let (messages, _model, tokens, saved_at) = crate::session::load_with_meta_in(id, base)?;
+    let messages: Vec<TuiMessage> = messages
+        .into_iter()
+        .filter(|message| match message {
+            TuiMessage::User { text, steered, .. } => {
+                !(*steered && dch_loop::is_nudge_wording(text))
+            }
+            _ => true,
+        })
+        .collect();
     let (machine, machine_compactions) = match crate::session::load_machine_in(id, base, saved_at) {
-        Some((messages, compactions)) => (Some(messages), compactions),
+        Some((messages, compactions)) => (
+            Some(dch_loop::history_without_nudge(&messages)),
+            compactions,
+        ),
         None => (None, 0),
     };
     Ok(ResumeOutcome {
@@ -498,7 +514,11 @@ pub(crate) fn tui_messages_to_loopctl(
     let mut tool_index = 0usize;
     for message in messages {
         match message {
-            TuiMessage::User { text, .. } => {
+            TuiMessage::User {
+                text,
+                unsent: false,
+                ..
+            } => {
                 let mut parts = std::mem::take(&mut pending_results);
                 parts.push(MessagePart::text(text.clone()));
                 push_user_message(&mut converted, parts);
@@ -570,8 +590,10 @@ pub(crate) fn tui_messages_to_loopctl(
                 }
                 push_assistant_message(&mut converted, parts);
             }
-            TuiMessage::System { .. } | TuiMessage::Error { .. } | TuiMessage::Compacted { .. } => {
-            }
+            TuiMessage::User { unsent: true, .. }
+            | TuiMessage::System { .. }
+            | TuiMessage::Error { .. }
+            | TuiMessage::Compacted { .. } => {}
         }
     }
     if !pending_results.is_empty() {
@@ -827,7 +849,7 @@ pub(crate) fn render_sessions(
             fit_column(&summary.model, MODEL_WIDTH),
             summary.last_activity.format("%Y-%m-%d %H:%M"),
             summary.user_message_count,
-            summary.token_total,
+            summary.context_tokens,
         )?;
     }
     Ok(())
@@ -872,6 +894,16 @@ mod tests {
             text: text.to_string(),
             timestamp: now(),
             steered: false,
+            unsent: false,
+        }
+    }
+
+    fn user_steered(text: &str) -> TuiMessage {
+        TuiMessage::User {
+            text: text.to_string(),
+            timestamp: now(),
+            steered: true,
+            unsent: false,
         }
     }
 
@@ -1301,6 +1333,152 @@ mod tests {
     }
 
     #[test]
+    fn a_typed_prompt_reading_the_reminder_wording_stays() {
+        // The steered flag is the corpse's tell: a prompt the user
+        // actually typed — even one quoting the reminder's own
+        // wording — is the user's words and keeps its place.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.keep();
+        let id = uuid::Uuid::new_v4();
+        crate::session::SessionSaver::with_base_dir(id, "m".to_string(), root.clone())
+            .save_at(
+                &[
+                    user(
+                        "reminder: 2 todo items still not completed — finish the \
+                          remaining work",
+                    ),
+                    user_steered(
+                        "reminder: 1 todo item still not completed — finish the \
+                         remaining work",
+                    ),
+                ],
+                crate::session::SessionTokens::default(),
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        let outcome = load_for_resume_in(id, &root).unwrap();
+        let texts: Vec<&str> = outcome
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                TuiMessage::User { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["reminder: 2 todo items still not completed — finish the remaining work"],
+            "the typed prompt stays whole, the steered corpse drops: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn a_persisted_reminder_row_is_dropped_on_load() {
+        // Reminder rows written before the hide are corpses in older
+        // display files — user-shaped, steered-flagged, replaying into
+        // the transcript on every resume as if the user had said them.
+        // The load drops them by their wording; everything the user
+        // actually said, steered or typed, keeps its place.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.keep();
+        let id = uuid::Uuid::new_v4();
+        let now = chrono::Utc::now();
+        crate::session::SessionSaver::with_base_dir(id, "m".to_string(), root.clone())
+            .save_at(
+                &[
+                    user("do the work"),
+                    user_steered(
+                        "reminder: 1 todo item still not completed — finish the \
+                         remaining work, or mark the entries done / remove them \
+                         with TodoWrite, then finish",
+                    ),
+                    assistant(vec![text_block("on it")]),
+                    user_steered("take the other branch"),
+                ],
+                crate::session::SessionTokens::default(),
+                now,
+            )
+            .unwrap();
+        let outcome = load_for_resume_in(id, &root).unwrap();
+        let texts: Vec<&str> = outcome
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                TuiMessage::User { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["do the work", "take the other branch"],
+            "the corpse is gone; the typed prompt and the real steer \
+             keep their places: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn a_pre_hide_machine_snapshot_loads_without_its_reminder_rows() {
+        // The display-side pin above has a machine-side twin. A file
+        // saved while the belts still stored their notes carries those
+        // rows on the machine half while the transcript half has always
+        // been filtered — and the two halves are exactly what the
+        // staleness guard counts against each other, so a basis that
+        // diverges by however many notes a session happened to attract
+        // misreads a healthy snapshot. The same filter runs on both, so
+        // a resumed run never replays a retired reminder either.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.keep();
+        let id = uuid::Uuid::new_v4();
+        let stamp = chrono::Utc::now();
+        let saver = crate::session::SessionSaver::with_base_dir(id, "m".to_string(), root.clone());
+        saver
+            .save_at(
+                &[user("do the work"), assistant(vec![text_block("on it")])],
+                crate::session::SessionTokens::default(),
+                stamp,
+            )
+            .unwrap();
+        let note = loopctl::message::Message::new(
+            loopctl::message::Role::User,
+            vec![loopctl::message::MessagePart::text(
+                "reminder: 1 todo item still not completed — finish the \
+                 remaining work, or mark the entries done / remove them \
+                 with TodoWrite, then finish",
+            )],
+        );
+        saver
+            .save_machine(
+                &[
+                    loopctl::message::Message::new(
+                        loopctl::message::Role::User,
+                        vec![loopctl::message::MessagePart::text("do the work")],
+                    ),
+                    note,
+                    loopctl::message::Message::new(
+                        loopctl::message::Role::Assistant,
+                        vec![loopctl::message::MessagePart::text("on it")],
+                    ),
+                ],
+                stamp,
+                0,
+            )
+            .unwrap();
+        let outcome = load_for_resume_in(id, &root).unwrap();
+        let machine = outcome.machine.expect("a fresh snapshot is adopted");
+        assert!(
+            !machine
+                .iter()
+                .any(|message| dch_loop::is_nudge_wording(&message.text_content())),
+            "the machine half loads on the transcript's basis: {machine:?}"
+        );
+        assert_eq!(
+            machine.len(),
+            2,
+            "the conversation the snapshot really held survives the filter: {machine:?}"
+        );
+    }
+
+    #[test]
     fn missing_machine_json_falls_back_to_derive() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.keep();
@@ -1390,6 +1568,7 @@ mod tests {
             text: "review the branch".to_string(),
             timestamp: now(),
             steered: false,
+            unsent: false,
         }];
         for _round in 0..4 {
             transcript.push(assistant(vec![
@@ -1429,6 +1608,53 @@ mod tests {
         assert_eq!(
             call_ids, result_ids,
             "every call keeps its result, in emission order"
+        );
+    }
+
+    #[test]
+    fn a_steered_row_resumes_as_the_user_message_the_run_read() {
+        // The steered flag separates the session's own words (a steer, a
+        // steer the run read) from the user's submissions for the
+        // listing's count — but the row still names text the model read,
+        // so the reconstructed history must carry it as a user message.
+        // Dropping it here would orphan the follow-up turn that answered
+        // it from the conversation a resume continues.
+        let transcript = vec![
+            user("the first prompt"),
+            TuiMessage::User {
+                text: "reminder: 1 todo item still not completed".to_string(),
+                timestamp: now(),
+                steered: true,
+                unsent: false,
+            },
+            assistant(vec![text_block("the follow-up's answer")]),
+        ];
+        let converted = tui_messages_to_loopctl(&transcript, false);
+        let user_texts: Vec<String> = converted
+            .iter()
+            .filter(|message| message.role == Role::User)
+            .flat_map(|message| message.parts.iter())
+            .filter_map(|part| match part {
+                MessagePart::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            user_texts.contains(&"reminder: 1 todo item still not completed".to_string()),
+            "the steered row rides the history the model continues from, \
+             flagged or not: {converted:?}"
+        );
+        assert_eq!(
+            converted[0].role,
+            Role::User,
+            "the prompt and the reminder that followed mid-run resume as one \
+             user turn — the shape the engine itself read: {converted:?}"
+        );
+        assert_eq!(
+            converted.len(),
+            2,
+            "prompt-plus-reminder as one user turn, the answer as the other: \
+             {converted:?}"
         );
     }
 
@@ -1773,6 +1999,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_unsent_row_never_reaches_the_derived_history() {
+        // The derived history is what the model continues from; a row
+        // the echo wrote as a record was never delivered, and feeding
+        // it here would say the model heard words it never did.
+        let transcript = vec![
+            user("the task that ran"),
+            assistant(vec![text_block("the answer")]),
+            TuiMessage::Error {
+                text: "Agent cancelled".to_string(),
+                timestamp: now(),
+            },
+            TuiMessage::User {
+                text: "queued when the exit came".to_string(),
+                timestamp: now(),
+                steered: false,
+                unsent: true,
+            },
+        ];
+        let converted = tui_messages_to_loopctl(&transcript, false);
+        let carried: Vec<String> = converted
+            .iter()
+            .filter(|message| message.role == Role::User)
+            .flat_map(|message| message.parts.iter())
+            .filter_map(|part| match part {
+                MessagePart::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            carried,
+            ["the task that ran".to_string()],
+            "only delivered words reach the history: {carried:?}"
+        );
+    }
+
     /// Save a transcript plus a machine half stamped at the same moment.
     fn save_pair(
         dir: &std::path::Path,
@@ -2011,7 +2273,7 @@ mod tests {
                 model: "m".to_string(),
                 last_activity: now(),
                 user_message_count: 1,
-                token_total: 0,
+                context_tokens: 0,
             }
         }
         let sessions: Vec<_> = (0..13).map(summary).collect();
@@ -2121,7 +2383,7 @@ mod tests {
                 )
                 .unwrap(),
             user_message_count: count,
-            token_total: 0,
+            context_tokens: 0,
         }
     }
 
@@ -2153,7 +2415,7 @@ mod tests {
         let total = sessions
             .first()
             .expect("the fixture row")
-            .token_total
+            .context_tokens
             .to_string();
         let data_row = table.lines().last().expect("the data row");
         let digits_end = data_row

@@ -577,7 +577,25 @@ impl Sandbox {
         self.dch_args(args, Some(piped))
     }
 
+    /// Run the real binary with `extra` in the child's environment.
+    ///
+    /// The route for a variable a scenario needs the *binary* to see —
+    /// `RUST_LOG` for the logging pins. Setting it on this process
+    /// instead is not an option the harness supports: the write races
+    /// every sibling test's reads of the same environment — `DCH_BIN` at
+    /// each spawn through [`dch_binary`], `TMPDIR` inside the
+    /// `tempfile::tempdir()` calls that build each sandbox — and these
+    /// tests run on many threads with no lock to hold across them. A
+    /// variable passed here reaches only the child this call starts.
+    pub fn dch_env(&self, args: &[&str], extra: &[(&str, &str)]) -> Output {
+        self.dch_args_env(args, None, extra)
+    }
+
     fn dch_args(&self, args: &[&str], stdin: Option<&str>) -> Output {
+        self.dch_args_env(args, stdin, &[])
+    }
+
+    fn dch_args_env(&self, args: &[&str], stdin: Option<&str>, extra: &[(&str, &str)]) -> Output {
         use std::process::Command;
         let mut command = Command::new(dch_binary());
         command
@@ -594,6 +612,9 @@ impl Sandbox {
             })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        for (key, value) in extra {
+            command.env(key, value);
+        }
         let mut child = command.spawn().expect("dch spawns");
         if let Some(text) = stdin {
             let mut pipe = child.stdin.take().expect("stdin pipe");
@@ -818,6 +839,33 @@ impl PtySession {
     /// press again — so the driver repeats the press on a cadence until
     /// the process is gone rather than guessing which press lands.
     pub fn quit_and_finish(mut self, timeout: std::time::Duration) -> portable_pty::ExitStatus {
+        self.quit_until_gone(timeout)
+    }
+
+    /// Quit the TUI, reap it, and hand back what the terminal showed.
+    ///
+    /// The session's exit lines print *after* the terminal is restored,
+    /// so a scenario asserting them needs the drained buffer rather than
+    /// the exit status alone. Reaping does not mean the bytes arrived:
+    /// the reader thread is still moving the child's last output into
+    /// the screen, so the wait is settled through [`settle_screen`] and
+    /// is best-effort — capped at [`SCREEN_STABLE_CAP`], returning what
+    /// arrived if a process keeps writing past it. Strip the result with
+    /// [`strip_ansi`] before matching words.
+    pub fn quit_and_read(
+        mut self,
+        timeout: std::time::Duration,
+    ) -> (portable_pty::ExitStatus, String) {
+        let status = self.quit_until_gone(timeout);
+        let screen = settle_screen(&|| self.snapshot(), SCREEN_STABLE_CAP, SCREEN_POLL);
+        (status, screen)
+    }
+
+    /// Press the exit chord on a cadence until the child is gone.
+    ///
+    /// Shared by [`Self::quit_and_finish`] and [`Self::quit_and_read`];
+    /// see the former for why the press is repeated rather than guessed.
+    fn quit_until_gone(&mut self, timeout: std::time::Duration) -> portable_pty::ExitStatus {
         let deadline = std::time::Instant::now()
             .checked_add(timeout)
             .expect("deadline computable");
@@ -838,6 +886,52 @@ impl PtySession {
     }
 }
 
+/// How long a settled screen must hold still before it counts as done.
+pub const SCREEN_STABLE_CAP: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The gap between two reads of the screen buffer.
+pub const SCREEN_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// The number of unchanged reads that settle the screen.
+const STABLE_READS: usize = 2;
+
+/// Read until the screen stops growing, then hand it back.
+///
+/// A reaped child is not a drained one: the reader thread is still
+/// moving its last bytes into the buffer when the process is gone, so
+/// the exit lines a scenario asserts on can still be in flight. Every
+/// read is taken after `poll` has passed and the buffer must come back
+/// unchanged `STABLE_READS` times running to count as settled — two
+/// reads with no sleep between them agree just as readily on an empty
+/// buffer, which is how a late trailing line gets missed. The wait is
+/// capped at `cap` and best-effort: output still arriving when it
+/// expires is returned as far as it got.
+pub fn settle_screen(
+    read: &dyn Fn() -> String,
+    cap: std::time::Duration,
+    poll: std::time::Duration,
+) -> String {
+    let mut screen = read();
+    let Some(deadline) = std::time::Instant::now().checked_add(cap) else {
+        return screen;
+    };
+    let mut unchanged = 0usize;
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(poll);
+        let next = read();
+        if next == screen {
+            unchanged = unchanged.saturating_add(1);
+            if unchanged >= STABLE_READS {
+                return next;
+            }
+        } else {
+            unchanged = 0;
+            screen = next;
+        }
+    }
+    screen
+}
+
 /// Strip ANSI escape sequences from a raw terminal stream.
 ///
 /// Covers the sequences a ratatui/crossterm TUI emits: CSI parameter
@@ -845,7 +939,7 @@ impl PtySession {
 /// from `@` to `~`) and OSC strings (each ending at BEL or the `ESC \`
 /// string terminator — the terminal answers its color queries with the
 /// latter). Anything the stripper leaves is printable text.
-fn strip_ansi(raw: &str) -> String {
+pub fn strip_ansi(raw: &str) -> String {
     let mut clean = String::with_capacity(raw.len());
     let mut chars = raw.chars();
     while let Some(char) = chars.next() {

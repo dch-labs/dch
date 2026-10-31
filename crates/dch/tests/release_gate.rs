@@ -136,6 +136,26 @@ fn at7_a_completed_turn_auto_saves_the_session() {
         .filter(|entry| entry.path().join("session.json").is_file())
         .collect();
     assert_eq!(saved.len(), 1, "exactly one session with a transcript");
+    // The save carries the loop's context estimate, not a zero: the
+    // conversation stands after the run, and the listing's CONTEXT
+    // column repeats whatever this file records.
+    let saved_path = saved
+        .first()
+        .expect("the one saved session")
+        .path()
+        .join("session.json");
+    let json = std::fs::read_to_string(saved_path).expect("the transcript file");
+    let envelope: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+    let context = envelope
+        .get("tokens")
+        .and_then(|tokens| tokens.get("context_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .expect("the tokens field carries a context estimate");
+    assert!(
+        context > 0,
+        "a headless save records the run's real context — a session is \
+         never smaller than its own system prompt"
+    );
 }
 
 #[test]

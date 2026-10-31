@@ -95,15 +95,15 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
         tokens.context_tokens = outcome.tokens.context_tokens;
     }
     let (permission_resolver, permission_rx) = permission_bridge();
-    let mut builder = dch_loop::Runner::builder(&config, &workdir)
-        .with_observer(Arc::new(observer) as Arc<dyn loopctl::observer::LoopObserver>)
-        .with_middleware(Arc::new(
-            dch_tui::CapturingMiddleware::new_with_input_redaction(
-                Arc::clone(&state.tool_captures),
-                config.security.redact_secrets,
-            ),
-        ))
-        .with_permission_resolver(permission_resolver);
+    let shutting_down = Arc::new(AtomicBool::new(false));
+    let mut builder = assemble_runner_builder(
+        &config,
+        &workdir,
+        observer,
+        &state,
+        permission_resolver,
+        &shutting_down,
+    );
     if let ResumeControl::Resumed(outcome) = &control {
         builder = builder.with_history(crate::resume::history_for_resume(
             outcome,
@@ -200,12 +200,15 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
     dch_tui::arm_fatal_signal_restore();
 
     let cancel = runner.cancel_signal();
-    let shutting_down = Arc::new(AtomicBool::new(false));
     let cancel_for_app = Arc::clone(&cancel);
     app.set_run_canceller(Box::new(move || cancel_for_app.cancel()));
     app.set_shutdown_flag(Arc::clone(&shutting_down));
     if let Some(machine) = &resumed_machine {
-        let adopted = Arc::new(machine.clone());
+        // Filtered at adoption too: a file saved before the hide may
+        // still carry the nudge's prompt as a user message, and
+        // re-seeding it here would round-trip the relic through every
+        // later save.
+        let adopted = filtered_machine_history(&Arc::new(machine.clone()));
         *state
             .machine_history
             .lock()
@@ -220,7 +223,7 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
     let driver = tokio::spawn(drive_submissions(
         runner,
         submit_rx,
-        state,
+        state.clone(),
         Arc::clone(&shutting_down),
         initial_transcript,
     ));
@@ -236,12 +239,82 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
     app.echo_rescued_corrections_at_exit();
     drop(app);
     signal_bridge.stop().await;
+    restore_and_print_exit(
+        transcript_worker,
+        guard,
+        session_id,
+        state.todos_undone_captured(),
+    );
+    session.map_err(|err| format!("terminal error: {err}"))
+}
+
+/// Join the writer inside the deaf window, then print the exit lines
+/// as one write.
+///
+/// The teardown tail, lifted for length: the transcript writer joins
+/// with fatal signals deaf so a straggler interrupt cannot take the
+/// process out mid-join, and before the terminal restore stands the
+/// fatal net down outright — its `_exit(130)` would drop whatever
+/// stdout still buffers, the resume command included. The exit lines
+/// carry the session's last fact beside the command: plan entries the
+/// final run left undone, stated for the user who decides whether to
+/// resume. `None` means no run settled a figure to state — the exit says
+/// the plan was never read rather than claiming it finished clean.
+fn restore_and_print_exit(
+    transcript_worker: TranscriptWorker,
+    guard: dch_tui::TerminalGuard,
+    session_id: uuid::Uuid,
+    todos_undone: Option<usize>,
+) {
     dch_tui::enter_signal_deaf_window();
     transcript_worker.join();
     dch_tui::exit_signal_deaf_window();
+    dch_tui::ignore_fatal_signals();
     drop(guard);
-    println!("{}", session_exit_line(session_id));
-    session.map_err(|err| format!("terminal error: {err}"))
+    print_session_exit(session_id, todos_undone);
+}
+
+/// Assemble the session's runner builder with every host axis attached.
+///
+/// The one place the TUI's registration set lives: the display
+/// observer, the input-capturing middleware, the permission bridge,
+/// and the todo nudge — whose echo is deliberately the no-op (the
+/// reminder must never surface as the user's words anywhere a user
+/// reads; the turn's own answer is the only trace it leaves) and
+/// whose leave-to-extend predicate answers from the session's
+/// shutdown flag, so an exit already begun declines the reminder
+/// turn before any request is spent on it. A quit that races between
+/// the predicate's acceptance and its own cancel may still pay for a
+/// reminder turn the teardown then stops — the accepted residual of
+/// checking a flag beside any engine turn.
+fn assemble_runner_builder<'a>(
+    config: &'a dch_config::DchConfig,
+    workdir: &std::path::Path,
+    observer: dch_tui::TuiObserver,
+    state: &dch_tui::TuiObserverState,
+    permission_resolver: dch_loop::AskResolverFn,
+    shutting_down: &Arc<AtomicBool>,
+) -> dch_loop::RunnerBuilder<'a> {
+    let nudge_gate = Arc::clone(shutting_down);
+    dch_loop::Runner::builder(config, workdir)
+        .with_observer(Arc::new(observer) as Arc<dyn loopctl::observer::LoopObserver>)
+        .with_middleware(Arc::new(
+            dch_tui::CapturingMiddleware::new_with_input_redaction(
+                Arc::clone(&state.tool_captures),
+                config.security.redact_secrets,
+            ),
+        ))
+        .with_permission_resolver(permission_resolver)
+        .with_todo_nudge(
+            move |_reminder| {
+                // No row: the reminder must not surface as the user's
+                // words anywhere a user reads — not the transcript, not
+                // the saved files, not the listing. The turn itself is
+                // the engine's to run; its answer lands in the
+                // transcript on its own.
+            },
+            move || !nudge_gate.load(Ordering::SeqCst),
+        )
 }
 
 /// Await the driver with a bound, then tear it down.
@@ -249,7 +322,9 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
 /// The exit is prompt even when the run will not die politely: a
 /// wedged tool or a stubborn stream gets a bounded wait, then the
 /// task is torn down — the session's halves were persisted by the
-/// settle above, so nothing more can be saved by waiting.
+/// settle above, so nothing more can be saved by waiting. Whatever the
+/// run had already settled for the exit lines stands: the bound is on
+/// the join, not on what the run reported before it.
 async fn tear_down_driver_bounded(driver: tokio::task::JoinHandle<()>) {
     let mut driver = driver;
     if tokio::time::timeout(std::time::Duration::from_millis(500), &mut driver)
@@ -290,12 +365,31 @@ fn install_turn_end_hook(
         if let Some(history) = history {
             let compactions = recorded_compactions(conversation);
             transcript_handle.send_machine(MachineSnapshot {
-                messages: history,
+                messages: filtered_machine_history(&history),
                 saved_at: chrono::Utc::now(),
                 compactions,
             });
         }
     }));
+}
+
+/// The machine history a save persists, minus the nudge's follow-up
+/// prompt.
+///
+/// The end-of-run nudge's reminder reaches the engine's committed
+/// history as a user message — the engine's only post-run mechanism
+/// works that way — and persisting it would replay the reminder as the
+/// user's own words on every resume. The display owes it no row and
+/// the file owes it no message: the shared filter drops exactly the
+/// wording the hook emits (see
+/// [`dch_loop::history_without_nudge`]) and merges the follow-up
+/// turn's answer into the assistant message it now directly follows,
+/// so the saved history keeps the alternating shape providers
+/// replay.
+fn filtered_machine_history(
+    history: &Arc<Vec<loopctl::message::Message>>,
+) -> Arc<Vec<loopctl::message::Message>> {
+    Arc::new(dch_loop::history_without_nudge(history))
 }
 
 /// The session-file token totals for the live counters.
@@ -319,16 +413,51 @@ fn snapshot_tokens(
     )
 }
 
-/// The two lines the TUI prints once a session ends.
+/// The exit lines the TUI prints once a session ends.
 ///
 /// A `Resume with:` label, then the copy-pasteable command on its own
-/// line — nothing else, so the exit leaves exactly the instruction
-/// behind. An initial snapshot persists before the first frame, so
-/// the file the command names exists however the session ended;
-/// printed after the transcript writer joins and the terminal is
-/// restored, on clean exits and failures alike.
-fn session_exit_line(session_id: uuid::Uuid) -> String {
-    format!("Resume with:\ndch --resume {session_id}")
+/// line — and, when the session ends with unfinished plan entries, a
+/// third line stating that work as a fact (`N todo item(s) left
+/// unfinished`). Nothing else, so the exit leaves exactly the
+/// instruction and the standing work behind. An initial snapshot
+/// persists before the first frame, so the file the command names
+/// exists however the session ended; printed after the transcript
+/// writer joins and the terminal is restored, on clean exits and
+/// failures alike.
+fn session_exit_line(session_id: uuid::Uuid, todos_undone: Option<usize>) -> String {
+    let resume = format!("Resume with:\ndch --resume {session_id}");
+    match todos_undone {
+        Some(0) => resume,
+        Some(undone) => {
+            let plural = if undone == 1 { "" } else { "s" };
+            format!("{resume}\n{undone} todo item{plural} left unfinished")
+        }
+        None => format!(
+            "{resume}\nthe run ended before its plan was read — dch cannot \
+             say whether todo items stand open"
+        ),
+    }
+}
+
+/// Print the exit lines as one write, once the terminal is restored.
+///
+/// `println!` would send the label and the command as separate
+/// writes — the formatter emits the argument and its newline as two
+/// pieces, and the line writer flushes only through the first
+/// newline, leaving the command buffered in userspace between them.
+/// Anything that ends the process in that gap — above all the deaf
+/// fatal handler's `_exit(130)` — drops the buffered half, leaving
+/// the label standing over a command that never printed. One
+/// `write_all` of the whole two-line string leaves through a single
+/// flush, so the lines reach the terminal together or not at all.
+fn print_session_exit(session_id: uuid::Uuid, todos_undone: Option<usize>) {
+    use std::io::Write as _;
+
+    let mut lines = session_exit_line(session_id, todos_undone);
+    lines.push('\n');
+    let mut stdout = std::io::stdout().lock();
+    drop(stdout.write_all(lines.as_bytes()));
+    drop(stdout.flush());
 }
 
 /// The workdir's checked-out branch, read from the repository's
@@ -943,34 +1072,6 @@ fn pull_pending_correction(
     }
 }
 
-/// The reminder a run that ended with an unfinished plan receives.
-///
-/// The tool contract and the system prompt tell the model to keep its
-/// list current; this is the belt under them — the session's own
-/// follow-up when the words were not enough. One nudge per claimed
-/// prompt, never a loop: the nudged run's own list is final, whatever
-/// it says, because a session that argues with itself forever is worse
-/// than one that sometimes ends untidy.
-fn todo_nudge(runner: &dch_loop::Runner) -> Option<String> {
-    let todos = runner
-        .context()
-        .todos
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let undone = todos
-        .iter()
-        .filter(|entry| !matches!(entry.status, dch_tools::TodoStatus::Completed))
-        .count();
-    (undone > 0).then(|| {
-        format!(
-            "reminder: {undone} todo item{} still not completed — finish the \
-             remaining work, or mark the entries done / remove them with \
-             TodoWrite, then finish",
-            if undone == 1 { "" } else { "s" }
-        )
-    })
-}
-
 /// Post a run's failure as the transcript's error row.
 ///
 /// The row is the session's record that the turn died and why: it
@@ -1008,8 +1109,8 @@ fn rescue_correction_text(state: &TuiObserverState, text: String) {
 /// own run just landed. Every correction still buffered at the exit
 /// drain is collected here rather than dropped with the channel: the
 /// queue it once could wait in dies with the process, and an
-/// unclaimed row is the one thing a resume can seed the waiting
-/// section from. Returns how many wordings were collected.
+/// unclaimed row is the one durable record the words can take.
+/// Returns how many wordings were collected.
 fn rescue_stranded_corrections(
     revived: &mut std::collections::VecDeque<Submission>,
     receiver: &mut mpsc::UnboundedReceiver<Submission>,
@@ -1037,8 +1138,8 @@ fn rescue_stranded_corrections(
 /// A correction buffered for the interrupted claim carries the newest
 /// wording — the words are the user's, and the newest ones win — so
 /// the exit collects it for the transcript echo: an unclaimed row is
-/// the one durable hand-back, and a resume seeds it back into the
-/// waiting section. Without one, the claimed prompt's own text was
+/// the one durable hand-back the words take. Without one, the claimed
+/// prompt's own text was
 /// already sent, and its row already stands in the transcript — the
 /// record the deliberate-stop rule reads — so nothing is collected.
 fn pull_corrected_wording(
@@ -1145,8 +1246,7 @@ fn apply_correction_cut(
 /// a moment before the flag rose — are collected by the exit drain
 /// into the transcript echo's shared buffer: their words left the
 /// queue with the claim, so an unclaimed row is the only durable
-/// hand-back, and a resume seeds each one back into the waiting
-/// section.
+/// hand-back they take.
 async fn drive_submissions(
     mut runner: dch_loop::Runner,
     mut receiver: mpsc::UnboundedReceiver<Submission>,
@@ -1158,6 +1258,7 @@ async fn drive_submissions(
     let mut last_claim: Option<(u64, usize)> = None;
     let mut revived: std::collections::VecDeque<Submission> = std::collections::VecDeque::new();
     let mut interrupted_for: Option<u64> = None;
+    state.record_todos_undone(runner.todo_undone());
     loop {
         if shutting_down.load(Ordering::SeqCst) {
             break;
@@ -1212,63 +1313,10 @@ async fn drive_submissions(
         cancel.reset();
         state.correction_cancel.store(u64::MAX, Ordering::SeqCst);
         let result = runner.run(&text).await;
-        // The todo nudge: a run that landed with work left on its own
-        // plan gets exactly one follow-up reminding it to close the
-        // list — the filing-and-forgetting shape the tool contract
-        // forbids but a model mid-flow still falls into. The nudge is
-        // not a new claim (nothing was queued for it) and not a plan
-        // boundary (the plan it nudges about must keep standing), so
-        // its echo rides the steered flag: a transcript row for
-        // honesty, no retirement. An exit already begun owns the
-        // session: the nudge never starts under it, its reminder
-        // belonging to a session that is leaving.
-        if !shutting_down.load(Ordering::SeqCst)
-            && result.is_ok()
-            && let Some(nudge) = todo_nudge(&runner)
-        {
-            state.push_steered(nudge.clone());
-            state.render_notify.notify(1);
-            let nudged = runner.run(&nudge).await;
-            if let Err(err) = &nudged
-                && !exit_owns_cancel(err, &shutting_down)
-            {
-                // A correction committed while the nudge ran names the
-                // same live claim the nudge borrowed — the nudge is
-                // simply the run in flight its cancel stopped, so the
-                // buffered correction is the next story, not an error
-                // to report: the same bookkeeping the turn's own
-                // settle runs, at the nudge's settle.
-                let claimed_by_correction = matches!(err, loopctl::error::LoopError::Cancelled)
-                    && {
-                        let interrupted_id =
-                            state.correction_cancel.swap(u64::MAX, Ordering::SeqCst);
-                        // Silence belongs to the run the flag names.
-                        // Mid-nudge the claim the correction answers
-                        // is still this prompt's, so a legitimate
-                        // match stands; a flag left standing for some
-                        // other turn cannot hush this settle — the
-                        // same id rule the turn's own settle applies.
-                        let names_this_turn =
-                            last_claim.is_none_or(|(claimed, _)| claimed == interrupted_id);
-                        let pulled = interrupted_id != u64::MAX
-                            && names_this_turn
-                            && pull_pending_correction(interrupted_id, &mut receiver, &mut revived);
-                        if pulled {
-                            interrupted_for = Some(interrupted_id);
-                        }
-                        pulled
-                    };
-                if !claimed_by_correction {
-                    post_run_error(&state, err);
-                }
-            }
-        }
-        // The turn landed: no correction can name it as the one in
-        // flight any more, so the mirror goes back to naming nothing.
         state.live_claim.store(u64::MAX, Ordering::SeqCst);
         let resolved = Arc::new(runner.committed_history());
         transcript.send_machine(MachineSnapshot {
-            messages: Arc::clone(&resolved),
+            messages: filtered_machine_history(&resolved),
             saved_at: chrono::Utc::now(),
             compactions: 0,
         });
@@ -1276,6 +1324,7 @@ async fn drive_submissions(
             .machine_history
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(resolved);
+        state.record_todos_undone(runner.todo_undone());
         if let Err(err) = &result {
             state
                 .active_tools
@@ -1283,8 +1332,8 @@ async fn drive_submissions(
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clear();
             if exit_owns_cancel(err, &shutting_down) {
-                // The record a cancel leaves, the exit leaves too:
-                // the resumed session reads the same stopped-run
+                // The record a cancel leaves, the exit leaves too: the
+                // resumed session reads the same stopped-run
                 // row either way. The words take their durable exits:
                 // a buffered correction for this claim is collected
                 // for the transcript echo, and without one the
@@ -1336,6 +1385,7 @@ async fn drive_submissions(
         rescue_stranded_corrections(&mut revived, &mut receiver, &state);
     }
     state.mark_run_ended();
+    state.record_todos_undone(runner.todo_undone());
 }
 
 #[cfg(test)]
@@ -1353,6 +1403,45 @@ mod tests {
     use super::*;
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use dch_config::ApiType;
+
+    /// Register the todo nudge the way `run_tui_session` does.
+    ///
+    /// The driver tests that speak of nudges build their runners
+    /// through this. Production's echo is a no-op — the reminder
+    /// surfaces nowhere a user reads — so the tests' echo writes the
+    /// steered lane instead: it makes the offer observable to pins
+    /// that count rows, a stand-in the production registration no
+    /// longer needs. The leave-to-extend keeps the production shape —
+    /// a shutdown flag the session never raises — and the decline
+    /// lane's own pins raise their flags through
+    /// [`with_gated_nudge`].
+    fn with_nudge<'a>(
+        builder: dch_loop::RunnerBuilder<'a>,
+        state: &TuiObserverState,
+    ) -> dch_loop::RunnerBuilder<'a> {
+        with_gated_nudge(builder, state, Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Register the todo nudge with a leave-to-extend the test controls.
+    ///
+    /// The gate is the production predicate's own shape — an
+    /// `Arc<AtomicBool>` read with `!load` — so the decline lane's
+    /// tests answer from the same closure the session registration
+    /// builds, over a flag they raise at the interleaving under test.
+    fn with_gated_nudge<'a>(
+        builder: dch_loop::RunnerBuilder<'a>,
+        state: &TuiObserverState,
+        gate: Arc<AtomicBool>,
+    ) -> dch_loop::RunnerBuilder<'a> {
+        let echo_state = state.clone();
+        builder.with_todo_nudge(
+            move |reminder| {
+                echo_state.push_steered(reminder);
+                echo_state.render_notify.notify(1);
+            },
+            move || !gate.load(Ordering::SeqCst),
+        )
+    }
 
     /// Queue a prompt the way the display does, then hand its id out.
     ///
@@ -1536,6 +1625,7 @@ mod tests {
                 text: "turn one".to_string(),
                 timestamp: chrono::Utc::now(),
                 steered: false,
+                unsent: false,
             }],
             crate::session::SessionTokens::default(),
         );
@@ -1956,10 +2046,108 @@ mod tests {
         (saver, dir, id)
     }
 
+    #[tokio::test]
+    async fn a_run_that_never_settles_leaves_no_undone_figure() {
+        // The undone count is recorded beside a settled run, and a new
+        // run's start is where an older run's answer stops being about
+        // this session's plan: a run taken before it settles must leave
+        // the exit silent, not repeating what came before it.
+        let (_, state) = TuiObserverState::new().into_observer();
+        state.record_todos_undone(2);
+        state.mark_run_started();
+        assert_eq!(
+            state.todos_undone_captured(),
+            None,
+            "the new run's start retires the old run's figure"
+        );
+        let wedged = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        tear_down_driver_bounded(wedged).await;
+        assert_eq!(
+            state.todos_undone_captured(),
+            None,
+            "an aborted run states no figure of its own"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_settled_figure_survives_a_driver_cut_down_late() {
+        // The bound is on the join, not on what the run reported: a run
+        // that settled its plan and then stalled going out still owns
+        // the exit lines. Clearing the figure at the abort would tell
+        // the user nothing about the work the run really left open.
+        let (_, state) = TuiObserverState::new().into_observer();
+        state.mark_run_started();
+        state.record_todos_undone(1);
+        let wedged = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        tear_down_driver_bounded(wedged).await;
+        assert_eq!(
+            state.todos_undone_captured(),
+            Some(1),
+            "a settled figure stands whatever the teardown does after"
+        );
+    }
+
+    #[test]
+    fn the_exit_lines_state_unfinished_work_as_a_fact() {
+        // The engine offers one follow-up per run and the follow-up's
+        // own end never another, so a long run can settle with plan
+        // entries still undone and no further nudge coming — the exit
+        // line owes the user that fact, beside the resume command.
+        let id = uuid::Uuid::new_v4();
+        let lines = session_exit_line(id, Some(4));
+        let command = format!("dch --resume {id}");
+        assert!(
+            lines.contains(&command),
+            "the resume command keeps its place: {lines}"
+        );
+        assert!(
+            lines.contains("4 todo items left unfinished"),
+            "the unfinished count rides the exit lines: {lines}"
+        );
+        let single = session_exit_line(id, Some(1));
+        assert!(
+            single.contains("1 todo item left unfinished"),
+            "the singular spelling for one entry: {single}"
+        );
+        let clean = session_exit_line(id, Some(0));
+        assert!(
+            !clean.contains("unfinished"),
+            "a clean plan's exit stays the plain two lines: {clean}"
+        );
+    }
+
+    #[test]
+    fn an_unread_plan_is_never_reported_as_a_clean_one() {
+        // The figure the exit lines print comes from the driver, and a
+        // driver taken by the exit's bounded join records nothing. The
+        // absence has to arrive as its own answer: printed as zero it
+        // would tell the user the plan closed clean over a session the
+        // save still carries as unfinished.
+        let id = uuid::Uuid::new_v4();
+        let unknown = session_exit_line(id, None);
+        let command = format!("dch --resume {id}");
+        assert!(
+            unknown.contains(&command),
+            "the resume command survives an unread plan: {unknown}"
+        );
+        assert!(
+            !unknown.contains("left unfinished") && !unknown.contains("clean"),
+            "the exit states its uncertainty rather than either verdict: {unknown}"
+        );
+        assert!(
+            unknown.contains("before its plan was read"),
+            "the unknown names itself as such: {unknown}"
+        );
+    }
+
     #[test]
     fn the_exit_lines_label_and_name_the_resume_command() {
         let id = uuid::Uuid::new_v4();
-        let lines = session_exit_line(id);
+        let lines = session_exit_line(id, Some(0));
         let mut printed = lines.split('\n');
         assert_eq!(
             printed.next(),
@@ -2061,6 +2249,7 @@ mod tests {
                 text: "x".repeat(20_000),
                 timestamp: now,
                 steered: false,
+                unsent: false,
             };
             100
         ];
@@ -2068,6 +2257,7 @@ mod tests {
             text: "final turn".to_string(),
             timestamp: now,
             steered: false,
+            unsent: false,
         }];
         handle.send(bulky, crate::session::SessionTokens::default());
         handle.send(final_turn, crate::session::SessionTokens::default());
@@ -2094,6 +2284,7 @@ mod tests {
                 text: "the last turn".to_string(),
                 timestamp: chrono::Utc::now(),
                 steered: false,
+                unsent: false,
             }],
             crate::session::SessionTokens::default(),
         );
@@ -2225,6 +2416,7 @@ mod tests {
                 text: "late".to_string(),
                 timestamp: chrono::Utc::now(),
                 steered: false,
+                unsent: false,
             }],
             crate::session::SessionTokens::default(),
         );
@@ -2393,6 +2585,18 @@ mod tests {
         fn request_count(&self) -> usize {
             self.requests.lock().map_or(0, |reqs| reqs.len())
         }
+
+        /// The body of every request received, oldest first.
+        ///
+        /// The count says how many runs reached the provider; the
+        /// bodies say what they carried, which is what a pin needs to
+        /// show that a piece of text was *not* among them.
+        fn bodies(&self) -> Vec<String> {
+            self.requests
+                .lock()
+                .map(|reqs| reqs.clone())
+                .unwrap_or_default()
+        }
     }
 
     /// Read one HTTP request off the socket, headers plus body.
@@ -2442,14 +2646,18 @@ mod tests {
         buf.windows(4).position(|w| w == b"\r\n\r\n")
     }
 
-    /// The prompt echoes waiting to become transcript rows.
+    /// The prompt echoes the display owes or has landed as rows.
     ///
-    /// Read off the graduation stream rather than any buffer of their own,
-    /// because an echo's place in the transcript is its place among the
-    /// replies: a test that checked them separately would pass however
-    /// they were ordered against everything else.
+    /// Read off the graduation stream and the waiting pin together,
+    /// because an echo's place in the transcript is its place among
+    /// the replies: a test that checked them separately would pass
+    /// however they were ordered against everything else. The pin's
+    /// half is the steers a run accepted but no boundary has read —
+    /// rows the display owes and holds at its edge until then, among
+    /// them a nudge's echo, whose harness may hold no observer to
+    /// fire the boundary that would land it.
     fn claimed(state: &TuiObserverState) -> Vec<String> {
-        state
+        let mut echoes = state
             .graduations
             .lock()
             .expect("graduation lock")
@@ -2458,7 +2666,16 @@ mod tests {
                 dch_tui::observer::Graduation::Sent { text, .. } => Some(text.clone()),
                 _ => None,
             })
-            .collect()
+            .collect::<Vec<_>>();
+        echoes.extend(
+            state
+                .pending_steers
+                .lock()
+                .expect("the pending-steer lock")
+                .iter()
+                .cloned(),
+        );
+        echoes
     }
 
     /// The assistant turns' text blocks across a resolved history.
@@ -2597,11 +2814,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp workdir");
         let mut config = sse_config(server.port);
         config.api.context_window = Some(200_000);
-        let runner = dch_loop::Runner::builder(&config, dir.path())
+        let (_, state) = TuiObserverState::new().into_observer();
+        let runner = with_nudge(dch_loop::Runner::builder(&config, dir.path()), &state)
             .build()
             .await
             .expect("offline runner construction");
-        let (_, state) = TuiObserverState::new().into_observer();
         let (tx, rx) = mpsc::unbounded_channel();
         queue_prompt(&state, &tx, "do the thing");
         drop(tx);
@@ -2685,10 +2902,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_exit_cancel_of_a_nudge_is_silent_and_reclaims_nothing() {
-        // The nudge is a follow-up the session owes itself, not work
-        // the user queued: the exit stopping it owes no error row and
-        // reclaims nothing — the prompt's own turn already landed.
+    async fn an_exit_stopping_the_followup_leaves_the_stopped_run_record() {
+        // The reminder turn joins the run it nudges, so the exit's
+        // cancel stops one flight, not two: the whole run resolves
+        // cancelled and settles exactly as any stopped run settles —
+        // one record row, the claimed prompt waiting again — with no
+        // second settle to double the row or spend another request.
         let script = vec![
             (
                 sse_tool_call_turn(
@@ -2710,12 +2929,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp workdir");
         let mut config = sse_config(server.port);
         config.api.context_window = Some(200_000);
-        let runner = dch_loop::Runner::builder(&config, dir.path())
+        let (_, state) = TuiObserverState::new().into_observer();
+        let runner = with_nudge(dch_loop::Runner::builder(&config, dir.path()), &state)
             .build()
             .await
             .expect("offline runner construction");
         let cancel = runner.cancel_signal();
-        let (_, state) = TuiObserverState::new().into_observer();
         let (tx, rx) = mpsc::unbounded_channel();
         queue_prompt(&state, &tx, "the prompt");
         let down = shutdown_flag(false);
@@ -2734,7 +2953,7 @@ mod tests {
         }
         assert!(
             server.request_count() >= 3,
-            "the nudge's request must be in flight before the exit lands"
+            "the follow-up's request must be in flight before the exit lands"
         );
         down.store(true, Ordering::SeqCst);
         cancel.cancel();
@@ -2743,14 +2962,20 @@ mod tests {
             .errors
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert!(
-            errors.is_empty(),
-            "the exit's own stop of the nudge posts no row: {errors:?}"
+        assert_eq!(
+            errors.len(),
+            1,
+            "one stop, one record row — the joined follow-up adds no second \
+             settle: {errors:?}"
         );
         drop(errors);
         assert!(
-            queued_prompts(&state).is_empty(),
-            "the landed turn's prompt is not requeued — only stopped work is"
+            queued_prompts(&state)
+                .iter()
+                .any(|(_, text)| text == "the prompt"),
+            "the stopped run's prompt waits again — the run never landed as a \
+             whole: {:?}",
+            queued_prompts(&state)
         );
     }
 
@@ -2996,23 +3221,98 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_exit_flag_stops_the_todo_nudge_from_starting() {
-        // A run that lands with work left on its plan earns its nudge
-        // only while the session is staying: an exit already begun
-        // owns the loop, and a nudge started under it would run the
-        // engine's bookkeeping — and any request it can reach —
-        // during teardown. The flag is up before the run lands, so
-        // the nudge never starts: one provider request, one claim.
-        // The run itself files the plan: its first turn is a TodoWrite
-        // call, so the store holds an undone entry when the run lands
-        // — the exact condition the nudge exists for.
-        let server = SseServer::start_timed(vec![
+    async fn a_flag_raised_mid_run_declines_the_followup_without_a_cancel() {
+        // The window the cancel-path twin cannot reach: the quit
+        // ladder raises the shutdown flag, and only later — after the
+        // session snapshot and the settle — does its cancel reach the
+        // engine. In between, the run can end clean with the plan
+        // undone, and the engine offers the reminder; the nudge's
+        // leave-to-extend answers from the same flag the ladder
+        // raised, so the offer dies unspent — no third request, no
+        // echo row for a turn the exit was already abandoning.
+        let script = vec![
             (
                 sse_tool_call_turn(
                     "TodoWrite",
-                    &serde_json::json!({"todos": [
-                        {"id": "t1", "subject": "close the list", "status": "pending"}
-                    ]}),
+                    &serde_json::json!({
+                        "todos": [{"id": "t1", "subject": "close the list",
+                                   "status": "pending"}]
+                    }),
+                ),
+                std::time::Duration::ZERO,
+            ),
+            (
+                sse_text_turn("the answer that landed"),
+                std::time::Duration::from_millis(300),
+            ),
+        ];
+        let server = SseServer::start_timed(script).await;
+        let dir = tempfile::tempdir().expect("temp workdir");
+        let mut config = sse_config(server.port);
+        config.api.context_window = Some(200_000);
+        let (_, state) = TuiObserverState::new().into_observer();
+        let gate = Arc::new(AtomicBool::new(false));
+        let runner = with_gated_nudge(
+            dch_loop::Runner::builder(&config, dir.path()),
+            &state,
+            Arc::clone(&gate),
+        )
+        .build()
+        .await
+        .expect("offline runner construction");
+        let (tx, rx) = mpsc::unbounded_channel();
+        queue_prompt(&state, &tx, "the prompt that ran");
+        drop(tx);
+        let driver = tokio::spawn(drive_submissions(
+            runner,
+            rx,
+            state.clone(),
+            shutdown_flag(false),
+            parked_transcript(),
+        ));
+        for _ in 0..1800 {
+            if server.request_count() >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            server.request_count() >= 1,
+            "the run's first turn must be in flight before the flag rises"
+        );
+        gate.store(true, Ordering::SeqCst);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(15), driver).await;
+        assert_eq!(
+            server.request_count(),
+            2,
+            "the run's own two turns and no reminder — the raised flag \
+             declined the offer before any request was spent"
+        );
+        assert!(
+            claimed(&state)
+                .iter()
+                .all(|sent| !sent.contains("reminder:")),
+            "no reminder row lands for a turn the exit was abandoning: {:?}",
+            claimed(&state)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exit_cancelled_run_is_never_offered_its_followup() {
+        // The engine offers the follow-up only on a clean end, so the
+        // exit's own shape — the flag up, the cancel fired — never
+        // reaches the offer: the run resolves cancelled and the
+        // reminder turn is not injected, whatever the plan still
+        // holds. The follow-up joins runs that land; it does not
+        // chase runs that die.
+        let script = vec![
+            (
+                sse_tool_call_turn(
+                    "TodoWrite",
+                    &serde_json::json!({
+                        "todos": [{"id": "t1", "subject": "close the list",
+                                   "status": "pending"}]
+                    }),
                 ),
                 std::time::Duration::from_millis(300),
             ),
@@ -3020,18 +3320,20 @@ mod tests {
                 sse_text_turn("the answer that landed"),
                 std::time::Duration::ZERO,
             ),
-        ])
-        .await;
+        ];
+        let server = SseServer::start_timed(script).await;
         let dir = tempfile::tempdir().expect("temp workdir");
         let mut config = sse_config(server.port);
         config.api.context_window = Some(200_000);
-        let runner = dch_loop::Runner::builder(&config, dir.path())
+        let (_, state) = TuiObserverState::new().into_observer();
+        let runner = with_nudge(dch_loop::Runner::builder(&config, dir.path()), &state)
             .build()
             .await
             .expect("offline runner construction");
-        let (_, state) = TuiObserverState::new().into_observer();
+        let cancel = runner.cancel_signal();
         let (tx, rx) = mpsc::unbounded_channel();
-        let running = queue_prompt(&state, &tx, "the prompt that ran");
+        queue_prompt(&state, &tx, "the prompt that ran");
+        drop(tx);
         let down = shutdown_flag(false);
         let driver = tokio::spawn(drive_submissions(
             runner,
@@ -3041,28 +3343,30 @@ mod tests {
             parked_transcript(),
         ));
         for _ in 0..1800 {
-            if state.live_claim.load(Ordering::SeqCst) == running {
+            if server.request_count() >= 1 {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        down.store(true, Ordering::SeqCst);
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(15), driver).await;
-        let posted = server
-            .requests
-            .lock()
-            .expect("request lock")
-            .iter()
-            .filter(|request| request.starts_with("POST "))
-            .count();
-        assert_eq!(
-            posted, 2,
-            "the run's two turns reached the provider and the nudge never started"
+        assert!(
+            server.request_count() >= 1,
+            "the run's first turn must be in flight before the exit lands"
         );
+        down.store(true, Ordering::SeqCst);
+        cancel.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(15), driver).await;
         assert_eq!(
-            claimed(&state),
-            ["the prompt that ran".to_string()],
-            "no nudge text is sent — the exit owns the session"
+            server.request_count(),
+            1,
+            "the run's first turn was in flight and the follow-up was never \
+             offered to a dying run"
+        );
+        assert!(
+            claimed(&state)
+                .iter()
+                .all(|sent| !sent.contains("reminder:")),
+            "no reminder text is sent — the offer never happened: {:?}",
+            claimed(&state)
         );
     }
 
@@ -3178,12 +3482,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp workdir");
         let mut config = sse_config(server.port);
         config.api.context_window = Some(200_000);
-        let runner = dch_loop::Runner::builder(&config, dir.path())
+        let (_, state) = TuiObserverState::new().into_observer();
+        let runner = with_nudge(dch_loop::Runner::builder(&config, dir.path()), &state)
             .build()
             .await
             .expect("offline runner construction");
         let cancel = runner.cancel_signal();
-        let (_, state) = TuiObserverState::new().into_observer();
         let (tx, rx) = mpsc::unbounded_channel();
         let superseded_id = queue_prompt(&state, &tx, "the wording that went out");
         let driver = tokio::spawn(drive_submissions(
@@ -3276,11 +3580,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp workdir");
         let mut config = sse_config(server.port);
         config.api.context_window = Some(200_000);
-        let runner = dch_loop::Runner::builder(&config, dir.path())
+        let (_, state) = TuiObserverState::new().into_observer();
+        let runner = with_nudge(dch_loop::Runner::builder(&config, dir.path()), &state)
             .build()
             .await
             .expect("offline runner construction");
-        let (_, state) = TuiObserverState::new().into_observer();
         let (tx, rx) = mpsc::unbounded_channel();
         queue_prompt(&state, &tx, "do the thing");
         drop(tx);
@@ -3292,8 +3596,8 @@ mod tests {
             shutdown_flag(false),
             parked_transcript(),
         ));
-        // Wait for the driver to drain: both runs (the prompt and the
-        // nudge) complete against their canned turns.
+        // Wait for the driver to drain: the run, reminder turn included,
+        // completes against its canned turns.
         let _ = tokio::time::timeout(std::time::Duration::from_secs(15), driver).await;
 
         assert_eq!(
@@ -3304,12 +3608,13 @@ mod tests {
              one more: the nudged run left the list as it was and the \
              driver moved on"
         );
-        // The nudge's echo is in the transcript, flagged as not a
-        // plan boundary.
+        // The nudge's echo is the display's record — held at the edge
+        // until a boundary reads it, and flagged as not a plan
+        // boundary when it lands.
         let echoes = claimed(&state);
         assert!(
             echoes.iter().any(|text| text.contains("reminder: 1 todo")),
-            "the nudge's wording is the transcript's record: {echoes:?}"
+            "the nudge's wording is the display's record: {echoes:?}"
         );
         // The nudge's echo rode the steered flag, so the display's
         // plan survived it — the Graduation::Sent drain clears the
@@ -3610,12 +3915,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp workdir");
         let mut config = sse_config(server.port);
         config.api.context_window = Some(200_000);
-        let runner = dch_loop::Runner::builder(&config, dir.path())
+        let (_, state) = TuiObserverState::new().into_observer();
+        let runner = with_nudge(dch_loop::Runner::builder(&config, dir.path()), &state)
             .build()
             .await
             .expect("offline runner construction");
         let cancel = runner.cancel_signal();
-        let (_, state) = TuiObserverState::new().into_observer();
         let (tx, rx) = mpsc::unbounded_channel();
         let foreign = queue_prompt(&state, &tx, "an older prompt's wording");
         // The live prompt files the plan; its id rides last_claim
@@ -3914,21 +4219,86 @@ mod tests {
         driver.abort();
     }
 
+    /// Steers through the app's seam at a turn's start, from inside the run.
+    ///
+    /// The loop emits `on_turn_start` after it has drained its steering slot
+    /// for that turn and before it sends that turn's request, so a steer
+    /// offered here provably missed the boundary that could have read it.
+    /// A poll from the test task cannot establish that while the run opens:
+    /// a steer accepted that early is still ahead of the first drain and
+    /// rides the first request.
+    struct TurnStartSteer {
+        /// The app's seam, attached once the built runner hands out its slot.
+        guidance: std::sync::Mutex<Option<Arc<dyn dch_tui::Guidance>>>,
+        /// The text the observer steers.
+        text: &'static str,
+        /// Whether the run in flight accepted the steer.
+        accepted: AtomicBool,
+    }
+
+    impl TurnStartSteer {
+        /// A steer holding `text`, with no seam attached yet.
+        fn new(text: &'static str) -> Arc<Self> {
+            Arc::new(Self {
+                guidance: std::sync::Mutex::new(None),
+                text,
+                accepted: AtomicBool::new(false),
+            })
+        }
+
+        /// Attach the seam the observer steers through.
+        fn attach(&self, guidance: Arc<dyn dch_tui::Guidance>) {
+            *self.guidance.lock().expect("the seam lock") = Some(guidance);
+        }
+
+        /// Whether the run in flight took the steer.
+        fn accepted(&self) -> bool {
+            self.accepted.load(Ordering::SeqCst)
+        }
+    }
+
+    impl loopctl::observer::LoopObserver for TurnStartSteer {
+        fn name(&self) -> &'static str {
+            "turn-start-steer"
+        }
+
+        fn on_turn_start(&self, ctx: &loopctl::observer::TurnStartContext) {
+            if ctx.turn > 0 || self.accepted() {
+                return;
+            }
+            let offered = self
+                .guidance
+                .lock()
+                .expect("the seam lock")
+                .as_ref()
+                .is_some_and(|guidance| guidance.steer(self.text.to_string()));
+            if offered {
+                self.accepted.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_host_seam_reaches_a_running_loop_and_gives_back_what_it_missed() {
         // The response is held far longer than the test needs, so the run is
-        // provably in flight on both sides of the seam. This is the only test
-        // that crosses the whole host path — app trait object, adapter,
-        // engine slot, live loop — and it is the one that earns the
-        // translation: text in, engine message out, and what no run delivered
-        // back out as text again.
+        // provably in flight around the steer. This is the only test that
+        // crosses the whole host path — app trait object, adapter, engine
+        // slot, live loop — and it is the one that earns the translation:
+        // text in, engine message out, and what no run delivered back out as
+        // text again. The steer is placed by the loop's own turn event, so
+        // the run's never having read it is a fact of the run's shape rather
+        // than of the machine's speed. A sentinel rides the text because the
+        // request body carries the system prompt and the tool schemas, where
+        // ordinary words appear by coincidence.
         let server = SseServer::start_with_delay(
             vec![sse_text_turn("too late")],
             std::time::Duration::from_secs(30),
         )
         .await;
         let dir = tempfile::tempdir().expect("temp workdir");
+        let steer = TurnStartSteer::new("the report is in the other directory, host-3j8f");
         let runner = dch_loop::Runner::builder(&sse_config(server.port), dir.path())
+            .with_observer(Arc::clone(&steer) as Arc<dyn loopctl::observer::LoopObserver>)
             .build()
             .await
             .expect("runner construction");
@@ -3938,20 +4308,19 @@ mod tests {
         let seam: Arc<dyn dch_tui::Guidance> = Arc::new(LoopGuidance {
             steering: runner.steering(),
         });
+        steer.attach(Arc::clone(&seam));
         let task = tokio::spawn(async move {
             let mut runner = runner;
             drop(runner.run("go").await);
         });
 
-        let mut accepted = false;
-        for _ in 0..400 {
-            if seam.steer("the report is in the other directory".to_string()) {
-                accepted = true;
-                break;
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while !steer.accepted() || server.request_count() < 1 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(accepted, "the seam reached the loop while it ran");
+        })
+        .await
+        .expect("the seam reached the loop while its request was in flight");
 
         cancel.cancel();
         tokio::time::timeout(std::time::Duration::from_secs(10), task)
@@ -3959,9 +4328,16 @@ mod tests {
             .expect("the cancelled run settles promptly")
             .expect("the driving task does not panic");
 
+        let bodies = server.bodies();
+        assert_eq!(bodies.len(), 1, "one request was in flight: {bodies:?}");
+        assert!(
+            !bodies[0].contains("host-3j8f"),
+            "a steer behind the drain cannot retroactively enter the request \
+             its turn sent: {bodies:?}"
+        );
         assert_eq!(
             seam.take_returned(),
-            ["the report is in the other directory"],
+            ["the report is in the other directory, host-3j8f"],
             "what the run never read comes back through the adapter as text — \
              including the guidance the ended run left in its live queue, not \
              only what an earlier run sealed away"
@@ -4464,7 +4840,7 @@ mod tests {
         // read-in payload does not: the guard above the threshold refuses a
         // request outright, so a window smaller than one turn's own size
         // would fail the run rather than compact it.
-        config.api.context_window = Some(9_000);
+        config.api.context_window = Some(9_250);
         // The truncating compactor, so the pass is the machine's own work:
         // the summarizers phone the provider for their summaries, and a
         // canned endpoint serving one body per connection cannot tell a run

@@ -16,7 +16,18 @@ use crate::ToolResultDisplay;
 use crate::message::ActiveTool;
 use crate::theme::Theme;
 
-/// Spinner frames, advanced by the render tick while a tool runs.
+/// How much run time one spinner frame stands for.
+///
+/// The running rows' dot turns at this cadence, derived from each
+/// tool's own elapsed clock on every redraw — never a tick-advanced
+/// index, which a coarse tick between redraws leaves frozen or
+/// skipping. Forty milliseconds is exactly two animation wakes, so
+/// the turn lands a fresh frame on every other 20ms redraw — a 25fps
+/// revolution, twice the prototype's beat, without asking the
+/// lane for wakes it does not already pay.
+pub const SPINNER_FRAME_MS: u64 = 40;
+
+/// Spinner frames, one per beat of a running tool's elapsed clock.
 ///
 /// One animation beat for every running indicator; each frame is one
 /// display column wide (pinned by test). The braille orbit the
@@ -26,6 +37,29 @@ pub const SPINNER_FRAMES: &[&str] = &[
     "\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}", "\u{2826}", "\u{2827}",
     "\u{2807}", "\u{280f}",
 ];
+
+/// The spinner frame an elapsed clock shows.
+///
+/// Each full [`SPINNER_FRAME_MS`] of the call's own elapsed time turns
+/// the orbit one cell, and a full revolution wraps back to the first
+/// cell. Every running row reads its frame from its own duration on
+/// each redraw rather than from a shared tick, so two calls a period
+/// apart show two cells on one frame and a coarse beat between draws
+/// can neither freeze the turn nor skip a beat.
+#[must_use]
+pub fn spinner_frame_at(elapsed: std::time::Duration) -> &'static str {
+    let periods = elapsed
+        .as_millis()
+        .checked_div(u128::from(SPINNER_FRAME_MS))
+        .unwrap_or(0);
+    let orbit = u128::try_from(SPINNER_FRAMES.len()).unwrap_or(1);
+    let index = usize::try_from(periods.checked_rem(orbit).unwrap_or(0)).unwrap_or(0);
+    SPINNER_FRAMES
+        .get(index)
+        .or_else(|| SPINNER_FRAMES.first())
+        .copied()
+        .unwrap_or("")
+}
 
 /// The running indicator for the per-tool line.
 ///
@@ -268,15 +302,12 @@ fn batch_subject(first: &str, rest: usize) -> String {
 #[must_use]
 pub fn running_tool_lines(
     tool: &ActiveTool,
-    spinner_idx: usize,
     theme: &Theme,
     verbosity: Verbosity,
 ) -> Vec<Line<'static>> {
-    let elapsed = format_elapsed(tool.start.elapsed().as_secs_f64());
-    let frame = SPINNER_FRAMES
-        .get(spinner_idx)
-        .or_else(|| SPINNER_FRAMES.first())
-        .unwrap_or(&"");
+    let since_start = tool.start.elapsed();
+    let elapsed = format_elapsed(since_start.as_secs_f64());
+    let frame = spinner_frame_at(since_start);
     match verbosity {
         Verbosity::Quiet => vec![Line::from(Span::styled(
             format!(
@@ -291,7 +322,10 @@ pub fn running_tool_lines(
                 " {} ",
                 humanize_tool_summary(&tool.name, &tool.input_summary)
             )),
-            Span::styled(format!("({elapsed})"), Style::default().fg(theme.ui.dim)),
+            Span::styled(
+                format!("({elapsed})"),
+                Style::default().fg(theme.ui.assistant_message_fg),
+            ),
         ])],
         Verbosity::Verbose => vec![
             Line::from(vec![
@@ -302,7 +336,10 @@ pub fn running_tool_lines(
                         .fg(theme.ui.assistant_message_fg)
                         .add_modifier(ratatui::style::Modifier::BOLD),
                 ),
-                Span::styled(format!("({elapsed})"), Style::default().fg(theme.ui.dim)),
+                Span::styled(
+                    format!("({elapsed})"),
+                    Style::default().fg(theme.ui.assistant_message_fg),
+                ),
             ]),
             Line::styled(
                 format!("    Input: {}", tool.input_summary),
