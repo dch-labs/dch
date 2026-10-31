@@ -509,17 +509,25 @@ fn reject_identity_free_entries(
 /// Project the submission onto the stored entry shape, names first.
 ///
 /// Drops the wire-only fields (`blocked_by`, `blocks`) and applies the
-/// name-authority rule: a literal subject replaces the standing one —
-/// an explicit reword — while a patch that omits it keeps the standing
-/// subject, description, and active form untouched, so `{id, status}`
-/// updates can never rename anything. Descriptions derive subjects
-/// only for entries with no standing name; the identity gate
-/// guarantees every newborn arrives with one or the other.
+/// name-authority rule: an entry's text — subject, description, active
+/// form — is read-only once the entry stands. A differing send against
+/// a standing id keeps the filed wording and earns the note this
+/// returns, so the plan's words are the words it was filed with, start
+/// to finish; a patch that omits the text keeps the standing values as
+/// silently as before, so `{id, status}` updates can never rename
+/// anything, and a restatement identical to the filed text is no send
+/// at all and costs no note. Descriptions derive subjects only for
+/// entries with no standing name; the identity gate guarantees every
+/// newborn arrives with one or the other.
+///
+/// Returns the stored entries and the read-only notes, one per entry
+/// whose sent text differed from its filed text.
 fn stored_entries(
     todos: &[TodoEntryInput],
     standing: &std::collections::HashMap<String, TodoEntry>,
-) -> Vec<TodoEntry> {
-    todos
+) -> (Vec<TodoEntry>, Vec<String>) {
+    let mut notes = Vec::new();
+    let entries = todos
         .iter()
         .map(|todo| {
             let base = standing.get(&todo.id);
@@ -528,24 +536,37 @@ fn stored_entries(
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty());
-            let subject = literal
-                .map(str::to_string)
-                .or_else(|| base.map(|entry| entry.subject.clone()))
-                .or_else(|| {
-                    (!todo.description.trim().is_empty())
-                        .then(|| derive_subject(&todo.description, &todo.id))
-                })
-                .unwrap_or_else(|| format!("Task {}", todo.id));
-            let description = if todo.description.trim().is_empty() {
-                base.map(|entry| entry.description.clone())
-                    .unwrap_or_default()
+            let (subject, description, active_form) = if let Some(base) = base {
+                let reworded = literal.is_some_and(|sent| sent != base.subject)
+                    || (!todo.description.trim().is_empty()
+                        && todo.description.trim() != base.description.trim())
+                    || todo
+                        .active_form
+                        .as_deref()
+                        .is_some_and(|sent| Some(sent) != base.active_form.as_deref());
+                if reworded {
+                    notes.push(format!(
+                        "'{}' reworded — the filed text stands (entries are \
+                         read-only once created; send only status and \
+                         dependencies)",
+                        todo.id
+                    ));
+                }
+                (
+                    base.subject.clone(),
+                    base.description.clone(),
+                    base.active_form.clone(),
+                )
             } else {
-                todo.description.clone()
+                let subject = literal
+                    .map(str::to_string)
+                    .or_else(|| {
+                        (!todo.description.trim().is_empty())
+                            .then(|| derive_subject(&todo.description, &todo.id))
+                    })
+                    .unwrap_or_else(|| format!("Task {}", todo.id));
+                (subject, todo.description.clone(), todo.active_form.clone())
             };
-            let active_form = todo
-                .active_form
-                .clone()
-                .or_else(|| base.and_then(|entry| entry.active_form.clone()));
             TodoEntry {
                 id: todo.id.clone(),
                 subject,
@@ -554,7 +575,8 @@ fn stored_entries(
                 active_form,
             }
         })
-        .collect()
+        .collect();
+    (entries, notes)
 }
 
 /// Whether this row's subject has to be derived rather than read.
@@ -755,17 +777,6 @@ impl TodoTool {
         let parsed = parse_todo_input(input)?;
 
         if parsed.todos.is_empty() {
-            // No removal exists — not even the empty call. An empty
-            // submission over a standing plan is the escape hatch the
-            // rung law kept meeting: wipe the list, dodge the walk.
-            // It renders the standing plan unchanged with the law
-            // named, so the model reads there is no way out but
-            // through. The render carries the standing rows in the
-            // same shape every other call returns — a resume seeder
-            // reading the last result finds the standing plan here
-            // exactly as it would after a patched call. The runner's
-            // own per-run reset stands — that one is the host's, not
-            // the model's.
             let entries = todos
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -829,8 +840,9 @@ impl TodoTool {
             .todos
             .iter()
             .any(|row| subject_is_derived(row, standing_by_id.get(&row.id)));
-        let (adjustments, enforced) =
-            normalize_and_store(&todos, stored_entries(&parsed.todos, &standing_by_id));
+        let (entries, reword_notes) = stored_entries(&parsed.todos, &standing_by_id);
+        let (mut adjustments, enforced) = normalize_and_store(&todos, entries);
+        adjustments.splice(0..0, reword_notes);
         let wire_by_id: std::collections::HashMap<String, (Vec<String>, Vec<String>)> = parsed
             .todos
             .iter()
@@ -884,8 +896,11 @@ impl Tool for TodoTool {
          for a pending entry lands in_progress (one rung per call, the \
          adjustment named in the result), and reopening completed work \
          goes through in_progress. New entries need a subject (or a \
-         description to derive one from); entries already on the plan \
-         keep theirs — id and status alone update them. The plan belongs \
+         description to derive one from); an entry's text — subject, \
+         description, active_form — is read-only once it is filed: a \
+         reword sent against a standing id keeps the filed wording, \
+         named in the result — so id and status alone update standing \
+         entries. The plan belongs \
          to the session: a run that ends with unfinished entries carries \
          them into the next run. The rendered list this tool returns is \
          the authoritative state; a finished run leaves every entry \
@@ -952,7 +967,9 @@ impl Tool for TodoTool {
              changed; omitted entries stand unchanged, entries are never \
              removed, and a completed request from pending lands \
              in_progress first (one rung per call). New entries need a \
-             subject; standing entries keep theirs. The rendered list the \
+             subject; an entry's text is read-only once it is filed — \
+             standing entries keep the wording they were filed with, so \
+             id and status alone update them. The rendered list the \
              tool returns is the authoritative state; it survives context \
              compaction and carries into the session's next run when \
              entries remain unfinished. A finished run leaves every entry \
@@ -1418,9 +1435,12 @@ mod tests {
 
     #[tokio::test]
     async fn an_omitted_status_keeps_the_standing_entry_status() {
-        // The patch the guide advertises: an id and a reworded subject, no
-        // status. Silence is not a transition, so completed work stays
-        // completed instead of being reopened by a field nobody sent.
+        // The patch the guide advertises is an id and a status; what
+        // arrives here is an id and a reword. Both halves keep their
+        // own law: the reword is refused — the filed wording stands —
+        // and the silence on status still never moves a rung, so
+        // completed work stays completed instead of being reopened by
+        // a field nobody sent.
         let (ctx, todos) = todo_context();
         seed(&todos, "1", TodoStatus::Completed);
         seed(&todos, "2", TodoStatus::InProgress);
@@ -1439,17 +1459,19 @@ mod tests {
             let store = todos.lock().unwrap();
             let entry = store.first().unwrap();
             assert_eq!(
-                entry.subject, "Reworded in place",
-                "the reword itself still lands"
+                entry.subject, "Seed 1",
+                "the reword is refused — the filed wording stands"
             );
             assert_eq!(
                 entry.status,
                 TodoStatus::Completed,
                 "a patch stating no status never moves the rung"
             );
+            let second = store.get(1).unwrap();
+            assert_eq!(second.subject, "Seed 2", "the same refusal holds below");
             assert_eq!(
-                store.get(1).map(|entry| entry.status),
-                Some(TodoStatus::InProgress),
+                second.status,
+                TodoStatus::InProgress,
                 "and the same silence holds a running entry on its rung"
             );
         }
@@ -1528,9 +1550,11 @@ mod tests {
     #[tokio::test]
     async fn a_reword_never_reopens_completed_work() {
         // The transition law's own view of a silent patch: no stated
-        // status is no requested move, so nothing is enforced and no
-        // adjustment is owed. The reopening the old field default
-        // manufactured on exactly this call is what this pins out.
+        // status is no requested move, so no rung is enforced. The
+        // reword the same call carries is refused with the read-only
+        // note — the one adjustment the receipt names — and completed
+        // work stays completed, doubly safe: no field default left to
+        // reopen it, no reword left to touch it.
         let (ctx, todos) = todo_context();
         seed(&todos, "1", TodoStatus::Completed);
         let out = TodoTool
@@ -1540,12 +1564,17 @@ mod tests {
         assert!(!out.is_error, "{}", out.text_content());
         let text = out.text_content();
         assert!(
-            !text.contains("Adjusted"),
-            "a patch asking for no move owes no adjustment notice: {text}"
+            !text.contains("completed →") && !text.contains("advanced"),
+            "a patch asking for no move owes no rung adjustment: {text}"
         );
         assert!(
-            text.contains("● [1] Reworded"),
-            "the entry renders on the rung it stood on: {text}"
+            text.contains("'1' reworded — the filed text stands"),
+            "the read-only note names the refused reword: {text}"
+        );
+        assert!(
+            text.contains("● [1] Seed 1"),
+            "the entry renders on the rung and under the name it stands \
+             on: {text}"
         );
     }
 
@@ -1841,7 +1870,11 @@ mod tests {
             "tool description must state the identity rule: {description}"
         );
         assert!(
-            description.contains("id and status alone update them"),
+            description.contains("read-only once it is filed"),
+            "tool description must state the text freeze: {description}"
+        );
+        assert!(
+            description.contains("id and status alone update standing"),
             "tool description must teach the minimal patch: {description}"
         );
         assert!(
@@ -2125,9 +2158,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_explicit_subject_rewords_a_standing_entry() {
-        // The model's reword is its own move: a literal subject replaces
-        // the standing one, named nowhere because nothing was adjusted.
+    async fn an_explicit_subject_never_rewords_a_standing_entry() {
+        // The model's reword is refused, not applied: an entry's text
+        // is the text it was filed with, and a literal subject sent
+        // against a standing id keeps the filed wording with the
+        // read-only note naming the refusal — the plan's words are
+        // fixed at filing, so what tracks the work is the status, and
+        // what identifies the work never drifts.
         let (ctx, todos) = todo_context();
         seed(&todos, "7", TodoStatus::Pending);
         let out = TodoTool
@@ -2141,8 +2178,15 @@ mod tests {
         assert!(!out.is_error, "{}", out.text_content());
         assert_eq!(
             todos.lock().unwrap().first().unwrap().subject,
-            "Repair the parser",
-            "an explicit subject is the model's reword"
+            "Seed 7",
+            "an explicit subject over a standing id files nothing — the \
+             filed wording stands"
+        );
+        assert!(
+            out.text_content()
+                .contains("'7' reworded — the filed text stands"),
+            "and the receipt names the refusal: {}",
+            out.text_content()
         );
     }
 
@@ -2150,10 +2194,12 @@ mod tests {
     async fn a_description_patch_over_a_named_entry_owes_no_recovery_notice() {
         // The notice answers "was a subject made rather than read?", and
         // a patch that carries only a description over an entry the plan
-        // already names reads that name. The old predicate looked at the
-        // submission alone — an absent subject plus a non-empty
-        // description — and so announced a recovery for a merge that
-        // derived nothing.
+        // already names reads that name — the old predicate looked at
+        // the submission alone and announced a recovery for a merge
+        // that derived nothing. Under the text freeze the detail itself
+        // never files — a standing entry's description is closed at
+        // filing like its subject — so the name stands, the detail
+        // stands off, and the only note owed is the read-only one.
         let (ctx, todos) = todo_context();
         seed(&todos, "7", TodoStatus::InProgress);
         let out = TodoTool
@@ -2172,7 +2218,18 @@ mod tests {
         let store = todos.lock().unwrap();
         let entry = store.first().unwrap();
         assert_eq!(entry.subject, "Seed 7", "the name stands");
-        assert_eq!(entry.description, "a fresh detail", "the detail landed");
+        assert_eq!(
+            entry.description, "",
+            "the filed description — empty at filing — stands off the \
+             refused detail"
+        );
+        drop(store);
+        assert!(
+            out.text_content()
+                .contains("'7' reworded — the filed text stands"),
+            "the read-only note names the refused detail: {}",
+            out.text_content()
+        );
     }
 
     #[test]
@@ -2394,13 +2451,121 @@ mod tests {
             {"id": "1", "subject": "Ship", "description": "Wire it",
              "status": "in_progress", "active_form": "Shipping"}
         ]}));
-        let entries = stored_entries(&parsed.todos, &std::collections::HashMap::new());
+        let (entries, notes) = stored_entries(&parsed.todos, &std::collections::HashMap::new());
         let entry = entries.first().unwrap();
         assert_eq!(entry.id, "1");
         assert_eq!(entry.subject, "Ship");
         assert_eq!(entry.description, "Wire it");
         assert_eq!(entry.status, TodoStatus::InProgress);
         assert_eq!(entry.active_form.as_deref(), Some("Shipping"));
+        assert!(
+            notes.is_empty(),
+            "a newborn files its own text as sent — no note: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn a_standing_entrys_text_is_read_only() {
+        // The plan's words are the words it was filed with: a reword
+        // sent against a standing id — subject, description, or an
+        // active form added against one never filed — keeps the filed
+        // wording and earns the note naming the law, while the status
+        // the same patch carries still lands.
+        let standing = std::collections::HashMap::from([
+            (
+                "p1".to_string(),
+                TodoEntry {
+                    id: "p1".to_string(),
+                    subject: "Ship the release".to_string(),
+                    description: "Tag and publish".to_string(),
+                    status: TodoStatus::InProgress,
+                    active_form: Some("Shipping the release".to_string()),
+                },
+            ),
+            (
+                "p2".to_string(),
+                TodoEntry {
+                    id: "p2".to_string(),
+                    subject: "Amend the canon".to_string(),
+                    description: String::new(),
+                    status: TodoStatus::Pending,
+                    active_form: None,
+                },
+            ),
+        ]);
+        let parsed = parse_input(json!({"todos": [
+            {"id": "p1", "subject": "Handing off the release",
+             "description": "DISPOSITION: recommendation delivered",
+             "status": "completed"},
+            {"id": "p2", "active_form": "Handing off the canon amendment"}
+        ]}));
+        let (entries, notes) = stored_entries(&parsed.todos, &standing);
+        let p1 = entries.first().unwrap();
+        assert_eq!(
+            p1.subject, "Ship the release",
+            "the filed subject stands over the reword"
+        );
+        assert_eq!(
+            p1.description, "Tag and publish",
+            "the filed description stands over the disposition dump"
+        );
+        assert_eq!(
+            p1.active_form.as_deref(),
+            Some("Shipping the release"),
+            "the filed active form stands"
+        );
+        assert_eq!(
+            p1.status,
+            TodoStatus::Completed,
+            "the status the same patch carried still lands — the freeze \
+             is on the words, not the walk"
+        );
+        let p2 = entries.get(1).unwrap();
+        assert_eq!(
+            p2.active_form, None,
+            "an active form added against a standing entry never files"
+        );
+        assert_eq!(notes.len(), 2, "one note per reworded entry: {notes:?}");
+        assert!(
+            notes.iter().all(|note| note.contains("read-only")),
+            "each note names the law: {notes:?}"
+        );
+        assert!(
+            notes.iter().any(|note| note.contains("'p1'")),
+            "and its entry: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn an_identical_restatement_of_the_filed_text_costs_nothing() {
+        // Sending back exactly the filed words is no send at all: the
+        // entry keeps its text and the tool spends no note on it —
+        // restating a plan to orient is not rewording it.
+        let standing = std::collections::HashMap::from([(
+            "p1".to_string(),
+            TodoEntry {
+                id: "p1".to_string(),
+                subject: "Ship the release".to_string(),
+                description: "Tag and publish".to_string(),
+                status: TodoStatus::InProgress,
+                active_form: Some("Shipping the release".to_string()),
+            },
+        )]);
+        let parsed = parse_input(json!({"todos": [
+            {"id": "p1", "subject": "Ship the release",
+             "description": "Tag and publish",
+             "active_form": "Shipping the release"}
+        ]}));
+        let (entries, notes) = stored_entries(&parsed.todos, &standing);
+        let entry = entries.first().unwrap();
+        assert_eq!(entry.subject, "Ship the release");
+        assert_eq!(entry.description, "Tag and publish");
+        assert_eq!(entry.active_form.as_deref(), Some("Shipping the release"));
+        assert_eq!(entry.status, TodoStatus::InProgress);
+        assert!(
+            notes.is_empty(),
+            "identical words are not a reword: {notes:?}"
+        );
     }
 
     #[test]

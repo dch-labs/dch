@@ -4836,7 +4836,7 @@ mod tests {
         // read-in payload does not: the guard above the threshold refuses a
         // request outright, so a window smaller than one turn's own size
         // would fail the run rather than compact it.
-        config.api.context_window = Some(9_000);
+        config.api.context_window = Some(9_250);
         // The truncating compactor, so the pass is the machine's own work:
         // the summarizers phone the provider for their summaries, and a
         // canned endpoint serving one body per connection cannot tell a run
