@@ -514,7 +514,11 @@ pub(crate) fn tui_messages_to_loopctl(
     let mut tool_index = 0usize;
     for message in messages {
         match message {
-            TuiMessage::User { text, .. } => {
+            TuiMessage::User {
+                text,
+                unsent: false,
+                ..
+            } => {
                 let mut parts = std::mem::take(&mut pending_results);
                 parts.push(MessagePart::text(text.clone()));
                 push_user_message(&mut converted, parts);
@@ -586,8 +590,10 @@ pub(crate) fn tui_messages_to_loopctl(
                 }
                 push_assistant_message(&mut converted, parts);
             }
-            TuiMessage::System { .. } | TuiMessage::Error { .. } | TuiMessage::Compacted { .. } => {
-            }
+            TuiMessage::User { unsent: true, .. }
+            | TuiMessage::System { .. }
+            | TuiMessage::Error { .. }
+            | TuiMessage::Compacted { .. } => {}
         }
     }
     if !pending_results.is_empty() {
@@ -1990,6 +1996,42 @@ mod tests {
         assert!(
             tui_messages_to_loopctl(&[], false).is_empty(),
             "nothing in, nothing out"
+        );
+    }
+
+    #[test]
+    fn an_unsent_row_never_reaches_the_derived_history() {
+        // The derived history is what the model continues from; a row
+        // the echo wrote as a record was never delivered, and feeding
+        // it here would say the model heard words it never did.
+        let transcript = vec![
+            user("the task that ran"),
+            assistant(vec![text_block("the answer")]),
+            TuiMessage::Error {
+                text: "Agent cancelled".to_string(),
+                timestamp: now(),
+            },
+            TuiMessage::User {
+                text: "queued when the exit came".to_string(),
+                timestamp: now(),
+                steered: false,
+                unsent: true,
+            },
+        ];
+        let converted = tui_messages_to_loopctl(&transcript, false);
+        let carried: Vec<String> = converted
+            .iter()
+            .filter(|message| message.role == Role::User)
+            .flat_map(|message| message.parts.iter())
+            .filter_map(|part| match part {
+                MessagePart::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            carried,
+            ["the task that ran".to_string()],
+            "only delivered words reach the history: {carried:?}"
         );
     }
 

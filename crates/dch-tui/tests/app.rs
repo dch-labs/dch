@@ -10315,10 +10315,10 @@ fn the_exit_echo_marks_its_rows_unsent() {
     }
     let before = app.conversation().len();
     app.echo_waiting_prompts_at_exit(app.waiting_prompt_texts_at_exit());
+    let echoed = app.conversation().get(before..).unwrap_or_default();
+    assert_eq!(echoed.len(), 1, "the waiting prompt echoes exactly one row");
     assert!(
-        app.conversation()
-            .get(before..)
-            .unwrap_or_default()
+        echoed
             .iter()
             .all(|message| matches!(message, TuiMessage::User { unsent: true, .. })),
         "every echoed waiting row carries the unsent flag"
@@ -10331,10 +10331,14 @@ fn the_exit_echo_marks_its_rows_unsent() {
         .push("the correction that never landed".to_string());
     let before = app.conversation().len();
     app.echo_rescued_corrections_at_exit();
+    let echoed = app.conversation().get(before..).unwrap_or_default();
+    assert_eq!(
+        echoed.len(),
+        1,
+        "the rescued correction echoes exactly one row"
+    );
     assert!(
-        app.conversation()
-            .get(before..)
-            .unwrap_or_default()
+        echoed
             .iter()
             .all(|message| matches!(message, TuiMessage::User { unsent: true, .. })),
         "every echoed correction row carries the unsent flag"
