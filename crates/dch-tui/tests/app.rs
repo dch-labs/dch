@@ -136,6 +136,7 @@ fn seeded_messages_become_the_conversation_pinned_to_the_newest() {
             text: "earlier turn".to_string(),
             timestamp: now,
             steered: false,
+            unsent: false,
         },
         dch_tui::TuiMessage::Assistant {
             blocks: vec![dch_tui::ContentBlock::Text {
@@ -351,6 +352,7 @@ fn scroll_keys_adjust_without_underflow() {
             text: format!("line {i}"),
             timestamp: chrono::Utc::now(),
             steered: false,
+            unsent: false,
         });
     }
     app.handle_event(&plain(KeyCode::PageDown));
@@ -850,6 +852,7 @@ fn ctrl_shift_c_copies_the_selection_without_quitting() {
         text: "abcdefghij".to_string(),
         timestamp: now,
         steered: false,
+        unsent: false,
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
@@ -1997,11 +2000,13 @@ fn a_drag_selects_characters_and_copies_silently() {
         text: "abcdefghij".to_string(),
         timestamp: now,
         steered: false,
+        unsent: false,
     });
     app.push_message(TuiMessage::User {
         text: "klmnopqrst".to_string(),
         timestamp: now,
         steered: false,
+        unsent: false,
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
@@ -2070,6 +2075,7 @@ fn a_user_turn_opens_with_the_primary_chevron() {
         text: "first line of the question\nsecond line".to_string(),
         timestamp: chrono::Utc::now(),
         steered: false,
+        unsent: false,
     });
     app.push_message(TuiMessage::Assistant {
         blocks: vec![ContentBlock::Text {
@@ -2144,6 +2150,7 @@ fn a_drag_shows_the_highlight_before_release() {
         text: "abcdefghij".to_string(),
         timestamp: now,
         steered: false,
+        unsent: false,
     });
     let _ = render_to_buffer(&mut app, 80, 24);
     let probe = render_to_buffer(&mut app, 80, 24);
@@ -2417,6 +2424,7 @@ fn a_released_selection_stays_highlighted_until_the_next_press() {
         text: "abcdefghij".to_string(),
         timestamp: now,
         steered: false,
+        unsent: false,
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
@@ -2494,6 +2502,7 @@ fn a_released_selection_copy_confirms_on_the_notice_row() {
         text: "abcdefghij".to_string(),
         timestamp: now,
         steered: false,
+        unsent: false,
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
@@ -2551,6 +2560,7 @@ fn a_click_without_travel_copies_and_notices_nothing() {
         text: "abcdefghij".to_string(),
         timestamp: now,
         steered: false,
+        unsent: false,
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
@@ -2602,6 +2612,7 @@ fn a_copy_no_transport_delivers_notices_the_failure() {
         text: "abcdefghij".to_string(),
         timestamp: now,
         steered: false,
+        unsent: false,
     });
     app.set_selection_copier(Box::new(|_attempt, _text| dch_tui::CopyAnswer::Failed));
 
@@ -2660,6 +2671,7 @@ fn a_hanging_copy_command_never_blocks_the_render_task() {
         text: "abcdefghij".to_string(),
         timestamp: now,
         steered: false,
+        unsent: false,
     });
 
     let probe = render_to_buffer(&mut app, 80, 24);
@@ -2721,6 +2733,7 @@ fn a_pending_transport_copy_posts_no_row_until_the_verdict() {
         text: "abcdefghij".to_string(),
         timestamp: now,
         steered: false,
+        unsent: false,
     });
 
     let probe = render_to_buffer(&mut app, 80, 24);
@@ -2767,6 +2780,7 @@ fn the_copy_chord_confirms_on_the_notice_row() {
         text: "abcdefghij".to_string(),
         timestamp: now,
         steered: false,
+        unsent: false,
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
@@ -2826,6 +2840,7 @@ fn a_shift_arrow_recopy_confirms_on_the_notice_row() {
         text: "abcdefghij".to_string(),
         timestamp: now,
         steered: false,
+        unsent: false,
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
@@ -2884,6 +2899,7 @@ fn a_drag_running_past_the_bottom_edge_scrolls_with_the_selection() {
             text: format!("line{i:02}"),
             timestamp: now,
             steered: false,
+            unsent: false,
         });
     }
     let _ = render_to_buffer(&mut app, 80, 25);
@@ -2932,6 +2948,7 @@ fn a_parked_edge_drag_keeps_scrolling_on_the_tick_until_the_document_ends() {
             text: format!("line{i:02}"),
             timestamp: now,
             steered: false,
+            unsent: false,
         });
     }
     let _ = render_to_buffer(&mut app, 80, 25);
@@ -3001,6 +3018,7 @@ fn buttonless_motion_ends_a_parked_edge_drag() {
             text: format!("line{i:02}"),
             timestamp: now,
             steered: false,
+            unsent: false,
         });
     }
     let _ = render_to_buffer(&mut app, 80, 24);
@@ -3045,6 +3063,7 @@ fn a_drag_running_past_the_top_edge_scrolls_upward() {
             text: format!("line{i:02}"),
             timestamp: now,
             steered: false,
+            unsent: false,
         });
     }
     let _ = render_to_buffer(&mut app, 80, 25);
@@ -3109,11 +3128,13 @@ fn shift_arrows_extend_and_shrink_a_released_selection() {
         text: "abcdefghij".to_string(),
         timestamp: now,
         steered: false,
+        unsent: false,
     });
     app.push_message(TuiMessage::User {
         text: "klmnopqrst".to_string(),
         timestamp: now,
         steered: false,
+        unsent: false,
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
@@ -3186,6 +3207,7 @@ fn shift_arrows_walk_the_view_to_follow_the_head() {
             text: format!("line{i:02}"),
             timestamp: now,
             steered: false,
+            unsent: false,
         });
     }
     let _ = render_to_buffer(&mut app, 80, 25);
@@ -3239,6 +3261,7 @@ fn plain_arrows_still_scroll_while_a_selection_is_up() {
             text: format!("line{i:02}"),
             timestamp: now,
             steered: false,
+            unsent: false,
         });
     }
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -3292,6 +3315,7 @@ fn a_rebuilt_line_space_forfeits_the_selection() {
             text: text.to_string(),
             timestamp: now,
             steered: false,
+            unsent: false,
         });
     }
     let probe = render_to_buffer(&mut app, 80, 24);
@@ -3375,6 +3399,7 @@ fn a_press_on_a_running_tool_row_anchors_on_the_selectable_transcript() {
         text: "abcdefghij".to_string(),
         timestamp: now,
         steered: false,
+        unsent: false,
     });
     app.active_tools()
         .lock()
@@ -3540,6 +3565,7 @@ fn a_streaming_delta_preserves_a_selection_in_the_settled_transcript() {
         text: "abcdefghij".to_string(),
         timestamp: now,
         steered: false,
+        unsent: false,
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
@@ -3612,6 +3638,7 @@ fn a_release_over_blank_cells_copies_nothing() {
         text: "abcdefghij\n\nklmnopqrst".to_string(),
         timestamp: now,
         steered: false,
+        unsent: false,
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
@@ -3685,6 +3712,7 @@ fn combining_marks_carry_with_their_base_and_line_up_with_the_rendered_cells() {
         text: "e\u{301}x".to_string(),
         timestamp: now,
         steered: false,
+        unsent: false,
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
@@ -3755,6 +3783,7 @@ fn a_press_outside_the_conversation_retires_the_selection_without_recopying() {
         text: "abcdefghij".to_string(),
         timestamp: now,
         steered: false,
+        unsent: false,
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
@@ -3829,6 +3858,7 @@ fn an_interior_blank_line_stays_in_a_multi_row_copy() {
         text: "abcdefghij\n\nklmnopqrst".to_string(),
         timestamp: now,
         steered: false,
+        unsent: false,
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
@@ -3883,6 +3913,7 @@ fn a_selection_landing_on_a_wide_characters_second_cell_takes_it() {
         text: "日x".to_string(),
         timestamp: now,
         steered: false,
+        unsent: false,
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
@@ -4316,6 +4347,7 @@ fn the_conversation_pane_holds_still_once_the_composer_reaches_its_cap() {
             text: format!("line {i:02}"),
             timestamp: chrono::Utc::now(),
             steered: false,
+            unsent: false,
         });
     }
     // fill the composer past its three-row cap first
@@ -4385,6 +4417,7 @@ fn late_pushed_messages_appear_in_the_next_render() {
         text: "arrived between frames".to_string(),
         timestamp: chrono::Utc::now(),
         steered: false,
+        unsent: false,
     });
     let terminal = render_to_buffer(&mut app, 40, 16);
     assert!(
@@ -4529,6 +4562,7 @@ fn multiline_user_and_system_echoes_render_on_separate_rows() {
         text: "first\nsecond".to_string(),
         timestamp: chrono::Utc::now(),
         steered: false,
+        unsent: false,
     });
     app.push_message(TuiMessage::System {
         text: "alpha\nbeta".to_string(),
@@ -5137,6 +5171,7 @@ fn long_user_lines_wrap_in_the_conversation_instead_of_clipping() {
         text: long,
         timestamp: now,
         steered: false,
+        unsent: false,
     });
     let terminal = render_to_buffer(&mut app, 80, 24);
     let rows = row_texts(&terminal);
@@ -5167,6 +5202,7 @@ fn a_pad_row_and_a_blank_line_breathe_between_user_turns_and_agent_material() {
         text: "the question".to_string(),
         timestamp: now,
         steered: false,
+        unsent: false,
     });
     app.push_message(TuiMessage::Assistant {
         blocks: vec![ContentBlock::Text {
@@ -5215,6 +5251,7 @@ fn a_pad_row_and_a_blank_line_breathe_between_user_turns_and_agent_material() {
         text: "the follow-up".to_string(),
         timestamp: now,
         steered: false,
+        unsent: false,
     });
     let follow_terminal = render_to_buffer(&mut app, 40, 18);
     let follow_rows = row_texts(&follow_terminal);
@@ -5312,6 +5349,7 @@ fn the_conversation_opens_one_row_below_the_pane_s_top_edge() {
         text: "the first line".to_string(),
         timestamp: chrono::Utc::now(),
         steered: false,
+        unsent: false,
     });
     let terminal = render_to_buffer(&mut app, 40, 16);
     let buffer = terminal.backend().buffer();
@@ -5354,6 +5392,7 @@ fn wrapped_lines_keep_a_right_margin_before_the_scrollbar_gutter() {
         text: "x".repeat(120),
         timestamp: chrono::Utc::now(),
         steered: false,
+        unsent: false,
     });
     let terminal = render_to_buffer(&mut app, 40, 18);
     let buffer = terminal.backend().buffer();
@@ -5575,6 +5614,7 @@ fn dragging_from_a_summary_row_still_selects_instead_of_toggling() {
         text: "abcdefghij".to_string(),
         timestamp: now,
         steered: false,
+        unsent: false,
     });
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
@@ -5902,6 +5942,7 @@ fn the_scrollbar_owns_its_gutter_and_never_touches_text() {
             text: format!("message {i:02}"),
             timestamp: chrono::Utc::now(),
             steered: false,
+            unsent: false,
         });
     }
     // 20 one-line messages over the conversation pane make the
@@ -5962,6 +6003,7 @@ fn the_gutter_stays_blank_when_the_document_fits() {
         text: "hello".to_string(),
         timestamp: chrono::Utc::now(),
         steered: false,
+        unsent: false,
     });
     let terminal = render_to_buffer(&mut app, 20, 18);
     let buffer = terminal.backend().buffer();
@@ -6156,6 +6198,7 @@ fn the_permission_sheet_sits_over_the_prompt_box() {
         text: "top of the conversation".to_string(),
         timestamp: chrono::Utc::now(),
         steered: false,
+        unsent: false,
     });
     let terminal = render_to_buffer(&mut app, 80, 30);
     let title_row = row_of(&terminal, "Permission required");
@@ -7902,6 +7945,7 @@ fn a_parked_drag_does_not_scroll_behind_a_pending_prompt() {
             text: format!("line{i:02}"),
             timestamp: now,
             steered: false,
+            unsent: false,
         });
     }
     let _ = render_to_buffer(&mut app, 80, 24);
@@ -9053,6 +9097,7 @@ fn the_wheel_still_pages_under_a_question() {
             text: format!("line{i:02}"),
             timestamp: now,
             steered: false,
+            unsent: false,
         });
     }
     let _ = render_to_buffer(&mut app, 80, 24);
@@ -9085,6 +9130,7 @@ fn page_keys_page_the_transcript_under_a_question() {
             text: format!("line{i:02}"),
             timestamp: now,
             steered: false,
+            unsent: false,
         });
     }
     let mut before_render = render_to_buffer(&mut app, 80, 24);
@@ -9163,6 +9209,7 @@ fn page_keys_page_the_transcript_behind_a_permission_ask() {
             text: format!("line{i:02}"),
             timestamp: now,
             steered: false,
+            unsent: false,
         });
     }
     let (requests_tx, requests_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -10158,6 +10205,7 @@ fn a_steered_echo_surviving_in_a_transcript_keeps_the_plan_standing() {
             text: "reminder: 1 todo item still not completed".to_string(),
             timestamp: chrono::Utc::now(),
             steered: true,
+            unsent: false,
         },
         TuiMessage::Assistant {
             blocks: vec![ContentBlock::Text {
@@ -10182,6 +10230,7 @@ fn a_steered_echo_surviving_in_a_transcript_keeps_the_plan_standing() {
         text: "the next claim".to_string(),
         timestamp: chrono::Utc::now(),
         steered: false,
+        unsent: false,
     }]);
     let terminal = render_to_buffer(&mut app, 80, 30);
     let flat: String = row_texts(&terminal).join("\n");
@@ -10232,6 +10281,7 @@ fn a_claim_after_a_finished_plan_takes_the_section_down() {
         text: "the next claim".to_string(),
         timestamp: chrono::Utc::now(),
         steered: false,
+        unsent: false,
     }]);
     let after = render_to_buffer(&mut app, 80, 30);
     let after_flat: String = row_texts(&after).join("\n");
@@ -10245,6 +10295,156 @@ fn a_claim_after_a_finished_plan_takes_the_section_down() {
         after_flat.contains("dig the trench"),
         "the retired plan's transcript record keeps its rows to read: \
          {after_flat:?}"
+    );
+}
+
+#[test]
+fn the_exit_echo_marks_its_rows_unsent() {
+    // The echo's row is a record, not a delivery, and the flag is the
+    // one bit that says so — the renderer's marker and the claim
+    // rules' exclusion both read it. Pinned at both places a row is
+    // written without a send behind it: the waiting prompts' echo and
+    // the rescued corrections' echo.
+    let (mut app, kept) = app_with_state();
+    {
+        let mut queue = kept
+            .queued
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        queue.push("the words no turn took".to_string());
+    }
+    let before = app.conversation().len();
+    app.echo_waiting_prompts_at_exit(app.waiting_prompt_texts_at_exit());
+    assert!(
+        app.conversation()
+            .get(before..)
+            .unwrap_or_default()
+            .iter()
+            .all(|message| matches!(message, TuiMessage::User { unsent: true, .. })),
+        "every echoed waiting row carries the unsent flag"
+    );
+
+    let (mut app, kept) = app_with_state();
+    kept.rescued_corrections
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push("the correction that never landed".to_string());
+    let before = app.conversation().len();
+    app.echo_rescued_corrections_at_exit();
+    assert!(
+        app.conversation()
+            .get(before..)
+            .unwrap_or_default()
+            .iter()
+            .all(|message| matches!(message, TuiMessage::User { unsent: true, .. })),
+        "every echoed correction row carries the unsent flag"
+    );
+}
+
+#[test]
+fn an_unsent_row_renders_dimmed_without_a_marker() {
+    // The conversation window must not pass the echo off as a message
+    // the agent read: the row renders in the dim register, the same
+    // shape as a delivered prompt but visually a record rather than a
+    // turn. The dimming is the whole signal — no marker wording rides
+    // the row — and a delivered row keeps the user's own color.
+    let fg_of_row_holding = |terminal: &Terminal<TestBackend>, needle: &str| {
+        let buffer = terminal.backend().buffer();
+        let rows = row_texts(terminal);
+        let row = rows
+            .iter()
+            .position(|row| row.contains(needle))
+            .unwrap_or_else(|| panic!("the row holding {needle:?} renders"));
+        let width = buffer.area.width as usize;
+        buffer
+            .content()
+            .iter()
+            .skip(row * width)
+            .take(width)
+            .find(|cell| {
+                let symbol = cell.symbol();
+                !symbol.trim().is_empty() && symbol != "\u{276f}"
+            })
+            .map(|cell| cell.fg)
+    };
+    let (mut app, _kept) = app_with_state();
+    app.seed_messages(vec![TuiMessage::User {
+        text: "queued when the kill came".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: true,
+    }]);
+    let dim = app.theme.ui.dim;
+    let terminal = render_to_buffer(&mut app, 80, 24);
+    let flat: String = row_texts(&terminal).join("\n");
+    assert!(
+        !flat.contains("never sent"),
+        "no marker wording rides the row — the dimming is the signal: {flat:?}"
+    );
+    assert!(
+        flat.contains("queued when the kill came"),
+        "the words themselves still render: {flat:?}"
+    );
+    assert_eq!(
+        fg_of_row_holding(&terminal, "queued when the kill came"),
+        Some(dim),
+        "the unsent row renders in the dim register"
+    );
+
+    let (mut app, _kept) = app_with_state();
+    app.seed_messages(vec![TuiMessage::User {
+        text: "queued when the kill came".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    }]);
+    let user_fg = app.theme.ui.user_message_fg;
+    let terminal = render_to_buffer(&mut app, 80, 24);
+    assert_eq!(
+        fg_of_row_holding(&terminal, "queued when the kill came"),
+        Some(user_fg),
+        "a delivered row keeps the user's own color"
+    );
+}
+
+#[test]
+fn an_unsent_row_does_not_retire_a_finished_plan() {
+    // The delivered claim's mirror: a real claim retires a finished
+    // plan, but an unsent row is not a claim — no turn took its
+    // words, so the plan it stands over never heard from it and keeps
+    // standing exactly as the echo found it.
+    let tool_block = TuiMessage::Assistant {
+        blocks: vec![ContentBlock::Tool {
+            call_id: "call-plan".to_string(),
+            name: "TodoWrite".to_string(),
+            input_preview: "2 items".to_string(),
+            success: true,
+            elapsed_secs: 0.1,
+            output_preview: "Updated 2 todo tasks".to_string(),
+            retained_input: r#"{"todos":[
+                {"id":"1","subject":"survey the land","status":"completed"},
+                {"id":"2","subject":"dig the trench","status":"completed"}
+            ]}"#
+            .to_string(),
+        }],
+        timestamp: chrono::Utc::now(),
+        duration_ms: None,
+    };
+    let mut app = app();
+    app.seed_messages(vec![tool_block]);
+    app.seed_messages(vec![TuiMessage::User {
+        text: "the words the exit echoed".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: true,
+    }]);
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let flat: String = row_texts(&terminal).join("\n");
+    assert_eq!(
+        flat.matches("2/2 done").count(),
+        2,
+        "an unsent row retires nothing — the finished plan keeps its \
+         block and section: {flat:?}"
     );
 }
 
@@ -10285,6 +10485,7 @@ fn a_cancelled_session_restores_into_its_own_plan() {
             text: "resume".to_string(),
             timestamp: chrono::Utc::now(),
             steered: false,
+            unsent: false,
         },
     ]);
     let terminal = render_to_buffer(&mut app, 80, 30);
@@ -10345,6 +10546,61 @@ fn a_restored_session_shows_the_last_run_s_plan() {
         flat.contains("\u{25d0} dig the trench"),
         "the section carries the restored run's final state: {flat:?}"
     );
+}
+
+#[test]
+fn a_restored_session_reads_the_plan_from_the_render_not_the_request() {
+    // A `TodoWrite` submission is an adjustment, not the whole list: a
+    // one-entry call that touches a single id leaves every other entry
+    // standing, and the tool's render is what the run actually holds.
+    // A resume that seeded the plan from the request would show one
+    // row where the runner's store — and the exit's unfinished count —
+    // say three, the same divergence in both directions. The seeded
+    // plan reads the render first, exactly as the live drain does, and
+    // the request stands in only for a block that kept no render.
+    let adjustment = TuiMessage::Assistant {
+        blocks: vec![ContentBlock::Tool {
+            call_id: "call-adj".to_string(),
+            name: "TodoWrite".to_string(),
+            input_preview: "1 items".to_string(),
+            success: true,
+            elapsed_secs: 0.1,
+            output_preview: concat!(
+                "Adjusted: '51' reworded — the filed text stands\n\n",
+                "# Task List\n\nSummary: 0 pending, 3 in progress, 0 completed\n\n",
+                "\u{25d0} [49] Find the moved release file\n\n",
+                "\u{25d0} [50] Update it with today's outcomes\n\n",
+                "\u{25d0} [51] Trace the exit echo and the resume seed\n",
+            )
+            .to_string(),
+            retained_input: r#"{"todos":[
+                {"id":"51","subject":"Trace the exit echo and the resume seed","status":"in_progress"}
+            ]}"#
+                .to_string(),
+        }],
+        timestamp: chrono::Utc::now(),
+        duration_ms: None,
+    };
+
+    let mut restored_app = app();
+    restored_app.seed_messages(vec![adjustment]);
+    let terminal = render_to_buffer(&mut restored_app, 80, 30);
+    let flat: String = row_texts(&terminal).join("\n");
+    assert!(
+        flat.contains("0/3 done"),
+        "the restored plan counts the render's three entries, not the \
+         request's one — the same three the exit's unfinished figure names: {flat:?}"
+    );
+    for subject in [
+        "Find the moved release file",
+        "Update it with today's outcomes",
+        "Trace the exit echo and the resume seed",
+    ] {
+        assert!(
+            flat.contains(subject),
+            "the section carries the standing entry {subject:?}: {flat:?}"
+        );
+    }
 }
 
 #[test]
@@ -11332,52 +11588,28 @@ fn cancel_run_in_flight_fires_only_under_a_run() {
 }
 
 #[test]
-fn a_resume_requeues_the_bare_unanswered_claims_standing_at_the_end() {
-    // The queue a resume opens with is the truth, not a phantom: a
-    // transcript ending on bare claims — the run in flight's prompt,
-    // caught before it could record anything, and the waiting ones the
-    // exit wrote there because no turn ever spent them — each waits
-    // again in the section, in the order they were typed. They wait
-    // for the user: the section shows them at rest, `e` fixes a
-    // wording, `d` takes one out, `s` aims one at a later run — none of
-    // them runs on its own. A claim followed by its cancellation
-    // record is a deliberate stop and owes nothing, and an answered
-    // claim is done. Resurrecting cancelled prompts would put words in
-    // the queue the user explicitly took back.
+fn a_resume_does_not_resurrect_the_killed_session_s_queue() {
+    // The waiting queue is process state: it dies with the process,
+    // whatever the exit wrote into the transcript on its way out. A
+    // resume that seeded the echoed rows back into the queue armed
+    // words the user took back with the kill — entries no driver
+    // claim could ever reach, because no submission carries their id,
+    // jumped by every fresh submit, and shown as pending through
+    // every turn after. The rows stay what the exit meant them to
+    // be: a record in the transcript the user reads, retypes, or
+    // lets lie. The queue opens empty whatever the transcript ends
+    // on.
     let now = chrono::Utc::now();
 
-    // The bare claim: owed, requeued.
-    let (mut app, kept) = app_with_state();
-    app.seed_messages(vec![TuiMessage::User {
-        text: "the interrupted run's prompt".to_string(),
-        timestamp: now,
-        steered: false,
-    }]);
-    let queued: Vec<String> = {
-        let queue = kept
-            .queued
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        (0..queue.len())
-            .filter_map(|index| queue.get(index))
-            .map(|entry| entry.text.clone())
-            .collect()
-    };
-    assert_eq!(
-        queued,
-        ["the interrupted run's prompt".to_string()],
-        "the bare unanswered claim waits again"
-    );
-
-    // A run of bare claims: every one owed, in the order they were
-    // typed — the exit wrote the waiting backlog behind the record of
-    // the run it stopped, and the resume carries all of it.
+    // The kill's own shape: the stop's record, then the echoed words
+    // the exit wrote behind it because no turn spent them.
     let (mut app, kept) = app_with_state();
     app.seed_messages(vec![
         TuiMessage::User {
             text: "stopped mid-run".to_string(),
             timestamp: now,
             steered: false,
+            unsent: false,
         },
         TuiMessage::Error {
             text: "Agent cancelled".to_string(),
@@ -11387,31 +11619,59 @@ fn a_resume_requeues_the_bare_unanswered_claims_standing_at_the_end() {
             text: "first waiting word".to_string(),
             timestamp: now,
             steered: false,
+            unsent: false,
         },
         TuiMessage::User {
             text: "second waiting word".to_string(),
             timestamp: now,
             steered: false,
+            unsent: false,
         },
     ]);
-    let queued: Vec<String> = {
+    {
         let queue = kept
             .queued
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        (0..queue.len())
-            .filter_map(|index| queue.get(index))
-            .map(|entry| entry.text.clone())
-            .collect()
-    };
+        assert!(
+            queue.is_empty(),
+            "the echoed waiting words are history, not a backlog to run"
+        );
+    }
+    let recorded: Vec<&str> = app
+        .conversation()
+        .iter()
+        .filter_map(|message| match message {
+            TuiMessage::User { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
     assert_eq!(
-        queued,
+        recorded,
         [
-            "first waiting word".to_string(),
-            "second waiting word".to_string()
+            "stopped mid-run",
+            "first waiting word",
+            "second waiting word"
         ],
-        "the trailing run waits whole — the recorded cancel above it stays \
-         stopped, the unspent words behind it wait in their typed order"
+        "the record stands in the transcript for the user to read"
+    );
+
+    // A hard kill that caught the run in flight: a bare claim at the
+    // end, with no cancellation record behind it at all.
+    let (mut app, kept) = app_with_state();
+    app.seed_messages(vec![TuiMessage::User {
+        text: "the interrupted run's prompt".to_string(),
+        timestamp: now,
+        steered: false,
+        unsent: false,
+    }]);
+    let queue = kept
+        .queued
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        queue.is_empty(),
+        "a bare claim is a record too — the queue still opens empty"
     );
 
     // The cancelled claim: deliberate, owes nothing.
@@ -11421,6 +11681,7 @@ fn a_resume_requeues_the_bare_unanswered_claims_standing_at_the_end() {
             text: "stopped mid-run".to_string(),
             timestamp: now,
             steered: false,
+            unsent: false,
         },
         TuiMessage::Error {
             text: "Agent cancelled".to_string(),
@@ -11443,6 +11704,7 @@ fn a_resume_requeues_the_bare_unanswered_claims_standing_at_the_end() {
             text: "answered".to_string(),
             timestamp: now,
             steered: false,
+            unsent: false,
         },
         TuiMessage::Assistant {
             blocks: vec![ContentBlock::Text {
@@ -11470,6 +11732,7 @@ fn a_resume_requeues_the_bare_unanswered_claims_standing_at_the_end() {
             text: "a steer's echo".to_string(),
             timestamp: now,
             steered: true,
+            unsent: false,
         },
     ]);
     let queue = kept
@@ -11485,8 +11748,8 @@ fn the_exit_writes_waiting_prompts_into_the_transcript_as_unclaimed_rows() {
     // row to survive: the exit reads the unclaimed entries inside the
     // window between the shutdown flag rising and the cancel firing —
     // the run in flight's entry is already out, the requeues have not
-    // landed — and writes them, in queue order, as the rows a resume
-    // seeds the waiting section from. Nothing waiting writes nothing:
+    // landed — and writes them, in queue order, as the transcript's
+    // durable record of them. Nothing waiting writes nothing:
     // the exit owes no row to a queue that held none.
     let (mut app, kept) = app_with_state();
     {
@@ -11514,6 +11777,7 @@ fn the_exit_writes_waiting_prompts_into_the_transcript_as_unclaimed_rows() {
             TuiMessage::User {
                 text,
                 steered: false,
+                unsent: true,
                 ..
             } => Some(text.as_str()),
             _ => None,
@@ -11549,8 +11813,7 @@ fn the_exit_echoes_rescued_corrections_as_unclaimed_rows() {
     // words that travelled only in the channel — and the exit writes
     // them back as unclaimed rows, in collection order, so the
     // transcript ends on everything the user typed that no turn
-    // spent and a resume seeds each row into the waiting section. An
-    // empty rescue writes nothing.
+    // spent. An empty rescue writes nothing.
     let (mut app, kept) = app_with_state();
     {
         let mut rescued = kept
@@ -11571,6 +11834,7 @@ fn the_exit_echoes_rescued_corrections_as_unclaimed_rows() {
             TuiMessage::User {
                 text,
                 steered: false,
+                unsent: true,
                 ..
             } => Some(text.as_str()),
             _ => None,
@@ -11673,6 +11937,7 @@ fn the_timer_row_names_its_count_with_a_quiet_elapsed_word() {
         text: "the turn above the timer".to_string(),
         timestamp: chrono::Utc::now(),
         steered: false,
+        unsent: false,
     }]);
     kept.mark_run_started();
     let terminal = render_to_buffer(&mut app, 80, 24);
@@ -11711,6 +11976,7 @@ fn the_timer_row_names_its_count_with_a_quiet_elapsed_word() {
             text: "answered".to_string(),
             timestamp: now,
             steered: false,
+            unsent: false,
         },
         TuiMessage::Assistant {
             blocks: vec![ContentBlock::Text {
@@ -11966,6 +12232,7 @@ fn flush_turn_end_hands_the_worker_the_whole_conversation() {
         text: "the last row".to_string(),
         timestamp: chrono::Utc::now(),
         steered: false,
+        unsent: false,
     }]);
     let seen: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
     let sink = Arc::clone(&seen);
@@ -12000,6 +12267,7 @@ fn a_tail_user_row_paints_its_own_chrome() {
         text: "the first question".to_string(),
         timestamp: chrono::Utc::now(),
         steered: false,
+        unsent: false,
     });
     app.push_message(TuiMessage::Assistant {
         blocks: vec![ContentBlock::Text {
@@ -12015,6 +12283,7 @@ fn a_tail_user_row_paints_its_own_chrome() {
         text: "the tail question".to_string(),
         timestamp: chrono::Utc::now(),
         steered: false,
+        unsent: false,
     });
     let probe = render_to_buffer(&mut app, 80, 24);
     let rows = row_texts(&probe);
@@ -12064,6 +12333,7 @@ fn a_layout_rebake_leaves_no_stale_chrome() {
         text: "the first question".to_string(),
         timestamp: chrono::Utc::now(),
         steered: false,
+        unsent: false,
     });
     app.push_message(TuiMessage::Assistant {
         blocks: vec![ContentBlock::Tool {
@@ -12082,6 +12352,7 @@ fn a_layout_rebake_leaves_no_stale_chrome() {
         text: "the second question".to_string(),
         timestamp: chrono::Utc::now(),
         steered: false,
+        unsent: false,
     });
     let _ = render_to_buffer(&mut app, 80, 30);
     app.set_verbosity(dch_config::Verbosity::Quiet);

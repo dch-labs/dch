@@ -888,6 +888,7 @@ mod tests {
             text: text.to_string(),
             timestamp: now(),
             steered: false,
+            unsent: false,
         }
     }
 
@@ -896,6 +897,7 @@ mod tests {
             text: text.to_string(),
             timestamp: now(),
             steered: true,
+            unsent: false,
         }
     }
 
@@ -1560,6 +1562,7 @@ mod tests {
             text: "review the branch".to_string(),
             timestamp: now(),
             steered: false,
+            unsent: false,
         }];
         for _round in 0..4 {
             transcript.push(assistant(vec![
@@ -1616,6 +1619,7 @@ mod tests {
                 text: "reminder: 1 todo item still not completed".to_string(),
                 timestamp: now(),
                 steered: true,
+                unsent: false,
             },
             assistant(vec![text_block("the follow-up's answer")]),
         ];

@@ -29,6 +29,7 @@ pub(crate) fn transcript_from(
         text: prompt.to_string(),
         timestamp: now,
         steered: false,
+        unsent: false,
     }];
     for output in turn_outputs {
         if output.trim().is_empty() {

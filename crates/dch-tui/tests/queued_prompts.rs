@@ -218,14 +218,16 @@ fn an_idle_submit_with_no_driver_still_echoes_at_once() {
 
 #[test]
 fn the_section_rises_for_an_owed_prompt_and_stays_down_for_a_claim_hop() {
-    // The section is not the run's shadow. Prompts a resume owes wait
-    // with no run up, and hiding them behind a run gate would put them
-    // back in the invisible backlog the seeding exists to clear — so
-    // anything genuinely waiting raises the panel, idle or not. The
-    // one thing that does not raise it is the handoff window: a submit
-    // into a session at rest is the driver's next claim, one channel
-    // hop away, and its row stays hidden for that hop instead of
-    // flashing under the title — the claim takes it exactly as before.
+    // The section is not the run's shadow. A queued prompt can stand
+    // with no run up — the moment between one run settling and the
+    // driver claiming the next id — and hiding that behind a run gate
+    // would blank the panel exactly when the user looks to see what
+    // still stands, so anything genuinely waiting raises the panel,
+    // idle or not. The one thing that does not raise it is the
+    // handoff window: a submit into a session at rest is the driver's
+    // next claim, one channel hop away, and its row stays hidden for
+    // that hop instead of flashing under the title — the claim takes
+    // it exactly as before.
     let (mut app, kept) = app_with_state();
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     app.set_submit_tx(tx);
@@ -244,18 +246,68 @@ fn the_section_rises_for_an_owed_prompt_and_stays_down_for_a_claim_hop() {
         "the prompt itself is still in the queue for the driver's claim"
     );
 
-    // An owed prompt — seeded the way a resume seeds, not submitted —
-    // waits with no claim coming for it, and the panel carries it.
+    // A prompt still queued with no run up — the settle-to-claim
+    // moment above — has no claim coming this frame, and the panel
+    // carries it.
     std::mem::drop(rx);
     let (mut app, kept) = app_with_state();
     kept.queued
         .lock()
         .unwrap()
-        .push("owed by the resume".to_string());
+        .push("waiting with no run up".to_string());
     let rendered = rows(&mut app, 80, 24);
     assert!(
         !marker_rows(&rendered).is_empty(),
-        "an owed prompt waits visibly, run or not: {rendered:?}"
+        "a waiting prompt shows with no run up: {rendered:?}"
+    );
+}
+
+#[test]
+fn the_resume_s_empty_queue_takes_the_user_s_next_prompt_cleanly() {
+    // The kill-then-resume shape end to end, at the seam the mess
+    // lived in: the transcript carries the exit's echoed rows, the
+    // queue opens empty, and the first submit after the resume is the
+    // driver's next claim — one entry, one submission, nothing
+    // resurrected in front of it and nothing left waiting behind it.
+    let (mut app, kept) = app_with_state();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    app.set_submit_tx(tx);
+    let now = chrono::Utc::now();
+    app.seed_messages(vec![
+        TuiMessage::Error {
+            text: "Agent cancelled".to_string(),
+            timestamp: now,
+        },
+        TuiMessage::User {
+            text: "queued when the kill came".to_string(),
+            timestamp: now,
+            steered: false,
+            unsent: false,
+        },
+    ]);
+    assert!(
+        waiting(&kept).is_empty(),
+        "the resume opens with the queue the kill left: empty"
+    );
+
+    submit(&mut app, "the user's real next words");
+
+    let queued = waiting(&kept);
+    assert_eq!(
+        queued.len(),
+        1,
+        "the fresh submit is the queue's only entry: {queued:?}"
+    );
+    let id = queued.first().map(|(id, _)| *id).unwrap();
+    assert_eq!(
+        run_id(rx.try_recv().expect("the submit hands the driver a Run")),
+        id,
+        "the submission names the fresh prompt — no resurrected id rides ahead of it"
+    );
+    assert_eq!(
+        claim(&kept, id).as_deref(),
+        Some("the user's real next words"),
+        "the driver's claim takes exactly the user's fresh words"
     );
 }
 

@@ -698,7 +698,14 @@ pub(crate) fn list_sessions_in(base: &Path) -> Result<Vec<SessionSummary>, Sessi
                 .messages
                 .iter()
                 .filter(|message| {
-                    matches!(message, dch_tui::TuiMessage::User { steered: false, .. })
+                    matches!(
+                        message,
+                        dch_tui::TuiMessage::User {
+                            steered: false,
+                            unsent: false,
+                            ..
+                        }
+                    )
                 })
                 .count(),
             context_tokens: stored.tokens.context_tokens,
@@ -738,6 +745,7 @@ mod tests {
                 text: "fix the leak".to_string(),
                 timestamp: now,
                 steered: false,
+                unsent: false,
             },
             TuiMessage::Assistant {
                 blocks: vec![
@@ -828,16 +836,19 @@ mod tests {
                 text: "the first prompt".to_string(),
                 timestamp: chrono::Utc::now(),
                 steered: false,
+                unsent: false,
             },
             dch_tui::TuiMessage::User {
                 text: "a steer the run read".to_string(),
                 timestamp: chrono::Utc::now(),
                 steered: true,
+                unsent: false,
             },
             dch_tui::TuiMessage::User {
                 text: "the second prompt".to_string(),
                 timestamp: chrono::Utc::now(),
                 steered: false,
+                unsent: false,
             },
         ];
         crate::session::SessionSaver::with_base_dir(id, "m".to_string(), dir.path().to_path_buf())
@@ -963,6 +974,7 @@ mod tests {
             text: "second".to_string(),
             timestamp: chrono::Utc::now(),
             steered: false,
+            unsent: false,
         }];
         saver
             .save(&second, SessionTokens::default())

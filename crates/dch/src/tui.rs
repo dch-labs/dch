@@ -1109,8 +1109,8 @@ fn rescue_correction_text(state: &TuiObserverState, text: String) {
 /// own run just landed. Every correction still buffered at the exit
 /// drain is collected here rather than dropped with the channel: the
 /// queue it once could wait in dies with the process, and an
-/// unclaimed row is the one thing a resume can seed the waiting
-/// section from. Returns how many wordings were collected.
+/// unclaimed row is the one durable record the words can take.
+/// Returns how many wordings were collected.
 fn rescue_stranded_corrections(
     revived: &mut std::collections::VecDeque<Submission>,
     receiver: &mut mpsc::UnboundedReceiver<Submission>,
@@ -1138,8 +1138,8 @@ fn rescue_stranded_corrections(
 /// A correction buffered for the interrupted claim carries the newest
 /// wording — the words are the user's, and the newest ones win — so
 /// the exit collects it for the transcript echo: an unclaimed row is
-/// the one durable hand-back, and a resume seeds it back into the
-/// waiting section. Without one, the claimed prompt's own text was
+/// the one durable hand-back the words take. Without one, the claimed
+/// prompt's own text was
 /// already sent, and its row already stands in the transcript — the
 /// record the deliberate-stop rule reads — so nothing is collected.
 fn pull_corrected_wording(
@@ -1246,8 +1246,7 @@ fn apply_correction_cut(
 /// a moment before the flag rose — are collected by the exit drain
 /// into the transcript echo's shared buffer: their words left the
 /// queue with the claim, so an unclaimed row is the only durable
-/// hand-back, and a resume seeds each one back into the waiting
-/// section.
+/// hand-back they take.
 async fn drive_submissions(
     mut runner: dch_loop::Runner,
     mut receiver: mpsc::UnboundedReceiver<Submission>,
@@ -1626,6 +1625,7 @@ mod tests {
                 text: "turn one".to_string(),
                 timestamp: chrono::Utc::now(),
                 steered: false,
+                unsent: false,
             }],
             crate::session::SessionTokens::default(),
         );
@@ -2249,6 +2249,7 @@ mod tests {
                 text: "x".repeat(20_000),
                 timestamp: now,
                 steered: false,
+                unsent: false,
             };
             100
         ];
@@ -2256,6 +2257,7 @@ mod tests {
             text: "final turn".to_string(),
             timestamp: now,
             steered: false,
+            unsent: false,
         }];
         handle.send(bulky, crate::session::SessionTokens::default());
         handle.send(final_turn, crate::session::SessionTokens::default());
@@ -2282,6 +2284,7 @@ mod tests {
                 text: "the last turn".to_string(),
                 timestamp: chrono::Utc::now(),
                 steered: false,
+                unsent: false,
             }],
             crate::session::SessionTokens::default(),
         );
@@ -2413,6 +2416,7 @@ mod tests {
                 text: "late".to_string(),
                 timestamp: chrono::Utc::now(),
                 steered: false,
+                unsent: false,
             }],
             crate::session::SessionTokens::default(),
         );

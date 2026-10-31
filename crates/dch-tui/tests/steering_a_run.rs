@@ -1094,7 +1094,7 @@ fn a_pinned_steer_survives_the_exit_as_a_waiting_prompt() {
     // they are in neither the queue nor the transcript. The exit's
     // snapshot takes the pin with the waiting prompts — typed words no
     // turn spent — and the echo writes each its unclaimed row, the
-    // shape a resume seeds back into the waiting section.
+    // transcript's durable record of the words.
     let (mut app, kept, _rx, guidance) = app_steerable();
     running(&kept, true);
     guidance.live.store(true, Ordering::SeqCst);

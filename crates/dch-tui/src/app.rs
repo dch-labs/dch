@@ -2143,10 +2143,14 @@ impl TuiApp {
     /// the user typed would otherwise leave no trace anywhere — the
     /// interrupted claim keeps the row its send earned, but a prompt
     /// no turn took has nothing. The rows land after the stop's own
-    /// record, in queue order, so a resume reads the transcript's end
-    /// as exactly what still stood and seeds every one of them back
-    /// into the waiting section. The flush beside them is the same
-    /// unconditional persist the settle performs — an exit with no
+    /// record, in queue order, and stand as the durable record of
+    /// words no turn spent: the queue they waited in dies with the
+    /// process, and a resume reads the rows as history rather than
+    /// resurrecting them into a queue nothing can run. Each row is
+    /// stamped `unsent`, so the renderer dims it and the claim rules
+    /// leave it out — it is a record, not a delivery. The flush
+    /// beside them is the same unconditional persist the settle
+    /// performs — an exit with no
     /// run in flight skips the settle entirely, and these rows must
     /// outlive that exit too.
     pub fn echo_waiting_prompts_at_exit(&mut self, texts: Vec<String>) {
@@ -2158,6 +2162,7 @@ impl TuiApp {
                 text,
                 timestamp: chrono::Utc::now(),
                 steered: false,
+                unsent: true,
             });
         }
         self.flush_turn_end();
@@ -2173,8 +2178,8 @@ impl TuiApp {
     /// this runs once the driver task has settled, after the waiting
     /// prompts' own echo, so the transcript ends on everything the
     /// user typed that no turn spent. The flush beside the rows is
-    /// the same unconditional persist the settle performs; a resume
-    /// seeds each row back into the waiting section.
+    /// the same unconditional persist the settle performs; the rows
+    /// stand as the record, and a resume leaves them as history.
     pub fn echo_rescued_corrections_at_exit(&mut self) {
         let texts: Vec<String> = std::mem::take(
             &mut *self
@@ -2191,6 +2196,7 @@ impl TuiApp {
                 text,
                 timestamp: chrono::Utc::now(),
                 steered: false,
+                unsent: true,
             });
         }
         self.flush_turn_end();
@@ -2371,20 +2377,14 @@ impl TuiApp {
     /// the run loop starts; a mid-session call would splice history
     /// into a live conversation.
     pub fn seed_messages(&mut self, messages: Vec<TuiMessage>) {
-        // A transcript's error rows are its cancellation records: a
-        // user row that follows one is a claim after an interrupted
-        // run — the plan it stands over is owed work, and the claim
-        // must not retire it. The live drain's `plan_interrupted`
-        // flag, reconstructed from the transcript's own shape.
         let mut last_row_was_error = false;
         for message in &messages {
             let TuiMessage::Assistant { blocks, .. } = message else {
-                // A steered row is not a claim: it rode into a run
-                // already in flight, so the plan it lands beside kept
-                // standing in the live session and keeps standing
-                // here — the nudge's echo is this shape on every run
-                // that lands with work left.
-                if let TuiMessage::User { steered: false, .. } = message
+                if let TuiMessage::User {
+                    steered: false,
+                    unsent: false,
+                    ..
+                } = message
                     && !last_row_was_error
                 {
                     self.retire_finished_plan();
@@ -2393,7 +2393,6 @@ impl TuiApp {
                 continue;
             };
             last_row_was_error = false;
-            // fall through: an assistant row answered what stood.
             for block in blocks {
                 if let ContentBlock::Tool {
                     call_id,
@@ -2409,11 +2408,13 @@ impl TuiApp {
                     call_id,
                     success,
                     retained_input,
+                    output_preview,
                     ..
                 } = block
                     && name == "TodoWrite"
                     && *success
-                    && let Some(rows) = crate::todo_view::parse_submission(retained_input)
+                    && let Some(rows) = crate::todo_view::parse_rendered(output_preview)
+                        .or_else(|| crate::todo_view::parse_submission(retained_input))
                 {
                     let changes = crate::todo_view::status_changes(&rows, &self.latest_todos);
                     self.todo_changes.insert(call_id.clone(), changes.clone());
@@ -2425,43 +2426,6 @@ impl TuiApp {
             }
         }
         self.conversation.extend(messages);
-        // A transcript that ends on bare, unanswered claims is work
-        // the exit left standing — the run in flight's prompt caught
-        // before it could record anything, the waiting ones written
-        // there by the exit itself because no turn ever spent them.
-        // Each waits again in the section, in the order they were
-        // typed. A claim followed by its cancellation record is a
-        // deliberate stop and owes nothing: the user cancelled that
-        // prompt, and resurrecting it into the queue would be a
-        // phantom they never sent. A claim an assistant row answered
-        // is done the same way.
-        let owed: Vec<String> = self
-            .conversation
-            .iter()
-            .rev()
-            .map_while(|message| match message {
-                TuiMessage::User {
-                    text,
-                    steered: false,
-                    ..
-                } => Some(text.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .filter(|text| !text.trim().is_empty())
-            .collect();
-        if !owed.is_empty() {
-            let mut queue = self
-                .state
-                .queued
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for text in owed {
-                queue.push(text);
-            }
-        }
         self.scroll_offset = 0;
         self.stick = Stick::Follow;
     }
@@ -2747,10 +2711,6 @@ impl TuiApp {
         {
             tracing::trace!("question reply channel already closed");
         }
-        // The entry behind the answered one slides into its place and is
-        // shown by the same index; answering the batch's last question
-        // leaves the view past the end, so it steps back onto what is
-        // left.
         self.clamp_question_view();
     }
 
@@ -2908,9 +2868,6 @@ impl TuiApp {
             return;
         }
         self.question_view = if forward {
-            // Past the batch's last question comes its first: the walk is
-            // a circle, so the question answered last is one press from
-            // the question answered first.
             let next = self.question_view.saturating_add(1);
             if next >= count { 0 } else { next }
         } else if self.question_view == 0 {
@@ -4534,6 +4491,7 @@ impl TuiApp {
                 text,
                 timestamp: chrono::Utc::now(),
                 steered: false,
+                unsent: false,
             });
         }
         self.scroll_to_bottom();
@@ -6880,6 +6838,7 @@ impl TuiApp {
                         text,
                         timestamp: now,
                         steered,
+                        unsent: false,
                     });
                     if !steered && !self.plan_interrupted {
                         self.retire_finished_plan();
@@ -7022,6 +6981,22 @@ impl TuiApp {
             }
             *previous_was_user = Some(is_user);
             match message {
+                TuiMessage::User {
+                    text, unsent: true, ..
+                } => {
+                    let tint_start = lines.len();
+                    lines.push(Line::default());
+                    let mark_row = lines.len();
+                    for segment in text.split('\n') {
+                        lines.extend(plain_wrapped_lines(
+                            segment,
+                            usize::from(width),
+                            self.theme.ui.dim,
+                        ));
+                    }
+                    lines.push(Line::default());
+                    user_turns.push((tint_start, lines.len(), mark_row));
+                }
                 TuiMessage::User { text, .. } => {
                     let tint_start = lines.len();
                     lines.push(Line::default());
@@ -8597,19 +8572,51 @@ struct InputView {
 }
 
 /// The facts [`TuiApp::render`] resolves before the frame's rows are
-/// split, gathered so the constraint build reads as one act: which
-/// optional sections stand this frame, and the heights the fixed
-/// furniture carries.
+/// split.
+///
+/// Gathered so the constraint build reads as one act: which optional
+/// sections stand this frame, and the heights the fixed furniture
+/// carries.
 #[derive(Clone, Copy)]
 struct FrameLayout {
+    /// The frame's whole screen area, borders included.
+    ///
+    /// Every constraint the layout resolves is a share of this rect,
+    /// and the split hands the same rect back as the chunks' common
+    /// parent — the one geometry the whole frame is cut from.
     area: Rect,
+
+    /// How many rows the composer claims this frame.
+    ///
+    /// Fixed furniture, resolved before the split: the conversation
+    /// pane takes whatever this leaves behind it, so a tall paste in
+    /// the input box is paid for out of the transcript's rows and not
+    /// out of the sections above.
     composer_height: u16,
-    /// Where the pulse strip takes its row — above the conversation
-    /// or on the spacer beside the composer.
+
+    /// Where the activity strip takes its row.
+    ///
+    /// The config's placement for the breathing bar, carried into the
+    /// layout because a strip at the terminal's top row is paid for
+    /// out of the conversation pane's height while one on the
+    /// composer's spacer costs nothing — the constraint build has to
+    /// know which before it splits.
     strip_position: StripPosition,
-    /// The question sheet's page the overlay answers, when the sheet
-    /// stands: the count ahead, as the overlay's own footer reads it.
+
+    /// The question sheet's page the overlay answers, when one stands.
+    ///
+    /// `None` while no ask owns the screen and the layout reserves
+    /// nothing for a sheet; `Some(page)` names the count-ahead page
+    /// the overlay's own footer reads, so the sheet's reserved height
+    /// matches the page actually shown rather than a generic one.
     question_page: Option<usize>,
+
+    /// Which optional sections stand this frame.
+    ///
+    /// The queue, plan, and place badges are each a maybe-row: this
+    /// bitset records which of them earned one, so the constraint
+    /// build reserves their rows in one act instead of each section
+    /// measuring itself against the transcript's pane.
     sections: Sections,
 }
 
@@ -8704,9 +8711,6 @@ pub enum CopyAnswer {
 fn copy_answer_notice(answer: CopyAnswer) -> &'static str {
     match answer {
         CopyAnswer::Verified => "selection copied",
-        // An in-flight transport chain owes a verdict; saying anything
-        // now would flash a claim the next frame replaces — the
-        // verdict is the only wording that holds the row.
         CopyAnswer::Unconfirmed => "",
         CopyAnswer::Failed => "copy failed — set display.copy_command",
     }
@@ -10341,8 +10345,6 @@ fn pulse_worm(began: Instant, now: Instant, width: usize) -> String {
     let move_span = quarter.saturating_mul(3);
     let elapsed = u64::try_from(now.duration_since(began).as_millis()).unwrap_or(0);
     let mark = elapsed.rem_euclid(period);
-    // A widening cast: `usize` has no `From` into `u128`, and this
-    // one can never truncate.
     let wide_width = width as u128;
     let (head_n, den) = worm_numer(mark, move_span);
     let (tail_n, _) = worm_numer(mark.saturating_sub(quarter), move_span);
@@ -10382,8 +10384,6 @@ fn pulse_worm_large(began: Instant, now: Instant, width: usize) -> String {
     let traversal = period.saturating_mul(2);
     let elapsed = u64::try_from(now.duration_since(began).as_millis()).unwrap_or(0);
     let mark = elapsed.rem_euclid(traversal);
-    // A widening cast: `usize` has no `From` into `u128`, and this
-    // one can never truncate.
     let wide_width = width as u128;
     let (head_n, den) = worm_large_numer(mark, period);
     let (tail_n, _) = worm_large_numer(mark.saturating_sub(period), period);
@@ -10709,6 +10709,7 @@ mod tests {
             text: "after the block".to_string(),
             timestamp: chrono::Utc::now(),
             steered: false,
+            unsent: false,
         });
         subject.expanded_tools.insert("call_todo".to_string());
         subject.auto_expanded_todo = Some("call_todo".to_string());
@@ -10782,6 +10783,7 @@ mod tests {
             text: "after the block".to_string(),
             timestamp: chrono::Utc::now(),
             steered: false,
+            unsent: false,
         });
         subject.expanded_tools.insert("call_todo".to_string());
         subject.auto_expanded_todo = Some("call_todo".to_string());
@@ -10925,6 +10927,7 @@ mod tests {
                 text: format!("prompt {turn}"),
                 timestamp: now,
                 steered: false,
+                unsent: false,
             });
             subject.push_message(TuiMessage::Assistant {
                 blocks: vec![ContentBlock::Text {
@@ -10953,6 +10956,7 @@ mod tests {
             text: "next".to_string(),
             timestamp: now,
             steered: false,
+            unsent: false,
         });
         terminal.draw(|frame| subject.render(frame)).unwrap();
         assert_eq!(
@@ -10987,6 +10991,7 @@ mod tests {
             text: "do it".to_string(),
             timestamp: now,
             steered: false,
+            unsent: false,
         });
         subject.push_message(TuiMessage::Assistant {
             blocks: vec![
@@ -11010,6 +11015,7 @@ mod tests {
             text: "again".to_string(),
             timestamp: now,
             steered: false,
+            unsent: false,
         });
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
@@ -11044,6 +11050,7 @@ mod tests {
                 text: format!("p{turn}"),
                 timestamp: now,
                 steered: false,
+                unsent: false,
             });
         }
         let mut terminal =
@@ -11288,6 +11295,7 @@ mod tests {
             text: "after the block".to_string(),
             timestamp: chrono::Utc::now(),
             steered: false,
+            unsent: false,
         });
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24)).expect("terminal");
@@ -11492,6 +11500,7 @@ mod tests {
             text: "after the notice".to_string(),
             timestamp: chrono::Utc::now(),
             steered: false,
+            unsent: false,
         });
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24)).expect("terminal");
@@ -11595,6 +11604,7 @@ mod tests {
                     text: "a turn of a few wrapped lines".to_string(),
                     timestamp: chrono::Utc::now(),
                     steered: false,
+                    unsent: false,
                 });
             }
         }
@@ -11671,6 +11681,7 @@ mod tests {
             text: "go check the files".to_string(),
             timestamp: chrono::Utc::now(),
             steered: false,
+            unsent: false,
         });
         subject
             .active_tools()
@@ -13220,6 +13231,7 @@ mod tests {
             text: "do a thing".to_string(),
             timestamp: chrono::Utc::now(),
             steered: false,
+            unsent: false,
         });
         app.state
             .graduations

@@ -287,8 +287,8 @@ pub(crate) fn parse_submission(input_json: &str) -> Option<Vec<TodoRow>> {
 /// and reads back as its shortest prefix. This is the read a caller
 /// takes first where both are at hand — the request says what was
 /// asked, the render what the tool settled for — and
-/// [`parse_submission`] answers only where this one cannot, a resumed
-/// transcript keeping the request and not the render.
+/// [`parse_submission`] answers only where this one cannot, a
+/// transcript block that kept no render of its own.
 pub(crate) fn parse_rendered(output: &str) -> Option<Vec<TodoRow>> {
     if !output.contains("# Task List") {
         return None;

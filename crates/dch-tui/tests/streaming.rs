@@ -654,6 +654,7 @@ fn a_detached_view_stays_anchored_when_the_layout_shrinks() {
             text: format!("line{i}"),
             timestamp: chrono::Utc::now(),
             steered: false,
+            unsent: false,
         });
     }
     seed(&app, &paras(1, 9));

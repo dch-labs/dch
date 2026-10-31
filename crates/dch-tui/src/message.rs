@@ -45,6 +45,18 @@ pub enum TuiMessage {
         /// field existed reading as plain claims.
         #[serde(default)]
         steered: bool,
+
+        /// Whether no turn ever took these words.
+        ///
+        /// The exit's echo writes a queued prompt — words the process
+        /// dropped before any run claimed them — into the transcript so
+        /// they leave a trace; this flag carries the other half of that
+        /// fact: the model never read them, the row is a record rather
+        /// than a delivered message, and the renderer dims it to say
+        /// so. `#[serde(default)]` keeps transcripts written before the
+        /// field existed reading as delivered claims.
+        #[serde(default)]
+        unsent: bool,
     },
 
     /// A completed assistant reply.
@@ -350,6 +362,7 @@ mod tests {
                 text: "hi\nthere".to_string(),
                 timestamp: now,
                 steered: false,
+                unsent: false,
             },
             TuiMessage::Assistant {
                 blocks: vec![
@@ -404,6 +417,19 @@ mod tests {
                     ContentBlock::Tool { call_id, retained_input, .. }
                         if call_id.is_empty() && retained_input.is_empty())))),
             "a tool block without a call id or retained input defaults both empty"
+        );
+    }
+
+    #[test]
+    fn a_user_row_without_the_unsent_field_reads_as_delivered() {
+        let old = r#"[{"role":"user","text":"queued when the exit came","timestamp":"2026-09-16T12:00:00Z","steered":false}]"#;
+        let parsed: Vec<TuiMessage> =
+            serde_json::from_str(old).expect("sessions recorded before the flag parse");
+        assert!(
+            parsed
+                .first()
+                .is_some_and(|message| matches!(message, TuiMessage::User { unsent: false, .. })),
+            "a user row saved before the flag existed is a delivered claim"
         );
     }
 

@@ -640,8 +640,8 @@ pub struct TuiObserverState {
     /// breaks — words that left the queue with the claim and would
     /// otherwise die with the channel — and the exit path drains the
     /// buffer once the driver task has settled, writing each text
-    /// back as an unclaimed transcript row a resume seeds into the
-    /// waiting section.
+    /// back as an unclaimed transcript row: the durable record of
+    /// words the channel carried but no turn spent.
     pub rescued_corrections: Arc<Mutex<Vec<String>>>,
 
     /// Token usage counters, per-turn and cumulative.
