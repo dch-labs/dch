@@ -1661,6 +1661,16 @@ pub struct TuiApp {
     /// and never claims, so a plan keeps updating through its own run.
     latest_todos: Vec<todo_view::TodoRow>,
 
+    /// The plan generation `latest_todos` graduated under.
+    ///
+    /// Snapshotted from the shared state's
+    /// [`plan_generation`](crate::observer::TuiObserverState::plan_generation)
+    /// at every `TodoWrite` graduation that replaces the rows, so the
+    /// retirement filter can tell a retirement newer than the rows —
+    /// which may take a pending row — from a stale one a reborn entry
+    /// outlived, whatever order the frame drains the two halves in.
+    todo_generation: u64,
+
     /// The rows each todo update changed, by the update's call id.
     ///
     /// The conversation's per-update block accents exactly these
@@ -2038,6 +2048,7 @@ impl TuiApp {
             session_id: None,
             session_id_span: std::cell::Cell::new(None),
             latest_todos: Vec::new(),
+            todo_generation: 0,
             todo_changes: HashMap::new(),
             todo_block_ranges: Vec::new(),
             todo_section_changes: HashMap::new(),
@@ -2471,6 +2482,10 @@ impl TuiApp {
                     self.todo_changes.insert(call_id.clone(), changes.clone());
                     self.todo_section_changes = changes;
                     self.latest_todos = rows;
+                    self.todo_generation = self
+                        .state
+                        .todo_graduation_generation
+                        .load(std::sync::atomic::Ordering::SeqCst);
                     self.expanded_tools.insert(call_id.clone());
                     self.auto_expanded_todo = Some(call_id.clone());
                 }
@@ -2488,6 +2503,17 @@ impl TuiApp {
     #[must_use]
     pub fn input(&self) -> &str {
         self.input.text()
+    }
+
+    /// Stamp the plan generation a todo graduation enqueues under.
+    ///
+    /// The observer's own tool-result path takes the stamp as each
+    /// accepted `TodoWrite` result enters the graduation buffer; a
+    /// graduation enqueued through [`graduations`](Self::graduations)
+    /// directly takes it here, so the rows it lands carry the same age
+    /// the retirement filter compares against.
+    pub fn note_todo_graduated(&self) {
+        self.state.note_todo_plan_graduated();
     }
 
     /// The scroll offset in lines above the bottom of the view.
@@ -6954,6 +6980,10 @@ impl TuiApp {
                             .insert(result.call_id.clone(), changes.clone());
                         self.todo_section_changes = changes;
                         self.latest_todos = rows;
+                        self.todo_generation = self
+                            .state
+                            .todo_graduation_generation
+                            .load(std::sync::atomic::Ordering::SeqCst);
                         self.expanded_tools.insert(result.call_id.clone());
                         todo_armed = Some(result.call_id.clone());
                     }
@@ -7001,8 +7031,12 @@ impl TuiApp {
         let retired = take_locked(&self.state.retired_plan_entries);
         if !retired.is_empty() {
             self.latest_todos.retain(|row| {
-                !retired.contains(&(row.id.clone(), row.subject.clone()))
-                    || !matches!(row.status, todo_view::TodoStatus::Pending)
+                !matches!(row.status, todo_view::TodoStatus::Pending)
+                    || !retired.iter().any(|entry| {
+                        entry.id == row.id
+                            && entry.subject == row.subject
+                            && entry.generation > self.todo_generation
+                    })
             });
         }
         if turn_ended && let Some(hook) = &self.turn_end_hook {
@@ -8148,7 +8182,11 @@ impl TuiApp {
         // answers from the right. The notice wins the columns it
         // needs and the place keeps the rest; nothing wraps, because
         // the row is one line and the shorter text clips before the
-        // two can collide.
+        // two can collide. The corner a short row cannot buy out of is
+        // a notice that would take the whole row: the place's share
+        // floors at zero there and renders nothing, so the row belongs
+        // entirely to the notice rather than painting one place cell
+        // underneath it.
         let notice = self.notice_text();
         let notice_len = notice
             .as_ref()
@@ -8167,7 +8205,7 @@ impl TuiApp {
                     .min(area.right().saturating_sub(1)),
                 y: area.y,
                 height: 1,
-                width: row_width.saturating_sub(notice_len).max(1),
+                width: row_width.saturating_sub(notice_len),
             },
         );
         if let Some(notice) = notice {

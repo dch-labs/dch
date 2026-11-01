@@ -532,7 +532,8 @@ fn folded_hint(rows: &[TodoRow], colors: &TodoColors) -> Line<'static> {
 /// cap spends the conversation's rows on the tasks nearest the top
 /// of the plan and says exactly what it cut. A single task whose
 /// wording wraps past the whole budget keeps its head while the
-/// budget pays for even one row; a budget that pays for none names
+/// budget pays for even one row; a budget that pays for none — where
+/// the cut is more than the ellipsis row itself could carry — names
 /// every task through the ellipsis rather than showing a count that
 /// disagrees with the rows. The body may reach `body_cap + 1` rows:
 /// the ellipsis line takes one row beyond the cap, and when the
@@ -858,6 +859,48 @@ Summary: 9 pending, 1 in progress, 2 completed\n\n\
             lines.len(),
             3,
             "the section is air, badge, and the honest count"
+        );
+    }
+
+    #[test]
+    fn one_one_line_task_at_a_zero_budget_rides_instead_of_ellipsing() {
+        // The zero-budget sentence's carve-out: a single one-line
+        // entry is a cut the ellipsis row itself could carry, so the
+        // entry rides that row and the section names the task whole —
+        // no count stands in for the one thing the section could have
+        // shown. The multi-entry zero budget above is the case the
+        // sentence still covers.
+        let rows: Vec<TodoRow> = (0..1)
+            .map(|index| TodoRow {
+                id: format!("t{index}"),
+                subject: format!("task {index}"),
+                status: TodoStatus::Pending,
+            })
+            .collect();
+        let colors = TodoColors {
+            dim: ratatui::style::Color::Reset,
+            accent: ratatui::style::Color::Reset,
+            moved: ratatui::style::Color::Reset,
+            badge_fill: ratatui::style::Color::Reset,
+            badge_letters: ratatui::style::Color::Reset,
+        };
+        let lines = section_lines(&rows, &HashMap::new(), &colors, 60, 0, None);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+        assert!(
+            text.iter().any(|line| line.contains("task 0")),
+            "the lone entry rides the row the ellipsis would have spent: {text:?}"
+        );
+        assert!(
+            !text.iter().any(|line| line.contains("more (ctrl+t")),
+            "no ellipsis stands in for the one thing the section could show: {text:?}"
         );
     }
 

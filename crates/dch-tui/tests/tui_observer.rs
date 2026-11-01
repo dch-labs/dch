@@ -181,6 +181,40 @@ fn a_repeated_tool_failure_keeps_the_conversation_free_of_retry_rows() {
 }
 
 #[test]
+fn an_accepted_todo_graduation_stamps_the_generation_it_enqueues_under() {
+    // The age the retirement filter compares against is recorded at
+    // the enqueue, not at the frame's drain: a retirement published
+    // before the graduation reads as the older change, and one
+    // published after as the newer — the order a frame drains the two
+    // in cannot reverse that. A refused TodoWrite result and a
+    // non-plan tool graduate no plan and stamp nothing.
+    let (observer, kept) = state_and_observer();
+    observer.finish_tool("call-1", "Read", false, Duration::from_millis(1));
+    assert_eq!(
+        kept.todo_graduation_generation
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a non-plan tool graduates no plan, so no stamp moves"
+    );
+    kept.publish_claim_retirements(&[("idea".to_string(), "the filed idea".to_string())]);
+    observer.finish_tool("call-2", "TodoWrite", false, Duration::from_millis(1));
+    assert_eq!(
+        kept.todo_graduation_generation
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the graduation stamps the generation standing at its enqueue — \
+         the publication before it is the older change"
+    );
+    observer.finish_tool("call-3", "TodoWrite", true, Duration::from_millis(1));
+    assert_eq!(
+        kept.todo_graduation_generation
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a refused TodoWrite result graduates no plan"
+    );
+}
+
+#[test]
 fn thinking_deltas_append_in_arrival_order_and_wake_the_render() {
     let (observer, kept) = state_and_observer();
     let listener = kept.render_notify.listen();

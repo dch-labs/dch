@@ -9780,6 +9780,7 @@ fn todo_graduation(app: &TuiApp, call_id: &str, submission: &str) {
 /// Feed one `TodoWrite` graduation carrying the tool's rendered result,
 /// the enforced truth a rung-law adjustment produces.
 fn todo_graduation_with_output(app: &TuiApp, call_id: &str, submission: &str, output: &str) {
+    app.note_todo_graduated();
     app.graduations()
         .lock()
         .unwrap()
@@ -12623,12 +12624,10 @@ fn a_published_retirement_drops_only_the_pending_rows() {
         ]}"#,
     );
     {
-        let mut retired = kept
-            .retired_plan_entries
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        retired.push(("idea".to_string(), "the filed idea".to_string()));
-        retired.push(("done".to_string(), "the finished work".to_string()));
+        kept.publish_claim_retirements(&[
+            ("idea".to_string(), "the filed idea".to_string()),
+            ("done".to_string(), "the finished work".to_string()),
+        ]);
     }
     let terminal = render_to_buffer(&mut app, 80, 30);
     let rows = row_texts(&terminal);
@@ -12673,13 +12672,7 @@ fn a_reborn_id_survives_its_stale_retirement() {
         ]}"#,
     );
     let _first = render_to_buffer(&mut app, 80, 30);
-    {
-        let mut retired = kept
-            .retired_plan_entries
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        retired.push(("idea".to_string(), "the filed idea".to_string()));
-    }
+    kept.publish_claim_retirements(&[("idea".to_string(), "the filed idea".to_string())]);
     // The rebirth: a later update re-uses the id for a different task,
     // and its graduation lands in the same frame as the retirement.
     todo_graduation(
@@ -12706,5 +12699,80 @@ fn a_reborn_id_survives_its_stale_retirement() {
         !rows.iter().any(|row| row.contains("the filed idea")),
         "the retired entry leaves the screen whole — the prior block stands \
          collapsed, the section shows the plan the store holds: {rows:?}"
+    );
+}
+
+#[test]
+fn a_reborn_row_of_the_same_id_and_subject_survives_its_stale_retirement() {
+    // The remaining corner of id re-use: a later plan re-adds the
+    // retired entry's id *and* subject both, so the pair alone cannot
+    // tell the two entries apart. The publication carries the plan
+    // generation it was made at, and a graduation that lands at or
+    // after that generation reads the retirement as stale — one frame
+    // draining the rebirth and the retirement together still leaves
+    // the reborn row standing, in step with the runner's own store.
+    let (mut app, kept) = app_with_state();
+    todo_graduation(
+        &app,
+        "call-1",
+        r#"{"todos":[
+            {"id":"idea","subject":"the filed idea","status":"pending"}
+        ]}"#,
+    );
+    let _first = render_to_buffer(&mut app, 80, 30);
+    kept.publish_claim_retirements(&[("idea".to_string(), "the filed idea".to_string())]);
+    // The rebirth: the next run files the very same task again, and
+    // its graduation lands in the same frame as the stale retirement.
+    todo_graduation(
+        &app,
+        "call-2",
+        r#"{"todos":[
+            {"id":"idea","subject":"the filed idea","status":"pending"},
+            {"id":"owed","subject":"the owed work","status":"in_progress"}
+        ]}"#,
+    );
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&terminal);
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("\u{2610} the filed idea")),
+        "the reborn entry stands — its id and subject were retired, its \
+         graduation was not: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("\u{25d0} the owed work")),
+        "the owed row stands untouched: {rows:?}"
+    );
+}
+
+#[test]
+fn a_notice_that_fills_the_row_leaves_the_place_no_cell() {
+    // The place row's corner: a notice whose column budget equals the
+    // row's width leaves the place nothing to name where the session
+    // stands — the place's share floors at zero cells and renders
+    // nothing, rather than painting its leading path character into
+    // the one column that would sit left of the notice's span. The
+    // notice stands whole, right-aligned, with the row's first cell
+    // blank beside it.
+    let (mut app, _kept) = app_with_state();
+    app.set_working_dir(std::path::Path::new("/home/dch/repos/dch"));
+    let notice = "THE NOTICE FILLS THE ROW IT SITS ON";
+    assert_eq!(
+        notice.chars().count(),
+        35,
+        "the fixture's width is the contract: one cell short of the row"
+    );
+    app.post_notice(notice.to_string());
+    let terminal = render_to_buffer(&mut app, 40, 26);
+    let rows = row_texts(&terminal);
+    let notice_row = rows
+        .iter()
+        .find(|row| row.contains(notice))
+        .expect("the notice stands whole on the row");
+    assert!(
+        !notice_row.trim_start().starts_with('/'),
+        "the place yields the row's last free cell — no path character \
+         peeks left of the notice: {notice_row:?}"
     );
 }

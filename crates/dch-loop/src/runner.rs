@@ -163,10 +163,29 @@ pub struct Runner {
 
     /// The plan entries the last claim retired, awaiting the host.
     ///
-    /// Cleared and refilled at every claim past the first, and handed
-    /// to the host through [`take_claim_retirements`](Self::take_claim_retirements)
-    /// so the display and every plan reader can publish the change.
+    /// Cleared and refilled at every claim past the first that finds
+    /// unfinished entries, and handed to the host through
+    /// [`take_claim_retirements`](Self::take_claim_retirements)
+    /// so the display and every plan reader can publish the change. A
+    /// claim that finds every entry completed clears the store without
+    /// touching this batch — there is nothing left to retire, and a
+    /// host that already published the previous batch owes no second
+    /// publication for the same plan.
     claim_retirements: Vec<dch_tools::TodoEntry>,
+
+    /// The host's synchronous eye on the claim's retirements.
+    ///
+    /// Set by
+    /// [`with_retirement_sink`](RunnerBuilder::with_retirement_sink);
+    /// when present it receives the batch the moment a claim retires
+    /// entries — before the run the claim precedes has asked the
+    /// provider anything — so a host whose display shows the plan can
+    /// publish the retirement while that run is still in flight rather
+    /// than after it resolves. The batch still accumulates for
+    /// [`take_claim_retirements`](Self::take_claim_retirements); a
+    /// host that registered a sink reads the change here and leaves
+    /// the polling accessor to the hosts that never registered one.
+    retirement_sink: Option<RetirementSink>,
 }
 
 impl Runner {
@@ -199,6 +218,7 @@ impl Runner {
             history: Vec::new(),
             permission_resolver: None,
             todo_nudge: None,
+            retirement_sink: None,
         }
     }
 
@@ -280,6 +300,11 @@ impl Runner {
                 });
             }
         }
+        if let Some(sink) = &self.retirement_sink
+            && !self.claim_retirements.is_empty()
+        {
+            sink(&self.claim_retirements);
+        }
         self.claimed_once = true;
         self.inner.run(input, run_config).await
     }
@@ -293,7 +318,11 @@ impl Runner {
     /// until the next `TodoWrite` lands. Each claim's batch is
     /// replaced by the next: a host that polls after every run never
     /// misses one, and a host that never polls loses only the record,
-    /// never the retirement itself.
+    /// never the retirement itself. A host that needs the batch the
+    /// moment the claim makes it — while the run is still in flight —
+    /// registers
+    /// [`with_retirement_sink`](RunnerBuilder::with_retirement_sink)
+    /// instead and reads it there.
     #[must_use]
     pub fn take_claim_retirements(&mut self) -> Vec<dch_tools::TodoEntry> {
         std::mem::take(&mut self.claim_retirements)
@@ -572,6 +601,14 @@ pub struct RunnerBuilder<'a> {
     /// before the plan is read in both — so a host that begins
     /// leaving mid-session declines without unwinding anything.
     todo_nudge: Option<TodoNudgeRegistration>,
+
+    /// The host's claim-edge eye on plan retirements.
+    ///
+    /// Set by [`with_retirement_sink`](Self::with_retirement_sink);
+    /// `None` on a host that polls
+    /// [`take_claim_retirements`](Runner::take_claim_retirements)
+    /// after its runs instead.
+    retirement_sink: Option<RetirementSink>,
 }
 
 /// The host-supplied halves of the todo nudge.
@@ -585,6 +622,14 @@ type TodoNudgeRegistration = (
     Arc<dyn Fn(String) + Send + Sync>,
     Arc<dyn Fn() -> bool + Send + Sync>,
 );
+
+/// The host's claim-edge publication for plan retirements.
+///
+/// Receives the entries a claim retired, the whole batch at once, at
+/// the claim edge itself — the shape
+/// [`with_retirement_sink`](RunnerBuilder::with_retirement_sink)
+/// registers and the runner keeps beside its own polling accessor.
+type RetirementSink = Arc<dyn Fn(&[dch_tools::TodoEntry]) + Send + Sync>;
 
 impl RunnerBuilder<'_> {
     /// Register a lifecycle observer.
@@ -685,6 +730,30 @@ impl RunnerBuilder<'_> {
         may_extend: impl Fn() -> bool + Send + Sync + 'static,
     ) -> Self {
         self.todo_nudge = Some((Arc::new(echo), Arc::new(may_extend)));
+        self
+    }
+
+    /// Publish each claim's plan retirements the moment the claim
+    /// makes them.
+    ///
+    /// The sink receives the entries a claim past the first retires —
+    /// never-started plan entries dropped so the run inherits owed
+    /// work and history, not abandoned ideas — at the claim edge
+    /// itself: the call happens before the run the claim precedes has
+    /// sent the provider anything, so a host whose display renders the
+    /// plan can drop the retired rows while that run is still in
+    /// flight instead of holding them until the run resolves. Spared
+    /// claims — a runner's first, and any that retires nothing — call
+    /// nothing. The batch still lands in
+    /// [`take_claim_retirements`](Runner::take_claim_retirements);
+    /// a host that registers a sink reads the change here and leaves
+    /// the polling accessor to the hosts that never registered one.
+    #[must_use]
+    pub fn with_retirement_sink(
+        mut self,
+        sink: impl Fn(&[dch_tools::TodoEntry]) + Send + Sync + 'static,
+    ) -> Self {
+        self.retirement_sink = Some(Arc::new(sink));
         self
     }
 
@@ -820,6 +889,7 @@ impl RunnerBuilder<'_> {
             run_config,
             claimed_once: false,
             claim_retirements: Vec::new(),
+            retirement_sink: self.retirement_sink,
         })
     }
 }
@@ -2795,6 +2865,57 @@ mod tests {
         assert!(
             runner.take_claim_retirements().is_empty(),
             "the take drains the batch — a polling host never re-reads a claim"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retirement_sink_hears_the_batch_at_the_claim_itself() {
+        // The claim edge, not the run's landing: the sink owes the host
+        // the batch while the run it precedes is still in flight, and
+        // the strictest offline proof of that is a run whose provider
+        // refuses the connection outright — the run never answers
+        // anything, yet the retirement the claim made has already been
+        // published. The spared first claim calls nothing, and the
+        // polling accessor still holds the batch a sink-registered
+        // host leaves for the ones that never registered.
+        let mut config = offline_config();
+        config.api.base_url = "http://127.0.0.1:1".to_string();
+        let dir = TempDir::new().expect("tempdir");
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_seen = Arc::clone(&seen);
+        let mut runner = Runner::builder(&config, dir.path())
+            .with_retirement_sink(move |entries| {
+                let mut seen = sink_seen.lock().expect("sink record lock");
+                for entry in entries {
+                    seen.push(entry.id.clone());
+                }
+            })
+            .build()
+            .await
+            .expect("constructs");
+        {
+            let mut store = runner.context.todos.lock().expect("todos lock");
+            store.push(standing_entry("idea", dch_tools::TodoStatus::Pending));
+        }
+        drop(runner.run("first prompt").await);
+        assert!(
+            seen.lock().expect("sink record lock").is_empty(),
+            "the spared first claim retires nothing, so the sink hears nothing"
+        );
+        drop(runner.run("second prompt").await);
+        assert_eq!(
+            *seen.lock().expect("sink record lock"),
+            ["idea".to_string()],
+            "the claim published its retirement before the refused run resolved anything"
+        );
+        assert_eq!(
+            runner
+                .take_claim_retirements()
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            ["idea"],
+            "the batch still waits in the polling accessor — the sink is a second leg, not a replacement"
         );
     }
 

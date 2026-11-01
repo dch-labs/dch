@@ -1941,11 +1941,13 @@ fn a_submit_after_the_driver_is_gone_names_the_driver() {
 }
 
 #[test]
-fn the_chord_that_enters_also_leaves() {
-    // Ctrl+Q is a toggle: the press that hands the section the keys is
-    // the press that takes them back, mirroring Esc — a key that opens
-    // a door it then refuses to close reads broken, and the user who
-    // entered on the chord reaches for the same chord to leave.
+fn the_leave_chord_hands_the_keys_back_as_esc_does() {
+    // The chords as they stand: Ctrl+W enters and steps inside, Esc
+    // and Ctrl+Q both leave, and Ctrl+Q alone — pressed from the
+    // composer — folds the section. Leaving must hand the keyboard
+    // back, so the chord that focuses is not a trap: the keys return
+    // to the composer, and the waiting prompt stays exactly where it
+    // was.
     let (mut app, _kept, _rx) = app_with_waiting(&["first waiting"]);
     let marker_fg = |app: &mut TuiApp| {
         let painted = painted_rows(app, 80, 24);
@@ -1962,21 +1964,21 @@ fn the_chord_that_enters_also_leaves() {
     assert_eq!(
         marker_fg(&mut app),
         app.theme.ui.primary,
-        "the chord hands the section the keys — the marker lights"
+        "the enter chord hands the section the keys — the marker lights"
     );
 
     press(&mut app, &ctrl(KeyCode::Char('q')));
     assert_eq!(
         marker_fg(&mut app),
         plain,
-        "the same chord takes them back — the marker settles to dim, \u{2026}"
+        "the leave chord takes the keys back — the marker settles to dim, \u{2026}"
     );
 
-    // And back in again: the toggle keeps working in both directions.
+    // And back in again: the chords keep working in both directions.
     press(&mut app, &ctrl(KeyCode::Char('w')));
     assert_eq!(
         marker_fg(&mut app),
         app.theme.ui.primary,
-        "the chord re-enters — a toggle, not a one-way door"
+        "the enter chord re-enters — not a one-way door"
     );
 }
