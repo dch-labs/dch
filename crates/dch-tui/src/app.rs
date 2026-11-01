@@ -6998,10 +6998,11 @@ impl TuiApp {
                 self.post_notice(wording.to_string());
             }
         }
-        let retired = take_locked(&self.state.retired_plan_ids);
+        let retired = take_locked(&self.state.retired_plan_entries);
         if !retired.is_empty() {
             self.latest_todos.retain(|row| {
-                !retired.contains(&row.id) || !matches!(row.status, todo_view::TodoStatus::Pending)
+                !retired.contains(&(row.id.clone(), row.subject.clone()))
+                    || !matches!(row.status, todo_view::TodoStatus::Pending)
             });
         }
         if turn_ended && let Some(hook) = &self.turn_end_hook {

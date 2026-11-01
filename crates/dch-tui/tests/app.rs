@@ -12624,11 +12624,11 @@ fn a_published_retirement_drops_only_the_pending_rows() {
     );
     {
         let mut retired = kept
-            .retired_plan_ids
+            .retired_plan_entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        retired.push("idea".to_string());
-        retired.push("done".to_string());
+        retired.push(("idea".to_string(), "the filed idea".to_string()));
+        retired.push(("done".to_string(), "the finished work".to_string()));
     }
     let terminal = render_to_buffer(&mut app, 80, 30);
     let rows = row_texts(&terminal);
@@ -12653,5 +12653,58 @@ fn a_published_retirement_drops_only_the_pending_rows() {
         rows.iter()
             .any(|row| row.contains("\u{2611} the finished work")),
         "a completed row retires through no claim — history stands: {rows:?}"
+    );
+}
+
+#[test]
+fn a_reborn_id_survives_its_stale_retirement() {
+    // A retirement names the entry the claim dropped — id and subject
+    // both. A later plan may re-use the retired id for a different
+    // task, and the tool treats the absent id as a new entry; an
+    // id-only retirement would take the reborn row with it while the
+    // runner keeps it, leaving the pinned plan stale. The pair is the
+    // identity: the reborn entry stands.
+    let (mut app, kept) = app_with_state();
+    todo_graduation(
+        &app,
+        "call-1",
+        r#"{"todos":[
+            {"id":"idea","subject":"the filed idea","status":"pending"}
+        ]}"#,
+    );
+    let _first = render_to_buffer(&mut app, 80, 30);
+    {
+        let mut retired = kept
+            .retired_plan_entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        retired.push(("idea".to_string(), "the filed idea".to_string()));
+    }
+    // The rebirth: a later update re-uses the id for a different task,
+    // and its graduation lands in the same frame as the retirement.
+    todo_graduation(
+        &app,
+        "call-2",
+        r#"{"todos":[
+            {"id":"idea","subject":"the reborn task","status":"pending"},
+            {"id":"owed","subject":"the owed work","status":"in_progress"}
+        ]}"#,
+    );
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&terminal);
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("\u{2610} the reborn task")),
+        "the reborn entry stands — its id was retired, its task was not: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("\u{25d0} the owed work")),
+        "the owed row stands untouched: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row.contains("the filed idea")),
+        "the retired entry leaves the screen whole — the prior block stands \
+         collapsed, the section shows the plan the store holds: {rows:?}"
     );
 }

@@ -1099,12 +1099,12 @@ fn publish_claim_retirements(runner: &mut dch_loop::Runner, state: &TuiObserverS
     if retired.is_empty() {
         return;
     }
-    let mut ids = state
-        .retired_plan_ids
+    let mut published = state
+        .retired_plan_entries
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     for entry in retired {
-        ids.push(entry.id);
+        published.push((entry.id, entry.subject));
     }
 }
 
