@@ -348,7 +348,7 @@ fn steering_a_prompt_out_for_editing_retires_its_slot() {
     running(&kept, true);
     guidance.live.store(true, Ordering::SeqCst);
     submit(&mut app, "first waiting");
-    press(&mut app, &ctrl(KeyCode::Char('q')));
+    press(&mut app, &ctrl(KeyCode::Char('w')));
     press(&mut app, &plain(KeyCode::Char('e')));
     assert_eq!(app.input(), "first waiting", "the prompt is in hand");
 
@@ -543,7 +543,7 @@ fn a_blank_draft_from_an_edit_leaves_the_waiting_prompt_waiting() {
     running(&kept, true);
     guidance.live.store(true, Ordering::SeqCst);
     submit(&mut app, "a prompt worth keeping");
-    press(&mut app, &ctrl(KeyCode::Char('q')));
+    press(&mut app, &ctrl(KeyCode::Char('w')));
     press(&mut app, &plain(KeyCode::Char('e')));
     for _ in 0.."a prompt worth keeping".len() {
         press(&mut app, &plain(KeyCode::Backspace));
@@ -577,7 +577,7 @@ fn s_guides_a_prompt_that_is_already_waiting() {
     submit(&mut app, "check the tests");
     submit(&mut app, "then the docs");
 
-    press(&mut app, &ctrl(KeyCode::Char('q')));
+    press(&mut app, &ctrl(KeyCode::Char('w')));
     press(&mut app, &plain(KeyCode::Char('s')));
     press(&mut app, &plain(KeyCode::Char('y')));
 
@@ -623,7 +623,7 @@ fn s_refuses_to_guide_when_nothing_is_running() {
         .unwrap()
         .push("queued while idle".to_string());
 
-    press(&mut app, &ctrl(KeyCode::Char('q')));
+    press(&mut app, &ctrl(KeyCode::Char('w')));
     press(&mut app, &plain(KeyCode::Char('s')));
     press(&mut app, &plain(KeyCode::Char('y')));
     let frame = rows(&mut app, 80, 24);
@@ -651,7 +651,7 @@ fn s_guides_the_prompt_on_screen_not_the_one_behind_it() {
     submit(&mut app, "first in order");
     submit(&mut app, "second in order");
 
-    press(&mut app, &ctrl(KeyCode::Char('q')));
+    press(&mut app, &ctrl(KeyCode::Char('w')));
     press(&mut app, &plain(KeyCode::Right));
     press(&mut app, &plain(KeyCode::Char('s')));
     press(&mut app, &plain(KeyCode::Char('y')));
@@ -675,7 +675,7 @@ fn guiding_the_last_waiting_prompt_gives_the_keys_back() {
     guidance.live.store(true, Ordering::SeqCst);
     submit(&mut app, "the only one waiting");
 
-    press(&mut app, &ctrl(KeyCode::Char('q')));
+    press(&mut app, &ctrl(KeyCode::Char('w')));
     press(&mut app, &plain(KeyCode::Char('s')));
     press(&mut app, &plain(KeyCode::Char('y')));
     type_into(&mut app, "z");

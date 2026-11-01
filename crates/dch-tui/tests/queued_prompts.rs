@@ -446,7 +446,7 @@ fn the_title_rides_as_a_badge_of_the_theme_s_own_colors() {
 #[test]
 fn the_keys_light_the_marker_and_leave_the_badge_s_accent_steady() {
     let (mut app, _kept, _rx) = app_with_waiting(&["first waiting"]);
-    press(&mut app, &ctrl(KeyCode::Char('q')));
+    press(&mut app, &ctrl(KeyCode::Char('w')));
 
     let painted = painted_rows(&mut app, 80, 24);
     let (row, column) = badge_at(&painted);
@@ -489,10 +489,10 @@ fn a_deferring_theme_leaves_the_badge_unfilled() {
 }
 
 #[test]
-fn ctrl_q_hands_the_keys_to_the_queue_and_the_arrows_walk_it() {
+fn ctrl_w_hands_the_keys_to_the_queue_and_the_arrows_walk_it() {
     let (mut app, kept, _rx) = app_with_waiting(&["first waiting", "second waiting"]);
 
-    press(&mut app, &ctrl(KeyCode::Char('q')));
+    press(&mut app, &ctrl(KeyCode::Char('w')));
     // A letter typed while reading the backlog belongs to nobody.
     type_into(&mut app, "z");
     assert!(
@@ -525,7 +525,7 @@ fn a_paste_while_the_section_holds_the_keys_builds_nothing() {
     // caret the section is not even showing.
     let (mut app, _kept, _rx) = app_with_waiting(&["something waiting"]);
 
-    press(&mut app, &ctrl(KeyCode::Char('q')));
+    press(&mut app, &ctrl(KeyCode::Char('w')));
     press(
         &mut app,
         &Event::Paste("pasted behind the backlog".to_string()),
@@ -613,7 +613,7 @@ fn the_arrows_still_move_the_composer_caret_when_the_queue_is_not_focused() {
 #[test]
 fn the_walk_wraps_past_the_last_waiting_prompt() {
     let (mut app, _kept, _rx) = app_with_waiting(&["one", "two", "three"]);
-    press(&mut app, &ctrl(KeyCode::Char('q')));
+    press(&mut app, &ctrl(KeyCode::Char('w')));
 
     for _ in 0..3 {
         press(&mut app, &plain(KeyCode::Right));
@@ -634,9 +634,121 @@ fn the_walk_wraps_past_the_last_waiting_prompt() {
 }
 
 #[test]
+fn ctrl_w_from_the_composer_stands_where_the_view_stood() {
+    // The walk's chord from the composer: it raises the section's
+    // focus and stands on the row the view last stood on — entering
+    // is not walking, and the first Ctrl+W lands on the front prompt
+    // rather than silently stepping past it.
+    let (mut app, _kept, _rx) = app_with_waiting(&["first waiting", "second waiting"]);
+    press(&mut app, &ctrl(KeyCode::Char('w')));
+    let shown = rows(&mut app, 80, 24);
+    assert!(
+        shown.iter().any(|row| row.contains("[1/2]")),
+        "the chord focuses without stepping — the front prompt stands: {shown:?}"
+    );
+}
+
+#[test]
+fn ctrl_w_steps_the_walk_once_the_section_holds_the_keys() {
+    // Inside the section the chord is the forward step: Left and Right
+    // walk both ways, and Ctrl+W is the one-key forward walk that
+    // wraps past the tail like the arrows do.
+    let (mut app, _kept, _rx) = app_with_waiting(&["one", "two", "three"]);
+    press(&mut app, &ctrl(KeyCode::Char('w')));
+    press(&mut app, &ctrl(KeyCode::Char('w')));
+    let second = rows(&mut app, 80, 24);
+    assert!(
+        second.iter().any(|row| row.contains("[2/3]")),
+        "the chord stepped forward: {second:?}"
+    );
+    press(&mut app, &ctrl(KeyCode::Char('w')));
+    press(&mut app, &ctrl(KeyCode::Char('w')));
+    let wrapped = rows(&mut app, 80, 24);
+    assert!(
+        wrapped.iter().any(|row| row.contains("[1/3]")),
+        "past the tail it wraps to the front, as the arrows do: {wrapped:?}"
+    );
+}
+
+#[test]
+fn ctrl_w_with_nothing_waiting_is_the_composer_s_word_delete() {
+    // The chord is contextual: with nothing waiting there is no
+    // section to walk, and the composer keeps its readline habit.
+    let (mut app, kept, _rx) = app_with_waiting(&[]);
+    type_into(&mut app, "one two");
+    press(&mut app, &ctrl(KeyCode::Char('w')));
+    assert_eq!(
+        app.input(),
+        "one ",
+        "the chord deletes a word when no queue waits"
+    );
+    assert!(waiting(&kept).is_empty());
+}
+
+#[test]
+fn ctrl_q_folds_the_section_to_its_count_and_back() {
+    // The fold: one row, the badge and the count naming the chord — a
+    // hidden backlog stays a fact on screen without spending the
+    // conversation's rows on it. The same chord lifts it back.
+    let (mut app, kept, _rx) = app_with_waiting(&["first waiting", "second waiting"]);
+    press(&mut app, &ctrl(KeyCode::Char('q')));
+    let folded = rows(&mut app, 80, 24);
+    assert!(
+        folded.iter().any(|row| row.contains("2 waiting")),
+        "the fold names the count: {folded:?}"
+    );
+    assert!(
+        !folded.iter().any(|row| row.contains("first waiting")),
+        "the prompt's rows are gone: {folded:?}"
+    );
+    assert_eq!(waiting(&kept).len(), 2, "the fold hides, never drops");
+
+    press(&mut app, &ctrl(KeyCode::Char('q')));
+    let open = rows(&mut app, 80, 24);
+    assert!(
+        open.iter().any(|row| row.contains("first waiting")),
+        "the same chord lifts the section back: {open:?}"
+    );
+}
+
+#[test]
+fn the_walk_is_inert_over_a_folded_section() {
+    // Ctrl+W over a folded section takes the press and does nothing:
+    // the fold is the user's word that the backlog stays out of the
+    // way, and opening it is Ctrl+Q's alone — the walk never reaches
+    // past a section the user put away to focus rows they cannot see.
+    let (mut app, _kept, _rx) = app_with_waiting(&["first waiting", "second waiting"]);
+    press(&mut app, &ctrl(KeyCode::Char('q')));
+    press(&mut app, &ctrl(KeyCode::Char('w')));
+    let shown = rows(&mut app, 80, 24);
+    assert!(
+        shown.iter().any(|row| row.contains("2 waiting")),
+        "the section stays folded — the count row still stands: {shown:?}"
+    );
+    assert!(
+        !shown.iter().any(|row| row.contains("[1/2]")),
+        "no prompt row surfaced and nothing focused: {shown:?}"
+    );
+    type_into(&mut app, "z");
+    assert_eq!(
+        app.input(),
+        "z",
+        "the composer keeps the keys — the chord neither focused the \
+         hidden section nor deleted the word"
+    );
+
+    press(&mut app, &ctrl(KeyCode::Char('q')));
+    let open = rows(&mut app, 80, 24);
+    assert!(
+        open.iter().any(|row| row.contains("[1/2]")),
+        "and Ctrl+Q alone lifts the fold: {open:?}"
+    );
+}
+
+#[test]
 fn e_lifts_the_prompt_into_the_composer_and_gives_the_keys_back() {
     let (mut app, kept, _rx) = app_with_waiting(&["rewrite the parser"]);
-    press(&mut app, &ctrl(KeyCode::Char('q')));
+    press(&mut app, &ctrl(KeyCode::Char('w')));
 
     press(&mut app, &plain(KeyCode::Char('e')));
     assert_eq!(
@@ -665,7 +777,7 @@ fn e_refuses_a_non_empty_composer_and_changes_nothing() {
     let (mut app, kept, _rx) = app_with_waiting(&["first waiting", "second waiting"]);
     type_into(&mut app, "a draft of my own");
 
-    press(&mut app, &ctrl(KeyCode::Char('q')));
+    press(&mut app, &ctrl(KeyCode::Char('w')));
     press(&mut app, &plain(KeyCode::Char('e')));
 
     assert_eq!(
@@ -693,7 +805,7 @@ fn e_refuses_a_non_empty_composer_and_changes_nothing() {
 #[test]
 fn enter_saves_the_edited_text_into_its_slot_and_keeps_the_order() {
     let (mut app, kept, _rx) = app_with_waiting(&["first task", "second task", "third task"]);
-    press(&mut app, &ctrl(KeyCode::Char('q')));
+    press(&mut app, &ctrl(KeyCode::Char('w')));
     press(&mut app, &plain(KeyCode::Right));
     press(&mut app, &plain(KeyCode::Char('e')));
     type_into(&mut app, " with the patch");
@@ -719,7 +831,7 @@ fn enter_saves_the_edited_text_into_its_slot_and_keeps_the_order() {
 #[test]
 fn saving_an_edit_leaves_the_input_history_alone() {
     let (mut app, _kept, _rx) = app_with_waiting(&["the real first task", "the real second"]);
-    press(&mut app, &ctrl(KeyCode::Char('q')));
+    press(&mut app, &ctrl(KeyCode::Char('w')));
     press(&mut app, &plain(KeyCode::Char('e')));
     type_into(&mut app, " (fixed)");
     press(&mut app, &plain(KeyCode::Enter));
@@ -740,7 +852,7 @@ fn saving_an_edit_leaves_the_input_history_alone() {
 #[test]
 fn a_blank_commit_saves_nothing_and_says_so() {
     let (mut app, kept, _rx) = app_with_waiting(&["a prompt worth keeping"]);
-    press(&mut app, &ctrl(KeyCode::Char('q')));
+    press(&mut app, &ctrl(KeyCode::Char('w')));
     press(&mut app, &plain(KeyCode::Char('e')));
     for _ in 0.."a prompt worth keeping".len() {
         press(&mut app, &plain(KeyCode::Backspace));
@@ -765,7 +877,7 @@ fn a_blank_commit_saves_nothing_and_says_so() {
 #[test]
 fn esc_drops_the_draft_and_leaves_the_prompt_as_it_was() {
     let (mut app, kept, _rx) = app_with_waiting(&["the prompt as submitted"]);
-    press(&mut app, &ctrl(KeyCode::Char('q')));
+    press(&mut app, &ctrl(KeyCode::Char('w')));
     press(&mut app, &plain(KeyCode::Char('e')));
     type_into(&mut app, "junk typed into the lifted text");
 
@@ -796,7 +908,7 @@ fn ctrl_c_while_editing_aborts_and_leaves_the_prompt_alone() {
     let flag = Arc::clone(&cancelled);
     app.set_run_canceller(Box::new(move || flag.store(true, Ordering::SeqCst)));
     kept.agent_running.store(true, Ordering::SeqCst);
-    press(&mut app, &ctrl(KeyCode::Char('q')));
+    press(&mut app, &ctrl(KeyCode::Char('w')));
     press(&mut app, &plain(KeyCode::Char('e')));
     type_into(&mut app, "mid-edit");
 
@@ -820,7 +932,7 @@ fn ctrl_c_while_editing_aborts_and_leaves_the_prompt_alone() {
 #[test]
 fn ctrl_q_after_an_edit_saves_it_before_focusing() {
     let (mut app, kept, _rx) = app_with_waiting(&["first waiting", "second waiting"]);
-    press(&mut app, &ctrl(KeyCode::Char('q')));
+    press(&mut app, &ctrl(KeyCode::Char('w')));
     press(&mut app, &plain(KeyCode::Char('e')));
     type_into(&mut app, " corrected");
 
@@ -847,7 +959,7 @@ fn ctrl_q_after_an_edit_saves_it_before_focusing() {
 #[test]
 fn a_refused_save_does_not_sweep_past_the_edit() {
     let (mut app, kept, _rx) = app_with_waiting(&["first waiting", "second waiting"]);
-    press(&mut app, &ctrl(KeyCode::Char('q')));
+    press(&mut app, &ctrl(KeyCode::Char('w')));
     press(&mut app, &plain(KeyCode::Char('e')));
     // Wipe the draft: the save is refused, so the edit has to stay put with
     // its text rather than be filed away behind a focused list — the chord
@@ -876,7 +988,7 @@ fn a_refused_save_does_not_sweep_past_the_edit() {
 #[test]
 fn delete_drops_the_prompt_on_screen_and_shows_the_next() {
     let (mut app, kept, mut rx) = app_with_waiting(&["drop this one", "keep this one"]);
-    press(&mut app, &ctrl(KeyCode::Char('q')));
+    press(&mut app, &ctrl(KeyCode::Char('w')));
 
     press(&mut app, &plain(KeyCode::Delete));
     press(&mut app, &plain(KeyCode::Char('y')));
@@ -906,7 +1018,7 @@ fn delete_drops_the_prompt_on_screen_and_shows_the_next() {
 #[test]
 fn dropping_the_last_prompt_releases_the_focus() {
     let (mut app, kept, _rx) = app_with_waiting(&["the only one"]);
-    press(&mut app, &ctrl(KeyCode::Char('q')));
+    press(&mut app, &ctrl(KeyCode::Char('w')));
 
     press(&mut app, &plain(KeyCode::Delete));
     press(&mut app, &plain(KeyCode::Char('y')));
@@ -928,7 +1040,7 @@ fn s_and_d_ask_before_they_act() {
     // stands them down, and nothing leaves the queue while the ask
     // stands.
     let (mut app, kept, _rx) = app_with_waiting(&["first waiting", "second waiting"]);
-    press(&mut app, &ctrl(KeyCode::Char('q')));
+    press(&mut app, &ctrl(KeyCode::Char('w')));
 
     press(&mut app, &plain(KeyCode::Char('d')));
     assert_eq!(
@@ -1002,7 +1114,7 @@ fn the_composer_greys_out_while_the_section_holds_the_keys() {
         "and its caret shows where typing lands"
     );
 
-    press(&mut app, &ctrl(KeyCode::Char('q')));
+    press(&mut app, &ctrl(KeyCode::Char('w')));
     let greyed = painted_rows(&mut app, 80, 24);
     let dim_edges = greyed
         .iter()
@@ -1052,7 +1164,7 @@ fn the_queue_chords_are_swallowed_and_the_runs_chords_survive() {
         timestamp: chrono::Utc::now(),
         duration_ms: None,
     }]);
-    press(&mut app, &ctrl(KeyCode::Char('q')));
+    press(&mut app, &ctrl(KeyCode::Char('w')));
 
     type_into(&mut app, "qx");
     // PageUp first: any key between the chord's two presses would
@@ -1117,7 +1229,7 @@ fn a_claimed_prompt_lands_in_the_transcript_and_leaves_the_section() {
 #[test]
 fn a_commit_on_a_prompt_the_run_already_took_goes_out_as_a_correction() {
     let (mut app, kept, mut rx) = app_with_waiting(&["the prompt under edit"]);
-    press(&mut app, &ctrl(KeyCode::Char('q')));
+    press(&mut app, &ctrl(KeyCode::Char('w')));
     press(&mut app, &plain(KeyCode::Char('e')));
     let (edited_from, _) = waiting(&kept)[0];
     type_into(&mut app, " — fixed after the fact");
@@ -1164,7 +1276,7 @@ fn a_correction_stops_the_turn_it_names_in_flight() {
     app.set_run_canceller(Box::new(move || {
         seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }));
-    press(&mut app, &ctrl(KeyCode::Char('q')));
+    press(&mut app, &ctrl(KeyCode::Char('w')));
     press(&mut app, &plain(KeyCode::Char('e')));
     let (id, _) = waiting(&kept)[0];
     let _handed_over = run_id(rx.try_recv().expect("the id travels first"));
@@ -1215,7 +1327,7 @@ fn a_flag_left_up_by_the_settle_window_comes_back_down() {
         // prompt was claimed — the mirror has moved on.
         mirror.store(u64::MAX, std::sync::atomic::Ordering::SeqCst);
     }));
-    press(&mut app, &ctrl(KeyCode::Char('q')));
+    press(&mut app, &ctrl(KeyCode::Char('w')));
     press(&mut app, &plain(KeyCode::Char('e')));
     let (id, _) = waiting(&kept)[0];
     let _handed_over = run_id(rx.try_recv().expect("the id travels first"));
@@ -1259,7 +1371,7 @@ fn a_correction_of_an_already_landed_prompt_leaves_the_run_alone() {
     app.set_run_canceller(Box::new(move || {
         seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }));
-    press(&mut app, &ctrl(KeyCode::Char('q')));
+    press(&mut app, &ctrl(KeyCode::Char('w')));
     press(&mut app, &plain(KeyCode::Char('e')));
     let (id, _) = waiting(&kept)[0];
     let _handed_over = run_id(rx.try_recv().expect("the id travels first"));
@@ -1303,7 +1415,7 @@ fn the_frame_releases_a_focus_the_claim_emptied() {
     // landing in the composer, which is what the user sees happening.
     let (mut app, kept, mut rx) = app_with_waiting(&["the last waiting prompt"]);
     let taken = run_id(rx.try_recv().expect("the submission was sent"));
-    press(&mut app, &ctrl(KeyCode::Char('q')));
+    press(&mut app, &ctrl(KeyCode::Char('w')));
     let _claimed = claim(&kept, taken);
     let rendered = rows(&mut app, 80, 24);
     press(&mut app, &plain(KeyCode::Char('e')));
@@ -1329,7 +1441,7 @@ fn a_correction_the_driver_cannot_take_returns_to_the_composer() {
     let (mut app, kept, rx) = app_with_waiting(&["the prompt under edit"]);
     let (edited_from, _) = waiting(&kept)[0];
     drop(rx);
-    press(&mut app, &ctrl(KeyCode::Char('q')));
+    press(&mut app, &ctrl(KeyCode::Char('w')));
     press(&mut app, &plain(KeyCode::Char('e')));
     type_into(&mut app, " — fixed too late");
     let _claimed = claim(&kept, edited_from);
@@ -1367,7 +1479,7 @@ fn a_permission_prompt_outranks_the_queue_chords() {
     app.set_permission_requests(requests_rx);
     app.poll_permission_requests();
 
-    press(&mut app, &ctrl(KeyCode::Char('q')));
+    press(&mut app, &ctrl(KeyCode::Char('w')));
     press(&mut app, &plain(KeyCode::Delete));
 
     assert_eq!(
@@ -1462,7 +1574,7 @@ fn a_long_prompt_wraps_across_both_rows_and_marks_the_cut() {
 #[test]
 fn the_section_numbers_the_prompt_and_names_the_count() {
     let (mut app, _kept, _rx) = app_with_waiting(&["first", "second", "third"]);
-    press(&mut app, &ctrl(KeyCode::Char('q')));
+    press(&mut app, &ctrl(KeyCode::Char('w')));
 
     let at_the_front = rows(&mut app, 80, 24);
     assert!(
@@ -1493,7 +1605,7 @@ fn the_focused_section_shows_its_chords_and_the_plain_one_does_not() {
         "and promises nothing it would not do from here"
     );
 
-    press(&mut app, &ctrl(KeyCode::Char('q')));
+    press(&mut app, &ctrl(KeyCode::Char('w')));
     let focused = rows(&mut app, 80, 24);
     assert!(
         focused.iter().any(|row| row.contains("walk")),
@@ -1509,7 +1621,7 @@ fn the_focused_section_shows_its_chords_and_the_plain_one_does_not() {
 #[test]
 fn a_narrow_terminal_keeps_the_hint_beside_the_badge_off_the_text() {
     let (mut app, _kept, _rx) = app_with_waiting(&["a prompt that wants room"]);
-    press(&mut app, &ctrl(KeyCode::Char('q')));
+    press(&mut app, &ctrl(KeyCode::Char('w')));
 
     let narrow = rows(&mut app, 28, 24);
     let marked = marker_rows(&narrow);
@@ -1765,7 +1877,7 @@ fn ctrl_q_hands_the_keys_back_from_a_focused_section() {
     // is only a letter, and after the second chord it must be only a
     // letter again.
     let (mut app, _kept, _rx) = app_with_waiting(&["first waiting"]);
-    press(&mut app, &ctrl(KeyCode::Char('q')));
+    press(&mut app, &ctrl(KeyCode::Char('w')));
 
     press(&mut app, &ctrl(KeyCode::Char('q')));
 
@@ -1783,7 +1895,7 @@ fn esc_is_the_way_out_of_a_focused_section() {
     // The other half of the same sentence: leaving is Esc's. Released, the
     // composer takes its keys back and `e` is only a letter again.
     let (mut app, kept, _rx) = app_with_waiting(&["first waiting"]);
-    press(&mut app, &ctrl(KeyCode::Char('q')));
+    press(&mut app, &ctrl(KeyCode::Char('w')));
 
     press(&mut app, &plain(KeyCode::Esc));
 
@@ -1829,11 +1941,13 @@ fn a_submit_after_the_driver_is_gone_names_the_driver() {
 }
 
 #[test]
-fn the_chord_that_enters_also_leaves() {
-    // Ctrl+Q is a toggle: the press that hands the section the keys is
-    // the press that takes them back, mirroring Esc — a key that opens
-    // a door it then refuses to close reads broken, and the user who
-    // entered on the chord reaches for the same chord to leave.
+fn the_leave_chord_hands_the_keys_back_as_esc_does() {
+    // The chords as they stand: Ctrl+W enters and steps inside, Esc
+    // and Ctrl+Q both leave, and Ctrl+Q alone — pressed from the
+    // composer — folds the section. Leaving must hand the keyboard
+    // back, so the chord that focuses is not a trap: the keys return
+    // to the composer, and the waiting prompt stays exactly where it
+    // was.
     let (mut app, _kept, _rx) = app_with_waiting(&["first waiting"]);
     let marker_fg = |app: &mut TuiApp| {
         let painted = painted_rows(app, 80, 24);
@@ -1846,25 +1960,25 @@ fn the_chord_that_enters_also_leaves() {
     };
 
     let plain = marker_fg(&mut app);
-    press(&mut app, &ctrl(KeyCode::Char('q')));
+    press(&mut app, &ctrl(KeyCode::Char('w')));
     assert_eq!(
         marker_fg(&mut app),
         app.theme.ui.primary,
-        "the chord hands the section the keys — the marker lights"
+        "the enter chord hands the section the keys — the marker lights"
     );
 
     press(&mut app, &ctrl(KeyCode::Char('q')));
     assert_eq!(
         marker_fg(&mut app),
         plain,
-        "the same chord takes them back — the marker settles to dim, \u{2026}"
+        "the leave chord takes the keys back — the marker settles to dim, \u{2026}"
     );
 
-    // And back in again: the toggle keeps working in both directions.
-    press(&mut app, &ctrl(KeyCode::Char('q')));
+    // And back in again: the chords keep working in both directions.
+    press(&mut app, &ctrl(KeyCode::Char('w')));
     assert_eq!(
         marker_fg(&mut app),
         app.theme.ui.primary,
-        "the chord re-enters — a toggle, not a one-way door"
+        "the enter chord re-enters — not a one-way door"
     );
 }

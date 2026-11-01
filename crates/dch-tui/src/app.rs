@@ -330,6 +330,30 @@ enum PlanView {
     Hidden,
 }
 
+/// The waiting section's posture, as `Ctrl+Q` leaves it.
+///
+/// One chord walks the two: standing at whatever height the waiting
+/// prompt's wording needs, or folded to the one-row badge that keeps a
+/// hidden backlog a fact on screen. Like the plan's postures this is a
+/// view preference — the queue keeps updating underneath both, and an
+/// emptied queue closes the section out of either one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueuePosture {
+    /// The section at its full height, the waiting prompt's wording
+    /// across its rows.
+    ///
+    /// The resting posture: the section exists to be read, and the
+    /// words are what get read.
+    Standing,
+
+    /// Folded to the one-row badge naming the count and the chord.
+    ///
+    /// The conversation takes the rows back; the badge keeps the
+    /// backlog visible as a figure, and `Ctrl+Q` lifts
+    /// the section back to standing.
+    Folded,
+}
+
 /// Which destructive act the section's confirmation is holding.
 ///
 /// Named rather than a flag: the two acts spend different things —
@@ -1637,6 +1661,16 @@ pub struct TuiApp {
     /// and never claims, so a plan keeps updating through its own run.
     latest_todos: Vec<todo_view::TodoRow>,
 
+    /// The plan generation `latest_todos` graduated under.
+    ///
+    /// Snapshotted from the shared state's
+    /// [`plan_generation`](crate::observer::TuiObserverState::plan_generation)
+    /// at every `TodoWrite` graduation that replaces the rows, so the
+    /// retirement filter can tell a retirement newer than the rows —
+    /// which may take a pending row — from a stale one a reborn entry
+    /// outlived, whatever order the frame drains the two halves in.
+    todo_generation: u64,
+
     /// The rows each todo update changed, by the update's call id.
     ///
     /// The conversation's per-update block accents exactly these
@@ -1680,8 +1714,21 @@ pub struct TuiApp {
     /// away. A view preference, not a mode: no keys are owned, the
     /// plan keeps updating underneath, and every claim starts the
     /// next run's plan from the capped posture whatever the last run
-    /// left.
+    /// left. The cycle skips the open posture when the capped one
+    /// already shows every entry — opening a list that stands whole
+    /// changes nothing, so the chord spends that press on the fold.
     plan_view: PlanView,
+
+    /// Whether the capped posture's last render cut an entry.
+    ///
+    /// The layout computes the section's rows from the same render the
+    /// frame draws, so it is the one place that already knows whether
+    /// the cap ate anything; the cell carries that answer across the
+    /// `&self` render into the key press that cycles the posture.
+    /// Fresh until the first frame renders — `false` reads as "the cap
+    /// cut nothing", which is at worst one skipped posture step before
+    /// the first frame draws.
+    plan_cut: std::cell::Cell<bool>,
 
     /// The working directory's own name, as the status bar shows it.
     ///
@@ -1715,6 +1762,18 @@ pub struct TuiApp {
     /// keeps it inside the queue, because a prompt claimed at the front
     /// pulls every row behind it up a place.
     queue_view: usize,
+
+    /// The waiting section's posture, as `Ctrl+Q` leaves it.
+    ///
+    /// A view preference, not queue state: the chord folds the section
+    /// to its one-row badge and lifts it back, and the folded row names
+    /// the count and the chord so a hidden backlog is still a fact on
+    /// screen. The fold never survives into the section's own modes —
+    /// the fold opens only on `Ctrl+Q` — the walk's chord runs inert
+    /// over a fold — and an edit or a confirm
+    /// rides the full section — so a folded posture under a non-plain
+    /// mode is a display relic the render refuses to honor.
+    queue_posture: QueuePosture,
 
     /// Whose hands the keyboard is in, as far as waiting prompts go.
     ///
@@ -1989,15 +2048,18 @@ impl TuiApp {
             session_id: None,
             session_id_span: std::cell::Cell::new(None),
             latest_todos: Vec::new(),
+            todo_generation: 0,
             todo_changes: HashMap::new(),
             todo_block_ranges: Vec::new(),
             todo_section_changes: HashMap::new(),
             plan_interrupted: false,
             plan_view: PlanView::Capped,
+            plan_cut: std::cell::Cell::new(false),
             working_dir: None,
             git_branch: None,
             transient_notice: None,
             queue_view: 0,
+            queue_posture: QueuePosture::Standing,
             queue_mode: QueueMode::Plain,
             pending_permissions: std::collections::VecDeque::new(),
             permission_rx: None,
@@ -2414,12 +2476,19 @@ impl TuiApp {
                     && name == "TodoWrite"
                     && *success
                     && let Some(rows) = crate::todo_view::parse_rendered(output_preview)
+                        .map(|rows| {
+                            crate::todo_view::rows_with_submitted_subjects(rows, retained_input)
+                        })
                         .or_else(|| crate::todo_view::parse_submission(retained_input))
                 {
                     let changes = crate::todo_view::status_changes(&rows, &self.latest_todos);
                     self.todo_changes.insert(call_id.clone(), changes.clone());
                     self.todo_section_changes = changes;
                     self.latest_todos = rows;
+                    self.todo_generation = self
+                        .state
+                        .todo_graduation_generation
+                        .load(std::sync::atomic::Ordering::SeqCst);
                     self.expanded_tools.insert(call_id.clone());
                     self.auto_expanded_todo = Some(call_id.clone());
                 }
@@ -2437,6 +2506,17 @@ impl TuiApp {
     #[must_use]
     pub fn input(&self) -> &str {
         self.input.text()
+    }
+
+    /// Stamp the plan generation a todo graduation enqueues under.
+    ///
+    /// The observer's own tool-result path takes the stamp as each
+    /// accepted `TodoWrite` result enters the graduation buffer; a
+    /// graduation enqueued through [`graduations`](Self::graduations)
+    /// directly takes it here, so the rows it lands carry the same age
+    /// the retirement filter compares against.
+    pub fn note_todo_graduated(&self) {
+        self.state.note_todo_plan_graduated();
     }
 
     /// The scroll offset in lines above the bottom of the view.
@@ -3628,9 +3708,13 @@ impl TuiApp {
             }
             (KeyCode::Char('s'), KeyModifiers::CONTROL) => self.steer_now(),
             (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
+                // The cycle spends a press on opening only when the
+                // cap actually cut something: a list the capped
+                // posture already shows whole has nothing to open, and
+                // that press folds the section instead.
                 self.plan_view = match self.plan_view {
-                    PlanView::Capped => PlanView::Full,
-                    PlanView::Full => PlanView::Hidden,
+                    PlanView::Capped if self.plan_cut.get() => PlanView::Full,
+                    PlanView::Capped | PlanView::Full => PlanView::Hidden,
                     PlanView::Hidden => PlanView::Capped,
                 };
                 true
@@ -4730,9 +4814,17 @@ impl TuiApp {
     /// steering chords and the transcript's paging stay live over the
     /// section, the same courtesy the ask sheet extends, because a user
     /// checking what a waiting prompt refers to has to be able to read
-    /// the conversation it came out of. Ctrl+Q is asked here rather than
-    /// below for the two moments it does own: entering the section from
-    /// the composer, and committing an edit from inside it. Leaving a
+    /// the conversation it came out of. The chords are asked here rather
+    /// than below for the moments they own: `Ctrl+W` walks the waiting
+    /// prompts — from the composer it raises the section's focus,
+    /// standing where the view last stood, and once the section holds
+    /// the keys the chord steps the walk forward; over a folded section
+    /// or an empty queue the chord is inert or the composer's — the
+    /// fold opens only on `Ctrl+Q`, and a queue with nothing waiting
+    /// hands the chord back so the composer keeps its delete-a-word.
+    /// `Ctrl+Q` folds and
+    /// unfolds the section from the composer, commits an edit from
+    /// inside it, and leaves a focused section. Leaving a
     /// focused section is `Esc`'s and the chord's both — the focused arm
     /// below takes the key and hands the keys back, so one press means
     /// enter and the next means leave.
@@ -4753,8 +4845,28 @@ impl TuiApp {
         if self.queue_mode == QueueMode::Focused {
             return Some(self.queue_focused_key(key));
         }
-        if let (KeyCode::Char('q'), KeyModifiers::CONTROL) = (key.code, key.modifiers) {
-            return Some(self.focus_queue());
+        if let (KeyCode::Char('w'), KeyModifiers::CONTROL) = (key.code, key.modifiers) {
+            if self.queued_display_len() == 0 {
+                return None;
+            }
+            // The walk has nothing to walk over a folded section, and
+            // unfolding is `Ctrl+Q`'s alone: the chord takes the press
+            // and does nothing, rather than reaching past a section
+            // the user put away.
+            if self.queue_posture == QueuePosture::Folded {
+                return Some(true);
+            }
+            self.focus_queue();
+            return Some(true);
+        }
+        if let (KeyCode::Char('q'), KeyModifiers::CONTROL) = (key.code, key.modifiers)
+            && self.queued_display_len() > 0
+        {
+            self.queue_posture = match self.queue_posture {
+                QueuePosture::Standing => QueuePosture::Folded,
+                QueuePosture::Folded => QueuePosture::Standing,
+            };
+            return Some(true);
         }
         None
     }
@@ -4789,7 +4901,8 @@ impl TuiApp {
 
     /// The keys the focused list answers.
     ///
-    /// Left and Right walk the waiting prompts, `e` lifts the shown one
+    /// Left and Right walk the waiting prompts and `Ctrl+W` steps the
+    /// same walk forward, `e` lifts the shown one
     /// into the composer, `s` sends it to the turn in flight as guidance,
     /// Delete or `d` takes it out of the queue for good, and Esc hands the
     /// keyboard back. Whatever else arrives is
@@ -4801,6 +4914,9 @@ impl TuiApp {
         match key.code {
             KeyCode::Left if bare => self.step_queue_view(false),
             KeyCode::Right if bare => self.step_queue_view(true),
+            KeyCode::Char('w') if key.modifiers == KeyModifiers::CONTROL => {
+                self.step_queue_view(true);
+            }
             KeyCode::Esc => self.queue_mode = QueueMode::Plain,
             KeyCode::Char('q') if key.modifiers == KeyModifiers::CONTROL => {
                 self.queue_mode = QueueMode::Plain;
@@ -5451,7 +5567,6 @@ impl TuiApp {
                 .saturating_sub(composer_height)
                 .saturating_sub(2)
                 .saturating_sub(STATUS_BAR_AIR)
-                .saturating_sub(u16::from(place_shown))
         } else {
             0
         };
@@ -5469,12 +5584,10 @@ impl TuiApp {
         if question_reserved > 0 {
             constraints.push(Constraint::Length(question_reserved));
         }
-        constraints.push(Constraint::Length(1));
-        // A ruled theme stands its caption above the top rule rather
-        // than between the rules: the caption rides the spacer's own
-        // slot and the spacer takes the next row down, so the box the
-        // rules draw never encloses the directory's name. Unruled
-        // themes keep the caption tight against the composer's paint.
+
+        if !place_shown {
+            constraints.push(Constraint::Length(1));
+        }
         if ruled && place_shown {
             constraints.push(Constraint::Length(1));
         }
@@ -5523,24 +5636,6 @@ impl TuiApp {
             .checked_sub(1)
             .filter(|_| self.pending_permissions.is_empty());
         let queue_shown = self.queued_display_len() > 0;
-        // The waiting section stands whenever anything waits, not only
-        // under a run: prompts a resume owes wait with no run up, and
-        // hiding them behind the run gate would put them back in the
-        // invisible backlog the seeding exists to clear. The plan
-        // section below makes the same argument for its own rows.
-        // The plan stands between the conversation and everything else
-        // while any task does — no run gate: a list with work left is
-        // worth keeping in view between runs too, carried across claims
-        // exactly as the runner carries its own store, and a finished
-        // list leaves at the claim that follows it — the same edge the
-        // runner clears the carried store at — so the section never
-        // ghosts done work across runs and never drops work the
-        // session still owes. Ctrl+T walks its postures — capped, full,
-        // hidden — a view preference, not a mode: it owns no keys and
-        // the plan keeps updating underneath either way. Hidden keeps
-        // one row of itself standing: the folded marker names the
-        // count and the chord, so a plan can be out of sight without
-        // being out of mind.
         let todo_shown = !self.latest_todos.is_empty();
         let place_shown = self.working_dir.is_some();
         let (constraints, question_reserved) = self.frame_constraints(FrameLayout {
@@ -5564,7 +5659,6 @@ impl TuiApp {
             .saturating_add(todo_at)
             .saturating_add(usize::from(question_reserved > 0))
             .saturating_add(usize::from(queue_shown));
-        let place_at = usize::from(place_shown);
         let fallback = area;
         self.render_conversation(frame, pane(&chunks, base, fallback));
         if todo_shown {
@@ -5580,7 +5674,10 @@ impl TuiApp {
                 ),
             );
         }
-        self.render_notice(frame, pane(&chunks, furniture.saturating_add(1), fallback));
+        let notice_rows = usize::from(!place_shown);
+        if notice_rows > 0 {
+            self.render_notice(frame, pane(&chunks, furniture.saturating_add(1), fallback));
+        }
         if self
             .state
             .agent_running
@@ -5590,18 +5687,15 @@ impl TuiApp {
         } else {
             self.run_anchor = None;
         }
-        // A ruled theme seats its caption above the top rule (the
-        // spacer's own slot rides one row higher than usual); an
-        // unruled one keeps it tight against the composer's paint.
         let caption_above_rule = self.theme.ui.composer_border.is_some() && place_shown;
-        let spacer_at = furniture
-            .saturating_add(2)
-            .saturating_add(usize::from(caption_above_rule));
-        let place_row_at = if caption_above_rule {
-            furniture.saturating_add(2)
+        let below_notice = furniture.saturating_add(1).saturating_add(notice_rows);
+        let seat_rows = usize::from(place_shown);
+        let (spacer_at, place_row_at) = if caption_above_rule {
+            (below_notice.saturating_add(seat_rows), below_notice)
         } else {
-            furniture.saturating_add(3)
+            (below_notice, below_notice.saturating_add(seat_rows))
         };
+        let composer_at = below_notice.saturating_add(seat_rows).saturating_add(1);
         let strip_row = if strip_at_top { 0 } else { spacer_at };
         let strip_drew = self.render_pulse_strip(frame, pane(&chunks, strip_row, fallback));
         let strip_owns_spacer = strip_drew && !strip_at_top;
@@ -5610,23 +5704,13 @@ impl TuiApp {
         }
         if let Some(color) = self.theme.ui.composer_border {
             let spacer = pane(&chunks, spacer_at, fallback);
-            let composer = pane(
-                &chunks,
-                furniture.saturating_add(3).saturating_add(place_at),
-                fallback,
-            );
+            let composer = pane(&chunks, composer_at, fallback);
             let rule = Style::default()
                 .fg(color)
                 .add_modifier(ratatui::style::Modifier::UNDERLINED);
             if spacer.height > 0 && !strip_owns_spacer {
                 frame.buffer_mut().set_style(spacer, rule);
             }
-            // The bottom rule rides the composer's padding row, one
-            // above the identity row: the model and mode hang below
-            // the rule — outside the box — rather than sitting on the
-            // underline, which read as the text crossing its own
-            // border. A starved composer keeps the rule on its last
-            // row rather than underlining a row it does not own.
             if composer.height > 0 {
                 let rule_row = if composer.height >= 2 {
                     composer.bottom().saturating_sub(2)
@@ -5641,20 +5725,12 @@ impl TuiApp {
                 frame.buffer_mut().set_style(bottom, rule);
             }
         }
-        let input_area = pane(
-            &chunks,
-            furniture.saturating_add(3).saturating_add(place_at),
-            fallback,
-        );
+        let input_area = pane(&chunks, composer_at, fallback);
         self.input_wrap_width = wrap_width;
         self.render_input(frame, input_area, &rows, caret);
         self.render_status_bar(
             frame,
-            pane(
-                &chunks,
-                furniture.saturating_add(4).saturating_add(place_at),
-                fallback,
-            ),
+            pane(&chunks, composer_at.saturating_add(1), fallback),
         );
         if let Some((prompt, more)) = self.pending_permissions.front().map(|request| {
             (
@@ -5671,6 +5747,22 @@ impl TuiApp {
                 area,
                 self.pending_questions.len().saturating_sub(1),
             );
+        }
+    }
+
+    /// The plan badge's chord hint, naming what the next press does.
+    ///
+    /// The cycle spends its press differently per posture — and the
+    /// capped posture's press depends on whether the cap actually cut
+    /// an entry — so the badge tells the truth for the state it stands
+    /// in: a cut cap names the whole list, a whole cap and the open
+    /// list name the fold. `None` for the hidden posture, whose one
+    /// row carries its own hint.
+    fn plan_chord_hint(&self) -> Option<&'static str> {
+        match self.plan_view {
+            PlanView::Hidden => None,
+            PlanView::Capped if self.plan_cut.get() => Some("ctrl+t to show all"),
+            PlanView::Full | PlanView::Capped => Some("ctrl+t to hide"),
         }
     }
 
@@ -5701,19 +5793,20 @@ impl TuiApp {
             PlanView::Full => usize::MAX,
             _ => TODO_SECTION_BODY_ROWS,
         };
-        let chord_hint = (self.plan_view != PlanView::Full).then_some("ctrl+t");
-        u16::try_from(
-            todo_view::section_lines(
-                &self.latest_todos,
-                &self.todo_section_changes,
-                &colors,
-                inner,
-                body_cap,
-                chord_hint,
-            )
-            .len(),
-        )
-        .unwrap_or(0)
+        let chord_hint = self.plan_chord_hint();
+        let lines = todo_view::section_lines(
+            &self.latest_todos,
+            &self.todo_section_changes,
+            &colors,
+            inner,
+            body_cap,
+            chord_hint,
+        );
+        let cut = body_cap != usize::MAX
+            && matches!(lines.last(), Some(line)
+                if line.spans.first().is_some_and(|span| span.content.starts_with('\u{2026}')));
+        self.plan_cut.set(cut);
+        u16::try_from(lines.len()).unwrap_or(0)
     }
 
     /// Render the pinned plan section: the run's current tasks,
@@ -5739,9 +5832,6 @@ impl TuiApp {
             badge_letters: self.theme.ui.background,
         };
         if self.plan_view == PlanView::Hidden {
-            // The folded stand-in: air, then the badge row — the count
-            // and the chord that opens the list again. The plan is out
-            // of sight, not out of mind.
             frame.render_widget(
                 Paragraph::new(todo_view::folded_lines(&self.latest_todos, &colors)),
                 Rect {
@@ -5762,7 +5852,7 @@ impl TuiApp {
             PlanView::Full => usize::MAX,
             _ => TODO_SECTION_BODY_ROWS,
         };
-        let chord_hint = (self.plan_view != PlanView::Full).then_some("ctrl+t");
+        let chord_hint = self.plan_chord_hint();
         let lines = todo_view::section_lines(
             &self.latest_todos,
             &self.todo_section_changes,
@@ -6192,7 +6282,8 @@ impl TuiApp {
     /// box.
     ///
     /// Draws where the user's attention already is: anchored at the
-    /// bottom, directly above the status bar, covering the notice row,
+    /// bottom, directly above the status bar, covering the bottom
+    /// furniture — the place row (or, with no place, the notice row),
     /// the spacer, and the composer — the box the user would type in
     /// is replaced by the question. The conversation above keeps
     /// rendering behind it, so what the run is doing stays visible
@@ -6882,18 +6973,8 @@ impl TuiApp {
                     {
                         self.expanded_tools.insert(result.call_id.clone());
                     }
-                    if result.name == "TodoWrite"
-                        && !result.is_error
-                        && let Some(rows) = crate::todo_view::parse_rendered(&result.full_output)
-                            .or_else(|| crate::todo_view::parse_submission(&result.full_input))
-                    {
-                        let changes = crate::todo_view::status_changes(&rows, &self.latest_todos);
-                        self.todo_changes
-                            .insert(result.call_id.clone(), changes.clone());
-                        self.todo_section_changes = changes;
-                        self.latest_todos = rows;
-                        self.expanded_tools.insert(result.call_id.clone());
-                        todo_armed = Some(result.call_id.clone());
+                    if result.name == "TodoWrite" && !result.is_error {
+                        todo_armed = self.graduate_todo_plan(&result);
                     }
                     self.push_message(TuiMessage::Assistant {
                         blocks: vec![ContentBlock::Tool {
@@ -6936,9 +7017,50 @@ impl TuiApp {
                 self.post_notice(wording.to_string());
             }
         }
+        let retired = take_locked(&self.state.retired_plan_entries);
+        if !retired.is_empty() {
+            self.latest_todos.retain(|row| {
+                !matches!(row.status, todo_view::TodoStatus::Pending)
+                    || !retired.iter().any(|entry| {
+                        entry.id == row.id
+                            && entry.subject == row.subject
+                            && entry.generation > self.todo_generation
+                    })
+            });
+        }
         if turn_ended && let Some(hook) = &self.turn_end_hook {
             hook(&self.conversation, machine_history.as_ref());
         }
+    }
+
+    /// Graduate one accepted `TodoWrite` result into the standing
+    /// plan.
+    ///
+    /// The enforced render supplies the rows and where each entry
+    /// stands; the submission supplies each row's whole wording, which
+    /// a rendered page keeps only as its first line. A result that
+    /// parses through neither half graduates nothing and returns
+    /// `None`; one that lands returns its call id — the call the frame
+    /// auto-expands — beside the rows, status deltas, and plan
+    /// generation it recorded.
+    fn graduate_todo_plan(
+        &mut self,
+        result: &crate::observer::ToolResultDisplay,
+    ) -> Option<String> {
+        let rows = crate::todo_view::parse_rendered(&result.full_output)
+            .map(|rows| crate::todo_view::rows_with_submitted_subjects(rows, &result.full_input))
+            .or_else(|| crate::todo_view::parse_submission(&result.full_input))?;
+        let changes = crate::todo_view::status_changes(&rows, &self.latest_todos);
+        self.todo_changes
+            .insert(result.call_id.clone(), changes.clone());
+        self.todo_section_changes = changes;
+        self.latest_todos = rows;
+        self.todo_generation = self
+            .state
+            .todo_graduation_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        self.expanded_tools.insert(result.call_id.clone());
+        Some(result.call_id.clone())
     }
 
     /// Flatten the conversation into styled lines for the given width.
@@ -7164,6 +7286,9 @@ impl TuiApp {
                     ));
                 } else if name == "TodoWrite"
                     && let Some(rows) = crate::todo_view::parse_rendered(&detail.output)
+                        .map(|rows| {
+                            crate::todo_view::rows_with_submitted_subjects(rows, &detail.input_json)
+                        })
                         .or_else(|| crate::todo_view::parse_submission(&detail.input_json))
                 {
                     let colors = crate::todo_view::TodoColors {
@@ -7526,6 +7651,12 @@ impl TuiApp {
         if total == 0 {
             return 0;
         }
+        if self.queue_posture == QueuePosture::Folded && self.queue_mode == QueueMode::Plain {
+            // Air above the badge row: whatever stands over the section
+            // — the plan, the transcript — keeps the row of separation
+            // the standing section's own standoff pays for.
+            return 2;
+        }
         let shown = self.queue_view.min(total.saturating_sub(1));
         let Some((_, text)) = self.queued_at(shown) else {
             return 0;
@@ -7577,6 +7708,35 @@ impl TuiApp {
             return;
         }
         let total = self.queued_display_len();
+        if total == 0 {
+            return;
+        }
+        if self.queue_posture == QueuePosture::Folded && self.queue_mode == QueueMode::Plain {
+            // The fold's two rows, the todo fold's shape: a row of air,
+            // then the badge pill and a dim count naming the chord that
+            // lifts the section back — a hidden backlog stays a fact on
+            // screen, and the section above keeps its separation.
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from(Vec::new()),
+                    Line::from(vec![
+                        Span::styled(
+                            format!(" {QUEUE_TITLE} "),
+                            Style::default()
+                                .fg(self.theme.ui.background)
+                                .bg(self.theme.ui.primary),
+                        ),
+                        Span::raw(" "),
+                        Span::styled(
+                            format!("{total} waiting · ctrl+q to show"),
+                            Style::default().fg(self.theme.ui.dim),
+                        ),
+                    ]),
+                ]),
+                area,
+            );
+            return;
+        }
         let shown = self.queue_view.min(total.saturating_sub(1));
         let Some((_, text)) = self.queued_at(shown) else {
             return;
@@ -7649,28 +7809,26 @@ impl TuiApp {
                 QueueAct::Drop => "drop this prompt? y/n",
             }
         } else if self.queue_mode == QueueMode::Focused {
-            "\u{2190}/\u{2192} walk  e edit  s guide  d drop  esc back"
+            "\u{2190}/\u{2192} walk  ctrl+w next  e edit  s guide  d drop  esc back"
         } else {
-            "ctrl+q walk the queue"
+            "ctrl+w walk  ctrl+q hide"
         }
     }
 
-    /// Render the notice row: one line of transient or state-driven
-    /// message above the composer.
+    /// The notice's current text, if any stands.
     ///
-    /// The armed-quit hint owns the row while it holds — safety
-    /// wording outranks anything expiring — and a transient
-    /// notice (a cancel, an event worth a glance, not a transcript
-    /// row) shows until its hold elapses. Stream and tool retries
-    /// live in the conversation as their own rows and keep this row
-    /// free. Blank otherwise; the row is
-    /// always reserved so nothing on screen shifts when a message
-    /// arrives or leaves.
-    fn render_notice(&self, frame: &mut Frame, area: Rect) {
-        if area.height == 0 {
-            return;
-        }
-        let text = if self.quit.armed {
+    /// One line of state-driven or transient message, chosen by
+    /// precedence: while the quit ladder is armed, a standing transient
+    /// notice speaks in its place and the ladder's own wording only
+    /// when none does; past that, the health notice, a transient
+    /// notice still inside its hold, and the steering hint, in that
+    /// order. Stream and tool retries never appear here — they live in
+    /// the conversation as their own rows — so whatever this returns
+    /// is the one line the frame has to say, hosted by
+    /// [`render_notice`](Self::render_notice) or the place row's right
+    /// edge.
+    fn notice_text(&self) -> Option<String> {
+        if self.quit.armed {
             Some(self.transient_notice.as_ref().map_or_else(
                 || "press ctrl+c again to quit".to_string(),
                 |(notice, _)| notice.clone(),
@@ -7684,8 +7842,22 @@ impl TuiApp {
                         .map(|(text, _)| text.clone())
                 })
                 .or_else(|| self.steering_hint())
-        };
-        if let Some(text) = text {
+        }
+    }
+
+    /// Render the notice row: one line of transient or state-driven
+    /// message, right-aligned.
+    ///
+    /// The row the place-less frame reserves so nothing on screen
+    /// shifts when a message arrives or leaves — with a place row
+    /// standing, the notice rides that row's right edge instead and
+    /// this renders nowhere. Blank otherwise; the text is the same
+    /// one [`render_place_row`](Self::render_place_row) hosts.
+    fn render_notice(&self, frame: &mut Frame, area: Rect) {
+        if area.height == 0 {
+            return;
+        }
+        if let Some(text) = self.notice_text() {
             frame.render_widget(
                 Paragraph::new(text)
                     .style(Style::default().fg(self.theme.ui.input_border))
@@ -8026,6 +8198,26 @@ impl TuiApp {
         if text.is_empty() {
             return;
         }
+        // The notice rides this row's right edge: the place names
+        // where the session stands on the left, and whatever the frame
+        // has to say — a transient notice, the quit ladder's arm —
+        // answers from the right. The notice wins the columns it
+        // needs and the place keeps the rest; nothing wraps, because
+        // the row is one line and the shorter text clips before the
+        // two can collide. The corner a short row cannot buy out of is
+        // a notice that would take the whole row: the place's share
+        // floors at zero there and renders nothing, so the row belongs
+        // entirely to the notice rather than painting one place cell
+        // underneath it.
+        let notice = self.notice_text();
+        let notice_len = notice
+            .as_ref()
+            .map_or(0u16, |text| u16::try_from(text.width()).unwrap_or(u16::MAX))
+            .saturating_add(1);
+        let row_width = area
+            .width
+            .max(1)
+            .saturating_sub(INPUT_SIDE_INSET.saturating_mul(2));
         frame.render_widget(
             Paragraph::new(text).style(Style::default().fg(self.theme.ui.dim)),
             Rect {
@@ -8035,12 +8227,25 @@ impl TuiApp {
                     .min(area.right().saturating_sub(1)),
                 y: area.y,
                 height: 1,
-                width: area
-                    .width
-                    .max(1)
-                    .saturating_sub(INPUT_SIDE_INSET.saturating_mul(2)),
+                width: row_width.saturating_sub(notice_len),
             },
         );
+        if let Some(notice) = notice {
+            frame.render_widget(
+                Paragraph::new(notice)
+                    .style(Style::default().fg(self.theme.ui.input_border))
+                    .alignment(ratatui::layout::Alignment::Right),
+                Rect {
+                    x: area
+                        .x
+                        .saturating_add(INPUT_SIDE_INSET)
+                        .min(area.right().saturating_sub(1)),
+                    y: area.y,
+                    height: 1,
+                    width: row_width,
+                },
+            );
+        }
     }
 
     /// The place row's text: the working directory spelled per the

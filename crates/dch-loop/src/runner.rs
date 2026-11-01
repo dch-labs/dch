@@ -150,6 +150,43 @@ pub struct Runner {
     /// [`Runner::run_with`] rather than rebuilding the `Runner` (rebuilding
     /// creates a fresh `BareLoop` and discards the conversation).
     run_config: RunConfig,
+
+    /// Whether any prompt has claimed this runner yet.
+    ///
+    /// The claim-edge retirement of never-started plan entries spares
+    /// the first claim of a runner's life: a resumed runner's seeded
+    /// plan is the prior session's open work arriving whole, and the
+    /// first continued run owes it unchanged — every claim past that
+    /// one is a new prompt, and a new prompt inherits owed work, not
+    /// abandoned ideas.
+    claimed_once: bool,
+
+    /// The plan entries the last claim retired, awaiting the host.
+    ///
+    /// Cleared and refilled at every claim past the first that finds
+    /// unfinished entries, and handed to the host through
+    /// [`take_claim_retirements`](Self::take_claim_retirements)
+    /// so the display and every plan reader can publish the change. A
+    /// claim that finds every entry completed — the empty store
+    /// included — clears the store and this batch both: the batch is
+    /// strictly one claim's retirements, so a claim that retires
+    /// nothing hands the host nothing, however the claim before it
+    /// ended.
+    claim_retirements: Vec<dch_tools::TodoEntry>,
+
+    /// The host's synchronous eye on the claim's retirements.
+    ///
+    /// Set by
+    /// [`with_retirement_sink`](RunnerBuilder::with_retirement_sink);
+    /// when present it receives the batch the moment a claim retires
+    /// entries — before the run the claim precedes has asked the
+    /// provider anything — so a host whose display shows the plan can
+    /// publish the retirement while that run is still in flight rather
+    /// than after it resolves. The batch still accumulates for
+    /// [`take_claim_retirements`](Self::take_claim_retirements); a
+    /// host that registered a sink reads the change here and leaves
+    /// the polling accessor to the hosts that never registered one.
+    retirement_sink: Option<RetirementSink>,
 }
 
 impl Runner {
@@ -182,6 +219,7 @@ impl Runner {
             history: Vec::new(),
             permission_resolver: None,
             todo_nudge: None,
+            retirement_sink: None,
         }
     }
 
@@ -190,7 +228,9 @@ impl Runner {
     /// Uses the run policy mapped from `DchConfig` at construction (turn
     /// budget, dispatch policy). The session's todo plan carries into this
     /// run when it holds unfinished entries and retires when the prior run
-    /// finished everything. Returns when the model signals end-of-turn, the
+    /// finished everything; a claim past the runner's first also retires
+    /// entries still pending — never started — while in-progress entries
+    /// carry as owed work. Returns when the model signals end-of-turn, the
     /// budget is exhausted, the loop detector aborts, or
     /// [`Runner::cancel`] is called. Equivalent to [`Runner::run_with`] with
     /// the default config; the conversation is shared across `run`/`run_with`
@@ -214,7 +254,12 @@ impl Runner {
     /// session default for this one call without rebuilding the `Runner` (a
     /// rebuild constructs a fresh `BareLoop` and discards the conversation).
     /// The session's todo plan carries into this run when it holds unfinished
-    /// entries and retires when the prior run finished everything. The
+    /// entries and retires when the prior run finished everything; a claim
+    /// past the runner's first also retires entries still pending — never
+    /// started, so a new prompt inherits the owed work (in progress) and
+    /// the history (completed) but not the ideas an earlier prompt filed
+    /// and left — while the first claim of a resumed runner carries the
+    /// seeded plan whole. The
     /// returned [`Run`] records `run_config` as its own snapshot, so per-call
     /// overrides are visible in the run's accounting. This mirrors loopctl's
     /// own default/override pairing (`stream_messages` vs
@@ -243,9 +288,46 @@ impl Runner {
                 .all(|entry| matches!(entry.status, dch_tools::TodoStatus::Completed))
             {
                 store.clear();
+                self.claim_retirements.clear();
+            } else if self.claimed_once {
+                self.claim_retirements.clear();
+                store.retain(|entry| {
+                    let standing = !matches!(entry.status, dch_tools::TodoStatus::Pending);
+                    if standing {
+                        true
+                    } else {
+                        self.claim_retirements.push(entry.clone());
+                        false
+                    }
+                });
             }
         }
+        if let Some(sink) = &self.retirement_sink
+            && !self.claim_retirements.is_empty()
+        {
+            sink(&self.claim_retirements);
+        }
+        self.claimed_once = true;
         self.inner.run(input, run_config).await
+    }
+
+    /// Take the plan entries the last claim retired.
+    ///
+    /// The claim-edge retirement drops never-started entries from the
+    /// store where the run cannot see them; this hands the dropped
+    /// entries to the host so the change is published — the display's
+    /// plan section drops the retired rows instead of holding them
+    /// until the next `TodoWrite` lands. Each claim's batch is
+    /// replaced by the next: a host that polls after every run never
+    /// misses one, and a host that never polls loses only the record,
+    /// never the retirement itself. A host that needs the batch the
+    /// moment the claim makes it — while the run is still in flight —
+    /// registers
+    /// [`with_retirement_sink`](RunnerBuilder::with_retirement_sink)
+    /// instead and reads it there.
+    #[must_use]
+    pub fn take_claim_retirements(&mut self) -> Vec<dch_tools::TodoEntry> {
+        std::mem::take(&mut self.claim_retirements)
     }
 
     /// Signal the in-flight run, if any, to cancel.
@@ -521,6 +603,14 @@ pub struct RunnerBuilder<'a> {
     /// before the plan is read in both — so a host that begins
     /// leaving mid-session declines without unwinding anything.
     todo_nudge: Option<TodoNudgeRegistration>,
+
+    /// The host's claim-edge eye on plan retirements.
+    ///
+    /// Set by [`with_retirement_sink`](Self::with_retirement_sink);
+    /// `None` on a host that polls
+    /// [`take_claim_retirements`](Runner::take_claim_retirements)
+    /// after its runs instead.
+    retirement_sink: Option<RetirementSink>,
 }
 
 /// The host-supplied halves of the todo nudge.
@@ -534,6 +624,14 @@ type TodoNudgeRegistration = (
     Arc<dyn Fn(String) + Send + Sync>,
     Arc<dyn Fn() -> bool + Send + Sync>,
 );
+
+/// The host's claim-edge publication for plan retirements.
+///
+/// Receives the entries a claim retired, the whole batch at once, at
+/// the claim edge itself — the shape
+/// [`with_retirement_sink`](RunnerBuilder::with_retirement_sink)
+/// registers and the runner keeps beside its own polling accessor.
+type RetirementSink = Arc<dyn Fn(&[dch_tools::TodoEntry]) + Send + Sync>;
 
 impl RunnerBuilder<'_> {
     /// Register a lifecycle observer.
@@ -634,6 +732,30 @@ impl RunnerBuilder<'_> {
         may_extend: impl Fn() -> bool + Send + Sync + 'static,
     ) -> Self {
         self.todo_nudge = Some((Arc::new(echo), Arc::new(may_extend)));
+        self
+    }
+
+    /// Publish each claim's plan retirements the moment the claim
+    /// makes them.
+    ///
+    /// The sink receives the entries a claim past the first retires —
+    /// never-started plan entries dropped so the run inherits owed
+    /// work and history, not abandoned ideas — at the claim edge
+    /// itself: the call happens before the run the claim precedes has
+    /// sent the provider anything, so a host whose display renders the
+    /// plan can drop the retired rows while that run is still in
+    /// flight instead of holding them until the run resolves. Spared
+    /// claims — a runner's first, and any that retires nothing — call
+    /// nothing. The batch still lands in
+    /// [`take_claim_retirements`](Runner::take_claim_retirements);
+    /// a host that registers a sink reads the change here and leaves
+    /// the polling accessor to the hosts that never registered one.
+    #[must_use]
+    pub fn with_retirement_sink(
+        mut self,
+        sink: impl Fn(&[dch_tools::TodoEntry]) + Send + Sync + 'static,
+    ) -> Self {
+        self.retirement_sink = Some(Arc::new(sink));
         self
     }
 
@@ -767,6 +889,9 @@ impl RunnerBuilder<'_> {
             context,
             fs_session,
             run_config,
+            claimed_once: false,
+            claim_retirements: Vec::new(),
+            retirement_sink: self.retirement_sink,
         })
     }
 }
@@ -2664,6 +2789,220 @@ mod tests {
             .expect("the installed stream carries the request")
             .expect("the bridge stays alive");
         assert_eq!(prompt.question, "wired?");
+    }
+
+    /// A store entry with the given id and status, subject and id alike.
+    fn standing_entry(id: &str, status: dch_tools::TodoStatus) -> dch_tools::TodoEntry {
+        dch_tools::TodoEntry {
+            id: id.to_string(),
+            subject: id.to_string(),
+            description: String::new(),
+            status,
+            active_form: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_second_claim_retires_never_started_entries() {
+        // The plan a new prompt inherits: owed work, not abandoned
+        // ideas. Entries still pending were never started — the rung
+        // law has no way back into pending — so the claim past the
+        // first drops them while the in-progress entry carries, and
+        // the exit's unfinished count reads only what is owed. The
+        // first claim is exempt: a runner fresh off a build owes its
+        // standing plan whole.
+        let config = offline_config();
+        let dir = TempDir::new().expect("tempdir");
+        let mut runner = Runner::builder(&config, dir.path())
+            .build()
+            .await
+            .expect("constructs");
+        {
+            let mut store = runner.context.todos.lock().expect("todos lock");
+            store.push(standing_entry("idea", dch_tools::TodoStatus::Pending));
+            store.push(standing_entry("owed", dch_tools::TodoStatus::InProgress));
+        }
+        drop(runner.run("first prompt").await);
+        let after_first: Vec<String> = runner
+            .context
+            .todos
+            .lock()
+            .expect("todos lock")
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect();
+        assert_eq!(
+            after_first,
+            ["idea", "owed"],
+            "the first claim carries the standing plan whole"
+        );
+        drop(runner.run("second prompt").await);
+        let after_second: Vec<String> = runner
+            .context
+            .todos
+            .lock()
+            .expect("todos lock")
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect();
+        assert_eq!(
+            after_second,
+            ["owed"],
+            "the second claim retires the never-started entry"
+        );
+        assert_eq!(
+            runner.todo_undone(),
+            1,
+            "the unfinished count reads only the owed work"
+        );
+        let retired = runner.take_claim_retirements();
+        assert_eq!(
+            retired
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            ["idea"],
+            "the dropped entry is handed to the host for publishing"
+        );
+        assert!(
+            runner.take_claim_retirements().is_empty(),
+            "the take drains the batch — a polling host never re-reads a claim"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retirement_sink_hears_the_batch_at_the_claim_itself() {
+        // The claim edge, not the run's landing: the sink owes the host
+        // the batch while the run it precedes is still in flight, and
+        // the strictest offline proof of that is a run whose provider
+        // refuses the connection outright — the run never answers
+        // anything, yet the retirement the claim made has already been
+        // published. The spared first claim calls nothing, and the
+        // polling accessor still holds the batch a sink-registered
+        // host leaves for the ones that never registered.
+        let mut config = offline_config();
+        config.api.base_url = "http://127.0.0.1:1".to_string();
+        let dir = TempDir::new().expect("tempdir");
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_seen = Arc::clone(&seen);
+        let mut runner = Runner::builder(&config, dir.path())
+            .with_retirement_sink(move |entries| {
+                let mut seen = sink_seen.lock().expect("sink record lock");
+                for entry in entries {
+                    seen.push(entry.id.clone());
+                }
+            })
+            .build()
+            .await
+            .expect("constructs");
+        {
+            let mut store = runner.context.todos.lock().expect("todos lock");
+            store.push(standing_entry("idea", dch_tools::TodoStatus::Pending));
+        }
+        drop(runner.run("first prompt").await);
+        assert!(
+            seen.lock().expect("sink record lock").is_empty(),
+            "the spared first claim retires nothing, so the sink hears nothing"
+        );
+        drop(runner.run("second prompt").await);
+        assert_eq!(
+            *seen.lock().expect("sink record lock"),
+            ["idea".to_string()],
+            "the claim published its retirement before the refused run resolved anything"
+        );
+        assert_eq!(
+            runner
+                .take_claim_retirements()
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            ["idea"],
+            "the batch still waits in the polling accessor — the sink is a second leg, not a replacement"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_claim_over_a_finished_plan_refires_nothing() {
+        // The batch is strictly one claim's retirements. The sink host
+        // never drains the polling accessor, so the retiring claim's
+        // batch is still standing when the next claim arrives over an
+        // empty store — every entry completed, which the empty store
+        // trivially is — and that claim must hand the host nothing:
+        // the store-clearing arm empties the batch beside the store,
+        // so an already-published retirement cannot fire twice and a
+        // polling host cannot re-read it.
+        let mut config = offline_config();
+        config.api.base_url = "http://127.0.0.1:1".to_string();
+        let dir = TempDir::new().expect("tempdir");
+        let fired: Arc<std::sync::atomic::AtomicUsize> =
+            Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sink_fired = Arc::clone(&fired);
+        let mut runner = Runner::builder(&config, dir.path())
+            .with_retirement_sink(move |_entries| {
+                sink_fired.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+            .build()
+            .await
+            .expect("constructs");
+        {
+            let mut store = runner.context.todos.lock().expect("todos lock");
+            store.push(standing_entry("idea", dch_tools::TodoStatus::Pending));
+        }
+        drop(runner.run("first prompt").await);
+        drop(runner.run("second prompt").await);
+        assert_eq!(
+            fired.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the second claim published its retirement exactly once"
+        );
+        drop(runner.run("third prompt").await);
+        assert_eq!(
+            fired.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the claim over the emptied store fires nothing — the retired \
+             batch died with the plan that held it"
+        );
+        assert!(
+            runner.take_claim_retirements().is_empty(),
+            "a polling host reads the finished plan's claim as empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_first_claim_carries_the_seeded_plan_whole() {
+        // The resume half: a restored history whose last render holds
+        // undone entries seeds the store, and the session's first
+        // continued run owes that plan unchanged — the retirement is
+        // for claims past the first, so resuming to finish open work
+        // never finds its pendings gone.
+        let config = offline_config();
+        let dir = TempDir::new().expect("tempdir");
+        let seeded_render = "# Task List\n\nSummary: 1 pending, 0 in progress, 0 \
+             completed\n\n○ [only] the owed work\n\n";
+        let history = vec![loopctl::message::Message::new(
+            loopctl::message::Role::User,
+            vec![loopctl::message::MessagePart::tool_result(
+                "c1",
+                "TodoWrite",
+                seeded_render,
+                false,
+            )],
+        )];
+        let mut runner = Runner::builder(&config, dir.path())
+            .with_history(history)
+            .build()
+            .await
+            .expect("constructs");
+        drop(runner.run("continue the work").await);
+        let store = runner.context.todos.lock().expect("todos lock").clone();
+        assert_eq!(
+            store
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            ["only"],
+            "the resumed session's first run carries its seeded plan whole"
+        );
     }
 
     #[tokio::test]

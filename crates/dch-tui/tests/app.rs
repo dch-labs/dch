@@ -7335,6 +7335,42 @@ fn queued_questions_keep_the_conversation_clear() {
 }
 
 #[test]
+fn the_question_sheet_reservation_counts_the_place_row_once() {
+    // The sheet covers the frame's bottom furniture, and the
+    // reservation must charge for exactly what it covers: with a place
+    // row standing, the notice rides that row's right edge, so the
+    // furniture above the composer is spacer + place — two rows — and
+    // a formula that also subtracts the place separately holds the
+    // conversation one row short of what the sheet needs, leaving a
+    // dead row between the transcript and the sheet.
+    let (mut app, _replies) = question_app(&[StagedQuestion {
+        question: "Ship the release to production tonight?",
+        options: &[("yes", None), ("no", None)],
+        multi_select: false,
+    }]);
+    app.set_working_dir(std::path::Path::new("/home/dch/repos/dch"));
+    for step in 0..30 {
+        app.push_message(dch_tui::TuiMessage::System {
+            text: format!("conversation row {step}"),
+            timestamp: chrono::Utc::now(),
+        });
+    }
+    app.push_message(dch_tui::TuiMessage::System {
+        text: "TAIL MARKER".to_string(),
+        timestamp: chrono::Utc::now(),
+    });
+    let terminal = render_to_buffer(&mut app, 60, 24);
+    let tail = row_of(&terminal, "TAIL MARKER");
+    let sheet = row_of(&terminal, "Question");
+    assert_eq!(
+        sheet.saturating_sub(tail),
+        1,
+        "the sheet tops one row below the transcript's tail — the \
+         reservation and the sheet agree row for row: tail at {tail}, sheet at {sheet}"
+    );
+}
+
+#[test]
 fn a_pending_question_renders_the_overlay() {
     let (mut app, _replies) = question_app(&[StagedQuestion {
         question: "Deploy the release now?",
@@ -9744,6 +9780,7 @@ fn todo_graduation(app: &TuiApp, call_id: &str, submission: &str) {
 /// Feed one `TodoWrite` graduation carrying the tool's rendered result,
 /// the enforced truth a rung-law adjustment produces.
 fn todo_graduation_with_output(app: &TuiApp, call_id: &str, submission: &str, output: &str) {
+    app.note_todo_graduated();
     app.graduations()
         .lock()
         .unwrap()
@@ -9917,22 +9954,11 @@ fn the_plan_stands_pinned_while_tasks_do() {
         "the section carries the run's current task: {flat:?}"
     );
 
-    // Ctrl+T walks the section's postures — capped, full, hidden. A
-    // list that already fits the cap opens without changing a thing;
-    // the next press folds the section away (the transcript's block
-    // keeps the record, the conversation takes the rows back); the
-    // press after that stands it back up.
-    assert!(app.handle_event(&Event::Key(KeyEvent::new(
-        KeyCode::Char('t'),
-        KeyModifiers::CONTROL,
-    ))));
-    let terminal = render_to_buffer(&mut app, 80, 30);
-    let flat: String = row_texts(&terminal).join("\n");
-    assert_eq!(
-        flat.matches("1/2 done").count(),
-        2,
-        "a list that fits the cap opens unchanged: {flat:?}"
-    );
+    // Ctrl+T walks the section's postures — capped, full, hidden.
+    // A list that already fits the cap has nothing to open, so the
+    // chord spends that press on the fold instead — opening a list
+    // that stands whole changes nothing; the next press stands it
+    // back up in the capped posture.
     assert!(app.handle_event(&Event::Key(KeyEvent::new(
         KeyCode::Char('t'),
         KeyModifiers::CONTROL,
@@ -9942,11 +9968,12 @@ fn the_plan_stands_pinned_while_tasks_do() {
     assert_eq!(
         flat.matches("1/2 done").count(),
         1,
-        "the next press hides the section — the fraction stands in the \
-         transcript's block alone: {flat:?}"
+        "a list that fits the cap folds rather than opening into the \
+         same rows — the fraction stands in the transcript's block \
+         alone: {flat:?}"
     );
     assert!(
-        flat.contains("1/2 · ctrl+t") && flat.contains(" TODO "),
+        flat.contains("1/2 · ctrl+t to show") && flat.contains(" TODO "),
         "the folded section leaves its badge row: the pill, the count, \
          and the chord that opens the list again: {flat:?}"
     );
@@ -10158,7 +10185,7 @@ fn a_long_plan_caps_its_section_and_names_the_cut() {
          them: {flat:?}"
     );
     assert!(
-        flat.contains("0/9 · ctrl+t") && flat.contains(" TODO "),
+        flat.contains("0/9 · ctrl+t to show") && flat.contains(" TODO "),
         "and the badge row stands in the section's place — the pill, the \
          count, and the chord: {flat:?}"
     );
@@ -11332,9 +11359,9 @@ fn the_capped_plan_badge_names_the_chord_that_opens_it() {
         "the fraction rides the badge: {badge_row:?}"
     );
     assert!(
-        badge_row.contains("ctrl+t"),
-        "the capped badge names the chord that opens the whole list, \
-         even when the cap cut nothing: {badge_row:?}"
+        badge_row.contains("ctrl+t to hide"),
+        "a plan that fits the cap has nothing to open — the badge names \
+         the fold its press performs: {badge_row:?}"
     );
     assert!(
         !rows.iter().any(|row| row.contains("more (ctrl+t")),
@@ -11349,9 +11376,120 @@ fn the_capped_plan_badge_names_the_chord_that_opens_it() {
         .find(|row| row.contains(" TODO "))
         .expect("the badge still names the section");
     assert!(
-        !badge_row.contains("ctrl+t"),
-        "the open list is its own answer — the full view carries no \
-         chord nudge: {badge_row:?}"
+        badge_row.contains("ctrl+t to show"),
+        "the folded row names the chord that stands the list back up: {badge_row:?}"
+    );
+    assert!(
+        rows.iter().filter(|row| row.contains("0/2 done")).count() == 1,
+        "the folded section spends no rows on the entries — the one \
+         fraction left is the transcript block's: {rows:?}"
+    );
+}
+
+#[test]
+fn ctrl_t_opens_only_when_the_cap_cut_an_entry() {
+    // The cycle's spent press: a list the cap actually cut has
+    // something to open, so the chord walks capped → full → hidden →
+    // capped in order — and the open posture shows every entry with
+    // no ellipsis standing in for the ones the cap hid.
+    let mut app = app();
+    let six: Vec<String> = (0..6)
+        .map(|index| {
+            format!("{{\"id\":\"{index}\",\"subject\":\"task {index}\",\"status\":\"pending\"}}")
+        })
+        .collect();
+    todo_graduation(
+        &app,
+        "call-cut",
+        &format!("{{\"todos\":[{}]}}", six.join(",")),
+    );
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&terminal);
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("+2 more (ctrl+t for all)")),
+        "the capped posture cut two entries and says so: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.contains("ctrl+t to show all")),
+        "a cut cap names the whole list its press opens: {rows:?}"
+    );
+
+    app.handle_event(&key(KeyCode::Char('t'), KeyModifiers::CONTROL));
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&terminal);
+    for index in 0..6 {
+        assert!(
+            rows.iter()
+                .any(|row| row.contains(&format!("task {index}"))),
+            "the open posture shows entry {index}: {rows:?}"
+        );
+    }
+    assert!(
+        !rows.iter().any(|row| row.contains("more (ctrl+t")),
+        "nothing stands behind an ellipsis in the open posture: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.contains("ctrl+t to hide")),
+        "the open list names the fold its press performs: {rows:?}"
+    );
+
+    app.handle_event(&key(KeyCode::Char('t'), KeyModifiers::CONTROL));
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&terminal);
+    assert!(
+        rows.iter().any(|row| row.contains("0/6 · ctrl+t to show"))
+            && !rows.iter().any(|row| row.contains("more (ctrl+t")),
+        "the next press folds the cut list to its badge, ellipsis and all: {rows:?}"
+    );
+
+    app.handle_event(&key(KeyCode::Char('t'), KeyModifiers::CONTROL));
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&terminal);
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("+2 more (ctrl+t for all)")),
+        "and the walk returns to the capped posture: {rows:?}"
+    );
+}
+
+#[test]
+fn a_folded_queue_keeps_its_air_over_the_plan() {
+    // The standing section pays for its own row of air above its
+    // badge; the fold owes the same separation, or whatever stands
+    // over it — the plan, the transcript — sits flush on the count
+    // row and the two sections read as one cramped block.
+    let (mut app, kept) = app_with_state();
+    todo_graduation(
+        &app,
+        "call-1",
+        r#"{"todos":[
+            {"id":"1","subject":"one thing","status":"in_progress"}
+        ]}"#,
+    );
+    {
+        let mut queue = kept
+            .queued
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        queue.push("first waiting".to_string());
+        queue.push("second waiting".to_string());
+    }
+    app.handle_event(&key(KeyCode::Char('q'), KeyModifiers::CONTROL));
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&terminal);
+    let fold_row = rows
+        .iter()
+        .position(|row| row.contains("2 waiting · ctrl+q to show"))
+        .expect("the folded count row renders");
+    assert!(
+        rows.get(fold_row.saturating_sub(1))
+            .is_some_and(|row| row.trim().is_empty()),
+        "a row of air stands between the plan and the folded count: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.contains("\u{25d0} one thing")),
+        "the plan stands above the fold: {rows:?}"
     );
 }
 
@@ -12387,5 +12525,297 @@ fn a_layout_rebake_leaves_no_stale_chrome() {
         buffer[(5, second_row)].bg,
         app.theme.ui.surface,
         "the rebaked layout boxes each turn on its new rows"
+    );
+}
+
+#[test]
+fn the_notice_rides_the_place_row_and_saves_its_own() {
+    // The notice used to reserve a whole row above the place row —
+    // blank almost always, one line of right-aligned text rarely. With
+    // a place named it rides that row's right edge instead: the frame
+    // keeps the row for the conversation, and the notice is exactly as
+    // visible as it ever was.
+    let (mut app, _kept) = app_with_state();
+    app.set_working_dir(std::path::Path::new("/home/dch/repos/dch"));
+    app.set_git_branch(Some("feat/x".to_string()));
+    app.post_notice("THE NOTICE SPEAKS".to_string());
+    let terminal = render_to_buffer(&mut app, 80, 26);
+    let rows = row_texts(&terminal);
+    let shared = rows
+        .iter()
+        .find(|row| row.contains("repos/dch (feat/x)"))
+        .expect("the place row names where the session stands");
+    assert!(
+        shared.contains("THE NOTICE SPEAKS"),
+        "the notice answers from the place row's right edge: {shared:?}"
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.contains("THE NOTICE SPEAKS"))
+            .count(),
+        1,
+        "no second row holds the notice — the dedicated one is gone, and \
+         the conversation pane keeps the row it freed: {rows:?}"
+    );
+}
+
+#[test]
+fn a_place_less_frame_keeps_the_reserved_notice_row() {
+    // Without a place row to host it, the notice keeps the row it
+    // always had: reserved, blank when silent, right-aligned when it
+    // speaks — nothing on screen shifts when a message arrives.
+    let (mut app, _kept) = app_with_state();
+    app.post_notice("THE NOTICE SPEAKS".to_string());
+    let terminal = render_to_buffer(&mut app, 80, 26);
+    let rows = row_texts(&terminal);
+    let notice_row = rows
+        .iter()
+        .find(|row| row.contains("THE NOTICE SPEAKS"))
+        .expect("the notice renders on its own row when no place stands");
+    assert!(
+        notice_row.trim_start().starts_with("THE NOTICE")
+            || notice_row.ends_with("THE NOTICE SPEAKS"),
+        "right-aligned on a row of its own: {notice_row:?}"
+    );
+}
+
+#[test]
+fn a_wide_glyph_notice_reserves_its_full_width() {
+    // The notice's length is a budget of display cells, not
+    // characters: a fullwidth glyph occupies two cells but counts as
+    // one character, and a char-counted budget would let the
+    // right-aligned notice paint over the place text's tail. Measured
+    // in cells, the place keeps the columns the notice needs and both
+    // texts stand whole on the row.
+    let (mut app, _kept) = app_with_state();
+    app.set_working_dir(std::path::Path::new("/home/dch/repos/dch"));
+    app.post_notice("ワイドゴ通知".to_string());
+    let terminal = render_to_buffer(&mut app, 80, 26);
+    let rows = row_texts(&terminal);
+    let shared = rows
+        .iter()
+        .find(|row| row.contains("repos/dch"))
+        .expect("the place row names where the session stands");
+    assert!(
+        shared.contains("repos/dch"),
+        "the place text keeps its tail under a wide notice: {shared:?}"
+    );
+    assert!(
+        shared.replace(' ', "").contains("ワイドゴ通知"),
+        "the notice stands whole on the same row (cell-spaced in the text          extract): {shared:?}"
+    );
+}
+
+#[test]
+fn a_published_retirement_drops_only_the_pending_rows() {
+    // The runner retires never-started entries at a claim, and the
+    // driver publishes the ids through the shared state; the frame's
+    // drain applies them to the plan section. The channel retires
+    // pending rows alone — a completed entry sharing a retired id is
+    // history, and an in-progress one is owed, so both stand.
+    let (mut app, kept) = app_with_state();
+    todo_graduation(
+        &app,
+        "call-1",
+        r#"{"todos":[
+            {"id":"idea","subject":"the filed idea","status":"pending"},
+            {"id":"owed","subject":"the owed work","status":"in_progress"},
+            {"id":"done","subject":"the finished work","status":"completed"}
+        ]}"#,
+    );
+    {
+        kept.publish_claim_retirements(&[
+            ("idea".to_string(), "the filed idea".to_string()),
+            ("done".to_string(), "the finished work".to_string()),
+        ]);
+    }
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&terminal);
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.contains("the filed idea"))
+            .count(),
+        1,
+        "the retired pending row leaves the section — the one copy left \
+         is the transcript block's record: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.contains("1/2 done")),
+        "the section's fraction counts only what stands: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("\u{25d0} the owed work")),
+        "the owed row stands: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("\u{2611} the finished work")),
+        "a completed row retires through no claim — history stands: {rows:?}"
+    );
+}
+
+#[test]
+fn a_reborn_id_survives_its_stale_retirement() {
+    // A retirement names the entry the claim dropped — id and subject
+    // both. A later plan may re-use the retired id for a different
+    // task, and the tool treats the absent id as a new entry; an
+    // id-only retirement would take the reborn row with it while the
+    // runner keeps it, leaving the pinned plan stale. The pair is the
+    // identity: the reborn entry stands.
+    let (mut app, kept) = app_with_state();
+    todo_graduation(
+        &app,
+        "call-1",
+        r#"{"todos":[
+            {"id":"idea","subject":"the filed idea","status":"pending"}
+        ]}"#,
+    );
+    let _first = render_to_buffer(&mut app, 80, 30);
+    kept.publish_claim_retirements(&[("idea".to_string(), "the filed idea".to_string())]);
+    // The rebirth: a later update re-uses the id for a different task,
+    // and its graduation lands in the same frame as the retirement.
+    todo_graduation(
+        &app,
+        "call-2",
+        r#"{"todos":[
+            {"id":"idea","subject":"the reborn task","status":"pending"},
+            {"id":"owed","subject":"the owed work","status":"in_progress"}
+        ]}"#,
+    );
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&terminal);
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("\u{2610} the reborn task")),
+        "the reborn entry stands — its id was retired, its task was not: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("\u{25d0} the owed work")),
+        "the owed row stands untouched: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row.contains("the filed idea")),
+        "the retired entry leaves the screen whole — the prior block stands \
+         collapsed, the section shows the plan the store holds: {rows:?}"
+    );
+}
+
+#[test]
+fn a_reborn_row_of_the_same_id_and_subject_survives_its_stale_retirement() {
+    // The remaining corner of id re-use: a later plan re-adds the
+    // retired entry's id *and* subject both, so the pair alone cannot
+    // tell the two entries apart. The publication carries the plan
+    // generation it was made at, and a graduation that lands at or
+    // after that generation reads the retirement as stale — one frame
+    // draining the rebirth and the retirement together still leaves
+    // the reborn row standing, in step with the runner's own store.
+    let (mut app, kept) = app_with_state();
+    todo_graduation(
+        &app,
+        "call-1",
+        r#"{"todos":[
+            {"id":"idea","subject":"the filed idea","status":"pending"}
+        ]}"#,
+    );
+    let _first = render_to_buffer(&mut app, 80, 30);
+    kept.publish_claim_retirements(&[("idea".to_string(), "the filed idea".to_string())]);
+    // The rebirth: the next run files the very same task again, and
+    // its graduation lands in the same frame as the stale retirement.
+    todo_graduation(
+        &app,
+        "call-2",
+        r#"{"todos":[
+            {"id":"idea","subject":"the filed idea","status":"pending"},
+            {"id":"owed","subject":"the owed work","status":"in_progress"}
+        ]}"#,
+    );
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&terminal);
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("\u{2610} the filed idea")),
+        "the reborn entry stands — its id and subject were retired, its \
+         graduation was not: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("\u{25d0} the owed work")),
+        "the owed row stands untouched: {rows:?}"
+    );
+}
+
+#[test]
+fn a_multiline_subject_retires_through_its_whole_wording() {
+    // The rendered list is a page: a subject spanning lines reads back
+    // as its first line alone, while the store — and the retirement
+    // published from it — carries the wording whole. The graduation
+    // restores each row's wording from the submission beside the
+    // render's enforced statuses, so the retirement's identity
+    // comparison lands and the pending row leaves the section; an owed
+    // companion proves the cut is precise.
+    let (mut app, kept) = app_with_state();
+    todo_graduation_with_output(
+        &app,
+        "call-1",
+        r#"{"todos":[
+            {"id":"idea","subject":"the filed wording\nand its second line","status":"pending"},
+            {"id":"kept","subject":"the kept work","status":"in_progress"}
+        ]}"#,
+        concat!(
+            "# Task List\n\nSummary: 1 pending, 1 in progress, 0 completed\n\n",
+            "\u{25cb} [idea] the filed wording\n\u{25d0} [kept] the kept work\n\n",
+        ),
+    );
+    kept.publish_claim_retirements(&[(
+        "idea".to_string(),
+        "the filed wording\nand its second line".to_string(),
+    )]);
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&terminal);
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.contains("the filed wording"))
+            .count(),
+        1,
+        "the section's copy leaves on the whole-wording match — the one \
+         copy left is the transcript block's record: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("\u{25d0} the kept work")),
+        "the owed companion stands untouched: {rows:?}"
+    );
+}
+
+#[test]
+fn a_notice_that_fills_the_row_leaves_the_place_no_cell() {
+    // The place row's corner: a notice whose column budget equals the
+    // row's width leaves the place nothing to name where the session
+    // stands — the place's share floors at zero cells and renders
+    // nothing, rather than painting its leading path character into
+    // the one column that would sit left of the notice's span. The
+    // notice stands whole, right-aligned, with the row's first cell
+    // blank beside it.
+    let (mut app, _kept) = app_with_state();
+    app.set_working_dir(std::path::Path::new("/home/dch/repos/dch"));
+    let notice = "THE NOTICE FILLS THE ROW IT SITS ON";
+    assert_eq!(
+        notice.chars().count(),
+        35,
+        "the fixture's width is the contract: one cell short of the row"
+    );
+    app.post_notice(notice.to_string());
+    let terminal = render_to_buffer(&mut app, 40, 26);
+    let rows = row_texts(&terminal);
+    let notice_row = rows
+        .iter()
+        .find(|row| row.contains(notice))
+        .expect("the notice stands whole on the row");
+    assert!(
+        !notice_row.trim_start().starts_with('/'),
+        "the place yields the row's last free cell — no path character \
+         peeks left of the notice: {notice_row:?}"
     );
 }

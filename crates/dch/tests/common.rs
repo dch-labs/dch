@@ -1082,6 +1082,34 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
+/// How long any discovery probe may spend connecting or reading.
+///
+/// The probes back the smoke suite's model discovery against
+/// endpoints nobody controls: one that accepts a connection but never
+/// answers must not hold discovery hostage behind it, so every probe
+/// fails on this bound and discovery moves on to its next candidate.
+const PROBE_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// One bounded connection to `host:port`, trying every address the
+/// host resolves to.
+///
+/// A name can list an unreachable address ahead of a reachable one —
+/// `localhost` with its `IPv6` entry first is the ordinary case — so
+/// each candidate gets its own connect timeout and the first that
+/// answers wins. `None` means every attempt failed or the name
+/// resolved to nothing at all.
+fn connect_bounded(host: &str, port: u16) -> Option<TcpStream> {
+    let addresses: Vec<std::net::SocketAddr> = match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => vec![std::net::SocketAddr::new(ip, port)],
+        Err(_) => std::net::ToSocketAddrs::to_socket_addrs(&(host, port))
+            .ok()?
+            .collect(),
+    };
+    addresses
+        .iter()
+        .find_map(|address| TcpStream::connect_timeout(address, PROBE_BOUND).ok())
+}
+
 /// One minimal HTTP GET, returning the response body.
 ///
 /// Speaks just enough HTTP for the model-listing endpoints the smoke
@@ -1090,8 +1118,38 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// caller treats as "not listed here". Chunked transfer encoding —
 /// what Ollama actually answers with — is stripped before the body
 /// returns.
+/// Issue one small POST and return its 200 body, dechunked if needed.
+///
+/// The Ollama control endpoints (`/api/show` among them) take the
+/// query as a JSON body rather than on the path, so the discovery
+/// probe needs the POST half beside the GET helper.
+fn http_post_body(host: &str, port: u16, path: &str, body: &str) -> Option<String> {
+    let mut stream = connect_bounded(host, port)?;
+    stream.set_read_timeout(Some(PROBE_BOUND)).ok()?;
+    write!(
+        stream,
+        "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .ok()?;
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).ok()?;
+    let head_end = find_subslice(&raw, b"\r\n\r\n")?;
+    let head = String::from_utf8_lossy(raw.get(..head_end)?).to_lowercase();
+    let body = raw.get(head_end.checked_add(4)?..)?;
+    if !(head.starts_with("http/1.1 200") || head.starts_with("http/1.0 200")) {
+        return None;
+    }
+    if head.contains("transfer-encoding: chunked") {
+        Some(String::from_utf8_lossy(&dechunk(body)).to_string())
+    } else {
+        Some(String::from_utf8_lossy(body).to_string())
+    }
+}
+
 fn http_get_body(host: &str, port: u16, path: &str) -> Option<String> {
-    let mut stream = TcpStream::connect((host, port)).ok()?;
+    let mut stream = connect_bounded(host, port)?;
+    stream.set_read_timeout(Some(PROBE_BOUND)).ok()?;
     write!(
         stream,
         "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
@@ -1200,11 +1258,45 @@ pub fn discover_model(base_url: &str) -> Option<String> {
         .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
         .map(|listing| model_names(&listing, "data", "id"));
     let names = ollama.or(openai)?;
-    names
+    let chats: Vec<String> = names
+        .iter()
+        .filter(|name| chats_at(&host, port, prefix.as_str(), name.as_str()))
+        .cloned()
+        .collect();
+    if chats.is_empty() {
+        return names
+            .iter()
+            .find(|name| name.contains("coder"))
+            .cloned()
+            .or_else(|| names.first().cloned());
+    }
+    chats
         .iter()
         .find(|name| name.contains("coder"))
         .cloned()
-        .or_else(|| names.first().cloned())
+        .or_else(|| chats.first().cloned())
+}
+
+/// Whether the model at `base_url`'s Ollama answers chat turns.
+///
+/// Asks `/api/show` for the model's capabilities and looks for
+/// `"chat"` among them; an unanswered or malformed show reads as not
+/// chat-capable, so the caller's fallback chain still gets its turn.
+fn chats_at(host: &str, port: u16, prefix: &str, model: &str) -> bool {
+    let request = format!("{{\"model\":\"{model}\"}}");
+    let Some(body) = http_post_body(host, port, &format!("{prefix}/api/show"), &request) else {
+        return false;
+    };
+    let Ok(shown) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return false;
+    };
+    shown
+        .get("capabilities")
+        .and_then(|caps| caps.as_array())
+        .is_some_and(|caps| {
+            caps.iter()
+                .any(|cap| cap.as_str() == Some("completion") || cap.as_str() == Some("chat"))
+        })
 }
 
 /// Initialize a git repository in `dir` with two committed baselines and
@@ -1299,4 +1391,45 @@ pub fn sse_thinking_tool_turn(thinking: &str, tool: &str, args: &serde_json::Val
     .map(|chunk| format!("data: {chunk}\n\n"))
     .chain(std::iter::once("data: [DONE]\n\n".to_string()))
     .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_silent_endpoint_fails_each_probe_within_its_bound() {
+        // The endpoint that accepts and never answers: a probe without
+        // a read bound waits the socket out and discovery stalls behind
+        // it. Both halves of the discovery leg — the listing GET and
+        // the capability POST — fail within the probe bound and read
+        // as "not listed here" instead.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("ephemeral bind");
+        let port = listener
+            .local_addr()
+            .expect("a bound socket has an address")
+            .port();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for _ in 0..2 {
+                let Ok((socket, _)) = listener.accept() else {
+                    break;
+                };
+                held.push(socket);
+            }
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        });
+        let started = std::time::Instant::now();
+        let posted = http_post_body("127.0.0.1", port, "/api/show", "{\"model\":\"x\"}");
+        assert!(
+            posted.is_none(),
+            "a response that never arrives reads as absent"
+        );
+        let fetched = http_get_body("127.0.0.1", port, "/v1/models");
+        assert!(fetched.is_none(), "the GET leg fails the same way");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "each probe fails within its bound rather than waiting the socket out"
+        );
+    }
 }

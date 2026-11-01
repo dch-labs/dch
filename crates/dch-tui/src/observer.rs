@@ -644,6 +644,48 @@ pub struct TuiObserverState {
     /// words the channel carried but no turn spent.
     pub rescued_corrections: Arc<Mutex<Vec<String>>>,
 
+    /// Plan entries a claim retired, awaiting the display's drain.
+    ///
+    /// The runner drops never-started entries at each claim past the
+    /// first, and the host bridges the two halves here through
+    /// [`publish_claim_retirements`](Self::publish_claim_retirements)
+    /// at the claim edge itself, so the pairs ride this buffer while
+    /// the run that claimed them is still in flight. Identity is the
+    /// pair plus the plan generation the retirement was published at:
+    /// a later plan may re-use a retired id for a different task, and
+    /// a later one still may re-add the same id and subject both —
+    /// only a retirement newer than the row's own graduation may take
+    /// a pending row, so a reborn entry stands whatever order the
+    /// frame drains in. Empty in a session whose claims retire
+    /// nothing.
+    pub retired_plan_entries: Arc<Mutex<Vec<RetiredPlanEntry>>>,
+
+    /// The plan's edit generation, ordering retirements against
+    /// graduations.
+    ///
+    /// Bumped once by every
+    /// [`publish_claim_retirements`](Self::publish_claim_retirements)
+    /// call, and snapshotted into
+    /// [`todo_graduation_generation`](Self::todo_graduation_generation)
+    /// whenever a `TodoWrite` graduation enqueues, so a retirement and
+    /// a row can be compared by age even when one frame drains both.
+    pub plan_generation: Arc<AtomicU64>,
+
+    /// The plan generation the newest `TodoWrite` graduation enqueued
+    /// under.
+    ///
+    /// Written at the enqueue — the moment the observer graduates an
+    /// accepted `TodoWrite` result, through
+    /// [`note_todo_plan_graduated`](Self::note_todo_plan_graduated) —
+    /// rather than at the frame's drain, because a retirement
+    /// published between a graduation's enqueue and its drain is the
+    /// older change and the filter must read it that way: the rows a
+    /// frame drains must carry the age they graduated at, not the age
+    /// the frame woke at. Restored transcripts graduate nothing, so a
+    /// resumed session's rows hold zero — older than any publication
+    /// the session goes on to make, which is exactly their age.
+    pub todo_graduation_generation: Arc<AtomicU64>,
+
     /// Token usage counters, per-turn and cumulative.
     ///
     /// Updated from stream and turn events.
@@ -669,6 +711,36 @@ pub struct TuiObserverState {
     /// retries run, and the reconnected note only until its hold
     /// lapses.
     pub health: Arc<Mutex<HealthNotice>>,
+}
+
+/// One plan entry a claim retired, as the display will judge it.
+///
+/// The `id` and `subject` name the entry the claim dropped; the
+/// `generation` is the plan generation the retirement was published
+/// at, so the drain can tell a retirement that predates a row's own
+/// graduation — which may take a pending row — from a stale one a
+/// reborn entry outlived.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetiredPlanEntry {
+    /// The entry's id, as the plan's last `TodoWrite` filed it.
+    ///
+    /// Paired with the subject, this names which row the retirement
+    /// speaks of; neither half alone is enough, because ids are re-used
+    /// across plans and subjects repeat across ids.
+    pub id: String,
+
+    /// The entry's subject wording at retirement.
+    ///
+    /// The second half of the row-naming pair: a reborn id carrying a
+    /// different task is a different entry, and the pair spares it.
+    pub subject: String,
+
+    /// The plan generation the retirement was published at.
+    ///
+    /// Higher than a row's graduation generation means the retirement
+    /// is newer than the row; equal or lower means the row graduated
+    /// at or after the retirement and only shares its name by re-use.
+    pub generation: u64,
 }
 
 /// The connection-health line the notice row renders.
@@ -843,6 +915,9 @@ impl TuiObserverState {
             context_window: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             queued: Arc::new(Mutex::new(PromptQueue::default())),
             rescued_corrections: Arc::new(Mutex::new(Vec::new())),
+            retired_plan_entries: Arc::new(Mutex::new(Vec::new())),
+            plan_generation: Arc::new(AtomicU64::new(0)),
+            todo_graduation_generation: Arc::new(AtomicU64::new(0)),
             tokens: Arc::new(Mutex::new(TokenCounts::default())),
             render_notify: Arc::new(event_listener::Event::new()),
             current_turn: Arc::new(Mutex::new(None)),
@@ -852,6 +927,50 @@ impl TuiObserverState {
             retry_episode: Arc::new(Mutex::new(None)),
             retry_episode_counter: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Publish one claim's retired plan entries for the display's
+    /// drain.
+    ///
+    /// Called at the claim edge — the moment the runner dropped the
+    /// entries, before the run that claimed them has reached the
+    /// provider — so the display can drop the retired rows while that
+    /// run is still in flight. Every entry of one call shares the plan
+    /// generation the call stamps, and the wake beside the publication
+    /// makes the change read as part of the claim rather than arriving
+    /// a frame late.
+    pub fn publish_claim_retirements(&self, entries: &[(String, String)]) {
+        if entries.is_empty() {
+            return;
+        }
+        let generation = self
+            .plan_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            .saturating_add(1);
+        let mut published = recover(&self.retired_plan_entries);
+        published.extend(entries.iter().map(|(id, subject)| RetiredPlanEntry {
+            id: id.clone(),
+            subject: subject.clone(),
+            generation,
+        }));
+        drop(published);
+        self.render_notify.notify(1);
+    }
+
+    /// Snapshot the plan generation a `TodoWrite` graduation enqueues
+    /// under.
+    ///
+    /// The stamp the retirement filter compares against: the rows a
+    /// graduation lands carry the age recorded here at the moment the
+    /// graduation enters the buffer, so a retirement published after
+    /// that moment reads as newer and one published before it reads as
+    /// stale — whatever order the frame drains the two in.
+    pub fn note_todo_plan_graduated(&self) {
+        let generation = self
+            .plan_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        self.todo_graduation_generation
+            .store(generation, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Record that `text` reached a run, as its transcript row will show it.
@@ -1046,6 +1165,9 @@ impl TuiObserver {
                 .map(|capture| (capture.input_json, capture.output))
                 .unwrap_or_default()
         };
+        if name == "TodoWrite" && !is_error {
+            self.state.note_todo_plan_graduated();
+        }
         recover(&self.state.graduations).push(Graduation::Tool(ToolResultDisplay {
             name: name.to_string(),
             call_id: call_id.to_string(),

@@ -278,15 +278,18 @@ fn restore_and_print_exit(
 ///
 /// The one place the TUI's registration set lives: the display
 /// observer, the input-capturing middleware, the permission bridge,
-/// and the todo nudge — whose echo is deliberately the no-op (the
+/// the todo nudge — whose echo is deliberately the no-op (the
 /// reminder must never surface as the user's words anywhere a user
 /// reads; the turn's own answer is the only trace it leaves) and
 /// whose leave-to-extend predicate answers from the session's
 /// shutdown flag, so an exit already begun declines the reminder
-/// turn before any request is spent on it. A quit that races between
-/// the predicate's acceptance and its own cancel may still pay for a
-/// reminder turn the teardown then stops — the accepted residual of
-/// checking a flag beside any engine turn.
+/// turn before any request is spent on it — and the retirement
+/// publisher, so each claim's dropped plan entries reach the display
+/// the moment the claim makes them, while the run it precedes is
+/// still in flight. A quit that races between the predicate's
+/// acceptance and its own cancel may still pay for a reminder turn
+/// the teardown then stops — the accepted residual of checking a
+/// flag beside any engine turn.
 fn assemble_runner_builder<'a>(
     config: &'a dch_config::DchConfig,
     workdir: &std::path::Path,
@@ -296,6 +299,7 @@ fn assemble_runner_builder<'a>(
     shutting_down: &Arc<AtomicBool>,
 ) -> dch_loop::RunnerBuilder<'a> {
     let nudge_gate = Arc::clone(shutting_down);
+    let retirements = retirement_publisher(state);
     dch_loop::Runner::builder(config, workdir)
         .with_observer(Arc::new(observer) as Arc<dyn loopctl::observer::LoopObserver>)
         .with_middleware(Arc::new(
@@ -305,6 +309,7 @@ fn assemble_runner_builder<'a>(
             ),
         ))
         .with_permission_resolver(permission_resolver)
+        .with_retirement_sink(retirements)
         .with_todo_nudge(
             move |_reminder| {
                 // No row: the reminder must not surface as the user's
@@ -1087,6 +1092,29 @@ fn post_run_error(state: &TuiObserverState, err: &loopctl::error::LoopError) {
     state.render_notify.notify(1);
 }
 
+/// The claim-edge publisher that carries retired plan entries to the
+/// display.
+///
+/// The runner drops never-started entries at each claim past the
+/// first, and the drop is invisible to the transcript until the next
+/// `TodoWrite` lands — so the runner's retirement sink hands the batch
+/// here the moment the claim makes it, while the run it precedes is
+/// still in flight, and the shared state's own publication records the
+/// plan generation and wakes the frame beside it: the plan section
+/// drops the retired rows on the next render, not a blink late.
+fn retirement_publisher(
+    state: &TuiObserverState,
+) -> impl Fn(&[dch_tools::TodoEntry]) + Send + Sync + 'static {
+    let published = state.clone();
+    move |entries: &[dch_tools::TodoEntry]| {
+        let pairs: Vec<(String, String)> = entries
+            .iter()
+            .map(|entry| (entry.id.clone(), entry.subject.clone()))
+            .collect();
+        published.publish_claim_retirements(&pairs);
+    }
+}
+
 /// Collect one correction's words for the exit's transcript echo.
 ///
 /// The queue is process state and dies with the session, so the one
@@ -1332,13 +1360,6 @@ async fn drive_submissions(
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clear();
             if exit_owns_cancel(err, &shutting_down) {
-                // The record a cancel leaves, the exit leaves too: the
-                // resumed session reads the same stopped-run
-                // row either way. The words take their durable exits:
-                // a buffered correction for this claim is collected
-                // for the transcript echo, and without one the
-                // claimed prompt's own row — already written at its
-                // send — is the record that stands.
                 post_run_error(&state, err);
                 if let Some(corrected) =
                     pull_corrected_wording(last_claim, &mut receiver, &mut revived)
@@ -1355,16 +1376,6 @@ async fn drive_submissions(
             } else {
                 u64::MAX
             };
-            // Only the run the correction named may go silent: the
-            // flag must carry this turn's own claim — the id set
-            // beside it at claim time, in this very task, so no race
-            // can blur it. A flag that outlived the display's
-            // stand-down names some other turn, and this cancel keeps
-            // its error row whatever order the two race in. A run
-            // that started without a claim at all (a resumed
-            // session's live pair) has no local id to check; the
-            // display could only ever have matched the flag against
-            // that pair, so its silence stands.
             let names_this_turn = last_claim.is_none_or(|(claimed, _)| claimed == interrupted_id);
             let correction = if interrupted_id != u64::MAX
                 && names_this_turn
@@ -3623,6 +3634,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_claims_retirement_reaches_the_display_while_its_run_is_in_flight() {
+        // The bridge the claim-edge publication owes: the runner drops
+        // never-started entries at its second claim, the sink the
+        // session registers hands the batch to the shared state the
+        // same moment, and the frame's wake fires beside it — all while
+        // the run that claimed them is still waiting on its held
+        // provider answer. A publication that waited for the run to
+        // resolve would leave the plan showing retired rows, and an
+        // unwoken frame would show them a blink late besides.
+        let server = SseServer::start_timed(vec![
+            (
+                sse_text_turn("first answered"),
+                std::time::Duration::from_millis(50),
+            ),
+            (
+                sse_text_turn("held answer"),
+                std::time::Duration::from_secs(30),
+            ),
+        ])
+        .await;
+        let dir = tempfile::tempdir().expect("temp workdir");
+        let mut config = sse_config(server.port);
+        config.api.context_window = Some(200_000);
+        let (_, state) = TuiObserverState::new().into_observer();
+        let runner = dch_loop::Runner::builder(&config, dir.path())
+            .with_retirement_sink(retirement_publisher(&state))
+            .build()
+            .await
+            .expect("offline runner construction");
+        {
+            let mut store = runner.context().todos.lock().expect("todos lock");
+            store.push(dch_tools::TodoEntry {
+                id: "idea".to_string(),
+                subject: "the filed idea".to_string(),
+                description: String::new(),
+                status: dch_tools::TodoStatus::Pending,
+                active_form: None,
+            });
+        }
+        let (tx, rx) = mpsc::unbounded_channel();
+        queue_prompt(&state, &tx, "first");
+        let driver = tokio::spawn(drive_submissions(
+            runner,
+            rx,
+            state.clone(),
+            shutdown_flag(false),
+            parked_transcript(),
+        ));
+        // The spared first claim settles before the wake under test
+        // registers: one request made and no live claim left means the
+        // first run is done, so the listener can only fire on the
+        // second claim's own publication.
+        let mut first_settled = false;
+        for _ in 0..3600 {
+            if server.request_count() == 1 && state.live_claim.load(Ordering::SeqCst) == u64::MAX {
+                first_settled = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(first_settled, "the first prompt's run settles first");
+        let wake = state.render_notify.listen();
+        queue_prompt(&state, &tx, "second");
+        let mut published = false;
+        for _ in 0..3600 {
+            // The lock is scoped to the read: the runtime is
+            // single-threaded here, and a guard held across the sleep
+            // below would wedge the sink's publication against it.
+            let batch_landed = {
+                let retired = state
+                    .retired_plan_entries
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                retired.len() == 1
+                    && retired.first().is_some_and(|entry| {
+                        entry.id == "idea"
+                            && entry.subject == "the filed idea"
+                            && entry.generation == 1
+                    })
+            };
+            if batch_landed {
+                published = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            published,
+            "the second claim's retirement is already in the display's buffer \
+             while its run is still in flight"
+        );
+        assert!(
+            !driver.is_finished(),
+            "the run the claim precedes has not resolved — the publication \
+             did not wait for it"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), wake)
+                .await
+                .is_ok(),
+            "the publication wakes the frame beside it"
+        );
+        drop(tx);
+        driver.abort();
+    }
+
+    #[tokio::test]
     async fn the_driver_names_its_live_claim_while_the_turn_runs() {
         // The mirror the display's stale-edit guard reads: a claim
         // names the turn it took, and the landing clears the name back
@@ -4034,8 +4152,14 @@ mod tests {
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
         type_into(&mut app, "the prompt left running");
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-        press(&mut app, KeyCode::Char('q'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
         press(&mut app, KeyCode::Char('e'), KeyModifiers::NONE);
+        assert_eq!(
+            app.input(),
+            "the wording that landed",
+            "the focus chord's `e` lifts waiting prompt A into the composer — \
+             the premise the correction below commits against"
+        );
         let ids: Vec<u64> = {
             let queue = state.queued.lock().expect("queue lock");
             (0..queue.len())

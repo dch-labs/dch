@@ -98,8 +98,10 @@ impl TodoStatus {
 /// The subject an entry without one is read under.
 ///
 /// The display's lenient twin of the tool's derivation: first non-blank
-/// line of the description, trimmed, cut at fifty characters with an
-/// ellipsis, the id when the description has nothing to say. The tool
+/// line of the description, trimmed and whole — the same rule the tool
+/// applies, so a description-only entry reads identically here and in
+/// the run's own render — the id when the description has nothing to
+/// say. The tool
 /// itself now refuses entries with neither a subject nor a description,
 /// so this fallback serves the transcripts recorded before that gate —
 /// a replayed list the run accepted in an older build still renders
@@ -109,13 +111,9 @@ fn derived_subject(description: &str, id: &str) -> String {
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty());
-    let Some(first_line) = first_line else {
-        return format!("Task {id}");
-    };
-    if first_line.chars().count() > 50 {
-        format!("{}...", first_line.chars().take(47).collect::<String>())
-    } else {
-        first_line.to_string()
+    match first_line {
+        Some(first_line) => first_line.to_string(),
+        None => format!("Task {id}"),
     }
 }
 
@@ -288,7 +286,10 @@ pub(crate) fn parse_submission(input_json: &str) -> Option<Vec<TodoRow>> {
 /// takes first where both are at hand — the request says what was
 /// asked, the render what the tool settled for — and
 /// [`parse_submission`] answers only where this one cannot, a
-/// transcript block that kept no render of its own.
+/// transcript block that kept no render of its own. Where both are
+/// at hand, pair this read with [`rows_with_submitted_subjects`] so
+/// the rows keep the submission's whole wordings beside the render's
+/// enforced statuses.
 pub(crate) fn parse_rendered(output: &str) -> Option<Vec<TodoRow>> {
     if !output.contains("# Task List") {
         return None;
@@ -322,6 +323,37 @@ pub(crate) fn parse_rendered(output: &str) -> Option<Vec<TodoRow>> {
         });
     }
     Some(rows)
+}
+
+/// The rendered rows, each carrying its submitted subject where the
+/// submission names the same id.
+///
+/// The render is the enforced truth for where each entry stands, but
+/// it is a page: a subject that spans lines reads back as its first
+/// line alone, while the store — and every retirement published from
+/// it — carries the wording whole. This keeps the render's rows and
+/// statuses and restores each row's wording from the submission's
+/// matching entry, so an identity comparison against the store's own
+/// subject succeeds. A row the submission does not name keeps the
+/// rendered wording it parsed with; a submission that does not parse
+/// leaves every row as it was.
+pub(crate) fn rows_with_submitted_subjects(
+    rendered: Vec<TodoRow>,
+    input_json: &str,
+) -> Vec<TodoRow> {
+    let Some(submitted) = parse_submission(input_json) else {
+        return rendered;
+    };
+    rendered
+        .into_iter()
+        .map(|row| {
+            let subject = submitted
+                .iter()
+                .find(|entry| entry.id == row.id)
+                .map_or_else(|| row.subject.clone(), |entry| entry.subject.clone());
+            TodoRow { subject, ..row }
+        })
+        .collect()
 }
 
 /// The rows a submission changed, by id.
@@ -519,7 +551,7 @@ fn folded_hint(rows: &[TodoRow], colors: &TodoColors) -> Line<'static> {
         ),
         Span::raw(" "),
         Span::styled(
-            format!("{} · ctrl+t", done_fraction(rows)),
+            format!("{} · ctrl+t to show", done_fraction(rows)),
             Style::default().fg(colors.dim),
         ),
     ])
@@ -534,11 +566,16 @@ fn folded_hint(rows: &[TodoRow], colors: &TodoColors) -> Line<'static> {
 /// cap spends the conversation's rows on the tasks nearest the top
 /// of the plan and says exactly what it cut. A single task whose
 /// wording wraps past the whole budget keeps its head while the
-/// budget pays for even one row; a budget that pays for none names
+/// budget pays for even one row; a budget that pays for none — where
+/// the cut is more than the ellipsis row itself could carry — names
 /// every task through the ellipsis rather than showing a count that
-/// disagrees with the rows. The ellipsis line
-/// may take one row beyond the cap — its arithmetic is the caller's
-/// height's arithmetic, both counting what this returns.
+/// disagrees with the rows. The body may reach `body_cap + 1` rows:
+/// the ellipsis line takes one row beyond the cap, and when the
+/// final entry is the only thing the cap would cut and fits within
+/// that one row, it stands there instead — no ellipsis at all, the
+/// whole list on screen for the price of the count that hid it.
+/// The caller's height arithmetic counts what this returns, so the
+/// layout always pays for exactly what is painted.
 pub(crate) fn section_lines(
     rows: &[TodoRow],
     changes: &HashMap<String, TodoStatus>,
@@ -576,11 +613,20 @@ pub(crate) fn section_lines(
     let mut shown = 0usize;
     for (index, group) in groups.into_iter().enumerate() {
         if used.saturating_add(group.len()) > body_cap {
-            if used == 0 && body_cap > 0 && !group.is_empty() {
-                lines.extend(group.into_iter().take(body_cap));
-                shown = index.saturating_add(1);
+            // The one trade the ellipsis cannot win: when the entry it
+            // would cut is the last one standing outside the cap and
+            // showing it costs at most the row the ellipsis itself
+            // would have taken, the entry rides that row instead — a
+            // "+1 more" that hides an entry the section had room to
+            // name is noise, not a cut.
+            let rides_the_ellipsis = index.saturating_add(1) == rows.len()
+                && used.saturating_add(group.len()) <= body_cap.saturating_add(1);
+            if !rides_the_ellipsis {
+                if used == 0 && body_cap > 0 && !group.is_empty() {
+                    lines.extend(group.into_iter().take(body_cap));
+                }
+                break;
             }
-            break;
         }
         used = used.saturating_add(group.len());
         shown = shown.saturating_add(1);
@@ -847,6 +893,272 @@ Summary: 9 pending, 1 in progress, 2 completed\n\n\
             lines.len(),
             3,
             "the section is air, badge, and the honest count"
+        );
+    }
+
+    #[test]
+    fn one_one_line_task_at_a_zero_budget_rides_instead_of_ellipsing() {
+        // The zero-budget sentence's carve-out: a single one-line
+        // entry is a cut the ellipsis row itself could carry, so the
+        // entry rides that row and the section names the task whole —
+        // no count stands in for the one thing the section could have
+        // shown. The multi-entry zero budget above is the case the
+        // sentence still covers.
+        let rows: Vec<TodoRow> = (0..1)
+            .map(|index| TodoRow {
+                id: format!("t{index}"),
+                subject: format!("task {index}"),
+                status: TodoStatus::Pending,
+            })
+            .collect();
+        let colors = TodoColors {
+            dim: ratatui::style::Color::Reset,
+            accent: ratatui::style::Color::Reset,
+            moved: ratatui::style::Color::Reset,
+            badge_fill: ratatui::style::Color::Reset,
+            badge_letters: ratatui::style::Color::Reset,
+        };
+        let lines = section_lines(&rows, &HashMap::new(), &colors, 60, 0, None);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+        assert!(
+            text.iter().any(|line| line.contains("task 0")),
+            "the lone entry rides the row the ellipsis would have spent: {text:?}"
+        );
+        assert!(
+            !text.iter().any(|line| line.contains("more (ctrl+t")),
+            "no ellipsis stands in for the one thing the section could show: {text:?}"
+        );
+    }
+
+    #[test]
+    fn the_last_entry_rides_the_ellipsis_row() {
+        // Five one-line entries against a four-row budget: the cut
+        // would name the fifth through an ellipsis that costs the very
+        // row the fifth entry needs, so the entry takes the row
+        // instead — the whole list stands, nothing is "+1 more". A cut
+        // only earns its ellipsis when it hides more than the ellipsis
+        // itself could have shown.
+        let rows: Vec<TodoRow> = (0..5)
+            .map(|index| TodoRow {
+                id: format!("t{index}"),
+                subject: format!("task {index}"),
+                status: TodoStatus::Pending,
+            })
+            .collect();
+        let colors = TodoColors {
+            dim: ratatui::style::Color::Reset,
+            accent: ratatui::style::Color::Reset,
+            moved: ratatui::style::Color::Reset,
+            badge_fill: ratatui::style::Color::Reset,
+            badge_letters: ratatui::style::Color::Reset,
+        };
+        let lines = section_lines(&rows, &HashMap::new(), &colors, 60, 4, None);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+        assert!(
+            !text.iter().any(|line| line.contains("more (ctrl+t")),
+            "the fifth entry stands in the row the ellipsis would have \
+             spent: {text:?}"
+        );
+        assert_eq!(lines.len(), 7, "air, badge, and all five entries");
+        for index in 0..5 {
+            assert!(
+                text.iter()
+                    .any(|line| line.contains(&format!("task {index}"))),
+                "entry {index} renders: {text:?}"
+            );
+        }
+
+        // Six entries against the same budget still cut: the ellipsis
+        // hides two, and one row cannot stand for both.
+        let rows: Vec<TodoRow> = (0..6)
+            .map(|index| TodoRow {
+                id: format!("t{index}"),
+                subject: format!("task {index}"),
+                status: TodoStatus::Pending,
+            })
+            .collect();
+        let lines = section_lines(&rows, &HashMap::new(), &colors, 60, 4, None);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+        assert!(
+            text.iter()
+                .any(|line| line.contains("+2 more (ctrl+t for all)")),
+            "a cut that hides two keeps its ellipsis: {text:?}"
+        );
+    }
+}
+
+// Test code panics by design — its asserts are the assertions.
+#[cfg(test)]
+#[allow(clippy::missing_panics_doc)]
+mod long_subject_wrap {
+    use super::*;
+
+    fn plain_colors() -> TodoColors {
+        TodoColors {
+            dim: ratatui::style::Color::Reset,
+            accent: ratatui::style::Color::Reset,
+            moved: ratatui::style::Color::Reset,
+            badge_fill: ratatui::style::Color::Reset,
+            badge_letters: ratatui::style::Color::Reset,
+        }
+    }
+
+    #[test]
+    fn a_long_subject_wraps_under_its_icon() {
+        // The subject is the words the reader came for, and the source
+        // no longer truncates a derived one — so the display's whole
+        // duty is the wrap: the words continue under the icon onto as
+        // many rows as they need, and the section's row arithmetic
+        // counts every continuation row it painted.
+        let subject =
+            "The executed-tool-name fix in dispatch.rs still has no test anywhere in the suite";
+        let rows = vec![TodoRow {
+            id: "t-c05".to_string(),
+            subject: subject.to_string(),
+            status: TodoStatus::Pending,
+        }];
+        let colors = plain_colors();
+        let lines = render_rows(&rows, &HashMap::new(), &colors, 30);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(
+            lines.len() > 1,
+            "a subject wider than the section wraps to continuation rows: {text:?}"
+        );
+        // A column-width wrap may break a word across a line boundary
+        // and every continuation row opens with its indent, so the
+        // check reads the rows the way the eye does: whitespace-free.
+        let packed = text.concat().replace(' ', "");
+        for word in ["executed-tool-name", "dispatch.rs", "anywhere", "suite"] {
+            assert!(
+                packed.contains(word),
+                "the wrap keeps every word, cutting none: {text:?}"
+            );
+        }
+        assert!(
+            !text.concat().contains("..."),
+            "no ellipsis stands in for words the width could not fit: {text:?}"
+        );
+
+        // And the section's arithmetic pays for the wrap: the open
+        // posture's line count includes every continuation row.
+        let section = section_lines(&rows, &HashMap::new(), &colors, 30, usize::MAX, None);
+        assert_eq!(
+            section.len(),
+            lines.len() + 2,
+            "air and badge beside every wrapped row the entry paints"
+        );
+    }
+}
+
+// Test code panics by design — its asserts are the assertions.
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::let_underscore_must_use
+)]
+mod review_2026_11_01_round {
+    use super::*;
+
+    fn plain_colors() -> TodoColors {
+        TodoColors {
+            dim: ratatui::style::Color::Reset,
+            accent: ratatui::style::Color::Reset,
+            moved: ratatui::style::Color::Reset,
+            badge_fill: ratatui::style::Color::Reset,
+            badge_letters: ratatui::style::Color::Reset,
+        }
+    }
+
+    #[test]
+    fn a_derived_subject_keeps_its_whole_first_line() {
+        // The display's derivation is the tool's twin: a
+        // description-only entry reads identically in the run's own
+        // render and in the plan section, so a long first line stays
+        // whole here too — an ellipsis in the panel would be a
+        // truncation the tool no longer performs.
+        let rows = parse_submission(
+            r#"{"todos": [{"id": "t1", "subject": null, "description": "\nThe executed-tool-name fix in dispatch.rs still has no test anywhere in the suite"}]}"#,
+        )
+        .expect("a null subject derives from the description");
+        assert_eq!(
+            rows.first().map(|row| row.subject.as_str()),
+            Some(
+                "The executed-tool-name fix in dispatch.rs still has no test anywhere in the suite"
+            ),
+            "the whole first line is the subject, no ellipsis"
+        );
+    }
+
+    #[test]
+    fn a_partially_rendered_entry_counts_as_cut() {
+        // One entry whose wording wraps past the whole budget keeps its
+        // head — the budget pays for even one row — and what did not
+        // fit stands behind the ellipsis: the entry is cut, not
+        // complete, so the plan-cut flag reads true and Ctrl+T opens
+        // the whole list.
+        let subject = "word ".repeat(24);
+        let rows = vec![TodoRow {
+            id: "solo".to_string(),
+            subject,
+            status: TodoStatus::Pending,
+        }];
+        let lines = section_lines(&rows, &HashMap::new(), &plain_colors(), 20, 4, None);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(
+            text.iter()
+                .any(|line| line.contains("+1 more (ctrl+t for all)")),
+            "the entry's unrendered rows stand behind the ellipsis: {text:?}"
+        );
+        assert_eq!(
+            lines.len(),
+            7,
+            "air, badge, four paid rows, and the ellipsis beyond the cap: {text:?}"
         );
     }
 }

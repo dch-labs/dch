@@ -35,6 +35,176 @@ fn submit(session: &mut common::PtySession, prompt: &str) {
     session.send(b"\r");
 }
 
+/// Whether a TCP connection can reach any address the host resolves
+/// to.
+///
+/// A name may answer on several addresses — `localhost` alone can
+/// resolve to the `IPv6` loopback ahead of the `IPv4` one, and a provider
+/// listening only on `127.0.0.1` is reachable through the second
+/// however fast the first refuses. Every resolved address gets its
+/// own connection attempt before the host reads as unreachable, and
+/// a name that resolves to nothing is unreachable outright.
+fn any_address_reachable(host: &str, port: u16) -> bool {
+    let addresses: Vec<std::net::SocketAddr> = match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => vec![std::net::SocketAddr::new(ip, port)],
+        Err(_) => match std::net::ToSocketAddrs::to_socket_addrs(&(host, port)) {
+            Ok(resolved) => resolved.collect(),
+            Err(_) => return false,
+        },
+    };
+    addresses.iter().any(|address| {
+        std::net::TcpStream::connect_timeout(address, Duration::from_secs(1)).is_ok()
+    })
+}
+
+/// Whether the live-provider leg has nothing to talk to.
+///
+/// The smoke suite's one real-provider test needs either a reachable
+/// endpoint or a configured key; on a box with neither — no local
+/// Ollama listening, no environment credentials — the leg cannot smoke
+/// anything, and failing the suite would report an absence, not a
+/// defect. Reachability is a one-second TCP probe of every address the
+/// base URL's host resolves to; a key in either env var keeps the leg
+/// on regardless, so a configured key against an unreachable endpoint
+/// still fails honestly.
+fn provider_absent(base_url: &str) -> bool {
+    let keyed =
+        std::env::var("DCH_SMOKE_API_KEY").is_ok() || std::env::var("OPENAI_API_KEY").is_ok();
+    if keyed {
+        return false;
+    }
+    let host_port = base_url
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .trim_end_matches('/')
+        .rsplit_once('/')
+        .map_or(
+            base_url
+                .trim_start_matches("http://")
+                .trim_start_matches("https://")
+                .trim_end_matches('/'),
+            |(head, _)| head,
+        );
+    let Some((host, port)) = host_port.rsplit_once(':') else {
+        return true;
+    };
+    let Ok(port) = port.parse::<u16>() else {
+        return true;
+    };
+    !any_address_reachable(host, port)
+}
+
+#[test]
+fn a_provider_listening_on_one_address_is_reachable_through_its_name() {
+    // `localhost` can resolve to the IPv6 loopback ahead of the IPv4
+    // one, and a provider bound to `127.0.0.1` alone is behind the
+    // second address. A probe that stops at the first address the
+    // resolver returns reports such a provider absent and silently
+    // skips the live leg; every address owes an attempt before the
+    // host reads as unreachable.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral bind");
+    let port = listener
+        .local_addr()
+        .expect("a bound socket has an address")
+        .port();
+    assert!(
+        any_address_reachable("localhost", port),
+        "the name reaches the listener through at least one of its addresses"
+    );
+}
+
+#[test]
+fn a_silent_port_on_every_address_reads_as_absent() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral bind");
+    let port = listener
+        .local_addr()
+        .expect("a bound socket has an address")
+        .port();
+    drop(listener);
+    assert!(
+        !any_address_reachable("127.0.0.1", port),
+        "nothing answers on the address, so the host reads as unreachable"
+    );
+}
+
+/// The tool-result answer an `AskUserQuestion` call carried back.
+///
+/// The follow-up request repeats the scripted call in its history —
+/// every option label among the arguments — so the request body as a
+/// whole names options the run never chose. The answer worth asserting
+/// on is the tool-result message paired with the `AskUserQuestion`
+/// call by its call id: its content is what the ask actually returned
+/// to the model.
+fn ask_tool_result(request_body: &str) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(request_body).ok()?;
+    let messages = parsed.get("messages")?.as_array()?;
+    let ask_id = messages.iter().find_map(|message| {
+        message
+            .get("tool_calls")
+            .and_then(|calls| calls.as_array())
+            .and_then(|calls| {
+                calls.iter().find(|call| {
+                    call.get("function")
+                        .and_then(|function| function.get("name"))
+                        .and_then(|name| name.as_str())
+                        == Some("AskUserQuestion")
+                })
+            })
+            .and_then(|call| call.get("id"))
+            .and_then(|id| id.as_str())
+    })?;
+    messages.iter().find_map(|message| {
+        let answers_the_ask = message.get("role").and_then(|role| role.as_str()) == Some("tool")
+            && message.get("tool_call_id").and_then(|id| id.as_str()) == Some(ask_id);
+        answers_the_ask.then(|| {
+            message
+                .get("content")
+                .and_then(|content| content.as_str())
+                .unwrap_or_default()
+                .to_string()
+        })
+    })
+}
+
+#[test]
+fn the_ask_assertion_reads_the_tool_result_not_the_scripted_arguments() {
+    // The discrimination the live leg depends on: the request body
+    // carries `Vanilla` in the scripted call's arguments whether or
+    // not Enter confirmed it, so a whole-body search passes on a run
+    // that answered differently. The paired tool result is the only
+    // place the confirmed option lives.
+    let follow_up = serde_json::json!({
+        "model": "test-model",
+        "messages": [
+            {"role": "user", "content": "ask me something"},
+            {"role": "assistant", "tool_calls": [{
+                "id": "call-1",
+                "function": {
+                    "name": "AskUserQuestion",
+                    "arguments": "{\"questions\":[{\"options\":[{\"label\":\"Vanilla\"}]}]}"
+                }
+            }]},
+            {"role": "tool", "tool_call_id": "call-1", "content": "declined the question"}
+        ]
+    })
+    .to_string();
+    let declined = ask_tool_result(&follow_up).expect("the paired result is found");
+    assert_eq!(
+        declined, "declined the question",
+        "the paired tool result is the answer, not the arguments beside it"
+    );
+    assert!(
+        !declined.contains("Vanilla"),
+        "an unconfirmed option must not read as the answer: {declined}"
+    );
+    let answered = follow_up.replace("declined the question", "chose Vanilla");
+    let confirmed = ask_tool_result(&answered).expect("the paired result is found");
+    assert!(
+        confirmed.contains("Vanilla"),
+        "the confirmed option rides the tool result: {confirmed}"
+    );
+}
+
 /// Wait until the sandbox's provider has received the first request.
 ///
 /// The request landing is the run-started proof: once the binary has
@@ -62,17 +232,28 @@ async fn at1_real_provider_answers() {
     }
     let base_url =
         std::env::var("DCH_SMOKE_BASE_URL").unwrap_or_else(|_| "http://localhost:11434/v1".into());
+    if provider_absent(&base_url) {
+        eprintln!(
+            "skipping: no live provider at {base_url} and no key set \
+            (DCH_SMOKE_API_KEY / OPENAI_API_KEY)"
+        );
+        return;
+    }
     let model = std::env::var("DCH_SMOKE_MODEL").ok().unwrap_or_else(|| {
         common::discover_model(&base_url)
             .unwrap_or_else(|| panic!("no model discoverable at {base_url}; set DCH_SMOKE_MODEL"))
     });
     let mut config = dch_config::DchConfig::default();
-    config.api.api_type = dch_config::ApiType::OpenAi;
+    let keyed = std::env::var("DCH_SMOKE_API_KEY").or_else(|_| std::env::var("OPENAI_API_KEY"));
+    config.api.api_type = match &keyed {
+        Ok(key) => {
+            config.api.api_key = Some(key.clone());
+            dch_config::ApiType::OpenAi
+        }
+        Err(_) => dch_config::ApiType::Ollama,
+    };
     config.api.base_url = base_url;
     config.api.model = model;
-    if let Ok(key) = std::env::var("DCH_SMOKE_API_KEY") {
-        config.api.api_key = Some(key);
-    }
     let dir = tempfile::tempdir().expect("tempdir");
     let mut runner = dch_loop::Runner::builder(&config, dir.path())
         .build()
@@ -177,20 +358,27 @@ fn at18_ask_tool_reports_through_the_tui() {
                 "options": [{"label": "Vanilla"}, {"label": "Chocolate"}]
             }]}),
         ),
-        sse_text_turn("proceeding without an answer"),
+        sse_text_turn("the flavor was noted"),
     ]);
     let session = sb.dch_pty(&[]);
     session.expect("test-model", Duration::from_secs(20));
     let mut session = session;
     submit(&mut session, "ask me something");
-    session.expect("proceeding without an answer", Duration::from_secs(20));
+    // The supervised ask waits for the user: the sheet rises, Enter
+    // confirms the row it stands on, and the choice rides the reply
+    // channel back into the run.
+    session.expect("Which flavor?", Duration::from_secs(20));
+    session.send(b"\r");
+    session.expect("the flavor was noted", Duration::from_secs(20));
     let requests = sb.requests();
     let follow_up = requests
         .get(1)
         .expect("the tool result came back to the model");
+    let answer =
+        ask_tool_result(follow_up).expect("the ask's own tool result rides the follow-up request");
     assert!(
-        follow_up.contains("non-interactive"),
-        "until the ask overlay lands the tool degrades honestly: {follow_up}"
+        answer.contains("Vanilla"),
+        "the confirmed option rode the reply channel through the TUI: {answer}"
     );
     session.quit_and_finish(Duration::from_secs(20));
 }
