@@ -35,6 +35,55 @@ fn submit(session: &mut common::PtySession, prompt: &str) {
     session.send(b"\r");
 }
 
+/// Whether the live-provider leg has nothing to talk to.
+///
+/// The smoke suite's one real-provider test needs either a reachable
+/// endpoint or a configured key; on a box with neither — no local
+/// Ollama listening, no environment credentials — the leg cannot smoke
+/// anything, and failing the suite would report an absence, not a
+/// defect. Reachability is a one-second TCP probe of the base URL's
+/// host and port; a key in either env var keeps the leg on regardless,
+/// so a configured key against an unreachable endpoint still fails
+/// honestly.
+fn provider_absent(base_url: &str) -> bool {
+    let keyed =
+        std::env::var("DCH_SMOKE_API_KEY").is_ok() || std::env::var("OPENAI_API_KEY").is_ok();
+    if keyed {
+        return false;
+    }
+    let host_port = base_url
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .trim_end_matches('/')
+        .rsplit_once('/')
+        .map_or(
+            base_url
+                .trim_start_matches("http://")
+                .trim_start_matches("https://")
+                .trim_end_matches('/'),
+            |(head, _)| head,
+        );
+    let Some((host, port)) = host_port.rsplit_once(':') else {
+        return true;
+    };
+    let Ok(port) = port.parse::<u16>() else {
+        return true;
+    };
+    std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::new(
+            host.parse::<std::net::IpAddr>().unwrap_or_else(|_| {
+                std::net::ToSocketAddrs::to_socket_addrs(&(host, port))
+                    .ok()
+                    .and_then(|mut addrs| addrs.next())
+                    .map_or(std::net::IpAddr::from([127, 0, 0, 1]), |addr| addr.ip())
+            }),
+            port,
+        ),
+        std::time::Duration::from_secs(1),
+    )
+    .is_err()
+}
+
 /// Wait until the sandbox's provider has received the first request.
 ///
 /// The request landing is the run-started proof: once the binary has
@@ -62,17 +111,28 @@ async fn at1_real_provider_answers() {
     }
     let base_url =
         std::env::var("DCH_SMOKE_BASE_URL").unwrap_or_else(|_| "http://localhost:11434/v1".into());
+    if provider_absent(&base_url) {
+        eprintln!(
+            "skipping: no live provider at {base_url} and no key set \
+            (DCH_SMOKE_API_KEY / OPENAI_API_KEY)"
+        );
+        return;
+    }
     let model = std::env::var("DCH_SMOKE_MODEL").ok().unwrap_or_else(|| {
         common::discover_model(&base_url)
             .unwrap_or_else(|| panic!("no model discoverable at {base_url}; set DCH_SMOKE_MODEL"))
     });
     let mut config = dch_config::DchConfig::default();
-    config.api.api_type = dch_config::ApiType::OpenAi;
+    let keyed = std::env::var("DCH_SMOKE_API_KEY").or_else(|_| std::env::var("OPENAI_API_KEY"));
+    config.api.api_type = match &keyed {
+        Ok(key) => {
+            config.api.api_key = Some(key.clone());
+            dch_config::ApiType::OpenAi
+        }
+        Err(_) => dch_config::ApiType::Ollama,
+    };
     config.api.base_url = base_url;
     config.api.model = model;
-    if let Ok(key) = std::env::var("DCH_SMOKE_API_KEY") {
-        config.api.api_key = Some(key);
-    }
     let dir = tempfile::tempdir().expect("tempdir");
     let mut runner = dch_loop::Runner::builder(&config, dir.path())
         .build()
@@ -177,20 +237,25 @@ fn at18_ask_tool_reports_through_the_tui() {
                 "options": [{"label": "Vanilla"}, {"label": "Chocolate"}]
             }]}),
         ),
-        sse_text_turn("proceeding without an answer"),
+        sse_text_turn("the flavor was noted"),
     ]);
     let session = sb.dch_pty(&[]);
     session.expect("test-model", Duration::from_secs(20));
     let mut session = session;
     submit(&mut session, "ask me something");
-    session.expect("proceeding without an answer", Duration::from_secs(20));
+    // The supervised ask waits for the user: the sheet rises, Enter
+    // confirms the row it stands on, and the choice rides the reply
+    // channel back into the run.
+    session.expect("Which flavor?", Duration::from_secs(20));
+    session.send(b"\r");
+    session.expect("the flavor was noted", Duration::from_secs(20));
     let requests = sb.requests();
     let follow_up = requests
         .get(1)
         .expect("the tool result came back to the model");
     assert!(
-        follow_up.contains("non-interactive"),
-        "until the ask overlay lands the tool degrades honestly: {follow_up}"
+        follow_up.contains("Vanilla"),
+        "the confirmed option rode the reply channel through the TUI: {follow_up}"
     );
     session.quit_and_finish(Duration::from_secs(20));
 }

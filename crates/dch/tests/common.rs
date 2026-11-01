@@ -1090,6 +1090,34 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// caller treats as "not listed here". Chunked transfer encoding —
 /// what Ollama actually answers with — is stripped before the body
 /// returns.
+/// Issue one small POST and return its 200 body, dechunked if needed.
+///
+/// The Ollama control endpoints (`/api/show` among them) take the
+/// query as a JSON body rather than on the path, so the discovery
+/// probe needs the POST half beside the GET helper.
+fn http_post_body(host: &str, port: u16, path: &str, body: &str) -> Option<String> {
+    let mut stream = TcpStream::connect((host, port)).ok()?;
+    write!(
+        stream,
+        "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .ok()?;
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).ok()?;
+    let head_end = find_subslice(&raw, b"\r\n\r\n")?;
+    let head = String::from_utf8_lossy(raw.get(..head_end)?).to_lowercase();
+    let body = raw.get(head_end.checked_add(4)?..)?;
+    if !(head.starts_with("http/1.1 200") || head.starts_with("http/1.0 200")) {
+        return None;
+    }
+    if head.contains("transfer-encoding: chunked") {
+        Some(String::from_utf8_lossy(&dechunk(body)).to_string())
+    } else {
+        Some(String::from_utf8_lossy(body).to_string())
+    }
+}
+
 fn http_get_body(host: &str, port: u16, path: &str) -> Option<String> {
     let mut stream = TcpStream::connect((host, port)).ok()?;
     write!(
@@ -1200,11 +1228,45 @@ pub fn discover_model(base_url: &str) -> Option<String> {
         .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
         .map(|listing| model_names(&listing, "data", "id"));
     let names = ollama.or(openai)?;
-    names
+    let chats: Vec<String> = names
+        .iter()
+        .filter(|name| chats_at(&host, port, prefix.as_str(), name.as_str()))
+        .cloned()
+        .collect();
+    if chats.is_empty() {
+        return names
+            .iter()
+            .find(|name| name.contains("coder"))
+            .cloned()
+            .or_else(|| names.first().cloned());
+    }
+    chats
         .iter()
         .find(|name| name.contains("coder"))
         .cloned()
-        .or_else(|| names.first().cloned())
+        .or_else(|| chats.first().cloned())
+}
+
+/// Whether the model at `base_url`'s Ollama answers chat turns.
+///
+/// Asks `/api/show` for the model's capabilities and looks for
+/// `"chat"` among them; an unanswered or malformed show reads as not
+/// chat-capable, so the caller's fallback chain still gets its turn.
+fn chats_at(host: &str, port: u16, prefix: &str, model: &str) -> bool {
+    let request = format!("{{\"model\":\"{model}\"}}");
+    let Some(body) = http_post_body(host, port, &format!("{prefix}/api/show"), &request) else {
+        return false;
+    };
+    let Ok(shown) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return false;
+    };
+    shown
+        .get("capabilities")
+        .and_then(|caps| caps.as_array())
+        .is_some_and(|caps| {
+            caps.iter()
+                .any(|cap| cap.as_str() == Some("completion") || cap.as_str() == Some("chat"))
+        })
 }
 
 /// Initialize a git repository in `dir` with two committed baselines and
