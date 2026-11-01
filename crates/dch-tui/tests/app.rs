@@ -12747,6 +12747,49 @@ fn a_reborn_row_of_the_same_id_and_subject_survives_its_stale_retirement() {
 }
 
 #[test]
+fn a_multiline_subject_retires_through_its_whole_wording() {
+    // The rendered list is a page: a subject spanning lines reads back
+    // as its first line alone, while the store — and the retirement
+    // published from it — carries the wording whole. The graduation
+    // restores each row's wording from the submission beside the
+    // render's enforced statuses, so the retirement's identity
+    // comparison lands and the pending row leaves the section; an owed
+    // companion proves the cut is precise.
+    let (mut app, kept) = app_with_state();
+    todo_graduation_with_output(
+        &app,
+        "call-1",
+        r#"{"todos":[
+            {"id":"idea","subject":"the filed wording\nand its second line","status":"pending"},
+            {"id":"kept","subject":"the kept work","status":"in_progress"}
+        ]}"#,
+        concat!(
+            "# Task List\n\nSummary: 1 pending, 1 in progress, 0 completed\n\n",
+            "\u{25cb} [idea] the filed wording\n\u{25d0} [kept] the kept work\n\n",
+        ),
+    );
+    kept.publish_claim_retirements(&[(
+        "idea".to_string(),
+        "the filed wording\nand its second line".to_string(),
+    )]);
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&terminal);
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.contains("the filed wording"))
+            .count(),
+        1,
+        "the section's copy leaves on the whole-wording match — the one \
+         copy left is the transcript block's record: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("\u{25d0} the kept work")),
+        "the owed companion stands untouched: {rows:?}"
+    );
+}
+
+#[test]
 fn a_notice_that_fills_the_row_leaves_the_place_no_cell() {
     // The place row's corner: a notice whose column budget equals the
     // row's width leaves the place nothing to name where the session

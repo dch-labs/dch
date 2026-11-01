@@ -286,7 +286,10 @@ pub(crate) fn parse_submission(input_json: &str) -> Option<Vec<TodoRow>> {
 /// takes first where both are at hand — the request says what was
 /// asked, the render what the tool settled for — and
 /// [`parse_submission`] answers only where this one cannot, a
-/// transcript block that kept no render of its own.
+/// transcript block that kept no render of its own. Where both are
+/// at hand, pair this read with [`rows_with_submitted_subjects`] so
+/// the rows keep the submission's whole wordings beside the render's
+/// enforced statuses.
 pub(crate) fn parse_rendered(output: &str) -> Option<Vec<TodoRow>> {
     if !output.contains("# Task List") {
         return None;
@@ -320,6 +323,37 @@ pub(crate) fn parse_rendered(output: &str) -> Option<Vec<TodoRow>> {
         });
     }
     Some(rows)
+}
+
+/// The rendered rows, each carrying its submitted subject where the
+/// submission names the same id.
+///
+/// The render is the enforced truth for where each entry stands, but
+/// it is a page: a subject that spans lines reads back as its first
+/// line alone, while the store — and every retirement published from
+/// it — carries the wording whole. This keeps the render's rows and
+/// statuses and restores each row's wording from the submission's
+/// matching entry, so an identity comparison against the store's own
+/// subject succeeds. A row the submission does not name keeps the
+/// rendered wording it parsed with; a submission that does not parse
+/// leaves every row as it was.
+pub(crate) fn rows_with_submitted_subjects(
+    rendered: Vec<TodoRow>,
+    input_json: &str,
+) -> Vec<TodoRow> {
+    let Some(submitted) = parse_submission(input_json) else {
+        return rendered;
+    };
+    rendered
+        .into_iter()
+        .map(|row| {
+            let subject = submitted
+                .iter()
+                .find(|entry| entry.id == row.id)
+                .map_or_else(|| row.subject.clone(), |entry| entry.subject.clone());
+            TodoRow { subject, ..row }
+        })
+        .collect()
 }
 
 /// The rows a submission changed, by id.

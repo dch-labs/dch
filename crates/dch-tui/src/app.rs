@@ -2476,6 +2476,9 @@ impl TuiApp {
                     && name == "TodoWrite"
                     && *success
                     && let Some(rows) = crate::todo_view::parse_rendered(output_preview)
+                        .map(|rows| {
+                            crate::todo_view::rows_with_submitted_subjects(rows, retained_input)
+                        })
                         .or_else(|| crate::todo_view::parse_submission(retained_input))
                 {
                     let changes = crate::todo_view::status_changes(&rows, &self.latest_todos);
@@ -6970,22 +6973,8 @@ impl TuiApp {
                     {
                         self.expanded_tools.insert(result.call_id.clone());
                     }
-                    if result.name == "TodoWrite"
-                        && !result.is_error
-                        && let Some(rows) = crate::todo_view::parse_rendered(&result.full_output)
-                            .or_else(|| crate::todo_view::parse_submission(&result.full_input))
-                    {
-                        let changes = crate::todo_view::status_changes(&rows, &self.latest_todos);
-                        self.todo_changes
-                            .insert(result.call_id.clone(), changes.clone());
-                        self.todo_section_changes = changes;
-                        self.latest_todos = rows;
-                        self.todo_generation = self
-                            .state
-                            .todo_graduation_generation
-                            .load(std::sync::atomic::Ordering::SeqCst);
-                        self.expanded_tools.insert(result.call_id.clone());
-                        todo_armed = Some(result.call_id.clone());
+                    if result.name == "TodoWrite" && !result.is_error {
+                        todo_armed = self.graduate_todo_plan(&result);
                     }
                     self.push_message(TuiMessage::Assistant {
                         blocks: vec![ContentBlock::Tool {
@@ -7042,6 +7031,36 @@ impl TuiApp {
         if turn_ended && let Some(hook) = &self.turn_end_hook {
             hook(&self.conversation, machine_history.as_ref());
         }
+    }
+
+    /// Graduate one accepted `TodoWrite` result into the standing
+    /// plan.
+    ///
+    /// The enforced render supplies the rows and where each entry
+    /// stands; the submission supplies each row's whole wording, which
+    /// a rendered page keeps only as its first line. A result that
+    /// parses through neither half graduates nothing and returns
+    /// `None`; one that lands returns its call id — the call the frame
+    /// auto-expands — beside the rows, status deltas, and plan
+    /// generation it recorded.
+    fn graduate_todo_plan(
+        &mut self,
+        result: &crate::observer::ToolResultDisplay,
+    ) -> Option<String> {
+        let rows = crate::todo_view::parse_rendered(&result.full_output)
+            .map(|rows| crate::todo_view::rows_with_submitted_subjects(rows, &result.full_input))
+            .or_else(|| crate::todo_view::parse_submission(&result.full_input))?;
+        let changes = crate::todo_view::status_changes(&rows, &self.latest_todos);
+        self.todo_changes
+            .insert(result.call_id.clone(), changes.clone());
+        self.todo_section_changes = changes;
+        self.latest_todos = rows;
+        self.todo_generation = self
+            .state
+            .todo_graduation_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        self.expanded_tools.insert(result.call_id.clone());
+        Some(result.call_id.clone())
     }
 
     /// Flatten the conversation into styled lines for the given width.
@@ -7267,6 +7286,9 @@ impl TuiApp {
                     ));
                 } else if name == "TodoWrite"
                     && let Some(rows) = crate::todo_view::parse_rendered(&detail.output)
+                        .map(|rows| {
+                            crate::todo_view::rows_with_submitted_subjects(rows, &detail.input_json)
+                        })
                         .or_else(|| crate::todo_view::parse_submission(&detail.input_json))
                 {
                     let colors = crate::todo_view::TodoColors {

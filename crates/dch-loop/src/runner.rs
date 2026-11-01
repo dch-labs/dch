@@ -167,10 +167,11 @@ pub struct Runner {
     /// unfinished entries, and handed to the host through
     /// [`take_claim_retirements`](Self::take_claim_retirements)
     /// so the display and every plan reader can publish the change. A
-    /// claim that finds every entry completed clears the store without
-    /// touching this batch — there is nothing left to retire, and a
-    /// host that already published the previous batch owes no second
-    /// publication for the same plan.
+    /// claim that finds every entry completed — the empty store
+    /// included — clears the store and this batch both: the batch is
+    /// strictly one claim's retirements, so a claim that retires
+    /// nothing hands the host nothing, however the claim before it
+    /// ended.
     claim_retirements: Vec<dch_tools::TodoEntry>,
 
     /// The host's synchronous eye on the claim's retirements.
@@ -287,6 +288,7 @@ impl Runner {
                 .all(|entry| matches!(entry.status, dch_tools::TodoStatus::Completed))
             {
                 store.clear();
+                self.claim_retirements.clear();
             } else if self.claimed_once {
                 self.claim_retirements.clear();
                 store.retain(|entry| {
@@ -2916,6 +2918,53 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["idea"],
             "the batch still waits in the polling accessor — the sink is a second leg, not a replacement"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_claim_over_a_finished_plan_refires_nothing() {
+        // The batch is strictly one claim's retirements. The sink host
+        // never drains the polling accessor, so the retiring claim's
+        // batch is still standing when the next claim arrives over an
+        // empty store — every entry completed, which the empty store
+        // trivially is — and that claim must hand the host nothing:
+        // the store-clearing arm empties the batch beside the store,
+        // so an already-published retirement cannot fire twice and a
+        // polling host cannot re-read it.
+        let mut config = offline_config();
+        config.api.base_url = "http://127.0.0.1:1".to_string();
+        let dir = TempDir::new().expect("tempdir");
+        let fired: Arc<std::sync::atomic::AtomicUsize> =
+            Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sink_fired = Arc::clone(&fired);
+        let mut runner = Runner::builder(&config, dir.path())
+            .with_retirement_sink(move |_entries| {
+                sink_fired.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+            .build()
+            .await
+            .expect("constructs");
+        {
+            let mut store = runner.context.todos.lock().expect("todos lock");
+            store.push(standing_entry("idea", dch_tools::TodoStatus::Pending));
+        }
+        drop(runner.run("first prompt").await);
+        drop(runner.run("second prompt").await);
+        assert_eq!(
+            fired.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the second claim published its retirement exactly once"
+        );
+        drop(runner.run("third prompt").await);
+        assert_eq!(
+            fired.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the claim over the emptied store fires nothing — the retired \
+             batch died with the plan that held it"
+        );
+        assert!(
+            runner.take_claim_retirements().is_empty(),
+            "a polling host reads the finished plan's claim as empty"
         );
     }
 
