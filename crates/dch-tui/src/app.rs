@@ -6998,6 +6998,12 @@ impl TuiApp {
                 self.post_notice(wording.to_string());
             }
         }
+        let retired = take_locked(&self.state.retired_plan_ids);
+        if !retired.is_empty() {
+            self.latest_todos.retain(|row| {
+                !retired.contains(&row.id) || !matches!(row.status, todo_view::TodoStatus::Pending)
+            });
+        }
         if turn_ended && let Some(hook) = &self.turn_end_hook {
             hook(&self.conversation, machine_history.as_ref());
         }
@@ -8145,9 +8151,7 @@ impl TuiApp {
         let notice = self.notice_text();
         let notice_len = notice
             .as_ref()
-            .map_or(0u16, |text| {
-                u16::try_from(text.chars().count()).unwrap_or(u16::MAX)
-            })
+            .map_or(0u16, |text| u16::try_from(text.width()).unwrap_or(u16::MAX))
             .saturating_add(1);
         let row_width = area
             .width

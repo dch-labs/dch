@@ -644,6 +644,16 @@ pub struct TuiObserverState {
     /// words the channel carried but no turn spent.
     pub rescued_corrections: Arc<Mutex<Vec<String>>>,
 
+    /// Plan entry ids a claim retired, awaiting the display's drain.
+    ///
+    /// The runner drops never-started entries at each claim past the
+    /// first, and the driver bridges the two halves here: the ids ride
+    /// this buffer until the frame drains them, and the plan section
+    /// drops the retired rows rather than holding them until the next
+    /// `TodoWrite` lands. Empty in a session whose claims retire
+    /// nothing.
+    pub retired_plan_ids: Arc<Mutex<Vec<String>>>,
+
     /// Token usage counters, per-turn and cumulative.
     ///
     /// Updated from stream and turn events.
@@ -843,6 +853,7 @@ impl TuiObserverState {
             context_window: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             queued: Arc::new(Mutex::new(PromptQueue::default())),
             rescued_corrections: Arc::new(Mutex::new(Vec::new())),
+            retired_plan_ids: Arc::new(Mutex::new(Vec::new())),
             tokens: Arc::new(Mutex::new(TokenCounts::default())),
             render_notify: Arc::new(event_listener::Event::new()),
             current_turn: Arc::new(Mutex::new(None)),

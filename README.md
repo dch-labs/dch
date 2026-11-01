@@ -207,7 +207,7 @@ Anywhere:
 | `Esc` `Esc` | Cancel the run in flight — only that turn, and the prompts waiting behind it keep their place in the queue and run next (see [Waiting prompts](#waiting-prompts)). One press arms and says so on the notice (the right edge of the place row), the next fires, any other key between stands it down. Permission asks, questions, and the waiting section own Esc first — under them, close the sheet or release the section and the cancel is two presses away |
 | `Ctrl-Shift-C` | Copy the selected transcript text (where the terminal reports the modifier) |
 | `Ctrl-S` | Send the composer now: to the turn in flight as guidance when a run is running, as an ordinary prompt when one is not |
-| `Ctrl-T` | Walk the plan section's postures — capped at four rows, the whole list, hidden. The plan keeps updating underneath |
+| `Ctrl-T` | Walk the plan section's postures: the first press folds the list when the cap already shows it whole, and opens the whole list when the cap cut an entry; then hidden, then capped again. The plan keeps updating underneath |
 
 While a permission prompt is on screen (see
 [Permissions](#permissions)), the prompt owns the keyboard:

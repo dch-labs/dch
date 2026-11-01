@@ -98,8 +98,10 @@ impl TodoStatus {
 /// The subject an entry without one is read under.
 ///
 /// The display's lenient twin of the tool's derivation: first non-blank
-/// line of the description, trimmed, cut at fifty characters with an
-/// ellipsis, the id when the description has nothing to say. The tool
+/// line of the description, trimmed and whole — the same rule the tool
+/// applies, so a description-only entry reads identically here and in
+/// the run's own render — the id when the description has nothing to
+/// say. The tool
 /// itself now refuses entries with neither a subject nor a description,
 /// so this fallback serves the transcripts recorded before that gate —
 /// a replayed list the run accepted in an older build still renders
@@ -109,13 +111,9 @@ fn derived_subject(description: &str, id: &str) -> String {
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty());
-    let Some(first_line) = first_line else {
-        return format!("Task {id}");
-    };
-    if first_line.chars().count() > 50 {
-        format!("{}...", first_line.chars().take(47).collect::<String>())
-    } else {
-        first_line.to_string()
+    match first_line {
+        Some(first_line) => first_line.to_string(),
+        None => format!("Task {id}"),
     }
 }
 
@@ -591,7 +589,6 @@ pub(crate) fn section_lines(
             if !rides_the_ellipsis {
                 if used == 0 && body_cap > 0 && !group.is_empty() {
                     lines.extend(group.into_iter().take(body_cap));
-                    shown = index.saturating_add(1);
                 }
                 break;
             }
@@ -1004,6 +1001,87 @@ mod long_subject_wrap {
             section.len(),
             lines.len() + 2,
             "air and badge beside every wrapped row the entry paints"
+        );
+    }
+}
+
+// Test code panics by design — its asserts are the assertions.
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::let_underscore_must_use
+)]
+mod review_2026_11_01_round {
+    use super::*;
+
+    fn plain_colors() -> TodoColors {
+        TodoColors {
+            dim: ratatui::style::Color::Reset,
+            accent: ratatui::style::Color::Reset,
+            moved: ratatui::style::Color::Reset,
+            badge_fill: ratatui::style::Color::Reset,
+            badge_letters: ratatui::style::Color::Reset,
+        }
+    }
+
+    #[test]
+    fn a_derived_subject_keeps_its_whole_first_line() {
+        // The display's derivation is the tool's twin: a
+        // description-only entry reads identically in the run's own
+        // render and in the plan section, so a long first line stays
+        // whole here too — an ellipsis in the panel would be a
+        // truncation the tool no longer performs.
+        let rows = parse_submission(
+            r#"{"todos": [{"id": "t1", "subject": null, "description": "\nThe executed-tool-name fix in dispatch.rs still has no test anywhere in the suite"}]}"#,
+        )
+        .expect("a null subject derives from the description");
+        assert_eq!(
+            rows.first().map(|row| row.subject.as_str()),
+            Some(
+                "The executed-tool-name fix in dispatch.rs still has no test anywhere in the suite"
+            ),
+            "the whole first line is the subject, no ellipsis"
+        );
+    }
+
+    #[test]
+    fn a_partially_rendered_entry_counts_as_cut() {
+        // One entry whose wording wraps past the whole budget keeps its
+        // head — the budget pays for even one row — and what did not
+        // fit stands behind the ellipsis: the entry is cut, not
+        // complete, so the plan-cut flag reads true and Ctrl+T opens
+        // the whole list.
+        let subject = "word ".repeat(24);
+        let rows = vec![TodoRow {
+            id: "solo".to_string(),
+            subject,
+            status: TodoStatus::Pending,
+        }];
+        let lines = section_lines(&rows, &HashMap::new(), &plain_colors(), 20, 4, None);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(
+            text.iter()
+                .any(|line| line.contains("+1 more (ctrl+t for all)")),
+            "the entry's unrendered rows stand behind the ellipsis: {text:?}"
+        );
+        assert_eq!(
+            lines.len(),
+            7,
+            "air, badge, four paid rows, and the ellipsis beyond the cap: {text:?}"
         );
     }
 }

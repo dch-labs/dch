@@ -12577,3 +12577,81 @@ fn a_place_less_frame_keeps_the_reserved_notice_row() {
         "right-aligned on a row of its own: {notice_row:?}"
     );
 }
+
+#[test]
+fn a_wide_glyph_notice_reserves_its_full_width() {
+    // The notice's length is a budget of display cells, not
+    // characters: a fullwidth glyph occupies two cells but counts as
+    // one character, and a char-counted budget would let the
+    // right-aligned notice paint over the place text's tail. Measured
+    // in cells, the place keeps the columns the notice needs and both
+    // texts stand whole on the row.
+    let (mut app, _kept) = app_with_state();
+    app.set_working_dir(std::path::Path::new("/home/dch/repos/dch"));
+    app.post_notice("ワイドゴ通知".to_string());
+    let terminal = render_to_buffer(&mut app, 80, 26);
+    let rows = row_texts(&terminal);
+    let shared = rows
+        .iter()
+        .find(|row| row.contains("repos/dch"))
+        .expect("the place row names where the session stands");
+    assert!(
+        shared.contains("repos/dch"),
+        "the place text keeps its tail under a wide notice: {shared:?}"
+    );
+    assert!(
+        shared.replace(' ', "").contains("ワイドゴ通知"),
+        "the notice stands whole on the same row (cell-spaced in the text          extract): {shared:?}"
+    );
+}
+
+#[test]
+fn a_published_retirement_drops_only_the_pending_rows() {
+    // The runner retires never-started entries at a claim, and the
+    // driver publishes the ids through the shared state; the frame's
+    // drain applies them to the plan section. The channel retires
+    // pending rows alone — a completed entry sharing a retired id is
+    // history, and an in-progress one is owed, so both stand.
+    let (mut app, kept) = app_with_state();
+    todo_graduation(
+        &app,
+        "call-1",
+        r#"{"todos":[
+            {"id":"idea","subject":"the filed idea","status":"pending"},
+            {"id":"owed","subject":"the owed work","status":"in_progress"},
+            {"id":"done","subject":"the finished work","status":"completed"}
+        ]}"#,
+    );
+    {
+        let mut retired = kept
+            .retired_plan_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        retired.push("idea".to_string());
+        retired.push("done".to_string());
+    }
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&terminal);
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.contains("the filed idea"))
+            .count(),
+        1,
+        "the retired pending row leaves the section — the one copy left \
+         is the transcript block's record: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|row| row.contains("1/2 done")),
+        "the section's fraction counts only what stands: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("\u{25d0} the owed work")),
+        "the owed row stands: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("\u{2611} the finished work")),
+        "a completed row retires through no claim — history stands: {rows:?}"
+    );
+}

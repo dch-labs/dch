@@ -1087,6 +1087,27 @@ fn post_run_error(state: &TuiObserverState, err: &loopctl::error::LoopError) {
     state.render_notify.notify(1);
 }
 
+/// Hand the claim's retired plan entries to the display.
+///
+/// The runner drops never-started entries at each claim past the
+/// first, and the drop is invisible to the transcript until the next
+/// `TodoWrite` lands — so the driver bridges the halves: the ids ride
+/// the shared state the frame drains, and the plan section drops the
+/// retired rows on the next render.
+fn publish_claim_retirements(runner: &mut dch_loop::Runner, state: &TuiObserverState) {
+    let retired = runner.take_claim_retirements();
+    if retired.is_empty() {
+        return;
+    }
+    let mut ids = state
+        .retired_plan_ids
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for entry in retired {
+        ids.push(entry.id);
+    }
+}
+
 /// Collect one correction's words for the exit's transcript echo.
 ///
 /// The queue is process state and dies with the session, so the one
@@ -1313,6 +1334,7 @@ async fn drive_submissions(
         cancel.reset();
         state.correction_cancel.store(u64::MAX, Ordering::SeqCst);
         let result = runner.run(&text).await;
+        publish_claim_retirements(&mut runner, &state);
         state.live_claim.store(u64::MAX, Ordering::SeqCst);
         let resolved = Arc::new(runner.committed_history());
         transcript.send_machine(MachineSnapshot {
@@ -1332,13 +1354,6 @@ async fn drive_submissions(
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clear();
             if exit_owns_cancel(err, &shutting_down) {
-                // The record a cancel leaves, the exit leaves too: the
-                // resumed session reads the same stopped-run
-                // row either way. The words take their durable exits:
-                // a buffered correction for this claim is collected
-                // for the transcript echo, and without one the
-                // claimed prompt's own row — already written at its
-                // send — is the record that stands.
                 post_run_error(&state, err);
                 if let Some(corrected) =
                     pull_corrected_wording(last_claim, &mut receiver, &mut revived)
@@ -1355,16 +1370,6 @@ async fn drive_submissions(
             } else {
                 u64::MAX
             };
-            // Only the run the correction named may go silent: the
-            // flag must carry this turn's own claim — the id set
-            // beside it at claim time, in this very task, so no race
-            // can blur it. A flag that outlived the display's
-            // stand-down names some other turn, and this cancel keeps
-            // its error row whatever order the two race in. A run
-            // that started without a claim at all (a resumed
-            // session's live pair) has no local id to check; the
-            // display could only ever have matched the flag against
-            // that pair, so its silence stands.
             let names_this_turn = last_claim.is_none_or(|(claimed, _)| claimed == interrupted_id);
             let correction = if interrupted_id != u64::MAX
                 && names_this_turn

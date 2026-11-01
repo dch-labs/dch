@@ -160,6 +160,13 @@ pub struct Runner {
     /// one is a new prompt, and a new prompt inherits owed work, not
     /// abandoned ideas.
     claimed_once: bool,
+
+    /// The plan entries the last claim retired, awaiting the host.
+    ///
+    /// Cleared and refilled at every claim past the first, and handed
+    /// to the host through [`take_claim_retirements`](Self::take_claim_retirements)
+    /// so the display and every plan reader can publish the change.
+    claim_retirements: Vec<dch_tools::TodoEntry>,
 }
 
 impl Runner {
@@ -261,11 +268,35 @@ impl Runner {
             {
                 store.clear();
             } else if self.claimed_once {
-                store.retain(|entry| !matches!(entry.status, dch_tools::TodoStatus::Pending));
+                self.claim_retirements.clear();
+                store.retain(|entry| {
+                    let standing = !matches!(entry.status, dch_tools::TodoStatus::Pending);
+                    if standing {
+                        true
+                    } else {
+                        self.claim_retirements.push(entry.clone());
+                        false
+                    }
+                });
             }
         }
         self.claimed_once = true;
         self.inner.run(input, run_config).await
+    }
+
+    /// Take the plan entries the last claim retired.
+    ///
+    /// The claim-edge retirement drops never-started entries from the
+    /// store where the run cannot see them; this hands the dropped
+    /// entries to the host so the change is published — the display's
+    /// plan section drops the retired rows instead of holding them
+    /// until the next `TodoWrite` lands. Each claim's batch is
+    /// replaced by the next: a host that polls after every run never
+    /// misses one, and a host that never polls loses only the record,
+    /// never the retirement itself.
+    #[must_use]
+    pub fn take_claim_retirements(&mut self) -> Vec<dch_tools::TodoEntry> {
+        std::mem::take(&mut self.claim_retirements)
     }
 
     /// Signal the in-flight run, if any, to cancel.
@@ -788,6 +819,7 @@ impl RunnerBuilder<'_> {
             fs_session,
             run_config,
             claimed_once: false,
+            claim_retirements: Vec::new(),
         })
     }
 }
@@ -2750,6 +2782,19 @@ mod tests {
             runner.todo_undone(),
             1,
             "the unfinished count reads only the owed work"
+        );
+        let retired = runner.take_claim_retirements();
+        assert_eq!(
+            retired
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            ["idea"],
+            "the dropped entry is handed to the host for publishing"
+        );
+        assert!(
+            runner.take_claim_retirements().is_empty(),
+            "the take drains the batch — a polling host never re-reads a claim"
         );
     }
 
