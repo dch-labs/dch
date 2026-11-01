@@ -204,7 +204,7 @@ Anywhere:
 | --- | --- |
 | `F2` | Cycle tool-line verbosity (Quiet → Normal → Verbose; initial mode from `display.verbosity`) |
 | `Ctrl-C` `Ctrl-C` | While a run is in flight — through a permission ask too, which passes the chord but owns Esc — the double press is one action: the fire cancels the run exactly as `Esc Esc` cancels it (same stop, same `Agent cancelled` record) and terminates the program on the same press. The first press only arms and says so; a stray key between the presses stands the whole action down. Text in the composer clears first wherever it stands, run or not — clearing is not consenting, and a paste never feeds an exit it was not offered to — so the ladder is always clear, then arm, then fire. At rest, with an empty composer, first press arms, second press quits. A prompt with its `Agent cancelled` record beside it was stopped deliberately and stays stopped. The prompts still waiting when the exit fires were never sent at all, and do not vanish with the process: each is written into the transcript as an unclaimed row — the record a resume reads, because the waiting queue itself is process state and dies with the process. The row renders dimmed: the model never read those words, so lift them from the transcript and re-send them if you still want them |
-| `Esc` `Esc` | Cancel the run in flight — only that turn, and the prompts waiting behind it keep their place in the queue and run next (see [Waiting prompts](#waiting-prompts)). One press arms and says so on the notice row, the next fires, any other key between stands it down. Permission asks, questions, and the waiting section own Esc first — under them, close the sheet or release the section and the cancel is two presses away |
+| `Esc` `Esc` | Cancel the run in flight — only that turn, and the prompts waiting behind it keep their place in the queue and run next (see [Waiting prompts](#waiting-prompts)). One press arms and says so on the notice (the right edge of the place row), the next fires, any other key between stands it down. Permission asks, questions, and the waiting section own Esc first — under them, close the sheet or release the section and the cancel is two presses away |
 | `Ctrl-Shift-C` | Copy the selected transcript text (where the terminal reports the modifier) |
 | `Ctrl-S` | Send the composer now: to the turn in flight as guidance when a run is running, as an ordinary prompt when one is not |
 | `Ctrl-T` | Walk the plan section's postures — capped at four rows, the whole list, hidden. The plan keeps updating underneath |
@@ -229,8 +229,10 @@ run — a prompt can sit queued in the settle-to-claim moment between one
 run ending and the next claiming it. Nothing waits after a resume: the
 queue is process state and dies with the process, and the exit's
 unclaimed rows are history to read, not a backlog to run. While they
-wait, prompts are yours: fix a wording with `e`, aim one at your next
-run with `s`, or take one out with `d`.
+wait, prompts are yours: `Ctrl+W` walks them and hands the section the
+keys, `Ctrl+Q` folds the section to a one-row count of what waits —
+and lifts it back — and once the section holds the keys, fix a wording
+with `e`, aim one at your next run with `s`, or take one out with `d`.
 Nothing enters the transcript until a prompt is actually sent — the
 one exception is the exit's unclaimed rows above — the user
 row a prompt gets is written at the moment its turn starts, with the
@@ -241,17 +243,18 @@ keeps the echo row written at its claim — the record of the words that
 went out — and the prompts still waiting keep their place and run
 next.
 
-`Ctrl+Q` takes the keyboard from anywhere (except while a permission or
+`Ctrl+W` takes the keyboard from anywhere (except while a permission or
 question sheet owns it) and gives it to the section:
 
 | Key | Action |
 | --- | --- |
-| `Ctrl+Q` | Focus the waiting section — or, with a prompt open in the composer, save it and focus the section. Does nothing while nothing waits |
+| `Ctrl+W` | Focus the waiting section, standing on the row the view last stood — over a folded section the press does nothing, and with nothing waiting it stays the composer's delete-a-word. Inside the section: step the walk forward, wrapping at the tail |
+| `Ctrl+Q` | Fold the section to its one-row count and lift it back. With a prompt open for editing: save it and return to the section. With the section focused: hand the keyboard back |
 | `Left` / `Right` | Walk the waiting prompts, wrapping at both ends. The queue's order is untouched: the walk moves what is shown, not what runs next |
-| `e` | Lift the shown prompt's text into the composer to edit it. Refused, with the reason on the notice row, while the composer holds a draft of its own |
+| `e` | Lift the shown prompt's text into the composer to edit it. Refused, with the reason on the notice (the place row's right edge), while the composer holds a draft of its own |
 | `Enter` | While a prompt is out for editing: save the text back into the prompt it came from, in its original slot, and clear the composer. A blank save is refused rather than emptying the prompt |
 | `Esc` | With a prompt out for editing: discard the draft and leave the prompt exactly as it was. With the section focused: hand the keyboard back |
-| `s` | Send the shown prompt to the turn already running, as guidance it reads at its next boundary — the prompt leaves the queue as it goes, so it cannot also run later. Asks first: `y` sends, any other key stands down. Refused, with the reason on the notice row, while nothing is running |
+| `s` | Send the shown prompt to the turn already running, as guidance it reads at its next boundary — the prompt leaves the queue as it goes, so it cannot also run later. Asks first: `y` sends, any other key stands down. Refused, with the reason on the notice (the place row's right edge), while nothing is running |
 | `Delete` / `d` | Take the shown prompt out of the queue for good — it never runs. Asks first: `y` drops, any other key stands down. Dropping the last waiting prompt releases the focus |
 
 The section swallows everything else while it holds the keys, so a letter
@@ -290,9 +293,15 @@ progress and newly filed rows in the accent; ☑ finished rows uniform
 in the dim register, the words struck through and the box plain), and
 an ellipsis naming the tasks past the section's four
 rows — and the ellipsis names the chord that lifts the cap: `Ctrl-T`
-walks the section from capped to the whole list to hidden, the plan
-updating underneath all three. Hidden keeps the badge row
-standing in the section's place — the `TODO` pill with `2/9 · ctrl+t`
+opens the whole list when the cap actually cut an entry, then folds
+the section, then stands the cap again — a cap that already shows the
+whole list skips the opening press and folds instead — the plan
+updating underneath every posture. Between prompts the plan keeps
+only what is owed: a new prompt inherits the entries in progress and
+the completed history, while entries still pending — filed by an
+earlier prompt and never started — retire at the claim. A resumed
+session's first run carries its restored plan whole. Hidden keeps the badge row
+standing in the section's place — the `TODO` pill with `2/9 · ctrl+t to show`
 beside it — so a folded plan is out of sight without being out of
 mind. It reads at a glance where the run is;
 the transcript's own todo blocks hold every update in full for the
@@ -317,7 +326,7 @@ after the turn: the model reads it on the later turns too, and the session
 saved to disk holds it.
 
 A prompt already queued patiently can join the running turn too: focus the
-waiting section (`Ctrl+Q`), walk to it (`Left`/`Right`), press `s` — it
+waiting section (`Ctrl+W`), walk to it (`Left`/`Right`), press `s` — it
 leaves the queue and reaches the model inside the turn, which is what you
 want when the turn has made the point urgent.
 
@@ -329,7 +338,7 @@ Two edges, both settled the same way — the words are the user's:
 - **The run ends before it reads the guidance.** The intent to send still
   stands, so it is sent: the text returns to the waiting section with its
   turn promised again, joins the transcript when that turn claims it, and
-  the notice row says why. Until its own turn comes it can still be edited
+  the notice (the place row's right edge) says why. Until its own turn comes it can still be edited
   (`e`) or taken out (`d`) like any other waiting prompt — and if the advice
   has gone stale with the turn it was meant for, `d` is one key.
 - **The session exits before the run reads the guidance.** The steered row

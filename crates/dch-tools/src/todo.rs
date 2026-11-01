@@ -252,8 +252,13 @@ where
 
 /// Derive a subject from a description.
 ///
-/// Takes the description's first non-blank line, trimmed, truncated to
-/// roughly fifty characters when longer. The id fallback is the pure
+/// Takes the description's first non-blank line, trimmed and whole:
+/// the subject is the one line every reader — the model in the
+/// render, the plan section on screen, a resumed session's seeded
+/// store — reads first, and cutting it to fit a column would hide the
+/// same words from all three at once. Displays that run out of width
+/// wrap the subject onto continuation rows rather than truncating
+/// it here. The id fallback is the pure
 /// helper's total arm — unreachable through the tool's identity gate,
 /// which rejects an entry with nothing to derive from before this runs.
 fn derive_subject(description: &str, id: &str) -> String {
@@ -261,13 +266,9 @@ fn derive_subject(description: &str, id: &str) -> String {
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty());
-    let Some(first_line) = first_line else {
-        return format!("Task {id}");
-    };
-    if first_line.chars().count() > 50 {
-        format!("{}...", first_line.chars().take(47).collect::<String>())
-    } else {
-        first_line.to_string()
+    match first_line {
+        Some(first_line) => first_line.to_string(),
+        None => format!("Task {id}"),
     }
 }
 
@@ -2366,14 +2367,19 @@ mod tests {
     }
 
     #[test]
-    fn derived_subjects_truncate_long_first_lines() {
-        let long = "x".repeat(60);
-        let subject = derive_subject(&long, "1");
-        assert_eq!(subject.chars().count(), 50, "{subject}");
-        assert!(subject.ends_with("..."), "{subject}");
+    fn derived_subjects_keep_the_whole_first_line() {
+        // The derived subject is the line every reader reads first —
+        // the render, the plan section, a resumed store seeded from
+        // it — so a long first line stays whole and every display that
+        // runs out of width wraps, never truncates at the source.
+        let long = "x".repeat(120);
+        assert_eq!(derive_subject(&long, "1"), long);
 
         let exact = "y".repeat(50);
         assert_eq!(derive_subject(&exact, "1"), exact);
+
+        let sentence = "The executed-tool-name fix in dispatch.rs still has no test anywhere";
+        assert_eq!(derive_subject(sentence, "t"), sentence);
     }
 
     #[test]

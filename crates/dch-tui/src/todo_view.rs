@@ -519,7 +519,7 @@ fn folded_hint(rows: &[TodoRow], colors: &TodoColors) -> Line<'static> {
         ),
         Span::raw(" "),
         Span::styled(
-            format!("{} · ctrl+t", done_fraction(rows)),
+            format!("{} · ctrl+t to show", done_fraction(rows)),
             Style::default().fg(colors.dim),
         ),
     ])
@@ -536,9 +536,13 @@ fn folded_hint(rows: &[TodoRow], colors: &TodoColors) -> Line<'static> {
 /// wording wraps past the whole budget keeps its head while the
 /// budget pays for even one row; a budget that pays for none names
 /// every task through the ellipsis rather than showing a count that
-/// disagrees with the rows. The ellipsis line
-/// may take one row beyond the cap — its arithmetic is the caller's
-/// height's arithmetic, both counting what this returns.
+/// disagrees with the rows. The body may reach `body_cap + 1` rows:
+/// the ellipsis line takes one row beyond the cap, and when the
+/// final entry is the only thing the cap would cut and fits within
+/// that one row, it stands there instead — no ellipsis at all, the
+/// whole list on screen for the price of the count that hid it.
+/// The caller's height arithmetic counts what this returns, so the
+/// layout always pays for exactly what is painted.
 pub(crate) fn section_lines(
     rows: &[TodoRow],
     changes: &HashMap<String, TodoStatus>,
@@ -576,11 +580,21 @@ pub(crate) fn section_lines(
     let mut shown = 0usize;
     for (index, group) in groups.into_iter().enumerate() {
         if used.saturating_add(group.len()) > body_cap {
-            if used == 0 && body_cap > 0 && !group.is_empty() {
-                lines.extend(group.into_iter().take(body_cap));
-                shown = index.saturating_add(1);
+            // The one trade the ellipsis cannot win: when the entry it
+            // would cut is the last one standing outside the cap and
+            // showing it costs at most the row the ellipsis itself
+            // would have taken, the entry rides that row instead — a
+            // "+1 more" that hides an entry the section had room to
+            // name is noise, not a cut.
+            let rides_the_ellipsis = index.saturating_add(1) == rows.len()
+                && used.saturating_add(group.len()) <= body_cap.saturating_add(1);
+            if !rides_the_ellipsis {
+                if used == 0 && body_cap > 0 && !group.is_empty() {
+                    lines.extend(group.into_iter().take(body_cap));
+                    shown = index.saturating_add(1);
+                }
+                break;
             }
-            break;
         }
         used = used.saturating_add(group.len());
         shown = shown.saturating_add(1);
@@ -847,6 +861,149 @@ Summary: 9 pending, 1 in progress, 2 completed\n\n\
             lines.len(),
             3,
             "the section is air, badge, and the honest count"
+        );
+    }
+
+    #[test]
+    fn the_last_entry_rides_the_ellipsis_row() {
+        // Five one-line entries against a four-row budget: the cut
+        // would name the fifth through an ellipsis that costs the very
+        // row the fifth entry needs, so the entry takes the row
+        // instead — the whole list stands, nothing is "+1 more". A cut
+        // only earns its ellipsis when it hides more than the ellipsis
+        // itself could have shown.
+        let rows: Vec<TodoRow> = (0..5)
+            .map(|index| TodoRow {
+                id: format!("t{index}"),
+                subject: format!("task {index}"),
+                status: TodoStatus::Pending,
+            })
+            .collect();
+        let colors = TodoColors {
+            dim: ratatui::style::Color::Reset,
+            accent: ratatui::style::Color::Reset,
+            moved: ratatui::style::Color::Reset,
+            badge_fill: ratatui::style::Color::Reset,
+            badge_letters: ratatui::style::Color::Reset,
+        };
+        let lines = section_lines(&rows, &HashMap::new(), &colors, 60, 4, None);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+        assert!(
+            !text.iter().any(|line| line.contains("more (ctrl+t")),
+            "the fifth entry stands in the row the ellipsis would have \
+             spent: {text:?}"
+        );
+        assert_eq!(lines.len(), 7, "air, badge, and all five entries");
+        for index in 0..5 {
+            assert!(
+                text.iter()
+                    .any(|line| line.contains(&format!("task {index}"))),
+                "entry {index} renders: {text:?}"
+            );
+        }
+
+        // Six entries against the same budget still cut: the ellipsis
+        // hides two, and one row cannot stand for both.
+        let rows: Vec<TodoRow> = (0..6)
+            .map(|index| TodoRow {
+                id: format!("t{index}"),
+                subject: format!("task {index}"),
+                status: TodoStatus::Pending,
+            })
+            .collect();
+        let lines = section_lines(&rows, &HashMap::new(), &colors, 60, 4, None);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+        assert!(
+            text.iter()
+                .any(|line| line.contains("+2 more (ctrl+t for all)")),
+            "a cut that hides two keeps its ellipsis: {text:?}"
+        );
+    }
+}
+
+// Test code panics by design — its asserts are the assertions.
+#[cfg(test)]
+#[allow(clippy::missing_panics_doc)]
+mod long_subject_wrap {
+    use super::*;
+
+    fn plain_colors() -> TodoColors {
+        TodoColors {
+            dim: ratatui::style::Color::Reset,
+            accent: ratatui::style::Color::Reset,
+            moved: ratatui::style::Color::Reset,
+            badge_fill: ratatui::style::Color::Reset,
+            badge_letters: ratatui::style::Color::Reset,
+        }
+    }
+
+    #[test]
+    fn a_long_subject_wraps_under_its_icon() {
+        // The subject is the words the reader came for, and the source
+        // no longer truncates a derived one — so the display's whole
+        // duty is the wrap: the words continue under the icon onto as
+        // many rows as they need, and the section's row arithmetic
+        // counts every continuation row it painted.
+        let subject =
+            "The executed-tool-name fix in dispatch.rs still has no test anywhere in the suite";
+        let rows = vec![TodoRow {
+            id: "t-c05".to_string(),
+            subject: subject.to_string(),
+            status: TodoStatus::Pending,
+        }];
+        let colors = plain_colors();
+        let lines = render_rows(&rows, &HashMap::new(), &colors, 30);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(
+            lines.len() > 1,
+            "a subject wider than the section wraps to continuation rows: {text:?}"
+        );
+        // A column-width wrap may break a word across a line boundary
+        // and every continuation row opens with its indent, so the
+        // check reads the rows the way the eye does: whitespace-free.
+        let packed = text.concat().replace(' ', "");
+        for word in ["executed-tool-name", "dispatch.rs", "anywhere", "suite"] {
+            assert!(
+                packed.contains(word),
+                "the wrap keeps every word, cutting none: {text:?}"
+            );
+        }
+        assert!(
+            !text.concat().contains("..."),
+            "no ellipsis stands in for words the width could not fit: {text:?}"
+        );
+
+        // And the section's arithmetic pays for the wrap: the open
+        // posture's line count includes every continuation row.
+        let section = section_lines(&rows, &HashMap::new(), &colors, 30, usize::MAX, None);
+        assert_eq!(
+            section.len(),
+            lines.len() + 2,
+            "air and badge beside every wrapped row the entry paints"
         );
     }
 }

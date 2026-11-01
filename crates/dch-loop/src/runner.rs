@@ -150,6 +150,16 @@ pub struct Runner {
     /// [`Runner::run_with`] rather than rebuilding the `Runner` (rebuilding
     /// creates a fresh `BareLoop` and discards the conversation).
     run_config: RunConfig,
+
+    /// Whether any prompt has claimed this runner yet.
+    ///
+    /// The claim-edge retirement of never-started plan entries spares
+    /// the first claim of a runner's life: a resumed runner's seeded
+    /// plan is the prior session's open work arriving whole, and the
+    /// first continued run owes it unchanged — every claim past that
+    /// one is a new prompt, and a new prompt inherits owed work, not
+    /// abandoned ideas.
+    claimed_once: bool,
 }
 
 impl Runner {
@@ -190,7 +200,9 @@ impl Runner {
     /// Uses the run policy mapped from `DchConfig` at construction (turn
     /// budget, dispatch policy). The session's todo plan carries into this
     /// run when it holds unfinished entries and retires when the prior run
-    /// finished everything. Returns when the model signals end-of-turn, the
+    /// finished everything; a claim past the runner's first also retires
+    /// entries still pending — never started — while in-progress entries
+    /// carry as owed work. Returns when the model signals end-of-turn, the
     /// budget is exhausted, the loop detector aborts, or
     /// [`Runner::cancel`] is called. Equivalent to [`Runner::run_with`] with
     /// the default config; the conversation is shared across `run`/`run_with`
@@ -214,7 +226,12 @@ impl Runner {
     /// session default for this one call without rebuilding the `Runner` (a
     /// rebuild constructs a fresh `BareLoop` and discards the conversation).
     /// The session's todo plan carries into this run when it holds unfinished
-    /// entries and retires when the prior run finished everything. The
+    /// entries and retires when the prior run finished everything; a claim
+    /// past the runner's first also retires entries still pending — never
+    /// started, so a new prompt inherits the owed work (in progress) and
+    /// the history (completed) but not the ideas an earlier prompt filed
+    /// and left — while the first claim of a resumed runner carries the
+    /// seeded plan whole. The
     /// returned [`Run`] records `run_config` as its own snapshot, so per-call
     /// overrides are visible in the run's accounting. This mirrors loopctl's
     /// own default/override pairing (`stream_messages` vs
@@ -243,8 +260,11 @@ impl Runner {
                 .all(|entry| matches!(entry.status, dch_tools::TodoStatus::Completed))
             {
                 store.clear();
+            } else if self.claimed_once {
+                store.retain(|entry| !matches!(entry.status, dch_tools::TodoStatus::Pending));
             }
         }
+        self.claimed_once = true;
         self.inner.run(input, run_config).await
     }
 
@@ -767,6 +787,7 @@ impl RunnerBuilder<'_> {
             context,
             fs_session,
             run_config,
+            claimed_once: false,
         })
     }
 }
@@ -2664,6 +2685,109 @@ mod tests {
             .expect("the installed stream carries the request")
             .expect("the bridge stays alive");
         assert_eq!(prompt.question, "wired?");
+    }
+
+    /// A store entry with the given id and status, subject and id alike.
+    fn standing_entry(id: &str, status: dch_tools::TodoStatus) -> dch_tools::TodoEntry {
+        dch_tools::TodoEntry {
+            id: id.to_string(),
+            subject: id.to_string(),
+            description: String::new(),
+            status,
+            active_form: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_second_claim_retires_never_started_entries() {
+        // The plan a new prompt inherits: owed work, not abandoned
+        // ideas. Entries still pending were never started — the rung
+        // law has no way back into pending — so the claim past the
+        // first drops them while the in-progress entry carries, and
+        // the exit's unfinished count reads only what is owed. The
+        // first claim is exempt: a runner fresh off a build owes its
+        // standing plan whole.
+        let config = offline_config();
+        let dir = TempDir::new().expect("tempdir");
+        let mut runner = Runner::builder(&config, dir.path())
+            .build()
+            .await
+            .expect("constructs");
+        {
+            let mut store = runner.context.todos.lock().expect("todos lock");
+            store.push(standing_entry("idea", dch_tools::TodoStatus::Pending));
+            store.push(standing_entry("owed", dch_tools::TodoStatus::InProgress));
+        }
+        drop(runner.run("first prompt").await);
+        let after_first: Vec<String> = runner
+            .context
+            .todos
+            .lock()
+            .expect("todos lock")
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect();
+        assert_eq!(
+            after_first,
+            ["idea", "owed"],
+            "the first claim carries the standing plan whole"
+        );
+        drop(runner.run("second prompt").await);
+        let after_second: Vec<String> = runner
+            .context
+            .todos
+            .lock()
+            .expect("todos lock")
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect();
+        assert_eq!(
+            after_second,
+            ["owed"],
+            "the second claim retires the never-started entry"
+        );
+        assert_eq!(
+            runner.todo_undone(),
+            1,
+            "the unfinished count reads only the owed work"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_first_claim_carries_the_seeded_plan_whole() {
+        // The resume half: a restored history whose last render holds
+        // undone entries seeds the store, and the session's first
+        // continued run owes that plan unchanged — the retirement is
+        // for claims past the first, so resuming to finish open work
+        // never finds its pendings gone.
+        let config = offline_config();
+        let dir = TempDir::new().expect("tempdir");
+        let seeded_render = "# Task List\n\nSummary: 1 pending, 0 in progress, 0 \
+             completed\n\n○ [only] the owed work\n\n";
+        let history = vec![loopctl::message::Message::new(
+            loopctl::message::Role::User,
+            vec![loopctl::message::MessagePart::tool_result(
+                "c1",
+                "TodoWrite",
+                seeded_render,
+                false,
+            )],
+        )];
+        let mut runner = Runner::builder(&config, dir.path())
+            .with_history(history)
+            .build()
+            .await
+            .expect("constructs");
+        drop(runner.run("continue the work").await);
+        let store = runner.context.todos.lock().expect("todos lock").clone();
+        assert_eq!(
+            store
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            ["only"],
+            "the resumed session's first run carries its seeded plan whole"
+        );
     }
 
     #[tokio::test]
