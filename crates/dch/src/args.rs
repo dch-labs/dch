@@ -152,12 +152,12 @@ pub struct Args {
     #[command(flatten)]
     pub config: ConfigArgs,
 
-    /// Increase verbosity.
+    /// Raise verbosity one step per occurrence.
     ///
     /// How verbosity combines with `--quiet` is resolved when configuration
     /// is applied, not here.
-    #[arg(short = 'v', long, help_heading = "Output")]
-    pub verbose: bool,
+    #[arg(short = 'v', long, action = clap::ArgAction::Count, help_heading = "Output")]
+    pub verbose: u8,
 
     /// Decrease verbosity.
     ///
@@ -335,7 +335,7 @@ mod tests {
         assert_eq!(args.model, None);
         assert_eq!(args.config.config_path, None);
         assert!(!args.config.unsafe_paths);
-        assert!(!args.verbose);
+        assert_eq!(args.verbose, 0);
         assert!(!args.quiet);
         assert_eq!(args.done_file, None);
     }
@@ -493,9 +493,19 @@ mod tests {
     }
 
     #[test]
-    fn verbose_parses_via_both_spellings() {
-        assert!(parse(&["--verbose"]).unwrap().verbose);
-        assert!(parse(&["-v"]).unwrap().verbose);
+    fn verbose_parses_via_both_spellings_and_counts() {
+        assert_eq!(parse(&["--verbose"]).unwrap().verbose, 1);
+        assert_eq!(parse(&["-v"]).unwrap().verbose, 1);
+        assert_eq!(
+            parse(&["-vv"]).unwrap().verbose,
+            2,
+            "a repeated flag steps a level"
+        );
+        assert_eq!(
+            parse(&["-v", "--verbose"]).unwrap().verbose,
+            2,
+            "spellings mix"
+        );
     }
 
     #[test]
@@ -515,7 +525,7 @@ mod tests {
         let args = parse(&["--model", "m", "t", "-v", "--done-file", "d"]).unwrap();
         assert_eq!(args.model, Some("m".to_string()));
         assert_eq!(args.task, Some("t".to_string()));
-        assert!(args.verbose);
+        assert_eq!(args.verbose, 1);
         assert_eq!(args.done_file, Some(PathBuf::from("d")));
     }
 

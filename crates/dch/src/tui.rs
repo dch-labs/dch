@@ -143,7 +143,7 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
     {
         crate::signals::report(&format!("dch: {warn}"));
     }
-    let (config, config_base) = resolve_session_config_pair(args, &control)?;
+    let (config, config_base, config_file) = resolve_session_config_pair(args, &control)?;
 
     let workdir = std::env::current_dir().map_err(|err| format!("cannot determine cwd: {err}"))?;
 
@@ -210,6 +210,7 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
     let driver_base = Arc::new(config_base.clone());
     let mut app = TuiApp::from_observer_state(config, state.clone());
     app.set_config_base(config_base);
+    app.set_config_file(config_file);
     app.set_submit_tx(submit_tx);
     app.set_guidance(guidance.clone());
     app.set_permission_requests(permission_rx);
@@ -1938,14 +1939,12 @@ async fn apply_session_command(
         }
         SessionCommand::Compact { compactions } => match runner.compact_now().await {
             Ok(figures) => {
-                let folded =
-                    filtered_machine_history(&Arc::new(runner.committed_history()));
+                let folded = filtered_machine_history(&Arc::new(runner.committed_history()));
                 *context
                     .state
                     .machine_history
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    Some(Arc::clone(&folded));
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&folded));
                 transcript.send_machine(MachineSnapshot {
                     messages: folded,
                     saved_at: chrono::Utc::now(),
@@ -2616,11 +2615,7 @@ mod tests {
             "the notice carries the pass's own figures: {text}"
         );
 
-        let cached = state
-            .machine_history
-            .lock()
-            .expect("history lock")
-            .clone();
+        let cached = state.machine_history.lock().expect("history lock").clone();
         assert!(
             cached.as_ref().is_some_and(|history| history.len() < 20),
             "the cached machine history is the folded one: {:?}",

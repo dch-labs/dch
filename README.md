@@ -77,8 +77,11 @@ echo "summarize this repo" | dch
 A single run is quiet by default: stdout carries only the final
 answer, printed once when the run ends, and stderr carries only the
 run's real trouble (warnings and failures). Pass `-v` to watch the run
-instead — the reply streams to stdout as it forms, and tool calls,
-turn markers, and token usage narrate on stderr.
+instead — the reply streams to stdout as it forms and tool-call lines
+narrate on stderr; a second `-v` adds durations, token counts, and the
+run summary. A single run is non-interactive throughout: the model is
+offered no `AskUserQuestion` tool, and permission asks it cannot
+surface are denied rather than waited on.
 
 A `TASK` argument selects single-run mode; with no argument, a stdin
 that is not a terminal selects it too. A bare invocation on a
@@ -144,7 +147,7 @@ Common options:
 | `--reasoning-effort LEVEL` | Override the configured thinking budget for this run |
 | `--no-redact` | Disable secrets redaction for this run |
 | `--done-file PATH` | Write a JSON completion status to PATH (single-run mode) |
-| `-v, --verbose` / `-q, --quiet` | Adjust verbosity (a single-run invocation is quiet by default; `-v` narrates the run) |
+| `-v, --verbose` / `-q, --quiet` | Adjust verbosity — repeat `-v` to step up (`-v` narrates a single run, `-vv` adds token and duration detail; in the TUI the flags set the initial tool-line verbosity). A single-run invocation is quiet by default |
 
 Themes: `default` (near-black, derived from OpenCode's dark palette),
 `transparent`, `dracula`, `nord`, `tokyo_night`,

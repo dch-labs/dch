@@ -1729,6 +1729,21 @@ pub struct TuiApp {
     /// nothing on any disk.
     config_persist_dir: Option<std::path::PathBuf>,
 
+    /// The configuration as the file states it, for write-through.
+    ///
+    /// The session-effective config mixes in run-scoped CLI overrides
+    /// and the selected profile's expanded `[api]`; persisting it would
+    /// write both into the user's file (an `--unsafe-paths` run leaving
+    /// `unsafe_paths = true` behind; a profile's endpoint and credential
+    /// freezing into `[api]` for profiles that name none of their own).
+    /// This copy is the file as loaded, before overrides and selections,
+    /// and carries only what a user word actually changed — `/set`,
+    /// `/unset`, `/theme`, a `/model` verdict's intended selection — so
+    /// [`persist_config`](Self::persist_config) writes user settings,
+    /// not the session. `None` (a host that installed none) falls back
+    /// to persisting the live config, today's behavior.
+    config_file: Option<DchConfig>,
+
     /// The session's id, as the status bar shows it.
     ///
     /// Set by the host once the session's identity is known — the
@@ -2299,6 +2314,7 @@ impl TuiApp {
             input_quiesce: None,
             config,
             config_persist_dir: None,
+            config_file: None,
         }
     }
 
@@ -2373,6 +2389,9 @@ impl TuiApp {
         match update {
             SessionUpdate::SessionId { id } => self.session_id = Some(id),
             SessionUpdate::ModelName { name } => {
+                if let Some(file) = self.config_file.as_mut() {
+                    file.api.model.clone_from(&name);
+                }
                 self.reselect_model(Some(&name));
                 self.publish_transcript_now();
                 self.persist_config("model");
@@ -2382,6 +2401,9 @@ impl TuiApp {
                 base_url,
                 api_type,
             } => {
+                if let Some(file) = self.config_file.as_mut() {
+                    file.api.model.clone_from(&model);
+                }
                 self.reselect_provider(model, base_url, &api_type);
                 self.publish_transcript_now();
                 self.persist_config("model");
@@ -2734,11 +2756,12 @@ impl TuiApp {
             ));
             return;
         }
+        let persisted = self.config_file.as_ref().unwrap_or(&self.config);
         if !self.config_overrides.contains_key(key) {
-            let original = if config_fields::is_absent(&self.config, key) {
+            let original = if config_fields::is_absent(persisted, key) {
                 None
             } else {
-                Some(config_fields::get(&self.config, key).unwrap_or_default())
+                Some(config_fields::get(persisted, key).unwrap_or_default())
             };
             self.config_overrides.insert(key.to_string(), original);
         }
@@ -2749,6 +2772,9 @@ impl TuiApp {
         }
         if let Some(base) = self.config_base.as_mut() {
             let _mirror = config_fields::set(base, key, value);
+        }
+        if let Some(file) = self.config_file.as_mut() {
+            let _mirror = config_fields::set(file, key, value);
         }
         self.apply_live_config(key);
         let shown = if config_fields::is_secret(key) && !value.is_empty() && value != "unset" {
@@ -2775,6 +2801,16 @@ impl TuiApp {
     /// into the file a next load prefers.
     pub fn set_config_persist_dir(&mut self, dir: Option<std::path::PathBuf>) {
         self.config_persist_dir = dir;
+    }
+
+    /// Install the file-stated config write-through persists.
+    ///
+    /// The host's wiring: the file as loaded, before any CLI override
+    /// or model selection ran. Every user-authored change lands on it
+    /// beside the live config, and [`persist_config`](Self::persist_config)
+    /// serializes it rather than the session-effective copy.
+    pub fn set_config_file(&mut self, file: DchConfig) {
+        self.config_file = Some(file);
     }
 
     /// Install the user-stated base a model selection layers onto.
@@ -2805,7 +2841,8 @@ impl TuiApp {
         let Some(dir) = self.config_persist_dir.clone() else {
             return;
         };
-        if let Err(why) = self.config.save_to_dir(&dir) {
+        let to_save = self.config_file.as_ref().unwrap_or(&self.config);
+        if let Err(why) = to_save.save_to_dir(&dir) {
             match config_fields::live(key) {
                 Some(config_fields::Live::Display) => self.post_notice(format!(
                     "applied for this session only — the config save failed: {why}"
@@ -2846,6 +2883,16 @@ impl TuiApp {
                 }
                 Some(value) => {
                     let _mirror = config_fields::set(base, key, value);
+                }
+            }
+        }
+        if let Some(file) = self.config_file.as_mut() {
+            match original.as_deref() {
+                None => {
+                    let _mirror = config_fields::clear(file, key);
+                }
+                Some(value) => {
+                    let _mirror = config_fields::set(file, key, value);
                 }
             }
         }
@@ -3368,6 +3415,9 @@ impl TuiApp {
             self.land_theme_change();
             let key = Theme::key_for_name(name).unwrap_or_default();
             self.config.display.theme = key.to_string();
+            if let Some(file) = self.config_file.as_mut() {
+                file.display.theme = key.to_string();
+            }
             self.persist_config("theme");
         } else {
             self.post_notice(format!("unknown theme '{name}'"));
@@ -18199,6 +18249,79 @@ mod tests {
         assert!(
             !saved.contains("\"nord\""),
             "the restore is written back: {saved}"
+        );
+    }
+
+    #[test]
+    fn a_set_persists_the_file_not_the_run_scoped_overrides() {
+        // --unsafe-paths is a per-run statement; a /theme in the same
+        // session must not write it into the file the next run loads.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut live = dch_config::DchConfig::default();
+        live.runner.unsafe_paths = true; // what --unsafe-paths left in effect
+        let mut app = TuiApp::new(live);
+        app.set_config_file(dch_config::DchConfig::default());
+        app.set_config_persist_dir(Some(dir.path().to_path_buf()));
+        app.run_command(Command::Set {
+            key: "theme".to_string(),
+            value: "nord".to_string(),
+        });
+        let saved =
+            std::fs::read_to_string(dir.path().join("config.toml")).expect("the set landed");
+        assert!(
+            saved.contains("\"nord\""),
+            "the user's change is written: {saved}"
+        );
+        assert!(
+            !saved.contains("unsafe_paths = true"),
+            "the run-scoped flag never lands: {saved}"
+        );
+    }
+
+    #[test]
+    fn a_model_verdict_persists_the_selection_not_the_expanded_bundle() {
+        // The verdict's [api] is the selected profile expanded — model,
+        // endpoint, credential. Persisting it would freeze the endpoint
+        // into [api] for every profile that names none of its own; the
+        // file records the intended selection alone.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dch_config::DchConfig {
+            models: vec![dch_config::ModelProfile {
+                model: "glm".to_string(),
+                base_url: Some("https://profile.example".to_string()),
+                ..dch_config::ModelProfile::default()
+            }],
+            api: dch_config::ApiConfig {
+                base_url: "https://base.example".to_string(),
+                ..dch_config::ApiConfig::default()
+            },
+            ..dch_config::DchConfig::default()
+        };
+        let mut live = file.clone();
+        // What the boot selection left in effect:
+        live.api.model = "glm".to_string();
+        live.api.base_url = "https://profile.example".to_string();
+        let mut app = TuiApp::new(live);
+        app.set_config_file(file);
+        app.set_config_persist_dir(Some(dir.path().to_path_buf()));
+        app.apply_session_update(crate::queue::SessionUpdate::ModelName {
+            name: "glm".to_string(),
+        });
+        let saved =
+            std::fs::read_to_string(dir.path().join("config.toml")).expect("the verdict landed");
+        let reloaded = dch_config::DchConfig::from_toml_str(&saved).expect("the file reloads");
+        assert_eq!(
+            reloaded.api.model, "glm",
+            "the selection is recorded: {saved}"
+        );
+        assert_eq!(
+            reloaded.api.base_url, "https://base.example",
+            "the file's own endpoint stands in [api]: {saved}"
+        );
+        assert_eq!(
+            reloaded.models.len(),
+            1,
+            "the profile list survives beside the selection: {saved}"
         );
     }
 

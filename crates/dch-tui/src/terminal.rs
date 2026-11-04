@@ -11,6 +11,7 @@ use crossterm::cursor::SetCursorStyle;
 use std::io::Write as _;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicPtr;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
@@ -127,11 +128,18 @@ fn record_support(support: BackgroundSupport) {
 static ORIGINAL_TERMIOS: OnceLock<libc::termios> = OnceLock::new();
 
 /// The exact bytes the fatal-signal handler writes to restore the
-/// terminal, built once at arm time from the state the session had
-/// then: the original background when one was captured, the mode
+/// terminal: the original background when one was captured, the mode
 /// teardown, and the alternate screen exit.
+///
+/// Published through a raw pointer rather than a [`OnceLock`] so a
+/// background captured *after* arming can refresh it: the arm call
+/// publishes the first copy, and every later capture republishes with
+/// the original it learned. A handler mid-write of a superseded copy
+/// keeps reading it — the displaced allocation is never freed — so the
+/// publication stays a pointer swap an async-signal-safe load can
+/// observe, and the process leaks at most a few small buffers.
 #[cfg(unix)]
-static SIGNAL_RESTORE_BYTES: OnceLock<Vec<u8>> = OnceLock::new();
+static SIGNAL_RESTORE_BYTES: AtomicPtr<Box<[u8]>> = AtomicPtr::new(std::ptr::null_mut());
 
 /// The SIGINT handler action this process replaced when it armed the
 /// fatal-signal restore, as a raw `sa_sigaction` value; a sentinel
@@ -338,6 +346,7 @@ fn query_unix(red: u8, green: u8, blue: u8) -> QueryOutcome {
     match outcome {
         QueryReply::Answered(original) => {
             let _stored = ORIGINAL_BACKGROUND.set(original);
+            refresh_signal_restore_bytes(original);
             let mut stdout = io::stdout();
             drop(write!(
                 stdout,
@@ -913,20 +922,25 @@ fn signal_restore_bytes(original: Option<(u8, u8, u8)>) -> Vec<u8> {
     bytes.into_bytes()
 }
 
-/// Replay the captured restore bytes and the captured line discipline.
+/// Replay the published restore bytes and the captured line discipline.
 ///
 /// The handler-side twin of [`restore_terminal`]'s first and last
 /// steps, built from raw `write` and `tcsetattr` so a signal arriving
 /// on any thread can run it without touching a lock or an allocator.
+/// The bytes are the *latest* publication — a background captured
+/// after arming rides them — read through an acquire load of the
+/// publication pointer, so the handler sees a fully-written allocation
+/// whatever the session did between publishing and the signal.
 ///
 /// # Safety
 ///
-/// Called from a signal handler: the statics it reads must have been
-/// set before the handler was armed, and the caller must tolerate the
-/// call running on any thread while other threads are mid-operation.
+/// Called from a signal handler: the byte string is an immutable
+/// allocation published before this load and never freed, and the
+/// caller must tolerate the call running on any thread while other
+/// threads are mid-operation.
 #[cfg(unix)]
 unsafe fn run_signal_restore() {
-    if let Some(bytes) = SIGNAL_RESTORE_BYTES.get() {
+    if let Some(bytes) = published_restore_bytes() {
         let mut offset = 0usize;
         while offset < bytes.len() {
             let remaining = bytes.len().saturating_sub(offset);
@@ -1078,13 +1092,61 @@ unsafe fn install_fatal_handler(signal: libc::c_int, chain: &AtomicUsize) {
     }
 }
 
+/// Publish `bytes` as the ones the fatal handler writes.
+///
+/// The swap is the whole publication: the displaced allocation is
+/// deliberately never freed — a handler may be mid-write of it — so
+/// the handler-side load stays a plain acquire read of a pointer,
+/// async-signal-safe all the way down.
+#[cfg(unix)]
+fn publish_restore_bytes(bytes: Box<[u8]>) {
+    let fresh = Box::into_raw(Box::new(bytes));
+    SIGNAL_RESTORE_BYTES.swap(fresh, Ordering::SeqCst);
+}
+
+/// The published restore bytes, the latest copy.
+///
+/// `None` before the first publication (an unarmed process). The load
+/// pairs with [`publish_restore_bytes`]'s swap, so a non-null answer
+/// names a fully-written allocation.
+#[cfg(unix)]
+fn published_restore_bytes() -> Option<&'static [u8]> {
+    let published = SIGNAL_RESTORE_BYTES.load(Ordering::Acquire);
+    if published.is_null() {
+        return None;
+    }
+    // SAFETY: the pointer came from `Box::into_raw` in
+    // `publish_restore_bytes`, the allocation is never freed, and the
+    // release publication guarantees its contents are visible to this
+    // acquire load.
+    let boxed = unsafe { &*published };
+    Some(&**boxed)
+}
+
+/// Fold a background captured after arming into the published bytes.
+///
+/// The arm-time copy could not know this background — typed-ahead
+/// input skips the startup query, and a later ask's capture is the
+/// first the session learns of it — so the capture republishes the
+/// bytes with the original embedded. Before arming this is a no-op:
+/// the arm build reads whatever has been captured by then.
+#[cfg(unix)]
+fn refresh_signal_restore_bytes(original: (u8, u8, u8)) {
+    if SIGNAL_RESTORE_ARMED.load(Ordering::SeqCst) {
+        publish_restore_bytes(signal_restore_bytes(Some(original)).into_boxed_slice());
+    }
+}
+
 /// Arm the fatal-signal terminal restore for SIGINT and SIGTERM.
 ///
-/// Builds the restore byte string from the state the session has at
+/// Publishes the restore byte string from the state the session has at
 /// arm time — call after [`sync_default_background`] so a captured
 /// original background rides in it — and replaces both signals'
 /// dispositions, keeping the displaced handlers for the live-phase
-/// chain. Idempotent: the first call arms, later calls return.
+/// chain. A background captured *after* arming republishes the bytes
+/// (see [`refresh_signal_restore_bytes`]), so the handler always
+/// restores the latest original the session learned. Idempotent: the
+/// first call arms, later calls return.
 ///
 /// The handler is deliberately synchronous rather than a tokio
 /// listener: it must still work when the runtime is blocked in a
@@ -1095,8 +1157,9 @@ pub fn arm_fatal_signal_restore() {
     if SIGNAL_RESTORE_ARMED.swap(true, Ordering::SeqCst) {
         return;
     }
-    let _stored =
-        SIGNAL_RESTORE_BYTES.set(signal_restore_bytes(ORIGINAL_BACKGROUND.get().copied()));
+    publish_restore_bytes(
+        signal_restore_bytes(ORIGINAL_BACKGROUND.get().copied()).into_boxed_slice(),
+    );
     // SAFETY: the two calls only register this module's handler and
     // record the actions they displaced.
     unsafe {
@@ -1788,5 +1851,44 @@ mod synchronized_output_pins {
         // alone, so the window markers always pair.
         let declined = theme_burst_bytes(None, Color::Rgb(40, 40, 40), Color::Rgb(1, 2, 3));
         assert_eq!(declined, SYNCHRONIZED_OUTPUT_END);
+    }
+}
+
+// Test code panics by design — its asserts are the assertions.
+#[cfg(all(test, unix))]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc
+)]
+mod signal_restore_publication_pins {
+    use super::*;
+
+    #[test]
+    fn the_publication_takes_the_latest_bytes_and_skips_the_unarmed() {
+        // A capture after arming must reach the handler: the arm-time
+        // snapshot could not know it, so the capture republishes, and
+        // the handler reads whichever publication is newest. Before
+        // arming a capture publishes nothing — the arm build reads the
+        // captured background directly. The publication static is
+        // process-global; this test process never arms the real
+        // handler, so publishing here disturbs nothing else.
+        let before = published_restore_bytes();
+        refresh_signal_restore_bytes((16, 16, 16));
+        assert_eq!(
+            published_restore_bytes(),
+            before,
+            "an unarmed process publishes nothing on capture"
+        );
+        publish_restore_bytes(b"arm-time".to_vec().into_boxed_slice());
+        assert_eq!(published_restore_bytes(), Some(&b"arm-time"[..]));
+        publish_restore_bytes(b"refreshed".to_vec().into_boxed_slice());
+        assert_eq!(
+            published_restore_bytes(),
+            Some(&b"refreshed"[..]),
+            "the latest publication is the one the handler reads"
+        );
     }
 }

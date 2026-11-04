@@ -10,9 +10,12 @@
 //! that could not be built, a resume that had to degrade, a run that
 //! ends with todos still open, a `--done-file` that refused to be
 //! written (each reported panic-proof, as every stderr word here is).
-//! `--verbose` hands the narration to the [`ConsoleObserver`]: the
-//! model's reply streams to stdout as it forms, and tool calls, usage,
-//! and lifecycle notes join stderr's trouble.
+//! `--verbose` hands the narration to the [`ConsoleObserver`]: one
+//! flag streams the model's reply to stdout as it forms with
+//! tool-call lines on stderr; a second adds durations, token counts,
+//! and the run summary. The run is non-interactive throughout: the
+//! model is offered no `AskUserQuestion` tool, and permission asks it
+//! cannot surface are denied by the gate rather than waited on.
 //! This module resolves the prompt, maps the outcome to the process
 //! exit code, and writes the `--done-file` marker.
 
@@ -510,7 +513,7 @@ async fn construct_run(
         .await
         .map_err(|message| construction_failure(args, message, inherited_mode))?;
 
-    let (config, _config_base) = resolve_session_config_pair(args, control)
+    let (config, _config_base, _config_file) = resolve_session_config_pair(args, control)
         .map_err(|message| construction_failure(args, message, inherited_mode))?;
 
     let verbosity = resolve_verbosity(args);
@@ -530,7 +533,8 @@ async fn construct_run(
     };
     let mut builder = dch_loop::Runner::builder(&config, &workdir)
         .with_observer(Arc::clone(&observer) as Arc<dyn loopctl::observer::LoopObserver>)
-        .with_todo_nudge(|_reminder| {}, || true);
+        .with_todo_nudge(|_reminder| {}, || true)
+        .without_interactive_tools();
     if let crate::resume::ResumeControl::Resumed(outcome) = control {
         builder = builder.with_history(crate::resume::history_for_resume(
             outcome,
@@ -776,6 +780,17 @@ pub(crate) fn apply_non_model_overrides(config: &mut dch_config::DchConfig, args
     if let Some(theme) = &args.theme {
         config.display.theme.clone_from(theme);
     }
+    let mut verbosity = config.display.verbosity;
+    for _ in 0..args.verbose {
+        verbosity = match verbosity {
+            Verbosity::Quiet => Verbosity::Normal,
+            Verbosity::Normal | Verbosity::Verbose => Verbosity::Verbose,
+        };
+    }
+    if args.quiet {
+        verbosity = Verbosity::Quiet;
+    }
+    config.display.verbosity = verbosity;
     if let Some(effort) = &args.config.reasoning_effort {
         config.api.reasoning_effort = Some(effort.clone());
     }
@@ -790,18 +805,21 @@ pub(crate) fn apply_non_model_overrides(config: &mut dch_config::DchConfig, args
     }
 }
 
-/// Resolve the session's (live, base) config pair: the shared override
-/// order both run modes stand on.
+/// Resolve the session's (live, base, file) config triple: the shared
+/// override order both run modes stand on.
 ///
 /// The live config is the file with every CLI override applied and the
 /// boot model selection made; the base is the same file with every
-/// override *except* that selection. Later selections — a mid-session
-/// `/model`, a cross-provider switch — layer onto the base so each
-/// equals a restart naming the model, never a stack of every selection
-/// so far. A resumed session adopts the saved conversation's own model
-/// into the live half — over the base, replacing the boot selection
-/// wholesale — unless the CLI named a model outright, in which case the
-/// flag's selection stands as the overrides left it.
+/// override *except* that selection; the file element is the file as
+/// loaded — no overrides, no selection — the panel's write-through
+/// persists, so run-scoped flags and the selected profile's expanded
+/// `[api]` never reach the user's config. Later selections — a
+/// mid-session `/model`, a cross-provider switch — layer onto the base
+/// so each equals a restart naming the model, never a stack of every
+/// selection so far. A resumed session adopts the saved conversation's
+/// own model into the live half — over the base, replacing the boot
+/// selection wholesale — unless the CLI named a model outright, in
+/// which case the flag's selection stands as the overrides left it.
 ///
 /// The steps run in one fixed order — non-model overrides onto the
 /// base, the full overrides onto the live config, the boot selection,
@@ -815,14 +833,22 @@ pub(crate) fn apply_non_model_overrides(config: &mut dch_config::DchConfig, args
 pub(crate) fn resolve_session_config_pair(
     args: &Args,
     control: &crate::resume::ResumeControl,
-) -> Result<(dch_config::DchConfig, dch_config::DchConfig), String> {
+) -> Result<
+    (
+        dch_config::DchConfig,
+        dch_config::DchConfig,
+        dch_config::DchConfig,
+    ),
+    String,
+> {
     let mut config = load_config(args.config.config_path.as_deref())?;
+    let file = config.clone();
     let mut base = config.clone();
     apply_non_model_overrides(&mut base, args);
     apply_cli_overrides(&mut config, args)?;
     crate::resume::adopt_resumed_model(&mut config, &base, control, args.model.as_deref());
     reapply_displaced_flag_overrides(&mut config, args);
-    Ok((config, base))
+    Ok((config, base, file))
 }
 
 /// Re-apply the flag overrides the config's own selection steps may
@@ -845,17 +871,22 @@ pub(crate) fn reapply_displaced_flag_overrides(config: &mut dch_config::DchConfi
 ///
 /// A headless run is quiet by default: stdout carries only the final
 /// answer — printed once at run end by the run bridge — and stderr
-/// carries the run's real trouble. `--verbose` restores the narrated
-/// run (streamed text on stdout, tool lines and usage on stderr);
-/// `--quiet` is the explicit spelling of the default and wins when both
-/// flags are passed. The configuration's `display.verbosity` governs
-/// the interactive panel and deliberately does not reach this decision:
+/// carries the run's real trouble. Each `--verbose` steps up one
+/// level: `-v` narrates the run (the reply streams to stdout,
+/// tool-call lines join stderr), `-vv` adds the detail chrome
+/// (durations, token counts, the run summary). `--quiet` is the
+/// explicit spelling of the default and wins when both flags are
+/// passed. The configuration's `display.verbosity` governs the
+/// interactive panel and deliberately does not reach this decision:
 /// a piped run's cleanliness cannot depend on a display setting.
 fn resolve_verbosity(args: &Args) -> Verbosity {
-    if args.verbose && !args.quiet {
-        Verbosity::Verbose
-    } else {
-        Verbosity::Quiet
+    if args.quiet {
+        return Verbosity::Quiet;
+    }
+    match args.verbose {
+        0 => Verbosity::Quiet,
+        1 => Verbosity::Normal,
+        _ => Verbosity::Verbose,
     }
 }
 
@@ -1439,7 +1470,7 @@ mod tests {
     }
 
     #[test]
-    fn verbosity_defaults_quiet_with_flags_overriding() {
+    fn verbosity_steps_quiet_to_normal_to_verbose_with_flags() {
         assert_eq!(
             resolve_verbosity(&parse(&[])),
             Verbosity::Quiet,
@@ -1450,11 +1481,57 @@ mod tests {
             Verbosity::Quiet,
             "--quiet is the explicit spelling of the default"
         );
-        assert_eq!(resolve_verbosity(&parse(&["-v"])), Verbosity::Verbose);
+        assert_eq!(
+            resolve_verbosity(&parse(&["-v"])),
+            Verbosity::Normal,
+            "one -v narrates the run: streamed text and tool lines"
+        );
+        assert_eq!(
+            resolve_verbosity(&parse(&["-vv"])),
+            Verbosity::Verbose,
+            "a second -v adds durations, token counts, and the run summary"
+        );
         assert_eq!(
             resolve_verbosity(&parse(&["-v", "-q"])),
             Verbosity::Quiet,
             "--quiet wins when both flags are passed"
+        );
+    }
+
+    #[test]
+    fn the_flags_set_the_panels_initial_verbosity() {
+        // The panel's first tool-line mode reads display.verbosity: -q
+        // stands it on Quiet, each -v steps the configured level up one
+        // rung, clamped at Verbose. The headless console never reads
+        // this field — its levels come from the flags directly.
+        let mut quiet_panel = dch_config::DchConfig::default();
+        apply_non_model_overrides(&mut quiet_panel, &parse(&["-q"]));
+        assert_eq!(quiet_panel.display.verbosity, Verbosity::Quiet);
+
+        let mut stepped = dch_config::DchConfig::default();
+        stepped.display.verbosity = Verbosity::Quiet;
+        apply_non_model_overrides(&mut stepped, &parse(&["-v"]));
+        assert_eq!(
+            stepped.display.verbosity,
+            Verbosity::Normal,
+            "one -v lifts a quiet panel to normal tool lines"
+        );
+
+        let mut loud = dch_config::DchConfig::default();
+        apply_non_model_overrides(&mut loud, &parse(&["-vv"]));
+        assert_eq!(
+            loud.display.verbosity,
+            Verbosity::Verbose,
+            "two -v reach Verbose from the normal default"
+        );
+
+        let mut clamped = dch_config::DchConfig::default();
+        clamped.display.verbosity = Verbosity::Verbose;
+        apply_non_model_overrides(&mut clamped, &parse(&["-vvv"]));
+        assert_eq!(
+            clamped.display.verbosity,
+            Verbosity::Verbose,
+            "the ladder clamps at Verbose"
         );
     }
 
@@ -1486,7 +1563,7 @@ mod tests {
         let config_path = path.display().to_string();
 
         let args = parse(&["--config", &config_path, "--reasoning-effort", "low"]);
-        let (fresh, _base) = resolve_session_config_pair(&args, &fresh_control()).unwrap();
+        let (fresh, _base, _file) = resolve_session_config_pair(&args, &fresh_control()).unwrap();
         assert_eq!(
             fresh.api.reasoning_effort.as_deref(),
             Some("low"),
@@ -1501,7 +1578,8 @@ mod tests {
             machine: None,
             machine_compactions: 0,
         });
-        let (resumed_config, _resumed_base) = resolve_session_config_pair(&args, &resumed).unwrap();
+        let (resumed_config, _resumed_base, _resumed_file) =
+            resolve_session_config_pair(&args, &resumed).unwrap();
         assert_eq!(
             resumed_config.api.reasoning_effort.as_deref(),
             Some("low"),
@@ -1512,7 +1590,7 @@ mod tests {
         // a restore of the flag's precedence, not an override of the
         // entry's own statement.
         let bare = parse(&["--config", &config_path]);
-        let (no_flag, _no_flag_base) =
+        let (no_flag, _no_flag_base, _no_flag_file) =
             resolve_session_config_pair(&bare, &fresh_control()).unwrap();
         assert_eq!(
             no_flag.api.reasoning_effort.as_deref(),

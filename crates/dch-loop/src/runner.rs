@@ -220,6 +220,7 @@ impl Runner {
             mcp_providers: Vec::new(),
             history: Vec::new(),
             permission_resolver: None,
+            interactive_tools: true,
             todo_nudge: None,
             retirement_sink: None,
         }
@@ -617,6 +618,14 @@ pub struct RunnerBuilder<'a> {
     /// signal, so a cancelled run denies rather than waits.
     permission_resolver: Option<AskResolverFn>,
 
+    /// Whether the interaction-only tools register.
+    ///
+    /// True by default — the interactive host's composition. Turned off
+    /// by [`without_interactive_tools`](Self::without_interactive_tools)
+    /// for hosts with no one to ask (a headless run), so the model is
+    /// never offered a call that could only fail.
+    interactive_tools: bool,
+
     /// How the host echoes an accepted todo-nudge reminder, and
     /// whether it will still take one.
     ///
@@ -732,6 +741,22 @@ impl RunnerBuilder<'_> {
         self
     }
 
+    /// Omit the interaction-only tools from the built runner's registry.
+    ///
+    /// The headless host's spelling of "no one to ask": `AskUserQuestion`
+    /// registers in the default composition and soft-errors when no UI
+    /// answers, but a composition that cannot ask at all is cleaner —
+    /// the model never sees the tool, so it never spends a turn on a
+    /// call that could only fail. Both registry positions (the engine's
+    /// advertised set and the dispatch core) omit it together, keeping
+    /// the two identical by construction. MCP tools are untouched: a
+    /// server's tools are the host's own choice.
+    #[must_use]
+    pub fn without_interactive_tools(mut self) -> Self {
+        self.interactive_tools = false;
+        self
+    }
+
     /// Arm the todo nudge, with the echo an accepted reminder owes
     /// and the host's leave to extend a run.
     ///
@@ -819,8 +844,18 @@ impl RunnerBuilder<'_> {
         let client = Arc::new(crate::create_client(&self.config.api)?);
         let connections = connect_mcp_servers(self.config, &context.cwd).await?;
         let read_windows = read_windows_for(&self.config.runner);
-        let registry = compose_registry(&connections, &fs_session, read_windows);
-        let core_registry = compose_registry(&connections, &fs_session, read_windows);
+        let registry = compose_registry(
+            &connections,
+            &fs_session,
+            read_windows,
+            self.interactive_tools,
+        );
+        let core_registry = compose_registry(
+            &connections,
+            &fs_session,
+            read_windows,
+            self.interactive_tools,
+        );
         for provider in &self.mcp_providers {
             provider.register_into(&registry);
             provider.register_into(&core_registry);
@@ -1092,12 +1127,19 @@ fn fs_resolve_policy_for(runner: &dch_config::RunnerConfig) -> FsResolvePolicy {
 /// registry and the dispatch pipeline's core cannot share boxed tools, so
 /// each gets its own composition from the same connections (an MCP tool
 /// clones into both, keeping the two positions identical by construction).
+/// `ask_tools` selects the builtin half: the full composition or the
+/// non-interactive one that omits `AskUserQuestion`.
 fn compose_registry(
     connections: &[McpConnection],
     fs_session: &FileSession,
     windows: dch_tools::ReadWindows,
+    ask_tools: bool,
 ) -> ToolRegistry {
-    let registry = builtin_registry(fs_session, windows);
+    let registry = if ask_tools {
+        builtin_registry(fs_session, windows)
+    } else {
+        dch_tools::non_interactive_registry(fs_session, windows)
+    };
     for connection in connections {
         match &connection.allowed {
             None => connection.provider.register_into(&registry),
@@ -5207,11 +5249,13 @@ mod tests {
             std::slice::from_ref(&connection),
             &session,
             dch_tools::ReadWindows::default(),
+            true,
         );
         let core = compose_registry(
             std::slice::from_ref(&connection),
             &session,
             dch_tools::ReadWindows::default(),
+            true,
         );
         for registry in [&engine, &core] {
             assert!(
@@ -6916,6 +6960,7 @@ mod tests {
             &[connection],
             &FileSession::new(PathBuf::from(".")),
             dch_tools::ReadWindows::default(),
+            true,
         );
 
         assert!(
@@ -7286,6 +7331,50 @@ mod tests {
         assert!(
             matches!(result, Err(loopctl::error::LoopError::Cancelled)),
             "expected Cancelled, got {result:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_runner_without_interactive_tools_never_advertises_the_ask() {
+        // The knob the headless host turns: with it, the tools the
+        // provider is offered carry no AskUserQuestion — the model
+        // never sees a tool whose call could only fail — while the
+        // default composition still offers it. The request body is
+        // where the advertised set is visible, so that is what is
+        // pinned.
+        let ask_server = SseServer::start(vec![sse_text_turn("fine")]).await;
+        let dir = TempDir::new().expect("tempdir");
+        let mut ask_runner = Runner::builder(&wire_config(ask_server.port, 5), dir.path())
+            .build()
+            .await
+            .expect("constructs");
+        tokio::time::timeout(std::time::Duration::from_secs(20), ask_runner.run("go"))
+            .await
+            .expect("the default run completes")
+            .expect("the default run finishes");
+        assert!(
+            recorded_requests(&ask_server)
+                .iter()
+                .any(|body| body.contains("AskUserQuestion")),
+            "the default composition advertises the ask tool"
+        );
+
+        let bare_server = SseServer::start(vec![sse_text_turn("fine")]).await;
+        let bare_dir = TempDir::new().expect("tempdir");
+        let mut bare_runner = Runner::builder(&wire_config(bare_server.port, 5), bare_dir.path())
+            .without_interactive_tools()
+            .build()
+            .await
+            .expect("constructs");
+        tokio::time::timeout(std::time::Duration::from_secs(20), bare_runner.run("go"))
+            .await
+            .expect("the non-interactive run completes")
+            .expect("the non-interactive run finishes");
+        assert!(
+            recorded_requests(&bare_server)
+                .iter()
+                .all(|body| !body.contains("AskUserQuestion")),
+            "the non-interactive composition never mentions the ask tool"
         );
     }
 
