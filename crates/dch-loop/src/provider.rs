@@ -537,8 +537,10 @@ fn profiled<B: Profiled>(builder: B, config: &ApiConfig, effort: Option<Thinking
 /// # Errors
 ///
 /// Returns [`RunnerError::Config`] when the configured spelling is not
-/// one of `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or
-/// `max` — the seven rungs the ladder ships.
+/// a rung of the ladder — the message names the accepted spellings from
+/// [`REASONING_EFFORT_WIRE_NAMES`](dch_config::REASONING_EFFORT_WIRE_NAMES),
+/// the one list the loader's validation, the composer's `/set` gate, and
+/// this parse share.
 fn effort_from_config(config: &ApiConfig) -> Result<Option<ThinkingEffort>, RunnerError> {
     let Some(name) = config.reasoning_effort.as_deref() else {
         return Ok(None);
@@ -553,8 +555,8 @@ fn effort_from_config(config: &ApiConfig) -> Result<Option<ThinkingEffort>, Runn
         "max" => ThinkingEffort::Max,
         other => {
             return Err(RunnerError::Config(format!(
-                "api.reasoning_effort: unknown level {other:?}; expected one of \
-                 none, minimal, low, medium, high, xhigh, max"
+                "api.reasoning_effort: unknown level {other:?}; expected one of {}",
+                dch_config::REASONING_EFFORT_WIRE_NAMES.join(", ")
             )));
         }
     };
@@ -739,6 +741,13 @@ mod tests {
         assert!(
             matches!(err, RunnerError::Config(ref msg) if msg.contains("turbo")),
             "the error names the bad value: {err:?}"
+        );
+        assert!(
+            matches!(&err, RunnerError::Config(msg)
+                if dch_config::REASONING_EFFORT_WIRE_NAMES
+                    .iter()
+                    .all(|rung| msg.contains(rung))),
+            "the message names every rung of the shared constant: {err:?}"
         );
     }
 

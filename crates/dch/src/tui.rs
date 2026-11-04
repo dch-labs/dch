@@ -23,7 +23,7 @@ use dch_tui::{TerminalGuard, TuiApp, TuiObserverState};
 use tokio::sync::mpsc;
 
 use crate::args::Args;
-use crate::headless::{apply_cli_overrides, load_config};
+use crate::headless::resolve_session_config_pair;
 use crate::resume::ResumeControl;
 
 /// Run the interactive session and return the process exit code.
@@ -106,34 +106,6 @@ fn seed_resumed_tokens(state: &TuiObserverState, control: &ResumeControl) {
     }
 }
 
-/// Load the session's config pair: the live config and its pre-selection base.
-///
-/// The live config is the file with every CLI override applied and the
-/// boot model selection made; the base is the same file with every
-/// override *except* that selection. Later selections — a mid-session
-/// `/model`, a cross-provider switch — layer onto the base so each
-/// equals a restart naming the model, never a stack of every selection
-/// so far. A resumed session adopts the saved conversation's own model
-/// into the live half here — over the base, replacing the boot
-/// selection wholesale — unless the CLI named a model outright, in
-/// which case the flag's selection stands as the overrides left it.
-///
-/// # Errors
-///
-/// Returns the config loader's message, or the `--model` refusal's,
-/// both as the session's startup error.
-fn session_config_pair(
-    args: &Args,
-    control: &ResumeControl,
-) -> Result<(dch_config::DchConfig, dch_config::DchConfig), String> {
-    let mut config = load_config(args.config.config_path.as_deref())?;
-    let mut base = config.clone();
-    crate::headless::apply_non_model_overrides(&mut base, args);
-    apply_cli_overrides(&mut config, args)?;
-    crate::resume::adopt_resumed_model(&mut config, &base, control, args.model.as_deref());
-    Ok((config, base))
-}
-
 /// Cancel the runner the session ends on, through the shared cell.
 ///
 /// The exit's cooperative stop: the cell a rebuild swapped names the
@@ -171,7 +143,7 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
     {
         crate::signals::report(&format!("dch: {warn}"));
     }
-    let (config, config_base) = session_config_pair(args, &control)?;
+    let (config, config_base) = resolve_session_config_pair(args, &control)?;
 
     let workdir = std::env::current_dir().map_err(|err| format!("cannot determine cwd: {err}"))?;
 
@@ -1964,8 +1936,24 @@ async fn apply_session_command(
                 ),
             }
         }
-        SessionCommand::Compact => match runner.compact_now().await {
-            Ok(figures) => post_session_notice(session_tx, figures),
+        SessionCommand::Compact { compactions } => match runner.compact_now().await {
+            Ok(figures) => {
+                let folded =
+                    filtered_machine_history(&Arc::new(runner.committed_history()));
+                *context
+                    .state
+                    .machine_history
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(Arc::clone(&folded));
+                transcript.send_machine(MachineSnapshot {
+                    messages: folded,
+                    saved_at: chrono::Utc::now(),
+                    compactions: compactions.saturating_add(1),
+                    saver: None,
+                });
+                post_session_notice(session_tx, figures);
+            }
             Err(err) => post_session_notice(session_tx, format!("compaction was declined ({err})")),
         },
     }
@@ -2532,6 +2520,123 @@ mod tests {
         assert!(
             crate::session::load_machine_in(id, &root, session_at).is_some(),
             "the machine half landing after restores the pair"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_manual_compact_publishes_the_folded_history_and_refreshes_the_cache() {
+        // /compact then quit before another run: without this publish
+        // the machine snapshot on disk is the pre-compaction history the
+        // last turn-end hook stamped, and a resume restores the very
+        // context the pass removed. The driver lands the folded history
+        // in the file, refreshes the cached copy the exit flush reads,
+        // and records the pass in the snapshot's total so the resume's
+        // stale-freeze guard cannot misread the shorter folded history.
+        let dir = tempfile::tempdir().expect("session tempdir");
+        let root = dir.keep();
+        let id = uuid::Uuid::new_v4();
+        let saver = Arc::new(crate::session::SessionSaver::with_base_dir(
+            id,
+            "m".to_string(),
+            root.clone(),
+        ));
+        let (transcript, worker) = TranscriptWorker::spawn(Arc::clone(&saver));
+        transcript.send(
+            vec![TuiMessage::User {
+                text: "the conversation so far".to_string(),
+                timestamp: chrono::Utc::now(),
+                steered: false,
+                unsent: false,
+            }],
+            crate::session::SessionTokens::default(),
+        );
+
+        let workdir = tempfile::tempdir().expect("temp workdir");
+        let seeds: Vec<loopctl::message::Message> = (0..20)
+            .map(|turn| {
+                let filler = "a line of context for the compactor ".repeat(120);
+                if turn % 2 == 0 {
+                    loopctl::message::Message::user(format!("earlier exchange {turn}: {filler}"))
+                } else {
+                    loopctl::message::Message::assistant(format!("earlier answer {turn}: {filler}"))
+                }
+            })
+            .collect();
+        // One scripted run first: the truncator folds material older
+        // than the last run, so the seeded bulk must sit behind a
+        // completed exchange to be droppable — and the seeds must sit
+        // between the threshold and the window so the run itself is
+        // sent while a pass is still warranted after it.
+        let server =
+            SseServer::start_with_delay(vec![sse_text_turn("grown")], std::time::Duration::ZERO)
+                .await;
+        let mut config = sse_config(server.port);
+        config.api.context_window = Some(40_000);
+        config.runner.compactor = dch_config::CompactorSelection::Truncating;
+        let mut runner = dch_loop::Runner::builder(&config, workdir.path())
+            .with_history(seeds)
+            .build()
+            .await
+            .expect("runner over a fat history");
+        tokio::time::timeout(std::time::Duration::from_secs(20), runner.run("grow"))
+            .await
+            .expect("the scripted run completes")
+            .expect("the run finishes");
+        let (_, state) = TuiObserverState::new().into_observer();
+        let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+        let mut context = DriverContext {
+            config: config.clone(),
+            config_base: std::sync::Arc::new(config),
+            workdir: workdir.path().to_path_buf(),
+            sessions_root: root.clone(),
+            state: state.clone(),
+            shutting_down: shutdown_flag(false),
+            lanes: InteractiveLanes::detached(),
+        };
+        apply_session_command(
+            &mut runner,
+            &transcript,
+            &session_tx,
+            SessionCommand::Compact { compactions: 1 },
+            &mut context,
+        )
+        .await;
+        worker.join();
+
+        let notice = tokio::time::timeout(std::time::Duration::from_secs(5), session_rx.recv())
+            .await
+            .expect("the pass reports its figures")
+            .expect("the session channel is open");
+        let text = match notice {
+            SessionUpdate::Notice { text } => text,
+            _ => String::new(),
+        };
+        assert!(
+            text.starts_with("compacted: "),
+            "the notice carries the pass's own figures: {text}"
+        );
+
+        let cached = state
+            .machine_history
+            .lock()
+            .expect("history lock")
+            .clone();
+        assert!(
+            cached.as_ref().is_some_and(|history| history.len() < 20),
+            "the cached machine history is the folded one: {:?}",
+            cached.as_ref().map(|history| history.len())
+        );
+        let outcome = crate::resume::load_for_resume_in(id, &root)
+            .expect("the session pair loads after the pass");
+        let folded = outcome.machine.expect("the machine half landed");
+        assert!(
+            folded.len() < 20,
+            "the snapshot on disk is the folded history, {} messages",
+            folded.len()
+        );
+        assert_eq!(
+            outcome.machine_compactions, 2,
+            "the recorded total adds this pass to the rows the display carried"
         );
     }
 

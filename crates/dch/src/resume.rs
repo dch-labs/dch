@@ -4,9 +4,11 @@
 //! [`resolve_resume`] turns the `--resume` flag into one
 //! [`ResumeControl`] both run modes consume: a loaded session seeds
 //! the display and the agent's conversation history and reuses its id
-//! so further auto-saves land in the same file, while the engine runs
-//! on the current configuration's model and provider — the saved
-//! model is provenance for the listing, never an override; a load
+//! so further auto-saves land in the same file, while the session
+//! continues on the model it last ran — the saved model resolved
+//! through `[[models]]` as the resume default, an explicit `--model`
+//! still winning, and the listing reading the same field as
+//! provenance; a load
 //! that fails degrade-able ways starts a fresh session carrying a
 //! warning for the mode to render.
 //! `--list-sessions` prints the saved-session table and exits. The
@@ -190,7 +192,11 @@ pub(crate) fn resolve_resume(args: &Args) -> ResumeControl {
 /// the wrong window for the same reason a mid-session switch would. An
 /// explicit CLI model wins untouched; a model no profile names (the
 /// session outlived a config change) keeps the bare name on the base
-/// settings.
+/// settings. A session recorded under a blank model (a default
+/// config's empty `api.model` is what a headless save records) carries
+/// no choice to adopt — the configured bundle stands exactly as the
+/// boot selection left it, rather than a blank envelope value winning
+/// over the user's configuration.
 pub(crate) fn adopt_resumed_model(
     config: &mut dch_config::DchConfig,
     base: &dch_config::DchConfig,
@@ -200,7 +206,9 @@ pub(crate) fn adopt_resumed_model(
     if cli_model.is_some() {
         return;
     }
-    if let ResumeControl::Resumed(outcome) = control {
+    if let ResumeControl::Resumed(outcome) = control
+        && !outcome.model.trim().is_empty()
+    {
         let mut fresh = base.clone();
         if fresh.select_model(Some(&outcome.model)).is_err() {
             fresh.api.model.clone_from(&outcome.model);
@@ -1035,6 +1043,45 @@ mod tests {
             Some(100_000),
             "no profile means the base settings stand"
         );
+    }
+
+    #[test]
+    fn a_blank_saved_model_adopts_nothing() {
+        // A default config's `api.model = ""` is what a headless save
+        // records when no model was configured. Resuming that session
+        // after one is configured must not let the blank envelope value
+        // win: the boot-selected bundle stands exactly as it was, blank
+        // meaning "no choice recorded", not "run no model".
+        for blank in ["", "   "] {
+            let outcome = ResumeOutcome {
+                session_id: Uuid::nil(),
+                model: blank.to_string(),
+                messages: Vec::new(),
+                tokens: crate::session::SessionTokens::default(),
+                machine: None,
+                machine_compactions: 0,
+            };
+            let control = ResumeControl::Resumed(outcome);
+            let mut config = dch_config::DchConfig {
+                models: vec![dch_config::ModelProfile {
+                    model: "glm-5.3".to_string(),
+                    context_window: Some(400_000),
+                    ..dch_config::ModelProfile::default()
+                }],
+                ..dch_config::DchConfig::default()
+            };
+            config
+                .select_model(None)
+                .expect("the boot selection names the top entry");
+            let base = config.clone();
+            let configured = config.api.clone();
+            adopt_resumed_model(&mut config, &base, &control, None);
+            assert_eq!(
+                config.api, configured,
+                "a saved model of {blank:?} adopts nothing — the configured \
+                 bundle stands"
+            );
+        }
     }
 
     fn now() -> chrono::DateTime<chrono::Utc> {
@@ -2677,6 +2724,10 @@ model = "plain"
             ],
         );
         let outcome = load_for_resume_in(id, dir.path()).expect("the saved session loads");
+        assert_eq!(
+            outcome.model, "resume-model",
+            "the envelope's model passes through to the outcome the adopt path reads"
+        );
         assert_eq!(
             outcome.messages.len(),
             3,

@@ -2954,8 +2954,10 @@ impl TuiApp {
     /// The engine's own context manager folds the committed history the
     /// same way its automatic passes do; the next turn continues from
     /// the folded context, and the driver's notice carries the token
-    /// figures the pass measured. Nothing is sent to the model — an
-    /// unknown slash line is never a prompt.
+    /// figures the pass measured. The folded history is also published
+    /// to the machine snapshot, so a session that ends before its next
+    /// run resumes from the compacted context. Nothing is sent to the
+    /// model — an unknown slash line is never a prompt.
     fn compact_command(&mut self) {
         if self.state.agent_running.load(Ordering::SeqCst) {
             self.post_notice(
@@ -2963,7 +2965,14 @@ impl TuiApp {
             );
             return;
         }
-        self.send_command(SessionCommand::Compact);
+        let compactions = u32::try_from(
+            self.conversation
+                .iter()
+                .filter(|message| matches!(message, TuiMessage::Compacted { .. }))
+                .count(),
+        )
+        .unwrap_or(u32::MAX);
+        self.send_command(SessionCommand::Compact { compactions });
     }
 
     /// Quit the session and leave the terminal, cleanly.
@@ -18055,7 +18064,7 @@ mod tests {
             matches!(
                 sent,
                 crate::queue::Submission::Command {
-                    command: crate::queue::SessionCommand::Compact
+                    command: crate::queue::SessionCommand::Compact { .. }
                 }
             ),
             "the driver gets the manual pass: {sent:?}"

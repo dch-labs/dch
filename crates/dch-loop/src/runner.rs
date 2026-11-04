@@ -3377,6 +3377,84 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn compact_now_at_rest_reports_a_fitting_context() {
+        // The no-action arm through the whole method, not just the
+        // formatter: a fresh runner's empty history fits, the pass
+        // declines to fold anything, and the notice says so without
+        // inventing figures. (The mid-turn refusal the doc names is the
+        // engine's own guard, pinned on the engine's side: run() takes
+        // the runner exclusively, so no host of this crate can hold a
+        // live turn and issue compact_now at once — the TUI refuses
+        // /compact while a run holds the agent before the engine's own
+        // check is ever reachable.)
+        let dir = TempDir::new().expect("tempdir");
+        let mut runner = Runner::builder(&offline_config(), dir.path())
+            .build()
+            .await
+            .expect("Runner::new constructs offline");
+        let notice = runner
+            .compact_now()
+            .await
+            .expect("an empty context needs no pass");
+        assert_eq!(
+            notice, "nothing to compact — the context fits",
+            "the no-action notice is the pass's own verdict"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_now_folds_the_committed_history_in_place() {
+        // A history already past the threshold, folded at rest: the
+        // runner's own committed history — the one the next run and the
+        // host's snapshot read — is the folded result, and the notice
+        // carries the figures the pass measured. This is the pass whose
+        // result the TUI driver publishes after; pinned here at the
+        // source, with the truncating selection so the pass is the
+        // machine's own work. One scripted run first: the truncator
+        // folds material older than the last run, so the seeded bulk
+        // must sit behind a completed exchange to be droppable.
+        let dir = TempDir::new().expect("tempdir");
+        let seeds: Vec<loopctl::message::Message> = (0..20)
+            .map(|turn| {
+                let filler = "a line of context for the compactor ".repeat(120);
+                if turn % 2 == 0 {
+                    loopctl::message::Message::user(format!("earlier exchange {turn}: {filler}"))
+                } else {
+                    loopctl::message::Message::assistant(format!("earlier answer {turn}: {filler}"))
+                }
+            })
+            .collect();
+        let server = SseServer::start(vec![sse_text_turn("grown")]).await;
+        let mut config = wire_config(server.port, 5);
+        config.api.context_window = Some(40_000);
+        config.runner.compactor = dch_config::CompactorSelection::Truncating;
+        let mut runner = Runner::builder(&config, dir.path())
+            .with_history(seeds)
+            .build()
+            .await
+            .expect("constructs over a fat history");
+        tokio::time::timeout(std::time::Duration::from_secs(20), runner.run("grow"))
+            .await
+            .expect("the scripted run completes")
+            .expect("the run finishes");
+        let before = runner.committed_history().len();
+        let notice = runner
+            .compact_now()
+            .await
+            .expect("a manual pass at rest runs");
+        assert!(
+            notice.starts_with("compacted: "),
+            "the notice carries the pass's own figures: {notice}"
+        );
+        let after = runner.committed_history().len();
+        assert!(
+            after < before,
+            "the committed history the next run continues from is the folded one \
+             ({before} -> {after})"
+        );
+    }
+
     fn offline_config() -> DchConfig {
         use dch_config::ApiConfig;
         use dch_config::ApiType;

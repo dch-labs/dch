@@ -852,11 +852,18 @@ mod tests {
         let cwd = tmp.path().to_str().unwrap();
         let ctx = ctx_in(cwd);
 
+        // The gate file keeps the job Running until the Running
+        // assertion has landed: a spawn delayed past a fixed `sleep`
+        // window would let the first poll race into Completed and fail
+        // a correct status machine. The job waits for the file; the
+        // test creates it only once Running is asserted.
+        let gate = tmp.path().join("gate");
+        let command = format!(
+            "while [ ! -e {} ]; do sleep 0.05; done && echo settled",
+            gate.display()
+        );
         let spawned = BashTool
-            .call(
-                json!({ "command": "sleep 1 && echo settled", "background": true }),
-                &ctx,
-            )
+            .call(json!({ "command": command, "background": true }), &ctx)
             .await
             .unwrap();
         let id = parse_spawned_id(&spawned.text_content());
@@ -865,6 +872,7 @@ mod tests {
             matches!(get_job(id).map(|job| job.status), Some(JobStatus::Running)),
             "a live job reads Running the moment it is spawned"
         );
+        std::fs::write(&gate, b"").unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(10);
         while list_jobs()
@@ -967,7 +975,8 @@ mod tests {
     /// Pulls the ID out of the spawn acknowledgement line.
     ///
     /// `BashTool` answers a backgrounded call with `Started background
-    /// job {id}: {summary}`; the ID is the second whitespace token.
+    /// job {id}: {summary}`; the ID is the fourth whitespace token —
+    /// the one after the word `job`.
     fn parse_spawned_id(ack: &str) -> u64 {
         ack.split_whitespace()
             .nth(3)

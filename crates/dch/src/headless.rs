@@ -4,15 +4,19 @@
 //! argument or a piped stdin. It owns no agent-loop
 //! logic — everything turn/stream/dispatch lives in loopctl via the runner —
 //! and prints nothing of its own beyond the answer the task asked for:
-//! the model's reply reaches stdout through the [`ConsoleObserver`]
-//! stream, and stderr carries only the run's own trouble — a session
+//! the run is quiet by default — stdout carries only the final answer,
+//! printed once at run end, and stderr carries only the run's own
+//! trouble — a session
 //! that could not be built, a resume that had to degrade, a run that
 //! ends with todos still open, a `--done-file` that refused to be
 //! written (each reported panic-proof, as every stderr word here is).
+//! `--verbose` hands the narration to the [`ConsoleObserver`]: the
+//! model's reply streams to stdout as it forms, and tool calls, usage,
+//! and lifecycle notes join stderr's trouble.
 //! This module resolves the prompt, maps the outcome to the process
 //! exit code, and writes the `--done-file` marker.
 
-use std::io::{IsTerminal, Read};
+use std::io::{IsTerminal, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -170,8 +174,9 @@ fn finish_pipeline(result: Result<HeadlessOutcome, HeadlessOutcome>) -> u8 {
 /// session, writes the `--done-file` (if requested), and returns the exit
 /// code. The caller (`main`) turns the code into the process exit status. A
 /// resumed `control` continues the loaded session: the agent starts
-/// from the restored history on the current configuration's model and
-/// provider — the saved model is provenance for the listing — the
+/// from the restored history on the model the session last ran — the
+/// saved model resolved through `[[models]]` as the resume default, an
+/// explicit `--model` still winning — the
 /// session id is the loaded one, and the saved transcript is the whole
 /// resumed conversation rather than the new turn alone; a degradation
 /// warning is printed to stderr before the run starts. The
@@ -294,6 +299,7 @@ async fn run_headless_inner(
         prompt,
         mut runner,
         model,
+        streams_answer,
         resumed_compactions,
         compaction_counter,
     } = built;
@@ -329,6 +335,9 @@ async fn run_headless_inner(
     let turn_outputs = runner.session_turn_outputs();
     match result {
         Ok(run) => {
+            if !streams_answer && let Some(answer) = &run.output {
+                print_final_answer(answer);
+            }
             let outcome = HeadlessOutcome::from_run(&run);
             write_done_file_if_requested(args, &outcome, inherited_mode.as_ref());
             outcome_recorded.store(true, Ordering::SeqCst);
@@ -456,6 +465,14 @@ struct ConstructedRun {
     /// the model the session actually ran.
     model: String,
 
+    /// Whether the observer narrates the run while it happens.
+    ///
+    /// False at the quiet default, where the observer writes nothing to
+    /// stdout and the run bridge delivers the final answer itself at
+    /// run end; true under `--verbose`, where the observer's stream
+    /// already carried the text and a second print would duplicate it.
+    streams_answer: bool,
+
     /// The compaction count a resumed snapshot already carried.
     ///
     /// The observer's counter starts at zero for this process, so a
@@ -493,15 +510,11 @@ async fn construct_run(
         .await
         .map_err(|message| construction_failure(args, message, inherited_mode))?;
 
-    let mut config = load_config(args.config.config_path.as_deref())
+    let (config, _config_base) = resolve_session_config_pair(args, control)
         .map_err(|message| construction_failure(args, message, inherited_mode))?;
-    let mut base = config.clone();
-    apply_non_model_overrides(&mut base, args);
-    apply_cli_overrides(&mut config, args)
-        .map_err(|message| construction_failure(args, message, inherited_mode))?;
-    crate::resume::adopt_resumed_model(&mut config, &base, control, args.model.as_deref());
 
-    let verbosity = resolve_verbosity(&config, args);
+    let verbosity = resolve_verbosity(args);
+    let streams_answer = !matches!(verbosity, Verbosity::Quiet);
     let observer = Arc::new(ConsoleObserver::new(
         verbosity,
         ConsoleObserver::detect_color(),
@@ -543,6 +556,7 @@ async fn construct_run(
         prompt,
         runner,
         model,
+        streams_answer,
         resumed_compactions,
         compaction_counter: observer.compaction_counter(),
     })
@@ -776,18 +790,96 @@ pub(crate) fn apply_non_model_overrides(config: &mut dch_config::DchConfig, args
     }
 }
 
-/// Resolve the effective verbosity from config and CLI flags.
+/// Resolve the session's (live, base) config pair: the shared override
+/// order both run modes stand on.
 ///
-/// `--quiet` wins when both flags are passed; with neither, the configured
-/// level stands.
-fn resolve_verbosity(config: &dch_config::DchConfig, args: &Args) -> Verbosity {
-    if args.quiet {
-        Verbosity::Quiet
-    } else if args.verbose {
+/// The live config is the file with every CLI override applied and the
+/// boot model selection made; the base is the same file with every
+/// override *except* that selection. Later selections — a mid-session
+/// `/model`, a cross-provider switch — layer onto the base so each
+/// equals a restart naming the model, never a stack of every selection
+/// so far. A resumed session adopts the saved conversation's own model
+/// into the live half — over the base, replacing the boot selection
+/// wholesale — unless the CLI named a model outright, in which case the
+/// flag's selection stands as the overrides left it.
+///
+/// The steps run in one fixed order — non-model overrides onto the
+/// base, the full overrides onto the live config, the boot selection,
+/// the resume adoption, then [`reapply_displaced_flag_overrides`] — so
+/// a per-run flag never loses to a value no word of the user's named.
+///
+/// # Errors
+///
+/// Returns the config loader's message, or the `--model` refusal's,
+/// both as the mode's startup error.
+pub(crate) fn resolve_session_config_pair(
+    args: &Args,
+    control: &crate::resume::ResumeControl,
+) -> Result<(dch_config::DchConfig, dch_config::DchConfig), String> {
+    let mut config = load_config(args.config.config_path.as_deref())?;
+    let mut base = config.clone();
+    apply_non_model_overrides(&mut base, args);
+    apply_cli_overrides(&mut config, args)?;
+    crate::resume::adopt_resumed_model(&mut config, &base, control, args.model.as_deref());
+    reapply_displaced_flag_overrides(&mut config, args);
+    Ok((config, base))
+}
+
+/// Re-apply the flag overrides the config's own selection steps may
+/// have displaced.
+///
+/// The reasoning-effort dial is the one flag those steps can overwrite
+/// after the flag first landed: a `[[models]]` entry may state its own
+/// `reasoning_effort`, which the boot selection layers on, and the
+/// resume adoption rebuilds `[api]` wholesale from the base. Running
+/// this after the last of those steps restores the documented
+/// precedence — the flag is a per-run statement and outranks both. Pure
+/// over the config, so the precedence is pinnable without a provider.
+pub(crate) fn reapply_displaced_flag_overrides(config: &mut dch_config::DchConfig, args: &Args) {
+    if let Some(effort) = &args.config.reasoning_effort {
+        config.api.reasoning_effort = Some(effort.clone());
+    }
+}
+
+/// Resolve the console verbosity for a headless run from the CLI flags.
+///
+/// A headless run is quiet by default: stdout carries only the final
+/// answer — printed once at run end by the run bridge — and stderr
+/// carries the run's real trouble. `--verbose` restores the narrated
+/// run (streamed text on stdout, tool lines and usage on stderr);
+/// `--quiet` is the explicit spelling of the default and wins when both
+/// flags are passed. The configuration's `display.verbosity` governs
+/// the interactive panel and deliberately does not reach this decision:
+/// a piped run's cleanliness cannot depend on a display setting.
+fn resolve_verbosity(args: &Args) -> Verbosity {
+    if args.verbose && !args.quiet {
         Verbosity::Verbose
     } else {
-        config.display.verbosity
+        Verbosity::Quiet
     }
+}
+
+/// Print the run's final answer to stdout when the observer did not
+/// stream it.
+///
+/// The quiet default leaves the observer's stdout empty, so the answer —
+/// and only the answer — arrives here, once, at run end. The real
+/// stdout handle is locked for the write, so the answer cannot
+/// interleave with another thread's output; the write's result is
+/// dropped, so a consumer that closed the pipe early ends the run
+/// through the ordinary path instead of a panic.
+fn print_final_answer(answer: &str) {
+    let mut out = std::io::stdout().lock();
+    write_final_answer(&mut out, answer);
+}
+
+/// Write the final answer line to `out`.
+///
+/// The testable core of [`print_final_answer`]: one line, the answer,
+/// one trailing newline — nothing else, whatever the run did to get
+/// here.
+fn write_final_answer(mut out: impl Write, answer: &str) {
+    drop(writeln!(out, "{answer}"));
 }
 
 /// Write the done-file when `--done-file` is supplied.
@@ -1347,24 +1439,85 @@ mod tests {
     }
 
     #[test]
-    fn verbosity_resolves_quiet_over_verbose_over_config() {
-        let config = dch_config::DchConfig::default();
+    fn verbosity_defaults_quiet_with_flags_overriding() {
         assert_eq!(
-            resolve_verbosity(&config, &parse(&["-q"])),
-            Verbosity::Quiet
+            resolve_verbosity(&parse(&[])),
+            Verbosity::Quiet,
+            "a headless run is quiet without a flag"
         );
         assert_eq!(
-            resolve_verbosity(&config, &parse(&["-v"])),
-            Verbosity::Verbose
+            resolve_verbosity(&parse(&["-q"])),
+            Verbosity::Quiet,
+            "--quiet is the explicit spelling of the default"
         );
+        assert_eq!(resolve_verbosity(&parse(&["-v"])), Verbosity::Verbose);
         assert_eq!(
-            resolve_verbosity(&config, &parse(&["-v", "-q"])),
+            resolve_verbosity(&parse(&["-v", "-q"])),
             Verbosity::Quiet,
             "--quiet wins when both flags are passed"
         );
+    }
+
+    #[test]
+    fn the_unstreamed_answer_prints_as_one_line_with_a_newline() {
+        let mut sink: Vec<u8> = Vec::new();
+        write_final_answer(&mut sink, "the answer");
         assert_eq!(
-            resolve_verbosity(&config, &parse(&[])),
-            config.display.verbosity
+            sink, b"the answer\n",
+            "the quiet path delivers exactly the answer and one newline"
+        );
+    }
+
+    #[test]
+    fn the_reasoning_effort_flag_wins_over_an_entrys_own_dial() {
+        // The entry states its own dial; the flag is a per-run statement
+        // and outranks it on every path — the boot selection layering
+        // the entry's bundle on (a fresh run), and the resume adoption
+        // rebuilding [api] from the base (a resumed run) both land after
+        // the flag first did, so the shared order re-applies the flag
+        // last.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[api]\nmodel = \"qwen\"\n\n[[models]]\nmodel = \"glm\"\nreasoning_effort = \"medium\"\n",
+        )
+        .unwrap();
+        let config_path = path.display().to_string();
+
+        let args = parse(&["--config", &config_path, "--reasoning-effort", "low"]);
+        let (fresh, _base) = resolve_session_config_pair(&args, &fresh_control()).unwrap();
+        assert_eq!(
+            fresh.api.reasoning_effort.as_deref(),
+            Some("low"),
+            "a fresh run: the flag beats the selected entry's own dial"
+        );
+
+        let resumed = crate::resume::ResumeControl::Resumed(crate::resume::ResumeOutcome {
+            session_id: uuid::Uuid::nil(),
+            model: "glm".to_string(),
+            messages: Vec::new(),
+            tokens: crate::session::SessionTokens::default(),
+            machine: None,
+            machine_compactions: 0,
+        });
+        let (resumed_config, _resumed_base) = resolve_session_config_pair(&args, &resumed).unwrap();
+        assert_eq!(
+            resumed_config.api.reasoning_effort.as_deref(),
+            Some("low"),
+            "a resumed run: the adoption's rebuild of [api] cannot displace the flag"
+        );
+
+        // Without the flag the entry's own dial stands — the re-apply is
+        // a restore of the flag's precedence, not an override of the
+        // entry's own statement.
+        let bare = parse(&["--config", &config_path]);
+        let (no_flag, _no_flag_base) =
+            resolve_session_config_pair(&bare, &fresh_control()).unwrap();
+        assert_eq!(
+            no_flag.api.reasoning_effort.as_deref(),
+            Some("medium"),
+            "with no flag the selected entry's dial applies"
         );
     }
 

@@ -127,9 +127,10 @@ pub fn live(key: &str) -> Option<Live> {
 /// The current value of `key` rendered as the file would spell it, or `None`.
 ///
 /// Scalars render as their literals, enums as their renamed strings,
-/// and an absent optional as the word `unset` — the same text a
-/// restore feeds back through [`set`], and the shape `/config` prints.
-/// `None` means the key names no settable value.
+/// and an absent optional as the word `unset` — the shape `/config`
+/// prints, and a display word only: [`set`] refuses it for the optional
+/// string keys rather than storing it, and `/unset` is the command that
+/// actually clears. `None` means the key names no settable value.
 #[must_use]
 pub fn get(config: &DchConfig, key: &str) -> Option<String> {
     // Scalars render plainly; Option renders `unset` when there is no value.
@@ -176,12 +177,19 @@ pub fn get(config: &DchConfig, key: &str) -> Option<String> {
 ///
 /// The value is parsed exactly as the config file parses it; a value that will
 /// not deserialize into the field's type comes back `Err` naming the field and
-/// the reason, leaving `config` untouched. The loader's own bounds are
-/// enforced here too — the `turn_timeout_secs` floor, the `read_max_bytes` /
-/// `max_tool_output_chars` relation, the `compact_threshold` range, and a
-/// theme spelling the palette table can resolve — because a value the next
-/// load would refuse may never be written: persisting it would brick the
-/// next start until a hand edit undid the write.
+/// the reason, leaving `config` untouched. The bounds split by who else
+/// enforces them: the loader-refused ones — the `turn_timeout_secs` floor,
+/// the `read_max_bytes` / `max_tool_output_chars` relation, the
+/// reasoning-effort ladder — are enforced identically here because a value
+/// the next load would reject may never be written (persisting it would
+/// brick the next start until a hand edit undid the write), while the ones
+/// the loader would only quietly rewrite — an out-of-range
+/// `compact_threshold` clamps, an unresolvable theme spelling falls back —
+/// are refused here so a write cannot land a value the next start would
+/// silently substitute away. The optional string keys refuse the literal
+/// word `unset`: it is [`get`]'s display spelling for absence, and storing
+/// it would both render identically to absence and shadow whatever the
+/// absence stood for; `/unset` is the command that clears.
 ///
 /// # Errors
 ///
@@ -189,6 +197,12 @@ pub fn get(config: &DchConfig, key: &str) -> Option<String> {
 /// a settable value or `value` does not parse into the field's type or past
 /// its bound.
 pub fn set(config: &mut DchConfig, key: &str, value: &str) -> Result<(), String> {
+    if value == "unset" && matches!(key, "api_key" | "fallback_model" | "copy_command") {
+        return Err(format!(
+            "{key}: `unset` is the display word for an absent value, not a \
+             storable one — clear it with /unset {key}"
+        ));
+    }
     match key {
         "model" => config.api.model = value.to_string(),
         "base_url" => config.api.base_url = value.to_string(),
@@ -215,7 +229,9 @@ pub fn set(config: &mut DchConfig, key: &str, value: &str) -> Result<(), String>
                     "theme: no theme named {value:?} — /themes lists every spelling"
                 ));
             }
-            config.display.theme = value.to_string();
+            config.display.theme = crate::theme::Theme::key_for_name(value)
+                .unwrap_or(value)
+                .to_string();
         }
         "no_color" => config.display.no_color = parse::<bool>(key, value)?,
         "strip_position" => config.display.strip_position = parse::<StripPosition>(key, value)?,
@@ -462,6 +478,47 @@ mod tests {
             get(&DchConfig::default(), "api_key").as_deref(),
             Some("unset"),
             "an absent key renders as unset, like every other optional leaf"
+        );
+    }
+
+    #[test]
+    fn the_unset_display_word_is_refused_for_optional_strings() {
+        // `unset` is /config's word for an absent optional, not a value:
+        // storing it would persist to the file, shadow the environment
+        // credential (or name a model that does not exist) on the next
+        // start, and render identically to absence so /config could not
+        // show the difference. The refusal points at the command that
+        // actually clears.
+        for key in ["api_key", "fallback_model", "copy_command"] {
+            let mut config = DchConfig::default();
+            let err = set(&mut config, key, "unset").unwrap_err();
+            assert!(
+                err.contains("/unset"),
+                "{key}: the refusal points at the clearing command: {err}"
+            );
+            assert!(
+                is_absent(&config, key),
+                "{key}: the refused write leaves the config untouched"
+            );
+        }
+    }
+
+    #[test]
+    fn a_theme_set_folds_the_spelling_to_the_registry_key() {
+        // "Gruvbox Dark" resolves through the palette table; the stored
+        // spelling must be the registry key it folds to, so the file and
+        // /config carry one canonical form whatever casing the user
+        // typed.
+        let mut config = DchConfig::default();
+        set(&mut config, "theme", "Gruvbox Dark").expect("the display spelling resolves");
+        assert_eq!(
+            config.display.theme, "gruvbox_dark",
+            "the stored spelling is the registry key"
+        );
+        assert_eq!(
+            get(&config, "theme").as_deref(),
+            Some("gruvbox_dark"),
+            "and /config shows the folded key"
         );
     }
 

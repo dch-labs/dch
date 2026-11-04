@@ -8,8 +8,9 @@ A terminal-based agentic coding assistant written in Rust, built on the
 - **Interactive TUI** — live streaming output, Markdown rendering with
   syntax highlighting, configurable themes.
 - **Single-run mode** — run one task non-interactively (as an argument
-  or piped on stdin), exit with a meaningful shell status, optionally
-  write a JSON completion report for CI and orchestration.
+  or piped on stdin), print only the final answer, exit with a
+  meaningful shell status, and optionally write a JSON completion
+  report for CI and orchestration.
 - **Built-in tools** — file reads and paginated viewing, batched
   multi-file reads (`ReadFiles`) under one byte budget, single and atomic
   multi-file edits, writes behind a linter gate, `bash` with
@@ -72,6 +73,12 @@ Single task, non-interactive — the result goes to stdout:
 dch "fix the failing test in crates/dch-tools"
 echo "summarize this repo" | dch
 ```
+
+A single run is quiet by default: stdout carries only the final
+answer, printed once when the run ends, and stderr carries only the
+run's real trouble (warnings and failures). Pass `-v` to watch the run
+instead — the reply streams to stdout as it forms, and tool calls,
+turn markers, and token usage narrate on stderr.
 
 A `TASK` argument selects single-run mode; with no argument, a stdin
 that is not a terminal selects it too. A bare invocation on a
@@ -137,7 +144,7 @@ Common options:
 | `--reasoning-effort LEVEL` | Override the configured thinking budget for this run |
 | `--no-redact` | Disable secrets redaction for this run |
 | `--done-file PATH` | Write a JSON completion status to PATH (single-run mode) |
-| `-v, --verbose` / `-q, --quiet` | Adjust verbosity |
+| `-v, --verbose` / `-q, --quiet` | Adjust verbosity (a single-run invocation is quiet by default; `-v` narrates the run) |
 
 Themes: `default` (near-black, derived from OpenCode's dark palette),
 `transparent`, `dracula`, `nord`, `tokyo_night`,

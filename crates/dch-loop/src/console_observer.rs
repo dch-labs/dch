@@ -5,8 +5,10 @@
 //! — tool calls, turn markers, token usage, compaction and model-switch
 //! notes, errors — goes to stderr, keeping stdout a clean transcript of what
 //! the model said. Output volume is governed by
-//! `Verbosity` (from `dch_config`): Quiet is model text only, Normal
-//! adds concise tool-call lines, Verbose adds durations, token counts, and
+//! `Verbosity` (from `dch_config`): Quiet writes nothing to stdout — the
+//! host delivers the final answer itself once the run ends — and keeps
+//! stderr for the run's real trouble; Normal streams the model's text and
+//! adds concise tool-call lines; Verbose adds durations, token counts, and
 //! lifecycle notes.
 
 use std::io::{IsTerminal, Write};
@@ -58,9 +60,11 @@ const RED: &str = "31";
 /// The model's text streams to stdout, and everything else — tool calls,
 /// turn markers, token usage, compaction and model-switch notes, errors —
 /// goes to stderr, keeping stdout a clean transcript of what the model said.
-/// Output volume is governed by [`Verbosity`]: Quiet emits model text only,
-/// Normal adds concise tool-call lines, Verbose adds durations, token
-/// counts, and lifecycle notes.
+/// Output volume is governed by [`Verbosity`]: Quiet emits nothing to
+/// stdout and keeps stderr for failures — the host prints the final answer
+/// itself at run end — Normal streams the model's text and adds concise
+/// tool-call lines, Verbose adds durations, token counts, and lifecycle
+/// notes.
 ///
 /// The `Mutex`-wrapped sinks keep the observer `Send + Sync` (the observer
 /// trait requires both) and serialize writes so concurrent events never
@@ -265,10 +269,12 @@ impl ConsoleObserver {
         drop(writeln!(err, "{msg}"));
     }
 
-    /// Whether progress chrome (tool lines, separators) is visible.
+    /// Whether progress chrome (tool lines, separators) and the streamed
+    /// model text are visible.
     ///
     /// Visible at Normal and Verbose; hidden at Quiet, where stdout
-    /// carries the model's text and nothing else.
+    /// carries nothing at all and the host prints the run's answer at
+    /// run end.
     fn chrome_visible(&self) -> bool {
         !matches!(self.verbosity, Verbosity::Quiet)
     }
@@ -302,7 +308,8 @@ impl LoopObserver for ConsoleObserver {
     /// Stream the delta to stdout in the assistant accent.
     ///
     /// Marks the turn as streamed, so the closing `on_response` does not
-    /// duplicate the text.
+    /// duplicate the text. Quiet suppresses the stream: stdout carries
+    /// nothing there, and the host prints the answer at run end.
     fn on_text_delta(&self, ctx: &TextDeltaContext) {
         self.stream_delta(&ctx.delta);
     }
@@ -311,9 +318,10 @@ impl LoopObserver for ConsoleObserver {
     ///
     /// After streamed deltas this only closes the line the deltas opened —
     /// reprinting the text would duplicate it. When nothing streamed, the
-    /// whole response arrives here as the sole copy. At Verbose, a
-    /// token-usage line accompanies it on stderr, naming the provider's
-    /// cached share of the input when one is reported.
+    /// whole response arrives here as the sole copy. At Quiet nothing is
+    /// written: the host delivers the final answer itself at run end. At
+    /// Verbose, a token-usage line accompanies it on stderr, naming the
+    /// provider's cached share of the input when one is reported.
     fn on_response(&self, ctx: &ResponseContext) {
         self.finish_response(&ctx.text, ctx.usage.as_ref());
     }
@@ -414,8 +422,12 @@ impl ConsoleObserver {
     /// Stream one text delta to stdout in the assistant accent.
     ///
     /// Marks the turn as streamed so the closing response does not
-    /// duplicate the text.
+    /// duplicate the text. Suppressed at Quiet — stdout carries nothing
+    /// there — so no delta marks the turn as streamed either.
     fn stream_delta(&self, delta: &str) {
+        if !self.chrome_visible() {
+            return;
+        }
         self.saw_text_delta.store(true, Ordering::Relaxed);
         let fragment = self.paint(CYAN, delta);
         self.say_raw(&fragment);
@@ -428,8 +440,13 @@ impl ConsoleObserver {
     /// the whole text as the sole delivery. The usage, when present,
     /// becomes a token-usage line on stderr at Verbose — with the cached
     /// share appended when the provider reported one — and its cached
-    /// count feeds the run summary's cache total.
+    /// count feeds the run summary's cache total. Suppressed at Quiet:
+    /// stdout carries nothing there, and the host prints the final answer
+    /// at run end.
     fn finish_response(&self, text: &str, usage: Option<&Usage>) {
+        if !self.chrome_visible() {
+            return;
+        }
         if self.saw_text_delta.load(Ordering::Relaxed) {
             self.say("");
         } else {
@@ -735,11 +752,18 @@ mod tests {
     #[test]
     fn quiet_suppresses_tool_call_chrome() {
         let h = Harness::build(Verbosity::Quiet, false);
+        h.delta("meanwhile");
+        h.response("the whole answer");
         h.tool_started("Bash");
         h.tool_finished("Bash", false);
         h.turn_ended(0, true);
         assert_eq!(h.stderr(), "", "quiet: no chrome on stderr");
-        assert_eq!(h.stdout(), "", "quiet: no chrome on stdout");
+        assert_eq!(
+            h.stdout(),
+            "",
+            "quiet: neither streamed text nor the answer reaches stdout — the \
+             host prints the final answer at run end"
+        );
     }
 
     #[test]
@@ -765,7 +789,7 @@ mod tests {
 
     #[test]
     fn on_response_prints_whole_text_when_nothing_streamed() {
-        let h = Harness::build(Verbosity::Quiet, false);
+        let h = Harness::build(Verbosity::Normal, false);
         h.response("hello");
         assert_eq!(h.stdout(), "hello\n");
     }
@@ -797,7 +821,7 @@ mod tests {
 
     #[test]
     fn text_deltas_stream_verbatim_to_stdout() {
-        let h = Harness::build(Verbosity::Quiet, false);
+        let h = Harness::build(Verbosity::Normal, false);
         h.delta("foo");
         h.delta("bar");
         assert_eq!(h.stdout(), "foobar", "streaming is verbatim, no newlines");
@@ -850,7 +874,7 @@ mod tests {
 
     #[test]
     fn color_on_wraps_streamed_text_in_cyan() {
-        let h = Harness::build(Verbosity::Quiet, true);
+        let h = Harness::build(Verbosity::Normal, true);
         h.delta("hi");
         assert!(
             h.stdout().contains("\x1b[36m"),
@@ -899,8 +923,7 @@ mod tests {
     #[test]
     fn quiet_lifecycle_notes_stay_silent() {
         // Detail chrome hides at Quiet: the notes the Verbose pin prints
-        // must leave stderr entirely empty, or the model's text is no
-        // longer the only thing stdout carries.
+        // must leave stderr entirely empty alongside quiet's empty stdout.
         let h = Harness::build(Verbosity::Quiet, false);
         h.observer.history_compacted(12_000, 4_000);
         h.observer
@@ -930,7 +953,8 @@ mod tests {
     #[test]
     fn run_end_summary_is_verbose_only() {
         // The end-of-run summary is detail chrome: Quiet and Normal runs get
-        // the model's text and per-event errors, but no summary line.
+        // per-event errors (and, at Normal, the model's text), but no
+        // summary line.
         for verbosity in [Verbosity::Quiet, Verbosity::Normal] {
             let h = Harness::build(verbosity, false);
             h.observer
@@ -963,7 +987,7 @@ mod tests {
 
         let flushes = Arc::new(AtomicUsize::new(0));
         let observer = ConsoleObserver::with_sinks(
-            Verbosity::Quiet,
+            Verbosity::Normal,
             false,
             Box::new(FlushSpy {
                 flushes: Arc::clone(&flushes),
@@ -979,7 +1003,7 @@ mod tests {
 
     #[test]
     fn each_turn_resets_the_delta_flag_so_unstreamed_responses_still_print() {
-        let h = Harness::build(Verbosity::Quiet, false);
+        let h = Harness::build(Verbosity::Normal, false);
 
         // Turn 1 streams deltas; the response closes the streamed line.
         h.delta("streamed");

@@ -249,8 +249,8 @@ struct StoredSession {
     ///
     /// Written by the host at saver construction so the envelope
     /// always carries it; the listing surfaces it, and a resume reads
-    /// it as provenance — the engine runs on the current
-    /// configuration's model and provider.
+    /// it as its default model — resolved through `[[models]]` onto
+    /// the pre-selection base, an explicit `--model` still winning.
     model: String,
 
     /// When this save happened; restamped per save.
@@ -973,6 +973,47 @@ mod tests {
             2,
             "only the submitted prompts count — the steered row is \
              the session's own word, not the user's"
+        );
+    }
+
+    #[test]
+    fn the_recorded_workdir_round_trips_a_save_and_listing() {
+        // The envelope's workdir names where the conversation ran; the
+        // listing surfaces it for the session picker. A save records it
+        // through with_workdir, the listing reads it back, and a legacy
+        // file predating the field lists none.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let id = Uuid::new_v4();
+        let workdir = std::path::Path::new("/tmp/dch-session-workdir");
+        crate::session::SessionSaver::with_base_dir(
+            id,
+            "test-model".to_string(),
+            dir.path().to_path_buf(),
+        )
+        .with_workdir(workdir)
+        .save(&sample_messages(), SessionTokens::default())
+        .expect("save");
+        let listed = list_sessions_in(dir.path()).expect("list");
+        assert_eq!(
+            listed.first().expect("the one session").workdir,
+            Some(workdir.display().to_string()),
+            "the listing carries the recorded workdir"
+        );
+
+        // A legacy envelope predating the field lists no workdir.
+        let path = dir.path().join(id.to_string()).join("session.json");
+        let mut envelope: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("parse");
+        envelope
+            .as_object_mut()
+            .expect("the envelope is an object")
+            .remove("workdir");
+        std::fs::write(&path, envelope.to_string()).expect("rewrite the legacy shape");
+        let listed = list_sessions_in(dir.path()).expect("list the legacy file");
+        assert_eq!(
+            listed.first().expect("the one session").workdir,
+            None,
+            "a legacy envelope without the field lists no workdir"
         );
     }
 

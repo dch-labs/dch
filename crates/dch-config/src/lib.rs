@@ -1923,9 +1923,11 @@ impl DchConfig {
     ///
     /// Runs after deserialization on every load, so a value the runtime
     /// would quietly rewrite surfaces as a startup error naming the field,
-    /// the value, and the bound it violated. Reached only through
-    /// [`from_toml_str`](Self::from_toml_str), which is what makes the
-    /// guarantee hold on every route a file takes to reach the runner.
+    /// the value, and the bound it violated. Reached through
+    /// [`from_toml_str`](Self::from_toml_str) on every load and from
+    /// [`save_to_dir`](Self::save_to_dir) before anything is staged, which
+    /// is what makes the guarantee hold on every route a file takes to
+    /// reach the runner.
     ///
     /// # Errors
     ///
@@ -1979,8 +1981,11 @@ impl DchConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`DchConfigError::Invalid`] for an entry naming no model or for
-    /// two entries sharing one name.
+    /// Returns [`DchConfigError::Invalid`] for an entry naming no model, for
+    /// two entries sharing one name, or for an entry whose stated
+    /// `reasoning_effort` is neither a rung of the ladder nor blank — the
+    /// blank spelling is the documented drop-dial override and passes, the
+    /// same as any other optional an entry names empty.
     fn validate_models(&self) -> Result<(), DchConfigError> {
         let mut seen: Vec<String> = Vec::new();
         for entry in &self.models {
@@ -2003,6 +2008,7 @@ impl DchConfig {
                 )));
             }
             if let Some(effort) = &entry.reasoning_effort
+                && !effort.trim().is_empty()
                 && !is_reasoning_effort(effort)
             {
                 return Err(DchConfigError::Invalid(format!(
@@ -3238,6 +3244,43 @@ context_window = 210_000
             config.api.reasoning_effort, None,
             "an entry naming an optional setting empty clears the inherited one, rather than \
              sending a dial the selected model cannot carry"
+        );
+    }
+
+    #[test]
+    fn from_toml_str_accepts_an_entry_that_drops_the_reasoning_dial() {
+        // The documented contract ("" drops the dial) must survive the
+        // loader: validate_models treats a blank override as the drop
+        // spelling, not an unknown rung, so the file loads and selecting
+        // the entry clears what [api] would hand over. Whitespace-only is
+        // the same drop, the way every other cleared() optional reads it.
+        let config = DchConfig::from_toml_str(
+            "[api]\nmodel = \"qwen\"\nreasoning_effort = \"medium\"\n\n\
+             [[models]]\nmodel = \"m\"\nreasoning_effort = \"\"\n\n\
+             [[models]]\nmodel = \"m-spaces\"\nreasoning_effort = \"   \"\n",
+        )
+        .expect("a blank override is the drop spelling, not an unknown rung");
+        for name in ["m", "m-spaces"] {
+            let mut selected = config.clone();
+            selected
+                .select_model(Some(name))
+                .expect("the entry selects");
+            assert_eq!(
+                selected.api.reasoning_effort, None,
+                "selecting {name:?} clears the inherited dial"
+            );
+        }
+    }
+
+    #[test]
+    fn from_toml_str_still_refuses_a_non_blank_unknown_reasoning_rung() {
+        let err = DchConfig::from_toml_str(
+            "[api]\nmodel = \"qwen\"\n\n[[models]]\nmodel = \"m\"\nreasoning_effort = \"sideways\"\n",
+        )
+        .expect_err("an unknown non-blank rung stays a startup error");
+        assert!(
+            err.to_string().contains("sideways"),
+            "the refusal names the entry's own value: {err}"
         );
     }
 

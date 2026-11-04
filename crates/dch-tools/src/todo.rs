@@ -306,8 +306,10 @@ const ENTRY_TEXT_LIMIT: usize = 160;
 /// The refusal names the entry, the field, and both lengths, so the
 /// model can rewrite the item short in one round trip — the same
 /// repair pattern the parse hints use. Every prose field a call can
-/// file on a new entry is bounded; ids and status spellings never reach
-/// a tenth of the limit.
+/// file on a new entry is bounded; status spellings are enum-bounded,
+/// and ids are deliberately left unbounded — the store's ids are the
+/// model's own, and trimming one would orphan the references that
+/// name it.
 ///
 /// # Errors
 ///
@@ -806,7 +808,9 @@ impl TodoTool {
     /// Returns [`ToolError::Execution`] when no runner context is installed,
     /// and [`ToolError::InvalidInput`] when the input cannot be parsed, an
     /// id is duplicated within the submission, a new entry carries neither
-    /// a subject nor a description, or a `blocked_by` reference names an
+    /// a subject nor a description, a prose field (subject, description,
+    /// or active form) exceeds the 160-character entry-text limit, or a
+    /// `blocked_by` reference names an
     /// absent id. Status requests are never rejected — the store is
     /// normalize-and-merge: once those checks pass, each carried entry is
     /// adjusted to the rung law and merged into the standing list, every
@@ -1214,6 +1218,29 @@ mod tests {
         let text = refused.to_string();
         assert!(
             text.contains("160") && text.contains("active_form of 200"),
+            "the refusal names the field, its length, and the limit: {text}"
+        );
+        assert!(
+            todos.lock().expect("todos lock not poisoned").is_empty(),
+            "a refused submission stores nothing"
+        );
+    }
+
+    #[test]
+    fn a_long_description_is_rejected_and_nothing_is_stored() {
+        // The second prose field: a description alone can found a new
+        // entry, so its length is bounded the same way a subject's is —
+        // and a refusal stores nothing; the model rewrites.
+        let (_context, todos) = todo_context();
+        let long: String = "x".repeat(200);
+        let input = serde_json::json!({
+            "todos": [ { "id": "1", "description": long, "status": "pending" } ]
+        });
+        let refused = TodoTool::todo_write_inner(input, Some(Arc::clone(&todos)))
+            .expect_err("an over-long description is refused, not cut");
+        let text = refused.to_string();
+        assert!(
+            text.contains("160") && text.contains("description of 200"),
             "the refusal names the field, its length, and the limit: {text}"
         );
         assert!(

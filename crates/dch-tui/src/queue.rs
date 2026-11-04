@@ -381,8 +381,18 @@ pub enum SessionCommand {
     /// The manual `/compact` seam: the engine's own context manager
     /// folds the history between runs, the next turn continues from
     /// the compacted context, and the notice carries the token
-    /// figures the pass measured.
-    Compact,
+    /// figures the pass measured. The driver publishes the folded
+    /// history to the machine snapshot beside the notice, and the
+    /// payload is the display transcript's Compacted-row count at the
+    /// moment of the command — the one number the driver cannot see
+    /// for itself, so the snapshot it publishes records a truthful
+    /// total (the rows the display carries plus this pass) without
+    /// holding the display.
+    Compact {
+        /// How many Compacted rows the display carries, for the
+        /// machine snapshot this pass publishes.
+        compactions: u32,
+    },
 
     /// List the saved sessions under the session root, for a picker.
     ///
