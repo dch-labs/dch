@@ -31,7 +31,9 @@ use dch_config::StripPosition;
 use dch_config::StripStyle;
 
 use crate::Graduation;
-use crate::events::TerminalEvents;
+use crate::commands::{self, Command, CompletionSources, Parsed};
+use crate::config_fields;
+use crate::events::{InputQuiesce, TerminalEvents};
 use crate::guidance::Guidance;
 use crate::input::{InputAction, InputEditor};
 use crate::markdown;
@@ -39,11 +41,97 @@ use crate::message::{ActiveTool, ContentBlock, TokenCounts, TuiMessage};
 use crate::observer::{HealthNotice, ToolResultDisplay, TuiObserverState};
 use crate::permission::PermissionRequest;
 use crate::question::QuestionPrompt;
-use crate::queue::Submission;
+use crate::queue::{ResumedTokens, SessionCommand, SessionPick, SessionUpdate, Submission};
 use crate::theme::Theme;
 use crate::todo_view;
 use crate::tool_render::SPINNER_FRAMES;
 use dch_config::Verbosity;
+
+/// The in-progress `Tab` completion cycle for a `/`-command line.
+///
+/// Freezes the candidate list and the position reached so each further
+/// Tab advances through the same list rather than re-deriving it against
+/// the candidate just applied — which would complete a completed word and
+/// strand the cycle on the first match. The `prefix` is the line up to and
+/// including the space before the word being completed (just the leading
+/// `/` for a command name), so re-applying a candidate keeps the rest of
+/// the line fixed and swaps only the completed word.
+/// The completion popup's window cap.
+///
+/// How many rows the popup shows at once; the window scrolls only
+/// when the selection steps past its edges.
+const POPUP_SHOWN: usize = 6;
+
+#[derive(Debug, Clone)]
+struct CompletionCycle {
+    /// The text before the completed word, held fixed across the cycle.
+    ///
+    /// Re-applying a candidate re-attaches exactly this text, so only
+    /// the completed word ever changes — `/model ` stays put while the
+    /// value after it cycles.
+    prefix: String,
+
+    /// The candidate values the cycle walks, in completion order.
+    ///
+    /// Frozen at the first press so cycling cannot re-derive against a
+    /// half-applied word; an edit between presses retires the cycle.
+    candidates: Vec<String>,
+
+    /// Which candidate currently stands in the composer.
+    ///
+    /// The next `Tab` steps forward from here, wrapping; the popup's
+    /// highlight follows the same index.
+    index: usize,
+
+    /// The popup window's start row, scrolled only at the edges.
+    ///
+    /// The selection moves through a still list: the window shifts
+    /// only when the selection would step past its top or bottom
+    /// edge, not to pin the selection at any particular row. This is
+    /// what makes backwards navigation read as the highlight moving
+    /// up, rather than the list sliding under a bottom-pinned
+    /// selection.
+    window_start: usize,
+}
+
+/// The popup's window over its candidates, following the highlight.
+///
+/// The first rows show until the highlight passes the last of them;
+/// from there the highlight pins to the window's last row and the
+/// rows above it scroll away — a dropdown's scroll, in a list that
+/// floats above the composer. Returns the window's start and the
+/// highlighted row's place inside it.
+fn popup_window(selected: usize, total: usize, shown_cap: usize) -> (usize, usize) {
+    let cap = shown_cap.min(total.max(1));
+    let start = selected
+        .saturating_sub(cap.saturating_sub(1))
+        .min(total.saturating_sub(cap));
+    (start, selected.saturating_sub(start))
+}
+
+/// The popup's rectangle: the composer's full width, floated directly
+/// above it as high as the content needs.
+fn popup_rect(input_area: Rect, height: u16) -> Rect {
+    Rect {
+        x: input_area.x,
+        y: input_area.y.saturating_sub(height),
+        width: input_area.width.max(1),
+        height,
+    }
+}
+
+/// The part of a `/`-command line that completion leaves untouched.
+///
+/// Everything up to and including the last whitespace, so completing a
+/// command argument keeps `/model ` or `/theme ` intact; with no whitespace
+/// yet the line is on its first word and only the leading `/` is kept, so a
+/// command name is completed onto a bare slash.
+fn completion_prefix(line: &str) -> String {
+    match line.rfind(char::is_whitespace) {
+        Some(last) => line.get(..=last).unwrap_or("/").to_string(),
+        None => "/".to_string(),
+    }
+}
 
 /// The callback fired when a turn's outcome joins the conversation.
 ///
@@ -217,9 +305,11 @@ const ANIMATION_INTERVAL: Duration = Duration::from_millis(20);
 /// Half a second on, half a second off — the cadence editors settle
 /// on when they own the blink themselves. The terminal's own
 /// blinking-cursor request may be ignored or preference-gated, so
-/// the app toggles visibility on its tick instead: what the user
-/// sees does not depend on the terminal's cooperation.
-const CARET_BLINK_TICKS: u32 = 5;
+/// the app owns the phase: what the user sees depends on neither the
+/// terminal's cooperation nor the rate anything redraws — a stream
+/// painting every frame and a fully idle lane alike flip at the
+/// clock's cadence.
+const CARET_BLINK_INTERVAL: Duration = Duration::from_millis(530);
 
 /// How many graduated calls keep their expansion data.
 ///
@@ -1630,6 +1720,15 @@ pub struct TuiApp {
     /// The status bar reads the model name from it.
     config: DchConfig,
 
+    /// Where live config changes persist, when a host wires it.
+    ///
+    /// Write-through's target: every command that changes a config
+    /// value — `/set`, `/unset`, `/theme`, a `/model` switch — saves
+    /// the whole configuration here, so the next launch opens where
+    /// this session left off. `None` (a bare test app) changes
+    /// nothing on any disk.
+    config_persist_dir: Option<std::path::PathBuf>,
+
     /// The session's id, as the status bar shows it.
     ///
     /// Set by the host once the session's identity is known — the
@@ -1730,6 +1829,30 @@ pub struct TuiApp {
     /// the first frame draws.
     plan_cut: std::cell::Cell<bool>,
 
+    /// The pinned section's scroll: how many entries the window skips.
+    ///
+    /// The wheel over the section steps this window one entry at a
+    /// time — a long plan stays readable without a scrollbar and
+    /// without the section's height ever growing past the screen.
+    /// Zero shows the plan's head; the window always keeps at least
+    /// one entry visible, and Ctrl+T's posture change resets it.
+    todo_scroll: usize,
+
+    /// The rect the last frame painted the pinned section into.
+    ///
+    /// The wheel needs to know whether the pointer stands on the
+    /// section; the render records the rect it filled so the next
+    /// mouse event answers against the same geometry.
+    todo_section_rect: Rect,
+
+    /// The full view's body-row budget the layout settled on.
+    ///
+    /// The height pass and the render must window the plan
+    /// identically or the section's rect and its content drift; the
+    /// height pass stores the bound it used and the render reads it
+    /// back within the same frame.
+    full_body_cap: std::cell::Cell<usize>,
+
     /// The working directory's own name, as the status bar shows it.
     ///
     /// Set by the host at launch with the directory the runner
@@ -1824,6 +1947,21 @@ pub struct TuiApp {
     /// left behind on the way.
     pending_questions: std::collections::VecDeque<PendingQuestion>,
 
+    /// The saved-session picker `/sessions` opened, when it stands.
+    ///
+    /// Holds the catalog the driver listed — newest first — and the
+    /// row the cursor is on. `None` when no picker stands; the picker
+    /// owns the keyboard while it does, and Enter hands its row to
+    /// the resume lane exactly as `/resume <id>` would.
+    session_picker: Option<SessionPicker>,
+
+    /// The configured-models picker `/models` opened, when it stands.
+    ///
+    /// Same shape as the session picker: the model names with the
+    /// cursor, Enter switching through the `/model` lane. `None` when
+    /// no picker stands.
+    model_picker: Option<ModelPicker>,
+
     /// Which queued question is on screen: an index into
     /// [`pending_questions`](Self::pending_questions).
     ///
@@ -1843,6 +1981,77 @@ pub struct TuiApp {
     /// permission channel's shape.
     question_rx: Option<tokio::sync::mpsc::UnboundedReceiver<QuestionPrompt>>,
 
+    /// The channel between-turns session updates arrive on, until `run`
+    /// claims it into its select.
+    ///
+    /// The driver owns the loop, so a `/model` switch or `/clear` that
+    /// changes which model or session the loop carries is decided there and
+    /// reported here; this is that one-way path. Installed by the host
+    /// beside the submit channel; a standalone app (no driver) leaves it
+    /// empty and never sees such an update.
+    session_rx: Option<tokio::sync::mpsc::UnboundedReceiver<SessionUpdate>>,
+
+    /// The live `Tab` completion cycle for a `/`-command line, if any.
+    ///
+    /// Present only while the composer holds a command mid-completion; any
+    /// other keystroke edits the line and drops it, so the cycle cannot
+    /// carry a stale candidate list into an edited word.
+    completion: Option<CompletionCycle>,
+
+    /// The draft stamp at which Esc dismissed the suggestion popup.
+    ///
+    /// `None` while the popup stands free; `Some(stamp)` while the
+    /// user has sent it away and the composer has not been edited —
+    /// any edit changes the stamp and re-arms the popup.
+    completion_dismissed: Option<u64>,
+
+    /// Config values overridden this session, each mapped to its original.
+    ///
+    /// `/set` records a key's value the first time it is changed so `/unset`
+    /// can restore exactly what the file gave, and not merely some default.
+    /// The map is the session's ledger of overrides — nothing is written back
+    /// to the file, so a restart starts again from disk. An entry's `None`
+    /// records that the file carried no value for the key at all, so the
+    /// restore reaches the same absence instead of a value spelled like one.
+    config_overrides: std::collections::HashMap<String, Option<String>>,
+
+    /// The user-stated config a model selection layers onto, when the
+    /// host installed one.
+    ///
+    /// Selections must not accrete: a second switch layers its entry
+    /// over the base the session started from — the file plus the CLI's
+    /// non-model overrides — never over the live config's
+    /// already-selected bundle, so `/model b` mid-session equals a
+    /// restart that named `b`. The host installs the boot-time base
+    /// beside the live config; `/set` and `/unset` mirror their writes
+    /// into it so a later switch cannot drop them. `None` until the
+    /// first verdict needs it — a panel nobody boot-selected snapshots
+    /// the live config at that moment, which for exactly those panels
+    /// is the file's own `[api]`.
+    config_base: Option<DchConfig>,
+
+    /// The theme the session was on before the completion popup
+    /// started previewing.
+    ///
+    /// Browsing `/theme` candidates previews each highlighted palette;
+    /// this holds what was showing before the browsing began, so
+    /// dismissing the popup without committing restores it — a
+    /// preview the user walked away from is not a switch. Cleared by
+    /// every committed path (`/theme <name>`, `/theme` bare,
+    /// `/set theme`); `None` when no browse stands.
+    theme_before_browse: Option<Theme>,
+
+    /// OSC escapes a pending theme preview owes the terminal.
+    ///
+    /// A preview swaps the palette and invalidates the caches at key
+    /// time, but the terminal escapes (background, cursor tint) are
+    /// deferred to the render: writing them at key time means the
+    /// background changes one frame before the text catches up —
+    /// the two-step flash. Holding them here lets the render loop
+    /// write the escapes and draw the re-styled content in one
+    /// back-to-back flush, so the palette lands whole.
+    pending_theme_osc: Option<(ratatui::style::Color, ratatui::style::Color)>,
+
     /// The instant the terminal regained focus and a whole-screen
     /// repaint is still owed, if one is.
     ///
@@ -1853,6 +2062,14 @@ pub struct TuiApp {
     /// screen, and lets the next draw repaint every cell — the same
     /// full repaint a resize forces.
     full_repaint_due: Option<Instant>,
+
+    /// The reader's pause handshake, wired when the run loop spawns
+    /// the event source.
+    ///
+    /// `None` until the run loop starts — and forever in tests — so a
+    /// theme switch with no reader to park defers its palette rather
+    /// than query a terminal stdin is contested for.
+    input_quiesce: Option<Arc<InputQuiesce>>,
 }
 
 /// The accumulators one conversation render pass fills.
@@ -2055,6 +2272,9 @@ impl TuiApp {
             plan_interrupted: false,
             plan_view: PlanView::Capped,
             plan_cut: std::cell::Cell::new(false),
+            todo_scroll: 0,
+            todo_section_rect: Rect::default(),
+            full_body_cap: std::cell::Cell::new(usize::MAX),
             working_dir: None,
             git_branch: None,
             transient_notice: None,
@@ -2064,10 +2284,21 @@ impl TuiApp {
             pending_permissions: std::collections::VecDeque::new(),
             permission_rx: None,
             pending_questions: std::collections::VecDeque::new(),
+            session_picker: None,
+            model_picker: None,
             question_view: 0,
             question_rx: None,
+            session_rx: None,
+            completion: None,
+            completion_dismissed: None,
+            config_overrides: std::collections::HashMap::new(),
+            config_base: None,
             full_repaint_due: None,
+            theme_before_browse: None,
+            pending_theme_osc: None,
+            input_quiesce: None,
             config,
+            config_persist_dir: None,
         }
     }
 
@@ -2116,6 +2347,1619 @@ impl TuiApp {
     /// carries it.
     pub fn set_session_id(&mut self, id: String) {
         self.session_id = Some(id);
+    }
+
+    /// Install the driver→panel channel for between-turns session updates.
+    ///
+    /// The driver alone holds the loop, so a `/model` switch or `/clear`
+    /// changes which model and session it carries there; with this channel
+    /// installed, those facts come back here to be shown. A standalone app
+    /// with no driver never installs it and never sees an update.
+    pub fn set_session_requests(
+        &mut self,
+        rx: tokio::sync::mpsc::UnboundedReceiver<SessionUpdate>,
+    ) {
+        self.session_rx = Some(rx);
+    }
+
+    /// Apply one driver→panel update to the panel's own state.
+    ///
+    /// The status bar's two facts land here, and so does everything else
+    /// the channel carries: a provider switch's settings, a resumed
+    /// session's transcript, and the driver's notices. A model or provider
+    /// fact is saved to the config file as it lands — the write-through's
+    /// moment is the loop's verdict, never the send.
+    pub fn apply_session_update(&mut self, update: SessionUpdate) {
+        match update {
+            SessionUpdate::SessionId { id } => self.session_id = Some(id),
+            SessionUpdate::ModelName { name } => {
+                self.reselect_model(Some(&name));
+                self.publish_transcript_now();
+                self.persist_config("model");
+            }
+            SessionUpdate::Provider {
+                model,
+                base_url,
+                api_type,
+            } => {
+                self.reselect_provider(model, base_url, &api_type);
+                self.publish_transcript_now();
+                self.persist_config("model");
+            }
+            SessionUpdate::Resumed {
+                id,
+                transcript,
+                tokens,
+            } => self.adopt_resumed_session(id, transcript, tokens),
+            SessionUpdate::Notice { text } => self.post_notice(text),
+            SessionUpdate::SessionCatalog { rows } => self.open_session_picker(rows),
+        }
+    }
+
+    /// The base the next selection layers onto, materializing it when no
+    /// host installed one.
+    ///
+    /// A host that boot-selected before handing the config over installs
+    /// the pre-selection base at wiring; a panel constructed straight
+    /// from a file config — tests, embedded hosts — holds no selection
+    /// yet, so the live config at the first verdict *is* the base and
+    /// capturing it there is exact.
+    fn base_for_selection(&mut self) -> DchConfig {
+        self.config_base
+            .get_or_insert_with(|| self.config.clone())
+            .clone()
+    }
+
+    /// Re-select `requested` over the user-stated base, replacing the
+    /// live `[api]`.
+    ///
+    /// The panel's half of the no-accretion rule: a selection layers
+    /// onto the base, never onto the live config's already-selected
+    /// bundle, so the second switch of a session equals a restart naming
+    /// it rather than a stack of every selection so far. Only `[api]` is
+    /// replaced — the live config's display-side state (a `/theme`
+    /// change, the settled caches) is not the selection's to touch. A
+    /// name no entry declares keeps the base bundle under the bare name,
+    /// exactly as `select_model` treats the base's own model.
+    fn reselect_model(&mut self, requested: Option<&str>) {
+        let mut fresh = self.base_for_selection();
+        if fresh.select_model(requested).is_err()
+            && let Some(name) = requested
+        {
+            fresh.api.model = name.to_string();
+        }
+        self.config.api = fresh.api;
+    }
+
+    /// Mirror a cross-provider verdict over the base the same way the
+    /// driver resolved it.
+    ///
+    /// The wire fields the update carries land first — they are the
+    /// rebuild's own report — and then the entry's layer resolves over
+    /// the base, so an entry's unstated fields inherit the user-stated
+    /// `[api]` rather than whichever provider ran before. Only `[api]`
+    /// is replaced, for the same reason [`reselect_model`](Self::reselect_model)
+    /// replaces only `[api]`.
+    fn reselect_provider(&mut self, model: String, base_url: String, api_type: &str) {
+        let mut fresh = self.base_for_selection();
+        fresh.api.model = model;
+        fresh.api.base_url = base_url;
+        if let Ok(kind) = serde_json::from_str::<dch_config::ApiType>(&format!("\"{api_type}\"")) {
+            fresh.api.api_type = kind;
+        }
+        let selected = fresh.api.model.clone();
+        let _selection = fresh.select_model(Some(&selected));
+        self.config.api = fresh.api;
+    }
+
+    /// Adopt a session the driver loaded: transcript, queue, and counters.
+    ///
+    /// The display half of a live resume: the driver rebuilt the loop on
+    /// the saved machine history and moved the save target onto the
+    /// session's own file; this replaces what is shown with the loaded
+    /// conversation — the same seeding a launch resume performs — empties
+    /// the waiting queue (those prompts belonged to the conversation that
+    /// just ended), and restores the session's token accounting so the
+    /// counters continue the saved session's story instead of restarting
+    /// at zero.
+    fn adopt_resumed_session(
+        &mut self,
+        id: String,
+        transcript: Vec<TuiMessage>,
+        tokens: ResumedTokens,
+    ) {
+        self.conversation.clear();
+        self.seed_messages(transcript);
+        self.conversation_generation = self.conversation_generation.saturating_add(1);
+        self.selection = None;
+        self.handed = None;
+        self.state
+            .queued
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        {
+            let mut counts = self
+                .state
+                .tokens
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            counts.cumulative_input = tokens.cumulative_input;
+            counts.cumulative_output = tokens.cumulative_output;
+            counts.input = tokens.last_input;
+            counts.context_tokens = tokens.context_tokens;
+        }
+        self.session_id = Some(id);
+        self.scroll_to_bottom();
+    }
+
+    /// Dispatch one locally-parsed command into its lane.
+    ///
+    /// A `/`-prefixed line never reaches the model: a recognised command is
+    /// carried out here, an unrecognised one answers with a notice, and the
+    /// composer clears either way. Only a line with no leading slash is left
+    /// to the ordinary submit path, which the caller drives.
+    fn handle_command(&mut self, parsed: Parsed) {
+        match parsed {
+            Parsed::Command(command) => self.run_command(command),
+            Parsed::Unknown { name } => {
+                self.post_notice(format!("unknown command /{name} — type /help for the list"));
+            }
+            Parsed::NotACommand => {}
+        }
+    }
+
+    /// Route one recognised command to its handler.
+    ///
+    /// The dispatch table itself: every [`Command`] variant maps to
+    /// exactly one handler here, so adding a command means adding the
+    /// variant, the registration, and this arm — the compiler keeps
+    /// the three in step.
+    pub fn run_command(&mut self, command: Command) {
+        match command {
+            Command::Help { topic } => match topic {
+                Some(topic) => self.show_command_detail(&topic),
+                None => self.show_help(),
+            },
+            Command::Theme { name } => match name {
+                Some(name) => self.set_theme_command(&name),
+                None => self.begin_theme_preview(),
+            },
+            Command::Model { name } => self.switch_model_command(&name),
+            Command::Clear => self.clear_command(),
+            Command::Resume { target } => self.resume_command(target),
+            Command::Models => self.list_models_command(),
+            Command::Config => self.show_config_command(),
+            Command::Set { key, value } => self.set_config_command(&key, &value),
+            Command::Unset { key } => self.unset_config_command(&key),
+            Command::Compact => self.compact_command(),
+            Command::Exit => self.exit_command(),
+            Command::Stop => self.stop_command(),
+            Command::Session => self.session_command(),
+            Command::Sessions => self.sessions_command(),
+            Command::Themes => self.list_themes_command(),
+            Command::Verbosity { level } => self.verbosity_command(level),
+            Command::Cost => self.cost_command(),
+            Command::Copy => self.copy_command(),
+            Command::Version => self.version_command(),
+        }
+    }
+
+    /// Print the command listing into the transcript, grouped by category.
+    ///
+    /// Reads the same registration table `parse` matches against, so the
+    /// listing cannot advertise a command the parser would reject or omit one
+    /// it would run — the rows and the vocabulary stay one thing. Commands are
+    /// gathered under their category headings in the palette's own order, each
+    /// row showing the invocation and its one-line summary.
+    fn show_help(&mut self) {
+        let now = chrono::Utc::now();
+        self.push_message(TuiMessage::System {
+            text: "In-session commands — a line starting with / runs here, it is not sent:"
+                .to_string(),
+            timestamp: now,
+        });
+        let specs = commands::specs();
+        let mut current: Option<&str> = None;
+        for spec in specs {
+            if current != Some(spec.category) {
+                current = Some(spec.category);
+                self.push_message(TuiMessage::System {
+                    text: format!("{}:", spec.category),
+                    timestamp: now,
+                });
+            }
+            let shape = if spec.args.is_empty() {
+                format!("/{}", spec.name)
+            } else {
+                format!("/{} {}", spec.name, spec.args)
+            };
+            let mut row = format!("  {shape:24} {}", spec.summary);
+            if !spec.aliases.is_empty() {
+                let alias: Vec<String> = spec.aliases.iter().map(|a| format!("/{a}")).collect();
+                row.push_str("  (also ");
+                row.push_str(&alias.join(", "));
+                row.push(')');
+            }
+            self.push_message(TuiMessage::System {
+                text: row,
+                timestamp: now,
+            });
+        }
+        self.push_message(TuiMessage::System {
+            text: "Type /help <command> for detail on one; Tab completes a word.".to_string(),
+            timestamp: now,
+        });
+        self.scroll_to_bottom();
+    }
+
+    /// Explain one command in depth, resolving a name or an alias.
+    ///
+    /// Reads the same table as the palette via [`commands::detail_for`], so an
+    /// alias (`/help new`) explains the command it names (`/clear`). An
+    /// unknown topic says so and points back at the listing rather than
+    /// inventing an explanation.
+    fn show_command_detail(&mut self, topic: &str) {
+        let now = chrono::Utc::now();
+        let Some((view, _matched)) = commands::detail_for(topic) else {
+            self.post_notice(format!("no command /{topic} — type /help for the list"));
+            return;
+        };
+        self.push_message(TuiMessage::System {
+            text: format!("/{} — {}", view.name, view.summary),
+            timestamp: now,
+        });
+        if !view.usage.is_empty() {
+            self.push_message(TuiMessage::System {
+                text: format!("  usage: {}", view.usage),
+                timestamp: now,
+            });
+        }
+        if !view.aliases.is_empty() {
+            let alias: Vec<String> = view.aliases.iter().map(|a| format!("/{a}")).collect();
+            self.push_message(TuiMessage::System {
+                text: format!("  aliases: {}", alias.join(", ")),
+                timestamp: now,
+            });
+        }
+        if !view.detail.is_empty() {
+            self.push_message(TuiMessage::System {
+                text: format!("  {}", view.detail),
+                timestamp: now,
+            });
+        }
+        self.scroll_to_bottom();
+    }
+
+    /// List the configured models, marking the one the loop is running.
+    ///
+    /// Reads the `[[models]]` profiles so there is a set to point `/model` at.
+    /// With none configured the notice says so plainly rather than printing an
+    /// empty table, because there is genuinely nothing to list.
+    fn list_models_command(&mut self) {
+        if self.config.models.is_empty() {
+            self.post_notice(
+                "no [[models]] configured — /model renames the live model directly".to_string(),
+            );
+            return;
+        }
+        let names: Vec<String> = self
+            .config
+            .models
+            .iter()
+            .map(|profile| profile.model.clone())
+            .collect();
+        let running = self
+            .config
+            .models
+            .iter()
+            .position(|profile| profile.model == self.config.api.model)
+            .unwrap_or(0);
+        self.model_picker = Some(ModelPicker {
+            rows: names,
+            cursor: running,
+        });
+    }
+
+    /// List the settable config keys and their values in effect.
+    ///
+    /// Every row is `key = value` read through [`config_fields`], secret keys
+    /// masked, so `/config`, `/set`, and `Tab` all describe the same surface.
+    /// Keys overridden this session are tagged so the temporary ones stand out.
+    fn show_config_command(&mut self) {
+        let now = chrono::Utc::now();
+        self.push_message(TuiMessage::System {
+            text: "Configuration in effect (* overridden this session):".to_string(),
+            timestamp: now,
+        });
+        for key in config_fields::KEYS {
+            let shown = match config_fields::get(&self.config, key) {
+                Some(value)
+                    if config_fields::is_secret(key) && !value.is_empty() && value != "unset" =>
+                {
+                    "••••".to_string()
+                }
+                Some(value) => value,
+                None => String::new(),
+            };
+            let mark = if self.config_overrides.contains_key(*key) {
+                "*"
+            } else {
+                " "
+            };
+            self.push_message(TuiMessage::System {
+                text: format!("  {mark} {key} = {shown}"),
+                timestamp: now,
+            });
+        }
+        self.push_message(TuiMessage::System {
+            text:
+                "The theme, verbosity, caret_display, and diff_layout rows change live; the rest \
+                   are read at startup. /set <key> <value> · /unset <key> · /config shows the \
+                   value in effect."
+                    .to_string(),
+            timestamp: now,
+        });
+        self.scroll_to_bottom();
+    }
+
+    /// Override a config value for this session, or say why it cannot be.
+    ///
+    /// Every accepted write lands in two places at once — the session's
+    /// own config and the config file, via
+    /// [`persist_config`](Self::persist_config) — but only a value the
+    /// running panel re-reads (the theme, the verbosity, the caret
+    /// display, the diff layout) changes the session already running:
+    /// those apply on the spot and are remembered so `/unset` can undo
+    /// them. A value the loop, the HTTP client, or a spawned process
+    /// reads once at startup cannot be moved for this session; the
+    /// write is still taken, and the notice says when it lands — "read
+    /// when dch starts" — rather than implying a liveness nothing
+    /// delivers. `/config` shows the value actually in effect.
+    ///
+    /// The model is the exception worth naming: the live conversation's model
+    /// *can* be moved between turns, but through `/model`, which drives the
+    /// running client — so `/set model X` is sugar for `/model X` rather than a
+    /// silent config edit that would not reach the loop.
+    fn set_config_command(&mut self, key: &str, value: &str) {
+        if key == "model" {
+            self.switch_model_command(value);
+            return;
+        }
+        if !config_fields::is_key(key) {
+            let keys: Vec<&str> = config_fields::KEYS.iter().copied().take(8).collect();
+            self.post_notice(format!(
+                "no such setting: {key} — /config lists them; try one of: {}",
+                keys.join(", ")
+            ));
+            return;
+        }
+        if !self.config_overrides.contains_key(key) {
+            let original = if config_fields::is_absent(&self.config, key) {
+                None
+            } else {
+                Some(config_fields::get(&self.config, key).unwrap_or_default())
+            };
+            self.config_overrides.insert(key.to_string(), original);
+        }
+        if let Err(why) = config_fields::set(&mut self.config, key, value) {
+            self.reconcile_override(key);
+            self.post_notice(format!("could not set {key}: {why}"));
+            return;
+        }
+        if let Some(base) = self.config_base.as_mut() {
+            let _mirror = config_fields::set(base, key, value);
+        }
+        self.apply_live_config(key);
+        let shown = if config_fields::is_secret(key) && !value.is_empty() && value != "unset" {
+            "••••".to_string()
+        } else {
+            value.to_string()
+        };
+        if matches!(config_fields::live(key), Some(config_fields::Live::Display)) {
+            self.post_notice(format!("{key} = {shown} — applied now"));
+        } else {
+            self.post_notice(format!(
+                "{key} = {shown} — saved; read when dch starts, so it applies next session"
+            ));
+        }
+        self.persist_config(key);
+    }
+
+    /// Point live config changes at a directory to persist into.
+    ///
+    /// The host's wiring: the real session hands the user's config
+    /// directory, and every later live change writes the whole
+    /// configuration through
+    /// [`save_to_dir`](dch_config::DchConfig::save_to_dir) — atomically,
+    /// into the file a next load prefers.
+    pub fn set_config_persist_dir(&mut self, dir: Option<std::path::PathBuf>) {
+        self.config_persist_dir = dir;
+    }
+
+    /// Install the user-stated base a model selection layers onto.
+    ///
+    /// The host's wiring for the no-accretion rule: the base is the
+    /// boot-time config before any model selection ran — the file plus
+    /// every CLI override except the boot model — and every later
+    /// selection the panel mirrors (a `/model` verdict, a provider
+    /// switch's verdict) layers onto it, so the second switch of a
+    /// session equals a restart naming it. A host that never calls this
+    /// snapshots the live config at the panel's first selection
+    /// verdict, which is exact only for configs nobody boot-selected.
+    pub fn set_config_base(&mut self, base: DchConfig) {
+        self.config_base = Some(base);
+    }
+
+    /// Write the configuration in effect to the persist directory.
+    ///
+    /// The one throat every live change swallows: on success the
+    /// notice names the class of the change that landed; on failure the
+    /// wording branches on that same class, because the two classes
+    /// fail differently — a display value the panel re-reads has
+    /// already applied and only the save is lost, while a restart-class
+    /// value applied nothing this session and, unsaved, applies nothing
+    /// next start either. The failure never rolls the session's own
+    /// value back.
+    fn persist_config(&mut self, key: &str) {
+        let Some(dir) = self.config_persist_dir.clone() else {
+            return;
+        };
+        if let Err(why) = self.config.save_to_dir(&dir) {
+            match config_fields::live(key) {
+                Some(config_fields::Live::Display) => self.post_notice(format!(
+                    "applied for this session only — the config save failed: {why}"
+                )),
+                _ => self.post_notice(format!(
+                    "not saved — the config save failed: {why}. {key} was never applied this \
+                     session, and without the save it will not apply next start either"
+                )),
+            }
+        }
+    }
+
+    /// Drop the session override on `key`, restoring its original value.
+    ///
+    /// Restores the value the config had before the first `/set` this session,
+    /// not a compiled-in default — so an override is truly undone, in the
+    /// session and in the file alike: the restore writes through, or a
+    /// restart would resurrect the override the user just removed. A key
+    /// that was never overridden says so rather than quietly rewriting it.
+    fn unset_config_command(&mut self, key: &str) {
+        let Some(original) = self.config_overrides.remove(key) else {
+            self.post_notice(format!("{key} has no session override to undo"));
+            return;
+        };
+        let restored = match original.as_deref() {
+            None => config_fields::clear(&mut self.config, key),
+            Some(value) => config_fields::set(&mut self.config, key, value),
+        };
+        if let Err(why) = restored {
+            self.config_overrides.insert(key.to_string(), original);
+            self.post_notice(format!("could not restore {key}: {why}"));
+            return;
+        }
+        if let Some(base) = self.config_base.as_mut() {
+            match original.as_deref() {
+                None => {
+                    let _mirror = config_fields::clear(base, key);
+                }
+                Some(value) => {
+                    let _mirror = config_fields::set(base, key, value);
+                }
+            }
+        }
+        self.apply_live_config(key);
+        self.persist_config(key);
+        let shown = if original.is_none() {
+            "unset — an environment credential takes over again".to_string()
+        } else if config_fields::is_secret(key) {
+            "••••".to_string()
+        } else {
+            original.unwrap_or_default()
+        };
+        self.post_notice(format!("{key} restored to {shown}"));
+    }
+
+    /// Push a just-changed value into whatever panel state reads it live.
+    ///
+    /// Only display-classed values have panel state to refresh — the
+    /// theme, the verbosity, the caret display, and the diff layout —
+    /// and their handlers re-bake the caches or re-render the rendered
+    /// exactly as the interactive controls would; every other key falls
+    /// through untouched, its effect waiting on the next start.
+    fn apply_live_config(&mut self, key: &str) {
+        match key {
+            "theme" => {
+                if let Some(theme) = Theme::by_name(&self.config.display.theme) {
+                    self.theme = theme;
+                    self.land_theme_change();
+                }
+            }
+            "verbosity" => {
+                let verbosity = self.config.display.verbosity;
+                self.set_verbosity(verbosity);
+            }
+            "diff_layout" => {
+                self.invalidate_conversation_renders();
+            }
+            _ => {}
+        }
+    }
+
+    /// Drop a ledger entry whose recorded original equals the current value.
+    ///
+    /// When a `/set` was refused nothing actually changed, so an entry added
+    /// just before the attempt would make `/unset` claim to undo something that
+    /// never happened; if the stored original still matches the value, the key
+    /// is not overridden and the entry is removed.
+    fn reconcile_override(&mut self, key: &str) {
+        let still_same = self
+            .config_overrides
+            .get(key)
+            .is_some_and(|original| match original {
+                Some(original) => {
+                    config_fields::get(&self.config, key).as_deref() == Some(original.as_str())
+                }
+                None => config_fields::is_absent(&self.config, key),
+            });
+        if still_same {
+            self.config_overrides.remove(key);
+        }
+    }
+
+    /// Send the driver a live resume: swap the conversation to a saved
+    /// session.
+    ///
+    /// The display's part is the shape check and the send: a target that
+    /// is not a session id is refused here — the driver's load keys on
+    /// the id alone — and a well-formed one travels to the driver, which
+    /// loads the session, rebuilds the loop on its history, and moves
+    /// the save target onto its file. What the screen shows comes back
+    /// over the session channel, seeded from the loaded transcript.
+    /// The send is refused while a run holds the agent, like every
+    /// conversation-moving command, and the waiting prompts drop before
+    /// it leaves: they belong to the conversation being left, and a
+    /// claim the driver already took must not race the resumed
+    /// session's first turn.
+    fn resume_command(&mut self, target: Option<String>) {
+        let Some(id) = target else {
+            self.post_notice("which session? /resume <id> — the id is printed on exit".to_string());
+            return;
+        };
+        if uuid::Uuid::parse_str(&id).is_err() {
+            self.post_notice(format!(
+                "{id} is not a session id — /resume takes the id dch --resume prints"
+            ));
+            return;
+        }
+        if self.state.agent_running.load(Ordering::SeqCst) {
+            self.post_notice(
+                "commands run between turns — wait for the current run to finish".to_string(),
+            );
+            return;
+        }
+        self.handed = None;
+        self.state
+            .queued
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        self.send_command(SessionCommand::Resume { id });
+        self.post_notice("resuming the session…".to_string());
+    }
+
+    /// Send the driver a manual compaction pass, between turns.
+    ///
+    /// The engine's own context manager folds the committed history the
+    /// same way its automatic passes do; the next turn continues from
+    /// the folded context, and the driver's notice carries the token
+    /// figures the pass measured. Nothing is sent to the model — an
+    /// unknown slash line is never a prompt.
+    fn compact_command(&mut self) {
+        if self.state.agent_running.load(Ordering::SeqCst) {
+            self.post_notice(
+                "commands run between turns — wait for the current run to finish".to_string(),
+            );
+            return;
+        }
+        self.send_command(SessionCommand::Compact);
+    }
+
+    /// Quit the session and leave the terminal, cleanly.
+    ///
+    /// The explicit-intent path through the exit contract: the same sequence
+    /// the confirmed `Ctrl+C` press runs — raise the shared shutdown flag so
+    /// the driver refuses anything still queued, cancel a run in flight if one
+    /// is going, then ask the frame loop to stop. There is no second press to
+    /// wait for: typing the command is itself the confirmation.
+    fn exit_command(&mut self) {
+        self.shutdown_flag
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.cancel_run_in_flight();
+        self.quit.requested = true;
+        self.post_notice("exiting — the session is saved".to_string());
+    }
+
+    /// Stop the run in flight without leaving the session.
+    ///
+    /// Cancels the current run through the same canceller `Ctrl+C` uses, so the
+    /// turn ends as an ordinary cancellation (its hook persists what landed) —
+    /// but unlike `/exit` the shutdown flag stays down, so the session and its
+    /// queue keep going. A plain notice when no run is in flight.
+    fn stop_command(&mut self) {
+        if self.cancel_run_in_flight() {
+            self.post_notice("stopped the current run — the session continues".to_string());
+        } else {
+            self.post_notice("nothing is running to stop".to_string());
+        }
+    }
+
+    /// Open the saved-session picker on a catalog the driver listed.
+    ///
+    /// The `/sessions` answer's display half: an empty catalog is
+    /// itself the answer — nothing saved yet — and is said aloud
+    /// rather than opening an empty sheet; anything else seats the
+    /// cursor on the newest conversation.
+    fn open_session_picker(&mut self, rows: Vec<SessionPick>) {
+        if rows.is_empty() {
+            self.post_notice("no saved sessions yet — a session saves as it runs".to_string());
+            return;
+        }
+        self.session_picker = Some(SessionPicker { rows, cursor: 0 });
+    }
+
+    /// Ask the driver for the saved-session catalog.
+    ///
+    /// The display's `/sessions` half is the ask: the sessions root
+    /// lives on the driver's side of the crate boundary, so the list
+    /// travels as a command and the catalog comes back as an update
+    /// that opens the picker. Refused while a run holds the agent,
+    /// like every conversation-moving command.
+    fn sessions_command(&mut self) {
+        if self.state.agent_running.load(Ordering::SeqCst) {
+            self.post_notice(
+                "commands run between turns — wait for the current run to finish".to_string(),
+            );
+            return;
+        }
+        self.send_command(SessionCommand::ListSessions);
+        self.post_notice("reading the saved sessions…".to_string());
+    }
+
+    /// Report the session's identity, model, and shape.
+    ///
+    /// Reads what the status bar and the save path already know — the session
+    /// id (the handle `dch --resume` would take), the model the loop runs, the
+    /// assistant turns so far, and the working directory — into the transcript.
+    /// Read-only; nothing is sent.
+    fn session_command(&mut self) {
+        let now = chrono::Utc::now();
+        let id = self
+            .session_id
+            .clone()
+            .unwrap_or_else(|| "(no id yet)".to_string());
+        let model = self.config.api.model.clone();
+        let turns = self
+            .conversation
+            .iter()
+            .filter(|message| matches!(message, TuiMessage::Assistant { .. }))
+            .count();
+        let workdir = self
+            .working_dir
+            .clone()
+            .unwrap_or_else(|| "(unknown directory)".to_string());
+        let branch = self.git_branch.clone();
+        self.push_message(TuiMessage::System {
+            text: format!("Session {id}"),
+            timestamp: now,
+        });
+        self.push_message(TuiMessage::System {
+            text: format!("  model {model} · {turns} assistant turn(s)"),
+            timestamp: now,
+        });
+        let where_row = match branch {
+            Some(branch) => format!("  in {workdir} ({branch})"),
+            None => format!("  in {workdir}"),
+        };
+        self.push_message(TuiMessage::System {
+            text: where_row,
+            timestamp: now,
+        });
+        self.push_message(TuiMessage::System {
+            text: "  resume this session later with: dch --resume <id>".to_string(),
+            timestamp: now,
+        });
+        self.scroll_to_bottom();
+    }
+
+    /// List every compiled-in theme, marking the live one.
+    ///
+    /// Reads the same constructor table `/theme` steps and `/theme <name>` sets
+    /// through, so the list is exactly the set that resolves. The running
+    /// palette is starred; the closing line says how to move.
+    fn list_themes_command(&mut self) {
+        let now = chrono::Utc::now();
+        let current = self.theme.name;
+        let keys = Theme::command_names();
+        self.push_message(TuiMessage::System {
+            text: format!("Themes (* marks the live one, {current}):"),
+            timestamp: now,
+        });
+        for key in keys {
+            let live = Theme::by_name(key).is_some_and(|theme| theme.name == current);
+            let mark = if live { "*" } else { " " };
+            self.push_message(TuiMessage::System {
+                text: format!("  {mark} {key}"),
+                timestamp: now,
+            });
+        }
+        self.push_message(TuiMessage::System {
+            text: "Step through them live with /theme; set one with /theme <name>.".to_string(),
+            timestamp: now,
+        });
+        self.scroll_to_bottom();
+    }
+
+    /// Set or report the display verbosity.
+    ///
+    /// With a level, routes through the same value-setting path as
+    /// `/set verbosity` — validating, remembering the original so `/unset` can
+    /// undo it, and applying to the display at once. Without one, it just
+    /// reports the current level so the user knows the word to pass.
+    fn verbosity_command(&mut self, level: Option<String>) {
+        match level {
+            None => self.post_notice(format!(
+                "verbosity is {:?} — /verbosity quiet|normal|verbose",
+                self.verbosity
+            )),
+            Some(level) => self.set_config_command("verbosity", &level),
+        }
+    }
+
+    /// Report the context fill and this session's token totals.
+    ///
+    /// Reads the same snapshot the context bar draws from (how full the model's
+    /// window is) plus the token tallies the loop keeps, so the number on the
+    /// bar and the number here agree. Read-only; nothing is sent.
+    fn cost_command(&mut self) {
+        let now = chrono::Utc::now();
+        let (used, window) = self.context_snapshot();
+        let percent = used
+            .checked_mul(100)
+            .and_then(|scaled| scaled.checked_div(window))
+            .unwrap_or(0)
+            .min(100);
+        let (input, output, total_in, total_out) = {
+            let counts = self
+                .state
+                .tokens
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            (
+                counts.input,
+                counts.output,
+                counts.cumulative_input,
+                counts.cumulative_output,
+            )
+        };
+        self.push_message(TuiMessage::System {
+            text: format!("Context: {used} of {window} tokens used ({percent}% full)."),
+            timestamp: now,
+        });
+        self.push_message(TuiMessage::System {
+            text: format!(
+                "  last turn: {input} in / {output} out · session total: {total_in} in / {total_out} out"
+            ),
+            timestamp: now,
+        });
+        self.scroll_to_bottom();
+    }
+
+    /// Copy the most recent answer to the system clipboard.
+    ///
+    /// Walks the conversation back to the last assistant turn and lifts its
+    /// text blocks (thinking and tool chrome aside), handing them to the same
+    /// clipboard path a selection copy uses. With no answer yet it says so
+    /// rather than copying an empty string.
+    fn copy_command(&mut self) {
+        let answer = self
+            .conversation
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                TuiMessage::Assistant { blocks, .. } => {
+                    let text: String = blocks
+                        .iter()
+                        .filter_map(|block| match block {
+                            ContentBlock::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    (!text.trim().is_empty()).then_some(text)
+                }
+                _ => None,
+            });
+        match answer {
+            Some(text) => self.copy_selection_and_notice(&text),
+            None => self.post_notice("no answer to copy yet".to_string()),
+        }
+    }
+
+    /// Print the running build's version.
+    ///
+    /// The compiled-in `CARGO_PKG_VERSION` beside the binary's name —
+    /// the figure a bug report names, with nothing else riding along.
+    fn version_command(&mut self) {
+        let now = chrono::Utc::now();
+        self.push_message(TuiMessage::System {
+            text: format!("dch {}", env!("CARGO_PKG_VERSION")),
+            timestamp: now,
+        });
+        self.scroll_to_bottom();
+    }
+
+    /// How long a theme switch waits for the event reader to
+    /// acknowledge it is parked before giving up on the one background
+    /// ask — it must exceed the reader's own poll wait by enough
+    /// margin that a reader just leaving an idle poll is still seen.
+    const QUIESCE_ACK: Duration = Duration::from_millis(400);
+
+    /// Swap the palette for preview, without landing it on the terminal.
+    ///
+    /// The browsing half of a theme switch: the palette field swaps and
+    /// the render caches invalidate — the next frame paints in the new
+    /// colors — but no OSC escape is written, no terminal query runs,
+    /// no cursor tint changes. The terminal's own background and cursor
+    /// keep their previous state until the user commits (Enter submits
+    /// the command, or the bare `/theme` settles), at which point
+    /// [`land_theme_change`](Self::land_theme_change) performs the
+    /// full landing. Browsing stays instant this way: stepping through
+    /// ten themes costs ten cache invalidations, not ten terminal
+    /// round-trips.
+    fn preview_theme(&mut self, theme: Theme) {
+        if self.theme_before_browse.is_none() {
+            self.theme_before_browse = Some(std::mem::replace(&mut self.theme, theme));
+        } else {
+            self.theme = theme;
+        }
+        self.pending_theme_osc = Some((self.theme.ui.background, self.theme.ui.primary));
+        self.invalidate_conversation_renders();
+    }
+
+    /// Land a theme change on every surface the session already painted.
+    ///
+    /// The startup sequence, replayed on every switch. The background
+    /// override lands in two tiers: a terminal the session has already
+    /// captured takes a plain write — no query, no reader to park —
+    /// and a terminal the session has never asked is asked exactly
+    /// once, with the event reader parked through the quiesce
+    /// handshake so the reply cannot be stolen into the composer as
+    /// keystrokes. A terminal that was asked and stayed silent is
+    /// never asked again; its palettes defer to the terminal's own
+    /// scheme for the session's life, exactly as they did at startup.
+    /// The cursor rides the canvas: tinted to the theme's accent where
+    /// the override lands, returned to the terminal's own where the
+    /// palette goes paintless. Both writes are deferred to the render
+    /// flush — the same burst that carries the re-styled cells — so a
+    /// committed switch lands in one visible step, never a canvas that
+    /// flips a beat ahead of the text under it. The invalidation
+    /// regenerates every styled line — the settled bake, the merged
+    /// cache the frames serve, and the live lane's streaming rows —
+    /// under the new palette rather than serving the old colors from
+    /// cache.
+    fn land_theme_change(&mut self) {
+        let background = self.theme.ui.background;
+        let landed = if crate::terminal::write_only_warranted(background) {
+            true
+        } else {
+            self.ask_background_once(background)
+        };
+        if !landed {
+            self.theme = self.theme.deferred_to_terminal();
+        }
+        self.pending_theme_osc = Some((self.theme.ui.background, self.theme.ui.primary));
+        self.invalidate_conversation_renders();
+    }
+
+    /// The one mid-session ask the session is allowed: park the event
+    /// reader, query the terminal while its reply cannot be stolen,
+    /// and let the reader go.
+    ///
+    /// Only a never-asked terminal earns the ask — a proven one never
+    /// reaches here (the write-only tier already landed), and a refused
+    /// one has answered for the session's life. Without a reader
+    /// handle (tests, headless constructors) there is nothing to park
+    /// and nothing to ask: the palette defers, the honest answer for a
+    /// session that cannot prove its terminal.
+    fn ask_background_once(&mut self, background: ratatui::style::Color) -> bool {
+        if !crate::terminal::next_ask_warranted(crate::terminal::background_support()) {
+            return false;
+        }
+        let Some(quiesce) = self.input_quiesce.clone() else {
+            return false;
+        };
+        quiesce.request();
+        let outcome = if quiesce.wait_paused(Self::QUIESCE_ACK) {
+            crate::terminal::ask_default_background(background)
+        } else {
+            crate::terminal::QueryOutcome::default()
+        };
+        quiesce.release();
+        if let Some(byte) = outcome.stolen {
+            self.return_stolen_byte(byte);
+        }
+        outcome.installed
+    }
+
+    /// Hand back a keystroke the terminal query consumed.
+    ///
+    /// The pause handshake's guarantee is that asking costs latency,
+    /// never input — within what one byte can say. An ASCII byte that
+    /// is not a control lands in the composer as if typed; a control
+    /// byte the composer has no letter for is said aloud on the notice
+    /// row. A byte above ASCII is the lead of a multi-byte keystroke
+    /// whose tail the query's reader never saw — no character can be
+    /// built from it without inventing one the user never typed, so it
+    /// is named on the notice row rather than mangled into a Latin-1
+    /// look-alike. A bare Esc is the one silent case: Esc is the key
+    /// users press to dismiss or abort out of habit, it names no
+    /// character the composer could take, and announcing its loss
+    /// teaches nothing the half-second query window did not already
+    /// cost — the press is swallowed and the screen says nothing.
+    fn return_stolen_byte(&mut self, byte: u8) {
+        if byte == 0x1b {
+            return;
+        }
+        match char::from_u32(u32::from(byte)).filter(|ch| ch.is_ascii() && !ch.is_control()) {
+            Some(ch) => {
+                self.input.insert_str(&ch.to_string());
+            }
+            None if byte.is_ascii() => {
+                self.post_notice(
+                    "a key pressed during the terminal query was consumed".to_string(),
+                );
+            }
+            None => {
+                self.post_notice(
+                    "a multi-byte key pressed during the terminal query was consumed".to_string(),
+                );
+            }
+        }
+    }
+
+    /// Invalidate every cached rendering of the conversation: the
+    /// baked prefix, the merged cache the frames serve, and the live
+    /// lane's styled rows.
+    ///
+    /// The shapes that make this necessary differ — a verbosity switch
+    /// re-shapes every tool body, a theme switch re-tints every styled
+    /// line — but the cache discipline is one: the generation bump
+    /// pierces the render guard (or the merged cache would keep serving
+    /// the old rendering until an unrelated event rebaked), the rebake
+    /// empties the bake, and the live-stamp reset forces the streaming
+    /// rows to re-render (or they would keep the old rendering until
+    /// their next delta).
+    fn invalidate_conversation_renders(&mut self) {
+        self.conversation_generation = self.conversation_generation.saturating_add(1);
+        self.rebake_whole();
+        self.live_stamp = 0;
+    }
+
+    /// Change the live theme by name, keeping the current one on a miss.
+    ///
+    /// Resolves through [`Theme::by_name`], so the display spelling and the
+    /// lowercase key reach the same palette however they are typed; rendering
+    /// reads the theme field every frame, so a swap shows on the next draw.
+    fn set_theme_command(&mut self, name: &str) {
+        self.theme_before_browse = None;
+        if let Some(theme) = Theme::by_name(name) {
+            self.theme = theme;
+            self.land_theme_change();
+            let key = Theme::key_for_name(name).unwrap_or_default();
+            self.config.display.theme = key.to_string();
+            self.persist_config("theme");
+        } else {
+            self.post_notice(format!("unknown theme '{name}'"));
+        }
+    }
+
+    /// Step to the next theme as a live preview.
+    ///
+    /// A bare `/theme` advances the panel to the next palette in registry
+    /// order; the change shows on the next draw because rendering reads the
+    /// theme field each frame. Repeating the command walks the whole set and
+    /// wraps, so `/theme` acts as its own cycle — whichever theme is showing
+    /// when you stop is the one this session keeps; the next launch opens
+    /// the file's theme again, so a palette meant to stay is set with
+    /// `/theme <name>` or `/set theme`. This is deliberately stateless:
+    /// there is no half-applied preview to cancel with an unrelated
+    /// keystroke, and no committed palette to fall back to.
+    fn begin_theme_preview(&mut self) {
+        self.theme_before_browse = None;
+        let names = Theme::names();
+        let Some(current) = names.iter().position(|name| *name == self.theme.name) else {
+            self.post_notice(format!(
+                "theme '{}' is not in the built-in set to step through; /theme <name> to set one",
+                self.theme.name
+            ));
+            return;
+        };
+        let next = current
+            .checked_add(1)
+            .filter(|next| *next < names.len())
+            .unwrap_or(0);
+        if let Some(name) = names
+            .get(next)
+            .and_then(|candidate| Theme::by_name(candidate))
+        {
+            self.theme = name;
+            self.land_theme_change();
+        }
+    }
+
+    /// Switch the live loop's model, resolved against the configured models.
+    ///
+    /// The lookup mirrors `dch --model`: a case-insensitive match among the
+    /// `[[models]]` entries, sent as that entry's own spelling. A
+    /// same-provider entry renames the live client; an entry on another
+    /// endpoint or protocol travels as a provider rebuild carrying the
+    /// conversation. With no entries configured any name is a plain
+    /// rename, again matching `--model`. The panel's configuration and
+    /// the file change only on the loop's verdict, published back over
+    /// the session channel — a refused switch leaves both exactly as
+    /// they were. A command is a between-turns act, so a run in flight
+    /// is refused.
+    fn switch_model_command(&mut self, name: &str) {
+        if self.state.agent_running.load(Ordering::SeqCst) {
+            self.post_notice(
+                "commands run between turns — wait for the current run to finish".to_string(),
+            );
+            return;
+        }
+        let profile = self
+            .config
+            .models
+            .iter()
+            .find(|profile| profile.model.eq_ignore_ascii_case(name));
+        if let Some(profile) = profile
+            && self.model_is_cross_provider(profile)
+        {
+            let (model, base_url, api_type) = (
+                profile.model.clone(),
+                profile.base_url.clone().unwrap_or_default(),
+                profile
+                    .api_type
+                    .and_then(|kind| {
+                        serde_json::to_value(kind)
+                            .ok()
+                            .and_then(|value| value.as_str().map(str::to_string))
+                    })
+                    .unwrap_or_default(),
+            );
+            self.retire_live_context_window();
+            self.send_command(SessionCommand::SwitchProvider {
+                model,
+                base_url,
+                api_type,
+            });
+            return;
+        }
+        let model = match profile {
+            Some(profile) => profile.model.clone(),
+            None if self.config.models.is_empty() => name.to_string(),
+            None => {
+                let options: Vec<&str> = self
+                    .config
+                    .models
+                    .iter()
+                    .map(|profile| profile.model.as_str())
+                    .take(6)
+                    .collect();
+                self.post_notice(format!(
+                    "no model named '{name}'; /model accepts: {}",
+                    options.join(", ")
+                ));
+                return;
+            }
+        };
+        self.retire_live_context_window();
+        self.send_command(SessionCommand::Model { name: model });
+    }
+
+    /// Whether `profile` would move the conversation to another client.
+    ///
+    /// A same-provider entry leaves both `base_url` and `api_type` unset,
+    /// inheriting the running config; a cross-provider entry replaces one or
+    /// both, which names a different client rather than a model on this loop.
+    fn model_is_cross_provider(&self, profile: &dch_config::ModelProfile) -> bool {
+        profile
+            .base_url
+            .as_deref()
+            .is_some_and(|url| url != self.config.api.base_url)
+            || profile
+                .api_type
+                .as_ref()
+                .is_some_and(|kind| *kind != self.config.api.api_type)
+    }
+
+    /// Empty the session at rest: the display here, the loop in the driver.
+    ///
+    /// The transcript, the waiting queue, and the selection are the app's
+    /// half and clear on the spot; the loop rewind and the fresh save target
+    /// are the driver's, asked for by the command sent beside it. Refused
+    /// while a run is in flight.
+    fn clear_command(&mut self) {
+        if self.state.agent_running.load(Ordering::SeqCst) {
+            self.post_notice(
+                "commands run between turns — wait for the current run to finish".to_string(),
+            );
+            return;
+        }
+        self.conversation.clear();
+        self.conversation_generation = self.conversation_generation.saturating_add(1);
+        self.selection = None;
+        self.handed = None;
+        self.state
+            .queued
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        self.scroll_to_bottom();
+        self.send_command(SessionCommand::Clear);
+        self.post_notice("session cleared — starting a fresh one".to_string());
+    }
+
+    /// Hand a session command to the driver over the submit channel.
+    ///
+    /// The driver is the loop's only holder; the display names the command
+    /// rather than reaching for it. A channel nobody listens to, and one that
+    /// was never installed, each report themselves on the notice row.
+    fn send_command(&mut self, command: SessionCommand) {
+        let sent = match self.submit_tx.as_ref() {
+            Some(tx) => tx.send(Submission::Command { command }).is_ok(),
+            None => false,
+        };
+        if sent {
+            return;
+        }
+        if self.submit_tx.is_some() {
+            self.post_notice("the driver has gone — nothing more can be sent".to_string());
+        } else {
+            self.post_notice("this session has no agent loop to command".to_string());
+        }
+    }
+
+    /// The suggestion popup's keys, taken before the editor sees
+    /// them.
+    ///
+    /// Up and Down belong to the popup while it stands, and stepping
+    /// applies the row it lands on into the composer — the same act a
+    /// Tab press performs — so the highlighted row and the drafted
+    /// line are always the same choice. Enter needs no arm of its own
+    /// here: the row the arrows chose is already the composer's text,
+    /// so Enter falls through to the editor and submits what stands.
+    /// Everything else falls through to the editor untouched.
+    fn completion_key(&mut self, key: KeyEvent) -> Option<bool> {
+        if !self.completion_popup_live() {
+            return None;
+        }
+        match (key.code, key.modifiers) {
+            (KeyCode::Up, KeyModifiers::NONE) => Some(self.step_completion(true)),
+            (KeyCode::Down, KeyModifiers::NONE) => Some(self.step_completion(false)),
+            (KeyCode::Enter, KeyModifiers::NONE | KeyModifiers::ALT | KeyModifiers::CONTROL)
+            | (KeyCode::Char('m'), KeyModifiers::CONTROL)
+                if self.previewed_a_theme() =>
+            {
+                self.apply_highlighted_row();
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether the current state shows a theme the browse previewed.
+    ///
+    /// The popup's Enter arm reads this to decide whether the standing
+    /// highlight represents the user's browsing choice — a theme the
+    /// palette is currently previewing that differs from the session's
+    /// own — so Enter can name it in the composer before submitting.
+    fn previewed_a_theme(&self) -> bool {
+        self.theme_before_browse.is_some()
+            && self
+                .input
+                .text()
+                .strip_prefix("/theme ")
+                .is_some_and(str::is_empty)
+    }
+
+    /// Write the highlighted candidate into the composer, replacing
+    /// whatever follows the prefix.
+    ///
+    /// The popup's Enter act: the user browsed with arrows (or Tab),
+    /// the highlight stands on a row, and Enter names it so the
+    /// submit commits the choice the screen says is selected. The
+    /// prefix is kept — only the value after it is written.
+    fn apply_highlighted_row(&mut self) {
+        let Some(cycle) = self.completion.as_ref() else {
+            return;
+        };
+        let Some(chosen) = cycle.candidates.get(cycle.index) else {
+            return;
+        };
+        let text = format!("{}{}", cycle.prefix, chosen);
+        self.input.set_text(text);
+    }
+
+    /// Whether an active cycle still holds the line — the bare prefix
+    /// it opened on, or a row it applied — so its candidate list and
+    /// highlight stand while the keys walk them.
+    ///
+    /// Both walkways (the arrows and Tab) apply the row they land on
+    /// into the composer, so a cycle holds exactly while the composer
+    /// spells one of its own states: the prefix a browse opened on
+    /// (`/theme ` with nothing chosen) or the prefix plus one of its
+    /// candidates — and, either way, no whitespace past the prefix:
+    /// the caret is still inside the word the cycle completes. A
+    /// space retires the cycle — the command-word cycle that walked
+    /// `/` to `/theme` is one word past its own domain at `/theme `,
+    /// and the keys must re-derive against what the popup suggests
+    /// there, never keep cycling commands. Any other text — an edit,
+    /// a different word — retires the cycle and the popup re-derives
+    /// from the new line.
+    fn cycle_holds_the_line(cycle: &CompletionCycle, line: &str) -> bool {
+        line.strip_prefix(&cycle.prefix)
+            .is_some_and(|rest| !rest.contains(char::is_whitespace))
+    }
+
+    /// Tab on a command line, in either direction: `BackTab` and
+    /// Shift-Tab step backwards through the same list.
+    fn tab_completion(&mut self, key: KeyEvent) -> bool {
+        let reverse = key.code == KeyCode::BackTab || key.modifiers.contains(KeyModifiers::SHIFT);
+        self.complete_command_line(reverse)
+    }
+
+    /// The candidates the suggestion popup would show for the line as
+    /// typed — the popup's own rule, shared with the keys that
+    /// navigate it.
+    ///
+    /// A leading-slash line with more than nothing to offer, minus the
+    /// sole candidate already fully spelled, minus a popup the user
+    /// dismissed with Esc at this exact draft (any edit re-arms it —
+    /// the stamp changes with the text). A cycle the keys are walking
+    /// overrides all of that: its own list stands, so stepping through
+    /// candidates with Tab or the arrows never collapses the popup to
+    /// the word just applied.
+    fn popup_candidates(&self) -> Option<(String, Vec<String>)> {
+        if self.completion_dismissed == Some(self.input.stamp()) {
+            return None;
+        }
+        let line = self.input.text();
+        if !line.starts_with('/') {
+            return None;
+        }
+        if let Some(cycle) = &self.completion
+            && line.starts_with(&cycle.prefix)
+            && cycle
+                .candidates
+                .iter()
+                .any(|candidate| line == cycle.prefix.clone() + candidate)
+        {
+            return Some((cycle.prefix.clone(), cycle.candidates.clone()));
+        }
+        let (prefix, candidates, _) = self.fresh_completion(line);
+        if candidates.is_empty() {
+            return None;
+        }
+        if candidates.len() == 1
+            && candidates
+                .first()
+                .is_some_and(|only| line == prefix.clone() + only)
+        {
+            return None;
+        }
+        Some((prefix, candidates))
+    }
+
+    /// Whether the suggestion popup stands above the composer now.
+    ///
+    /// The renderer's and the key handlers' shared gate: while it
+    /// holds, the popup owns the arrows and Enter owes it a row when a
+    /// step has moved the highlight.
+    fn completion_popup_live(&self) -> bool {
+        self.popup_candidates().is_some()
+    }
+
+    /// Preview the theme the popup's highlight stands on, when the
+    /// popup is walking `/theme` candidates.
+    ///
+    /// The palette follows the highlight in every state the popup can
+    /// be in — stepping and applying alike — so what the screen says
+    /// is selected is what the screen is
+    /// painted in. Other completions (models, keys) pass through:
+    /// nothing about their rows previews.
+    fn preview_highlighted_theme_row(&mut self) {
+        if let Some(cycle) = &self.completion
+            && cycle.prefix.starts_with("/theme ")
+            && let Some(name) = cycle.candidates.get(cycle.index)
+            && let Some(theme) = Theme::by_name(name)
+        {
+            self.preview_theme(theme);
+        }
+    }
+
+    /// The completion cycle's live half: when the popup is walking
+    /// `/theme` candidates — arrows stepping, Tab cycling — each
+    /// candidate the text lands on previews immediately, the same
+    /// whole-palette repaint a bare `/theme` step performs. The
+    /// preview is session-only and stateless: nothing persists until
+    /// Enter submits the command, and the candidate showing when the
+    /// user stops stepping is the one the screen keeps.
+    fn preview_theme_from_completion(&mut self) {
+        let line = self.input.text().to_string();
+        let Some(name) = line.strip_prefix("/theme ") else {
+            return;
+        };
+        if name.is_empty() || name.contains(char::is_whitespace) {
+            return;
+        }
+        if let Some(theme) = Theme::by_name(name) {
+            self.preview_theme(theme);
+        }
+    }
+
+    /// Move the popup's highlight one row, wrapping at the ends, and
+    /// apply the row it lands on.
+    ///
+    /// An arrow is a selection in every popup: the composer takes the
+    /// landed row — the command menu writes the command word, a value
+    /// list writes the value — the same text a Tab writes, so the
+    /// composer, the highlight, and the palette never disagree about
+    /// what is selected; the palette previews the theme the landed
+    /// row names. Tab and Shift+Tab continue from the row the arrows
+    /// landed on; the keys share one position. Typing replaces the
+    /// applied row and restarts the filter from the prefix.
+    fn step_completion(&mut self, up: bool) -> bool {
+        let Some((prefix, candidates)) = self.popup_candidates() else {
+            return false;
+        };
+        let line = self.input.text().to_string();
+        let len = candidates.len();
+        let current = match &self.completion {
+            Some(cycle) if cycle.prefix == prefix && Self::cycle_holds_the_line(cycle, &line) => {
+                cycle.index
+            }
+            _ => 0,
+        };
+        let index = if up {
+            current.checked_sub(1).unwrap_or(len.saturating_sub(1))
+        } else {
+            current
+                .checked_add(1)
+                .and_then(|next| next.checked_rem(len))
+                .unwrap_or(0)
+        };
+        let total = candidates.len();
+        if candidates.get(index).is_none() {
+            return true;
+        }
+        let applied = candidates.get(index).map(|row| format!("{prefix}{row}"));
+        self.completion = Some(CompletionCycle {
+            prefix,
+            candidates,
+            index,
+            window_start: self
+                .completion
+                .as_ref()
+                .map_or(0, |cycle| cycle.window_start)
+                .clamp(index.saturating_sub(POPUP_SHOWN.saturating_sub(1)), index)
+                .min(total.saturating_sub(POPUP_SHOWN)),
+        });
+        if let Some(text) = applied {
+            self.input.set_text(text);
+        }
+        self.preview_highlighted_theme_row();
+        true
+    }
+
+    /// Truncate the composer to the cycle's prefix when the next key
+    /// is a typed character and the composer spells exactly a row the
+    /// popup applied.
+    ///
+    /// An applied row is a selection, and typing replaces a
+    /// selection: an `n` typed over an applied `dracula` filters to
+    /// `/theme n`, never `/theme draculan`. A fragment the user
+    /// built by hand — a partial filter, a bare prefix — is not an
+    /// applied row, and typing appends to it as always. A space is
+    /// not filter text: it appends, moving a command word on to its
+    /// value position.
+    fn drop_applied_row_for_typing(&mut self, key: KeyEvent) {
+        let typed = matches!(key.code, KeyCode::Char(ch) if ch != ' ')
+            && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT);
+        if !typed {
+            return;
+        }
+        let Some(cycle) = &self.completion else {
+            return;
+        };
+        let line = self.input.text();
+        let Some(rest) = line.strip_prefix(&cycle.prefix) else {
+            return;
+        };
+        if !rest.is_empty() && cycle.candidates.iter().any(|row| row == rest) {
+            let prefix = cycle.prefix.clone();
+            self.input.set_text(prefix);
+        }
+    }
+
+    /// Retire a theme browse the composer left by any path.
+    ///
+    /// Esc is the deliberate exit and the commit (`/theme <name>` Enter)
+    /// is the chosen one, but a browse can also end by the composer
+    /// drifting away — a backspace past the space, a cleared draft, a
+    /// new command typed over the old one. In every one of those the
+    /// previewed theme is a leftover the user walked past, not a
+    /// choice; the palette returns to the theme the session was on,
+    /// the same restoration Esc performs, so no path out of the browse
+    /// leaves the screen painted in a theme nobody picked.
+    fn retire_theme_browse_if_gone(&mut self) {
+        let Some(theme) = self.theme_before_browse.clone() else {
+            return;
+        };
+        let browse_stands = self
+            .popup_candidates()
+            .is_some_and(|(prefix, _)| prefix.starts_with("/theme "));
+        if !browse_stands {
+            self.theme_before_browse = None;
+            self.theme = theme;
+            self.pending_theme_osc = Some((self.theme.ui.background, self.theme.ui.primary));
+            self.invalidate_conversation_renders();
+        }
+    }
+
+    /// Esc's idle duties, innermost first: a standing popup goes away,
+    /// then the draft clears.
+    ///
+    /// While a run holds, Esc keeps its cancel-arm meaning instead —
+    /// this runs only on the idle branch. An empty composer returns
+    /// the key unhandled rather than claiming it.
+    fn esc_clears_or_dismisses(&mut self) -> bool {
+        if self.completion_popup_live() {
+            self.completion_dismissed = Some(self.input.stamp());
+            self.completion = None;
+            if let Some(theme) = self.theme_before_browse.take() {
+                self.theme = theme;
+                self.pending_theme_osc = Some((self.theme.ui.background, self.theme.ui.primary));
+                self.invalidate_conversation_renders();
+            }
+            self.input.clear();
+            self.completion_dismissed = None;
+            return true;
+        }
+        if self.input.is_empty() {
+            return false;
+        }
+        self.input.clear();
+        self.completion = None;
+        self.completion_dismissed = None;
+        true
+    }
+
+    /// Complete the command word (or argument) the composer is on,
+    /// stepping forward or back.
+    ///
+    /// On a line starting with `/` the first Tab applies the first
+    /// matching candidate (a first Shift+Tab the last) and the popup
+    /// keeps standing on the whole list; each further Tab steps to the
+    /// next candidate — Shift+Tab or `BackTab` steps back — pre-filling
+    /// the composer as it goes; the popup's arrows apply the landed
+    /// row the same way, from the same shared position.
+    /// The candidate list is frozen at the first press so cycling never
+    /// re-completes a completed word, and an edit between presses
+    /// re-derives it. Any other line leaves Tab to the editor's indent.
+    /// Returns whether the key was used.
+    fn complete_command_line(&mut self, reverse: bool) -> bool {
+        if !self.input.text().starts_with('/') {
+            return false;
+        }
+        let line = self.input.text().to_string();
+        let mut carried_window = self.completion.as_ref().map_or(0, |c| c.window_start);
+        let (mut prefix, mut candidates, mut index) = match self.completion.clone() {
+            Some(cycle) => {
+                if Self::cycle_holds_the_line(&cycle, &line) {
+                    let len = cycle.candidates.len();
+                    let next = if reverse {
+                        cycle.index.checked_sub(1).unwrap_or(len.saturating_sub(1))
+                    } else {
+                        cycle
+                            .index
+                            .checked_add(1)
+                            .and_then(|next| next.checked_rem(len))
+                            .unwrap_or(0)
+                    };
+                    (cycle.prefix, cycle.candidates, next)
+                } else {
+                    self.fresh_completion(&line)
+                }
+            }
+            None => self.fresh_completion(&line),
+        };
+        if reverse && self.completion.is_none() {
+            index = index.max(candidates.len().saturating_sub(1));
+        }
+        if !line.ends_with(' ')
+            && candidates
+                .get(index)
+                .is_some_and(|standing| format!("{prefix}{standing}") == line)
+        {
+            let (arg_prefix, arg_candidates, arg_index) =
+                self.fresh_completion(&format!("{line} "));
+            if !arg_candidates.is_empty() {
+                prefix = arg_prefix;
+                candidates = arg_candidates;
+                index = arg_index;
+                carried_window = 0;
+            }
+        }
+        let Some(chosen) = candidates.get(index).cloned() else {
+            return true;
+        };
+        let total = candidates.len();
+        let window_start = if index < carried_window {
+            index
+        } else if index >= carried_window.saturating_add(POPUP_SHOWN) {
+            index
+                .saturating_sub(POPUP_SHOWN.saturating_sub(1))
+                .min(total.saturating_sub(POPUP_SHOWN))
+        } else {
+            carried_window.min(total.saturating_sub(POPUP_SHOWN))
+        };
+        self.input.set_text(prefix.clone() + &chosen);
+        self.completion = Some(CompletionCycle {
+            prefix,
+            candidates,
+            index,
+            window_start,
+        });
+        self.preview_theme_from_completion();
+        if !self.input.text().starts_with("/theme ") {
+            self.post_notice(chosen);
+        }
+        true
+    }
+
+    /// Derive a completion cycle from scratch against the current line.
+    ///
+    /// Reads the command names plus the configured model and theme values into
+    /// a [`CompletionSources`] and asks the parser for candidates. A prefix
+    /// nothing starts with yields an empty list, which the caller reads as
+    /// "nothing to complete" and leaves the line untouched.
+    fn fresh_completion(&self, line: &str) -> (String, Vec<String>, usize) {
+        let models: Vec<String> = self
+            .config
+            .models
+            .iter()
+            .map(|profile| profile.model.clone())
+            .collect();
+        let themes: Vec<String> = Theme::command_names()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let keys: Vec<String> = commands::config_keys()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let sources = CompletionSources {
+            models: &models,
+            themes: &themes,
+            keys: &keys,
+        };
+        (
+            completion_prefix(line),
+            commands::complete(line, sources),
+            0,
+        )
     }
 
     /// Name the working directory the place row shows.
@@ -2364,6 +4208,26 @@ impl TuiApp {
         }
     }
 
+    /// Fire the run-cancel at the runner the session is running now.
+    ///
+    /// Every cancel the app lands — Esc-Esc, `/stop`, a correction's,
+    /// the exit handshake — goes through the shared signal cell here,
+    /// the one a runner rebuild swaps, so the stop reaches the live
+    /// runner and never the startup runner's dead handle. The boxed
+    /// canceller rides along after it: at startup it names the same
+    /// signal, and a mode or test that installed a counting sink
+    /// still sees the fire.
+    fn fire_cancel(&mut self) {
+        self.state
+            .cancel_signal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cancel();
+        if let Some(cancel) = &self.run_canceller {
+            cancel();
+        }
+    }
+
     /// Cancel the run in flight, when one is.
     ///
     /// The exit path's handshake: an exit confirmed under a running
@@ -2380,9 +4244,7 @@ impl TuiApp {
         {
             return false;
         }
-        if let Some(cancel) = &self.run_canceller {
-            cancel();
-        }
+        self.fire_cancel();
         true
     }
 
@@ -2529,12 +4391,18 @@ impl TuiApp {
 
     /// Whether the composer caret is in its visible blink phase.
     ///
-    /// The terminal's own cursor stands in for the caret, so this is
-    /// the app-side half of the blink contract: keyboard input
-    /// resolidifies it, mouse traffic does not.
+    /// The app paints the caret itself — the terminal's own cursor
+    /// stays hidden for the composer — so this is the app-side half
+    /// of the blink contract: keyboard input resolidifies it, mouse
+    /// traffic does not. A `static` [`dch_config::CaretDisplay`] reads as
+    /// always-on here: the phase stands solid and the beat never
+    /// darkens it.
     #[must_use]
     pub fn caret_visible(&self) -> bool {
-        self.caret_blink.on
+        matches!(
+            self.config.display.caret_display,
+            dch_config::CaretDisplay::Static
+        ) || self.caret_blink.on
     }
 
     /// Whether the view follows the newest content.
@@ -2972,6 +4840,148 @@ impl TuiApp {
             .min(self.pending_questions.len().saturating_sub(1));
     }
 
+    /// The keys the saved-session picker takes, when it stands.
+    ///
+    /// The picker owns the keyboard while it stands: the arrows walk
+    /// the rows (wrapping at the ends), Enter resumes the highlighted
+    /// session through the very lane `/resume` takes — so every guard
+    /// there applies — and Esc closes. The sheet-surviving chords pass
+    /// through untouched; everything else is swallowed, because a
+    /// keystroke behind a picker's back would build a draft the picker
+    /// then hides.
+    fn sessions_key(&mut self, key: KeyEvent) -> Option<bool> {
+        if self.session_picker.is_none() || key_survives_the_sheet(key) {
+            return None;
+        }
+        let handled = match (key.code, key.modifiers) {
+            (KeyCode::Up, KeyModifiers::NONE) => {
+                self.step_session_picker(true);
+                true
+            }
+            (KeyCode::Down, KeyModifiers::NONE) => {
+                self.step_session_picker(false);
+                true
+            }
+            (KeyCode::Enter, KeyModifiers::NONE) => {
+                let chosen = self
+                    .session_picker
+                    .as_ref()
+                    .and_then(|picker| picker.rows.get(picker.cursor).cloned());
+                match chosen {
+                    Some(pick) => {
+                        self.session_picker = None;
+                        self.resume_command(Some(pick.id));
+                        true
+                    }
+                    None => true,
+                }
+            }
+            (KeyCode::Esc, KeyModifiers::NONE) => {
+                self.session_picker = None;
+                true
+            }
+            _ => true,
+        };
+        Some(handled)
+    }
+
+    /// Step the picker's cursor one row, wrapping at the ends.
+    ///
+    /// The same walk the completion popup's arrows take: a list short
+    /// enough to show whole never moves, and the ends wrap so both
+    /// directions always have somewhere to go.
+    /// The keys the configured-models picker takes, when it stands.
+    ///
+    /// The same contract as the session picker: the arrows walk the
+    /// rows (wrapping), Enter switches to the highlighted model
+    /// through the very `/model` lane, Esc closes. Everything else
+    /// is swallowed.
+    fn models_key(&mut self, key: KeyEvent) -> Option<bool> {
+        if self.model_picker.is_none() || key_survives_the_sheet(key) {
+            return None;
+        }
+        let handled = match (key.code, key.modifiers) {
+            (KeyCode::Up, KeyModifiers::NONE) => {
+                self.step_model_picker(true);
+                true
+            }
+            (KeyCode::Down, KeyModifiers::NONE) => {
+                self.step_model_picker(false);
+                true
+            }
+            (KeyCode::Enter, KeyModifiers::NONE) => {
+                let chosen = self
+                    .model_picker
+                    .as_ref()
+                    .and_then(|picker| picker.rows.get(picker.cursor).cloned());
+                match chosen {
+                    Some(model) => {
+                        self.model_picker = None;
+                        self.switch_model_command(&model);
+                        true
+                    }
+                    None => true,
+                }
+            }
+            (KeyCode::Esc, KeyModifiers::NONE) => {
+                self.model_picker = None;
+                true
+            }
+            _ => true,
+        };
+        Some(handled)
+    }
+
+    /// Step the model picker's cursor one row, wrapping at the ends.
+    ///
+    /// The picker's arrow semantics: Up and Down move a single row and
+    /// wrap past either end onto the opposite row, so both directions
+    /// reach every entry without a second key. An empty sheet (no
+    /// declared models) never reaches here — the picker does not open —
+    /// and the guard keeps the step a no-op rather than a panic if one
+    /// ever stands.
+    fn step_model_picker(&mut self, up: bool) {
+        let Some(picker) = self.model_picker.as_mut() else {
+            return;
+        };
+        if picker.rows.is_empty() {
+            return;
+        }
+        let last = picker.rows.len().saturating_sub(1);
+        picker.cursor = if up {
+            if picker.cursor == 0 {
+                last
+            } else {
+                picker.cursor.saturating_sub(1)
+            }
+        } else if picker.cursor >= last {
+            0
+        } else {
+            picker.cursor.saturating_add(1)
+        };
+    }
+
+    fn step_session_picker(&mut self, up: bool) {
+        let Some(picker) = self.session_picker.as_mut() else {
+            return;
+        };
+        if picker.rows.is_empty() {
+            return;
+        }
+        let last = picker.rows.len().saturating_sub(1);
+        picker.cursor = if up {
+            if picker.cursor == 0 {
+                last
+            } else {
+                picker.cursor.saturating_sub(1)
+            }
+        } else if picker.cursor >= last {
+            0
+        } else {
+            picker.cursor.saturating_add(1)
+        };
+    }
+
     /// Apply a key press to the question on screen.
     ///
     /// `Some(redraw)` when a question is pending — the overlay owns the
@@ -3152,21 +5162,8 @@ impl TuiApp {
                     entry.ui.cursor = (entry.ui.cursor.saturating_add(1)).min(free_row);
                 }
             }
-            // The walk moves the view and leaves the queue's arrival
-            // order alone — that order is what the sheet counts, so
-            // walking to the third question of four can say `3 of 4`, and
-            // say it again after a walk away and back. Nothing resets on
-            // the way: each entry carries its own cursor, marks, and
-            // draft, so the question walked to still holds what was left
-            // there and the one walked away from keeps it for the return.
             KeyCode::Right if bare => self.step_question_view(true),
             KeyCode::Left if bare => self.step_question_view(false),
-            // Space's whole job is the dot, and the compose row is a row
-            // like the others: marking it is the user saying the typed
-            // reply is the answer. Opening the draft used to be Space's
-            // trick on that one row, which made a single key mean two
-            // things by where the cursor happened to stand; Enter is what
-            // opens the draft, as it is everywhere it means onward.
             KeyCode::Char(' ') if bare => {
                 if let Some(entry) = self.shown_question_mut() {
                     let ui = &mut entry.ui;
@@ -3178,9 +5175,6 @@ impl TuiApp {
                             ui.toggled.insert(cursor);
                         }
                     } else {
-                        // One mark, moved: the row Space stands on takes
-                        // it and every other row loses it, and Space again
-                        // on the marked row clears it.
                         ui.toggled.clear();
                         if !marked {
                             ui.toggled.insert(cursor);
@@ -3189,12 +5183,6 @@ impl TuiApp {
                 }
             }
             KeyCode::Enter if bare => {
-                // An empty compose row has no reply to send, so Enter goes
-                // and writes one — but only where that empty row is the
-                // whole answer the user asked for. Beside marks on real
-                // options, the marks are the answer already chosen, and a
-                // row with nothing to say does not veto them: it simply
-                // adds nothing, on the cursor's row as anywhere.
                 if self.needs_the_draft(cursor == free_row) {
                     if let Some(entry) = self.shown_question_mut() {
                         entry.ui.open_composing();
@@ -3207,12 +5195,6 @@ impl TuiApp {
             KeyCode::Esc if bare => {
                 self.resolve_pending_question(Vec::new());
             }
-            // A letter typed at the rows is a reply being started, and it
-            // belongs to the draft rather than vanishing on the way to
-            // nowhere. Space marks and Enter opens, but the fastest road
-            // to a typed answer is to start typing it, and a keystroke
-            // the overlay drops in silence is the one thing a keyboard
-            // should never do.
             KeyCode::Char(ch) if bare || key.modifiers == KeyModifiers::SHIFT => {
                 if let Some(entry) = self.shown_question_mut() {
                     entry.ui.open_composing();
@@ -3253,9 +5235,7 @@ impl TuiApp {
     /// not linger until the next real event.
     pub fn set_verbosity(&mut self, verbosity: Verbosity) {
         self.verbosity = verbosity;
-        self.conversation_generation = self.conversation_generation.saturating_add(1);
-        self.rebake_whole();
-        self.live_stamp = 0;
+        self.invalidate_conversation_renders();
     }
 
     /// Advance to the next verbosity mode, wrapping around.
@@ -3271,6 +5251,27 @@ impl TuiApp {
             Verbosity::Verbose => Verbosity::Quiet,
         };
         self.set_verbosity(next);
+    }
+
+    /// Persist the standing transcript right now, out of band.
+    ///
+    /// The turn-end hook is the save path of record, but a model
+    /// switch changes the envelope's model field the moment it lands
+    /// — the saver's relabel is already in — and the file should say
+    /// so immediately, not at whatever turn ends next. This fires the
+    /// same hook a turn end does, with the conversation as it stands
+    /// and the engine's last committed history, so session.json is
+    /// rewritten under the new label at once.
+    fn publish_transcript_now(&mut self) {
+        let machine = self
+            .state
+            .machine_history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(hook) = &self.turn_end_hook {
+            hook(&self.conversation, machine.as_ref());
+        }
     }
 
     /// Install the callback fired when a turn ends.
@@ -3308,6 +5309,7 @@ impl TuiApp {
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.quit = QuitState::default();
         let mut events = TerminalEvents::spawn();
+        self.input_quiesce = Some(events.quiesce_handle());
         let mut tick = tokio::time::interval(TICK_INTERVAL);
         let mut animation = tokio::time::interval(ANIMATION_INTERVAL);
         animation.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -3317,6 +5319,8 @@ impl TuiApp {
         let mut permission_closed = false;
         let mut question_rx = self.question_rx.take();
         let mut question_closed = false;
+        let mut session_rx = self.session_rx.take();
+        let mut session_closed = false;
 
         terminal.draw(|frame| self.render(frame))?;
 
@@ -3357,14 +5361,6 @@ impl TuiApp {
                     }
                 }
                 _instant = tick.tick() => self.tick_wake(Instant::now()),
-                // The animation heartbeat: unconditional. The tick
-                // fires every 20ms whether or not anything else is
-                // happening — streaming, typing, a stopwatch ticking —
-                // and each beat draws whenever something animates.
-                // The gate decides only whether THIS beat draws, so
-                // an idle-but-running session re-renders the spinner
-                // at the same cadence a running tool's stopwatch
-                // enjoys, never waiting on another lane's traffic.
                 _anim = animation.tick() => {
                     let animating = self.pulse_animation_living();
                     if animating {
@@ -3390,6 +5386,20 @@ impl TuiApp {
                         false
                     }
                 }
+                maybe_update = async {
+                    match session_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(update) = maybe_update {
+                        self.apply_session_update(update);
+                        true
+                    } else {
+                        session_closed = true;
+                        false
+                    }
+                }
             };
             if permission_closed {
                 permission_rx = None;
@@ -3398,6 +5408,10 @@ impl TuiApp {
             if question_closed {
                 question_rx = None;
                 question_closed = false;
+            }
+            if session_closed {
+                session_rx = None;
+                session_closed = false;
             }
             if self.retire_withdrawn_questions() {
                 needs_redraw = true;
@@ -3409,9 +5423,16 @@ impl TuiApp {
                 needs_redraw = true;
             }
             if needs_redraw {
+                let theme_burst = self.pending_theme_osc.take();
+                if theme_burst.is_some() {
+                    crate::terminal::begin_synchronized_output();
+                }
                 let started = Instant::now();
                 terminal.draw(|frame| self.render(frame))?;
                 let took = started.elapsed();
+                if let Some((background, primary)) = theme_burst {
+                    crate::terminal::finish_theme_burst(background, primary);
+                }
                 if let Some(lane) = self.frame_stats.note_draw(took, Instant::now()) {
                     tracing::debug!(
                         target: "dch_tui::frames",
@@ -3628,6 +5649,49 @@ impl TuiApp {
         }
     }
 
+    /// Ask every overlay that can own the keyboard, innermost first.
+    ///
+    /// The chain of sheets in priority order: a pending permission
+    /// ask answers before a question sheet, which answers before the
+    /// session picker, which answers before the waiting queue — only
+    /// one of them can stand at a time in practice, and the first
+    /// `Some` is the key's verdict. `None` means no sheet claims the
+    /// press and the composer's own handling takes over.
+    fn sheet_key(&mut self, key: KeyEvent) -> Option<bool> {
+        self.permission_key(key)
+            .or_else(|| self.question_key(key))
+            .or_else(|| self.sessions_key(key))
+            .or_else(|| self.models_key(key))
+            .or_else(|| self.queue_key(key))
+    }
+
+    /// One bare Esc: innermost first — popup, draft, then the cancel.
+    ///
+    /// A standing suggestion dismisses, a draft clears, and only a
+    /// bare composer lets the cancel ladder engage — so Esc,Esc
+    /// cancels the run only when there is nothing else to consume the
+    /// press. The cancel fires through both the live runner's shared
+    /// signal (the one the driver keeps current across every rebuild)
+    /// and the host's installed closure. At rest the same innermost
+    /// order applies with no cancel to reach.
+    fn esc_under_run_or_idle(&mut self) -> bool {
+        if self.esc_clears_or_dismisses() {
+            return true;
+        }
+        if !self.state.agent_running.load(Ordering::SeqCst) {
+            return false;
+        }
+        if self.cancel_arm {
+            self.cancel_arm = false;
+            self.fire_cancel();
+            self.post_notice("Agent cancelled".to_string());
+            return true;
+        }
+        self.cancel_arm = true;
+        self.post_notice("press Esc again to cancel the run".to_string());
+        true
+    }
+
     /// Apply one key press: the quit chord, copy chord, and
     /// page-scroll keys stay app-level, everything else belongs to the
     /// input editor — unless a permission ask is pending, in which
@@ -3663,6 +5727,12 @@ impl TuiApp {
     /// an arrow, with a transcript selection up, moves the
     /// selection's head instead: the editor's select-by-keyboard.
     fn handle_key(&mut self, key: KeyEvent) -> bool {
+        let handled = self.handle_key_inner(key);
+        self.retire_theme_browse_if_gone();
+        handled
+    }
+
+    fn handle_key_inner(&mut self, key: KeyEvent) -> bool {
         if !matches!(
             (key.code, key.modifiers),
             (KeyCode::Char('c'), KeyModifiers::CONTROL)
@@ -3675,48 +5745,22 @@ impl TuiApp {
         ) {
             self.cancel_arm = false;
         }
-        if let Some(resolved) = self.permission_key(key) {
-            return resolved;
+        if let Some(handled) = self.sheet_key(key) {
+            return handled;
         }
-        if let Some(resolved) = self.question_key(key) {
-            return resolved;
-        }
-        if let Some(handled) = self.queue_key(key) {
+        if let Some(handled) = self.completion_key(key) {
             return handled;
         }
         match (key.code, key.modifiers) {
-            (KeyCode::Esc, KeyModifiers::NONE) => {
-                if self
-                    .state
-                    .agent_running
-                    .load(std::sync::atomic::Ordering::SeqCst)
-                {
-                    if self.cancel_arm {
-                        self.cancel_arm = false;
-                        if let Some(cancel) = &self.run_canceller {
-                            cancel();
-                        }
-                        self.post_notice("Agent cancelled".to_string());
-                    } else {
-                        self.cancel_arm = true;
-                        self.post_notice("press Esc again to cancel the run".to_string());
-                    }
-                    true
-                } else {
-                    false
-                }
-            }
+            (KeyCode::Esc, KeyModifiers::NONE) => self.esc_under_run_or_idle(),
             (KeyCode::Char('s'), KeyModifiers::CONTROL) => self.steer_now(),
             (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
-                // The cycle spends a press on opening only when the
-                // cap actually cut something: a list the capped
-                // posture already shows whole has nothing to open, and
-                // that press folds the section instead.
                 self.plan_view = match self.plan_view {
                     PlanView::Capped if self.plan_cut.get() => PlanView::Full,
                     PlanView::Capped | PlanView::Full => PlanView::Hidden,
                     PlanView::Hidden => PlanView::Capped,
                 };
+                self.todo_scroll = 0;
                 true
             }
             (KeyCode::Char('c'), mods) if mods == KeyModifiers::CONTROL | KeyModifiers::SHIFT => {
@@ -3726,17 +5770,6 @@ impl TuiApp {
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                 if !self.input.is_empty() {
                     self.input.clear();
-                    if self
-                        .state
-                        .agent_running
-                        .load(std::sync::atomic::Ordering::SeqCst)
-                    {
-                        self.post_notice(
-                            "draft cleared — press ctrl+c twice to cancel and exit".to_string(),
-                        );
-                    } else {
-                        self.post_notice("draft cleared — press ctrl+c twice to quit".to_string());
-                    }
                 } else if self
                     .state
                     .agent_running
@@ -3803,7 +5836,13 @@ impl TuiApp {
                 self.nudge_selection(key.code);
                 true
             }
+            (KeyCode::Tab | KeyCode::BackTab, KeyModifiers::NONE | KeyModifiers::SHIFT)
+                if self.input.text().starts_with('/') =>
+            {
+                self.tab_completion(key)
+            }
             _ => {
+                self.drop_applied_row_for_typing(key);
                 let action = self.input.handle_key(key, self.input_wrap_width);
                 self.apply_input_action(action)
             }
@@ -3844,6 +5883,14 @@ impl TuiApp {
             };
         }
         match mouse.kind {
+            MouseEventKind::ScrollUp if self.wheel_over_todo_section(mouse.row) => {
+                self.scroll_todo_section(true);
+                true
+            }
+            MouseEventKind::ScrollDown if self.wheel_over_todo_section(mouse.row) => {
+                self.scroll_todo_section(false);
+                true
+            }
             MouseEventKind::ScrollUp => self.scroll_the_wheel(true),
             MouseEventKind::ScrollDown => self.scroll_the_wheel(false),
             MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
@@ -4279,22 +6326,16 @@ impl TuiApp {
         let dim = self.theme.ui.dim;
         let expanded = !folded && matches!(self.thinking_mode, ThinkingMode::Follow);
         let marker = if expanded { "▾" } else { "▸" };
-        // The title rides the running register — the same foreground a
-        // running tool's title carries — while the stream is live; the
-        // completed block grey-outs in the dim tone, and so does every
-        // auxiliary span here (marker, elapsed, body). Only the word
-        // itself stands at full voice while there is thinking to read.
         let row = Line::from(vec![
             Span::styled(format!("{marker} "), Style::default().fg(dim)),
             Span::styled(
                 "Thinking",
-                Style::default().add_modifier(ratatui::style::Modifier::ITALIC),
+                Style::default()
+                    .fg(self.theme.ui.foreground)
+                    .add_modifier(ratatui::style::Modifier::ITALIC),
             ),
             Span::styled(
                 format!(" · {}", format_duration(elapsed)),
-                // The elapsed reads light while the stream runs — the
-                // theme's reply color — and grey-outs with the whole
-                // block once it settles.
                 Style::default().fg(self.theme.ui.assistant_message_fg),
             ),
         ]);
@@ -4548,13 +6589,15 @@ impl TuiApp {
     /// transcript row; and they are the user's, so a driver's exit is not
     /// the thing that throws them away.
     fn submit_text(&mut self, text: String) {
+        match commands::parse(&text) {
+            Parsed::NotACommand => {}
+            parsed => {
+                self.handle_command(parsed);
+                self.scroll_to_bottom();
+                return;
+            }
+        }
         if self.submit_tx.is_some() {
-            // The handoff window: an empty queue in a session at rest
-            // — no claim standing, no run going — means this prompt is
-            // the driver's very next claim, one channel hop away, and
-            // the row hides until the claim takes it, so no frame draws
-            // it as waiting. Anything else (a backlog, a claim, a run
-            // in flight) is genuinely waiting and shows.
             let was_empty = self.queued_len() == 0;
             let idle = self.state.live_claim.load(Ordering::SeqCst) == u64::MAX
                 && !self.state.agent_running.load(Ordering::SeqCst);
@@ -4625,26 +6668,7 @@ impl TuiApp {
         if taken {
             if self.state.live_claim.load(Ordering::SeqCst) == id {
                 self.state.correction_cancel.store(id, Ordering::SeqCst);
-                if let Some(cancel) = &self.run_canceller {
-                    cancel();
-                }
-                // The check-then-cancel above is not atomic, and the
-                // window it leaves is narrow but real: between the
-                // read that matched and the cancel landing, the named
-                // turn can settle and the driver can claim the next
-                // prompt — the cancel would then stop a run the
-                // correction never named. Re-reading the mirror after
-                // the cancel closes what it can: a mirror that has
-                // moved on names a turn the flag must not ride, so
-                // the flag comes down and the cancellation it caused
-                // is the run's own to report. What remains beyond
-                // this guard — a claim landing between the second
-                // read and the driver's pre-run clear — cannot spend
-                // a prompt silently: the driver's settle goes quiet
-                // only for a run whose own claim the flag carries,
-                // so the run resolves cancelled with its error row
-                // and the buffered correction runs as its own turn
-                // behind it.
+                self.fire_cancel();
                 if self.state.live_claim.load(Ordering::SeqCst) != id {
                     self.state
                         .correction_cancel
@@ -4849,10 +6873,6 @@ impl TuiApp {
             if self.queued_display_len() == 0 {
                 return None;
             }
-            // The walk has nothing to walk over a folded section, and
-            // unfolding is `Ctrl+Q`'s alone: the chord takes the press
-            // and does nothing, rather than reaching past a section
-            // the user put away.
             if self.queue_posture == QueuePosture::Folded {
                 return Some(true);
             }
@@ -5134,11 +7154,18 @@ impl TuiApp {
     /// out of the queue was already recorded when it was submitted, and
     /// saying it twice would list it twice.
     fn deliver_guidance(&mut self, text: String) {
-        if self
-            .guidance
+        let steered = self
+            .state
+            .steering
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .is_some_and(|guidance| guidance.steer(text.clone()))
-        {
+            || self
+                .guidance
+                .as_ref()
+                .is_some_and(|guidance| guidance.steer(text.clone()));
+        if steered {
             self.state.push_steered(text);
             self.scroll_to_bottom();
             return;
@@ -5206,17 +7233,21 @@ impl TuiApp {
     /// them for it still can, seeing the notice, and the alternative
     /// would put words into a conversation their author never aimed at.
     fn return_guidance(&mut self) {
-        let Some(guidance) = self.guidance.as_ref() else {
-            return;
-        };
-        let taken = guidance.take_returned();
+        let mut taken = self
+            .state
+            .steering
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map_or_else(Vec::new, |guidance| guidance.take_returned());
+        if taken.is_empty()
+            && let Some(guidance) = self.guidance.as_ref()
+        {
+            taken = guidance.take_returned();
+        }
         if taken.is_empty() {
             return;
         }
-        // The pin held the same words the seam returns: those rows
-        // leave the edge with their texts, the waiting section their
-        // one home now. Anything the seam did not return stays pinned
-        // — a boundary may still owe it a row.
         self.state
             .pending_steers
             .lock()
@@ -5470,7 +7501,7 @@ impl TuiApp {
         } else {
             self.drag_autoscroll()
         };
-        let blinked = self.caret_blink.tick();
+        let blinked = self.caret_blink.refresh(now);
         let notice_lapsed = self
             .transient_notice
             .as_ref()
@@ -5576,7 +7607,9 @@ impl TuiApp {
         }
         constraints.push(Constraint::Min(0));
         if todo_shown {
-            constraints.push(Constraint::Length(self.todo_section_height(area.width)));
+            constraints.push(Constraint::Length(
+                self.todo_section_height(area.width, area.height),
+            ));
         }
         if queue_shown {
             constraints.push(Constraint::Length(self.queue_section_height(area.width)));
@@ -5728,6 +7761,9 @@ impl TuiApp {
         let input_area = pane(&chunks, composer_at, fallback);
         self.input_wrap_width = wrap_width;
         self.render_input(frame, input_area, &rows, caret);
+        self.render_completion(frame, input_area);
+        self.render_session_picker(frame, input_area);
+        self.render_model_picker(frame, input_area);
         self.render_status_bar(
             frame,
             pane(&chunks, composer_at.saturating_add(1), fallback),
@@ -5774,12 +7810,13 @@ impl TuiApp {
     /// for. The folded posture is one row: the marker
     /// [`todo_view::folded_hint`] leaves, cheaper than the list and
     /// louder than nothing.
-    fn todo_section_height(&self, width: u16) -> u16 {
+    fn todo_section_height(&self, width: u16, screen: u16) -> u16 {
         if self.plan_view == PlanView::Hidden {
             // The air above the badge row.
             return 2;
         }
         let colors = todo_view::TodoColors {
+            plain: self.theme.ui.foreground,
             dim: self.theme.ui.dim,
             accent: self.theme.ui.primary,
             moved: self.theme.ui.secondary,
@@ -5790,9 +7827,10 @@ impl TuiApp {
             .saturating_sub(TODO_SECTION_INSET.saturating_mul(2))
             .max(1);
         let body_cap = match self.plan_view {
-            PlanView::Full => usize::MAX,
+            PlanView::Full => usize::from(screen.saturating_sub(12)).max(TODO_SECTION_BODY_ROWS),
             _ => TODO_SECTION_BODY_ROWS,
         };
+        self.full_body_cap.set(body_cap);
         let chord_hint = self.plan_chord_hint();
         let lines = todo_view::section_lines(
             &self.latest_todos,
@@ -5800,6 +7838,7 @@ impl TuiApp {
             &colors,
             inner,
             body_cap,
+            self.clamped_todo_skip(),
             chord_hint,
         );
         let cut = body_cap != usize::MAX
@@ -5807,6 +7846,55 @@ impl TuiApp {
                 if line.spans.first().is_some_and(|span| span.content.starts_with('\u{2026}')));
         self.plan_cut.set(cut);
         u16::try_from(lines.len()).unwrap_or(0)
+    }
+
+    /// The section's window offset, never past the last entry.
+    ///
+    /// The wheel moves one entry at a time and the window always
+    /// keeps at least one entry in it, so the offset clamps against
+    /// the plan's own length — a plan that shrank under a standing
+    /// scroll heals on the next frame without a reset of its own.
+    fn clamped_todo_skip(&self) -> usize {
+        if self.latest_todos.is_empty() {
+            0
+        } else {
+            self.todo_scroll
+                .min(self.latest_todos.len().saturating_sub(1))
+        }
+    }
+
+    /// Whether the wheel's row stands inside the painted section.
+    ///
+    /// The rect the last frame recorded is the geometry the pointer
+    /// event was reported against; a hidden or empty section never
+    /// claims the wheel.
+    fn wheel_over_todo_section(&self, row: u16) -> bool {
+        self.todo_section_rect.height > 0
+            && self.plan_view != PlanView::Hidden
+            && !self.latest_todos.is_empty()
+            && row >= self.todo_section_rect.y
+            && row
+                < self
+                    .todo_section_rect
+                    .y
+                    .saturating_add(self.todo_section_rect.height)
+    }
+
+    /// Step the section's window one entry under the wheel.
+    ///
+    /// Down moves deeper into the plan, up back toward its head; the
+    /// clamp keeps at least one entry on screen either way, so the
+    /// window never scrolls past the plan's end.
+    fn scroll_todo_section(&mut self, up: bool) {
+        if self.latest_todos.is_empty() {
+            return;
+        }
+        let deepest = self.latest_todos.len().saturating_sub(1);
+        self.todo_scroll = if up {
+            self.todo_scroll.saturating_sub(1)
+        } else {
+            self.todo_scroll.saturating_add(1).min(deepest)
+        };
     }
 
     /// Render the pinned plan section: the run's current tasks,
@@ -5820,11 +7908,13 @@ impl TuiApp {
     /// tasks are the agent's bookkeeping, the model owns the list, and
     /// the section asks for no keys at all — it is furniture, not a
     /// sheet.
-    fn render_todo_section(&self, frame: &mut Frame, area: Rect) {
+    fn render_todo_section(&mut self, frame: &mut Frame, area: Rect) {
         if area.height == 0 || area.width == 0 {
             return;
         }
+        self.todo_section_rect = area;
         let colors = todo_view::TodoColors {
+            plain: self.theme.ui.foreground,
             dim: self.theme.ui.dim,
             accent: self.theme.ui.primary,
             moved: self.theme.ui.secondary,
@@ -5832,6 +7922,7 @@ impl TuiApp {
             badge_letters: self.theme.ui.background,
         };
         if self.plan_view == PlanView::Hidden {
+            self.todo_section_rect = Rect::default();
             frame.render_widget(
                 Paragraph::new(todo_view::folded_lines(&self.latest_todos, &colors)),
                 Rect {
@@ -5849,7 +7940,7 @@ impl TuiApp {
             return;
         }
         let body_cap = match self.plan_view {
-            PlanView::Full => usize::MAX,
+            PlanView::Full => self.full_body_cap.get(),
             _ => TODO_SECTION_BODY_ROWS,
         };
         let chord_hint = self.plan_chord_hint();
@@ -5861,6 +7952,7 @@ impl TuiApp {
                 .saturating_sub(TODO_SECTION_INSET.saturating_mul(2))
                 .max(1),
             body_cap,
+            self.clamped_todo_skip(),
             chord_hint,
         );
         frame.render_widget(
@@ -7292,6 +9384,7 @@ impl TuiApp {
                         .or_else(|| crate::todo_view::parse_submission(&detail.input_json))
                 {
                     let colors = crate::todo_view::TodoColors {
+                        plain: self.theme.ui.foreground,
                         dim: self.theme.ui.dim,
                         accent: self.theme.ui.primary,
                         moved: self.theme.ui.secondary,
@@ -7882,7 +9975,260 @@ impl TuiApp {
         {
             return None;
         }
-        Some("ctrl+s sends this to the running turn".to_string())
+        Some("ctrl+s to guide".to_string())
+    }
+
+    /// Render the saved-session picker above the composer.
+    ///
+    /// The same floating shape the completion popup takes: rows above
+    /// the composer, the cursor row highlighted — inverting under a
+    /// palette that defers its colors, exactly the popup's rule — a
+    /// dim header naming the keys, and a window that follows the
+    /// cursor so a long catalog always keeps the chosen row on
+    /// screen. Each row spells the short id, the model, when the
+    /// session last saved, and its prompt count.
+    fn render_session_picker(&mut self, frame: &mut Frame, input_area: Rect) {
+        const SHOWN: usize = 8;
+        let Some(picker) = self.session_picker.as_ref() else {
+            return;
+        };
+        if picker.rows.is_empty() {
+            return;
+        }
+        let surface = self.theme.ui.surface;
+        let (start, cursor_row) = popup_window(picker.cursor, picker.rows.len(), SHOWN);
+        let lines: Vec<Line> = std::iter::once(Line::styled(
+            " sessions — ↑↓ walk · ⏎ resume · esc close ",
+            Style::default().fg(self.theme.ui.dim),
+        ))
+        .chain(
+            picker
+                .rows
+                .iter()
+                .skip(start)
+                .take(SHOWN)
+                .enumerate()
+                .map(|(index, pick)| {
+                    let highlighted = index == cursor_row;
+                    let style = if highlighted {
+                        if self.theme.ui.primary == Color::Reset || surface == Color::Reset {
+                            Style::default().add_modifier(ratatui::style::Modifier::REVERSED)
+                        } else {
+                            Style::default().fg(surface).bg(self.theme.ui.primary)
+                        }
+                    } else {
+                        Style::default().fg(self.theme.ui.input_text).bg(surface)
+                    };
+                    let short = &pick.id[..pick.id.len().min(8)];
+                    let dir = pick
+                        .workdir
+                        .as_deref()
+                        .and_then(|dir| {
+                            std::path::Path::new(dir)
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                        })
+                        .unwrap_or("—");
+                    Line::from(Span::styled(
+                        format!(
+                            " {short}  {:<20} {:<12} {}  {}p ",
+                            pick.model,
+                            dir,
+                            pick.saved_at.format("%b %d %H:%M"),
+                            pick.prompts
+                        ),
+                        style,
+                    ))
+                }),
+        )
+        .collect();
+        let height = u16::try_from(lines.len()).unwrap_or(1).min(input_area.y);
+        if height == 0 {
+            return;
+        }
+        let popup = popup_rect(input_area, height);
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Paragraph::new(lines).style(Style::default().bg(surface)),
+            popup,
+        );
+    }
+
+    /// Render the configured-models picker above the composer.
+    ///
+    /// The same floating shape the session picker takes: a dim header
+    /// naming the keys, each row the model name with the running one
+    /// marked `•`, the cursor row highlighted (inverting under a
+    /// palette that defers its colors). The window follows the cursor
+    /// at its edges, same scroll rule as the session picker.
+    fn render_model_picker(&mut self, frame: &mut Frame, input_area: Rect) {
+        const SHOWN: usize = 8;
+        let Some(picker) = self.model_picker.as_ref() else {
+            return;
+        };
+        if picker.rows.is_empty() {
+            return;
+        }
+        let surface = self.theme.ui.surface;
+        let total = picker.rows.len();
+        let max_start = total.saturating_sub(SHOWN);
+        let start = picker
+            .cursor
+            .saturating_sub(SHOWN.saturating_sub(1))
+            .min(max_start);
+        let running = &self.config.api.model;
+        let lines: Vec<Line> = std::iter::once(Line::styled(
+            " models — ↑↓ walk · ⏎ switch · esc close ",
+            Style::default().fg(self.theme.ui.dim),
+        ))
+        .chain(
+            picker
+                .rows
+                .iter()
+                .skip(start)
+                .take(SHOWN)
+                .enumerate()
+                .map(|(index, name)| {
+                    let highlighted = index == picker.cursor.saturating_sub(start);
+                    let style = if highlighted {
+                        if self.theme.ui.primary == Color::Reset || surface == Color::Reset {
+                            Style::default().add_modifier(ratatui::style::Modifier::REVERSED)
+                        } else {
+                            Style::default().fg(surface).bg(self.theme.ui.primary)
+                        }
+                    } else {
+                        Style::default().fg(self.theme.ui.input_text).bg(surface)
+                    };
+                    let marker = if name == running { "•" } else { " " };
+                    Line::from(Span::styled(format!(" {marker} {name} "), style))
+                }),
+        )
+        .collect();
+        let height = u16::try_from(lines.len()).unwrap_or(1).min(input_area.y);
+        if height == 0 {
+            return;
+        }
+        let popup = popup_rect(input_area, height);
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Paragraph::new(lines).style(Style::default().bg(surface)),
+            popup,
+        );
+    }
+
+    /// Draw a live completion popup above the composer.
+    ///
+    /// While the composer holds a leading-slash line, this lists what the same
+    /// [`commands::complete`] that Tab accepts would offer right now — command
+    /// names for `/t…`, and the command's values (models, theme names, config
+    /// keys) once the command word is complete and an argument has begun, as in
+    /// `/theme def`. A command row carries the same one-line summary `/help`
+    /// prints for it — dimmed, and aligned in one column past the widest name
+    /// the window shows, `/help`'s own shape column sized to the panel, so the
+    /// descriptions read as a column rather than tailing each name; a value
+    /// row stands alone — the value is the whole offer. It is a read-only
+    /// preview recomputed each frame from the
+    /// current text; Tab is what actually accepts or cycles a choice, so this
+    /// never changes what is typed. It hides when there is nothing to offer, or
+    /// when the sole candidate is already fully spelled out in the composer.
+    fn render_completion(&mut self, frame: &mut Frame, input_area: Rect) {
+        const SHOWN: usize = 6;
+        let Some((prefix, candidates)) = self.popup_candidates() else {
+            self.completion = None;
+            return;
+        };
+
+        let total = candidates.len();
+        let active_cycle = self
+            .completion
+            .as_ref()
+            .filter(|cycle| cycle.prefix == prefix);
+        let start = active_cycle.map_or(0, |cycle| {
+            let max_start = total.saturating_sub(SHOWN);
+            let start = cycle.window_start.min(max_start);
+            let selected = cycle.index.min(total.saturating_sub(1));
+            if selected < start {
+                selected
+            } else if selected >= start.saturating_add(SHOWN) {
+                selected
+                    .saturating_sub(SHOWN.saturating_sub(1))
+                    .min(max_start)
+            } else {
+                start
+            }
+        });
+        let highlighted_row = active_cycle.map(|cycle| {
+            cycle
+                .index
+                .min(total.saturating_sub(1))
+                .saturating_sub(start)
+        });
+        let shown: Vec<&String> = candidates.iter().skip(start).take(SHOWN).collect();
+
+        let surface = self.theme.ui.surface;
+        let completing_command = prefix == "/";
+        let width = usize::from(input_area.width.max(1));
+        let summary_column = if completing_command {
+            shown
+                .iter()
+                .map(|candidate| format!("   /{candidate}").width())
+                .max()
+                .unwrap_or(0)
+                .saturating_add(2)
+        } else {
+            0
+        };
+        let lines: Vec<Line> = shown
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| {
+                let highlighted = highlighted_row == Some(index);
+                let style = if highlighted {
+                    if self.theme.ui.primary == Color::Reset
+                        || self.theme.ui.surface == Color::Reset
+                    {
+                        Style::default().add_modifier(ratatui::style::Modifier::REVERSED)
+                    } else {
+                        Style::default()
+                            .fg(self.theme.ui.surface)
+                            .bg(self.theme.ui.primary)
+                    }
+                } else {
+                    Style::default().fg(self.theme.ui.input_text).bg(surface)
+                };
+                let mut spans = if completing_command {
+                    let name = format!("/{candidate}");
+                    vec![Span::styled(format!("{name:<summary_column$}"), style)]
+                } else {
+                    vec![Span::styled(format!("{candidate} "), style)]
+                };
+                if completing_command && let Some(summary) = commands::summary_for(candidate) {
+                    let budget = width.saturating_sub(summary_column);
+                    let summary_style = if highlighted {
+                        style
+                    } else {
+                        Style::default().fg(self.theme.ui.dim).bg(surface)
+                    };
+                    let clamped = wrap_prompt_rows(summary, budget, 1)
+                        .first()
+                        .cloned()
+                        .unwrap_or_default();
+                    spans.push(Span::styled(clamped, summary_style));
+                }
+                Line::from(spans)
+            })
+            .collect();
+
+        let height = u16::try_from(lines.len()).unwrap_or(1).min(input_area.y);
+        if height == 0 {
+            return;
+        }
+        let popup = popup_rect(input_area, height);
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Paragraph::new(lines).style(Style::default().bg(surface)),
+            popup,
+        );
     }
 
     /// Render the input field: a fixed multi-row window onto the
@@ -7913,10 +10259,10 @@ impl TuiApp {
     /// [`render`](Self::render) and shared with the identity row's
     /// tag. The text window takes its height from the pane's own rows
     /// net of the vertical padding, so no paint of the field's lands
-    /// outside the pane it was given; the cursor position is clamped
-    /// the same way, so a terminal too short for the field's full
-    /// height parks the cursor on a row the field owns, and a field
-    /// allotted no rows at all parks no cursor.
+    /// outside the pane it was given; the caret paints inside the
+    /// pane the same way, so a terminal too short for the field's full
+    /// height shows the caret on a row the field owns, and a field
+    /// allotted no rows at all paints no caret.
     fn render_input(&mut self, frame: &mut Frame, area: Rect, rows: &[String], caret: (u16, u16)) {
         let (caret_row, column) = caret;
         let muted = self.section_holds_keys();
@@ -8049,7 +10395,18 @@ impl TuiApp {
             )
             .min(area.bottom().saturating_sub(1));
         if area.height > 0 && self.composer_caret_visible() {
-            frame.set_cursor_position((caret_x, caret_y));
+            let caret_style = if self.theme.ui.primary == Color::Reset
+                || self.theme.ui.background == Color::Reset
+            {
+                Style::default().add_modifier(ratatui::style::Modifier::REVERSED)
+            } else {
+                Style::default()
+                    .fg(self.theme.ui.background)
+                    .bg(self.theme.ui.primary)
+            };
+            if let Some(cell) = frame.buffer_mut().cell_mut((caret_x, caret_y)) {
+                cell.set_style(caret_style);
+            }
         }
     }
 
@@ -8067,23 +10424,30 @@ impl TuiApp {
         )
     }
 
-    /// Whether the composer's terminal cursor shows this frame.
+    /// Whether the composer's caret paints this frame.
     ///
-    /// False while the blink phase has it off — and for the whole
-    /// time a permission ask is pending: the sheet owns the composer's
-    /// rows and its keys, and a cursor there would point at nothing
-    /// the user can edit. The waiting section's focus and its ask
-    /// hide it for the same reason: the keys are landing on the
-    /// queue, and a blinking caret in a composer that cannot be typed
-    /// into would point at a lie. A frame that sets no cursor
-    /// position hides the terminal cursor, so this is the whole
+    /// False while the blink phase has it off — unless the config
+    /// spells the display `static`, in which case the caret stands solid
+    /// through every phase — and for the whole time a permission ask
+    /// is pending: the sheet owns the composer's rows and its keys,
+    /// and a caret there would point at nothing the user can edit.
+    /// The waiting section's focus and its ask hide it for the same
+    /// reason: the keys are landing on the queue, and a caret in a
+    /// composer that cannot be typed into would point at a lie. The
+    /// caret is the app's own painted cell — the terminal's own
+    /// cursor stays hidden for the composer — so this is the whole
     /// show-or-hide decision.
     #[must_use]
     pub fn composer_caret_visible(&self) -> bool {
-        self.caret_blink.on
+        (matches!(
+            self.config.display.caret_display,
+            dch_config::CaretDisplay::Static
+        ) || self.caret_blink.on)
             && !self.section_holds_keys()
             && self.pending_permissions.front().is_none()
             && self.pending_questions.is_empty()
+            && self.session_picker.is_none()
+            && self.model_picker.is_none()
     }
 
     /// Render the footer's three rows: a row of air under the
@@ -8198,17 +10562,6 @@ impl TuiApp {
         if text.is_empty() {
             return;
         }
-        // The notice rides this row's right edge: the place names
-        // where the session stands on the left, and whatever the frame
-        // has to say — a transient notice, the quit ladder's arm —
-        // answers from the right. The notice wins the columns it
-        // needs and the place keeps the rest; nothing wraps, because
-        // the row is one line and the shorter text clips before the
-        // two can collide. The corner a short row cannot buy out of is
-        // a notice that would take the whole row: the place's share
-        // floors at zero there and renders nothing, so the row belongs
-        // entirely to the notice rather than painting one place cell
-        // underneath it.
         let notice = self.notice_text();
         let notice_len = notice
             .as_ref()
@@ -8231,18 +10584,19 @@ impl TuiApp {
             },
         );
         if let Some(notice) = notice {
+            let x = area
+                .x
+                .saturating_add(INPUT_SIDE_INSET)
+                .min(area.right().saturating_sub(1));
             frame.render_widget(
                 Paragraph::new(notice)
                     .style(Style::default().fg(self.theme.ui.input_border))
                     .alignment(ratatui::layout::Alignment::Right),
                 Rect {
-                    x: area
-                        .x
-                        .saturating_add(INPUT_SIDE_INSET)
-                        .min(area.right().saturating_sub(1)),
+                    x: x.saturating_add(row_width.saturating_sub(notice_len)),
                     y: area.y,
                     height: 1,
-                    width: row_width,
+                    width: notice_len.min(row_width),
                 },
             );
         }
@@ -8289,18 +10643,47 @@ impl TuiApp {
         )
     }
 
+    /// Retire the engine-reported context window.
+    ///
+    /// The live figure in the shared state is a fact about the engine
+    /// that last ran — the model a switch leaves behind. Every model
+    /// switch retires it: the bar falls to the configured window of
+    /// the model now named until the new engine's first report
+    /// replaces it with live truth again.
+    fn retire_live_context_window(&mut self) {
+        self.state
+            .context_window
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The window the active model's own settings name.
+    ///
+    /// The same resolution the engine is built on: the selected
+    /// profile's `context_window` when it states one, else the base
+    /// `[api]` figure, else the built-in fallback. The bar's fallback
+    /// leg and a switch's verdict store both read this, so the figure
+    /// the bar shows between a switch and the first new turn is the
+    /// same one the engine runs.
+    fn configured_context_window(&self) -> u64 {
+        self.config
+            .models
+            .iter()
+            .find(|profile| profile.model.eq_ignore_ascii_case(&self.config.api.model))
+            .and_then(|profile| profile.context_window)
+            .or(self.config.api.context_window)
+            .unwrap_or(dch_config::FALLBACK_CONTEXT_WINDOW)
+    }
+
     /// The context readout's inputs: the tokens used against the window
     /// the engine actually runs — the live window once the engine has
-    /// reported one, the config's (or the fallback) before that.
+    /// reported one, the configured window of the model the config
+    /// names before that.
     fn context_snapshot(&self) -> (u64, u64) {
         let live_window = self.state.context_window.load(Ordering::SeqCst);
         let window = if live_window > 0 {
             live_window
         } else {
-            self.config
-                .api
-                .context_window
-                .unwrap_or(dch_config::FALLBACK_CONTEXT_WINDOW)
+            self.configured_context_window()
         };
         let used = self
             .state
@@ -8648,6 +11031,44 @@ impl QuitState {
     }
 }
 
+/// The saved-session picker `/sessions` stands on.
+///
+/// The catalog the driver listed with the cursor's row. Rows arrive
+/// newest-first and never change while the picker stands — resuming
+/// closes it — so the cursor indexes a frozen list, exactly the
+/// completion cycle's discipline.
+struct SessionPicker {
+    /// The catalog, newest first.
+    ///
+    /// What the driver's listing read; the picker never edits it.
+    rows: Vec<SessionPick>,
+
+    /// The row the cursor stands on.
+    ///
+    /// Wraps at both ends when the arrows walk; Enter resumes this
+    /// row's session.
+    cursor: usize,
+}
+
+/// The configured-models picker `/models` stands on.
+///
+/// The same floating shape the session picker takes: the model names
+/// with the cursor's row. Enter switches to the highlighted model
+/// through the same `/model` lane; Esc closes. The running model is
+/// marked beside its name.
+struct ModelPicker {
+    /// The configured model names, in `[[models]]` order.
+    ///
+    /// Read from the display's own config — no driver round-trip —
+    /// and never edited while the picker stands.
+    rows: Vec<String>,
+
+    /// The row the cursor stands on.
+    ///
+    /// Wraps at both ends; Enter switches to this model.
+    cursor: usize,
+}
+
 /// The composer caret's blink state.
 ///
 /// The terminal's blinking-cursor request is often ignored or
@@ -8659,20 +11080,25 @@ impl QuitState {
 struct CaretBlink {
     /// Whether the caret is in its visible phase.
     ///
-    /// The frame shows the terminal cursor only while this is true;
+    /// The frame paints the caret cell only while this is true;
     /// the pending-permission and pending-question sheets suppress it.
     on: bool,
 
-    /// Ticks since the phase last flipped.
+    /// When the current phase began — the clock the blink beats on.
     ///
-    /// Counted against the run loop's tick so the half-second phases
-    /// survive frame-rate changes.
-    ticks: u32,
+    /// Set by input (the caret resolidifies) and read by
+    /// [`refresh`](Self::refresh), which derives the phase from the
+    /// time since it rather than from any tick count, so no redraw
+    /// rate can speed the blink up or slow it down.
+    anchor: Instant,
 }
 
 impl Default for CaretBlink {
     fn default() -> Self {
-        Self { on: true, ticks: 0 }
+        Self {
+            on: true,
+            anchor: Instant::now(),
+        }
     }
 }
 
@@ -8683,23 +11109,27 @@ impl CaretBlink {
     /// traffic never calls this, so reading alone does not hold the
     /// caret solid.
     fn resolidify(&mut self) {
+        self.anchor = Instant::now();
         self.on = true;
-        self.ticks = 0;
     }
 
-    /// Advance one tick, flipping the phase when it is due.
-    ///
-    /// Returns whether the phase flipped, so the caller can redraw —
+    /// Bring the phase up to `now`, reporting whether it flipped —
     /// the only idle activity a blink generates.
-    fn tick(&mut self) -> bool {
-        self.ticks = self.ticks.saturating_add(1);
-        if self.ticks >= CARET_BLINK_TICKS {
-            self.ticks = 0;
-            self.on = !self.on;
-            true
-        } else {
-            false
-        }
+    ///
+    /// The phase is the clock's, not the tick count's: on through one
+    /// [`CARET_BLINK_INTERVAL`] since the anchor, off through the
+    /// next, alternating — so a burst of ticks between flips (a
+    /// stream painting every frame) and a dozing lane (a fully idle
+    /// session) both find the caret at the same steady cadence.
+    fn refresh(&mut self, now: Instant) -> bool {
+        let intervals = now
+            .duration_since(self.anchor)
+            .as_millis()
+            .div_euclid(CARET_BLINK_INTERVAL.as_millis());
+        let on = matches!(intervals.checked_rem(2), Some(0));
+        let flipped = on != self.on;
+        self.on = on;
+        flipped
     }
 }
 
@@ -13552,12 +15982,63 @@ mod tests {
     }
 
     #[test]
+    fn a_canvas_repainting_theme_keeps_the_running_titles_visible() {
+        // The reported bug, pinned at the scene: github_light repaints
+        // the canvas white, and a terminal launched under a dark scheme
+        // keeps a light default foreground — any register that leans on
+        // the terminal default renders white on white. The running
+        // title must carry the theme's own standing foreground, which
+        // on this canvas is a dark register.
+        let (_observer, state) = crate::observer::TuiObserverState::new().into_observer();
+        let mut config = dch_config::DchConfig::default();
+        config.display.theme = "github_light".to_string();
+        let app = TuiApp::from_observer_state(config, state.clone());
+        assert_eq!(
+            app.theme.ui.background,
+            ratatui::style::Color::Rgb(255, 255, 255),
+            "fixture premise: the theme repaints a white canvas"
+        );
+        assert_eq!(
+            app.theme.ui.foreground,
+            ratatui::style::Color::Rgb(36, 41, 47),
+            "fixture premise: the standing register is dark on that canvas"
+        );
+        state
+            .agent_running
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        *state.thinking.lock().expect("the thinking lock") = crate::observer::ThinkingStream {
+            text: "reasoning in flight".to_string(),
+            began: Some(Instant::now()),
+            ..Default::default()
+        };
+        let (lines, _) = app.live_thinking_lines(80);
+        let title = lines
+            .first()
+            .expect("the marker row")
+            .spans
+            .iter()
+            .find(|span| span.content.contains("Thinking"))
+            .expect("the title span");
+        assert_eq!(
+            title.style.fg,
+            Some(ratatui::style::Color::Rgb(36, 41, 47)),
+            "the title paints in the theme's dark standing register — never the \
+             terminal default a dark-scheme terminal would betray"
+        );
+    }
+
+    #[test]
     fn the_live_thinking_title_reads_the_running_register() {
         // While the stream runs, the title answers to the same
-        // register a running tool's title carries — the default
-        // foreground, italic as thinking's identity — while its
-        // elapsed span reads the light reply register; the completed
-        // block greys both out with everything else.
+        // register a running tool's title carries — the theme's own
+        // standing foreground, italic as thinking's identity — while
+        // its elapsed span reads the light reply register; the
+        // completed block greys both out with everything else. The
+        // register is explicit, never the terminal's default: a
+        // canvas-repainting theme cannot lean on a default foreground
+        // belonging to the scheme the user launched under — the exact
+        // white-on-white github_light shipped on a dark-scheme
+        // terminal.
         let (_observer, state) = crate::observer::TuiObserverState::new().into_observer();
         let app = TuiApp::from_observer_state(dch_config::DchConfig::default(), state.clone());
         state
@@ -13576,9 +16057,10 @@ mod tests {
             .find(|span| span.content.contains("Thinking"))
             .expect("the title span");
         assert_eq!(
-            title.style.fg, None,
-            "the title carries the default foreground while running — \
-             the running tool's register, not the dim"
+            title.style.fg,
+            Some(app.theme.ui.foreground),
+            "the title carries the theme's standing foreground while running — \
+             the running tool's register, never the terminal default or the dim"
         );
         assert!(
             title
@@ -13940,6 +16422,2025 @@ mod tests {
             relativize(Path::new("/srv/work"), home),
             None,
             "a directory outside home has no relative spelling"
+        );
+    }
+
+    /// Run a slash command and return everything it surfaced, as one
+    /// newline-joined string. Reads both lanes a command may write to: the
+    /// transcript rows it appended (`/session`, `/cost`, `/themes`, `/version`)
+    /// and the transient status line it raised (`/exit`, `/stop`, `/copy`).
+    fn command_output(app: &mut TuiApp, line: &str) -> String {
+        let commands::Parsed::Command(command) = commands::parse(line) else {
+            panic!("expected {line:?} to parse to a command");
+        };
+        let before = app.conversation.len();
+        app.run_command(command);
+        let mut out: Vec<String> = app
+            .conversation
+            .iter()
+            .skip(before)
+            .filter_map(|message| match message {
+                TuiMessage::System { text, .. } | TuiMessage::User { text, .. } => {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        if let Some((notice, _)) = &app.transient_notice {
+            out.push(notice.clone());
+        }
+        out.join("\n")
+    }
+
+    #[test]
+    fn version_command_prints_the_running_version() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        let out = command_output(&mut app, "/version");
+        assert!(out.contains("dch "), "got {out:?}");
+        assert!(out.contains(env!("CARGO_PKG_VERSION")), "got {out:?}");
+    }
+
+    #[test]
+    fn themes_command_lists_the_settable_command_names() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        let out = command_output(&mut app, "/themes");
+        // The live palette (the default theme) is starred by its command key —
+        // the very word you would pass to `/theme`, not its pretty label.
+        assert!(out.contains("* default"), "got {out:?}");
+        for key in crate::theme::Theme::command_names() {
+            assert!(out.contains(key), "missing command name {key} in {out:?}");
+        }
+        // The display spelling (`"Gruvbox Dark"`) is deliberately not listed.
+        assert!(
+            !out.contains("Gruvbox Dark"),
+            "lists keys, not display labels"
+        );
+    }
+
+    #[test]
+    fn verbosity_command_reports_then_sets() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        // No argument: report the current level, change nothing.
+        let report = command_output(&mut app, "/verbosity");
+        assert!(report.contains("verbosity is"), "got {report:?}");
+        // A level: apply it to the live display through the shared setter.
+        command_output(&mut app, "/verbosity verbose");
+        assert!(matches!(app.verbosity, dch_config::Verbosity::Verbose));
+    }
+
+    #[test]
+    fn cost_command_reports_context_and_tokens() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        let out = command_output(&mut app, "/cost");
+        assert!(out.contains("Context:"), "got {out:?}");
+        assert!(out.contains("tokens used"), "got {out:?}");
+    }
+
+    #[test]
+    fn session_command_reports_identity_and_model() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        let out = command_output(&mut app, "/session");
+        assert!(out.contains("Session"), "got {out:?}");
+        assert!(out.contains(&app.config.api.model), "got {out:?}");
+    }
+
+    #[test]
+    fn stop_with_nothing_running_says_so_and_does_not_quit() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        let out = command_output(&mut app, "/stop");
+        assert!(out.contains("nothing is running"), "got {out:?}");
+        // Stopping a run must not ask the loop to leave the session.
+        assert!(!app.quit.requested);
+    }
+
+    #[test]
+    fn exit_command_requests_the_quit() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        command_output(&mut app, "/exit");
+        assert!(app.quit.requested);
+    }
+
+    #[test]
+    fn copy_with_no_answer_says_so() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        let out = command_output(&mut app, "/copy");
+        assert!(out.contains("no answer to copy"), "got {out:?}");
+    }
+
+    #[test]
+    fn copy_command_hands_the_last_answer_to_the_copier() {
+        // The copy leg's real path: an injected copier records exactly what it
+        // was handed, standing in for the clipboard so the test never shells
+        // out. A turn carrying prose plus tool chrome must yield just the prose.
+        use std::sync::atomic::AtomicU64;
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        let now = chrono::Utc::now();
+        app.push_message(TuiMessage::User {
+            text: "explain it".to_string(),
+            timestamp: now,
+            steered: false,
+            unsent: false,
+        });
+        app.push_message(TuiMessage::Assistant {
+            blocks: vec![
+                ContentBlock::Text {
+                    text: "the answer".to_string(),
+                },
+                ContentBlock::Tool {
+                    name: "Read".to_string(),
+                    call_id: "c1".to_string(),
+                    input_preview: "a.rs".to_string(),
+                    success: true,
+                    elapsed_secs: 0.1,
+                    output_preview: "…".to_string(),
+                    retained_input: String::new(),
+                },
+            ],
+            timestamp: now,
+            duration_ms: Some(0),
+        });
+        let captured: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+        let calls = Arc::new(AtomicU64::new(0));
+        let sink = Arc::clone(&captured);
+        let counted = Arc::clone(&calls);
+        app.set_selection_copier(Box::new(move |_attempt, text| {
+            *sink
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(text.to_string());
+            counted.fetch_add(1, Ordering::SeqCst);
+            CopyAnswer::Verified
+        }));
+
+        let out = command_output(&mut app, "/copy");
+
+        assert_eq!(
+            captured
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_deref(),
+            Some("the answer"),
+            "the copier receives the answer text, tool chrome excluded"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "exactly one copy attempted"
+        );
+        assert!(
+            !out.contains("no answer"),
+            "an answer was present, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn stop_cancels_a_run_in_flight_without_quitting() {
+        // The stop leg's live path: with a run marked in flight, the shared
+        // canceller fires and a notice lands, yet the session is asked to stay —
+        // the distinction from `/exit` that the whole command turns on.
+        use std::sync::atomic::AtomicBool;
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let fired = Arc::clone(&cancelled);
+        app.set_run_canceller(Box::new(move || fired.store(true, Ordering::SeqCst)));
+        app.state.agent_running.store(true, Ordering::SeqCst);
+
+        let out = command_output(&mut app, "/stop");
+
+        assert!(out.contains("stopped the current run"), "got {out:?}");
+        assert!(
+            cancelled.load(Ordering::SeqCst),
+            "the run was actually cancelled"
+        );
+        assert!(
+            !app.quit.requested,
+            "stopping a run must not leave the session"
+        );
+    }
+
+    #[test]
+    fn clear_empties_the_transcript_and_offers_a_fresh_session() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        let now = chrono::Utc::now();
+        app.push_message(TuiMessage::User {
+            text: "keep?".to_string(),
+            timestamp: now,
+            steered: false,
+            unsent: false,
+        });
+        app.push_message(TuiMessage::System {
+            text: "a note".to_string(),
+            timestamp: now,
+        });
+        let out = command_output(&mut app, "/clear");
+        assert!(app.conversation.is_empty(), "the transcript is emptied");
+        assert!(out.contains("session cleared"), "got {out:?}");
+    }
+
+    #[test]
+    fn help_lists_the_palette_and_its_footer() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        let out = command_output(&mut app, "/help");
+        assert!(out.contains("In-session commands"), "got {out:?}");
+        assert!(out.contains("/clear"), "the listing shows a known command");
+        assert!(
+            out.contains("/help <command>"),
+            "the footer points at per-command help, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn help_explains_one_command_and_flags_a_missing_topic() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        let detail = command_output(&mut app, "/help model");
+        assert!(detail.contains("/model"), "got {detail:?}");
+        // An unknown topic points back at the list rather than inventing one.
+        let miss = command_output(&mut app, "/help zzz");
+        assert!(miss.contains("no command /zzz"), "got {miss:?}");
+    }
+
+    #[test]
+    fn set_theme_applies_a_name_and_keeps_the_current_on_a_miss() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        // `/theme nord` resolves through by_name; the palette's own `name` is
+        // its display spelling ("Nord"), which is what the notice and field show.
+        let hit = command_output(&mut app, "/theme nord");
+        assert!(
+            !hit.contains("theme set to"),
+            "the switch is silent: {hit:?}"
+        );
+        assert_eq!(app.theme.name, "Nord");
+        assert_eq!(
+            app.config.display.theme, "nord",
+            "the config and the file carry the registry key — the one spelling \
+             /themes lists and the config documents, never the display name"
+        );
+        let miss = command_output(&mut app, "/theme notarealtheme");
+        assert!(
+            miss.contains("unknown theme 'notarealtheme'"),
+            "got {miss:?}"
+        );
+        assert_eq!(app.theme.name, "Nord", "a miss keeps the current palette");
+        assert_eq!(
+            app.config.display.theme, "nord",
+            "and a miss keeps the stored key"
+        );
+    }
+
+    #[test]
+    fn theme_without_a_name_steps_the_palette() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        let before = app.theme.name;
+        let out = command_output(&mut app, "/theme");
+        assert!(
+            !out.contains("theme preview"),
+            "the step is silent — the palette change is the feedback: {out:?}"
+        );
+        assert_ne!(
+            app.theme.name, before,
+            "the bare command steps to the next palette"
+        );
+    }
+
+    #[test]
+    fn every_theme_switch_path_rebakes_without_a_screen_clear() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        for command in ["/theme nord", "/theme", "/set theme nord"] {
+            // Pretend every rendered-line cache is fresh under the old
+            // palette: the render guard current, the live lane warm. A
+            // switch that only cleared the bake would leave the merged
+            // cache serving the old colors and the live lane waiting
+            // for its next delta — the generation bump and the stamp
+            // reset are what make the very next frame re-render both.
+            app.conversation_cache_generation = app.conversation_generation;
+            app.live_stamp = 7;
+            app.conversation_baked_through = 3;
+            app.full_repaint_due = None;
+            let generation = app.conversation_generation;
+            command_output(&mut app, command);
+            assert_eq!(
+                app.conversation_baked_through, 0,
+                "{command} invalidates the conversation bake"
+            );
+            assert!(
+                app.conversation_generation > generation,
+                "{command} pierces the render guard's generation"
+            );
+            assert_eq!(
+                app.live_stamp, 0,
+                "{command} forces the live lane to re-render"
+            );
+            assert!(
+                app.full_repaint_due.is_none(),
+                "{command} clears no screen — the diff repaints without a blank frame"
+            );
+            assert_eq!(
+                app.theme.ui.foreground,
+                ratatui::style::Color::Reset,
+                "{command} defers the palette with no reader to park for the ask"
+            );
+        }
+    }
+
+    #[test]
+    fn a_committed_switch_defers_its_terminal_writes_to_the_flush() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        for command in ["/theme nord", "/theme", "/set theme nord"] {
+            app.pending_theme_osc = None;
+            command_output(&mut app, command);
+            let (background, primary) = app
+                .pending_theme_osc
+                .expect("{command} parks its terminal writes on the flush");
+            assert_eq!(
+                background, app.theme.ui.background,
+                "{command} parks the landed palette's canvas, not a key-time leftover"
+            );
+            assert_eq!(
+                primary, app.theme.ui.primary,
+                "{command} parks the cursor tint beside the canvas it belongs to"
+            );
+        }
+    }
+
+    #[test]
+    fn tab_completes_a_theme_argument_to_its_command_name() {
+        // `/theme def` then Tab offers the command spelling `default` — the word
+        // `/theme` accepts and the config file writes, not the display label
+        // ("Default"). Completion and the command share one vocabulary.
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        app.input.set_text("/theme def".to_string());
+        assert!(app.complete_command_line(false));
+        assert_eq!(app.input.text(), "/theme default");
+    }
+
+    #[test]
+    fn tab_completes_a_command_name_from_its_prefix() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        app.input.set_text("/them".to_string());
+        assert!(app.complete_command_line(false));
+        assert!(
+            app.input.text() == "/theme" || app.input.text() == "/themes",
+            "a command prefix completes to a full command name, got {:?}",
+            app.input.text()
+        );
+    }
+
+    #[test]
+    fn tab_cycles_the_suggestions_with_the_popup_standing() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        app.input.set_text("/theme ".to_string());
+        let (_, candidates, _) = app.fresh_completion("/theme ");
+        assert!(
+            candidates.len() >= 2,
+            "the probe stem offers at least two themes, got {candidates:?}"
+        );
+        let first = candidates.first().cloned().unwrap_or_default();
+        let second = candidates.get(1).cloned().unwrap_or_default();
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        assert!(app.handle_key(tab));
+        assert_eq!(
+            app.input.text(),
+            format!("/theme {first}"),
+            "the first Tab applies the highlighted row — the composer names what the screen previews"
+        );
+        assert_eq!(
+            app.theme.name,
+            Theme::by_name(&first)
+                .map(|theme| theme.name)
+                .unwrap_or_default(),
+            "the palette previews the row the first Tab applied"
+        );
+        assert!(
+            app.completion_popup_live(),
+            "the popup stands after the applied row"
+        );
+        assert!(app.handle_key(tab));
+        assert_eq!(
+            app.input.text(),
+            format!("/theme {second}"),
+            "the second Tab steps to the second row — the same row a Down lands on"
+        );
+        // After applying, the popup stands — the cycle's frozen list
+        // keeps the candidates visible so the next Tab (or the arrows)
+        // continues cycling through them.
+        assert!(
+            app.completion_popup_live(),
+            "the popup stands after an applied candidate — Tab cycles, it does not select"
+        );
+        // A third Tab steps onward to the third row.
+        assert!(app.handle_key(tab));
+        assert_eq!(
+            app.input.text(),
+            format!("/theme {}", candidates.get(2).cloned().unwrap_or_default()),
+            "the third Tab steps to the third row — cycling continues"
+        );
+    }
+
+    #[test]
+    fn backtab_from_a_bare_stem_applies_the_last_row() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        app.input.set_text("/theme ".to_string());
+        let (_, candidates, _) = app.fresh_completion("/theme ");
+        assert!(candidates.len() >= 2, "themes offer more than one");
+        let last = candidates.last().cloned().unwrap_or_default();
+        assert!(app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)));
+        assert_eq!(
+            app.input.text(),
+            format!("/theme {last}"),
+            "a reverse first press applies the last row, not a browse"
+        );
+        assert!(
+            app.completion_popup_live(),
+            "the popup stands after the applied row"
+        );
+    }
+
+    #[test]
+    fn arrows_walk_the_suggestion_popup_and_preview_the_landed_row() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        app.input.set_text("/theme ".to_string());
+        let (_, candidates, _) = app.fresh_completion("/theme ");
+        assert!(
+            candidates.len() >= 2,
+            "the probe stem offers at least two themes, got {candidates:?}"
+        );
+        let second = candidates.get(1).cloned().unwrap_or_default();
+        assert!(
+            app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            "Down with the popup standing is the popup's"
+        );
+        assert_eq!(
+            app.input.text(),
+            format!("/theme {second}"),
+            "the composer takes the landed row — selection, preview, and text agree"
+        );
+        assert_eq!(
+            app.theme.name,
+            Theme::by_name(&second)
+                .map(|theme| theme.name)
+                .unwrap_or_default(),
+            "the palette previews the landed row"
+        );
+        assert!(
+            app.completion_popup_live(),
+            "the popup stands while the arrows browse"
+        );
+    }
+
+    #[test]
+    fn tab_on_a_fully_typed_command_applies_the_first_argument() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        app.input.set_text("/theme".to_string());
+        let (_, candidates, _) = app.fresh_completion("/theme ");
+        let first = candidates.first().cloned().unwrap_or_default();
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+        assert_eq!(
+            app.input.text(),
+            format!("/theme {first}"),
+            "Tab on a fully typed command lands on the first value — space added, row applied"
+        );
+        assert!(
+            app.completion_popup_live(),
+            "the popup stands with the argument candidates"
+        );
+        assert_eq!(
+            app.theme.name,
+            Theme::by_name(&first)
+                .map(|theme| theme.name)
+                .unwrap_or_default(),
+            "the palette previews the row the composer names"
+        );
+    }
+
+    #[test]
+    fn arrows_over_the_command_list_write_the_composer() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        app.input.set_text("/".to_string());
+        let (_, candidates, _) = app.fresh_completion("/");
+        assert!(
+            candidates.len() >= 3,
+            "the command list offers several rows, got {candidates:?}"
+        );
+        let first = candidates.first().cloned().unwrap_or_default();
+        let second = candidates.get(1).cloned().unwrap_or_default();
+        let last = candidates.last().cloned().unwrap_or_default();
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+        assert_eq!(
+            app.input.text(),
+            format!("/{second}"),
+            "Down applies the row it lands on — the composer follows the highlight"
+        );
+        assert!(
+            app.completion_popup_live(),
+            "the popup stands on the whole list while the arrows walk it"
+        );
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
+        assert_eq!(
+            app.input.text(),
+            format!("/{first}"),
+            "Up steps back and applies the row above"
+        );
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
+        assert_eq!(
+            app.input.text(),
+            format!("/{last}"),
+            "Up from the top wraps to the last row and applies it"
+        );
+    }
+
+    #[test]
+    fn a_space_retires_the_command_cycle_and_tab_completes_values() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        app.input.set_text("/".to_string());
+        let (_, commands, _) = app.fresh_completion("/");
+        let steps = commands
+            .iter()
+            .position(|name| name == "theme")
+            .expect("the command list carries /theme");
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        for _ in 0..steps {
+            assert!(app.handle_key(down), "the arrows walk the command menu");
+        }
+        assert_eq!(
+            app.input.text(),
+            "/theme",
+            "the walk landed on the /theme row"
+        );
+        assert!(
+            app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
+            "the space is the editor's, taken as typed"
+        );
+        let (_, themes, _) = app.fresh_completion("/theme ");
+        let first = themes.first().cloned().unwrap_or_default();
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+        assert_eq!(
+            app.input.text(),
+            format!("/theme {first}"),
+            "Tab at the value position completes a theme — the command list is a word behind"
+        );
+        assert!(
+            app.completion_popup_live(),
+            "the popup stands on the theme list"
+        );
+    }
+
+    #[test]
+    fn keys_after_a_retired_browse_do_not_flip_the_theme() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        app.input.set_text("/theme ".to_string());
+        let original = app.theme.name;
+        // Preview a different theme.
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+        assert!(
+            app.theme.name != original,
+            "the arrows previewed away from the original"
+        );
+        // Backspace out of the applied row and past the space — the
+        // browse ends on the press that removes the space, and the
+        // theme restores.
+        while app.input.text().starts_with("/theme ") {
+            assert!(
+                app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+                "the editor takes the backspace"
+            );
+        }
+        assert_eq!(
+            app.theme.name, original,
+            "the retire restored the session's theme"
+        );
+        // Now type ordinary text: the theme must NOT change on any
+        // keypress. This is the exact flip-on-every-key bug.
+        for glyph in "hello world".chars() {
+            assert!(app.handle_key(KeyEvent::new(KeyCode::Char(glyph), KeyModifiers::NONE)));
+            assert_eq!(
+                app.theme.name, original,
+                "typing '{glyph}' after a retired browse leaves the theme alone"
+            );
+        }
+        // Backspaces too.
+        for _ in 0..5 {
+            assert!(app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)));
+            assert_eq!(
+                app.theme.name, original,
+                "backspacing after a retired browse leaves the theme alone"
+            );
+        }
+    }
+
+    #[test]
+    fn a_browse_left_by_backspace_restores_the_theme() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        app.input.set_text("/theme ".to_string());
+        let original = app.theme.name;
+        let (_, candidates, _) = app.fresh_completion("/theme ");
+        let third = candidates.get(2).cloned().unwrap_or_default();
+        // Two arrows land on the third theme; the preview follows.
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+        assert_eq!(
+            app.theme.name,
+            Theme::by_name(&third)
+                .map(|theme| theme.name)
+                .unwrap_or_default(),
+            "the arrows previewed the third theme"
+        );
+        // Backspace out of the applied row and past the space: the
+        // text leaves the browse, and the theme returns to the
+        // session's own — not the preview.
+        while app.input.text().starts_with("/theme ") {
+            assert!(
+                app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+                "the editor takes the backspace"
+            );
+        }
+        assert_eq!(
+            app.theme.name, original,
+            "the browse the backspace ended restores the session's theme"
+        );
+    }
+
+    #[test]
+    fn a_browse_left_by_clearing_restores_the_theme() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        app.input.set_text("/theme ".to_string());
+        let original = app.theme.name;
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+        assert!(
+            app.theme.name != original,
+            "the arrow previewed a different theme"
+        );
+        // Ctrl+C clears the draft; the browse is gone, the theme returns.
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+        assert_eq!(
+            app.theme.name, original,
+            "the browse the clear ended restores the session's theme"
+        );
+    }
+
+    #[test]
+    fn a_committed_switch_after_browsing_keeps_the_choice() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        app.input.set_text("/theme ".to_string());
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+        // Type the rest of a theme name — the browse narrows, not ends.
+        for glyph in "nord".chars() {
+            assert!(app.handle_key(KeyEvent::new(KeyCode::Char(glyph), KeyModifiers::NONE)));
+        }
+        // The text still names a theme; the browse hasn't ended.
+        assert_eq!(app.input.text(), "/theme nord", "the typed name stands");
+        // Enter commits — the choice keeps, no restore.
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        assert_eq!(
+            app.theme.name, "Nord",
+            "the committed switch stands — the browse's restore does not undo it"
+        );
+    }
+
+    #[test]
+    fn the_browse_previews_the_theme_it_highlights() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        app.input.set_text("/theme ".to_string());
+        let original = app.theme.name;
+        let (_, candidates, _) = app.fresh_completion("/theme ");
+        let second = candidates.get(1).cloned().unwrap_or_default();
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+        assert_eq!(
+            app.input.text(),
+            format!("/theme {second}"),
+            "the composer names the row the highlight stands on"
+        );
+        assert!(
+            app.completion_popup_live(),
+            "the browse leaves the popup standing"
+        );
+        assert_eq!(
+            app.theme.name,
+            Theme::by_name(&second)
+                .map(|theme| theme.name)
+                .unwrap_or_default(),
+            "the palette previews the highlighted row, not the theme the browse started from"
+        );
+        assert!(
+            app.theme.name != original || original.eq_ignore_ascii_case(&second),
+            "the preview moved to the highlighted row (or that row was the original)"
+        );
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert_eq!(
+            app.theme.name, original,
+            "Esc after the browse restores the theme the session was on"
+        );
+    }
+
+    #[test]
+    fn arrows_preview_and_tab_applies_from_the_arrows_row() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        app.input.set_text("/theme ".to_string());
+        let (_, candidates, _) = app.fresh_completion("/theme ");
+        assert!(
+            candidates.len() >= 3,
+            "the themes offer at least three rows, got {candidates:?}"
+        );
+        let third = candidates.get(2).cloned().unwrap_or_default();
+        // Two arrow presses walk to the third row; the palette and the
+        // composer both follow.
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+        assert_eq!(
+            app.input.text(),
+            format!("/theme {third}"),
+            "the composer names the arrow-landed row — Enter submits the choice on screen"
+        );
+        assert_eq!(
+            app.theme.name,
+            Theme::by_name(&third)
+                .map(|theme| theme.name)
+                .unwrap_or_default(),
+            "the preview follows the arrow-landed row"
+        );
+        // Tab continues from the arrow's position — the shared cycle —
+        // and applies the next row into the composer.
+        assert!(app.complete_command_line(false));
+        assert_eq!(
+            app.input.text(),
+            format!("/theme {}", candidates.get(3).cloned().unwrap_or_default()),
+            "Tab continues from the row the arrows landed on — one position, two keys"
+        );
+    }
+
+    #[test]
+    fn the_popup_arrows_wrap_at_both_ends() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        app.input.set_text("/theme ".to_string());
+        let (_, candidates, _) = app.fresh_completion("/theme ");
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        let last = candidates.last().cloned().unwrap_or_default();
+        let first = candidates.first().cloned().unwrap_or_default();
+        assert!(app.handle_key(up));
+        assert_eq!(
+            app.theme.name,
+            Theme::by_name(&last)
+                .map(|theme| theme.name)
+                .unwrap_or_default(),
+            "Up from the fresh highlight wraps to the last row"
+        );
+        assert_eq!(
+            app.input.text(),
+            format!("/theme {last}"),
+            "the composer takes the wrapped row"
+        );
+        assert!(app.handle_key(up));
+        assert!(app.handle_key(down));
+        assert_eq!(
+            app.theme.name,
+            Theme::by_name(&last)
+                .map(|theme| theme.name)
+                .unwrap_or_default(),
+            "Up then Down returns to the last row (Up wrapped, Down stepped back)"
+        );
+        assert!(
+            app.completion_popup_live(),
+            "the popup stands through the walk"
+        );
+        let _ = first;
+    }
+
+    #[test]
+    fn tab_continues_from_the_row_the_arrows_landed_on() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        app.input.set_text("/theme ".to_string());
+        let (_, candidates, _) = app.fresh_completion("/theme ");
+        assert!(
+            candidates.len() >= 3,
+            "the themes offer at least three rows, got {candidates:?}"
+        );
+        let second = candidates.get(1).cloned().unwrap_or_default();
+        let third = candidates.get(2).cloned().unwrap_or_default();
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+        assert_eq!(
+            app.theme.name,
+            Theme::by_name(&second)
+                .map(|theme| theme.name)
+                .unwrap_or_default(),
+            "the arrow lands on the second row — the preview proves the position"
+        );
+        assert!(app.complete_command_line(false));
+        assert_eq!(
+            app.input.text(),
+            format!("/theme {third}"),
+            "Tab continues from the arrow-landed row, applying the third"
+        );
+    }
+
+    #[test]
+    fn esc_on_a_popup_clears_the_whole_command() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        app.input.set_text("/the".to_string());
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(
+            app.handle_key(esc),
+            "the standing popup is Esc's first duty"
+        );
+        assert!(
+            app.input.is_empty(),
+            "one press clears the suggestion and the draft together"
+        );
+        assert!(!app.completion_popup_live(), "the popup is gone");
+        assert!(
+            !app.handle_key(esc),
+            "an empty composer leaves Esc unclaimed"
+        );
+    }
+
+    #[test]
+    fn an_edit_after_stepping_keeps_the_cycles_position() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        app.input.set_text("/theme ".to_string());
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+        // Type after the browse: the text narrows, the position persists.
+        app.input.set_text("/theme d".to_string());
+        assert!(
+            app.completion_popup_live(),
+            "the popup re-arms for the edited draft"
+        );
+        let (_, candidates, _) = app.fresh_completion("/theme d");
+        // The cycle was at index 1 (from the first arrow); the next
+        // arrow continues from there, stepping to index 2 of the
+        // fresh "d"-filtered list.
+        let third = candidates.get(2).cloned().unwrap_or_default();
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+        assert_eq!(
+            app.theme.name,
+            Theme::by_name(&third)
+                .map(|theme| theme.name)
+                .unwrap_or_default(),
+            "the step continues from the cycle's position in the fresh list"
+        );
+    }
+
+    #[test]
+    fn the_popup_window_follows_the_highlight() {
+        assert_eq!(
+            popup_window(3, 12, 6),
+            (0, 3),
+            "near the head the window sits at the top"
+        );
+        assert_eq!(
+            popup_window(7, 12, 6),
+            (2, 5),
+            "past the last row the highlight pins to the window's bottom"
+        );
+        assert_eq!(
+            popup_window(11, 12, 6),
+            (6, 5),
+            "at the very end the window rides the list's tail"
+        );
+        assert_eq!(
+            popup_window(0, 1, 6),
+            (0, 0),
+            "a list shorter than the cap shows whole"
+        );
+    }
+
+    #[test]
+    fn the_popup_spans_the_composer_s_width() {
+        let area = Rect {
+            x: 2,
+            y: 10,
+            width: 40,
+            height: 3,
+        };
+        let popup = popup_rect(area, 4);
+        assert_eq!(popup.width, 40, "the popup is as wide as the composer");
+        assert_eq!(popup.x, 2, "it shares the composer's left edge");
+        assert_eq!(popup.y, 6, "it floats immediately above the composer");
+        assert_eq!(popup.height, 4, "it is as tall as its content needs");
+    }
+
+    /// The screen rows a draw paints, one `String` per terminal row, so a
+    /// test can read the popup the way the user sees it: whole rows of
+    /// text, not styled cells.
+    fn screen_rows(subject: &mut TuiApp) -> Vec<String> {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+        terminal.draw(|frame| subject.render(frame)).expect("draw");
+        let buffer = terminal.backend().buffer();
+        let mut rows: Vec<String> = vec![String::new(); 24];
+        for (index, cell) in buffer.content.iter().enumerate() {
+            let (_, y) = buffer.pos_of(index);
+            if let Some(row) = rows.get_mut(usize::from(y)) {
+                row.push_str(cell.symbol());
+            }
+        }
+        rows
+    }
+
+    #[test]
+    fn the_popup_command_rows_carry_the_help_summary() {
+        let mut subject = TuiApp::new(dch_config::DchConfig::default());
+        subject.input.set_text("/".to_string());
+        let rows = screen_rows(&mut subject);
+        let (_, candidates, _) = subject.fresh_completion("/");
+        let mut columns: Vec<usize> = Vec::new();
+        for name in candidates.iter().take(6) {
+            let summary = commands::summary_for(name).expect("every listed command has a summary");
+            let row = rows
+                .iter()
+                .find(|row| row.contains(&format!("/{name} ")))
+                .unwrap_or_else(|| panic!("the popup lists /{name}, rows: {rows:?}"));
+            let column = row.find(summary).unwrap_or_else(|| {
+                panic!("the /{name} row carries its /help summary {summary:?}, got {row:?}")
+            });
+            columns.push(column);
+        }
+        let first = columns.first().copied().unwrap_or(0);
+        assert!(
+            columns.iter().all(|&column| column == first),
+            "every summary starts in the same column, got {columns:?} (rows: {rows:?})"
+        );
+    }
+
+    #[test]
+    fn a_value_row_in_the_popup_stands_alone() {
+        let mut subject = TuiApp::new(dch_config::DchConfig::default());
+        subject.input.set_text("/theme ".to_string());
+        let rows = screen_rows(&mut subject);
+        let (_, candidates, _) = subject.fresh_completion("/theme ");
+        let value = candidates.first().cloned().unwrap_or_default();
+        let row = rows
+            .iter()
+            .find(|row| row.trim_start().starts_with(&value))
+            .unwrap_or_else(|| panic!("the popup lists {value}, rows: {rows:?}"));
+        let summary = commands::summary_for("theme").unwrap_or_default();
+        assert!(
+            !row.contains(summary),
+            "a theme row is the value alone, not the /theme summary, got {row:?}"
+        );
+    }
+
+    #[test]
+    fn the_tab_notice_names_the_choice_and_nothing_else() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        // Themes are silent — the palette change is the feedback — so
+        // the notice's shape is verified through a key completion.
+        app.input.set_text("/verbosity ".to_string());
+        // The first Tab from a bare space browses without applying;
+        // the second applies the first candidate and carries the notice.
+        assert!(app.complete_command_line(false));
+        assert!(app.complete_command_line(false));
+        let notice = app
+            .transient_notice
+            .as_ref()
+            .map(|(text, _)| text.clone())
+            .unwrap_or_default();
+        assert!(
+            !notice.is_empty() && !notice.contains("more") && !notice.contains(','),
+            "the notice is the chosen value alone, no list, no tally: {notice}"
+        );
+
+        // A theme completion is silent: the palette previews live and
+        // no notice rides on top of what the user is already seeing.
+        let mut theme_app = TuiApp::new(dch_config::DchConfig::default());
+        theme_app.input.set_text("/theme ".to_string());
+        assert!(theme_app.complete_command_line(false));
+        let silent = theme_app
+            .transient_notice
+            .as_ref()
+            .map(|(text, _)| text.clone())
+            .unwrap_or_default();
+        assert!(
+            silent.is_empty(),
+            "a theme completion posts no notice — the preview is the feedback: {silent}"
+        );
+    }
+
+    #[test]
+    fn the_caret_blinks_on_the_clock_not_the_tick_count() {
+        let base = Instant::now();
+        let mut blink = CaretBlink {
+            anchor: base,
+            on: true,
+        };
+        assert!(
+            !blink.refresh(base + Duration::from_millis(100)),
+            "inside the first interval the caret stays solid"
+        );
+        assert!(
+            !blink.refresh(base + Duration::from_millis(529)),
+            "a tick near the boundary still finds it on"
+        );
+        assert!(
+            blink.refresh(base + Duration::from_millis(530)),
+            "the interval boundary flips the caret off"
+        );
+        assert!(!blink.on, "the off phase holds between flips");
+        assert!(
+            blink.refresh(base + Duration::from_millis(1060)),
+            "the second interval flips it back on"
+        );
+        // A long doze lands on the phase the clock says, not the one
+        // the tick count would: 1600 ms is three intervals — odd, off.
+        let mut dozed = CaretBlink {
+            anchor: base,
+            on: true,
+        };
+        assert!(
+            dozed.refresh(base + Duration::from_millis(1600)),
+            "three intervals in, the caret is dark whatever woke it"
+        );
+    }
+
+    #[test]
+    fn the_caret_inverts_the_glyph_under_it_while_visible() {
+        let mut subject = TuiApp::new(dch_config::DchConfig::default());
+        subject.input.set_text("zq".to_string());
+        // Park the caret over the `q` so a glyph is under it.
+        subject
+            .input
+            .handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), 80);
+        subject.caret_blink.on = true;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+        terminal
+            .draw(|frame| subject.render(frame))
+            .expect("draw with the caret on");
+        let inverted = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .find(|cell| cell.symbol() == "q" && cell.bg == subject.theme.ui.primary)
+            .expect("the glyph under the caret carries the accent");
+        assert_eq!(
+            inverted.fg, subject.theme.ui.background,
+            "the glyph reads in the canvas color: inverted under the caret"
+        );
+
+        subject.caret_blink.on = false;
+        terminal
+            .draw(|frame| subject.render(frame))
+            .expect("draw with the caret off");
+        let plain = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .find(|cell| cell.symbol() == "q")
+            .expect("the glyph is still on screen");
+        assert_ne!(
+            plain.bg, subject.theme.ui.primary,
+            "the blink's dark phase restores the plain cell"
+        );
+    }
+
+    #[test]
+    fn models_without_profiles_says_the_model_renames_directly() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        let out = command_output(&mut app, "/models");
+        assert!(out.contains("no [[models]] configured"), "got {out:?}");
+    }
+
+    #[test]
+    fn config_lists_the_values_in_effect() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        let out = command_output(&mut app, "/config");
+        assert!(out.contains("Configuration in effect"), "got {out:?}");
+        assert!(out.contains("model ="), "the model row shows, got {out:?}");
+        // The footer's live claim is pinned against the classification
+        // itself, not a copied string: every key `live` classes Display
+        // must be named in the footer, so the next Display key cannot
+        // ship unmentioned the way diff_layout did.
+        let footer = out
+            .lines()
+            .find(|line| line.contains("change live"))
+            .expect("the footer explains what changes live");
+        for key in config_fields::KEYS {
+            if matches!(config_fields::live(key), Some(config_fields::Live::Display)) {
+                assert!(
+                    footer.contains(key),
+                    "the footer names {key} among the live rows: {footer}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn set_writes_a_startup_read_value_for_the_next_session() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        let out = command_output(&mut app, "/set auto_compact false");
+        assert!(
+            out.contains("saved") && out.contains("next session"),
+            "the notice names honestly when a startup-read value lands: {out:?}"
+        );
+        assert!(
+            !app.config.runner.auto_compact,
+            "the value is written to the session's config, ready for the next start"
+        );
+        // And /unset hands back what the file gave.
+        let out = command_output(&mut app, "/unset auto_compact");
+        assert!(out.contains("restored to true"), "got {out:?}");
+        assert!(app.config.runner.auto_compact, "the original is back");
+    }
+
+    #[test]
+    fn unset_restores_an_absent_value_to_absence() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        assert!(app.config.api.reasoning_effort.is_none(), "absent at rest");
+        command_output(&mut app, "/set reasoning_effort high");
+        assert_eq!(
+            app.config.api.reasoning_effort.as_deref(),
+            Some("high"),
+            "the override stands in"
+        );
+        let out = command_output(&mut app, "/unset reasoning_effort");
+        assert!(out.contains("restored to unset"), "got {out:?}");
+        assert!(
+            app.config.api.reasoning_effort.is_none(),
+            "the restore reaches the same absence the file spelled by omission, not the literal word"
+        );
+    }
+
+    #[test]
+    fn a_set_of_the_api_key_masks_the_value_in_the_notice() {
+        // The set-side twin of the `/config` and `/unset` masks: a
+        // secret's value must never ride the notice lane — the notice is
+        // a persisted message, so the raw key would outlive the moment
+        // the user typed it. The set itself still lands; only its echo
+        // is masked, and the clearing spelling `unset` stays legible.
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        let out = command_output(&mut app, "/set api_key sk-live-supersecret");
+        assert!(out.contains("••••"), "the notice masks the secret: {out:?}");
+        assert!(
+            !out.contains("sk-live-supersecret"),
+            "the raw secret never rides the notice: {out:?}"
+        );
+        assert_eq!(
+            app.config.api.api_key.as_deref(),
+            Some("sk-live-supersecret"),
+            "the masked echo still lands the real value"
+        );
+    }
+
+    #[test]
+    fn unset_restores_an_absent_api_key_to_none() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        assert!(app.config.api.api_key.is_none(), "absent at rest");
+        command_output(&mut app, "/set api_key sk-live");
+        assert_eq!(app.config.api.api_key.as_deref(), Some("sk-live"));
+        let out = command_output(&mut app, "/unset api_key");
+        assert!(
+            out.contains("restored to unset"),
+            "an absent original is named as the absence it is, not masked \
+             as a restored credential: {out:?}"
+        );
+        assert!(
+            !out.contains("••••"),
+            "bullets over an absence read as a restored value: {out:?}"
+        );
+        assert!(
+            app.config.api.api_key.is_none(),
+            "an absent key does not come back as an empty value shadowing the environment credential"
+        );
+    }
+
+    #[test]
+    fn sessions_parse_and_refuse_under_a_run() {
+        let commands::Parsed::Command(command) = commands::parse("/sessions") else {
+            panic!("the bare spelling is the whole command");
+        };
+        assert!(matches!(command, Command::Sessions));
+        assert!(
+            matches!(
+                commands::parse("/sessions now"),
+                commands::Parsed::Unknown { .. }
+            ),
+            "the command takes no argument"
+        );
+
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        app.state
+            .agent_running
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.set_submit_tx(tx);
+        let out = command_output(&mut app, "/sessions");
+        assert!(
+            out.contains("commands run between turns"),
+            "the picker asks between turns, like every conversation mover: {out:?}"
+        );
+        assert!(rx.try_recv().is_err(), "no listing travels under a run");
+    }
+
+    #[test]
+    fn the_session_picker_walks_and_enter_resumes_the_chosen_row() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        let rows = vec![
+            SessionPick {
+                id: "11111111-1111-1111-1111-111111111111".to_string(),
+                model: "newest-model".to_string(),
+                saved_at: chrono::Utc::now(),
+                prompts: 3,
+                workdir: None,
+            },
+            SessionPick {
+                id: "22222222-2222-2222-2222-222222222222".to_string(),
+                model: "older-model".to_string(),
+                saved_at: chrono::Utc::now(),
+                prompts: 7,
+                workdir: None,
+            },
+        ];
+        app.apply_session_update(SessionUpdate::SessionCatalog { rows });
+        assert!(
+            app.session_picker.is_some(),
+            "a catalog with rows opens the picker"
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.set_submit_tx(tx);
+
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(
+            app.handle_key(down),
+            "the arrows are the picker's while it stands"
+        );
+        assert!(app.handle_key(enter), "Enter takes the row");
+        assert!(app.session_picker.is_none(), "resuming closes the picker");
+        let sent = rx
+            .try_recv()
+            .expect("Enter handed the row to the resume lane");
+        let crate::queue::Submission::Command { command } = sent else {
+            panic!("the picker's Enter sends a command, got {sent:?}")
+        };
+        let SessionCommand::Resume { id } = command else {
+            panic!("the chosen row travels as a resume, got {command:?}")
+        };
+        assert_eq!(
+            id, "22222222-2222-2222-2222-222222222222",
+            "the walked-to row is the one that resumes"
+        );
+
+        // An empty catalog says so without opening a sheet, and Esc
+        // closes a standing picker.
+        app.apply_session_update(SessionUpdate::SessionCatalog { rows: Vec::new() });
+        assert!(
+            app.session_picker.is_none(),
+            "an empty catalog never opens the sheet"
+        );
+        app.apply_session_update(SessionUpdate::SessionCatalog {
+            rows: vec![SessionPick {
+                id: "33333333-3333-3333-3333-333333333333".to_string(),
+                model: "m".to_string(),
+                saved_at: chrono::Utc::now(),
+                prompts: 1,
+                workdir: None,
+            }],
+        });
+        assert!(app.session_picker.is_some());
+        assert!(app.handle_key(esc), "Esc is the picker's");
+        assert!(app.session_picker.is_none(), "Esc closes the picker");
+    }
+
+    #[test]
+    fn the_switch_verdict_does_not_overwrite_the_engine_s_window() {
+        // The display's verdict arm is not the window's authority: the
+        // driver rebuilt the engine and stored its actual measure —
+        // including any provider-probe discovery the config alone
+        // cannot name. The display makes the same profile selection
+        // for /config, but does NOT re-store the window; whatever the
+        // engine measures is what the bar reads, and the config's
+        // figure (the fallback 200k when nothing states one) must not
+        // replace it.
+        let config = dch_config::DchConfig {
+            models: vec![dch_config::ModelProfile {
+                model: "wide".to_string(),
+                context_window: None,
+                ..dch_config::ModelProfile::default()
+            }],
+            ..dch_config::DchConfig::default()
+        };
+        let mut app = TuiApp::new(config);
+        // The driver stored the engine's probe-discovered figure —
+        // say 131072 (a real window the config never states).
+        app.state
+            .context_window
+            .store(131_072, std::sync::atomic::Ordering::SeqCst);
+        app.apply_session_update(SessionUpdate::ModelName {
+            name: "wide".to_string(),
+        });
+        let (_, window) = app.context_snapshot();
+        assert_eq!(
+            window, 131_072,
+            "the engine's own measure survives the verdict — the config's fallback does not replace it"
+        );
+    }
+
+    #[test]
+    fn a_sheet_s_esc_does_not_arm_the_cancel_ladder() {
+        // The restored priority: a sheet (a permission ask) reads its
+        // own Esc — the ask denies — without stepping the cancel
+        // ladder. Only a bare composer lets the ladder engage, so a
+        // user denying rapid asks cannot accidentally arm a cancel,
+        // and the run's cancel needs its own deliberate pair.
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        app.state
+            .agent_running
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let cancels = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sink = Arc::clone(&cancels);
+        app.set_run_canceller(Box::new(move || {
+            sink.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        app.pending_permissions
+            .push_back(crate::permission::PermissionRequest {
+                tool_name: "Bash".to_string(),
+                prompt: "run it?".to_string(),
+                reply: reply_tx,
+            });
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+
+        // The ask's Esc: denies it, does NOT arm the cancel.
+        assert!(app.handle_key(esc), "the sheet's Esc is taken");
+        assert!(
+            !reply_rx.blocking_recv().unwrap_or(true),
+            "the standing ask still reads the Esc as its deny"
+        );
+        assert_eq!(
+            cancels.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the sheet's press never arms the cancel"
+        );
+
+        // With the ask gone and the composer bare, the ladder works:
+        // arm, then cancel.
+        assert!(app.handle_key(esc), "the bare-composer Esc is taken");
+        assert_eq!(
+            cancels.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "one bare press arms, it does not cancel"
+        );
+        assert!(app.handle_key(esc), "the second bare Esc is taken");
+        assert_eq!(
+            cancels.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the second bare Esc cancels the run"
+        );
+    }
+
+    #[test]
+    fn a_model_verdict_persists_the_transcript_at_once() {
+        // The switch changes the envelope's model the moment it lands
+        // — the saver is already relabeled on the driver's half — so
+        // the display fires the save hook immediately: session.json
+        // names the new model without waiting for a turn to end.
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        let fired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sink = Arc::clone(&fired);
+        app.set_turn_end_hook(Box::new(move |_, _| {
+            sink.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+        app.apply_session_update(SessionUpdate::ModelName {
+            name: "switched-model".to_string(),
+        });
+        assert_eq!(
+            fired.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the verdict publishes a save at once, not at the next turn end"
+        );
+        assert_eq!(
+            app.config.api.model, "switched-model",
+            "and the config carries the verdict"
+        );
+    }
+
+    #[test]
+    fn resume_refuses_while_a_run_is_in_flight() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        app.state
+            .agent_running
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.set_submit_tx(tx);
+        let id = uuid::Uuid::new_v4().to_string();
+        let out = command_output(&mut app, &format!("/resume {id}"));
+        assert!(
+            out.contains("commands run between turns"),
+            "the registry's refusal promise holds: {out:?}"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing travels to the driver under a run"
+        );
+    }
+
+    #[test]
+    fn a_resume_drops_the_waiting_queue_before_the_send() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        // A prompt waiting in the queue belongs to the conversation being
+        // left; the resume drops it before the send so the driver's next
+        // claim cannot race the resumed session's first turn.
+        app.state
+            .queued
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push("a waiting prompt".to_string());
+        let id = uuid::Uuid::new_v4().to_string();
+        let out = command_output(&mut app, &format!("/resume {id}"));
+        assert!(out.contains("resuming the session…"), "got {out:?}");
+        assert!(
+            app.state
+                .queued
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "the waiting prompts do not travel to the resumed session"
+        );
+    }
+
+    #[test]
+    fn a_stolen_multibyte_lead_is_named_not_mangled() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        // 0xE2 leads the three-byte spelling of an em dash; the query's
+        // reader took only the first byte, so no character can be built
+        // from it — the composer must stay empty and the notice must
+        // name the loss rather than plant a Latin-1 look-alike.
+        app.return_stolen_byte(0xE2);
+        assert!(
+            app.input.is_empty(),
+            "no fabricated character lands in the composer"
+        );
+        let notice = app
+            .transient_notice
+            .as_ref()
+            .map(|(text, _)| text.clone())
+            .unwrap_or_default();
+        assert!(
+            notice.contains("multi-byte"),
+            "the loss is named honestly: {notice:?}"
+        );
+
+        // An ASCII printable byte still lands as if typed, control or not.
+        app.return_stolen_byte(b'a');
+        app.return_stolen_byte(b' ');
+        assert_eq!(
+            app.input.text(),
+            "a ",
+            "printable ASCII arrives exactly as typed"
+        );
+        app.return_stolen_byte(0x01);
+        let notice = app
+            .transient_notice
+            .as_ref()
+            .map(|(text, _)| text.clone())
+            .unwrap_or_default();
+        assert!(
+            notice.contains("was consumed") && !notice.contains("multi-byte"),
+            "a control byte is named as itself: {notice:?}"
+        );
+    }
+
+    #[test]
+    fn a_static_caret_display_paints_through_the_dark_phase() {
+        let mut subject = TuiApp::new(dch_config::DchConfig::default());
+        subject.config.display.caret_display = dch_config::CaretDisplay::Static;
+        subject.input.set_text("zq".to_string());
+        subject.caret_blink.on = false;
+        assert!(
+            subject.composer_caret_visible(),
+            "a static caret ignores the beat's phase"
+        );
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+        terminal
+            .draw(|frame| subject.render(frame))
+            .expect("draw in the dark phase");
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .any(|cell| cell.bg == subject.theme.ui.primary),
+            "the caret cell paints through the dark phase"
+        );
+
+        // The blinking default keeps the phase: the same dark tick
+        // hides the caret.
+        let mut beating = TuiApp::new(dch_config::DchConfig::default());
+        beating.caret_blink.on = false;
+        assert!(
+            !beating.composer_caret_visible(),
+            "the blinking caret still hides in its dark phase"
+        );
+    }
+
+    #[test]
+    fn typing_resolidifies_a_dark_caret_and_mouse_traffic_does_not() {
+        // The painted caret's resolidify contract, pinned at the seam
+        // where the phase can be forced dark: a keystroke through the
+        // input path brings the caret back at once — not at the next
+        // phase boundary — and mouse traffic, which reads rather than
+        // types, leaves the dark phase dark.
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        app.caret_blink.on = false;
+        assert!(
+            app.handle_event(&crossterm::event::Event::Key(KeyEvent::new(
+                KeyCode::Char('x'),
+                KeyModifiers::NONE
+            ))),
+            "the editor takes the keystroke"
+        );
+        assert!(
+            app.composer_caret_visible(),
+            "keyboard input resolidifies the caret from its dark phase"
+        );
+        app.caret_blink.on = false;
+        let reading = crossterm::event::Event::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollUp,
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+        let _ = app.handle_event(&reading);
+        assert!(
+            !app.composer_caret_visible(),
+            "mouse traffic leaves the dark phase alone"
+        );
+    }
+
+    #[test]
+    fn a_set_value_is_overridable_and_unset_restores_the_original() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        // Default verbosity is Normal; set it to Verbose, then undo exactly.
+        command_output(&mut app, "/set verbosity verbose");
+        assert!(
+            matches!(app.verbosity, dch_config::Verbosity::Verbose),
+            "the set applies to the live display"
+        );
+        let out = command_output(&mut app, "/unset verbosity");
+        assert!(out.contains("restored"), "got {out:?}");
+        assert!(
+            !matches!(app.verbosity, dch_config::Verbosity::Verbose),
+            "unset reverts to the value before the override"
+        );
+    }
+
+    #[test]
+    fn unset_of_a_never_overridden_key_says_so() {
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        let out = command_output(&mut app, "/unset theme");
+        assert!(out.contains("no session override"), "got {out:?}");
+    }
+
+    #[test]
+    fn a_resume_target_that_is_not_a_session_id_is_refused_locally() {
+        // The driver's load keys on the id alone, so a target that is not
+        // one is refused before anything is sent: the notice names the
+        // shape /resume takes, and the channel carries nothing.
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.set_submit_tx(tx);
+        let out = command_output(&mut app, "/resume 7");
+        assert!(out.contains("not a session id"), "got {out:?}");
+        assert!(
+            rx.try_recv().is_err(),
+            "a malformed target sends the driver nothing"
+        );
+        let bare = command_output(&mut app, "/resume");
+        assert!(bare.contains("which session?"), "got {bare:?}");
+    }
+
+    #[test]
+    fn a_well_formed_resume_target_sends_the_driver_the_swap() {
+        // The live swap's send half: an id that parses travels to the
+        // driver untouched, and the transcript stays free of
+        // slash-command rows.
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.set_submit_tx(tx);
+        let id = uuid::Uuid::new_v4().to_string();
+        let out = command_output(&mut app, &format!("/resume {id}"));
+        assert!(out.contains("resuming"), "got {out:?}");
+        let sent = rx
+            .try_recv()
+            .expect("the resume command reaches the driver");
+        assert!(
+            matches!(
+                sent,
+                crate::queue::Submission::Command {
+                    command: crate::queue::SessionCommand::Resume { .. }
+                }
+            ),
+            "the driver gets the live swap: {sent:?}"
+        );
+    }
+
+    #[test]
+    fn compact_sends_the_manual_pass_to_the_driver() {
+        // The manual seam: `/compact` sends the driver the compact
+        // command, the engine's own context manager folds the history
+        // between runs, and the next turn continues from the compacted
+        // context. The display's notice stays free of token figures —
+        // the driver's own logging carries those.
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.set_submit_tx(tx);
+        let out = command_output(&mut app, "/compact");
+        let sent = rx
+            .try_recv()
+            .expect("the compact command reaches the driver");
+        assert!(
+            matches!(
+                sent,
+                crate::queue::Submission::Command {
+                    command: crate::queue::SessionCommand::Compact
+                }
+            ),
+            "the driver gets the manual pass: {sent:?}"
+        );
+        assert!(
+            out.is_empty() || !out.contains("automatic"),
+            "the command sends the pass rather than narrating the automatic one: {out:?}"
+        );
+    }
+
+    #[test]
+    fn the_help_listing_renders_in_the_registrys_grouped_order() {
+        // The palette's own order is the listing's order: /help renders
+        // the registry grouped by category without sorting anything of
+        // its own, so the two cannot drift apart.
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        let out = command_output(&mut app, "/help");
+        let help_at = out.find("Help:").expect("the Help heading leads");
+        let sessions_at = out.find("Sessions:").expect("the Sessions heading follows");
+        let appearance_at = out
+            .find("Appearance:")
+            .expect("the Appearance heading sits mid-list");
+        let config_at = out
+            .find("Configuration:")
+            .expect("the Configuration heading trails");
+        let context_at = out.find("Context:").expect("the Context heading closes");
+        assert!(
+            help_at < sessions_at
+                && sessions_at < appearance_at
+                && appearance_at < config_at
+                && config_at < context_at,
+            "the listing keeps the palette's deliberate order: {out:?}"
+        );
+    }
+
+    #[test]
+    fn a_resumed_session_re_seeds_the_transcript_and_empties_the_queue() {
+        // The display half of the live swap: what arrives over the session
+        // channel replaces the conversation wholesale, drops the prompts
+        // waiting for the ended one, and restores the counters to the
+        // saved session's accounting.
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        app.seed_messages(vec![TuiMessage::System {
+            text: "the old conversation".to_string(),
+            timestamp: chrono::Utc::now(),
+        }]);
+        app.state
+            .queued
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push("waiting on the old session".to_string());
+        app.apply_session_update(crate::queue::SessionUpdate::Resumed {
+            id: "resumed-id".to_string(),
+            transcript: vec![TuiMessage::System {
+                text: "the resumed conversation".to_string(),
+                timestamp: chrono::Utc::now(),
+            }],
+            tokens: crate::queue::ResumedTokens {
+                cumulative_input: 11,
+                cumulative_output: 7,
+                last_input: 5,
+                context_tokens: 3,
+            },
+        });
+        let texts: Vec<String> = app
+            .conversation
+            .iter()
+            .filter_map(|message| match message {
+                TuiMessage::System { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["the resumed conversation".to_string()],
+            "the loaded transcript is the conversation now"
+        );
+        assert!(
+            app.state
+                .queued
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "prompts waiting for the ended conversation do not survive"
+        );
+        assert_eq!(app.session_id.as_deref(), Some("resumed-id"));
+        let (cumulative_input, context_tokens) = {
+            let counts = app
+                .state
+                .tokens
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (counts.cumulative_input, counts.context_tokens)
+        };
+        assert_eq!(cumulative_input, 11, "the spend continues the save's count");
+        assert_eq!(context_tokens, 3, "the usage bar opens on the saved fill");
+    }
+
+    #[test]
+    fn a_notice_from_the_driver_lands_on_the_notice_row() {
+        // The driver has no other way to be heard: a refusal, a failure,
+        // or a result arrives as plain text and posts where the user
+        // reads.
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        app.apply_session_update(crate::queue::SessionUpdate::Notice {
+            text: "the loop kept its model".to_string(),
+        });
+        let (notice, _) = app.transient_notice.as_ref().expect("a notice stands");
+        assert!(notice.contains("kept its model"), "got {notice:?}");
+    }
+
+    #[test]
+    fn unset_persists_the_restored_value_to_the_config_file() {
+        // The undo is a change like the change it undoes: /unset restores
+        // the value configuration had and writes it back, so a restart
+        // cannot resurrect the override.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        app.set_config_persist_dir(Some(dir.path().to_path_buf()));
+        app.run_command(Command::Set {
+            key: "theme".to_string(),
+            value: "nord".to_string(),
+        });
+        let saved =
+            std::fs::read_to_string(dir.path().join("config.toml")).expect("the set landed");
+        assert!(saved.contains("\"nord\""), "got {saved}");
+        app.run_command(Command::Unset {
+            key: "theme".to_string(),
+        });
+        let saved =
+            std::fs::read_to_string(dir.path().join("config.toml")).expect("the restore landed");
+        assert!(
+            !saved.contains("\"nord\""),
+            "the restore is written back: {saved}"
+        );
+    }
+
+    #[test]
+    fn a_model_switch_persists_only_on_the_loops_verdict() {
+        // The send is not the switch: the panel writes nothing when the
+        // command leaves, and the file lands when the loop's acceptance
+        // comes back over the session channel — a refused switch leaves
+        // the file describing the loop that kept running.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        app.set_config_persist_dir(Some(dir.path().to_path_buf()));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        app.set_submit_tx(tx);
+        app.run_command(Command::Model {
+            name: "other-model".to_string(),
+        });
+        assert!(
+            !dir.path().join("config.toml").exists(),
+            "the send alone writes nothing"
+        );
+        app.apply_session_update(crate::queue::SessionUpdate::ModelName {
+            name: "other-model".to_string(),
+        });
+        let saved =
+            std::fs::read_to_string(dir.path().join("config.toml")).expect("the verdict landed");
+        assert!(saved.contains("\"other-model\""), "got {saved}");
+    }
+
+    #[test]
+    fn a_verdict_reselects_over_the_base_not_the_accreted_live_config() {
+        // The no-accretion rule: the boot selection laid the seed entry
+        // (its 200_000 window) onto the live config; a later verdict for
+        // an entry stating no window must resolve over the user-stated
+        // base — whose own window is 64_000 — not over the live bundle,
+        // where the seed's 200_000 would silently stand and /config
+        // would misreport the very figure the switch's notice prints.
+        let file_config = dch_config::DchConfig::from_toml_str(
+            r#"
+[api]
+model = "seed"
+context_window = 64_000
+
+[[models]]
+model = "seed"
+context_window = 200_000
+
+[[models]]
+model = "plain"
+"#,
+        )
+        .expect("the fixture parses");
+        let mut booted = file_config.clone();
+        booted
+            .select_model(None)
+            .expect("the boot selection lays the seed entry");
+        assert_eq!(
+            booted.api.context_window,
+            Some(200_000),
+            "fixture premise: the live config carries the seed's window after boot"
+        );
+        let mut app = TuiApp::new(booted);
+        app.set_config_base(file_config);
+        app.apply_session_update(crate::queue::SessionUpdate::ModelName {
+            name: "plain".to_string(),
+        });
+        assert_eq!(app.config.api.model, "plain", "the verdict's model stands");
+        assert_eq!(
+            app.config.api.context_window,
+            Some(64_000),
+            "the base's own window is what runs — the seed entry's 200_000 did not accrete"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_failed_persist_names_the_class_honestly() {
+        // The two live classes fail differently and the failure notice
+        // must say which happened: a display value has already applied
+        // and only the save is lost, while a restart-class value applied
+        // nothing this session and, unsaved, applies nothing next start
+        // either.
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500))
+            .expect("the dir refuses staging");
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        app.set_config_persist_dir(Some(dir.path().to_path_buf()));
+        let out = command_output(&mut app, "/set max_turns 50");
+        assert!(
+            out.contains("not saved") && out.contains("never applied this session"),
+            "a restart-class failure says nothing applied and nothing will: {out:?}"
+        );
+        let out = command_output(&mut app, "/set verbosity verbose");
+        assert!(
+            out.contains("applied for this session only"),
+            "a display-class failure says the session kept the change: {out:?}"
+        );
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("the dir is writable again for cleanup");
+    }
+
+    #[test]
+    fn set_of_an_unknown_theme_is_refused_whole() {
+        // The whole /set theme nonsense story at the command level: the
+        // notice refuses naming the word, the config keeps its theme, and
+        // nothing reaches the file — no "applied now", no silent
+        // fallback at the next launch.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        app.set_config_persist_dir(Some(dir.path().to_path_buf()));
+        let out = command_output(&mut app, "/set theme not-a-theme");
+        assert!(
+            out.contains("could not set theme") && out.contains("not-a-theme"),
+            "the refusal names the field and the word: {out:?}"
+        );
+        assert!(
+            !out.contains("applied now"),
+            "a refused set never claims it applied: {out:?}"
+        );
+        assert_eq!(
+            app.config.display.theme, "default",
+            "the config keeps its theme"
+        );
+        assert!(
+            !dir.path().join("config.toml").exists(),
+            "a refused set persists nothing"
+        );
+    }
+
+    #[test]
+    fn set_of_an_off_ladder_effort_is_refused_whole() {
+        // The command-level half: `/set reasoning_effort hihg` is
+        // refused with the ladder named, the config keeps its value,
+        // and nothing reaches the file — the next start stays
+        // constructible.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        app.set_config_persist_dir(Some(dir.path().to_path_buf()));
+        let out = command_output(&mut app, "/set reasoning_effort hihg");
+        assert!(
+            out.contains("could not set reasoning_effort") && out.contains("hihg"),
+            "the refusal names the field and the word: {out:?}"
+        );
+        assert!(
+            app.config.api.reasoning_effort.is_none(),
+            "the config keeps its value"
+        );
+        assert!(
+            !dir.path().join("config.toml").exists(),
+            "a refused set persists nothing"
+        );
+    }
+
+    #[test]
+    fn set_of_a_bricking_value_is_refused_whole() {
+        // The command-level half of the bricking fix: `/set
+        // turn_timeout_secs 60` is refused at the field gate with the
+        // loader's floor named, the config keeps its value, and the file
+        // is never written — the next start stays possible.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        app.set_config_persist_dir(Some(dir.path().to_path_buf()));
+        let out = command_output(&mut app, "/set turn_timeout_secs 60");
+        assert!(
+            out.contains("could not set turn_timeout_secs") && out.contains("120"),
+            "the refusal names the field and the floor: {out:?}"
+        );
+        assert_eq!(
+            app.config.runner.turn_timeout_secs, 300,
+            "the config keeps its value"
+        );
+        assert!(
+            !dir.path().join("config.toml").exists(),
+            "a refused set persists nothing"
+        );
+    }
+
+    #[test]
+    fn a_stolen_printable_key_lands_in_the_composer_and_other_bytes_notice() {
+        // The pause handshake costs latency, never input: a printable
+        // keystroke the query consumed returns to the composer as if
+        // typed, and a control byte is said aloud rather than dropped.
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        app.return_stolen_byte(b'x');
+        assert!(
+            app.input.text().contains('x'),
+            "the printable keystroke reaches the composer"
+        );
+        app.return_stolen_byte(0x03);
+        let (notice, _) = app
+            .transient_notice
+            .as_ref()
+            .expect("a consumed control byte is acknowledged");
+        assert!(notice.contains("consumed"), "got {notice:?}");
+    }
+
+    #[test]
+    fn a_stolen_esc_says_nothing() {
+        // The one silent case: Esc pressed inside the terminal query's
+        // window — the half-second a committed theme switch spends
+        // asking the terminal about its canvas — is a habitual
+        // dismissal, not information. The keystroke is swallowed
+        // without a notice: the /theme-plus-Esc flow clears its command
+        // and the screen announces nothing, because the press carried
+        // nothing worth announcing and the query window already cost
+        // the moment.
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        app.return_stolen_byte(0x1b);
+        assert!(
+            app.transient_notice.is_none(),
+            "a swallowed Esc posts no notice"
+        );
+        assert!(
+            app.input.is_empty(),
+            "a swallowed Esc inserts nothing into the composer"
+        );
+        assert!(
+            app.conversation.is_empty(),
+            "a swallowed Esc writes no message to the transcript"
+        );
+    }
+
+    #[test]
+    fn a_session_update_lands_in_the_status_bar_fields() {
+        // The reverse lane: facts the driver computes and the display cannot.
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        app.apply_session_update(crate::queue::SessionUpdate::SessionId {
+            id: "abc-123".to_string(),
+        });
+        assert_eq!(app.session_id.as_deref(), Some("abc-123"));
+        app.apply_session_update(crate::queue::SessionUpdate::ModelName {
+            name: "gpt-4o".to_string(),
+        });
+        assert_eq!(app.config.api.model, "gpt-4o");
+        // The window follows the accepted model: once the verdict names the
+        // wide profile, the retired engine figure gives way to that
+        // profile's configured window.
+        app.config.models = vec![dch_config::ModelProfile {
+            model: "wide".to_string(),
+            context_window: Some(400_000),
+            ..dch_config::ModelProfile::default()
+        }];
+        app.retire_live_context_window();
+        app.apply_session_update(crate::queue::SessionUpdate::ModelName {
+            name: "wide".to_string(),
+        });
+        let (_, window) = app.context_snapshot();
+        assert_eq!(
+            window, 400_000,
+            "the bar reads the accepted model's configured window"
         );
     }
 }

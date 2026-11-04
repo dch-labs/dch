@@ -318,10 +318,13 @@ pub fn running_tool_lines(
         ))],
         Verbosity::Normal => vec![Line::from(vec![
             Span::styled(RUNNING_GLYPH, Style::default().fg(theme.ui.dim)),
-            Span::raw(format!(
-                " {} ",
-                humanize_tool_summary(&tool.name, &tool.input_summary)
-            )),
+            Span::styled(
+                format!(
+                    " {} ",
+                    humanize_tool_summary(&tool.name, &tool.input_summary)
+                ),
+                Style::default().fg(theme.ui.foreground),
+            ),
             Span::styled(
                 format!("({elapsed})"),
                 Style::default().fg(theme.ui.assistant_message_fg),
@@ -408,5 +411,65 @@ pub fn format_elapsed(secs: f64) -> String {
         format!("{}m{}s", (total / 60.0).floor(), total % 60.0)
     } else {
         format!("{secs:.1}s")
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc
+)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_running_title_reads_the_themes_standing_foreground() {
+        // The name span of a running tool rides the standing register —
+        // the theme's own foreground, never the terminal's default. A
+        // canvas-repainting theme (github_light writes a white canvas)
+        // cannot lean on a default foreground that belongs to the
+        // scheme the user launched under: on a dark-scheme terminal
+        // that default is light, and the title rendered white on
+        // white. The glyph stays dim and the elapsed stays in the reply
+        // register — the name alone stands at full voice.
+        let tool = crate::message::ActiveTool {
+            call_id: "call-1".to_string(),
+            name: "Bash".to_string(),
+            input_summary: "cargo test".to_string(),
+            start: std::time::Instant::now(),
+        };
+        let theme = crate::theme::Theme::by_name("github_light").expect("the theme resolves");
+        let lines = running_tool_lines(&tool, &theme, dch_config::Verbosity::Normal);
+        let row = lines.first().expect("the running row");
+        let name = row
+            .spans
+            .iter()
+            .find(|span| span.content.contains("Running:"))
+            .expect("the title span");
+        assert_eq!(
+            name.style.fg,
+            Some(theme.ui.foreground),
+            "the running title carries the theme's standing foreground — \
+             never the terminal default the white canvas would betray"
+        );
+        let glyph = row.spans.first().expect("the glyph leads");
+        assert_eq!(
+            glyph.style.fg,
+            Some(theme.ui.dim),
+            "the glyph keeps the dim register"
+        );
+        let elapsed = row
+            .spans
+            .iter()
+            .find(|span| span.content.starts_with('('))
+            .expect("the elapsed span");
+        assert_eq!(
+            elapsed.style.fg,
+            Some(theme.ui.assistant_message_fg),
+            "the elapsed keeps the reply register"
+        );
     }
 }

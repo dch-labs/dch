@@ -495,8 +495,11 @@ async fn construct_run(
 
     let mut config = load_config(args.config.config_path.as_deref())
         .map_err(|message| construction_failure(args, message, inherited_mode))?;
+    let mut base = config.clone();
+    apply_non_model_overrides(&mut base, args);
     apply_cli_overrides(&mut config, args)
         .map_err(|message| construction_failure(args, message, inherited_mode))?;
+    crate::resume::adopt_resumed_model(&mut config, &base, control, args.model.as_deref());
 
     let verbosity = resolve_verbosity(&config, args);
     let observer = Arc::new(ConsoleObserver::new(
@@ -727,6 +730,12 @@ pub(crate) fn load_config(path: Option<&Path>) -> Result<dch_config::DchConfig, 
 /// runners carry that failure to their own startup error path rather than
 /// beginning a run against the wrong endpoint.
 ///
+/// The non-model overrides land first via
+/// [`apply_non_model_overrides`], then the boot model selection runs —
+/// the file's saved `[api] model` names the default when it matches a
+/// declared entry, else the first entry does — so a host that wants the
+/// pre-selection base for later re-selection snapshots between the two.
+///
 /// # Errors
 ///
 /// Returns the user-facing message for a `--model` name that matches no
@@ -735,9 +744,21 @@ pub(crate) fn apply_cli_overrides(
     config: &mut dch_config::DchConfig,
     args: &Args,
 ) -> Result<(), String> {
+    apply_non_model_overrides(config, args);
     config
         .select_model(args.model.as_deref())
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| err.to_string())
+}
+
+/// Apply every CLI override except the boot model selection.
+///
+/// The base a later model selection layers onto: theme, reasoning
+/// effort, path-safety, permission mode, and redaction are user
+/// statements the selection must not displace, while the model choice
+/// itself is the selection's whole job. Applying exactly these to a
+/// clone of the loaded file yields the pre-selection base the interactive
+/// host carries beside its live config.
+pub(crate) fn apply_non_model_overrides(config: &mut dch_config::DchConfig, args: &Args) {
     if let Some(theme) = &args.theme {
         config.display.theme.clone_from(theme);
     }
@@ -753,7 +774,6 @@ pub(crate) fn apply_cli_overrides(
     if args.config.no_redact {
         config.security.redact_secrets = false;
     }
-    Ok(())
 }
 
 /// Resolve the effective verbosity from config and CLI flags.
@@ -1904,7 +1924,7 @@ mod tests {
     /// concurrently delivered test signal would hijack.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn a_resumed_run_uses_the_current_config_s_model_until_the_cli_overrides_it() {
+    async fn a_resumed_run_continues_the_sessions_last_model_until_the_cli_overrides_it() {
         let _signal_lock = SIGNAL_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1959,8 +1979,8 @@ mod tests {
         );
         let (_, model, _, _) = crate::session::load_with_meta_in(*id, sessions.path()).unwrap();
         assert_eq!(
-            model, "m-second",
-            "a resumed session runs — and re-records — the current configuration's model"
+            model, "m-first",
+            "a resumed session continues on — and re-records — the model it last ran, not the configuration's current one"
         );
 
         let third = parse(&[
@@ -1987,7 +2007,7 @@ mod tests {
         let (_, model, _, _) = crate::session::load_with_meta_in(*id, sessions.path()).unwrap();
         assert_eq!(
             model, "m-cli",
-            "an explicit --model overrides the current configuration"
+            "an explicit --model overrides both the envelope and the configuration"
         );
     }
 }

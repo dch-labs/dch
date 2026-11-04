@@ -402,7 +402,7 @@ fn guidance_a_run_never_reached_comes_back_once_the_slot_is_idle() {
     while let Ok(submission) = rx.try_recv() {
         match submission {
             dch_tui::Submission::Run { id } => ids.push(id),
-            other @ dch_tui::Submission::Correct { .. } => {
+            other @ (dch_tui::Submission::Correct { .. } | dch_tui::Submission::Command { .. }) => {
                 panic!("a returned prompt is handed over as a run, got {other:?}")
             }
         }
@@ -727,6 +727,37 @@ fn one_returned_prompt_is_reported_in_the_singular() {
 }
 
 #[test]
+fn returned_guidance_drains_the_rebuilt_slot() {
+    // A rebuild swaps the steering cell; the run-end hand-back must
+    // drain the slot the session's runner holds now, not only the
+    // startup handle the app kept — otherwise words steered into the
+    // rebuilt runner and never read sit sealed in a pocket nothing
+    // drains, silently, while the promised queue hand-back never
+    // happens.
+    let (mut app, kept, _rx, _startup) = app_steerable();
+    let rebuilt = FakeGuidance::returned(&["steered past the rebuild"]);
+    kept.adopt_runner_handles(
+        Arc::new(loopctl::cancel::CancelSignal::new()),
+        Some(Arc::clone(&rebuilt) as Arc<dyn Guidance>),
+    );
+    running(&kept, false);
+
+    let frame = rows(&mut app, 80, 24);
+
+    assert_eq!(
+        waiting(&kept),
+        ["steered past the rebuild"],
+        "the rebuilt slot's unreturned words come back to the waiting queue"
+    );
+    assert!(
+        frame
+            .iter()
+            .any(|row| row.contains("1 prompt the model never read is waiting again")),
+        "under the documented notice: {frame:?}"
+    );
+}
+
+#[test]
 fn returned_guidance_with_no_driver_says_it_cannot_run() {
     let (mut app, kept, rx, _slot) = app_steerable();
     let guidance = FakeGuidance::returned(&["words with nowhere to go"]);
@@ -758,9 +789,7 @@ fn the_hint_names_the_chord_exactly_when_it_would_do_something() {
     type_into(&mut app, "wait, the service is mine");
     let frame = rows(&mut app, 90, 24);
     assert!(
-        frame
-            .iter()
-            .any(|row| row.contains("ctrl+s sends this to the running turn")),
+        frame.iter().any(|row| row.contains("ctrl+s to guide")),
         "the hint shows with a draft and a run in flight: {frame:?}"
     );
 

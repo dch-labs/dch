@@ -232,6 +232,28 @@ pub enum PathStyle {
     Relative,
 }
 
+/// How the composer's caret presents itself.
+///
+/// Selects the caret's beat. Consumed from
+/// [`DisplayConfig::caret_display`] and (de)serialized as its
+/// lowercase name — `"static"` or `"blink"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CaretDisplay {
+    /// A solid caret, on in every frame.
+    ///
+    /// The blink's dark phase never darkens it: some eyes and some
+    /// terminals prefer the still marker.
+    Static,
+
+    /// The blinking caret, on a clock-steady beat.
+    ///
+    /// The default: the 530 ms on/off cadence, resolidified by
+    /// keyboard input.
+    #[default]
+    Blink,
+}
+
 /// The animation the TUI's activity strip plays while the agent runs.
 ///
 /// Selects the breathing bar's motion. Consumed from
@@ -617,6 +639,14 @@ pub enum DchConfigError {
     /// deserialize into [`DchConfig`].
     #[error("failed to parse config TOML: {0}")]
     Parse(#[from] toml::de::Error),
+
+    /// Serialization failure while persisting a configuration.
+    ///
+    /// Wraps the [`toml::ser::Error`] raised when a value in the
+    /// configuration cannot be rendered into a TOML document — the
+    /// save stops before any file is touched.
+    #[error("failed to serialize config TOML: {0}")]
+    Serialize(#[from] toml::ser::Error),
 
     /// A present config file carried a value the loader rejects.
     ///
@@ -1074,6 +1104,14 @@ pub struct DisplayConfig {
     /// (PageUp/PageDown, arrows on an empty editor) covers the rest.
     pub mouse_capture: bool,
 
+    /// How the composer's caret presents itself.
+    ///
+    /// `blink` (the default) keeps the clock-steady 530 ms on/off
+    /// cadence; `static` stands the caret solid in every frame. The
+    /// caret's shape and placement never change — only its beat. See
+    /// [`CaretDisplay`].
+    pub caret_display: CaretDisplay,
+
     /// How the TUI lays out a file edit's diff in the conversation
     /// pane.
     ///
@@ -1491,6 +1529,7 @@ impl Default for DisplayConfig {
             path_style: PathStyle::default(),
             diff_layout: DiffLayout::default(),
             mouse_capture: true,
+            caret_display: CaretDisplay::default(),
             copy_command: None,
         }
     }
@@ -1571,6 +1610,141 @@ impl DchConfig {
             return Self::from_toml_str(&content);
         }
         Ok(Self::default())
+    }
+
+    /// Serialize the whole configuration to TOML text.
+    ///
+    /// The mirror of [`from_toml_str`](Self::from_toml_str): every field
+    /// in effect — defaults where nothing was configured — rendered as
+    /// the document a later load parses back to this same
+    /// configuration. [`save_to_dir`](Self::save_to_dir) writes exactly
+    /// this text.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`toml::ser::Error`] serialization raises, such as a
+    /// value no TOML document can carry.
+    pub fn to_toml_string(&self) -> Result<String, DchConfigError> {
+        Ok(toml::to_string_pretty(self)?)
+    }
+
+    /// Persist the configuration to `dir`, atomically.
+    ///
+    /// Write-through for every value a live session changed: the
+    /// document is the full configuration via
+    /// [`to_toml_string`](Self::to_toml_string), and the target follows
+    /// the load precedence — `config.local.toml` when one stands, else
+    /// `config.toml` — so what the next launch loads is what this
+    /// session left. The local-file preference is sampled at save
+    /// time, and the check carries a small race by design: a local
+    /// file created in the window between the check and the write
+    /// lands shadows this session's write in `config.toml` until the
+    /// next save finds the local file and targets it — the accepted
+    /// cost of never creating a local file on a session's behalf. The
+    /// write is atomic: the document lands in a
+    /// sibling temporary file first, its bytes are pushed to the disk,
+    /// and the file renames into place — so a crashed process leaves
+    /// the previous file whole rather than a torn document, and a
+    /// power loss in the window cannot leave a zero-length live file
+    /// where the staged bytes never settled. The staged file is
+    /// *created* with the owner-only mode it must keep — the document
+    /// may carry a credential, and a rename replaces the target's
+    /// mode, so the staging step is where a live change would
+    /// otherwise loosen a chmod-600 config to world-readable; creating
+    /// it owner-only from the first byte leaves no window where the
+    /// credential is wider, and no crash path that strands it wider.
+    /// The document is validated before anything is staged: a save may
+    /// never land a configuration the loader itself would refuse,
+    /// because the next start would then die on this file until a hand
+    /// edit fixed it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when validation refuses the document, when
+    /// serialization fails, when the directory cannot be created, or
+    /// when the staged write or rename does — the target file itself is
+    /// never touched until the rename succeeds.
+    pub fn save_to_dir(&self, dir: &Path) -> Result<(), DchConfigError> {
+        static SAVE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        self.validate()?;
+        let document = self.to_toml_string()?;
+        let target = if dir.join("config.local.toml").exists() {
+            dir.join("config.local.toml")
+        } else {
+            dir.join("config.toml")
+        };
+        std::fs::create_dir_all(dir)?;
+        let staging = dir.join(format!(
+            ".{}.{}.{}.tmp",
+            target
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .unwrap_or("config.toml"),
+            std::process::id(),
+            SAVE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        ));
+        Self::write_staging_file(&staging, &document)?;
+        std::fs::rename(&staging, &target)?;
+        Ok(())
+    }
+
+    /// Persist the configuration to the user's [config dir](config_dir).
+    ///
+    /// The production half of write-through: hosts call this after a
+    /// live change so the next launch opens where this session left
+    /// off. See [`save_to_dir`](Self::save_to_dir) for the file choice
+    /// and the atomicity contract.
+    ///
+    /// # Errors
+    ///
+    /// See [`save_to_dir`](Self::save_to_dir).
+    pub fn save(&self) -> Result<(), DchConfigError> {
+        self.save_to_dir(&config_dir())
+    }
+
+    /// Create the staging file with the mode it must keep, write the
+    /// document through it, and flush the bytes to the disk before the
+    /// caller's rename.
+    ///
+    /// The staging half of [`save_to_dir`](Self::save_to_dir)'s
+    /// atomicity: on unix the file is created `0600` — owner-only from
+    /// its first byte, so the credential the document may carry is
+    /// never readable by another local user, not in the write window a
+    /// chmod-after-create would leave, not in the stray a crash in that
+    /// window would strand. `create_new` refuses to touch anything
+    /// already standing at the path, which the caller's unique staging
+    /// name makes a should-never; refusing is the honest answer if it
+    /// ever happens. The `sync_all` before the return is the
+    /// power-loss half: a rename replaces the target by directory
+    /// entry, but on several common filesystems the entry can settle
+    /// before the staged bytes do, leaving a zero-length live file
+    /// after a crash — pushing the data out first closes that window,
+    /// so the atomicity the caller claims holds against the wall, not
+    /// only the process. Platforms without file modes write plainly —
+    /// the mode contract is unix's to keep.
+    ///
+    /// # Errors
+    ///
+    /// Returns the filesystem error the create, the write, or the
+    /// sync raises; no file is left behind on a failed write beyond
+    /// the (owner-only) staging path the caller named.
+    fn write_staging_file(staging: &Path, document: &str) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::io::Write as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(staging)?;
+            file.write_all(document.as_bytes())?;
+            file.sync_all()
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(staging, document)
+        }
     }
 
     /// Parse configuration from TOML text, rejecting values the runtime
@@ -1662,14 +1836,20 @@ impl DchConfig {
     /// [`ApiConfig`] — the field every consumer already reads — so selecting
     /// changes nothing downstream of here.
     ///
-    /// `None` selects the **first entry**: the list is ordered and the top of
-    /// it is the default run, which is what makes a `[[models]]` config —
-    /// one block per model, switchable by name — readable top-down. `[api]` stays
-    /// the default only while the config declares no entries, so every config
-    /// written before entries existed keeps behaving as it always did, and
-    /// `[api]` keeps supplying the settings an entry leaves unstated. An entry
-    /// named the same as `[api] model` is not a conflict: it *is* that model's
-    /// own config, and being at the top of the list makes it the default.
+    /// `None` selects what the config itself names: a saved `[api] model`
+    /// that matches a declared entry selects that entry, and only a saved
+    /// name that is empty or matches nothing falls back to the **first**
+    /// entry — the list is ordered and the top of it is the default run.
+    /// The saved name is what a landed `/model` switch persisted, so a
+    /// fresh start opening on the switched model is the whole point of
+    /// that write; the fallback keeps the top-of-the-list default
+    /// readable for configs whose `[api] model` names nothing declared.
+    /// `[api]` stays the selection only while the config declares no
+    /// entries, so every config written before entries existed keeps
+    /// behaving as it always did, and `[api]` keeps supplying the settings
+    /// an entry leaves unstated. An entry named the same as `[api] model`
+    /// is not a conflict: it *is* that model's own config, and being at
+    /// the top of the list makes it the default.
     ///
     /// A name no entry answers but `[api] model` does resolves to the
     /// settings `[api]` already carries, so listing entries cannot strand the
@@ -1695,8 +1875,17 @@ impl DchConfig {
     /// default entry, whose profile the user may believe served the run.
     pub fn select_model(&mut self, requested: Option<&str>) -> Result<(), DchConfigError> {
         let Some(wanted) = requested else {
-            if let Some(first) = self.models.first().cloned() {
-                self.api = first.apply_onto(&self.api);
+            let saved = self.api.model.trim();
+            let saved_entry = if saved.is_empty() {
+                None
+            } else {
+                self.models
+                    .iter()
+                    .find(|entry| entry.model.trim().eq_ignore_ascii_case(saved))
+            };
+            if let Some(entry) = saved_entry.or_else(|| self.models.first()) {
+                let entry = entry.clone();
+                self.api = entry.apply_onto(&self.api);
             }
             return Ok(());
         };
@@ -1761,6 +1950,16 @@ impl DchConfig {
                 self.runner.read_max_bytes
             )));
         }
+        if let Some(effort) = &self.api.reasoning_effort
+            && !is_reasoning_effort(effort)
+        {
+            return Err(DchConfigError::Invalid(format!(
+                "reasoning_effort = {effort:?} is not a rung of the ladder: the client \
+                 refuses an unknown level at construction, so the loader names it here — \
+                 expected one of {}",
+                REASONING_EFFORT_WIRE_NAMES.join(", ")
+            )));
+        }
         self.validate_models()?;
         Ok(())
     }
@@ -1801,6 +2000,16 @@ impl DchConfig {
                     "duplicate [[models]] entry for model {:?}: --model could not choose \
                      between them",
                     entry.model
+                )));
+            }
+            if let Some(effort) = &entry.reasoning_effort
+                && !is_reasoning_effort(effort)
+            {
+                return Err(DchConfigError::Invalid(format!(
+                    "[[models]] {named:?} carries reasoning_effort = {effort:?}, not a rung \
+                     of the ladder: selecting that entry would hand the client a level \
+                     its construction refuses — expected one of {}",
+                    REASONING_EFFORT_WIRE_NAMES.join(", ")
                 )));
             }
             seen.push(named.to_string());
@@ -1881,10 +2090,38 @@ impl DchConfig {
 
 /// The smallest accepted `[runner] turn_timeout_secs` value, in seconds.
 ///
+/// Public because the write-through gates mirror it: the composer's
+/// `/set` refuses a value below the floor with the same number the
+/// loader enforces, so the two checks can never disagree about the
+/// bound.
+///
 /// The stream handler floors a whole-stream budget at its first-event
 /// window of this length, so a configured total below the bound would be
 /// silently replaced rather than honored; the loader rejects it instead.
-const TURN_TIMEOUT_FLOOR_SECS: u64 = 120;
+pub const TURN_TIMEOUT_FLOOR_SECS: u64 = 120;
+
+/// The reasoning-effort ladder's wire spellings, in rung order.
+///
+/// The words `[api] reasoning_effort` (and a `[[models]]` entry's
+/// override of it) may carry — the same ladder the loop's client
+/// construction maps onto the provider's own levels, spelled exactly
+/// as the wire names that mapping reads. Public so the composer's
+/// `/set` gate and the loader's validation enforce one list, and so
+/// the loop's parse is pinned to it: a value outside this list fails
+/// client construction at startup, which is precisely why neither the
+/// loader nor the write-through may ever accept one.
+pub const REASONING_EFFORT_WIRE_NAMES: &[&str] =
+    &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// Whether `name` is a rung of the reasoning-effort ladder.
+///
+/// The single word-list check both config-side gates read — the
+/// loader's `validate` and the composer's `/set` — so a value one
+/// accepts, the other cannot refuse.
+#[must_use]
+pub fn is_reasoning_effort(name: &str) -> bool {
+    REASONING_EFFORT_WIRE_NAMES.contains(&name)
+}
 
 /// Default byte ceiling on one read's joined output.
 ///
@@ -2298,6 +2535,26 @@ mod tests {
         assert!(
             toml::from_str::<DisplayConfig>(r#"path_style = "short""#).is_err(),
             "an unknown style fails the load instead of falling back"
+        );
+    }
+
+    #[test]
+    fn caret_display_defaults_to_blink_and_parses_both_names() {
+        let mut document = toml::from_str::<DisplayConfig>("").expect("the empty document parses");
+        assert_eq!(
+            document.caret_display,
+            CaretDisplay::Blink,
+            "the caret blinks by default"
+        );
+        document = toml::from_str::<DisplayConfig>("caret_display = \"static\"\n")
+            .expect("the static spelling parses");
+        assert_eq!(document.caret_display, CaretDisplay::Static);
+        document = toml::from_str::<DisplayConfig>("caret_display = \"blink\"\n")
+            .expect("the blink spelling parses");
+        assert_eq!(document.caret_display, CaretDisplay::Blink);
+        assert!(
+            toml::from_str::<DisplayConfig>("caret_display = \"solid\"\n").is_err(),
+            "an unknown spelling fails the load instead of falling back"
         );
     }
 
@@ -3055,6 +3312,76 @@ context_window = 210_000
     }
 
     #[test]
+    fn an_unknown_reasoning_effort_fails_the_load_naming_the_ladder() {
+        // The ladder is a construction contract: an unknown rung kills
+        // client construction at startup, so the loader refuses it
+        // here — for the `[api]` value and for a `[[models]]` entry's
+        // own override, either spelling of the same brick — naming the
+        // rungs that exist. The write-through's gate reads the same
+        // list, so what /set may write, the loader accepts.
+        let err = DchConfig::from_toml_str("[api]\nmodel = \"m\"\nreasoning_effort = \"hihg\"\n")
+            .expect_err("a typo is not a rung");
+        let message = err.to_string();
+        assert!(
+            message.contains("hihg") && message.contains("xhigh"),
+            "the refusal names the value and the ladder: {message}"
+        );
+        let err = DchConfig::from_toml_str(
+            "[api]\nmodel = \"base\"\n\n[[models]]\nmodel = \"m\"\nreasoning_effort = \"turbo\"\n",
+        )
+        .expect_err("an entry's override rides the same ladder");
+        assert!(
+            err.to_string().contains("turbo"),
+            "the entry refusal names the value: {err}"
+        );
+        DchConfig::from_toml_str("[api]\nmodel = \"m\"\nreasoning_effort = \"xhigh\"\n")
+            .expect("every rung of the ladder parses");
+    }
+
+    #[test]
+    fn a_saved_selection_names_the_next_default_run() {
+        // The read side of `/model`'s persistence: a switch that landed
+        // wrote `[api] model`, and the next boot's selection honors that
+        // name — its own entry lays over the base, not the list's head.
+        // Without this, the first `[[models]]` entry would silently win
+        // every restart and the saved switch would revert.
+        let mut config = config_with_two_models();
+        config.api.model = "qwen-fast".to_string();
+        config.select_model(None).expect("the saved name selects");
+        assert_eq!(
+            config.api.model, "qwen-fast",
+            "the saved selection stands — the head entry does not overwrite it"
+        );
+        assert_eq!(
+            config.api.context_window,
+            Some(210_000),
+            "the saved entry's own window is what the run measures"
+        );
+        assert_eq!(
+            config.api.base_url, "http://localhost:8080/v1",
+            "an entry stating no endpoint inherits [api]'s, as a restart would"
+        );
+        assert_eq!(
+            config.api.api_key, None,
+            "no other entry's credential rides in — the base carries none"
+        );
+    }
+
+    #[test]
+    fn an_unknown_saved_name_falls_back_to_the_top_entry() {
+        // A saved name nothing declares — a hand-edited file, a profile
+        // deleted since the switch — cannot strand the run: the top of
+        // the list is the default, and the default takes over.
+        let mut config = config_with_two_models();
+        config.api.model = "deleted-since-the-switch".to_string();
+        config.select_model(None).expect("the fallback selects");
+        assert_eq!(
+            config.api.model, "glm-5.3",
+            "a saved name nothing declares loses to the list's head"
+        );
+    }
+
+    #[test]
     fn model_names_leads_with_the_base_when_no_entry_claims_it() {
         let config = config_with_two_models();
         assert_eq!(
@@ -3183,6 +3510,205 @@ api_type = "ollama"
         assert_eq!(
             back.models, config.models,
             "an entry survives the round trip"
+        );
+    }
+}
+
+// Test code panics by design — its asserts are the assertions.
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::let_underscore_must_use
+)]
+mod save_roundtrip {
+    use super::*;
+
+    #[test]
+    fn a_saved_configuration_loads_back_identical() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = DchConfig::default();
+        config.api.model = "switched-model".to_string();
+        config.display.theme = "nord".to_string();
+        config.display.verbosity = Verbosity::Verbose;
+        config.save_to_dir(dir.path()).expect("the save lands");
+        let back = DchConfig::load_from_dir(dir.path()).expect("the save loads back");
+        assert_eq!(
+            back.to_toml_string().expect("loads serialize"),
+            config.to_toml_string().expect("original serializes"),
+            "save then load is a lossless round trip"
+        );
+        assert_eq!(
+            back.api.model, "switched-model",
+            "the changed field arrives"
+        );
+        assert_eq!(back.display.theme, "nord", "the theme arrives");
+    }
+
+    #[test]
+    fn concurrent_savers_never_land_a_torn_document() {
+        // Two savers racing through one directory must degrade to
+        // last-writer-wins, never to a hybrid: each save stages under
+        // its own name, so no interleaving can leave half of one
+        // document inside another's rename.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut handles = Vec::new();
+        for which in 0..2_u64 {
+            let root = dir.path().to_path_buf();
+            handles.push(std::thread::spawn(move || {
+                for round in 0..40_u64 {
+                    let mut config = DchConfig::default();
+                    config.api.model = format!("model-{which}-{round}");
+                    config
+                        .save_to_dir(&root)
+                        .unwrap_or_else(|err| panic!("save {which}/{round} lands: {err}"));
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("both savers finish");
+        }
+        let landed = std::fs::read_to_string(dir.path().join("config.toml"))
+            .expect("a whole document landed");
+        let parsed = toml::from_str::<DchConfig>(&landed)
+            .expect("the winner is one writer's whole document, never a splice");
+        assert!(
+            parsed.api.model.starts_with("model-"),
+            "the landed model is one of the savers' own: {}",
+            parsed.api.model
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_save_lands_the_config_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A pre-existing world-readable target: the staged replacement
+        // must tighten it, not carry the loose mode into place.
+        std::fs::write(dir.path().join("config.toml"), "[api]\n").expect("the target stands");
+        std::fs::set_permissions(
+            dir.path().join("config.toml"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .expect("the loose mode stands");
+        DchConfig::default()
+            .save_to_dir(dir.path())
+            .expect("the save lands");
+        let mode = std::fs::metadata(dir.path().join("config.toml"))
+            .expect("the file stands")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "the saved config is owner-only — a live change never loosens it"
+        );
+    }
+
+    #[test]
+    fn a_save_targets_the_local_file_when_one_stands() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("config.local.toml"),
+            "[api]\nmodel = \"local\"\n",
+        )
+        .expect("the local file stands");
+        let mut config = DchConfig::default();
+        config.api.model = "written-through".to_string();
+        config.save_to_dir(dir.path()).expect("the save lands");
+        let contents =
+            std::fs::read_to_string(dir.path().join("config.local.toml")).expect("local exists");
+        assert!(
+            contents.contains("written-through"),
+            "the local file — the one a load prefers — carries the change: {contents}"
+        );
+        assert!(
+            !dir.path().join("config.toml").exists(),
+            "no config.toml is created beside a standing local file"
+        );
+    }
+
+    #[test]
+    fn a_first_save_creates_the_canonical_file_and_leaves_no_temp() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        DchConfig::default()
+            .save_to_dir(dir.path())
+            .expect("the save lands");
+        assert!(
+            dir.path().join("config.toml").exists(),
+            "the canonical file appears"
+        );
+        let strays: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("the dir reads")
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.rsplit('.').next() == Some("tmp"))
+            })
+            .collect();
+        assert!(
+            strays.is_empty(),
+            "the staging file renamed away, none left behind"
+        );
+    }
+
+    #[test]
+    fn a_save_refuses_a_document_the_loader_would_refuse() {
+        // The write-through's own guard: a config mutated past the
+        // loader's bounds stops at the save, never at the next start —
+        // a save that landed it would brick the launch until a hand
+        // edit fixed the file. Nothing is staged and the target keeps
+        // whatever it carried.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = DchConfig::default();
+        config.runner.turn_timeout_secs = 60;
+        let err = config
+            .save_to_dir(dir.path())
+            .expect_err("the loader refuses this document; the save must refuse it first");
+        assert!(
+            err.to_string().contains("turn_timeout_secs"),
+            "the refusal names the field: {err}"
+        );
+        assert!(
+            !dir.path().join("config.toml").exists(),
+            "a refused save touches no target"
+        );
+        let entries = std::fs::read_dir(dir.path())
+            .expect("the dir reads")
+            .filter_map(std::result::Result::ok)
+            .count();
+        assert_eq!(entries, 0, "a refused save stages nothing");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_staging_file_is_created_owner_only() {
+        // The document may carry a credential, so the staging file is
+        // created with the mode it must keep rather than created loose
+        // and tightened after: under the usual umask a plain create
+        // would stand at 0644 for the whole write window, and a crash
+        // there would strand it that way for good.
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let staging = dir.path().join(".config.toml.stage");
+        DchConfig::write_staging_file(&staging, "[api]\nmodel = \"m\"\n")
+            .expect("the staging write lands");
+        let mode = std::fs::metadata(&staging)
+            .expect("the staging file stands")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "owner-only from the first byte, whatever the umask leaves open"
         );
     }
 }

@@ -326,34 +326,72 @@ pub(crate) fn parse_rendered(output: &str) -> Option<Vec<TodoRow>> {
 }
 
 /// The rendered rows, each carrying its submitted subject where the
-/// submission names the same id.
+/// submission itself sent one for the same id.
 ///
 /// The render is the enforced truth for where each entry stands, but
 /// it is a page: a subject that spans lines reads back as its first
 /// line alone, while the store — and every retirement published from
 /// it — carries the wording whole. This keeps the render's rows and
-/// statuses and restores each row's wording from the submission's
-/// matching entry, so an identity comparison against the store's own
-/// subject succeeds. A row the submission does not name keeps the
-/// rendered wording it parsed with; a submission that does not parse
-/// leaves every row as it was.
+/// statuses and restores each row's wording from the submission where
+/// the model actually sent one, so an identity comparison against the
+/// store's own subject succeeds. A submission that sent no subject —
+/// the status-only update, whose absent fields mean "unchanged" —
+/// changes nothing: the wording a row carries is the standing entry's
+/// to keep, and a derived placeholder is not the submission's to
+/// impose. A row the submission does not name keeps the rendered
+/// wording it parsed with; a submission that does not parse leaves
+/// every row as it was.
 pub(crate) fn rows_with_submitted_subjects(
     rendered: Vec<TodoRow>,
     input_json: &str,
 ) -> Vec<TodoRow> {
-    let Some(submitted) = parse_submission(input_json) else {
+    let Some(sent) = sent_subjects(input_json) else {
         return rendered;
     };
     rendered
         .into_iter()
-        .map(|row| {
-            let subject = submitted
-                .iter()
-                .find(|entry| entry.id == row.id)
-                .map_or_else(|| row.subject.clone(), |entry| entry.subject.clone());
-            TodoRow { subject, ..row }
+        .map(|mut row| {
+            if let Some(subject) = sent.get(&row.id) {
+                row.subject = subject.clone();
+            }
+            row
         })
         .collect()
+}
+
+/// The subjects a submission itself sent, by id.
+///
+/// Reads the raw entries before any derivation could fill a missing
+/// subject in — the decode of a double-encoded `todos` array aside,
+/// nothing is repaired here — so the map holds only wordings the model
+/// actually wrote. An entry whose subject is absent, null, or blank
+/// contributes nothing: its row's wording is not the submission's to
+/// change. `None` when the text is not a submission the tool could
+/// have sent.
+fn sent_subjects(input_json: &str) -> Option<std::collections::HashMap<String, String>> {
+    let mut value: serde_json::Value = serde_json::from_str(input_json).ok()?;
+    if let Some(todos) = value.get_mut("todos")
+        && let Some(encoded) = todos.as_str()
+        && let Ok(decoded) = serde_json::from_str::<serde_json::Value>(encoded)
+    {
+        *todos = decoded;
+    }
+    let entries = value.get("todos")?.as_array()?;
+    let mut sent = std::collections::HashMap::new();
+    for entry in entries {
+        let Some(id) = entry.get("id").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Some(subject) = entry
+            .get("subject")
+            .and_then(serde_json::Value::as_str)
+            .filter(|subject| !subject.trim().is_empty())
+        else {
+            continue;
+        };
+        sent.insert(id.to_string(), subject.to_string());
+    }
+    Some(sent)
 }
 
 /// The rows a submission changed, by id.
@@ -379,12 +417,24 @@ pub(crate) fn status_changes(
 /// The colors the todo rows render in.
 ///
 /// Four registers are all the rows need: the plain of standing work
-/// (the terminal's own text color — a task not yet started is not
+/// (the theme's standing text color — a task not yet started is not
 /// de-emphasized, it is simply waiting), the dim of finished work and
 /// hints, the accent of the current rung, and the moved register a
 /// row wears for the update that touched it. Passed in by the caller
 /// so the module stays a renderer with no theme of its own.
 pub(crate) struct TodoColors {
+    /// The standing-work register — pending subjects and their boxes.
+    ///
+    /// The theme's own foreground, not the terminal's default: a theme
+    /// that repaints the canvas (`github_light` writes a white
+    /// background) cannot lean on the terminal's default foreground,
+    /// which belongs to the scheme the user launched under — on a
+    /// dark-scheme terminal that default is light, and standing work
+    /// would render invisible on the repainted canvas. A paintless
+    /// theme's foreground is `Reset`, the honest register when nothing
+    /// was repainted.
+    pub plain: ratatui::style::Color,
+
     /// De-emphasized text — completed subjects and hints.
     ///
     /// Finished work stays readable but retired; the summary line
@@ -459,11 +509,7 @@ pub(crate) fn render_rows(
                 Style::default().fg(colors.accent),
             ),
             TodoStatus::Pending => {
-                let register = if moved {
-                    colors.moved
-                } else {
-                    ratatui::style::Color::Reset
-                };
+                let register = if moved { colors.moved } else { colors.plain };
                 (
                     "\u{2610}",
                     Style::default().fg(register),
@@ -582,6 +628,7 @@ pub(crate) fn section_lines(
     colors: &TodoColors,
     width: u16,
     body_cap: usize,
+    skip: usize,
     chord_hint: Option<&'static str>,
 ) -> Vec<Line<'static>> {
     let mut badge_spans = vec![
@@ -607,19 +654,14 @@ pub(crate) fn section_lines(
     let mut lines = vec![Line::from(Vec::new()), Line::from(badge_spans)];
     let groups: Vec<Vec<Line<'static>>> = rows
         .iter()
+        .skip(skip)
         .map(|row| render_rows(std::slice::from_ref(row), changes, colors, width))
         .collect();
     let mut used = 0usize;
     let mut shown = 0usize;
     for (index, group) in groups.into_iter().enumerate() {
         if used.saturating_add(group.len()) > body_cap {
-            // The one trade the ellipsis cannot win: when the entry it
-            // would cut is the last one standing outside the cap and
-            // showing it costs at most the row the ellipsis itself
-            // would have taken, the entry rides that row instead — a
-            // "+1 more" that hides an entry the section had room to
-            // name is noise, not a cut.
-            let rides_the_ellipsis = index.saturating_add(1) == rows.len()
+            let rides_the_ellipsis = index.saturating_add(1).saturating_add(skip) == rows.len()
                 && used.saturating_add(group.len()) <= body_cap.saturating_add(1);
             if !rides_the_ellipsis {
                 if used == 0 && body_cap > 0 && !group.is_empty() {
@@ -632,7 +674,7 @@ pub(crate) fn section_lines(
         shown = shown.saturating_add(1);
         lines.extend(group);
     }
-    let more = rows.len().saturating_sub(shown);
+    let more = rows.len().saturating_sub(skip).saturating_sub(shown);
     if more > 0 {
         lines.push(Line::styled(
             format!("… +{more} more (ctrl+t for all)"),
@@ -752,6 +794,58 @@ Summary: 9 pending, 1 in progress, 2 completed\n\n\
     }
 
     #[test]
+    fn a_skipped_window_shows_the_deeper_entries() {
+        // The wheel's window: `skip` seats the section deeper into the
+        // plan, the head leaving and the tail arriving, while the tally
+        // counts what the window hides — never what it skipped past.
+        let rows = parse_submission(
+            r#"{"todos":[
+                {"id":"1","subject":"task one"},
+                {"id":"2","subject":"task two"},
+                {"id":"3","subject":"task three"},
+                {"id":"4","subject":"task four"},
+                {"id":"5","subject":"task five"},
+                {"id":"6","subject":"task six"}
+            ]}"#,
+        )
+        .expect("the submission parses");
+        let colors = TodoColors {
+            plain: ratatui::style::Color::Reset,
+            dim: ratatui::style::Color::Reset,
+            accent: ratatui::style::Color::Reset,
+            moved: ratatui::style::Color::Reset,
+            badge_fill: ratatui::style::Color::Reset,
+            badge_letters: ratatui::style::Color::Reset,
+        };
+        let lines = section_lines(&rows, &HashMap::new(), &colors, 60, 4, 2, None);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+        assert!(
+            !text.iter().any(|line| line.contains("task one")),
+            "the skipped head is gone: {text:?}"
+        );
+        assert!(
+            !text.iter().any(|line| line.contains("task two")),
+            "the second skipped entry is gone too: {text:?}"
+        );
+        assert!(
+            text.iter().any(|line| line.contains("task three")),
+            "the window starts at the third entry: {text:?}"
+        );
+        assert!(
+            !text.iter().any(|line| line.contains("more (ctrl+t")),
+            "the tally counts only what the window hides: {text:?}"
+        );
+    }
+
+    #[test]
     fn an_id_carrying_the_closing_bracket_reads_back_as_its_shortest_prefix() {
         // The render escapes nothing, so `○ [a] b] the tail` is the same
         // page for two different plans and no parse rule can prefer one.
@@ -769,13 +863,15 @@ Summary: 9 pending, 1 in progress, 2 completed\n\n\
     #[test]
     fn the_four_registers_keep_standing_work_plain() {
         // Grey means retired: a completed row reads dim and struck, a
-        // pending row the update did not touch reads in the terminal's
-        // own register — standing work is not demoted — a moved row
-        // wears the moved register, and the rung in progress wears the
-        // accent alone. An earlier spelling dimmed unmoved pending rows
-        // (a reader met a freshly-filed task going grey the moment the
-        // next update landed), and a later one lent the accent to moved
-        // rows too — a newborn read as running the moment it was filed.
+        // pending row the update did not touch reads in the standing
+        // register — the theme's own foreground, so a canvas-repainting
+        // theme keeps standing work visible whatever scheme the
+        // terminal launched under — a moved row wears the moved
+        // register, and the rung in progress wears the accent alone. An
+        // earlier spelling dimmed unmoved pending rows (a reader met a
+        // freshly-filed task going grey the moment the next update
+        // landed), and a later one lent the accent to moved rows too —
+        // a newborn read as running the moment it was filed.
         let rows = vec![
             TodoRow {
                 id: "done".to_string(),
@@ -802,6 +898,7 @@ Summary: 9 pending, 1 in progress, 2 completed\n\n\
         changes.insert("now".to_string(), TodoStatus::InProgress);
         changes.insert("new".to_string(), TodoStatus::Pending);
         let colors = TodoColors {
+            plain: ratatui::style::Color::Reset,
             dim: ratatui::style::Color::DarkGray,
             accent: ratatui::style::Color::Cyan,
             moved: ratatui::style::Color::Yellow,
@@ -868,13 +965,14 @@ Summary: 9 pending, 1 in progress, 2 completed\n\n\
             })
             .collect();
         let colors = TodoColors {
+            plain: ratatui::style::Color::Reset,
             dim: ratatui::style::Color::Reset,
             accent: ratatui::style::Color::Reset,
             moved: ratatui::style::Color::Reset,
             badge_fill: ratatui::style::Color::Reset,
             badge_letters: ratatui::style::Color::Reset,
         };
-        let lines = section_lines(&rows, &HashMap::new(), &colors, 60, 0, None);
+        let lines = section_lines(&rows, &HashMap::new(), &colors, 60, 0, 0, None);
         let text: Vec<String> = lines
             .iter()
             .map(|line| {
@@ -897,6 +995,59 @@ Summary: 9 pending, 1 in progress, 2 completed\n\n\
     }
 
     #[test]
+    fn a_status_only_update_keeps_the_rendered_wordings() {
+        // The update that sends only id, status, and active_form means
+        // "unchanged" for the fields it omits — the tool's own
+        // standing-name rule answers it that way, and the render beside
+        // it carries the standing wordings. A merge that read the
+        // submission through the derivation would stamp `Task {id}`
+        // over every row, renaming the plan mid-run; only a subject the
+        // submission itself sent may replace the rendered wording.
+        let rendered = vec![TodoRow {
+            id: "1".to_string(),
+            subject: "Establish scope and run baseline make ci gate".to_string(),
+            status: TodoStatus::InProgress,
+        }];
+        let merged = rows_with_submitted_subjects(
+            rendered,
+            r#"{"todos": [
+                {"id": "1", "status": "in_progress",
+                 "active_form": "Running baseline make ci gate"}
+            ]}"#,
+        );
+        assert_eq!(
+            merged.first().map(|row| row.subject.as_str()),
+            Some("Establish scope and run baseline make ci gate"),
+            "the status-only update renames nothing — the rendered wording stands"
+        );
+    }
+
+    #[test]
+    fn a_multiline_sent_subject_still_restores_whole() {
+        // The merge's own reason: a sent subject spanning lines reads
+        // back from the page as its first line, and the whole wording
+        // is what the store and any retirement carry. Where the
+        // submission sent the wording, the merge restores it.
+        let rendered = vec![TodoRow {
+            id: "idea".to_string(),
+            subject: "the filed wording".to_string(),
+            status: TodoStatus::Pending,
+        }];
+        let merged = rows_with_submitted_subjects(
+            rendered,
+            r#"{"todos": [
+                {"id": "idea", "subject": "the filed wording\nand its second line",
+                 "status": "pending"}
+            ]}"#,
+        );
+        assert_eq!(
+            merged.first().map(|row| row.subject.as_str()),
+            Some("the filed wording\nand its second line"),
+            "the sent wording replaces the page's first line with the whole"
+        );
+    }
+
+    #[test]
     fn one_one_line_task_at_a_zero_budget_rides_instead_of_ellipsing() {
         // The zero-budget sentence's carve-out: a single one-line
         // entry is a cut the ellipsis row itself could carry, so the
@@ -912,13 +1063,14 @@ Summary: 9 pending, 1 in progress, 2 completed\n\n\
             })
             .collect();
         let colors = TodoColors {
+            plain: ratatui::style::Color::Reset,
             dim: ratatui::style::Color::Reset,
             accent: ratatui::style::Color::Reset,
             moved: ratatui::style::Color::Reset,
             badge_fill: ratatui::style::Color::Reset,
             badge_letters: ratatui::style::Color::Reset,
         };
-        let lines = section_lines(&rows, &HashMap::new(), &colors, 60, 0, None);
+        let lines = section_lines(&rows, &HashMap::new(), &colors, 60, 0, 0, None);
         let text: Vec<String> = lines
             .iter()
             .map(|line| {
@@ -954,13 +1106,14 @@ Summary: 9 pending, 1 in progress, 2 completed\n\n\
             })
             .collect();
         let colors = TodoColors {
+            plain: ratatui::style::Color::Reset,
             dim: ratatui::style::Color::Reset,
             accent: ratatui::style::Color::Reset,
             moved: ratatui::style::Color::Reset,
             badge_fill: ratatui::style::Color::Reset,
             badge_letters: ratatui::style::Color::Reset,
         };
-        let lines = section_lines(&rows, &HashMap::new(), &colors, 60, 4, None);
+        let lines = section_lines(&rows, &HashMap::new(), &colors, 60, 4, 0, None);
         let text: Vec<String> = lines
             .iter()
             .map(|line| {
@@ -993,7 +1146,7 @@ Summary: 9 pending, 1 in progress, 2 completed\n\n\
                 status: TodoStatus::Pending,
             })
             .collect();
-        let lines = section_lines(&rows, &HashMap::new(), &colors, 60, 4, None);
+        let lines = section_lines(&rows, &HashMap::new(), &colors, 60, 4, 0, None);
         let text: Vec<String> = lines
             .iter()
             .map(|line| {
@@ -1019,6 +1172,7 @@ mod long_subject_wrap {
 
     fn plain_colors() -> TodoColors {
         TodoColors {
+            plain: ratatui::style::Color::Reset,
             dim: ratatui::style::Color::Reset,
             accent: ratatui::style::Color::Reset,
             moved: ratatui::style::Color::Reset,
@@ -1073,7 +1227,7 @@ mod long_subject_wrap {
 
         // And the section's arithmetic pays for the wrap: the open
         // posture's line count includes every continuation row.
-        let section = section_lines(&rows, &HashMap::new(), &colors, 30, usize::MAX, None);
+        let section = section_lines(&rows, &HashMap::new(), &colors, 30, usize::MAX, 0, None);
         assert_eq!(
             section.len(),
             lines.len() + 2,
@@ -1099,6 +1253,7 @@ mod review_2026_11_01_round {
 
     fn plain_colors() -> TodoColors {
         TodoColors {
+            plain: ratatui::style::Color::Reset,
             dim: ratatui::style::Color::Reset,
             accent: ratatui::style::Color::Reset,
             moved: ratatui::style::Color::Reset,
@@ -1140,7 +1295,7 @@ mod review_2026_11_01_round {
             subject,
             status: TodoStatus::Pending,
         }];
-        let lines = section_lines(&rows, &HashMap::new(), &plain_colors(), 20, 4, None);
+        let lines = section_lines(&rows, &HashMap::new(), &plain_colors(), 20, 4, 0, None);
         let text: Vec<String> = lines
             .iter()
             .map(|line| {

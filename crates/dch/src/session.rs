@@ -40,8 +40,11 @@ const MACHINE_FORMAT: &str = "dch.machine.v1";
 /// One directory per session holds `session.json` plus any sibling
 /// artifacts the runtime writes alongside it; the saver owns only its
 /// own file. Saves are whole-file rewrites through a same-directory
-/// temp file and rename, so a crash mid-write leaves the previous
-/// good transcript intact. The session id is consumed, never created —
+/// temp file and rename, with the staged bytes synced to the disk
+/// before the rename lands — so a crash mid-write leaves the previous
+/// good transcript intact, and a power loss in the same window
+/// cannot leave a zero-length live file where the staged bytes never
+/// settled. The session id is consumed, never created —
 /// callers pass the identity the agent loop already carries.
 pub struct SessionSaver {
     /// The session whose file this saver reads and writes.
@@ -54,8 +57,20 @@ pub struct SessionSaver {
     /// The model the session runs, recorded in the envelope.
     ///
     /// Read back by listing and resume so a session can be
-    /// re-instantiated with the model it was started with.
-    model: String,
+    /// re-instantiated with the model it was started with, and
+    /// rewritten by a rotation or retarget so the fresh identity
+    /// carries the loop's current model rather than the ended
+    /// session's.
+    pub(crate) model: String,
+
+    /// The working directory the session ran in, if the host named
+    /// one.
+    ///
+    /// Recorded in the envelope beside the model so a listing row
+    /// can show where the conversation happened; the host sets it
+    /// through [`with_workdir`](Self::with_workdir) after
+    /// construction.
+    workdir: Option<String>,
 
     /// The root sessions directory, injectable for tests.
     ///
@@ -101,6 +116,14 @@ pub struct SessionSummary {
     /// steer, a hook-injected reminder) rather than a prompt the user
     /// submitted.
     pub user_message_count: usize,
+
+    /// The working directory the session ran in, when the envelope
+    /// recorded one.
+    ///
+    /// The picker's rows show it so two sessions on the same model
+    /// in different repos read differently at a glance. `None` on
+    /// sessions saved before the field existed.
+    pub workdir: Option<String>,
 
     /// The engine's context-size estimate at the last save.
     ///
@@ -252,6 +275,15 @@ struct StoredSession {
     /// accumulating from the resume.
     #[serde(default)]
     tokens: SessionTokens,
+
+    /// The working directory the session ran in.
+    ///
+    /// Written by the host at saver construction so the picker's
+    /// rows can tell sessions apart at a glance — two sessions on
+    /// the same model in different repos read differently. Absent on
+    /// files saved before the field existed; those read as none.
+    #[serde(default)]
+    workdir: Option<String>,
 }
 
 /// A session's cumulative token accounting.
@@ -308,6 +340,7 @@ impl SessionSaver {
         Self {
             session_id,
             model,
+            workdir: None,
             base_dir: sessions_dir(),
         }
     }
@@ -321,8 +354,50 @@ impl SessionSaver {
         Self {
             session_id,
             model,
+            workdir: None,
             base_dir,
         }
+    }
+
+    /// Record the working directory the session runs in.
+    ///
+    /// The host calls this once at startup with the directory the
+    /// session's tools dispatch through, so the envelope — and every
+    /// listing row downstream — can tell where the conversation
+    /// happened.
+    pub fn with_workdir(mut self, workdir: &Path) -> Self {
+        self.workdir = Some(workdir.display().to_string());
+        self
+    }
+
+    /// A sibling saver for a chosen identity: the given id and model,
+    /// same root.
+    ///
+    /// A `/clear` starts a fresh conversation under a brand-new id while
+    /// the ended session's file stands untouched, and a live resume
+    /// moves the save target onto the resumed session's own id so later
+    /// saves write its file. Both keep the root directory (so a test
+    /// pointed at a throwaway directory stays there) and record the
+    /// model the loop actually runs — the caller's current one, not
+    /// the ended saver's — so the fresh file's provenance names the
+    /// loop that writes it.
+    #[must_use]
+    pub fn with_identity(&self, session_id: Uuid, model: String) -> Self {
+        Self {
+            session_id,
+            model,
+            workdir: self.workdir.clone(),
+            base_dir: self.base_dir.clone(),
+        }
+    }
+
+    /// The session identity this saver writes under.
+    ///
+    /// The uuid that names the directory both files land in — the same
+    /// id the status bar renders and a later `--resume` adopts.
+    #[must_use]
+    pub fn session_id(&self) -> Uuid {
+        self.session_id
     }
 
     /// The file this saver writes: `<base>/<uuid>/session.json`.
@@ -380,6 +455,7 @@ impl SessionSaver {
         let json = serde_json::to_string(&stored)?;
         let mut temp = tempfile::NamedTempFile::new_in(dir)?;
         std::io::Write::write_all(&mut temp, json.as_bytes())?;
+        std::fs::File::sync_all(temp.as_file())?;
         drop(
             temp.persist(&path)
                 .map_err(|err| SessionError::Io(err.error))?,
@@ -454,10 +530,12 @@ impl SessionSaver {
             saved_at,
             messages: messages.to_vec(),
             tokens,
+            workdir: self.workdir.clone(),
         };
         let json = serde_json::to_string_pretty(&stored)?;
         let mut temp = tempfile::NamedTempFile::new_in(dir)?;
         std::io::Write::write_all(&mut temp, json.as_bytes())?;
+        std::fs::File::sync_all(temp.as_file())?;
         drop(
             temp.persist(&path)
                 .map_err(|err| SessionError::Io(err.error))?,
@@ -709,6 +787,7 @@ pub(crate) fn list_sessions_in(base: &Path) -> Result<Vec<SessionSummary>, Sessi
                 })
                 .count(),
             context_tokens: stored.tokens.context_tokens,
+            workdir: stored.workdir,
         });
     }
     sessions.sort_by_key(|summary| std::cmp::Reverse(summary.last_activity));
@@ -730,6 +809,39 @@ mod tests {
 
     fn saver(dir: &std::path::Path, id: Uuid) -> SessionSaver {
         SessionSaver::with_base_dir(id, "test-model".to_string(), dir.to_path_buf())
+    }
+
+    #[test]
+    fn a_chosen_identity_keeps_the_root_and_records_the_given_model() {
+        // A rotated save target keeps the root it had — a throwaway test
+        // dir stays throwaway — and takes both halves of its identity
+        // from the caller: the id the fresh session writes under, and
+        // the model the loop actually runs when the rotation happens.
+        // The recorded workdir survives the same move: it names where
+        // the conversation ran, and a rotation is a new session of the
+        // same work, not a move to a new tree.
+        let dir = std::path::Path::new("/tmp/dch-session-test");
+        let workdir = std::path::Path::new("/tmp/dch-session-workdir");
+        let original = saver(dir, Uuid::new_v4()).with_workdir(workdir);
+        let chosen = Uuid::new_v4();
+
+        let fresh = original.with_identity(chosen, "switched-model".to_string());
+
+        assert_eq!(
+            fresh.session_id(),
+            chosen,
+            "the new saver writes under the id the caller chose"
+        );
+        assert_eq!(fresh.base_dir, original.base_dir, "same root");
+        assert_eq!(
+            fresh.workdir,
+            Some(workdir.display().to_string()),
+            "the rotation keeps the recorded workdir"
+        );
+        assert_eq!(
+            fresh.model, "switched-model",
+            "the provenance is the loop's current model, not the ended session's"
+        );
     }
 
     /// Load through the path-injectable core so tests never read the
@@ -794,6 +906,7 @@ mod tests {
             saved_at,
             messages: messages.to_vec(),
             tokens: SessionTokens::default(),
+            workdir: None,
         };
         let path = dir.join(id.to_string()).join("session.json");
         std::fs::create_dir_all(path.parent().expect("the session dir")).expect("mkdir");

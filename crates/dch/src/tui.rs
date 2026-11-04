@@ -14,6 +14,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use dch_tui::PermissionRequest;
 use dch_tui::QuestionPrompt;
+use dch_tui::ResumedTokens;
+use dch_tui::SessionCommand;
+use dch_tui::SessionUpdate;
 use dch_tui::Submission;
 use dch_tui::TuiMessage;
 use dch_tui::{TerminalGuard, TuiApp, TuiObserverState};
@@ -51,40 +54,47 @@ pub async fn run_tui(args: &Args, control: ResumeControl) -> u8 {
     }
 }
 
-/// Host one interactive session end to end.
+/// Publish the resumed machine history to the shared state and the
+/// transcript worker.
 ///
-/// Every construction step — config, working directory, agent,
-/// terminal — runs before the alternate screen is entered, so a
-/// failure reports to the user's normal terminal. Draw failures after
-/// the session started are reported only once the guard has restored
-/// the terminal, so the message never lands inside raw mode. A
-/// resumed control shapes each step: the restored conversation seeds
-/// both the agent's history and the display, the engine runs on the
-/// current configuration's model and provider — the session's
-/// recorded model is provenance for the listing, not an instruction —
-/// and the session id is the loaded one so auto-saves keep writing
-/// the resumed file.
-///
-/// # Errors
-///
-/// Returns the user-facing failure message for any construction or
-/// session-level failure; the caller maps it to the exit code.
-async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), String> {
-    if let ResumeControl::Fresh {
-        warn: Some(warn), ..
-    } = &control
-    {
-        crate::signals::report(&format!("dch: {warn}"));
-    }
-    let mut config = load_config(args.config.config_path.as_deref())?;
-    apply_cli_overrides(&mut config, args)?;
+/// The adoption half of a resume: the loaded machine snapshot is
+/// filtered (a file saved before a hide may carry the nudge's prompt
+/// as a user message), published to the shared state the display and
+/// the driver read, and sent to the transcript worker so the first
+/// save stamps the same history.
+fn seed_resumed_machine(
+    machine: Option<&[loopctl::message::Message]>,
+    state: &TuiObserverState,
+    conversation: &[dch_tui::TuiMessage],
+    transcript: &TranscriptHandle,
+) {
+    let Some(machine) = machine else {
+        return;
+    };
+    let adopted = filtered_machine_history(&std::sync::Arc::new(machine.to_vec()));
+    *state
+        .machine_history
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&adopted));
+    let compactions = recorded_compactions(conversation);
+    transcript.send_machine(MachineSnapshot {
+        messages: adopted,
+        saved_at: chrono::Utc::now(),
+        compactions,
+        saver: None,
+    });
+}
 
-    let workdir = std::env::current_dir().map_err(|err| format!("cannot determine cwd: {err}"))?;
-
-    let (observer, state) = TuiObserverState::new()
-        .with_secret_redaction(config.security.redact_secrets)
-        .into_observer();
-    if let ResumeControl::Resumed(outcome) = &control {
+/// Seed the shared token counters from a resumed session's envelope.
+///
+/// The display half of a resume's accounting: the session's
+/// cumulative figures continue from the file's own record instead of
+/// restarting at zero, so the context bar and `/cost` read the
+/// conversation's totals from the first frame. A fresh control
+/// leaves the counters untouched — a new session starts at zero by
+/// definition.
+fn seed_resumed_tokens(state: &TuiObserverState, control: &ResumeControl) {
+    if let ResumeControl::Resumed(outcome) = control {
         let mut tokens = state
             .tokens
             .lock()
@@ -94,14 +104,89 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
         tokens.input = outcome.tokens.last_input_tokens;
         tokens.context_tokens = outcome.tokens.context_tokens;
     }
-    let (permission_resolver, permission_rx) = permission_bridge();
+}
+
+/// Load the session's config pair: the live config and its pre-selection base.
+///
+/// The live config is the file with every CLI override applied and the
+/// boot model selection made; the base is the same file with every
+/// override *except* that selection. Later selections — a mid-session
+/// `/model`, a cross-provider switch — layer onto the base so each
+/// equals a restart naming the model, never a stack of every selection
+/// so far. A resumed session adopts the saved conversation's own model
+/// into the live half here — over the base, replacing the boot
+/// selection wholesale — unless the CLI named a model outright, in
+/// which case the flag's selection stands as the overrides left it.
+///
+/// # Errors
+///
+/// Returns the config loader's message, or the `--model` refusal's,
+/// both as the session's startup error.
+fn session_config_pair(
+    args: &Args,
+    control: &ResumeControl,
+) -> Result<(dch_config::DchConfig, dch_config::DchConfig), String> {
+    let mut config = load_config(args.config.config_path.as_deref())?;
+    let mut base = config.clone();
+    crate::headless::apply_non_model_overrides(&mut base, args);
+    apply_cli_overrides(&mut config, args)?;
+    crate::resume::adopt_resumed_model(&mut config, &base, control, args.model.as_deref());
+    Ok((config, base))
+}
+
+/// Cancel the runner the session ends on, through the shared cell.
+///
+/// The exit's cooperative stop: the cell a rebuild swapped names the
+/// runner in flight at exit, which the launch-captured signal may no
+/// longer be, so the stop goes to the live handle the session holds.
+fn cancel_the_live_runner(state: &TuiObserverState) {
+    state
+        .cancel_signal
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .cancel();
+}
+
+/// Host one interactive session end to end.
+///
+/// Every construction step — config, working directory, agent,
+/// terminal — runs before the alternate screen is entered, so a
+/// failure reports to the user's normal terminal. Draw failures after
+/// the session started are reported only once the guard has restored
+/// the terminal, so the message never lands inside raw mode. A
+/// resumed control shapes each step: the restored conversation seeds
+/// both the agent's history and the display, the engine runs on the
+/// model the session last ran — the envelope's own record — unless
+/// the CLI names a model outright, and the session id is the loaded
+/// one so auto-saves keep writing the resumed file.
+///
+/// # Errors
+///
+/// Returns a human-readable message when terminal initialization
+/// fails or the session's runner cannot be constructed.
+async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), String> {
+    if let ResumeControl::Fresh {
+        warn: Some(warn), ..
+    } = &control
+    {
+        crate::signals::report(&format!("dch: {warn}"));
+    }
+    let (config, config_base) = session_config_pair(args, &control)?;
+
+    let workdir = std::env::current_dir().map_err(|err| format!("cannot determine cwd: {err}"))?;
+
+    let (observer, state) = TuiObserverState::new()
+        .with_secret_redaction(config.security.redact_secrets)
+        .into_observer();
+    seed_resumed_tokens(&state, &control);
+    let (lanes, permission_rx, prompt_rx) = InteractiveLanes::bridges();
     let shutting_down = Arc::new(AtomicBool::new(false));
     let mut builder = assemble_runner_builder(
         &config,
         &workdir,
         observer,
         &state,
-        permission_resolver,
+        Arc::clone(&lanes.permission),
         &shutting_down,
     );
     if let ResumeControl::Resumed(outcome) = &control {
@@ -118,9 +203,6 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
         .context_window
         .store(runner.context_window(), Ordering::SeqCst);
 
-    // Rebuild the read-before-write guard's baselines for the files
-    // the restored transcript shows being read: without this, a
-    // resumed Write treats every previously-read file as never-read.
     if let ResumeControl::Resumed(outcome) = &control {
         for path in crate::resume::resumed_read_paths_with_machine(
             &outcome.messages,
@@ -133,33 +215,38 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
     // The cooperative interrupt bridge: the first external SIGINT or
     // SIGTERM cancels the run in flight; the forced second press
     // restores the terminal before the bridge's own exit.
-    let signal_bridge = crate::signals::install_cancel_handler(runner.cancel_signal(), || {
-        let _restored = dch_tui::restore_terminal();
-    });
+    // The live handles the display reads: stored once here and after
+    // every runner rebuild, so Esc,Esc and Ctrl+S always reach the
+    // CURRENT runner, never a stale one from before a /model or
+    // /resume swap. The guidance share is the panel's own steer handle —
+    // the same Arc the adopted state holds.
+    let guidance: Option<Arc<dyn dch_tui::Guidance>> = Some(Arc::new(LoopGuidance {
+        steering: runner.steering(),
+    }));
+    state.adopt_runner_handles(runner.cancel_signal(), guidance.clone());
+    let signal_bridge =
+        crate::signals::install_live_cancel_handler(Arc::clone(&state.cancel_signal), || {
+            let _restored = dch_tui::restore_terminal();
+        });
 
-    // The asking path: the runner's asking channel and its bridge are
-    // supervised, so the prompts the app's overlay renders keep
-    // arriving for the session's whole life — each answer returns to
-    // the asking tool through the bridge's own correlation.
-    let (prompt_tx, prompt_rx) = mpsc::unbounded_channel();
-    let questions = runner.question_path().supervise(prompt_tx, overlay_prompt);
-
+    let questions = lanes.open(&runner);
     let (submit_tx, submit_rx) = mpsc::unbounded_channel();
+    let (session_tx, session_rx) = mpsc::unbounded_channel();
     let model = config.api.model.clone();
     let mouse_capture = config.display.mouse_capture;
+    let driver_config = config.clone();
+    let driver_base = Arc::new(config_base.clone());
     let mut app = TuiApp::from_observer_state(config, state.clone());
+    app.set_config_base(config_base);
     app.set_submit_tx(submit_tx);
-    app.set_guidance(Some(Arc::new(LoopGuidance {
-        steering: runner.steering(),
-    })));
+    app.set_guidance(guidance.clone());
     app.set_permission_requests(permission_rx);
     app.set_question_requests(prompt_rx);
+    app.set_session_requests(session_rx);
     app.set_working_dir(&workdir);
+    app.set_config_persist_dir(Some(dch_config::config_dir()));
     app.set_git_branch(git_branch(&workdir));
 
-    // Seed the display from the control — the restored transcript, or
-    // the note that a resume degraded to this fresh session — and take
-    // the id the saver writes under: the resumed file's own identity.
     let mut resumed_machine: Option<Vec<loopctl::message::Message>> = None;
     let session_id = match control {
         ResumeControl::Resumed(outcome) => {
@@ -167,26 +254,24 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
             resumed_machine = outcome.machine;
             outcome.session_id
         }
-        ResumeControl::Fresh {
-            session_id,
-            warn: Some(warn),
-        } => {
-            app.push_message(TuiMessage::System {
-                text: warn,
-                timestamp: chrono::Utc::now(),
-            });
+        ResumeControl::Fresh { session_id, warn } => {
+            if let Some(warn) = warn {
+                app.push_message(TuiMessage::System {
+                    text: warn,
+                    timestamp: chrono::Utc::now(),
+                });
+            }
             session_id.unwrap_or_else(|| runner.session_id())
         }
-        ResumeControl::Fresh {
-            session_id,
-            warn: None,
-        } => session_id.unwrap_or_else(|| runner.session_id()),
     };
     app.set_session_id(session_id.to_string());
 
-    let saver = Arc::new(crate::session::SessionSaver::with_model(session_id, model));
+    let saver = Arc::new(
+        crate::session::SessionSaver::with_model(session_id, model).with_workdir(&workdir),
+    );
     let (transcript_handle, transcript_worker) = TranscriptWorker::spawn(saver);
     let initial_transcript = transcript_handle.clone();
+    let exit_saver = Arc::clone(&initial_transcript.saver);
     install_turn_end_hook(&mut app, &state, transcript_handle);
 
     initial_transcript.send(app.conversation().to_vec(), snapshot_tokens(&state.tokens));
@@ -194,7 +279,9 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
     TerminalGuard::install_panic_hook();
     let (guard, mut terminal) =
         TerminalGuard::new(mouse_capture).map_err(|err| format!("terminal init: {err}"))?;
-    if !dch_tui::sync_default_background(app.theme.ui.background) {
+    if dch_tui::sync_default_background(app.theme.ui.background) {
+        dch_tui::set_cursor_color(app.theme.ui.primary);
+    } else {
         app.theme = app.theme.deferred_to_terminal();
     }
     dch_tui::arm_fatal_signal_restore();
@@ -203,30 +290,27 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
     let cancel_for_app = Arc::clone(&cancel);
     app.set_run_canceller(Box::new(move || cancel_for_app.cancel()));
     app.set_shutdown_flag(Arc::clone(&shutting_down));
-    if let Some(machine) = &resumed_machine {
-        // Filtered at adoption too: a file saved before the hide may
-        // still carry the nudge's prompt as a user message, and
-        // re-seeding it here would round-trip the relic through every
-        // later save.
-        let adopted = filtered_machine_history(&Arc::new(machine.clone()));
-        *state
-            .machine_history
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&adopted));
-        let compactions = recorded_compactions(app.conversation());
-        initial_transcript.send_machine(MachineSnapshot {
-            messages: adopted,
-            saved_at: chrono::Utc::now(),
-            compactions,
-        });
-    }
-    let driver = tokio::spawn(drive_submissions(
+    seed_resumed_machine(
+        resumed_machine.as_deref(),
+        &state,
+        app.conversation(),
+        &initial_transcript,
+    );
+    let driver = tokio::spawn(Box::pin(run_driver_loop(
         runner,
         submit_rx,
-        state.clone(),
-        Arc::clone(&shutting_down),
+        DriverContext {
+            config: driver_config,
+            config_base: driver_base,
+            workdir: workdir.clone(),
+            sessions_root: crate::session::sessions_dir(),
+            state: state.clone(),
+            shutting_down: Arc::clone(&shutting_down),
+            lanes,
+        },
         initial_transcript,
-    ));
+        session_tx,
+    )));
 
     let session = app.run(&mut terminal).await;
     shutting_down.store(true, Ordering::SeqCst);
@@ -234,7 +318,7 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
     app.settle_exit_stop(&mut terminal);
     app.echo_waiting_prompts_at_exit(unclaimed);
     questions.abort();
-    cancel.cancel();
+    cancel_the_live_runner(&state);
     tear_down_driver_bounded(driver).await;
     app.echo_rescued_corrections_at_exit();
     drop(app);
@@ -242,7 +326,7 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
     restore_and_print_exit(
         transcript_worker,
         guard,
-        session_id,
+        &exit_saver,
         state.todos_undone_captured(),
     );
     session.map_err(|err| format!("terminal error: {err}"))
@@ -260,10 +344,14 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
 /// final run left undone, stated for the user who decides whether to
 /// resume. `None` means no run settled a figure to state — the exit says
 /// the plan was never read rather than claiming it finished clean.
+/// The command's id is read from the save target after the join — the
+/// session the LAST save wrote, whatever a `/clear` rotation or a
+/// `/resume` retarget left in the cell, never the id the session
+/// started under.
 fn restore_and_print_exit(
     transcript_worker: TranscriptWorker,
     guard: dch_tui::TerminalGuard,
-    session_id: uuid::Uuid,
+    saver: &Arc<std::sync::Mutex<Arc<crate::session::SessionSaver>>>,
     todos_undone: Option<usize>,
 ) {
     dch_tui::enter_signal_deaf_window();
@@ -271,6 +359,10 @@ fn restore_and_print_exit(
     dch_tui::exit_signal_deaf_window();
     dch_tui::ignore_fatal_signals();
     drop(guard);
+    let session_id = saver
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .session_id();
     print_session_exit(session_id, todos_undone);
 }
 
@@ -373,6 +465,7 @@ fn install_turn_end_hook(
                 messages: filtered_machine_history(&history),
                 saved_at: chrono::Utc::now(),
                 compactions,
+                saver: None,
             });
         }
     }));
@@ -505,8 +598,33 @@ fn git_branch(workdir: &Path) -> Option<String> {
 /// snapshots up behind it. Publishing is all the hook does — cheap
 /// enough to run inline on the render task.
 struct TranscriptHandle {
+    /// The one-slot mailbox this handle publishes into, shared with
+    /// the writer.
+    ///
+    /// Holds the newest waiting snapshot of each half — display and
+    /// machine — under one lock; a publish overwrites the waiting
+    /// snapshot of its own half rather than queueing behind it,
+    /// which is what bounds retention at one transcript per half.
     pending: Arc<std::sync::Mutex<PendingSaves>>,
+
+    /// The condvar that wakes the writer for a publish.
+    ///
+    /// The writer sleeps only while the slot sits empty and
+    /// re-checks on every wake, so a notify racing a drain costs
+    /// one spurious look and a published snapshot never waits
+    /// unseen.
     signal: Arc<std::sync::Condvar>,
+
+    /// The writer's current save target.
+    ///
+    /// Held in a swappable cell so a `/clear` can move future saves
+    /// to a fresh session file while the ended one stands, and a
+    /// relabel can swap the model without moving the session id. A
+    /// publish pins the saver it finds into the snapshot it takes,
+    /// so a save already in flight keeps the destination it was
+    /// aimed at — a swap mid-write cannot rename it onto the new
+    /// file.
+    saver: Arc<std::sync::Mutex<Arc<crate::session::SessionSaver>>>,
 }
 
 impl Clone for TranscriptHandle {
@@ -519,6 +637,7 @@ impl Clone for TranscriptHandle {
         Self {
             pending: Arc::clone(&self.pending),
             signal: Arc::clone(&self.signal),
+            saver: Arc::clone(&self.saver),
         }
     }
 }
@@ -530,6 +649,11 @@ impl TranscriptHandle {
     /// transcript is ever worth writing — then wakes the writer.
     /// Never blocks and never fails visibly.
     fn send(&self, messages: Vec<TuiMessage>, tokens: crate::session::SessionTokens) {
+        let saver = self
+            .saver
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         let mut pending = self
             .pending
             .lock()
@@ -538,6 +662,7 @@ impl TranscriptHandle {
             messages,
             tokens,
             saved_at: chrono::Utc::now(),
+            saver,
         });
         drop(pending);
         self.signal.notify_one();
@@ -549,7 +674,13 @@ impl TranscriptHandle {
     /// the engine's committed history; the writer persists it under
     /// its own sibling file, so the display half in flight beside it
     /// is never held back by this half or vice versa.
-    fn send_machine(&self, machine: MachineSnapshot) {
+    fn send_machine(&self, mut machine: MachineSnapshot) {
+        machine.saver = Some(
+            self.saver
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        );
         let mut pending = self
             .pending
             .lock()
@@ -557,6 +688,66 @@ impl TranscriptHandle {
         pending.machine = Some(machine);
         drop(pending);
         self.signal.notify_one();
+    }
+
+    /// Relabel the saver's model without moving its session id.
+    ///
+    /// A `/model` switch changes the model the session runs, and the
+    /// envelope's model field must follow: the file a later
+    /// `--resume` reads names the model this session ended on, which
+    /// is the model the next run of that session defaults to. The
+    /// id stays exactly where it is — the switch moves the model,
+    /// never the identity.
+    fn relabel_model(&self, model: &str) {
+        let mut saver = self
+            .saver
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let id = saver.session_id();
+        *saver = Arc::new(saver.with_identity(id, model.to_string()));
+    }
+
+    /// Move the writer's save target to a brand-new session, returning its id.
+    ///
+    /// A `/clear` calls this at rest once the loop's rewind emptied the
+    /// history: the fresh identity sends every *later* save to a new file
+    /// while the ended one stands whole, and a save already published keeps
+    /// the destination it was published under — the pin lives in the
+    /// snapshot, not the cell. The swap lives in the saver cell shared with
+    /// the writer thread, so the turn-end hook's own handle — a clone of
+    /// this one — begins writing under the new id from its next publish.
+    /// The recorded model is the loop's current one, so the fresh file's
+    /// provenance names the loop that writes it. Returns the new session id
+    /// as the status bar renders it, so the driver can publish it to the
+    /// display.
+    fn rotate(&self, model: &str) -> String {
+        let mut saver = self
+            .saver
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let fresh = saver.with_identity(uuid::Uuid::new_v4(), model.to_string());
+        let id = fresh.session_id().to_string();
+        *saver = Arc::new(fresh);
+        id
+    }
+
+    /// Move the writer's save target onto an existing session's file.
+    ///
+    /// A live resume calls this at rest: the session being adopted
+    /// already has a file, and the writes that follow belong to it —
+    /// the continued conversation appends to the identity it resumed
+    /// rather than orphaning it under a fresh one. Like a rotation, a
+    /// save already published keeps its own destination. The model
+    /// recorded is the loop's current one, the same provenance a
+    /// launch resume files under. Returns the id as the status bar
+    /// renders it, so the driver can publish it to the display.
+    fn retarget(&self, id: uuid::Uuid, model: &str) -> String {
+        let mut saver = self
+            .saver
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *saver = Arc::new(saver.with_identity(id, model.to_string()));
+        id.to_string()
     }
 }
 
@@ -587,6 +778,14 @@ struct TranscriptSnapshot {
     /// sibling's read-time stamp beside it compares content against
     /// content, never write order.
     saved_at: chrono::DateTime<chrono::Utc>,
+
+    /// The destination this snapshot was published under.
+    ///
+    /// Pinned at publish time: a rotation that lands after the publish
+    /// cannot redirect a save already in flight — the ended session's
+    /// last turn lands in the ended session's file, never in the fresh
+    /// one that replaced it.
+    saver: Arc<crate::session::SessionSaver>,
 }
 
 /// One machine-history snapshot: the engine's committed conversation.
@@ -618,6 +817,14 @@ struct MachineSnapshot {
     /// nothing because the transcript's rows carry the exemption on
     /// this path.
     compactions: u32,
+
+    /// The destination this snapshot was published under.
+    ///
+    /// Pinned by the publish itself: the handle's send path stamps the
+    /// saver it read under its lock into the snapshot, so a later
+    /// rotation or retarget cannot redirect a save already waiting.
+    /// `None` only between construction and that stamp.
+    saver: Option<Arc<crate::session::SessionSaver>>,
 }
 
 /// Count the compaction rows a conversation has recorded.
@@ -677,9 +884,34 @@ impl PendingSaves {
 /// and any snapshot still in the slot, so a quitting session
 /// persists its last turn.
 struct TranscriptWorker {
+    /// The one-slot mailbox the writer drains, shared with the
+    /// handles.
+    ///
+    /// The same lock every publish goes through: newest-wins per
+    /// half, so the writer persists the newest snapshot of each
+    /// kind and never a queue of stale ones.
     pending: Arc<std::sync::Mutex<PendingSaves>>,
+
+    /// The condvar the writer waits on between snapshots.
+    ///
+    /// Its predicate is the slot sitting empty and the stop flag
+    /// down, re-checked on every wake, so a shutdown notification
+    /// cannot land unseen between the check and the wait.
     signal: Arc<std::sync::Condvar>,
+
+    /// The writer's stop flag, set by a join or a drop.
+    ///
+    /// The loop leaves after draining whatever the slot still
+    /// holds — a quitting session persists its final turn — and the
+    /// drop path sets the same flag so an early-failure exit parks
+    /// the writer off its wait.
     shutdown: Arc<AtomicBool>,
+
+    /// The writer thread's join handle, taken at join.
+    ///
+    /// `None` once joined, so the idempotent drop finds nothing to
+    /// wait on; before a spawn completes it is absent for the same
+    /// reason.
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -756,6 +988,7 @@ impl TranscriptWorker {
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread_pending = Arc::clone(&pending);
         let thread_shutdown = Arc::clone(&shutdown);
+        let saver_cell = Arc::new(std::sync::Mutex::new(saver));
         let handle = std::thread::spawn(move || {
             loop {
                 let mut guard = thread_pending
@@ -769,13 +1002,20 @@ impl TranscriptWorker {
                 if display.is_none() && machine.is_none() {
                     break;
                 }
+                // Each snapshot carries the destination it was published
+                // under: a rotation that lands after the publish cannot
+                // redirect a save already in flight.
                 if let Some(snapshot) = display
-                    && let Err(err) =
-                        saver.save_at(&snapshot.messages, snapshot.tokens, snapshot.saved_at)
+                    && let Err(err) = snapshot.saver.save_at(
+                        &snapshot.messages,
+                        snapshot.tokens,
+                        snapshot.saved_at,
+                    )
                 {
                     tracing::warn!(error = %err, "session transcript could not be saved");
                 }
                 if let Some(snapshot) = machine
+                    && let Some(saver) = snapshot.saver.as_ref()
                     && let Err(err) = saver.save_machine(
                         &snapshot.messages,
                         snapshot.saved_at,
@@ -791,6 +1031,7 @@ impl TranscriptWorker {
             TranscriptHandle {
                 pending,
                 signal: Arc::clone(&signal),
+                saver: saver_cell,
             },
             TranscriptWorker {
                 pending: worker_pending,
@@ -915,6 +1156,118 @@ fn permission_bridge() -> (
     (resolver, requests_rx)
 }
 
+/// The session's interactive lanes: the permission gate and the ask
+/// tool's channel.
+///
+/// Both lanes must outlive any single runner. A `/resume` or a
+/// cross-provider `/model` rebuilds the runner on a fresh
+/// [`RunnerContext`](dch_loop::Runner::context), and the two host
+/// axes a rebuild cannot carry through the builder are exactly these:
+/// the panel holds their receivers — handed over once, at startup —
+/// and a rebuild that built its own bridge would strand the resolver
+/// on a closed channel (every ask silently denying) and leave the new
+/// context with no question channel at all. Carrying the pair here
+/// keeps one bridge per session: the resolver the panel answers and
+/// the prompt channel the sheet renders are the same objects every
+/// rebuild hands to the new runner.
+#[derive(Clone)]
+struct InteractiveLanes {
+    /// The resolver the permission middleware asks through.
+    ///
+    /// The same clone the first runner was built with; every rebuild
+    /// receives it again, so the panel's receiver — held since
+    /// startup — stays the live one.
+    permission: loopctl::middleware::AskResolverFn,
+
+    /// The channel ask-tool prompts arrive on, overlay-shaped.
+    ///
+    /// The sender half of the pair the panel's question sheet owns;
+    /// each rebuild's supervision task forwards the new context's
+    /// prompts through the same [`overlay_prompt`] rewrite before
+    /// they travel here.
+    prompt_tx: mpsc::UnboundedSender<QuestionPrompt>,
+
+    /// The rewrite of a tool prompt into the display's overlay type.
+    ///
+    /// The same [`overlay_prompt`] the startup supervision installs,
+    /// so a rebuilt runner's prompts render in the identical shape.
+    overlay: fn(dch_loop::PromptedQuestion) -> QuestionPrompt,
+}
+
+impl InteractiveLanes {
+    /// The session's bridges, before any runner exists to supervise.
+    ///
+    /// Both channels and the resolver in one call: the panel's
+    /// receivers come back beside the lanes that will carry the
+    /// sender halves through every rebuild — the wiring a session
+    /// does exactly once, at startup.
+    fn bridges() -> (
+        Self,
+        mpsc::UnboundedReceiver<PermissionRequest>,
+        mpsc::UnboundedReceiver<QuestionPrompt>,
+    ) {
+        let (permission, permission_rx) = permission_bridge();
+        let (prompt_tx, prompt_rx) = mpsc::unbounded_channel();
+        (
+            Self {
+                permission,
+                prompt_tx,
+                overlay: overlay_prompt,
+            },
+            permission_rx,
+            prompt_rx,
+        )
+    }
+
+    /// Install the first ask supervision on the session's first
+    /// runner.
+    ///
+    /// The startup half of the ask lane; every rebuild installs its
+    /// own generation through [`attach`](Self::attach). The handle
+    /// comes back for the exit path's abort.
+    fn open(&self, runner: &dch_loop::Runner) -> tokio::task::JoinHandle<()> {
+        runner
+            .question_path()
+            .supervise(self.prompt_tx.clone(), self.overlay)
+    }
+
+    /// Attach both lanes to a freshly built runner.
+    ///
+    /// The permission side needs no attach — the resolver rides the
+    /// builder itself — so this installs only the question
+    /// supervision: a new generation on the new runner's context,
+    /// forwarding its prompts to the panel through the session's one
+    /// channel. The previous generation parks on the context it still
+    /// holds an `Arc` to — nothing dispatches through it after the swap,
+    /// so no prompt can be stolen — and settles when the session's
+    /// channels close at exit; one parked generation accrues per
+    /// user-triggered rebuild, bounded and cleared by the session's
+    /// end.
+    fn attach(&self, runner: &dch_loop::Runner) {
+        let _generation = runner
+            .question_path()
+            .supervise(self.prompt_tx.clone(), self.overlay);
+    }
+
+    /// Lanes whose panel halves are gone.
+    ///
+    /// A test seam for driver contexts that never exercise the
+    /// interactive paths: the receivers are dropped on the spot, so a
+    /// permission ask would deny and a question prompt would end the
+    /// supervision — exactly the behaviors a test that stays off the
+    /// lanes wants, and nothing a real session may build.
+    #[cfg(test)]
+    fn detached() -> Self {
+        let (permission, _rx) = permission_bridge();
+        let (prompt_tx, _prompt_rx) = mpsc::unbounded_channel();
+        Self {
+            permission,
+            prompt_tx,
+            overlay: overlay_prompt,
+        }
+    }
+}
+
 /// Rewrite one asking-path prompt into the app's overlay type.
 ///
 /// The mechanical field-for-field mapping between the composition
@@ -1008,27 +1361,10 @@ fn correction_cut_notice(
     interrupted: bool,
 ) -> Option<String> {
     match removed {
-        // A refused rewind is never silent, whatever the lengths
-        // beside it read as: the turn the correction meant to replace
-        // is still in the conversation, and the error is the only
-        // thing that says so.
         Err(error) => Some(format!(
             "the superseded turn stayed in the conversation: {error}"
         )),
-        // A turn the correction itself stopped may commit nothing, and
-        // the history already standing exactly where the cut would
-        // land is not news: the corrected turn is the next story the
-        // user reads. A history folded *below* the cut falls through
-        // to the compacted arm below — interrupted or not, the
-        // correction rides on top of the fold.
         _ if committed_before_cut == before && interrupted => None,
-        // A turn the correction did not stop may still have written
-        // nothing: a run the window refuses outright discards even its
-        // own prompt, and the history then stands exactly where the
-        // cut lands with nothing folded. The verdict must not claim a
-        // compaction that never ran — and the lengths cannot separate
-        // this shape from a fold that lands exactly back, so the row
-        // names the stopped turn, the shape a session reaches.
         Ok(_)
             if committed_before_cut == before
                 && committed_after_cut == before
@@ -1092,8 +1428,84 @@ fn post_run_error(state: &TuiObserverState, err: &loopctl::error::LoopError) {
     state.render_notify.notify(1);
 }
 
-/// The claim-edge publisher that carries retired plan entries to the
-/// display.
+/// The pieces a driver command needs beyond the runner it holds.
+///
+/// A [`SessionCommand`] that rebuilds the
+/// runner — a cross-provider model switch, a live resume — needs the
+/// config to build on, the sessions root a resume loads through, the
+/// workdir the tools dispatch through, the shared observer state a
+/// fresh observer reads, and the shutdown flag the assembler's nudge
+/// gate consults. The config is live truth: every switch the loop
+/// accepts updates it here, so a later rebuild builds on what the
+/// loop actually runs rather than what the session launched with.
+/// Bundled here so the driver loop and its command application stay
+/// under the argument count the lints enforce.
+#[derive(Clone)]
+struct DriverContext {
+    /// The session's live configuration, kept current by accepted switches.
+    ///
+    /// The host builds the first copy from its own load; the driver
+    /// updates it whenever the loop accepts a model or provider
+    /// switch, so a rebuild — a resume, a later switch — runs on the
+    /// settings in effect at that moment, not the launch-time ones.
+    config: dch_config::DchConfig,
+
+    /// The user-stated config every selection layers onto.
+    ///
+    /// The boot-time config before any model selection ran — the file
+    /// plus the CLI's non-model overrides — carried beside the live
+    /// copy because `select_model` layers rather than replaces: a
+    /// switch selecting onto the live config would stack the new
+    /// entry over the previous selection's unstated leftovers (the
+    /// boot default's context window surviving a switch to an entry
+    /// that states none). Every switch clones this base and selects
+    /// onto it, so the second switch of a session equals a restart
+    /// naming it. Shared behind an [`Arc`] because the config is large
+    /// and never mutated after construction — a driver future carrying
+    /// the context stays small. Panel-side `/set` overrides never reach
+    /// it — exactly as they never reached the driver's live copy
+    /// mid-session; the file is their road to a rebuild.
+    config_base: Arc<dch_config::DchConfig>,
+
+    /// The directory the session's tools dispatch through.
+    ///
+    /// The workdir every tool's paths resolve against — the same root
+    /// the runner was built on, carried so a rebuilt runner inherits
+    /// it unchanged.
+    workdir: std::path::PathBuf,
+
+    /// The root under which saved sessions live.
+    ///
+    /// A live resume loads through this root — the same one the
+    /// session saver writes under. Carried here rather than derived
+    /// at load time so a test points it at a throwaway directory.
+    sessions_root: std::path::PathBuf,
+
+    /// The shared observer state the display drains.
+    ///
+    /// The atomics and queues the driver writes and the panel reads —
+    /// tokens, run flags, the todo and tool lanes — one handle shared
+    /// by both halves of the session.
+    state: TuiObserverState,
+
+    /// The shutdown flag the nudge gate consults.
+    ///
+    /// Raised by the exit path before its cancel; the todo nudge
+    /// refuses to speak for a session on its way out, so a quitting
+    /// user's last turn carries no reminder text.
+    shutting_down: Arc<AtomicBool>,
+
+    /// The session's interactive lanes: permission gate and ask tool.
+    ///
+    /// Built once at startup from the very channels the panel holds,
+    /// so every runner rebuild re-attaches the same pair — see
+    /// [`InteractiveLanes`] for why a rebuild may never build its
+    /// own.
+    lanes: InteractiveLanes,
+}
+
+/// The claim-edge publisher that carries retired plan entries to
+/// the display.
 ///
 /// The runner drops never-started entries at each claim past the
 /// first, and the drop is invisible to the transcript until the next
@@ -1179,7 +1591,7 @@ fn pull_corrected_wording(
         if pull_pending_correction(id, receiver, revived) {
             revived.pop_back().and_then(|submission| match submission {
                 Submission::Correct { text, .. } => Some(text),
-                Submission::Run { .. } => None,
+                Submission::Run { .. } | Submission::Command { .. } => None,
             })
         } else {
             None
@@ -1275,20 +1687,19 @@ fn apply_correction_cut(
 /// into the transcript echo's shared buffer: their words left the
 /// queue with the claim, so an unclaimed row is the only durable
 /// hand-back they take.
-async fn drive_submissions(
+async fn run_driver_loop(
     mut runner: dch_loop::Runner,
     mut receiver: mpsc::UnboundedReceiver<Submission>,
-    state: TuiObserverState,
-    shutting_down: Arc<AtomicBool>,
+    mut context: DriverContext,
     transcript: TranscriptHandle,
+    session_tx: mpsc::UnboundedSender<SessionUpdate>,
 ) {
-    let cancel = runner.cancel_signal();
     let mut last_claim: Option<(u64, usize)> = None;
     let mut revived: std::collections::VecDeque<Submission> = std::collections::VecDeque::new();
     let mut interrupted_for: Option<u64> = None;
-    state.record_todos_undone(runner.todo_undone());
+    context.state.record_todos_undone(runner.todo_undone());
     loop {
-        if shutting_down.load(Ordering::SeqCst) {
+        if context.shutting_down.load(Ordering::SeqCst) {
             break;
         }
         let submission = match revived.pop_front() {
@@ -1297,7 +1708,7 @@ async fn drive_submissions(
                 if let Ok(submission) = receiver.try_recv() {
                     submission
                 } else {
-                    state.mark_run_ended();
+                    context.state.mark_run_ended();
                     match receiver.recv().await {
                         Some(submission) => submission,
                         None => break,
@@ -1305,7 +1716,7 @@ async fn drive_submissions(
                 }
             }
         };
-        if shutting_down.load(Ordering::SeqCst) {
+        if context.shutting_down.load(Ordering::SeqCst) {
             // The submission was pulled in good faith a moment before
             // the flag rose; hand it to the exit drain below rather
             // than deciding its fate here.
@@ -1314,11 +1725,11 @@ async fn drive_submissions(
         }
         let text = match submission {
             Submission::Run { id } => {
-                let Some(text) = take_queued(&state, id, &shutting_down) else {
+                let Some(text) = take_queued(&context.state, id, &context.shutting_down) else {
                     continue;
                 };
                 last_claim = Some((id, runner.committed_history().len()));
-                state.live_claim.store(id, Ordering::SeqCst);
+                context.state.live_claim.store(id, Ordering::SeqCst);
                 interrupted_for = None;
                 text
             }
@@ -1331,48 +1742,67 @@ async fn drive_submissions(
                     .filter(|(claimed, _)| *claimed == id)
                     .map(|(_, before)| before);
                 if let Some(before) = superseded {
-                    apply_correction_cut(&mut runner, &state, before, interrupted);
+                    apply_correction_cut(&mut runner, &context.state, before, interrupted);
                 }
                 text
             }
+            Submission::Command { command } => {
+                apply_session_command(&mut runner, &transcript, &session_tx, command, &mut context)
+                    .await;
+                continue;
+            }
         };
-        state.mark_run_started();
-        state.push_sent(text.clone());
-        cancel.reset();
-        state.correction_cancel.store(u64::MAX, Ordering::SeqCst);
+        context.state.mark_run_started();
+        context.state.push_sent(text.clone());
+        context
+            .state
+            .cancel_signal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .reset();
+        context
+            .state
+            .correction_cancel
+            .store(u64::MAX, Ordering::SeqCst);
         let result = runner.run(&text).await;
-        state.live_claim.store(u64::MAX, Ordering::SeqCst);
+        context.state.live_claim.store(u64::MAX, Ordering::SeqCst);
         let resolved = Arc::new(runner.committed_history());
         transcript.send_machine(MachineSnapshot {
             messages: filtered_machine_history(&resolved),
             saved_at: chrono::Utc::now(),
             compactions: 0,
+            saver: None,
         });
-        *state
+        *context
+            .state
             .machine_history
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(resolved);
-        state.record_todos_undone(runner.todo_undone());
+        context.state.record_todos_undone(runner.todo_undone());
         if let Err(err) = &result {
-            state
+            context
+                .state
                 .active_tools
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clear();
-            if exit_owns_cancel(err, &shutting_down) {
-                post_run_error(&state, err);
+            if exit_owns_cancel(err, &context.shutting_down) {
+                post_run_error(&context.state, err);
                 if let Some(corrected) =
                     pull_corrected_wording(last_claim, &mut receiver, &mut revived)
                 {
-                    rescue_correction_text(&state, corrected);
+                    rescue_correction_text(&context.state, corrected);
                 } else {
-                    push_queued(&state, text.clone());
+                    push_queued(&context.state, text.clone());
                 }
-                state.mark_run_ended();
+                context.state.mark_run_ended();
                 break;
             }
             let interrupted_id = if matches!(err, loopctl::error::LoopError::Cancelled) {
-                state.correction_cancel.swap(u64::MAX, Ordering::SeqCst)
+                context
+                    .state
+                    .correction_cancel
+                    .swap(u64::MAX, Ordering::SeqCst)
             } else {
                 u64::MAX
             };
@@ -1388,15 +1818,458 @@ async fn drive_submissions(
             if let Some(cancelled_for) = correction {
                 interrupted_for = Some(cancelled_for);
             } else {
-                post_run_error(&state, err);
+                post_run_error(&context.state, err);
             }
         }
     }
-    if shutting_down.load(Ordering::SeqCst) {
-        rescue_stranded_corrections(&mut revived, &mut receiver, &state);
+    if context.shutting_down.load(Ordering::SeqCst) {
+        rescue_stranded_corrections(&mut revived, &mut receiver, &context.state);
     }
-    state.mark_run_ended();
-    state.record_todos_undone(runner.todo_undone());
+    context.state.mark_run_ended();
+    context.state.record_todos_undone(runner.todo_undone());
+}
+
+/// Carry out one session command on the driver's loop, at rest.
+///
+/// Every command's effect lands on the runner or the session state the
+/// driver owns. `Model` rebuilds the loop on the selected entry — a
+/// switch is not a rename, because every setting the entry selects
+/// (the context window above all) belongs to the engine; `Clear` rewinds
+/// the committed history to empty and moves the save target to a fresh
+/// session; a cross-provider `SwitchProvider` and a `Resume` rebuild the
+/// runner on new settings or a restored history, carrying the
+/// conversation. The context's config is the session's live truth — an
+/// accepted switch updates it here, always by selecting onto the
+/// user-stated base so no switch accretes the previous one's leftovers,
+/// and every later rebuild builds on what the loop actually runs — and
+/// an outcome the display cannot see for itself travels back over the
+/// session channel: the applied model, the fresh or adopted id, the
+/// loaded transcript, or a notice saying a refusal or failure kept
+/// things as they were.
+async fn apply_session_command(
+    runner: &mut dch_loop::Runner,
+    transcript: &TranscriptHandle,
+    session_tx: &mpsc::UnboundedSender<SessionUpdate>,
+    command: SessionCommand,
+    context: &mut DriverContext,
+) {
+    match command {
+        SessionCommand::Model { name } => {
+            let mut config = context.config_base.as_ref().clone();
+            if let Err(err) = config.select_model(Some(&name)) {
+                post_session_notice(
+                    session_tx,
+                    format!(
+                        "the loop kept {}: the switch was declined ({err})",
+                        context.config.api.model
+                    ),
+                );
+                return;
+            }
+            let history = runner.committed_history();
+            let read_paths = crate::resume::resumed_read_paths_with_machine(&[], Some(&history));
+            let observer = context.state.clone().into_observer().0;
+            let new_runner = assemble_runner_builder(
+                &config,
+                &context.workdir,
+                observer,
+                &context.state,
+                Arc::clone(&context.lanes.permission),
+                &context.shutting_down,
+            )
+            .with_history(history)
+            .build()
+            .await;
+            match new_runner {
+                Ok(built) => {
+                    for path in read_paths {
+                        let _recorded = built.record_resumed_read(&path).await;
+                    }
+                    context.lanes.attach(&built);
+                    let window = built.context_window();
+                    context.state.context_window.store(window, Ordering::SeqCst);
+                    *runner = built;
+                    context.state.adopt_runner_handles(
+                        runner.cancel_signal(),
+                        Some(Arc::new(LoopGuidance {
+                            steering: runner.steering(),
+                        })),
+                    );
+                    context.config = config;
+                    transcript.relabel_model(&name);
+                    post_session_notice(
+                        session_tx,
+                        format!("switched to {name} — context window {window} tokens"),
+                    );
+                    if session_tx.send(SessionUpdate::ModelName { name }).is_err() {
+                        tracing::warn!("model switch landed but the display is gone");
+                    }
+                }
+                Err(err) => post_session_notice(
+                    session_tx,
+                    format!(
+                        "the loop kept {}: the switch could not be built ({err})",
+                        context.config.api.model
+                    ),
+                ),
+            }
+        }
+        SessionCommand::Clear => {
+            land_session_clear(
+                runner.rewind_history_to(0),
+                transcript,
+                session_tx,
+                &context.config.api.model,
+            );
+        }
+        SessionCommand::SwitchProvider {
+            model,
+            base_url,
+            api_type,
+        } => {
+            Box::pin(switch_provider(
+                runner, transcript, session_tx, context, model, base_url, api_type,
+            ))
+            .await;
+        }
+        SessionCommand::Resume { id } => {
+            Box::pin(resume_into_session(
+                runner, transcript, session_tx, context, id,
+            ))
+            .await;
+        }
+        SessionCommand::ListSessions => {
+            match crate::session::list_sessions_in(&context.sessions_root) {
+                Ok(summaries) => {
+                    let rows: Vec<dch_tui::queue::SessionPick> = summaries
+                        .into_iter()
+                        .map(|summary| dch_tui::queue::SessionPick {
+                            id: summary.id.to_string(),
+                            model: summary.model,
+                            saved_at: summary.last_activity,
+                            prompts: summary.user_message_count,
+                            workdir: summary.workdir,
+                        })
+                        .collect();
+                    if session_tx
+                        .send(SessionUpdate::SessionCatalog { rows })
+                        .is_err()
+                    {
+                        tracing::warn!("session catalog listed but the display is gone");
+                    }
+                }
+                Err(err) => post_session_notice(
+                    session_tx,
+                    format!("the saved sessions could not be read ({err})"),
+                ),
+            }
+        }
+        SessionCommand::Compact => match runner.compact_now().await {
+            Ok(figures) => post_session_notice(session_tx, figures),
+            Err(err) => post_session_notice(session_tx, format!("compaction was declined ({err})")),
+        },
+    }
+}
+
+/// Post one driver notice, or drop it with a warn when the display is gone.
+///
+/// The notice lane's single throat: every refusal, failure, and result
+/// the driver owes the user reads the same way, and a display that has
+/// already left is a warn rather than an error.
+fn post_session_notice(session_tx: &mpsc::UnboundedSender<SessionUpdate>, text: String) {
+    if session_tx.send(SessionUpdate::Notice { text }).is_err() {
+        tracing::warn!("a session notice was lost with the display gone");
+    }
+}
+
+/// The cross-provider switch: rebuild the runner on the profile's wire.
+///
+/// A different provider cannot ride a rename — the wire shape differs
+/// — so the switch travels as a rebuild: the committed history carries
+/// forward, the observer state is shared (the same buffers the display
+/// drains), and every wire the session's build installed rides the same
+/// assembler the first build used. An empty api type inherits the
+/// running protocol; a spelled one must name a protocol the config
+/// knows, or the switch is refused whole rather than half-moving the
+/// endpoint. The context's config takes the settings the rebuild
+/// installed, so later rebuilds build on them.
+async fn switch_provider(
+    runner: &mut dch_loop::Runner,
+    transcript: &TranscriptHandle,
+    session_tx: &mpsc::UnboundedSender<SessionUpdate>,
+    context: &mut DriverContext,
+    model: String,
+    base_url: String,
+    api_type: String,
+) {
+    let protocol = if api_type.is_empty() {
+        Ok(context.config.api.api_type)
+    } else {
+        serde_json::from_str::<dch_config::ApiType>(&format!("\"{api_type}\""))
+    };
+    let Ok(protocol) = protocol else {
+        post_session_notice(
+            session_tx,
+            format!("kept the current provider — {model}'s api type is not a known protocol"),
+        );
+        return;
+    };
+    let mut config = context.config_base.as_ref().clone();
+    config.api.model = model;
+    config.api.base_url = base_url;
+    config.api.api_type = protocol;
+    let selected = config.api.model.clone();
+    if config.select_model(Some(&selected)).is_err() {
+        tracing::debug!(model = %selected, "provider switch without a profile entry");
+    }
+    let history = runner.committed_history();
+    let read_paths = crate::resume::resumed_read_paths_with_machine(&[], Some(&history));
+    let observer = context.state.clone().into_observer().0;
+    let new_runner = assemble_runner_builder(
+        &config,
+        &context.workdir,
+        observer,
+        &context.state,
+        Arc::clone(&context.lanes.permission),
+        &context.shutting_down,
+    )
+    .with_history(history)
+    .build()
+    .await;
+    match new_runner {
+        Ok(built) => {
+            for path in read_paths {
+                let _recorded = built.record_resumed_read(&path).await;
+            }
+            context.lanes.attach(&built);
+            let window = built.context_window();
+            context.state.context_window.store(window, Ordering::SeqCst);
+            *runner = built;
+            context.state.adopt_runner_handles(
+                runner.cancel_signal(),
+                Some(Arc::new(LoopGuidance {
+                    steering: runner.steering(),
+                })),
+            );
+            context.config = config.clone();
+            transcript.relabel_model(&config.api.model);
+            post_session_notice(
+                session_tx,
+                format!(
+                    "switched to {} — context window {window} tokens",
+                    config.api.model
+                ),
+            );
+            let update = SessionUpdate::Provider {
+                model: config.api.model.clone(),
+                base_url: config.api.base_url.clone(),
+                api_type: serde_json::to_value(config.api.api_type)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_string))
+                    .unwrap_or_default(),
+            };
+            if session_tx.send(update).is_err() {
+                tracing::warn!("provider switch landed but the display is gone");
+            }
+        }
+        Err(err) => post_session_notice(
+            session_tx,
+            format!("kept the current provider — the rebuild failed ({err})"),
+        ),
+    }
+}
+
+/// The live resume: adopt a saved session's history, file, and display.
+///
+/// The driver alone can load: it parses the id, reads the saved pair
+/// from the sessions root, rebuilds the runner on the restored machine
+/// history with the same read-guard baselines a launch resume builds,
+/// restores the token accounting into the shared state, retargets the
+/// save target onto the session's own file, and publishes the machine
+/// snapshot under it — the target must own the pin before the adopted
+/// history publishes, or the write lands under the outgoing session
+/// and its newer stamp hands a later resume the wrong pair. Only then
+/// does the loaded transcript travel to the display, which re-seeds
+/// from it. Every failure — a malformed id, an unreadable session, a
+/// refused rebuild — posts a notice and leaves the loop exactly as it
+/// stood.
+async fn resume_into_session(
+    runner: &mut dch_loop::Runner,
+    transcript: &TranscriptHandle,
+    session_tx: &mpsc::UnboundedSender<SessionUpdate>,
+    context: &mut DriverContext,
+    id: String,
+) {
+    let Ok(target) = uuid::Uuid::parse_str(&id) else {
+        post_session_notice(
+            session_tx,
+            format!("{id} is not a session id — nothing was resumed"),
+        );
+        return;
+    };
+    let Ok(outcome) = crate::resume::load_for_resume_in(target, &context.sessions_root) else {
+        post_session_notice(
+            session_tx,
+            format!("session {id} could not be loaded — the loop kept its conversation"),
+        );
+        return;
+    };
+    let machine = outcome.machine.clone().unwrap_or_default();
+    let observer = context.state.clone().into_observer().0;
+    let new_runner = assemble_runner_builder(
+        &context.config,
+        &context.workdir,
+        observer,
+        &context.state,
+        Arc::clone(&context.lanes.permission),
+        &context.shutting_down,
+    )
+    .with_history(machine.clone())
+    .build()
+    .await;
+    let built = match new_runner {
+        Ok(built) => {
+            context.lanes.attach(&built);
+            built
+        }
+        Err(err) => {
+            post_session_notice(
+                session_tx,
+                format!(
+                    "session {id} could not be adopted — the loop kept its conversation ({err})"
+                ),
+            );
+            return;
+        }
+    };
+    for path in crate::resume::resumed_read_paths_with_machine(
+        &outcome.messages,
+        outcome.machine.as_deref(),
+    ) {
+        let _recorded = built.record_resumed_read(&path).await;
+    }
+    *runner = built;
+    context.state.adopt_runner_handles(
+        runner.cancel_signal(),
+        Some(Arc::new(LoopGuidance {
+            steering: runner.steering(),
+        })),
+    );
+    {
+        let mut tokens = context
+            .state
+            .tokens
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tokens.cumulative_input = outcome.tokens.cumulative_input;
+        tokens.cumulative_output = outcome.tokens.cumulative_output;
+        tokens.input = outcome.tokens.last_input_tokens;
+        tokens.context_tokens = outcome.tokens.context_tokens;
+    }
+    let adopted = filtered_machine_history(&Arc::new(machine));
+    *context
+        .state
+        .machine_history
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&adopted));
+    transcript.retarget(target, &context.config.api.model);
+    transcript.send_machine(MachineSnapshot {
+        messages: adopted,
+        saved_at: chrono::Utc::now(),
+        compactions: recorded_compactions(&outcome.messages),
+        saver: None,
+    });
+    let update = SessionUpdate::Resumed {
+        id: target.to_string(),
+        transcript: outcome.messages,
+        tokens: ResumedTokens {
+            cumulative_input: outcome.tokens.cumulative_input,
+            cumulative_output: outcome.tokens.cumulative_output,
+            last_input: outcome.tokens.last_input_tokens,
+            context_tokens: outcome.tokens.context_tokens,
+        },
+    };
+    if session_tx.send(update).is_err() {
+        tracing::warn!("session resumed but the display is gone");
+    }
+}
+
+/// Whether a `/clear` may rotate onto a fresh session, given the
+/// rewind's verdict.
+///
+/// The one gate the clear path turns on: only a rewind that emptied
+/// the loop's history earns the fresh identity, so a refused rewind
+/// leaves the ended session standing — same id, same file — and the
+/// caller says so to the display instead of publishing a swap that
+/// never happened.
+fn rewind_earned_fresh_session<E>(rewind: &Result<usize, E>) -> bool {
+    rewind.is_ok()
+}
+
+/// Apply one `/clear` verdict: rotate and publish on an emptied
+/// history, say the refusal aloud on an error.
+///
+/// The caller-side half of [`rewind_earned_fresh_session`]'s gate, kept
+/// as its own step so the wiring is testable beside the verdict: an
+/// emptied history rotates the save target and publishes the fresh id;
+/// a refused rewind rotates nothing, publishes nothing, and names the
+/// failure on the notice lane so the ended session — same id, same
+/// file — visibly stands. A rewind that merely had nothing to remove
+/// still emptied the history and still earns the rotation.
+fn land_session_clear<E: std::fmt::Display>(
+    rewind: Result<usize, E>,
+    transcript: &TranscriptHandle,
+    session_tx: &mpsc::UnboundedSender<SessionUpdate>,
+    model: &str,
+) {
+    if rewind_earned_fresh_session(&rewind) {
+        let id = transcript.rotate(model);
+        if session_tx.send(SessionUpdate::SessionId { id }).is_err() {
+            tracing::warn!("session cleared but the display is gone");
+        }
+    } else if let Err(err) = rewind {
+        post_session_notice(
+            session_tx,
+            format!("the session could not be cleared — the loop kept its history ({err})"),
+        );
+    }
+}
+
+/// Test-facing driver entry: the loop over a session channel nobody reads.
+///
+/// The production driver reports between-turns model and session changes on a
+/// channel the panel reads; a driver test cares about runs and corrections,
+/// not those reports, so it drives through here with a sender whose receiver
+/// is dropped immediately. No existing test sends a [`Submission::Command`],
+/// so the closed sender is never written to; a test that does exercise a
+/// command calls [`run_driver_loop`] directly and keeps the receiver to
+/// assert on the published update.
+#[cfg(test)]
+async fn drive_submissions(
+    runner: dch_loop::Runner,
+    receiver: mpsc::UnboundedReceiver<Submission>,
+    state: TuiObserverState,
+    shutting_down: Arc<AtomicBool>,
+    transcript: TranscriptHandle,
+) {
+    let (session_tx, _session_rx) = mpsc::unbounded_channel();
+    state.adopt_runner_handles(runner.cancel_signal(), None);
+    Box::pin(run_driver_loop(
+        runner,
+        receiver,
+        DriverContext {
+            config: dch_config::DchConfig::default(),
+            config_base: std::sync::Arc::new(dch_config::DchConfig::default()),
+            workdir: std::path::PathBuf::from("."),
+            sessions_root: crate::session::sessions_dir(),
+            state,
+            shutting_down,
+            lanes: InteractiveLanes::detached(),
+        },
+        transcript,
+        session_tx,
+    ))
+    .await;
 }
 
 #[cfg(test)]
@@ -1652,6 +2525,7 @@ mod tests {
             messages: Arc::new(Vec::new()),
             saved_at: chrono::Utc::now(),
             compactions: 0,
+            saver: None,
         });
         worker.join();
         let (_, _, _, session_at) = crate::session::load_with_meta_in(id, &root).unwrap();
@@ -2724,6 +3598,1315 @@ mod tests {
             },
             ..dch_config::DchConfig::default()
         }
+    }
+
+    #[tokio::test]
+    async fn a_model_command_at_rest_rebuilds_the_loop_and_publishes_the_name() {
+        // The session lane's model leg, end to end: a `/model` the app
+        // already resolved to a name arrives as a command, the driver
+        // selects it onto the user-stated base, rebuilds the loop on it
+        // (conversation carried, no turn), and the applied name is
+        // published back so the status bar and the next request agree.
+        // An offline runner is enough — the rebuild itself never
+        // touches the network.
+        let runner = unreachable_runner().await;
+        let (_, state) = TuiObserverState::new().into_observer();
+        let (submit_tx, submit_rx) = mpsc::unbounded_channel();
+        let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+        submit_tx
+            .send(Submission::Command {
+                command: SessionCommand::Model {
+                    name: "gpt-4o-mini".to_string(),
+                },
+            })
+            .expect("driver channel open");
+        // Dropping the submit side lets the driver carry out the command,
+        // then see an empty channel and leave its loop.
+        drop(submit_tx);
+
+        let driver = tokio::spawn(Box::pin(run_driver_loop(
+            runner,
+            submit_rx,
+            DriverContext {
+                config: dch_config::DchConfig::default(),
+                config_base: std::sync::Arc::new(dch_config::DchConfig::default()),
+                workdir: std::path::PathBuf::from("."),
+                sessions_root: crate::session::sessions_dir(),
+                state,
+                shutting_down: shutdown_flag(false),
+                lanes: InteractiveLanes::detached(),
+            },
+            parked_transcript(),
+            session_tx,
+        )));
+        let update = tokio::time::timeout(std::time::Duration::from_secs(5), session_rx.recv())
+            .await
+            .expect("a model update is published")
+            .expect("the session channel is open when the command lands");
+        let update = match update {
+            SessionUpdate::Notice { .. } => {
+                tokio::time::timeout(std::time::Duration::from_secs(5), session_rx.recv())
+                    .await
+                    .expect("the verdict follows the receipt")
+                    .expect("the session channel is open")
+            }
+            verdict => verdict,
+        };
+        assert_eq!(
+            update,
+            SessionUpdate::ModelName {
+                name: "gpt-4o-mini".to_string()
+            },
+            "the applied switch is published by its own name"
+        );
+        let _ = driver.await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_rebuild_names_the_model_the_loop_kept() {
+        // A switch whose rebuild cannot be built names the model still
+        // running — the loop's own, never the requested one — so the two
+        // failure notices (a declined selection, a failed build) agree
+        // about what "kept" means. The build is made to fail offline: a
+        // blank fallback name is refused by the fallback breaker at
+        // construction, no network involved.
+        let runner = unreachable_runner().await;
+        let (_, state) = TuiObserverState::new().into_observer();
+        let (submit_tx, submit_rx) = mpsc::unbounded_channel();
+        let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+        let mut context = unreachable_config();
+        context.models = vec![dch_config::ModelProfile {
+            model: "wanted-model".to_string(),
+            ..dch_config::ModelProfile::default()
+        }];
+        context.api.model = "kept-model".to_string();
+        // The blank fallback is what the rebuild refuses; the loop's own
+        // construction predates it and stands.
+        context.api.fallback_model = Some(String::new());
+        submit_tx
+            .send(Submission::Command {
+                command: SessionCommand::Model {
+                    name: "wanted-model".to_string(),
+                },
+            })
+            .expect("driver channel open");
+        drop(submit_tx);
+        let driver = tokio::spawn(Box::pin(run_driver_loop(
+            runner,
+            submit_rx,
+            DriverContext {
+                config_base: std::sync::Arc::new(context.clone()),
+                config: context,
+                workdir: std::path::PathBuf::from("."),
+                sessions_root: crate::session::sessions_dir(),
+                state,
+                shutting_down: shutdown_flag(false),
+                lanes: InteractiveLanes::detached(),
+            },
+            parked_transcript(),
+            session_tx,
+        )));
+        let mut notice = None;
+        for _ in 0..3 {
+            let update = tokio::time::timeout(std::time::Duration::from_secs(5), session_rx.recv())
+                .await
+                .expect("the driver answers the command")
+                .expect("the session channel is open when the command lands");
+            if let SessionUpdate::Notice { text } = update {
+                notice = Some(text);
+                break;
+            }
+        }
+        let notice = notice.unwrap_or_else(|| {
+            panic!("a failed rebuild posts a notice, not a silent drop");
+        });
+        assert!(
+            notice.contains("the loop kept kept-model"),
+            "the notice names the model still running: {notice}"
+        );
+        assert!(
+            !notice.contains("wanted-model"),
+            "the requested model is not the one the loop kept: {notice}"
+        );
+        let _ = driver.await;
+    }
+
+    #[tokio::test]
+    async fn a_model_switch_selects_onto_the_base_not_the_accreted_live_config() {
+        // The driver's half of the no-accretion rule, read off the
+        // switch's own receipt: the boot selection laid the seed entry's
+        // 200k window onto the live config, and a switch to an entry
+        // stating no window must rebuild on the base's own 64k — the
+        // receipt names the figure the engine actually measures, never
+        // the previous selection's leftover.
+        let runner = unreachable_runner().await;
+        let (_, state) = TuiObserverState::new().into_observer();
+        let (submit_tx, submit_rx) = mpsc::unbounded_channel();
+        let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+        let mut base = unreachable_config();
+        base.api.context_window = Some(64_000);
+        base.models = vec![
+            dch_config::ModelProfile {
+                model: "seed".to_string(),
+                context_window: Some(200_000),
+                ..dch_config::ModelProfile::default()
+            },
+            dch_config::ModelProfile {
+                model: "plain".to_string(),
+                ..dch_config::ModelProfile::default()
+            },
+        ];
+        base.api.model = "seed".to_string();
+        let mut live = base.clone();
+        live.select_model(None)
+            .expect("the boot selection lays the seed entry");
+        assert_eq!(
+            live.api.context_window,
+            Some(200_000),
+            "fixture premise: the live config carries the seed's window after boot"
+        );
+        submit_tx
+            .send(Submission::Command {
+                command: SessionCommand::Model {
+                    name: "plain".to_string(),
+                },
+            })
+            .expect("driver channel open");
+        drop(submit_tx);
+        let driver = tokio::spawn(Box::pin(run_driver_loop(
+            runner,
+            submit_rx,
+            DriverContext {
+                config_base: std::sync::Arc::new(base),
+                config: live,
+                workdir: std::path::PathBuf::from("."),
+                sessions_root: crate::session::sessions_dir(),
+                state,
+                shutting_down: shutdown_flag(false),
+                lanes: InteractiveLanes::detached(),
+            },
+            parked_transcript(),
+            session_tx,
+        )));
+        let mut receipt = None;
+        for _ in 0..3 {
+            let update = tokio::time::timeout(std::time::Duration::from_secs(5), session_rx.recv())
+                .await
+                .expect("the driver answers the command")
+                .expect("the session channel is open when the command lands");
+            if let SessionUpdate::Notice { text } = &update
+                && text.contains("switched to plain")
+            {
+                receipt = Some(text.clone());
+                break;
+            }
+        }
+        let receipt = receipt.unwrap_or_else(|| panic!("the switch posts its receipt"));
+        assert!(
+            receipt.contains("context window 64000 tokens"),
+            "the receipt names the base's own window — the seed entry's 200_000 did not \
+             accrete: {receipt}"
+        );
+        let _ = driver.await;
+    }
+
+    #[tokio::test]
+    async fn a_model_command_rebuilds_on_the_profile_and_writes_the_file() {
+        // A `/model` is a rebuild, not a rename, and this is the whole
+        // contract read off disk and shared state: the engine comes
+        // back built on the selected entry — its context window is the
+        // new model's own figure, the one the bar and the compaction
+        // threshold read — and session.json is rewritten at once under
+        // the new name, verified by loading the file the writer left.
+        let dir = tempfile::tempdir().expect("sessions tempdir");
+        let id = uuid::Uuid::new_v4();
+        let saver = Arc::new(crate::session::SessionSaver::with_base_dir(
+            id,
+            "first-model".to_string(),
+            dir.path().to_path_buf(),
+        ));
+        let (transcript, worker) = TranscriptWorker::spawn(Arc::clone(&saver));
+        let hook_transcript = transcript.clone();
+
+        let config = dch_config::DchConfig {
+            models: vec![dch_config::ModelProfile {
+                model: "wide-model".to_string(),
+                context_window: Some(123_456),
+                ..dch_config::ModelProfile::default()
+            }],
+            ..dch_config::DchConfig::default()
+        };
+
+        let runner = unreachable_runner().await;
+        let (_, state) = TuiObserverState::new().into_observer();
+        let (submit_tx, submit_rx) = mpsc::unbounded_channel();
+        let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+        submit_tx
+            .send(Submission::Command {
+                command: SessionCommand::Model {
+                    name: "wide-model".to_string(),
+                },
+            })
+            .expect("driver channel open");
+        drop(submit_tx);
+        let driver = tokio::spawn(Box::pin(run_driver_loop(
+            runner,
+            submit_rx,
+            DriverContext {
+                config_base: std::sync::Arc::new(config.clone()),
+                config,
+                workdir: std::path::PathBuf::from("."),
+                sessions_root: dir.path().to_path_buf(),
+                state: state.clone(),
+                shutting_down: shutdown_flag(false),
+                lanes: InteractiveLanes::detached(),
+            },
+            transcript.clone(),
+            session_tx,
+        )));
+        let update = tokio::time::timeout(std::time::Duration::from_secs(5), session_rx.recv())
+            .await
+            .expect("a model update is published")
+            .expect("the session channel is open when the command lands");
+        // The switch posts its receipt first (the notice naming what
+        // landed and at what window), then the verdict.
+        let update = match update {
+            SessionUpdate::Notice { text } => {
+                assert!(
+                    text.contains("switched to wide-model") && text.contains("123456"),
+                    "the receipt names the model and the engine's window: {text}"
+                );
+                tokio::time::timeout(std::time::Duration::from_secs(5), session_rx.recv())
+                    .await
+                    .expect("the verdict follows the receipt")
+                    .expect("the session channel is open")
+            }
+            verdict => verdict,
+        };
+        assert_eq!(
+            update,
+            SessionUpdate::ModelName {
+                name: "wide-model".to_string()
+            },
+            "the applied switch is published by its own name"
+        );
+        let _ = driver.await;
+        assert_eq!(
+            state.context_window.load(Ordering::SeqCst),
+            123_456,
+            "the rebuilt engine carries the selected profile's window — the figure the bar shows and the compaction threshold reads"
+        );
+        // The display half of the loop: the same wiring run_tui_session
+        // installs — the save hook on the app, the session channel in —
+        // and the verdict applied the way the run loop applies it. The
+        // publish the verdict carries is what writes the file; nothing
+        // else in this flow saves.
+        let mut app = dch_tui::TuiApp::from_observer_state(
+            dch_config::DchConfig {
+                models: vec![dch_config::ModelProfile {
+                    model: "wide-model".to_string(),
+                    context_window: Some(123_456),
+                    ..dch_config::ModelProfile::default()
+                }],
+                ..dch_config::DchConfig::default()
+            },
+            state.clone(),
+        );
+        let (_display_tx, display_rx) = mpsc::unbounded_channel();
+        app.set_session_requests(display_rx);
+        app.set_turn_end_hook(Box::new(move |conversation, machine| {
+            hook_transcript.send(
+                conversation.to_vec(),
+                crate::session::SessionTokens::default(),
+            );
+            if let Some(machine) = machine {
+                hook_transcript.send_machine(MachineSnapshot {
+                    messages: filtered_machine_history(&Arc::new(machine.to_vec())),
+                    saved_at: chrono::Utc::now(),
+                    compactions: 0,
+                    saver: None,
+                });
+            }
+        }));
+        app.apply_session_update(update);
+        worker.join();
+        let (_, model, _, _) =
+            crate::session::load_with_meta_in(id, dir.path()).expect("the file the writer left");
+        assert_eq!(
+            model, "wide-model",
+            "session.json names the switched model, read off disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn typing_a_model_switch_rewrites_the_file_and_the_window() {
+        // The full production path, no shortcuts: the app types the
+        // command through its own key handling — parse, the profile
+        // match, the send — the driver rebuilds the engine on the
+        // selected entry and relabels the saver, the verdict travels
+        // back and the display publishes the save, the writer drains,
+        // and the test reads session.json off disk and the shared
+        // window. This is the path a user's `/model` actually takes.
+        let dir = tempfile::tempdir().expect("sessions tempdir");
+        let id = uuid::Uuid::new_v4();
+        let saver = Arc::new(crate::session::SessionSaver::with_base_dir(
+            id,
+            "first-model".to_string(),
+            dir.path().to_path_buf(),
+        ));
+        let (transcript, worker) = TranscriptWorker::spawn(Arc::clone(&saver));
+        let hook_transcript = transcript.clone();
+
+        let config = dch_config::DchConfig {
+            models: vec![dch_config::ModelProfile {
+                model: "wide-model".to_string(),
+                context_window: Some(123_456),
+                ..dch_config::ModelProfile::default()
+            }],
+            ..dch_config::DchConfig::default()
+        };
+
+        let runner = unreachable_runner().await;
+        let (_, state) = TuiObserverState::new().into_observer();
+        let (submit_tx, submit_rx) = mpsc::unbounded_channel();
+        let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+
+        let mut app = dch_tui::TuiApp::from_observer_state(config, state.clone());
+        app.set_submit_tx(submit_tx);
+        let (_drain_tx, session_rx_for_app) = mpsc::unbounded_channel();
+        app.set_session_requests(session_rx_for_app);
+        app.set_turn_end_hook(Box::new(move |conversation, machine| {
+            hook_transcript.send(
+                conversation.to_vec(),
+                crate::session::SessionTokens::default(),
+            );
+            if let Some(machine) = machine {
+                hook_transcript.send_machine(MachineSnapshot {
+                    messages: filtered_machine_history(&Arc::new(machine.to_vec())),
+                    saved_at: chrono::Utc::now(),
+                    compactions: 0,
+                    saver: None,
+                });
+            }
+        }));
+
+        let mut switch_config = unreachable_config();
+        switch_config.models = vec![dch_config::ModelProfile {
+            model: "wide-model".to_string(),
+            context_window: Some(123_456),
+            ..dch_config::ModelProfile::default()
+        }];
+        let driver = tokio::spawn(Box::pin(run_driver_loop(
+            runner,
+            submit_rx,
+            DriverContext {
+                config_base: std::sync::Arc::new(switch_config.clone()),
+                config: switch_config,
+                workdir: std::path::PathBuf::from("."),
+                sessions_root: dir.path().to_path_buf(),
+                state: state.clone(),
+                shutting_down: shutdown_flag(false),
+                lanes: InteractiveLanes::detached(),
+            },
+            transcript,
+            session_tx,
+        )));
+
+        // Type the command the way a user does: key by key, then Enter.
+        for glyph in "/model wide-model".chars() {
+            app.handle_event(&Event::Key(KeyEvent::new(
+                KeyCode::Char(glyph),
+                KeyModifiers::NONE,
+            )));
+        }
+        app.handle_event(&Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+
+        // The driver's receipt comes first (the notice), then the
+        // verdict; apply the verdict the way the run loop does.
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), session_rx.recv())
+            .await
+            .expect("the switch lands")
+            .expect("the session channel is open");
+        let verdict = match first {
+            SessionUpdate::Notice { .. } => {
+                tokio::time::timeout(std::time::Duration::from_secs(5), session_rx.recv())
+                    .await
+                    .expect("the verdict follows the receipt")
+                    .expect("the session channel is open")
+            }
+            verdict => verdict,
+        };
+        app.apply_session_update(verdict);
+        drop(app);
+        driver.abort();
+        assert_eq!(
+            state.context_window.load(Ordering::SeqCst),
+            123_456,
+            "the shared window carries the selected profile's figure — what the bar and the compaction threshold read"
+        );
+        worker.join();
+        let (_, model, _, _) =
+            crate::session::load_with_meta_in(id, dir.path()).expect("the file the writer left");
+        assert_eq!(
+            model, "wide-model",
+            "session.json names the switched model, read off disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_clear_command_at_rest_publishes_a_fresh_session_id() {
+        // The session lane's clear leg at rest: the driver empties the loop's
+        // history and moves the save target to a new session through the
+        // transcript handle, then publishes the new id so the bar shows the
+        // conversation's replacement, not the ended one. The id must be a real
+        // identity — a fresh uuid — not the empty string or the old one.
+        let runner = unreachable_runner().await;
+        let (_, state) = TuiObserverState::new().into_observer();
+        let (submit_tx, submit_rx) = mpsc::unbounded_channel();
+        let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+        submit_tx
+            .send(Submission::Command {
+                command: SessionCommand::Clear,
+            })
+            .expect("driver channel open");
+        drop(submit_tx);
+
+        let driver = tokio::spawn(Box::pin(run_driver_loop(
+            runner,
+            submit_rx,
+            DriverContext {
+                config: dch_config::DchConfig::default(),
+                config_base: std::sync::Arc::new(dch_config::DchConfig::default()),
+                workdir: std::path::PathBuf::from("."),
+                sessions_root: crate::session::sessions_dir(),
+                state,
+                shutting_down: shutdown_flag(false),
+                lanes: InteractiveLanes::detached(),
+            },
+            parked_transcript(),
+            session_tx,
+        )));
+        let update = tokio::time::timeout(std::time::Duration::from_secs(5), session_rx.recv())
+            .await
+            .expect("a session id is published")
+            .expect("the session channel is open when the command lands");
+        let SessionUpdate::SessionId { id } = update else {
+            panic!("a clear publishes a fresh session id, got {update:?}");
+        };
+        assert!(
+            uuid::Uuid::parse_str(&id).is_ok(),
+            "the published id is a session identity, got {id}"
+        );
+        let _ = driver.await;
+    }
+
+    #[tokio::test]
+    async fn a_declined_model_switch_publishes_a_notice() {
+        // The `Model` leg's failure path: a name the live loop refuses must
+        // not publish a `ModelName` — the status bar would claim a model the
+        // loop never took — and the refusal is said aloud on the notice lane
+        // instead of dying in a log. A blank name is refused at the runner.
+        let runner = unreachable_runner().await;
+        let (_, state) = TuiObserverState::new().into_observer();
+        let (submit_tx, submit_rx) = mpsc::unbounded_channel();
+        let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+        submit_tx
+            .send(Submission::Command {
+                command: SessionCommand::Model {
+                    name: String::new(),
+                },
+            })
+            .expect("driver channel open");
+        drop(submit_tx);
+
+        let driver = tokio::spawn(Box::pin(run_driver_loop(
+            runner,
+            submit_rx,
+            DriverContext {
+                config: dch_config::DchConfig::default(),
+                config_base: std::sync::Arc::new(dch_config::DchConfig::default()),
+                workdir: std::path::PathBuf::from("."),
+                sessions_root: crate::session::sessions_dir(),
+                state,
+                shutting_down: shutdown_flag(false),
+                lanes: InteractiveLanes::detached(),
+            },
+            parked_transcript(),
+            session_tx,
+        )));
+        let update = tokio::time::timeout(std::time::Duration::from_secs(5), session_rx.recv())
+            .await
+            .expect("a refusal is published")
+            .expect("the session channel is open when the refusal lands");
+        let SessionUpdate::Notice { text } = update else {
+            panic!("a refused switch posts a notice, got {update:?}");
+        };
+        assert!(
+            text.contains("kept"),
+            "the notice names the model that stands: {text}"
+        );
+        let _ = driver.await;
+    }
+
+    #[tokio::test]
+    async fn a_refused_clear_lands_as_a_notice_and_rotates_nothing() {
+        // The Clear arm's caller-side wiring, not only its predicate: a
+        // rewind that refuses must post the notice, publish no fresh
+        // id, and leave the save target on the session it stood on —
+        // the caller that forgets to ask the gate is what this catches.
+        let dir = tempfile::tempdir().expect("sessions tempdir");
+        let id = uuid::Uuid::new_v4();
+        let saver = Arc::new(crate::session::SessionSaver::with_base_dir(
+            id,
+            "m".to_string(),
+            dir.path().to_path_buf(),
+        ));
+        let (handle, worker) = TranscriptWorker::spawn(Arc::clone(&saver));
+        let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+        let refused = loopctl::error::LoopError::InvalidInput("a turn is in flight".to_string());
+        land_session_clear(Err(refused), &handle, &session_tx, "m");
+        let notice = tokio::time::timeout(std::time::Duration::from_secs(5), session_rx.recv())
+            .await
+            .expect("the refusal is said aloud")
+            .expect("the session channel is open");
+        let SessionUpdate::Notice { text } = notice else {
+            panic!("a refused clear posts a notice, got {notice:?}")
+        };
+        assert!(
+            text.contains("could not be cleared"),
+            "the notice names what was refused: {text}"
+        );
+        assert!(
+            session_rx.try_recv().is_err(),
+            "no fresh session id rides a refused clear"
+        );
+        worker.join();
+        let saving = handle
+            .saver
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            saving.session_id(),
+            id,
+            "the save target never rotated off the refused session"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rebuilt_runner_keeps_both_interactive_lanes() {
+        // What a rebuild must never lose: the ask tool's channel and
+        // the permission gate. The lanes a session carries attach a
+        // fresh runner's question supervision to the panel's own
+        // channel, and the resolver every rebuild builds with is the
+        // one the panel has held since startup — so an ask through the
+        // rebuilt context reaches the panel, not a closed channel's
+        // silent denial.
+        let (permission, mut permission_rx) = permission_bridge();
+        let (prompt_tx, mut prompt_rx) = mpsc::unbounded_channel();
+        let lanes = InteractiveLanes {
+            permission: Arc::clone(&permission),
+            prompt_tx,
+            overlay: overlay_prompt,
+        };
+        let rebuilt = unreachable_runner().await;
+        lanes.attach(&rebuilt);
+
+        // The ask lane: a question through the rebuilt runner's
+        // context lands on the panel's channel, overlay-shaped.
+        let sender = rebuilt
+            .context()
+            .question_tx
+            .lock()
+            .expect("slot lock")
+            .clone()
+            .expect("attach installed a live generation");
+        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+        sender
+            .send(dch_tools::QuestionRequest {
+                questions: vec![dch_tools::Question {
+                    question: "still asking?".to_string(),
+                    header: None,
+                    options: Vec::new(),
+                    multi_select: false,
+                    response_tx,
+                }],
+            })
+            .expect("the installed channel takes the question");
+        let prompt = tokio::time::timeout(std::time::Duration::from_secs(5), prompt_rx.recv())
+            .await
+            .expect("the panel's channel carries the rebuilt runner's prompt")
+            .expect("the supervision stays alive");
+        assert_eq!(prompt.question, "still asking?");
+
+        // The permission lane: the resolver a rebuild reuses reaches
+        // the panel's receiver and returns its verdict.
+        let verdict = permission("may I run this?", "Bash");
+        let request = tokio::time::timeout(std::time::Duration::from_secs(5), permission_rx.recv())
+            .await
+            .expect("the panel's permission channel carries the ask")
+            .expect("the bridge stays alive");
+        assert_eq!(request.tool_name, "Bash");
+        request
+            .reply
+            .send(true)
+            .expect("the panel answers while the resolver waits");
+        assert!(
+            verdict.await,
+            "the verdict the panel sent is the verdict the gate reads"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sessions_listing_carries_the_saved_sessions_newest_first() {
+        // The `/sessions` ask, driven end to end: the driver lists the
+        // sessions root it holds and hands the catalog back newest
+        // first — the older session saved earlier, the newer later,
+        // and the picker's first row is the newer one.
+        let dir = tempfile::tempdir().expect("sessions tempdir");
+        let older = uuid::Uuid::new_v4();
+        let newer = uuid::Uuid::new_v4();
+        for (id, model, stamp) in [
+            (
+                older,
+                "older-model",
+                chrono::Utc::now() - chrono::Duration::hours(2),
+            ),
+            (newer, "newer-model", chrono::Utc::now()),
+        ] {
+            let saver = crate::session::SessionSaver::with_base_dir(
+                id,
+                model.to_string(),
+                dir.path().to_path_buf(),
+            );
+            saver
+                .save_at(
+                    &[dch_tui::TuiMessage::User {
+                        text: "the saved turn".to_string(),
+                        timestamp: stamp,
+                        steered: false,
+                        unsent: false,
+                    }],
+                    crate::session::SessionTokens::default(),
+                    stamp,
+                )
+                .expect("the saved session lands");
+        }
+        let runner = unreachable_runner().await;
+        let (_, state) = TuiObserverState::new().into_observer();
+        let (submit_tx, submit_rx) = mpsc::unbounded_channel();
+        let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+        submit_tx
+            .send(Submission::Command {
+                command: SessionCommand::ListSessions,
+            })
+            .expect("driver channel open");
+        drop(submit_tx);
+        let driver = tokio::spawn(Box::pin(run_driver_loop(
+            runner,
+            submit_rx,
+            DriverContext {
+                config: unreachable_config(),
+                config_base: std::sync::Arc::new(unreachable_config()),
+                workdir: std::path::PathBuf::from("."),
+                sessions_root: dir.path().to_path_buf(),
+                state,
+                shutting_down: shutdown_flag(false),
+                lanes: InteractiveLanes::detached(),
+            },
+            TranscriptWorker::spawn(Arc::new(crate::session::SessionSaver::with_base_dir(
+                uuid::Uuid::new_v4(),
+                "m".to_string(),
+                dir.path().to_path_buf(),
+            )))
+            .0,
+            session_tx,
+        )));
+        let update = tokio::time::timeout(std::time::Duration::from_secs(5), session_rx.recv())
+            .await
+            .expect("the catalog is published")
+            .expect("the session channel is open when the listing lands");
+        let SessionUpdate::SessionCatalog { rows } = update else {
+            panic!("a listing answers with the catalog, got {update:?}")
+        };
+        assert_eq!(rows.len(), 2, "both saved sessions list: {rows:?}");
+        assert_eq!(
+            rows.first()
+                .and_then(|row| uuid::Uuid::parse_str(&row.id).ok()),
+            Some(newer),
+            "the newest session is the picker's first row"
+        );
+        assert_eq!(rows[1].model, "older-model", "each row carries its model");
+        let _ = driver.await;
+    }
+
+    #[tokio::test]
+    async fn a_resume_command_rebuilds_on_the_saved_history_and_takes_its_file() {
+        // The live swap, driven end to end: the driver loads the saved pair
+        // from the sessions root it holds, rebuilds the runner on the
+        // restored history, retargets the save target onto the session's own
+        // file, and publishes the loaded transcript back so the display can
+        // re-seed. The handle's saver ends on the resumed id — the file the
+        // next save writes.
+        let dir = tempfile::tempdir().expect("sessions tempdir");
+        let id = uuid::Uuid::new_v4();
+        let saver = Arc::new(crate::session::SessionSaver::with_base_dir(
+            id,
+            "saved-model".to_string(),
+            dir.path().to_path_buf(),
+        ));
+        let now = chrono::Utc::now();
+        let conversation = vec![dch_tui::TuiMessage::User {
+            text: "the saved turn".to_string(),
+            timestamp: now,
+            steered: false,
+            unsent: false,
+        }];
+        let tokens = crate::session::SessionTokens {
+            cumulative_input: 21,
+            cumulative_output: 13,
+            last_input_tokens: 5,
+            context_tokens: 8,
+        };
+        saver
+            .save_at(&conversation, tokens, now)
+            .expect("the saved session lands");
+        let (handle, worker) = TranscriptWorker::spawn(Arc::clone(&saver));
+
+        let runner = unreachable_runner().await;
+        let (_, state) = TuiObserverState::new().into_observer();
+        let (submit_tx, submit_rx) = mpsc::unbounded_channel();
+        let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+        submit_tx
+            .send(Submission::Command {
+                command: SessionCommand::Resume { id: id.to_string() },
+            })
+            .expect("driver channel open");
+        drop(submit_tx);
+        let driver = tokio::spawn(Box::pin(run_driver_loop(
+            runner,
+            submit_rx,
+            DriverContext {
+                config: unreachable_config(),
+                config_base: std::sync::Arc::new(unreachable_config()),
+                workdir: std::path::PathBuf::from("."),
+                sessions_root: dir.path().to_path_buf(),
+                state,
+                shutting_down: shutdown_flag(false),
+                lanes: InteractiveLanes::detached(),
+            },
+            handle.clone(),
+            session_tx,
+        )));
+        let update = tokio::time::timeout(std::time::Duration::from_secs(5), session_rx.recv())
+            .await
+            .expect("a resumed update is published")
+            .expect("the session channel is open when the resume lands");
+        let SessionUpdate::Resumed {
+            id: resumed_id,
+            transcript,
+            tokens: resumed_tokens,
+        } = update
+        else {
+            panic!("a resume publishes the loaded transcript, got {update:?}");
+        };
+        assert_eq!(resumed_id, id.to_string());
+        assert_eq!(
+            resumed_tokens.cumulative_input, 21,
+            "the accounting continues the saved session's count"
+        );
+        assert!(
+            transcript.iter().any(|message| matches!(
+                message,
+                dch_tui::TuiMessage::User { text, .. } if text == "the saved turn"
+            )),
+            "the loaded transcript carries the saved turn: {transcript:?}"
+        );
+        let _ = driver.await;
+        worker.join();
+        let saving = handle
+            .saver
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            saving.session_id(),
+            id,
+            "later saves write the resumed session's own file"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resume_publishes_the_adopted_machine_under_the_resumed_session() {
+        // The ordering the seam demands, with distinct ids so it cannot
+        // hide behind a shared one: the save target retargets onto the
+        // resumed session before the adopted machine publishes, so the
+        // snapshot pins the resumed session's saver and the write lands
+        // beside its transcript — never under the outgoing session the
+        // driver is leaving, whose newer machine stamp would hand a
+        // later resume the wrong pair.
+        let dir = tempfile::tempdir().expect("sessions tempdir");
+        let outgoing = uuid::Uuid::new_v4();
+        let target = uuid::Uuid::new_v4();
+        let saver = Arc::new(crate::session::SessionSaver::with_base_dir(
+            outgoing,
+            "outgoing-model".to_string(),
+            dir.path().to_path_buf(),
+        ));
+        let target_saver = crate::session::SessionSaver::with_base_dir(
+            target,
+            "saved-model".to_string(),
+            dir.path().to_path_buf(),
+        );
+        let now = chrono::Utc::now();
+        target_saver
+            .save_at(
+                &[dch_tui::TuiMessage::User {
+                    text: "the saved turn".to_string(),
+                    timestamp: now,
+                    steered: false,
+                    unsent: false,
+                }],
+                crate::session::SessionTokens::default(),
+                now,
+            )
+            .expect("the saved session lands");
+        let (handle, worker) = TranscriptWorker::spawn(Arc::clone(&saver));
+
+        let runner = unreachable_runner().await;
+        let (_, state) = TuiObserverState::new().into_observer();
+        let (submit_tx, submit_rx) = mpsc::unbounded_channel();
+        let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+        submit_tx
+            .send(Submission::Command {
+                command: SessionCommand::Resume {
+                    id: target.to_string(),
+                },
+            })
+            .expect("driver channel open");
+        drop(submit_tx);
+        let driver = tokio::spawn(Box::pin(run_driver_loop(
+            runner,
+            submit_rx,
+            DriverContext {
+                config: unreachable_config(),
+                config_base: std::sync::Arc::new(unreachable_config()),
+                workdir: std::path::PathBuf::from("."),
+                sessions_root: dir.path().to_path_buf(),
+                state,
+                shutting_down: shutdown_flag(false),
+                lanes: InteractiveLanes::detached(),
+            },
+            handle.clone(),
+            session_tx,
+        )));
+        let update = tokio::time::timeout(std::time::Duration::from_secs(5), session_rx.recv())
+            .await
+            .expect("a resumed update is published")
+            .expect("the session channel is open when the resume lands");
+        assert!(
+            matches!(update, SessionUpdate::Resumed { .. }),
+            "the resume lands, got {update:?}"
+        );
+        let _ = driver.await;
+        worker.join();
+        assert!(
+            dir.path()
+                .join(target.to_string())
+                .join("machine.json")
+                .is_file(),
+            "the adopted machine lands beside the resumed session's transcript"
+        );
+        assert!(
+            !dir.path()
+                .join(outgoing.to_string())
+                .join("machine.json")
+                .exists(),
+            "the outgoing session never receives the resumed machine"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resume_that_cannot_load_notices_and_keeps_the_loop() {
+        // A well-formed id with no saved session behind it: the driver says
+        // so on the notice lane, and the conversation it holds stands — no
+        // session id is published, nothing is rotated.
+        let dir = tempfile::tempdir().expect("sessions tempdir");
+        let runner = unreachable_runner().await;
+        let (_, state) = TuiObserverState::new().into_observer();
+        let (submit_tx, submit_rx) = mpsc::unbounded_channel();
+        let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+        submit_tx
+            .send(Submission::Command {
+                command: SessionCommand::Resume {
+                    id: uuid::Uuid::new_v4().to_string(),
+                },
+            })
+            .expect("driver channel open");
+        drop(submit_tx);
+        let driver = tokio::spawn(Box::pin(run_driver_loop(
+            runner,
+            submit_rx,
+            DriverContext {
+                config: dch_config::DchConfig::default(),
+                config_base: std::sync::Arc::new(dch_config::DchConfig::default()),
+                workdir: std::path::PathBuf::from("."),
+                sessions_root: dir.path().to_path_buf(),
+                state,
+                shutting_down: shutdown_flag(false),
+                lanes: InteractiveLanes::detached(),
+            },
+            parked_transcript(),
+            session_tx,
+        )));
+        let update = tokio::time::timeout(std::time::Duration::from_secs(5), session_rx.recv())
+            .await
+            .expect("a notice is published")
+            .expect("the session channel is open when the refusal lands");
+        let SessionUpdate::Notice { text } = update else {
+            panic!("an unloadable resume posts a notice, got {update:?}");
+        };
+        assert!(
+            text.contains("could not be loaded"),
+            "the notice says what stood: {text}"
+        );
+        let _ = driver.await;
+    }
+
+    #[tokio::test]
+    async fn a_provider_switch_with_an_unknown_protocol_is_refused_whole() {
+        // The api type names the wire shape: one the config's vocabulary
+        // rejects is refused before any rebuild, so the endpoint is never
+        // half-moved and the loop keeps the conversation it holds.
+        let runner = unreachable_runner().await;
+        let (_, state) = TuiObserverState::new().into_observer();
+        let (submit_tx, submit_rx) = mpsc::unbounded_channel();
+        let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+        submit_tx
+            .send(Submission::Command {
+                command: SessionCommand::SwitchProvider {
+                    model: "elsewhere-model".to_string(),
+                    base_url: "http://127.0.0.1:1".to_string(),
+                    api_type: "not-a-protocol".to_string(),
+                },
+            })
+            .expect("driver channel open");
+        drop(submit_tx);
+        let driver = tokio::spawn(Box::pin(run_driver_loop(
+            runner,
+            submit_rx,
+            DriverContext {
+                config: dch_config::DchConfig::default(),
+                config_base: std::sync::Arc::new(dch_config::DchConfig::default()),
+                workdir: std::path::PathBuf::from("."),
+                sessions_root: crate::session::sessions_dir(),
+                state,
+                shutting_down: shutdown_flag(false),
+                lanes: InteractiveLanes::detached(),
+            },
+            parked_transcript(),
+            session_tx,
+        )));
+        let update = tokio::time::timeout(std::time::Duration::from_secs(5), session_rx.recv())
+            .await
+            .expect("a notice is published")
+            .expect("the session channel is open when the refusal lands");
+        let SessionUpdate::Notice { text } = update else {
+            panic!("an unknown protocol posts a notice, got {update:?}");
+        };
+        assert!(
+            text.contains("not a known protocol"),
+            "the refusal names the half-move it prevented: {text}"
+        );
+        let _ = driver.await;
+    }
+
+    #[tokio::test]
+    async fn a_model_switch_then_clear_files_the_fresh_session_under_the_live_model() {
+        // Two commands in sequence: the rename the loop accepts updates the
+        // driver's live configuration, and the clear's rotated saver records
+        // that model — not the launch-time one — so the fresh session's
+        // envelope names the loop that actually writes it.
+        let dir = tempfile::tempdir().expect("transcript tempdir");
+        let saver = Arc::new(crate::session::SessionSaver::with_base_dir(
+            uuid::Uuid::new_v4(),
+            "test-model".to_string(),
+            dir.keep(),
+        ));
+        let (handle, _worker) = TranscriptWorker::spawn(Arc::clone(&saver));
+        let runner = unreachable_runner().await;
+        let (_, state) = TuiObserverState::new().into_observer();
+        let (submit_tx, submit_rx) = mpsc::unbounded_channel();
+        let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+        submit_tx
+            .send(Submission::Command {
+                command: SessionCommand::Model {
+                    name: "renamed-model".to_string(),
+                },
+            })
+            .expect("driver channel open");
+        submit_tx
+            .send(Submission::Command {
+                command: SessionCommand::Clear,
+            })
+            .expect("driver channel open");
+        drop(submit_tx);
+        let driver = tokio::spawn(Box::pin(run_driver_loop(
+            runner,
+            submit_rx,
+            DriverContext {
+                config: unreachable_config(),
+                config_base: std::sync::Arc::new(unreachable_config()),
+                workdir: std::path::PathBuf::from("."),
+                sessions_root: crate::session::sessions_dir(),
+                state,
+                shutting_down: shutdown_flag(false),
+                lanes: InteractiveLanes::detached(),
+            },
+            handle.clone(),
+            session_tx,
+        )));
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), session_rx.recv())
+            .await
+            .expect("the rename is published")
+            .expect("the session channel is open");
+        let first = match first {
+            SessionUpdate::Notice { .. } => {
+                tokio::time::timeout(std::time::Duration::from_secs(5), session_rx.recv())
+                    .await
+                    .expect("the verdict follows the receipt")
+                    .expect("the session channel is open")
+            }
+            verdict => verdict,
+        };
+        assert_eq!(
+            first,
+            SessionUpdate::ModelName {
+                name: "renamed-model".to_string()
+            }
+        );
+        let second = tokio::time::timeout(std::time::Duration::from_secs(5), session_rx.recv())
+            .await
+            .expect("the fresh id is published")
+            .expect("the session channel is open");
+        let SessionUpdate::SessionId { id } = second else {
+            panic!("a clear publishes a fresh session id, got {second:?}");
+        };
+        assert_ne!(id, saver.session_id().to_string());
+        let _ = driver.await;
+        let saving = handle
+            .saver
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            saving.model, "renamed-model",
+            "the rotated saver records the live loop's model"
+        );
+    }
+
+    #[test]
+    fn a_model_switch_relables_the_saver_without_moving_the_session() {
+        // `/model` changes what the session runs, and the envelope
+        // must say so: the saver's model field follows the switch so a
+        // later resume defaults to it, while the session id — the
+        // file's identity — never moves.
+        let dir = tempfile::tempdir().expect("sessions tempdir");
+        let id = uuid::Uuid::new_v4();
+        let saver = Arc::new(crate::session::SessionSaver::with_base_dir(
+            id,
+            "first-model".to_string(),
+            dir.path().to_path_buf(),
+        ));
+        let (handle, worker) = TranscriptWorker::spawn(Arc::clone(&saver));
+        handle.relabel_model("switched-model");
+        worker.join();
+        let saving = handle
+            .saver
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            saving.model, "switched-model",
+            "the envelope's model follows the switch the next save writes"
+        );
+        assert_eq!(
+            saving.session_id(),
+            id,
+            "the switch moves the model, never the session's identity"
+        );
+    }
+
+    #[test]
+    fn the_exit_command_names_the_session_the_last_save_wrote() {
+        // The exit line's id follows the save target: a `/clear`
+        // rotation and a `/resume` retarget both swap the cell, and the
+        // command a user copies at exit must name the session those
+        // saves went to — never the one the session started under.
+        let dir = tempfile::tempdir().expect("sessions tempdir");
+        let first = uuid::Uuid::new_v4();
+        let saver = Arc::new(crate::session::SessionSaver::with_base_dir(
+            first,
+            "m".to_string(),
+            dir.path().to_path_buf(),
+        ));
+        let (handle, worker) = TranscriptWorker::spawn(Arc::clone(&saver));
+        let exit_reads = || {
+            handle
+                .saver
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .session_id()
+        };
+        assert_eq!(
+            exit_reads(),
+            first,
+            "before any move, the opening id stands"
+        );
+        let rotated = handle.rotate("m");
+        worker.join();
+        assert_eq!(
+            exit_reads().to_string(),
+            rotated,
+            "a cleared session's exit names the fresh id"
+        );
+        let adopted = uuid::Uuid::new_v4();
+        handle.retarget(adopted, "m");
+        assert_eq!(
+            exit_reads(),
+            adopted,
+            "a resumed session's exit names the adopted id"
+        );
+    }
+
+    #[test]
+    fn a_published_snapshot_keeps_the_destination_it_was_published_with() {
+        // A save published before a rotation keeps the destination it was
+        // published under: the pin rides in the snapshot itself, so a
+        // mid-flight swap of the saver cell cannot redirect it. Driven
+        // without a writer so the pending slot — where the pin lives —
+        // is inspectable exactly across the rotation boundary.
+        let dir = tempfile::tempdir().expect("sessions tempdir");
+        let first = uuid::Uuid::new_v4();
+        let saver = Arc::new(crate::session::SessionSaver::with_base_dir(
+            first,
+            "m".to_string(),
+            dir.path().to_path_buf(),
+        ));
+        let handle = TranscriptHandle {
+            pending: Arc::new(std::sync::Mutex::new(PendingSaves::default())),
+            signal: Arc::new(std::sync::Condvar::new()),
+            saver: Arc::new(std::sync::Mutex::new(saver)),
+        };
+        handle.send(
+            vec![dch_tui::TuiMessage::User {
+                text: "the ended session's last turn".to_string(),
+                timestamp: chrono::Utc::now(),
+                steered: false,
+                unsent: false,
+            }],
+            crate::session::SessionTokens::default(),
+        );
+        let rotated = handle.rotate("m");
+        let pending = handle
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let pinned = pending
+            .display
+            .as_ref()
+            .expect("the published snapshot waits in the slot")
+            .saver
+            .session_id();
+        drop(pending);
+        assert_eq!(
+            pinned, first,
+            "the waiting save keeps the destination it was published under"
+        );
+        let cell = handle
+            .saver
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            cell.session_id().to_string(),
+            rotated,
+            "the cell itself moved to the fresh identity"
+        );
+    }
+
+    #[test]
+    fn a_rotated_writer_lands_each_save_in_its_own_file() {
+        // The write half, sequenced through the real writer: a save the
+        // rotation overtakes lands in the ended session's file, and the
+        // first save published after the swap opens the fresh one.
+        let dir = tempfile::tempdir().expect("sessions tempdir");
+        let first = uuid::Uuid::new_v4();
+        let saver = Arc::new(crate::session::SessionSaver::with_base_dir(
+            first,
+            "m".to_string(),
+            dir.path().to_path_buf(),
+        ));
+        let (handle, worker) = TranscriptWorker::spawn(Arc::clone(&saver));
+        let now = chrono::Utc::now();
+        handle.send(
+            vec![dch_tui::TuiMessage::User {
+                text: "the ended session's last turn".to_string(),
+                timestamp: now,
+                steered: false,
+                unsent: false,
+            }],
+            crate::session::SessionTokens::default(),
+        );
+        let first_path = dir.path().join(first.to_string()).join("session.json");
+        let written = std::time::Instant::now();
+        while !first_path.exists()
+            && std::time::Instant::now().duration_since(written) < std::time::Duration::from_secs(2)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(
+            first_path.exists(),
+            "the pre-rotation save reaches the ended session's file"
+        );
+        let rotated = handle.rotate("m");
+        handle.send(
+            vec![dch_tui::TuiMessage::User {
+                text: "the fresh session's first turn".to_string(),
+                timestamp: now,
+                steered: false,
+                unsent: false,
+            }],
+            crate::session::SessionTokens::default(),
+        );
+        worker.join();
+        let first_save = std::fs::read_to_string(&first_path)
+            .expect("the ended session's file stands with its last turn");
+        assert!(
+            first_save.contains("the ended session's last turn"),
+            "got {first_save}"
+        );
+        let rotated_save = std::fs::read_to_string(dir.path().join(rotated).join("session.json"))
+            .expect("the post-rotation save lands in the fresh session's file");
+        assert!(
+            rotated_save.contains("the fresh session's first turn"),
+            "got {rotated_save}"
+        );
+    }
+
+    #[test]
+    fn a_refused_rewind_keeps_the_session_identity() {
+        // The clear path's one gate: only a rewind that emptied the history
+        // earns the fresh identity, so a refused rewind keeps the session —
+        // its id, its file — exactly as it stood.
+        let accepted: Result<usize, String> = Ok(3);
+        assert!(
+            rewind_earned_fresh_session(&accepted),
+            "a rewind that emptied the history earns the fresh session"
+        );
+        let refused: Result<usize, String> = Err("a turn is in flight".to_string());
+        assert!(
+            !rewind_earned_fresh_session(&refused),
+            "a refused rewind keeps the ended session standing"
+        );
     }
 
     #[tokio::test]
@@ -4541,6 +6724,91 @@ mod tests {
                 errors.len(),
                 1,
                 "the submission runs rather than being eaten by the stale trip"
+            );
+            assert_ne!(
+                errors.first().map(String::as_str),
+                Some(loopctl::error::LoopError::Cancelled.to_string().as_str()),
+                "the run must reach its provider failure, not die on a \
+                 cancel nobody pressed for it"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stale_trip_on_the_swapped_signal_does_not_eat_the_rebuilt_run() {
+        // The rebuild half of the stale-trip rule: /model swaps the
+        // shared signal cell, and the driver's pre-run re-arm must
+        // read that swapped cell — resetting only a launch-captured
+        // signal would leave the trip standing on the rebuilt runner,
+        // whose first turn then dies on a cancel nobody pressed.
+        let runner = unreachable_runner().await;
+        let (_, state) = TuiObserverState::new().into_observer();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut context = unreachable_config();
+        context.models = vec![dch_config::ModelProfile {
+            model: "rebuilt-model".to_string(),
+            ..dch_config::ModelProfile::default()
+        }];
+        let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+        tx.send(Submission::Command {
+            command: SessionCommand::Model {
+                name: "rebuilt-model".to_string(),
+            },
+        })
+        .expect("driver channel open");
+        let driver = tokio::spawn(Box::pin(run_driver_loop(
+            runner,
+            rx,
+            DriverContext {
+                config: context,
+                config_base: std::sync::Arc::new(dch_config::DchConfig::default()),
+                workdir: std::path::PathBuf::from("."),
+                sessions_root: crate::session::sessions_dir(),
+                state: state.clone(),
+                shutting_down: shutdown_flag(false),
+                lanes: InteractiveLanes::detached(),
+            },
+            parked_transcript(),
+            session_tx,
+        )));
+        // The rebuild's verdict says the swap already happened — the
+        // cell now holds the rebuilt runner's own signal.
+        let update = tokio::time::timeout(std::time::Duration::from_secs(5), session_rx.recv())
+            .await
+            .expect("a model update is published")
+            .expect("the session channel is open when the command lands");
+        let verdict = match update {
+            SessionUpdate::Notice { .. } => {
+                tokio::time::timeout(std::time::Duration::from_secs(5), session_rx.recv())
+                    .await
+                    .expect("the verdict follows the receipt")
+                    .expect("the session channel is open")
+            }
+            verdict => verdict,
+        };
+        assert_eq!(
+            verdict,
+            SessionUpdate::ModelName {
+                name: "rebuilt-model".to_string()
+            },
+            "the switch landed on the rebuilt runner before the trip"
+        );
+        // Trip the swapped signal while nothing runs — the shape of a
+        // cancel pressed just as a run was ending.
+        state.cancel_signal.lock().unwrap().cancel();
+        queue_prompt(&state, &tx, "still runs after the rebuild");
+        drop(tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(30), driver)
+            .await
+            .expect("the rebuilt run settles without hanging");
+
+        {
+            let errors = state.errors.lock().unwrap();
+            assert_eq!(
+                errors.len(),
+                1,
+                "the rebuilt runner's submission runs rather than being \
+                 eaten by the stale trip"
             );
             assert_ne!(
                 errors.first().map(String::as_str),

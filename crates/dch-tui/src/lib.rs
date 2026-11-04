@@ -4,6 +4,8 @@
 #![warn(missing_docs)]
 
 pub mod app;
+pub mod commands;
+pub mod config_fields;
 pub mod diff;
 pub mod events;
 pub mod guidance;
@@ -21,6 +23,7 @@ pub mod tool_capture;
 pub mod tool_render;
 
 pub use app::{CopyAnswer, TuiApp};
+pub use commands::{Command, CommandSpec, CompletionSources, Parsed};
 pub use events::TerminalEvents;
 pub use guidance::Guidance;
 pub use input::{InputAction, InputEditor, InputHistory};
@@ -28,9 +31,12 @@ pub use message::{ActiveTool, ContentBlock, TokenCounts, TuiMessage};
 pub use observer::{Graduation, HealthNotice, ToolResultDisplay, TuiObserver, TuiObserverState};
 pub use permission::PermissionRequest;
 pub use question::{QuestionChoice, QuestionPrompt};
-pub use queue::{PromptQueue, QueuedPrompt, Submission};
+pub use queue::{
+    PromptQueue, QueuedPrompt, ResumedTokens, SessionCommand, SessionUpdate, Submission,
+};
 pub use terminal::{
     TerminalGuard, arm_fatal_signal_restore, enter_signal_deaf_window, exit_signal_deaf_window,
-    ignore_fatal_signals, init_terminal, restore_terminal, sync_default_background,
+    ignore_fatal_signals, init_terminal, reset_cursor_color, restore_terminal, set_cursor_color,
+    sync_default_background,
 };
 pub use tool_capture::{CapturingMiddleware, ToolCapture, ToolCaptureSink};

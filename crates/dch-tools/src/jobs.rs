@@ -839,6 +839,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_job_polls_running_then_terminal_and_stays_terminal() {
+        // The status machine is one-way: `Running` until the process
+        // exits, then exactly one terminal verdict that every later
+        // observation returns unchanged. The one-way claim lived only in
+        // the enum's docs before this; the pin drives the whole
+        // sequence — spawn, poll Running, await the transition, poll
+        // again — through the table the tools share.
+        let _guard = JOB_TEST_GUARD.lock().await;
+        reset_job_table();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let ctx = ctx_in(cwd);
+
+        let spawned = BashTool
+            .call(
+                json!({ "command": "sleep 1 && echo settled", "background": true }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let id = parse_spawned_id(&spawned.text_content());
+
+        assert!(
+            matches!(get_job(id).map(|job| job.status), Some(JobStatus::Running)),
+            "a live job reads Running the moment it is spawned"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while list_jobs()
+            .iter()
+            .any(|job| job.status == JobStatus::Running)
+            && Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let terminal = get_job(id).expect("the completed job is retained");
+        assert!(
+            matches!(terminal.status, JobStatus::Completed(ref text) if text.contains("settled")),
+            "the sleeper completed: {:?}",
+            terminal.status
+        );
+
+        let again = get_job(id).expect("the entry stands");
+        assert_eq!(
+            again.status, terminal.status,
+            "a terminal status never changes again"
+        );
+
+        let polled = JobsTool
+            .call(json!({ "operation": "job_status", "job_id": id }), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            polled.text_content().contains("Completed"),
+            "the tool's poll agrees with the table: {}",
+            polled.text_content()
+        );
+    }
+
+    #[tokio::test]
     async fn a_running_job_survives_the_retention_rollover_and_its_late_result_lands() {
         let _guard = JOB_TEST_GUARD.lock().await;
         reset_job_table();

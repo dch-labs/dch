@@ -6,7 +6,8 @@
 //! provider client, a tool registry, a session config carrying the composed
 //! system prompt, and the observer-bearing managers bundle), wires them into
 //! a [`BareLoop`], and exposes [`Runner::run`] / [`Runner::cancel`] as
-//! one-line delegations.
+//! one-line delegations beside [`Runner::compact_now`], the between-turns
+//! compaction seam.
 //!
 //! The loop offers two extension axes with distinct contracts, and the
 //! builder exposes both symmetrically:
@@ -92,7 +93,8 @@ use crate::with_context;
 /// [`RunnerContext`], a session config carrying the composed system prompt,
 /// and the observer-bearing managers bundle) into one [`BareLoop`], and the
 /// public surface stays thin: runs carry or retire the session's todo plan
-/// and delegate to the loop, the rest are accessors.
+/// and delegate to the loop, the between-turns seams (cancel, one manual
+/// compaction pass) delegate the same way, and the rest are accessors.
 ///
 /// Construct once per agent identity with [`Runner::builder`]…`.build()`,
 /// then drive it with [`Runner::run`]: each call is one prompt → loop →
@@ -328,6 +330,30 @@ impl Runner {
     #[must_use]
     pub fn take_claim_retirements(&mut self) -> Vec<dch_tools::TodoEntry> {
         std::mem::take(&mut self.claim_retirements)
+    }
+
+    /// Run one compaction pass over the committed history, now.
+    ///
+    /// The manual `/compact` seam: between runs, the engine's own
+    /// context manager — the same compactor and thresholds the
+    /// automatic passes use — folds the history, and the pruned result
+    /// is installed as the machine's history so the next run continues
+    /// from the compacted context. The returned string is the notice a
+    /// host shows: the tokens the pass saved and the size it left the
+    /// context — figures the pass itself measured, never derived. A
+    /// machine caught mid-turn refuses: compaction runs
+    /// between runs, not under a live turn.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the engine's own shapes — [`LoopError::InvalidInput`]
+    /// when a turn is in flight, [`LoopError::CompactionFailed`] when
+    /// the compactor itself fails, and
+    /// [`LoopError::ContextExceeded`] when the compacted result still
+    /// exceeds the window.
+    pub async fn compact_now(&mut self) -> Result<String, LoopError> {
+        let outcome = self.inner.compact_manual().await?;
+        Ok(compaction_notice(&outcome))
     }
 
     /// Signal the in-flight run, if any, to cancel.
@@ -1321,6 +1347,28 @@ impl ToolMiddleware for ContextInjector {
     }
 }
 
+/// The notice a manual compaction pass earned, from what the pass measured.
+///
+/// Pure over the outcome so the wording is pinnable without an engine:
+/// the compacted arm carries only the figures the pass itself reported —
+/// tokens saved and the size the context now measures, never a figure
+/// derived from them — and the no-action arm says the context fits. The
+/// wildcard arm exists because loopctl marks the outcome non-exhaustive;
+/// its honest answer is a finished-without-figures notice, never a
+/// fabricated number.
+fn compaction_notice(outcome: &loopctl::compact::EnsureContextResult) -> String {
+    match outcome {
+        loopctl::compact::EnsureContextResult::Compacted(result) => format!(
+            "compacted: {} tokens saved — the context now measures {} tokens",
+            result.tokens_saved, result.tokens_after
+        ),
+        loopctl::compact::EnsureContextResult::NoAction(_) => {
+            "nothing to compact — the context fits".to_string()
+        }
+        _ => "compaction pass finished".to_string(),
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -1345,6 +1393,29 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Mutex;
     use tempfile::TempDir;
+
+    #[test]
+    fn the_compaction_notice_carries_only_measured_figures() {
+        // Both arms pinned at the wording level: a compacted pass names
+        // the tokens saved and the size the context now measures —
+        // figures the pass itself reported, never derived from them —
+        // and a no-action pass says the context fits without inventing
+        // numbers.
+        let compacted = loopctl::compact::EnsureContextResult::Compacted(
+            loopctl::compact::CompactionOutcome::compacted(Vec::new(), 1_000, 650),
+        );
+        assert_eq!(
+            compaction_notice(&compacted),
+            "compacted: 350 tokens saved — the context now measures 650 tokens",
+            "the compacted arm prints the pass's own figures"
+        );
+        let fitting = loopctl::compact::EnsureContextResult::NoAction(Vec::new());
+        assert_eq!(
+            compaction_notice(&fitting),
+            "nothing to compact — the context fits",
+            "the no-action arm claims nothing it did not measure"
+        );
+    }
 
     /// A tool that reports the `cwd` it sees via the `RunnerContext` extension
     /// (sentinel `"absent"` when no extension is installed) plus the native
@@ -4132,6 +4203,102 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rebuild_with_carried_history_keeps_the_read_guard_armed() {
+        // The mid-session switch shape: the host rebuilds the runner on
+        // a carried machine history and re-arms the guard from that
+        // history's own Read call inputs — the fresh context's baseline
+        // map starts empty, so without the re-arm an externally changed
+        // file would take the stale write. The refusal wording is the
+        // resumed-baseline shape: the model never saw these bytes in
+        // this session's engine.
+        let server = SseServer::start(vec![
+            sse_tool_call_turn(
+                "Write",
+                &serde_json::json!({"file_path": "note.txt", "content": "clobber"}),
+            ),
+            sse_text_turn("done"),
+        ])
+        .await;
+        let dir = TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join("note.txt"), "original").expect("seed target");
+        let first = Runner::builder(&wire_config(server.port, 10), dir.path())
+            .build()
+            .await
+            .expect("constructs");
+        // The carried history: the conversation's earlier turn read the
+        // file and the read came back clean — recorded verbatim in the
+        // machine shape a switch carries, call paired to its result the
+        // way the host's re-arm pairing reads it.
+        let history = vec![
+            Message::new(
+                loopctl::message::Role::Assistant,
+                vec![MessagePart::tool_call(
+                    "call_1",
+                    "Read",
+                    serde_json::json!({"path": "note.txt"}),
+                )],
+            ),
+            Message::new(
+                loopctl::message::Role::User,
+                vec![MessagePart::tool_result(
+                    "call_1", "Read", "original", false,
+                )],
+            ),
+        ];
+        let rebuilt = Runner::builder(&wire_config(server.port, 10), dir.path())
+            .with_history(history)
+            .build()
+            .await
+            .expect("rebuilds with the carried history");
+        drop(first);
+        // The host's re-arm: every path the carried history shows read
+        // and clean — the pairing rule the resume path ships.
+        let mut succeeded = std::collections::HashSet::new();
+        for message in rebuilt.committed_history() {
+            for part in &message.parts {
+                if let MessagePart::ToolResult {
+                    call_id, is_error, ..
+                } = part
+                    && !matches!(is_error, Some(true))
+                {
+                    succeeded.insert(call_id.clone());
+                }
+            }
+        }
+        for message in rebuilt.committed_history() {
+            for part in &message.parts {
+                let MessagePart::ToolCall { id, name, input } = part else {
+                    continue;
+                };
+                if !succeeded.contains(id) {
+                    continue;
+                }
+                if name == "Read"
+                    && let Some(path) = input.get("path").and_then(serde_json::Value::as_str)
+                {
+                    assert!(
+                        rebuilt.record_resumed_read(path).await,
+                        "the carried read re-arms on the rebuilt context"
+                    );
+                }
+            }
+        }
+        std::fs::write(dir.path().join("note.txt"), "externally changed")
+            .expect("mutate after the rebuild");
+        let mut rebuilt = rebuilt;
+        let run = tokio::time::timeout(std::time::Duration::from_secs(10), rebuilt.run("go"))
+            .await
+            .expect("run settles within timeout")
+            .expect("a refused tool is a soft error, not a run failure");
+        assert_eq!(run.output.as_deref(), Some("done"));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("note.txt")).unwrap_or_default(),
+            "externally changed",
+            "the re-armed guard held the write across the rebuild"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_approved_write_still_refuses_a_target_changed_during_the_ask() {
         // The approval window must not widen the conflict window: the
         // gate parks the dispatch until the resolver answers, and the
@@ -4660,6 +4827,111 @@ mod tests {
             std::fs::read_to_string(dir.path().join("plain.rs")).unwrap_or_default(),
             "fn main() {}\n",
             "the linted write moves no bytes either"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unprotected_first_write_at_a_pipe_keeps_the_raw_route() {
+        // The write-protection family installs only beside redaction, and
+        // the tool layer's own refusal is baseline-conditional: a pipe the
+        // session never read holds no baseline, so with redaction off the
+        // staleness check classifies nothing and the atomic rename lands
+        // an ordinary file over the endpoint — the target gate's
+        // documented "raw route". Pinned so the acceptance of that cell
+        // is a fact the suite owns: a future unconditioned WriteTargetGate
+        // flips this pin, and a stall here would mean the tool opened the
+        // pipe instead of renaming over it.
+        let dir = TempDir::new().expect("tempdir");
+        let fifo = dir.path().join("notify");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo runs");
+        assert!(status.success(), "the fifo fixture exists");
+        let pipeline = fs_pipeline(dir.path(), false);
+
+        let write = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            drive(
+                &pipeline,
+                "Write",
+                serde_json::json!({"file_path": "notify", "content": "payload"}),
+            ),
+        )
+        .await
+        .expect("the raw route settles instead of parking on the pipe");
+        assert!(
+            !write.is_error,
+            "the never-read pipe holds no baseline to hold the write with: {}",
+            write.output
+        );
+        assert!(
+            std::fs::metadata(&fifo).is_ok_and(|meta| meta.is_file()),
+            "an ordinary file stands at the endpoint after the rename"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&fifo).unwrap_or_default(),
+            "payload",
+            "the renamed file carries the written bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_batch_whose_second_entry_lost_its_anchor_writes_nothing() {
+        // One MultiEdit call, two files: both read through the pipeline,
+        // the second externally changed before the batch runs. The
+        // anchor the second entry names is gone from the file's current
+        // bytes, so the batch's preparation stage — which reads every
+        // target and substitutes every anchor before any write — refuses
+        // the whole call: nothing lands, ahead-entry included. The
+        // mid-batch partial-landing shape (writes that already reached
+        // the disk when a *later* entry's re-check conflicts) belongs to
+        // the write stage loopctl pins; the deterministic dch-seam fact
+        // is this all-or-nothing refusal at preparation.
+        let dir = TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join("a.txt"), "alpha\n").expect("seed a");
+        std::fs::write(dir.path().join("b.txt"), "beta\n").expect("seed b");
+        let pipeline = fs_pipeline(dir.path(), false);
+
+        let read = drive(
+            &pipeline,
+            "ReadFiles",
+            serde_json::json!({"files": ["a.txt", "b.txt"]}),
+        )
+        .await;
+        assert!(!read.is_error, "{}", read.output);
+        std::fs::write(dir.path().join("b.txt"), "external\n")
+            .expect("external change to the second file");
+
+        let batch = drive(
+            &pipeline,
+            "MultiEdit",
+            serde_json::json!({
+                "edits": [
+                    {"file_path": "a.txt", "old_text": "alpha", "new_text": "ALPHA"},
+                    {"file_path": "b.txt", "old_text": "beta", "new_text": "BETA"}
+                ]
+            }),
+        )
+        .await;
+        assert!(
+            batch.is_error,
+            "the batch refuses against the changed second file: {batch:?}"
+        );
+        let refusal = batch.output.to_string();
+        assert!(
+            refusal.contains("b.txt"),
+            "the refusal names the file whose anchor is gone: {refusal}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap_or_default(),
+            "alpha\n",
+            "preparation-stage refusal lands nothing — the ahead entry stays as it was"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("b.txt")).unwrap_or_default(),
+            "external\n",
+            "the externally changed file keeps its bytes"
         );
     }
 

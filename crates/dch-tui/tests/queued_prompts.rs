@@ -103,7 +103,7 @@ fn claim(kept: &dch_tui::TuiObserverState, id: u64) -> Option<String> {
 fn run_id(submission: dch_tui::Submission) -> u64 {
     match submission {
         dch_tui::Submission::Run { id } => id,
-        other @ dch_tui::Submission::Correct { .. } => {
+        other @ (dch_tui::Submission::Correct { .. } | dch_tui::Submission::Command { .. }) => {
             panic!("a plain submit hands over a run, got {other:?}")
         }
     }

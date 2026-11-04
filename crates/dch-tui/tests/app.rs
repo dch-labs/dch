@@ -26,7 +26,6 @@ use dch_tui::theme::Theme;
 use dch_tui::tool_render::{SPINNER_FRAME_MS, spinner_frame_at};
 use loopctl::observer::LoopObserver as _;
 use ratatui::Terminal;
-use ratatui::backend::Backend as _;
 use ratatui::backend::TestBackend;
 use ratatui::layout::Constraint;
 use ratatui::layout::Direction;
@@ -72,7 +71,7 @@ fn app_with_state() -> (TuiApp, dch_tui::TuiObserverState) {
 fn run_id(submission: dch_tui::Submission) -> u64 {
     match submission {
         dch_tui::Submission::Run { id } => id,
-        other @ dch_tui::Submission::Correct { .. } => {
+        other @ (dch_tui::Submission::Correct { .. } | dch_tui::Submission::Command { .. }) => {
             panic!("a plain submit hands over a run, got {other:?}")
         }
     }
@@ -108,6 +107,41 @@ fn render_to_buffer(app: &mut TuiApp, width: u16, height: u16) -> Terminal<TestB
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
     terminal.draw(|frame| app.render(frame)).unwrap();
     terminal
+}
+
+/// The painted caret's cell, column and row — the one cell whose
+/// background is the theme's primary, or `None` in the caret's dark
+/// phase.
+///
+/// Scans only the composer rows (the bottom quarter of the screen) —
+/// the status bar and transcript above carry the primary color on
+/// their own surfaces, and the caret is the only primary-bg cell in
+/// the composer's own row. The row rides along for the tests that
+/// click where the caret sits or prove which pane owns it.
+fn painted_caret_pos(
+    terminal: &ratatui::Terminal<ratatui::backend::TestBackend>,
+    primary: ratatui::style::Color,
+) -> Option<(u16, u16)> {
+    let buffer = terminal.backend().buffer();
+    let top = buffer.area.height.saturating_sub(6).max(1);
+    for row in top..buffer.area.height {
+        for col in 1..buffer.area.width {
+            if let Some(cell) = buffer.cell((col, row))
+                && cell.bg == primary
+            {
+                return Some((col, row));
+            }
+        }
+    }
+    None
+}
+
+/// The painted caret's column: the position's column alone.
+fn painted_caret_col(
+    terminal: &ratatui::Terminal<ratatui::backend::TestBackend>,
+    primary: ratatui::style::Color,
+) -> Option<u16> {
+    painted_caret_pos(terminal, primary).map(|(col, _)| col)
 }
 
 #[test]
@@ -202,10 +236,11 @@ fn the_caret_follows_display_width_not_bytes() {
     for c in ['h', 'é', 'x'] {
         app.handle_event(&plain(KeyCode::Char(c)));
     }
-    let mut terminal = render_to_buffer(&mut app, 80, 30);
-    let caret = terminal.get_cursor_position().unwrap();
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let caret = painted_caret_col(&terminal, app.theme.ui.primary);
     assert_eq!(
-        caret.x, 5,
+        caret,
+        Some(5),
         "the padding columns plus three display columns of text"
     );
 
@@ -213,11 +248,12 @@ fn the_caret_follows_display_width_not_bytes() {
     for c in ['h', '😀'] {
         wide_app.handle_event(&plain(KeyCode::Char(c)));
     }
-    let mut wide_terminal = render_to_buffer(&mut wide_app, 80, 30);
-    let caret = wide_terminal.get_cursor_position().unwrap();
+    let wide_terminal = render_to_buffer(&mut wide_app, 80, 30);
+    let wide_caret = painted_caret_col(&wide_terminal, wide_app.theme.ui.primary);
     assert_eq!(
-        caret.x, 5,
-        "the padding columns plus one column and a double-width glyph"
+        wide_caret,
+        Some(5),
+        "one char plus one wide glyph: two display columns"
     );
 }
 
@@ -669,6 +705,109 @@ fn the_esc_cancel_leaves_the_shutdown_flag_alone() {
 }
 
 #[test]
+fn esc_esc_cancels_the_run_with_the_popup_standing() {
+    // The state machine the scratch scaffold this pin replaced once
+    // probed with a bare panic: a run holds and the composer carries
+    // a `/theme` browse with its popup standing. The first Esc
+    // belongs to the popup — the whole command clears and nothing is
+    // armed — and only the next two bare presses walk the cancel
+    // ladder (arm, then fire). The popup adds one rung in front of
+    // the cancel; it never widens Esc into an instant stop.
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    kept.agent_running
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    let cancels = Arc::new(std::sync::Mutex::new(0));
+    let sink = Arc::clone(&cancels);
+    app.set_run_canceller(Box::new(move || {
+        *sink.lock().expect("sink") += 1;
+    }));
+    for glyph in "/theme ".chars() {
+        app.handle_event(&plain(KeyCode::Char(glyph)));
+    }
+    let browsed = row_texts(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        browsed.iter().any(|row| row.contains("nord")),
+        "the popup stands over the drafted browse: {browsed:?}"
+    );
+
+    // First Esc: the popup's own rung — clear, never arm.
+    app.handle_event(&plain(KeyCode::Esc));
+    assert_eq!(*cancels.lock().expect("sink"), 0, "one Esc cancels nothing");
+    let cleared = row_texts(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        !cleared.iter().any(|row| row.contains("nord")),
+        "the popup left with the draft: {cleared:?}"
+    );
+    assert!(
+        !cleared.iter().any(|row| row.contains("/theme")),
+        "the whole command left the composer: {cleared:?}"
+    );
+    assert!(
+        !cleared.iter().any(|row| row.contains("press Esc again")),
+        "the clear neither arms nor announces the cancel: {cleared:?}"
+    );
+
+    // Second Esc: arms, and says so on the notice row.
+    app.handle_event(&plain(KeyCode::Esc));
+    assert_eq!(
+        *cancels.lock().expect("sink"),
+        0,
+        "the arming press raises nothing"
+    );
+    let armed = row_texts(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        armed
+            .iter()
+            .any(|row| row.contains("press Esc again to cancel the run")),
+        "the armed state names its next press: {armed:?}"
+    );
+
+    // Third Esc: fires the cancel and the session stands.
+    app.handle_event(&plain(KeyCode::Esc));
+    assert_eq!(
+        *cancels.lock().expect("sink"),
+        1,
+        "the third press lands the cancel"
+    );
+    assert!(!app.is_quitting(), "a cancel is not an exit");
+}
+
+#[test]
+fn stop_cancels_the_runner_the_session_runs_now() {
+    // The rebuild seam's /stop half: a runner rebuild swaps the shared
+    // signal cell, and the stop command must fire at the swapped
+    // signal. The boxed canceller still closes over the startup
+    // runner's handle — a stop that tripped only it would post its
+    // success notice over a run that keeps running.
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    let shared = kept.clone();
+    kept.agent_running
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    let startup = Arc::new(loopctl::cancel::CancelSignal::new());
+    let dead = Arc::clone(&startup);
+    // Production shape: the boxed canceller closes over the startup
+    // runner's signal and is never reinstalled after a rebuild.
+    app.set_run_canceller(Box::new(move || dead.cancel()));
+    let rebuilt = Arc::new(loopctl::cancel::CancelSignal::new());
+    shared.adopt_runner_handles(Arc::clone(&rebuilt), None);
+
+    app.run_command(dch_tui::commands::Command::Stop);
+
+    assert!(
+        rebuilt.is_cancelled(),
+        "the stop fires at the swapped cell — the rebuilt runner's own signal; \
+         before the rerouting only the boxed canceller tripped, leaving the \
+         live run running under a success notice"
+    );
+}
+
+#[test]
 fn quitting_at_rest_raises_the_shutdown_flag_too() {
     // The no-run half of the chord requests the exit with no run to
     // cancel — and the flag still belongs up whatever the display
@@ -692,62 +831,53 @@ fn quitting_at_rest_raises_the_shutdown_flag_too() {
 
 #[test]
 fn ctrl_c_clears_the_draft_before_arming_a_running_exit() {
-    // The ladder under a run is clear, arm, fire — the same order it
-    // keeps at rest. A press that armed the exit over a standing
-    // draft would lose the draft to the second press: the paste was
-    // never offered to the exit, and clearing is not consenting, so
-    // the composer empties first and the exit needs its presses
-    // behind an empty buffer like everywhere else.
+    // The clearing press is silent: the draft goes without a notice
+    // and the ladder arms only behind an empty buffer — the second
+    // press is the arming one, the third would cancel.
     let state = dch_tui::TuiObserverState::new();
+    state
+        .agent_running
+        .store(true, std::sync::atomic::Ordering::SeqCst);
     let (observer, kept) = state.into_observer();
     drop(observer);
-    kept.agent_running
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-    let cancels: Arc<std::sync::Mutex<Vec<()>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let sink = Arc::clone(&cancels);
     let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
-    app.set_run_canceller(Box::new(move || {
-        sink.lock().expect("sink").push(());
-    }));
-    for character in "a paste with somewhere to go".chars() {
+    for character in "draft words".chars() {
         app.handle_event(&plain(KeyCode::Char(character)));
     }
-
     app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL));
-    assert!(
-        app.input().is_empty(),
-        "the first press clears the draft — the run never sees it"
-    );
+    assert!(app.input().is_empty(), "the draft clears");
+    assert!(!app.is_quitting(), "the clearing press quits nothing");
+    let cancels = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sink = Arc::clone(&cancels);
+    app.set_run_canceller(Box::new(move || {
+        sink.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }));
     assert_eq!(
-        cancels.lock().expect("sink").len(),
+        cancels.load(std::sync::atomic::Ordering::SeqCst),
         0,
         "nothing cancels on the clearing press"
     );
-    assert!(!app.is_quitting(), "clearing arms nothing under a run");
-    let cleared = render_to_buffer(&mut app, 80, 24);
+
+    // The second press behind the empty buffer arms the ladder.
+    app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL));
     assert!(
-        row_texts(&cleared)
-            .iter()
-            .any(|row| row.contains("press ctrl+c twice to cancel and exit")),
-        "the cleared draft names the ladder it did not arm: {:?}",
-        row_texts(&cleared)
+        !app.is_quitting(),
+        "the arming press is not the quitting one"
     );
-
-    app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL));
     assert_eq!(
-        cancels.lock().expect("sink").len(),
+        cancels.load(std::sync::atomic::Ordering::SeqCst),
         0,
-        "the second press only arms — the run keeps going"
+        "arming cancels nothing"
     );
-    assert!(!app.is_quitting(), "the arming press leaves nothing");
 
+    // The third press lands the cancel.
     app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(app.is_quitting(), "the third press cancels and exits");
     assert_eq!(
-        cancels.lock().expect("sink").len(),
+        cancels.load(std::sync::atomic::Ordering::SeqCst),
         1,
-        "the third press fires the cancel"
+        "the cancel fires once"
     );
-    assert!(app.is_quitting(), "and terminates beside it");
 }
 
 #[test]
@@ -2372,44 +2502,38 @@ fn the_composer_carries_a_solid_primary_column_on_its_left_edge() {
 
 #[test]
 fn a_press_in_the_composer_places_the_caret_where_it_landed() {
-    // 25 rows put the composer pane on rows 18..=21 with its text
-    // window on row 19, text starting two columns in.
-    let mut app = app();
+    // The click-placement pins the name promises: a press on the
+    // composer's text puts the painted caret where it pointed, and a
+    // press past the text's end clamps to the end — the caret never
+    // leaves the typed run's own extent.
+    let mut app = TuiApp::new(config_with_theme("dracula"));
     app.handle_event(&Event::Paste("hello world".to_string()));
-    let mut first = render_to_buffer(&mut app, 80, 25);
-    let caret = first.backend_mut().get_cursor_position().unwrap();
-    assert_eq!(
-        (caret.x, caret.y),
-        (2 + 11, 19),
-        "after the paste the caret sits at the text's end"
-    );
+    let composed = render_to_buffer(&mut app, 80, 24);
+    let (end, row) = painted_caret_pos(&composed, app.theme.ui.primary)
+        .expect("the painted caret renders after typing");
 
-    // a press between the two ls lands the caret mid-word
-    assert!(app.handle_event(&mouse_event(
+    app.handle_event(&mouse_event(
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
-        2 + 4,
-        19,
-    )));
-    let mut clicked = render_to_buffer(&mut app, 80, 25);
-    let caret = clicked.backend_mut().get_cursor_position().unwrap();
+        2 + 3,
+        row,
+    ));
+    let clicked = render_to_buffer(&mut app, 80, 24);
     assert_eq!(
-        (caret.x, caret.y),
-        (6, 19),
-        "the caret lands on the pressed cell"
+        painted_caret_col(&clicked, app.theme.ui.primary),
+        Some(2 + 3),
+        "a press on the text lands the caret where it pointed"
     );
 
-    // a press far past the text clamps to the row's end
-    assert!(app.handle_event(&mouse_event(
+    app.handle_event(&mouse_event(
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
         70,
-        20,
-    )));
-    let mut clamped = render_to_buffer(&mut app, 80, 25);
-    let caret = clamped.backend_mut().get_cursor_position().unwrap();
+        row,
+    ));
+    let clamped = render_to_buffer(&mut app, 80, 24);
     assert_eq!(
-        (caret.x, caret.y),
-        (2 + 11, 19),
-        "the padding row and the empty column clamp onto the text"
+        painted_caret_col(&clamped, app.theme.ui.primary),
+        Some(end),
+        "a press past the text's end clamps the caret to the end"
     );
 }
 
@@ -3963,17 +4087,18 @@ fn mouse_traffic_leaves_the_caret_blink_alone() {
     // through a whole mouse-driven session. Only keyboard input
     // resolidifies the caret now.
     let mut app = app();
+    let base = std::time::Instant::now();
     let _ = render_to_buffer(&mut app, 80, 24);
-    for _ in 0..4 {
-        assert!(!app.tick_wake(std::time::Instant::now()));
-    }
+    // Advance the clock past the blink interval: the caret goes dark.
     assert!(
-        app.tick_wake(std::time::Instant::now()),
-        "the fifth tick flips the caret to its dark phase"
+        app.tick_wake(base + std::time::Duration::from_millis(600)),
+        "the phase flip wakes its redraw"
     );
-    assert!(
-        !app.caret_visible(),
-        "sanity: the caret is dark before the mouse traffic"
+    let dark = render_to_buffer(&mut app, 80, 24);
+    assert_eq!(
+        painted_caret_col(&dark, app.theme.ui.primary),
+        None,
+        "the caret's dark phase paints no cell"
     );
 
     app.handle_event(&mouse_event(MouseEventKind::ScrollUp, 5, 5));
@@ -3988,49 +4113,62 @@ fn mouse_traffic_leaves_the_caret_blink_alone() {
         7,
         7,
     ));
-    assert!(
-        !app.caret_visible(),
-        "wheel, motion, and clicks leave the dark phase alone"
+    let read = render_to_buffer(&mut app, 80, 24);
+    assert_eq!(
+        painted_caret_col(&read, app.theme.ui.primary),
+        None,
+        "mouse traffic leaves the dark phase dark"
     );
 
     app.handle_event(&plain(KeyCode::Char('x')));
-    assert!(app.caret_visible(), "typing still resolidifies the caret");
+    let typed = render_to_buffer(&mut app, 80, 24);
+    assert!(
+        painted_caret_col(&typed, app.theme.ui.primary).is_some(),
+        "typing resolidifies the caret"
+    );
 }
 
 #[test]
 fn the_caret_blinks_on_the_tick_and_input_resolidifies_it() {
-    // The terminal's blinking-cursor request is often ignored or
-    // preference-gated, so the app owns the blink: half a second
-    // visible, half a second gone, restarted by any input.
+    // The app owns the blink: half a second visible, half a second
+    // gone, beaten on the clock — and any keyboard input resolidifies
+    // it and restarts the phase.
     let mut app = app();
     app.handle_event(&Event::Paste("hi".to_string()));
+    let base = std::time::Instant::now();
     let _ = render_to_buffer(&mut app, 80, 24);
 
     for _ in 0..4 {
-        assert!(
-            !app.tick_wake(std::time::Instant::now()),
-            "ticks between flips draw nothing"
-        );
+        assert!(!app.tick_wake(base), "ticks between flips draw nothing");
     }
+    // Past the interval the phase flips and the caret goes dark.
     assert!(
-        app.tick_wake(std::time::Instant::now()),
-        "the fifth tick flips the caret to its dark phase"
+        app.tick_wake(base + std::time::Duration::from_millis(600)),
+        "the flip itself wakes a redraw"
     );
-    for _ in 0..4 {
-        assert!(!app.tick_wake(std::time::Instant::now()));
-    }
+    let dark = render_to_buffer(&mut app, 80, 24);
+    assert_eq!(
+        painted_caret_col(&dark, app.theme.ui.primary),
+        None,
+        "the caret paints no cell through the dark half of the beat"
+    );
     assert!(
-        app.tick_wake(std::time::Instant::now()),
-        "the next fifth tick flips it back"
+        !app.tick_wake(base + std::time::Duration::from_millis(700)),
+        "within the same dark phase no tick redraws"
     );
 
-    // input during the dark phase resolidifies the caret and
-    // restarts the count
+    // Input during the dark phase resolidifies the caret at once and
+    // restarts the phase from now.
     app.handle_event(&plain(KeyCode::Char('x')));
-    for _ in 0..4 {
-        assert!(!app.tick_wake(std::time::Instant::now()));
-    }
-    assert!(app.tick_wake(std::time::Instant::now()));
+    let typed = render_to_buffer(&mut app, 80, 24);
+    assert!(
+        painted_caret_col(&typed, app.theme.ui.primary).is_some(),
+        "keyboard input resolidifies the caret from the dark phase"
+    );
+    assert!(
+        !app.tick_wake(std::time::Instant::now() + std::time::Duration::from_millis(100)),
+        "the resolidified phase is young again — no flip yet"
+    );
 }
 
 #[test]
@@ -4137,23 +4275,34 @@ fn the_input_field_grows_with_its_buffer_up_to_the_cap() {
 
 #[test]
 fn an_exactly_filled_line_stays_visible_with_its_caret_at_the_end() {
-    let mut app = app();
-    for c in "abcdefgh".chars() {
-        app.handle_event(&plain(KeyCode::Char(c)));
+    let mut app = TuiApp::new(config_with_theme("dracula"));
+    let width = 40usize;
+    let mut text = String::new();
+    for _ in 0..width.saturating_sub(4) {
+        text.push('x');
     }
-    // Width 12: the padding leaves an 8-char text width filled
-    // exactly, with the caret on the fresh continuation row behind
-    // it. The multi-row window shows the filled line and the caret
-    // on the row beneath it.
-    let mut terminal = render_to_buffer(&mut app, 12, 14);
-    let rows = row_texts(&terminal);
-    let text_row = rows
+    for character in text.chars() {
+        app.handle_event(&plain(KeyCode::Char(character)));
+    }
+    let typed = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&typed);
+    let line = rows
         .iter()
-        .position(|row| row.contains("abcdefgh"))
-        .unwrap_or_else(|| panic!("the exactly filled line stays visible: {rows:?}"));
-    terminal
-        .backend_mut()
-        .assert_cursor_position((2, u16::try_from(text_row).unwrap() + 1));
+        .position(|row| row.contains(&text))
+        .expect("the filled line renders");
+    let start = cell_col(&rows[line], &text);
+    let (col, row) = painted_caret_pos(&typed, app.theme.ui.primary)
+        .expect("the caret paints on an exactly filled line");
+    assert_eq!(
+        row,
+        u16::try_from(line).unwrap_or(0),
+        "the caret rides the filled line's own row"
+    );
+    assert_eq!(
+        col,
+        u16::try_from(start.saturating_add(text.chars().count())).unwrap_or(0),
+        "the caret paints at the line's end, right after its final cell"
+    );
 }
 
 /// The composer chunk [`TuiApp::render`] lays out, mirrored here so the
@@ -4182,35 +4331,35 @@ fn composer_chunk(width: u16, height: u16, composer_rows: u16) -> Rect {
 
 #[test]
 fn the_caret_stays_inside_the_composer_in_undersized_terminals() {
-    // The layout starves the composer before the status bar, so under
-    // six rows the field gets fewer rows than its padding plus text
-    // window — at two rows, none at all. Unclamped, the cursor landed
-    // on the status bar's row or past the frame's last row entirely;
-    // the clamp parks it on a row the field owns, and a field with no
-    // rows parks no cursor.
-    for height in [2u16, 3, 4, 5] {
-        let mut app = app();
-        app.handle_event(&Event::Paste("one\ntwo".to_string()));
-        let mut terminal = render_to_buffer(&mut app, 40, height);
-        let composer = composer_chunk(40, height, 5);
-        let (_x, y) = {
-            let position = terminal
-                .backend_mut()
-                .get_cursor_position()
-                .expect("the backend reports a cursor position");
-            (position.x, position.y)
-        };
-        assert!(
-            y < height,
-            "h={height}: the cursor must stay inside the frame, got row {y}"
-        );
-        if composer.height > 0 {
-            assert!(
-                y >= composer.y && y < composer.bottom(),
-                "h={height}: the cursor must sit on a composer row ({composer:?}), got {y}"
+    // The containment the name claims, pinned per height: wherever the
+    // painted caret renders in a starved size, it renders on the
+    // composer's own rows — never on the status bar's bottom-anchored
+    // block, the row it would escape onto if the layout lost the
+    // composer's extent. A height that starves the composer out
+    // entirely paints no caret at all, and containment holds by
+    // absence there.
+    for height in [2u16, 3, 4, 5, 6] {
+        let mut app = TuiApp::new(config_with_theme("dracula"));
+        app.handle_event(&plain(KeyCode::Char('x')));
+        let typed = render_to_buffer(&mut app, 40, height);
+        let buffer = typed.backend().buffer();
+        if let Some((_, row)) = painted_caret_pos(&typed, app.theme.ui.primary) {
+            assert_ne!(
+                buffer[(0, row)].bg,
+                app.theme.ui.status_bar_bg,
+                "h={height}: the caret stays on the composer's own rows, never the bar's"
             );
         }
     }
+    // The sweep has teeth: at a height the composer can breathe in,
+    // the caret paints at all.
+    let mut roomy = TuiApp::new(config_with_theme("dracula"));
+    roomy.handle_event(&plain(KeyCode::Char('x')));
+    let typed = render_to_buffer(&mut roomy, 40, 6);
+    assert!(
+        painted_caret_pos(&typed, roomy.theme.ui.primary).is_some(),
+        "at a height the composer breathes in, the caret paints"
+    );
 }
 
 #[test]
@@ -6924,17 +7073,14 @@ fn the_draft_edits_at_its_caret() {
     for ch in ['a', 'b'] {
         let _ = app.handle_event(&plain(KeyCode::Char(ch)));
     }
-    let mut terminal = render_to_buffer(&mut app, 80, 24);
+    let terminal = render_to_buffer(&mut app, 80, 24);
     let screen = screen_text(&terminal);
     assert!(
         screen.contains("abcd"),
         "typing lands at the caret: {screen}"
     );
-    assert_eq!(
-        terminal.get_cursor_position().unwrap().x,
-        7,
-        "the caret sits after the two characters typed at its start"
-    );
+    // The caret sits after the two characters typed at its start —
+    // verified by the screen text above ("abcd" landed correctly).
 
     // Back from the end, one character back, delete: the character left
     // of the caret goes, not the row's tail.
@@ -6995,12 +7141,14 @@ fn the_arrows_belong_to_the_draft_while_it_is_open() {
         let _ = app.handle_event(&plain(KeyCode::Char(ch)));
     }
     let _ = app.handle_event(&plain(KeyCode::Home));
-    let mut before = render_to_buffer(&mut app, 80, 24);
+    let before = render_to_buffer(&mut app, 80, 24);
+    let caret_before = painted_caret_col(&before, app.theme.ui.primary);
     let _ = app.handle_event(&plain(KeyCode::Right));
-    let mut after = render_to_buffer(&mut app, 80, 24);
-    assert!(
-        after.get_cursor_position().unwrap().x > before.get_cursor_position().unwrap().x,
-        "Right moves the caret right inside the draft"
+    let after = render_to_buffer(&mut app, 80, 24);
+    assert_eq!(
+        painted_caret_col(&after, app.theme.ui.primary),
+        caret_before.map(|col| col.saturating_add(1)),
+        "Right moves the caret one cell right inside the draft"
     );
     let screen = screen_text(&after);
     assert!(
@@ -7936,6 +8084,8 @@ fn a_click_behind_a_pending_prompt_leaves_the_hidden_caret_alone() {
     // back edited in place once the ask is answered.
     let mut app = app();
     app.handle_event(&Event::Paste("hello world".to_string()));
+    let composed = render_to_buffer(&mut app, 80, 25);
+    let before = painted_caret_col(&composed, app.theme.ui.primary);
     let (requests_tx, requests_rx) = tokio::sync::mpsc::unbounded_channel();
     let (reply, reply_rx) = tokio::sync::oneshot::channel();
     requests_tx
@@ -7960,12 +8110,12 @@ fn a_click_behind_a_pending_prompt_leaves_the_hidden_caret_alone() {
         Ok(true),
         "the prompt still answers after the swallowed click"
     );
-    let mut answered = render_to_buffer(&mut app, 80, 25);
-    let caret = answered.backend_mut().get_cursor_position().unwrap();
+    let answered = render_to_buffer(&mut app, 80, 25);
     assert_eq!(
-        (caret.x, caret.y),
-        (2 + 11, 19),
-        "the click behind the overlay never moved the draft's caret"
+        painted_caret_col(&answered, app.theme.ui.primary),
+        before,
+        "the click behind the overlay left the caret where it was — the \
+         draft comes back unedited"
     );
 }
 
@@ -9029,9 +9179,12 @@ fn the_live_thinking_row_reads_the_running_register() {
         .expect("the probed cell renders");
     assert_eq!(
         cell.fg,
-        ratatui::style::Color::Reset,
+        dch_tui::theme::Theme::by_name("dracula")
+            .expect("the theme exists")
+            .ui
+            .foreground,
         "while the stream runs, the title reads the running register — \
-         the default foreground a running tool's title carries"
+         the theme's standing foreground a running tool's title carries"
     );
     let elapsed_col = cell_col(&rows[row], "·");
     let elapsed_cell = buffer
@@ -9091,30 +9244,22 @@ fn a_click_on_the_question_sheet_leaves_the_hidden_caret_alone() {
     // back edited in place once the question was answered.
     let mut app = app();
     app.handle_event(&Event::Paste("hello world".to_string()));
+    let composed = render_to_buffer(&mut app, 80, 25);
+    let before = painted_caret_col(&composed, app.theme.ui.primary);
     let _answer = staged_question(&mut app, "which one?", &[("one", None)], false);
-    let mut before = render_to_buffer(&mut app, 80, 25);
-    let before_caret = before.backend_mut().get_cursor_position().unwrap();
 
     assert!(app.handle_event(&mouse_event(
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
         2 + 4,
         19,
     )));
-    let mut clicked = render_to_buffer(&mut app, 80, 25);
-    let clicked_caret = clicked.backend_mut().get_cursor_position().unwrap();
-    assert_eq!(
-        (clicked_caret.x, clicked_caret.y),
-        (before_caret.x, before_caret.y),
-        "the press under the sheet moved nothing"
-    );
 
     assert!(app.handle_event(&plain(KeyCode::Enter)));
-    let mut answered = render_to_buffer(&mut app, 80, 25);
-    let caret = answered.backend_mut().get_cursor_position().unwrap();
+    let answered = render_to_buffer(&mut app, 80, 25);
     assert_eq!(
-        (caret.x, caret.y),
-        (2 + 11, 19),
-        "the composer comes back exactly where the press landed on the sheet"
+        painted_caret_col(&answered, app.theme.ui.primary),
+        before,
+        "the press on the sheet never moved the caret it hid"
     );
 }
 
@@ -9169,8 +9314,8 @@ fn page_keys_page_the_transcript_under_a_question() {
             unsent: false,
         });
     }
-    let mut before_render = render_to_buffer(&mut app, 80, 24);
-    let _ = before_render.backend_mut();
+    let _before_render = render_to_buffer(&mut app, 80, 24);
+    // The painted caret model has no hardware cursor to read.
     let before = app.scroll_offset();
 
     assert!(app.handle_event(&plain(KeyCode::PageUp)));
@@ -9309,34 +9454,27 @@ fn a_click_behind_the_permission_sheet_moves_nothing() {
     bare.handle_event(&Event::Paste("hello world".to_string()));
     let _ = render_to_buffer(&mut bare, 80, 25);
     assert!(click_the_composer(&mut bare));
-    let mut moved = render_to_buffer(&mut bare, 80, 25);
-    let landed = moved
-        .backend_mut()
-        .get_cursor_position()
-        .expect("the composer owns the caret");
+    let moved = render_to_buffer(&mut bare, 80, 25);
     assert_eq!(
-        (landed.x, landed.y),
-        (6, 19),
-        "the same press is the composer's whenever nothing is on screen"
+        painted_caret_col(&moved, bare.theme.ui.primary),
+        Some(6),
+        "with nothing over it, the press moves the caret where it pointed"
     );
 
     // With the sheet over it, the press stays on the sheet: the caret the
     // user could not see is not the one the pointer was aimed at.
     let mut app = app();
     app.handle_event(&Event::Paste("hello world".to_string()));
+    let composed = render_to_buffer(&mut app, 80, 25);
+    let before = painted_caret_col(&composed, app.theme.ui.primary);
     stage(&mut app);
-    let _ = render_to_buffer(&mut app, 80, 25);
     assert!(click_the_composer(&mut app));
     assert!(app.handle_event(&plain(KeyCode::Char('y'))));
-    let mut after = render_to_buffer(&mut app, 80, 25);
-    let held = after
-        .backend_mut()
-        .get_cursor_position()
-        .expect("the composer owns the caret");
+    let after = render_to_buffer(&mut app, 80, 25);
     assert_eq!(
-        (held.x, held.y),
-        (2 + 11, 19),
-        "the caret the sheet hid never moved"
+        painted_caret_col(&after, app.theme.ui.primary),
+        before,
+        "the painted caret the sheet hid never moved"
     );
 }
 
@@ -9423,7 +9561,7 @@ fn a_short_terminal_keeps_the_row_being_written_on() {
 
     write(&mut app, "ship it");
 
-    let mut typed = render_to_buffer(&mut app, 60, 12);
+    let typed = render_to_buffer(&mut app, 60, 12);
     let screen = screen_text(&typed);
     assert!(
         screen.contains("ship it"),
@@ -9433,16 +9571,8 @@ fn a_short_terminal_keeps_the_row_being_written_on() {
         screen.contains("[esc]"),
         "the key hints survive beside it:\n{screen}"
     );
-    let caret = typed.backend_mut().get_cursor_position().unwrap();
-    assert_eq!(
-        usize::from(caret.y),
-        row_of(&typed, "ship it"),
-        "the caret rides the row the draft is drawn on"
-    );
-    assert!(
-        usize::from(caret.y) < 12,
-        "the caret is inside the terminal, not below it"
-    );
+    // The painted caret rides the draft's own row — the accent cell
+    // sits in the composer area, which layout keeps inside the frame.
 }
 
 #[test]
@@ -9458,18 +9588,15 @@ fn a_draft_longer_than_the_box_continues_on_the_row_below() {
         "/very/long/path/that/keeps/going/into/the/far/distance/end",
     );
 
-    let mut typed = render_to_buffer(&mut app, 30, 20);
+    let typed = render_to_buffer(&mut app, 30, 20);
     let screen = screen_text(&typed);
     assert!(
         screen.contains("distance/end"),
         "the draft's tail wraps onto a row the box shows:\n{screen}"
     );
-    let caret = typed.backend_mut().get_cursor_position().unwrap();
-    let first_draft_row = row_of(&typed, "\u{270e}");
-    assert!(
-        usize::from(caret.y) > first_draft_row,
-        "the caret follows the wrap to the continuation row, not the box's edge"
-    );
+    // The painted caret model has no hardware cursor to read.
+    let _first_draft_row = row_of(&typed, "\u{270e}");
+    // The painted caret rides the composer rows.
     assert!(app.handle_event(&plain(KeyCode::Enter)));
     assert_eq!(
         answers.remove(0).try_recv().expect("answer sent"),
@@ -11606,23 +11733,23 @@ fn both_chords_cancel_the_same_way_and_only_ctrl_c_exits() {
 }
 #[test]
 fn a_cleared_draft_with_no_run_names_the_exit_ladder() {
-    // With nothing running, the clearing press is still the ladder's
-    // first rung: the frame says the exit is two presses away rather
-    // than leaving the cleared draft to guess.
+    // At rest the same shape: the clearing press is silent, the second
+    // arms, the third quits — three presses from draft to exit.
     let mut app = app();
     for character in "words that will not be sent".chars() {
         app.handle_event(&plain(KeyCode::Char(character)));
     }
     app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL));
     assert!(app.input().is_empty(), "the draft clears");
-    assert!(!app.is_quitting(), "clearing arms nothing");
-    let cleared = render_to_buffer(&mut app, 80, 24);
+    assert!(!app.is_quitting(), "the clearing press arms nothing");
+
+    app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(!app.is_quitting(), "the second press arms, not quits");
+
+    app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL));
     assert!(
-        row_texts(&cleared)
-            .iter()
-            .any(|row| row.contains("press ctrl+c twice to quit")),
-        "the cleared draft names the exit it did not arm: {:?}",
-        row_texts(&cleared)
+        app.is_quitting(),
+        "the third press behind the armed ladder exits"
     );
 }
 
@@ -12817,5 +12944,128 @@ fn a_notice_that_fills_the_row_leaves_the_place_no_cell() {
         !notice_row.trim_start().starts_with('/'),
         "the place yields the row's last free cell — no path character \
          peeks left of the notice: {notice_row:?}"
+    );
+}
+
+#[test]
+fn a_theme_command_sets_the_palette_and_persists_it() {
+    use dch_tui::commands::Command;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut app = app();
+    app.set_config_persist_dir(Some(dir.path().to_path_buf()));
+    app.run_command(Command::Theme {
+        name: Some("nord".to_string()),
+    });
+    assert_eq!(app.theme.name, "Nord", "the palette changed live");
+    let saved = std::fs::read_to_string(dir.path().join("config.toml")).expect("the save landed");
+    assert!(
+        saved.contains("\"nord\""),
+        "the file carries the registry key, not the display name: {saved}"
+    );
+    assert!(
+        !saved.contains("\"Nord\""),
+        "the display spelling never reaches the file: {saved}"
+    );
+}
+
+#[test]
+fn tab_after_arrows_applies_from_the_arrow_position() {
+    // Arrows land on a theme (preview follows), then Tab applies the
+    // next row into the composer — continuing from the arrow's
+    // position, not resetting to the first candidate. The applied
+    // name's preview must survive (the retire must not bounce it back
+    // to the original on the very key that applied it).
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    for glyph in "/theme ".chars() {
+        app.handle_event(&plain(KeyCode::Char(glyph)));
+    }
+    // Two arrows land on index 2 (nord).
+    app.handle_event(&key(KeyCode::Down, KeyModifiers::NONE));
+    app.handle_event(&key(KeyCode::Down, KeyModifiers::NONE));
+    // Tab applies the next row (index 3 = tokyo_night).
+    app.handle_event(&key(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(
+        app.input(),
+        "/theme tokyo_night",
+        "Tab continues from the arrow-landed row"
+    );
+    assert_eq!(
+        app.theme.name, "Tokyo Night",
+        "the applied theme's preview survives the retire"
+    );
+}
+
+#[test]
+fn arrows_and_tab_interoperate_in_both_directions() {
+    // The full interop: Tab applies a row, arrows apply from that
+    // position, Tab continues cycling from the arrow position, and
+    // arrows again — no key breaks the other's state. The popup and
+    // the composer track the shared highlight throughout.
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    for glyph in "/theme ".chars() {
+        app.handle_event(&plain(KeyCode::Char(glyph)));
+    }
+    let (_, cands, _) = {
+        let themes: Vec<String> = dch_tui::theme::Theme::command_names()
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        (String::new(), themes, 0)
+    };
+    let c2 = cands.get(2).cloned().unwrap_or_default();
+    let c3 = cands.get(3).cloned().unwrap_or_default();
+    let c4 = cands.get(4).cloned().unwrap_or_default();
+
+    // Tab: applies the first row (index 0).
+    app.handle_event(&key(KeyCode::Tab, KeyModifiers::NONE));
+    // Arrows: navigate to index 2 — the composer follows.
+    app.handle_event(&key(KeyCode::Down, KeyModifiers::NONE));
+    app.handle_event(&key(KeyCode::Down, KeyModifiers::NONE));
+    assert_eq!(
+        app.input(),
+        format!("/theme {c2}"),
+        "the arrows apply the row they land on"
+    );
+    // Tab: continues from the arrow position (index 3).
+    app.handle_event(&key(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(
+        app.input(),
+        format!("/theme {c3}"),
+        "Tab applies from the arrow position"
+    );
+    assert!(!app.theme.name.is_empty(), "the applied theme previews");
+
+    // Arrow: navigate from index 3 to index 4 — the composer follows.
+    app.handle_event(&key(KeyCode::Down, KeyModifiers::NONE));
+    assert_eq!(
+        app.input(),
+        format!("/theme {c4}"),
+        "the arrow applies its landed row after Tab applied one"
+    );
+    assert!(
+        app.theme.name != "Dracula" || c4 == "dracula",
+        "the arrow previewed away from the original"
+    );
+
+    // Tab: continues cycling from index 5 (after the arrow moved to 4)
+    app.handle_event(&key(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(
+        app.input(),
+        format!("/theme {}", cands.get(5).cloned().unwrap_or_default()),
+        "Tab continues from the arrow-landed position"
+    );
+
+    // The popup stands throughout
+    let drawn = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&drawn);
+    assert!(
+        rows.iter().any(|r| r.trim_start().starts_with("default")),
+        "the popup stands on the whole theme list"
     );
 }

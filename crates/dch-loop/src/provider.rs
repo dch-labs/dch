@@ -724,15 +724,7 @@ mod tests {
 
     #[test]
     fn effort_mapping_accepts_each_level_and_rejects_the_unknown() {
-        for (name, _) in [
-            ("none", 0),
-            ("minimal", 1),
-            ("low", 2),
-            ("medium", 3),
-            ("high", 4),
-            ("xhigh", 5),
-            ("max", 6),
-        ] {
+        for name in dch_config::REASONING_EFFORT_WIRE_NAMES {
             let mut c = cfg(ApiType::OpenAi, "https://api.openai.com/v1", Some("k"));
             c.reasoning_effort = Some(name.to_string());
             let effort = effort_from_config(&c)
