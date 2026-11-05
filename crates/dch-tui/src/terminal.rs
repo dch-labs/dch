@@ -1144,7 +1144,7 @@ fn refresh_signal_restore_bytes(original: (u8, u8, u8)) {
 /// original background rides in it — and replaces both signals'
 /// dispositions, keeping the displaced handlers for the live-phase
 /// chain. A background captured *after* arming republishes the bytes
-/// (see [`refresh_signal_restore_bytes`]), so the handler always
+/// (see `refresh_signal_restore_bytes`), so the handler always
 /// restores the latest original the session learned. Idempotent: the
 /// first call arms, later calls return.
 ///
@@ -1398,12 +1398,6 @@ impl Drop for TerminalGuard {
 )]
 mod tests {
     use super::*;
-
-    /// Serializes tests that touch process-global signal state: the
-    /// deaf flag and the fatal dispositions are one shared process,
-    /// so parallel signal tests would race each other's stores.
-    #[cfg(unix)]
-    static SIGNAL_STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Reads one signal's current disposition record.
     #[cfg(unix)]
@@ -1854,6 +1848,14 @@ mod synchronized_output_pins {
     }
 }
 
+/// Serializes tests that touch process-global signal state: the
+/// armed flag, the deaf flag, and the fatal dispositions are one
+/// shared process, so parallel signal tests would race each other's
+/// stores. Module-scope so the arming tests and the publication pins
+/// — separate test mods — serialize against each other too.
+#[cfg(all(test, unix))]
+static SIGNAL_STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 // Test code panics by design — its asserts are the assertions.
 #[cfg(all(test, unix))]
 #[allow(
@@ -1872,9 +1874,16 @@ mod signal_restore_publication_pins {
         // snapshot could not know it, so the capture republishes, and
         // the handler reads whichever publication is newest. Before
         // arming a capture publishes nothing — the arm build reads the
-        // captured background directly. The publication static is
-        // process-global; this test process never arms the real
-        // handler, so publishing here disturbs nothing else.
+        // captured background directly. The publication static and
+        // the armed flag are process-global, and other tests in this
+        // binary arm the restore for real: the shared state lock plus
+        // a forced-unarmed flag keep the assertion true whatever order
+        // the tests run in, and the swap restores the process's arming
+        // afterward.
+        let _signal_state = SIGNAL_STATE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let was_armed = SIGNAL_RESTORE_ARMED.swap(false, Ordering::SeqCst);
         let before = published_restore_bytes();
         refresh_signal_restore_bytes((16, 16, 16));
         assert_eq!(
@@ -1890,5 +1899,6 @@ mod signal_restore_publication_pins {
             Some(&b"refreshed"[..]),
             "the latest publication is the one the handler reads"
         );
+        SIGNAL_RESTORE_ARMED.store(was_armed, Ordering::SeqCst);
     }
 }

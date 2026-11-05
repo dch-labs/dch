@@ -1938,7 +1938,7 @@ async fn apply_session_command(
             }
         }
         SessionCommand::Compact { compactions } => match runner.compact_now().await {
-            Ok(figures) => {
+            Ok((true, figures)) => {
                 let folded = filtered_machine_history(&Arc::new(runner.committed_history()));
                 *context
                     .state
@@ -1951,6 +1951,9 @@ async fn apply_session_command(
                     compactions: compactions.saturating_add(1),
                     saver: None,
                 });
+                post_session_notice(session_tx, figures);
+            }
+            Ok((false, figures)) => {
                 post_session_notice(session_tx, figures);
             }
             Err(err) => post_session_notice(session_tx, format!("compaction was declined ({err})")),
@@ -2632,6 +2635,76 @@ mod tests {
         assert_eq!(
             outcome.machine_compactions, 2,
             "the recorded total adds this pass to the rows the display carried"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_no_op_compact_publishes_nothing_and_counts_nothing() {
+        // A fitting context declines to fold: the machine snapshot the
+        // last turn-end hook stamped stands (no machine half lands
+        // beside the display), and the recorded total gains no pass —
+        // the resume guard's legitimate-shrink exemption must be earned
+        // by folds that actually ran.
+        let dir = tempfile::tempdir().expect("session tempdir");
+        let root = dir.keep();
+        let id = uuid::Uuid::new_v4();
+        let saver = Arc::new(crate::session::SessionSaver::with_base_dir(
+            id,
+            "m".to_string(),
+            root.clone(),
+        ));
+        let (transcript, worker) = TranscriptWorker::spawn(Arc::clone(&saver));
+        transcript.send(
+            vec![TuiMessage::User {
+                text: "the conversation so far".to_string(),
+                timestamp: chrono::Utc::now(),
+                steered: false,
+                unsent: false,
+            }],
+            crate::session::SessionTokens::default(),
+        );
+        let workdir = tempfile::tempdir().expect("temp workdir");
+        let mut runner = dch_loop::Runner::builder(&unreachable_config(), workdir.path())
+            .build()
+            .await
+            .expect("an empty runner constructs");
+        let (_, state) = TuiObserverState::new().into_observer();
+        let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+        let mut context = DriverContext {
+            config: unreachable_config(),
+            config_base: std::sync::Arc::new(unreachable_config()),
+            workdir: workdir.path().to_path_buf(),
+            sessions_root: root.clone(),
+            state,
+            shutting_down: shutdown_flag(false),
+            lanes: InteractiveLanes::detached(),
+        };
+        apply_session_command(
+            &mut runner,
+            &transcript,
+            &session_tx,
+            SessionCommand::Compact { compactions: 4 },
+            &mut context,
+        )
+        .await;
+        worker.join();
+
+        let notice = tokio::time::timeout(std::time::Duration::from_secs(5), session_rx.recv())
+            .await
+            .expect("the declined pass still reports")
+            .expect("the session channel is open");
+        let text = match notice {
+            SessionUpdate::Notice { text } => text,
+            _ => String::new(),
+        };
+        assert!(
+            text.contains("nothing to compact"),
+            "the notice names the decline: {text}"
+        );
+        let (_, _, _, session_at) = crate::session::load_with_meta_in(id, &root).unwrap();
+        assert!(
+            crate::session::load_machine_in(id, &root, session_at).is_none(),
+            "a declined pass republishes nothing"
         );
     }
 

@@ -1739,7 +1739,7 @@ pub struct TuiApp {
     /// This copy is the file as loaded, before overrides and selections,
     /// and carries only what a user word actually changed — `/set`,
     /// `/unset`, `/theme`, a `/model` verdict's intended selection — so
-    /// [`persist_config`](Self::persist_config) writes user settings,
+    /// `persist_config` writes user settings,
     /// not the session. `None` (a host that installed none) falls back
     /// to persisting the live config, today's behavior.
     config_file: Option<DchConfig>,
@@ -2807,8 +2807,8 @@ impl TuiApp {
     ///
     /// The host's wiring: the file as loaded, before any CLI override
     /// or model selection ran. Every user-authored change lands on it
-    /// beside the live config, and [`persist_config`](Self::persist_config)
-    /// serializes it rather than the session-effective copy.
+    /// beside the live config, and `persist_config` serializes it
+    /// rather than the session-effective copy.
     pub fn set_config_file(&mut self, file: DchConfig) {
         self.config_file = Some(file);
     }

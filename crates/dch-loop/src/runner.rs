@@ -339,9 +339,13 @@ impl Runner {
     /// context manager — the same compactor and thresholds the
     /// automatic passes use — folds the history, and the pruned result
     /// is installed as the machine's history so the next run continues
-    /// from the compacted context. The returned string is the notice a
-    /// host shows: the tokens the pass saved and the size it left the
-    /// context — figures the pass itself measured, never derived. A
+    /// from the compacted context. The returned pair carries the
+    /// notice a host shows — the tokens the pass saved and the size it
+    /// left the context, figures the pass itself measured, never
+    /// derived — beside whether the pass actually changed the history:
+    /// `false` for a fitting context the pass declined to fold, so a
+    /// host's bookkeeping (a snapshot republish, a compaction count)
+    /// can skip its work when nothing changed. A
     /// machine caught mid-turn refuses: compaction runs
     /// between runs, not under a live turn.
     ///
@@ -352,9 +356,11 @@ impl Runner {
     /// the compactor itself fails, and
     /// [`LoopError::ContextExceeded`] when the compacted result still
     /// exceeds the window.
-    pub async fn compact_now(&mut self) -> Result<String, LoopError> {
+    pub async fn compact_now(&mut self) -> Result<(bool, String), LoopError> {
         let outcome = self.inner.compact_manual().await?;
-        Ok(compaction_notice(&outcome))
+        let notice = compaction_notice(&outcome);
+        let compacted = matches!(outcome, loopctl::compact::EnsureContextResult::Compacted(_));
+        Ok((compacted, notice))
     }
 
     /// Signal the in-flight run, if any, to cancel.
@@ -3435,13 +3441,17 @@ mod tests {
             .build()
             .await
             .expect("Runner::new constructs offline");
-        let notice = runner
+        let (compacted, notice) = runner
             .compact_now()
             .await
             .expect("an empty context needs no pass");
         assert_eq!(
             notice, "nothing to compact — the context fits",
             "the no-action notice is the pass's own verdict"
+        );
+        assert!(
+            !compacted,
+            "a fitting context changed no history — the host counts no pass"
         );
     }
 
@@ -3481,7 +3491,7 @@ mod tests {
             .expect("the scripted run completes")
             .expect("the run finishes");
         let before = runner.committed_history().len();
-        let notice = runner
+        let (compacted, notice) = runner
             .compact_now()
             .await
             .expect("a manual pass at rest runs");
@@ -3489,6 +3499,7 @@ mod tests {
             notice.starts_with("compacted: "),
             "the notice carries the pass's own figures: {notice}"
         );
+        assert!(compacted, "a real fold changed the history");
         let after = runner.committed_history().len();
         assert!(
             after < before,
