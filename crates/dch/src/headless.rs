@@ -124,6 +124,23 @@ impl HeadlessOutcome {
         }
     }
 
+    /// Map a completed run whose answer could not be delivered (exit 2).
+    ///
+    /// The run itself finished — the turn and tool-call totals are real,
+    /// and the done-file carries them — but the product never reached
+    /// the consumer, so the shell owes the run's own failure code and
+    /// the done-file a failure whose message names the delivery error
+    /// rather than an answer nobody read.
+    fn from_delivery_failure(error: &std::io::Error, run: &Run) -> Self {
+        Self {
+            exit_code: 2,
+            success: false,
+            message: format!("failed to write the final answer to stdout: {error}"),
+            turns: Some(run.turn_count()),
+            tools_used: Some(run.tool_call_count()),
+        }
+    }
+
     /// Map a `LoopError` to an outcome, honouring the cancel exit code.
     ///
     /// Cancelled runs exit 130; all other loop errors exit 2. The error
@@ -340,10 +357,12 @@ async fn run_headless_inner(
     let turn_outputs = runner.session_turn_outputs();
     match result {
         Ok(run) => {
-            if !streams_answer && let Some(answer) = &run.output {
-                print_final_answer(answer);
-            }
-            let outcome = HeadlessOutcome::from_run(&run);
+            let delivery = if !streams_answer && let Some(answer) = &run.output {
+                print_final_answer(answer)
+            } else {
+                Ok(())
+            };
+            let outcome = outcome_after_delivery(&run, delivery);
             write_done_file_if_requested(args, &outcome, inherited_mode.as_ref());
             outcome_recorded.store(true, Ordering::SeqCst);
             transcript.extend(crate::messages::transcript_from(
@@ -873,8 +892,21 @@ pub(crate) fn resolve_session_config_pair(
 /// precedence — the flag is a per-run statement and outranks both. Pure
 /// over the config, so the precedence is pinnable without a provider.
 pub(crate) fn reapply_displaced_flag_overrides(config: &mut dch_config::DchConfig, args: &Args) {
-    if let Some(effort) = &args.config.reasoning_effort {
-        config.api.reasoning_effort = Some(effort.clone());
+    reapply_reasoning_effort(config, args.config.reasoning_effort.as_deref());
+}
+
+/// Restore the run's `--reasoning-effort` flag over any later selection.
+///
+/// The step every selection shares: a `[[models]]` entry may state its
+/// own dial, and a selection — the boot choice, a mid-session `/model`
+/// or provider switch, a resume's adoption — layers it on after the
+/// flag first landed. Shared here so the boot order and the
+/// mid-session restores spell one precedence: the flag is a per-run
+/// statement and outranks every dial the configuration names. A `None`
+/// effort states no flag, and whatever the selection left stands.
+pub(crate) fn reapply_reasoning_effort(config: &mut dch_config::DchConfig, effort: Option<&str>) {
+    if let Some(effort) = effort {
+        config.api.reasoning_effort = Some(effort.to_string());
     }
 }
 
@@ -907,12 +939,18 @@ fn resolve_verbosity(args: &Args) -> Verbosity {
 /// The quiet default leaves the observer's stdout empty, so the answer —
 /// and only the answer — arrives here, once, at run end. The real
 /// stdout handle is locked for the write, so the answer cannot
-/// interleave with another thread's output; the write's result is
-/// dropped, so a consumer that closed the pipe early ends the run
-/// through the ordinary path instead of a panic.
-fn print_final_answer(answer: &str) {
+/// interleave with another thread's output; the write's result travels
+/// to the caller, so a delivery that failed — a consumer that closed
+/// the pipe early — fails the run instead of exiting behind an answer
+/// the consumer never saw.
+///
+/// # Errors
+///
+/// Returns the stdout write's own error verbatim; see
+/// [`write_final_answer`].
+fn print_final_answer(answer: &str) -> std::io::Result<()> {
     let mut out = std::io::stdout().lock();
-    write_final_answer(&mut out, answer);
+    write_final_answer(&mut out, answer)
 }
 
 /// Write the final answer line to `out`.
@@ -920,8 +958,34 @@ fn print_final_answer(answer: &str) {
 /// The testable core of [`print_final_answer`]: one line, the answer,
 /// one trailing newline — nothing else, whatever the run did to get
 /// here.
-fn write_final_answer(mut out: impl Write, answer: &str) {
-    drop(writeln!(out, "{answer}"));
+///
+/// # Errors
+///
+/// Returns the write's error unchanged: a sink that refuses the line
+/// (a closed pipe, a full disk) is a delivery failure the caller owes
+/// its exit path, not one to swallow behind a success.
+fn write_final_answer(mut out: impl Write, answer: &str) -> std::io::Result<()> {
+    writeln!(out, "{answer}")
+}
+
+/// Map a finished run to its outcome under the answer's delivery verdict.
+///
+/// A delivered answer (or a run with none to deliver) keeps the run's
+/// own outcome; a refused write fails the run instead — exit 2, a
+/// failure done-file with the run's real counts — and warns on stderr,
+/// the one channel still standing when stdout is what failed: without
+/// the warning a shell user sees the failure code and no word of its
+/// cause, the observer having printed nothing in the quiet default.
+fn outcome_after_delivery(run: &Run, delivery: std::io::Result<()>) -> HeadlessOutcome {
+    match delivery {
+        Ok(()) => HeadlessOutcome::from_run(run),
+        Err(err) => {
+            crate::signals::report(&format!(
+                "warning: the final answer could not be written to stdout: {err}"
+            ));
+            HeadlessOutcome::from_delivery_failure(&err, run)
+        }
+    }
 }
 
 /// Write the done-file when `--done-file` is supplied.
@@ -1144,6 +1208,45 @@ mod tests {
         assert!(!outcome.success);
         assert_eq!(outcome.turns, Some(0), "counts survive for the done-file");
         assert_eq!(outcome.tools_used, Some(0));
+    }
+
+    #[test]
+    fn a_delivered_answer_keeps_the_runs_own_outcome() {
+        let mut run = Run::new("task", &RunConfig::default());
+        run.output = Some("the answer".into());
+        let outcome = outcome_after_delivery(&run, Ok(()));
+        assert_eq!(outcome.exit_code, 0);
+        assert!(outcome.success);
+        assert_eq!(outcome.message, "the answer");
+    }
+
+    #[test]
+    fn a_refused_delivery_fails_the_run_with_its_real_counts() {
+        // The shell's verdict and the done-file's status both turn on the
+        // delivery: exit 2, a failure status, the run's turn and tool
+        // totals kept, and the message naming the write's own error —
+        // never an answer the consumer never saw.
+        let mut run = Run::new("task", &RunConfig::default());
+        run.output = Some("the answer".into());
+        let outcome = outcome_after_delivery(&run, Err(std::io::Error::other("pipe closed")));
+        assert_eq!(outcome.exit_code, 2, "a failed delivery is a failed run");
+        assert!(!outcome.success, "the done-file records the failure");
+        assert_eq!(outcome.turns, Some(0), "the run's counts survive");
+        assert_eq!(outcome.tools_used, Some(0));
+        assert!(
+            outcome.message.contains("failed to write the final answer"),
+            "the failure says what failed: {}",
+            outcome.message
+        );
+        assert!(
+            outcome.message.contains("pipe closed"),
+            "the failure names the write's own error: {}",
+            outcome.message
+        );
+        assert_ne!(
+            outcome.message, "the answer",
+            "an undelivered answer is not reported as the run's message"
+        );
     }
 
     #[test]
@@ -1550,10 +1653,33 @@ mod tests {
     #[test]
     fn the_unstreamed_answer_prints_as_one_line_with_a_newline() {
         let mut sink: Vec<u8> = Vec::new();
-        write_final_answer(&mut sink, "the answer");
+        write_final_answer(&mut sink, "the answer").expect("a Vec sink takes the line");
         assert_eq!(
             sink, b"the answer\n",
             "the quiet path delivers exactly the answer and one newline"
+        );
+    }
+
+    #[test]
+    fn a_refused_answer_write_surfaces_the_error() {
+        // The quiet path's contract runs the other way too: a stdout
+        // that refuses the write (a consumer closed the pipe) is a
+        // delivery failure the caller reports, not one it swallows
+        // behind an exit 0 and a success done-file.
+        struct RefusingSink;
+        impl Write for RefusingSink {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("the pipe went away"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let err = write_final_answer(&mut RefusingSink, "the answer")
+            .expect_err("a refusing sink fails the delivery");
+        assert!(
+            err.to_string().contains("the pipe went away"),
+            "the surfaced error is the write's own: {err}"
         );
     }
 

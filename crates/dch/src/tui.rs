@@ -272,15 +272,15 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
     let driver = tokio::spawn(Box::pin(run_driver_loop(
         runner,
         submit_rx,
-        DriverContext {
-            config: driver_config,
-            config_base: driver_base,
-            workdir: workdir.clone(),
-            sessions_root: crate::session::sessions_dir(),
-            state: state.clone(),
-            shutting_down: Arc::clone(&shutting_down),
+        session_driver_context(
+            driver_config,
+            driver_base,
+            workdir.clone(),
+            state.clone(),
+            Arc::clone(&shutting_down),
             lanes,
-        },
+            args,
+        ),
         initial_transcript,
         session_tx,
     )));
@@ -303,6 +303,37 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
         state.todos_undone_captured(),
     );
     session.map_err(|err| format!("terminal error: {err}"))
+}
+
+/// Assemble the driver's context from the session's resolved pieces.
+///
+/// Lifted for length: the session builder hands over its live and base
+/// configs, its shared state, and the run's CLI statements, and the
+/// sessions root and flag overrides land here — the one place that
+/// knows where the driver loads resumes from and which flags it owes
+/// precedence for the session's whole life.
+fn session_driver_context(
+    config: dch_config::DchConfig,
+    config_base: Arc<dch_config::DchConfig>,
+    workdir: std::path::PathBuf,
+    state: TuiObserverState,
+    shutting_down: Arc<AtomicBool>,
+    lanes: InteractiveLanes,
+    args: &Args,
+) -> DriverContext {
+    DriverContext {
+        config,
+        config_base,
+        workdir,
+        sessions_root: crate::session::sessions_dir(),
+        state,
+        shutting_down,
+        lanes,
+        overrides: RunOverrides {
+            model: args.model.clone(),
+            reasoning_effort: args.config.reasoning_effort.clone(),
+        },
+    }
 }
 
 /// Join the writer inside the deaf window, then print the exit lines
@@ -1401,6 +1432,30 @@ fn post_run_error(state: &TuiObserverState, err: &loopctl::error::LoopError) {
     state.render_notify.notify(1);
 }
 
+/// The run-scoped CLI statements a mid-session path must keep honouring.
+///
+/// `--model` and `--reasoning-effort` are per-run words: the boot
+/// resolution gives them their documented precedence over the
+/// configuration's own selection steps, and a mid-session rebuild — a
+/// `/model` switch, a provider switch, a live resume — runs those same
+/// steps again. Carried beside the configs so those paths restore the
+/// flags exactly as boot's order did, instead of letting a `[[models]]`
+/// entry's own dial or a saved session's model quietly outrank them.
+#[derive(Debug, Clone, Default)]
+struct RunOverrides {
+    /// The `--model` flag's name, when the flag was given.
+    ///
+    /// A live resume adopts no saved model over it — the same bow a
+    /// startup resume's adoption makes.
+    model: Option<String>,
+
+    /// The `--reasoning-effort` flag's value, when the flag was given.
+    ///
+    /// Restored over whatever dial a mid-session selection lays on, on
+    /// every path that selects.
+    reasoning_effort: Option<String>,
+}
+
 /// The pieces a driver command needs beyond the runner it holds.
 ///
 /// A [`SessionCommand`] that rebuilds the
@@ -1475,6 +1530,16 @@ struct DriverContext {
     /// [`InteractiveLanes`] for why a rebuild may never build its
     /// own.
     lanes: InteractiveLanes,
+
+    /// The run-scoped CLI statements a rebuild must keep honouring.
+    ///
+    /// `--model` and `--reasoning-effort` as the flags gave them
+    /// (`None` when absent): a switch restores the effort dial over
+    /// whatever the selected entry states, and a live resume adopts no
+    /// saved model over the flag's own — the precedences the boot
+    /// resolution already gave them, kept for the whole session rather
+    /// than the stretch before the first rebuild.
+    overrides: RunOverrides,
 }
 
 /// The claim-edge publisher that carries retired plan entries to
@@ -1839,6 +1904,10 @@ async fn apply_session_command(
                 );
                 return;
             }
+            crate::headless::reapply_reasoning_effort(
+                &mut config,
+                context.overrides.reasoning_effort.as_deref(),
+            );
             let history = runner.committed_history();
             let read_paths = crate::resume::resumed_read_paths_with_machine(&[], Some(&history));
             let observer = context.state.clone().into_observer().0;
@@ -2012,6 +2081,10 @@ async fn switch_provider(
     if config.select_model(Some(&selected)).is_err() {
         tracing::debug!(model = %selected, "provider switch without a profile entry");
     }
+    crate::headless::reapply_reasoning_effort(
+        &mut config,
+        context.overrides.reasoning_effort.as_deref(),
+    );
     let history = runner.committed_history();
     let read_paths = crate::resume::resumed_read_paths_with_machine(&[], Some(&history));
     let observer = context.state.clone().into_observer().0;
@@ -2073,8 +2146,11 @@ async fn switch_provider(
 ///
 /// The driver alone can load: it parses the id, reads the saved pair
 /// from the sessions root, rebuilds the runner on the restored machine
-/// history with the same read-guard baselines a launch resume builds,
-/// restores the token accounting into the shared state, retargets the
+/// history — under the saved session's own model, adopted through its
+/// `[[models]]` entry exactly as a launch resume adopts it, unless the
+/// run's `--model` flag named one outright — with the same read-guard
+/// baselines a launch resume builds, restores the token accounting into
+/// the shared state, retargets the
 /// save target onto the session's own file, and publishes the machine
 /// snapshot under it — the target must own the pin before the adopted
 /// history publishes, or the write lands under the outgoing session
@@ -2105,9 +2181,21 @@ async fn resume_into_session(
         return;
     };
     let machine = outcome.machine.clone().unwrap_or_default();
+    let mut config = context.config.clone();
+    if context.overrides.model.is_none() && !outcome.model.trim().is_empty() {
+        let mut fresh = context.config_base.as_ref().clone();
+        if fresh.select_model(Some(&outcome.model)).is_err() {
+            fresh.api.model.clone_from(&outcome.model);
+        }
+        config.api = fresh.api;
+    }
+    crate::headless::reapply_reasoning_effort(
+        &mut config,
+        context.overrides.reasoning_effort.as_deref(),
+    );
     let observer = context.state.clone().into_observer().0;
     let new_runner = assemble_runner_builder(
-        &context.config,
+        &config,
         &context.workdir,
         observer,
         &context.state,
@@ -2138,13 +2226,16 @@ async fn resume_into_session(
     ) {
         let _recorded = built.record_resumed_read(&path).await;
     }
+    let window = built.context_window();
     *runner = built;
+    context.state.context_window.store(window, Ordering::SeqCst);
     context.state.adopt_runner_handles(
         runner.cancel_signal(),
         Some(Arc::new(LoopGuidance {
             steering: runner.steering(),
         })),
     );
+    context.config = config;
     {
         let mut tokens = context
             .state
@@ -2255,6 +2346,7 @@ async fn drive_submissions(
             state,
             shutting_down,
             lanes: InteractiveLanes::detached(),
+            overrides: RunOverrides::default(),
         },
         transcript,
         session_tx,
@@ -2594,6 +2686,7 @@ mod tests {
             state: state.clone(),
             shutting_down: shutdown_flag(false),
             lanes: InteractiveLanes::detached(),
+            overrides: RunOverrides::default(),
         };
         apply_session_command(
             &mut runner,
@@ -2678,6 +2771,7 @@ mod tests {
             state,
             shutting_down: shutdown_flag(false),
             lanes: InteractiveLanes::detached(),
+            overrides: RunOverrides::default(),
         };
         apply_session_command(
             &mut runner,
@@ -3808,6 +3902,7 @@ mod tests {
                 state,
                 shutting_down: shutdown_flag(false),
                 lanes: InteractiveLanes::detached(),
+                overrides: RunOverrides::default(),
             },
             parked_transcript(),
             session_tx,
@@ -3875,6 +3970,7 @@ mod tests {
                 state,
                 shutting_down: shutdown_flag(false),
                 lanes: InteractiveLanes::detached(),
+                overrides: RunOverrides::default(),
             },
             parked_transcript(),
             session_tx,
@@ -3957,6 +4053,7 @@ mod tests {
                 state,
                 shutting_down: shutdown_flag(false),
                 lanes: InteractiveLanes::detached(),
+                overrides: RunOverrides::default(),
             },
             parked_transcript(),
             session_tx,
@@ -4033,6 +4130,7 @@ mod tests {
                 state: state.clone(),
                 shutting_down: shutdown_flag(false),
                 lanes: InteractiveLanes::detached(),
+                overrides: RunOverrides::default(),
             },
             transcript.clone(),
             session_tx,
@@ -4180,6 +4278,7 @@ mod tests {
                 state: state.clone(),
                 shutting_down: shutdown_flag(false),
                 lanes: InteractiveLanes::detached(),
+                overrides: RunOverrides::default(),
             },
             transcript,
             session_tx,
@@ -4258,6 +4357,7 @@ mod tests {
                 state,
                 shutting_down: shutdown_flag(false),
                 lanes: InteractiveLanes::detached(),
+                overrides: RunOverrides::default(),
             },
             parked_transcript(),
             session_tx,
@@ -4306,6 +4406,7 @@ mod tests {
                 state,
                 shutting_down: shutdown_flag(false),
                 lanes: InteractiveLanes::detached(),
+                overrides: RunOverrides::default(),
             },
             parked_transcript(),
             session_tx,
@@ -4488,6 +4589,7 @@ mod tests {
                 state,
                 shutting_down: shutdown_flag(false),
                 lanes: InteractiveLanes::detached(),
+                overrides: RunOverrides::default(),
             },
             TranscriptWorker::spawn(Arc::new(crate::session::SessionSaver::with_base_dir(
                 uuid::Uuid::new_v4(),
@@ -4569,6 +4671,7 @@ mod tests {
                 state,
                 shutting_down: shutdown_flag(false),
                 lanes: InteractiveLanes::detached(),
+                overrides: RunOverrides::default(),
             },
             handle.clone(),
             session_tx,
@@ -4670,6 +4773,7 @@ mod tests {
                 state,
                 shutting_down: shutdown_flag(false),
                 lanes: InteractiveLanes::detached(),
+                overrides: RunOverrides::default(),
             },
             handle.clone(),
             session_tx,
@@ -4729,6 +4833,7 @@ mod tests {
                 state,
                 shutting_down: shutdown_flag(false),
                 lanes: InteractiveLanes::detached(),
+                overrides: RunOverrides::default(),
             },
             parked_transcript(),
             session_tx,
@@ -4745,6 +4850,345 @@ mod tests {
             "the notice says what stood: {text}"
         );
         let _ = driver.await;
+    }
+
+    #[tokio::test]
+    async fn a_model_switch_restores_the_flag_effort_over_the_entrys_dial() {
+        // The flag is a per-run statement: the entry states its own dial,
+        // the switch selects it, and the restore puts the flag's value
+        // back on top — the precedence the boot order gives it, kept
+        // past the session's first rebuild instead of ending there.
+        let mut runner = unreachable_runner().await;
+        let (_, state) = TuiObserverState::new().into_observer();
+        let (session_tx, _session_rx) = mpsc::unbounded_channel();
+        let mut base = unreachable_config();
+        base.models = vec![dch_config::ModelProfile {
+            model: "dialled".to_string(),
+            reasoning_effort: Some("high".to_string()),
+            ..dch_config::ModelProfile::default()
+        }];
+        let mut live = base.clone();
+        live.select_model(None)
+            .expect("the boot selection lays the entry's dial");
+        assert_eq!(
+            live.api.reasoning_effort.as_deref(),
+            Some("high"),
+            "fixture premise: the entry's dial lands without a flag to restore"
+        );
+        live.api.reasoning_effort = Some("low".to_string()); // the flag's boot restore
+        let mut context = DriverContext {
+            config: live,
+            config_base: std::sync::Arc::new(base),
+            workdir: std::path::PathBuf::from("."),
+            sessions_root: crate::session::sessions_dir(),
+            state,
+            shutting_down: shutdown_flag(false),
+            lanes: InteractiveLanes::detached(),
+            overrides: RunOverrides {
+                model: None,
+                reasoning_effort: Some("low".to_string()),
+            },
+        };
+        let transcript = parked_transcript();
+        apply_session_command(
+            &mut runner,
+            &transcript,
+            &session_tx,
+            SessionCommand::Model {
+                name: "dialled".to_string(),
+            },
+            &mut context,
+        )
+        .await;
+        assert_eq!(
+            context.config.api.reasoning_effort.as_deref(),
+            Some("low"),
+            "the flag's dial survives the switch onto the entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_provider_switch_restores_the_flag_effort_over_the_entrys_dial() {
+        // The same law on the cross-provider wire: an entry naming the
+        // switched-to model contributes its own dial through the
+        // selection, and the run's flag goes back on top before the
+        // rebuild reads it.
+        let mut runner = unreachable_runner().await;
+        let (_, state) = TuiObserverState::new().into_observer();
+        let (session_tx, _session_rx) = mpsc::unbounded_channel();
+        let mut base = unreachable_config();
+        base.models = vec![dch_config::ModelProfile {
+            model: "elsewhere".to_string(),
+            reasoning_effort: Some("high".to_string()),
+            ..dch_config::ModelProfile::default()
+        }];
+        let mut context = DriverContext {
+            config: unreachable_config(),
+            config_base: std::sync::Arc::new(base),
+            workdir: std::path::PathBuf::from("."),
+            sessions_root: crate::session::sessions_dir(),
+            state,
+            shutting_down: shutdown_flag(false),
+            lanes: InteractiveLanes::detached(),
+            overrides: RunOverrides {
+                model: None,
+                reasoning_effort: Some("low".to_string()),
+            },
+        };
+        let transcript = parked_transcript();
+        apply_session_command(
+            &mut runner,
+            &transcript,
+            &session_tx,
+            SessionCommand::SwitchProvider {
+                model: "elsewhere".to_string(),
+                base_url: "http://127.0.0.1:1".to_string(),
+                api_type: "openai".to_string(),
+            },
+            &mut context,
+        )
+        .await;
+        assert_eq!(
+            context.config.api.reasoning_effort.as_deref(),
+            Some("low"),
+            "the flag's dial survives the provider switch onto the entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_resume_adopts_the_saved_sessions_model_through_its_profile() {
+        // The startup rule, kept on the live path: a resumed session
+        // continues on the model it last ran, resolved through its
+        // `[[models]]` entry — the profile's window is what the rebuilt
+        // engine measures — and the run's effort flag goes back on top
+        // of whatever the entry states, exactly as the boot order does.
+        let dir = tempfile::tempdir().expect("sessions tempdir");
+        let id = uuid::Uuid::new_v4();
+        let saver = crate::session::SessionSaver::with_base_dir(
+            id,
+            "saved-model".to_string(),
+            dir.path().to_path_buf(),
+        );
+        let now = chrono::Utc::now();
+        saver
+            .save_at(
+                &[dch_tui::TuiMessage::User {
+                    text: "the saved turn".to_string(),
+                    timestamp: now,
+                    steered: false,
+                    unsent: false,
+                }],
+                crate::session::SessionTokens::default(),
+                now,
+            )
+            .expect("the saved session lands");
+        let mut runner = unreachable_runner().await;
+        let (_, state) = TuiObserverState::new().into_observer();
+        let (session_tx, _session_rx) = mpsc::unbounded_channel();
+        let mut base = unreachable_config();
+        base.models = vec![dch_config::ModelProfile {
+            model: "saved-model".to_string(),
+            context_window: Some(123_456),
+            reasoning_effort: Some("high".to_string()),
+            ..dch_config::ModelProfile::default()
+        }];
+        let window_probe = state.clone();
+        let mut context = DriverContext {
+            config: unreachable_config(),
+            config_base: std::sync::Arc::new(base),
+            workdir: std::path::PathBuf::from("."),
+            sessions_root: dir.path().to_path_buf(),
+            state,
+            shutting_down: shutdown_flag(false),
+            lanes: InteractiveLanes::detached(),
+            overrides: RunOverrides {
+                model: None,
+                reasoning_effort: Some("low".to_string()),
+            },
+        };
+        let transcript = parked_transcript();
+        apply_session_command(
+            &mut runner,
+            &transcript,
+            &session_tx,
+            SessionCommand::Resume { id: id.to_string() },
+            &mut context,
+        )
+        .await;
+        assert_eq!(
+            context.config.api.model, "saved-model",
+            "the resumed session's own model is adopted"
+        );
+        assert_eq!(
+            context.config.api.context_window,
+            Some(123_456),
+            "the adoption resolves through the entry's profile"
+        );
+        assert_eq!(
+            context.config.api.reasoning_effort.as_deref(),
+            Some("low"),
+            "the run's flag outranks the adopted entry's dial"
+        );
+        assert_eq!(
+            window_probe.context_window.load(Ordering::SeqCst),
+            123_456,
+            "the context bar measures the adopted model's own window"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resume_rebuild_that_fails_keeps_the_live_config() {
+        // The adoption is provisional: a config that cannot be built —
+        // here through the blank fallback the construction breaker
+        // refuses — leaves the live config, and the loop it stands for,
+        // exactly as it stood, with the refusal said on the notice lane.
+        let dir = tempfile::tempdir().expect("sessions tempdir");
+        let id = uuid::Uuid::new_v4();
+        let saver = crate::session::SessionSaver::with_base_dir(
+            id,
+            "saved-model".to_string(),
+            dir.path().to_path_buf(),
+        );
+        let now = chrono::Utc::now();
+        saver
+            .save_at(
+                &[dch_tui::TuiMessage::User {
+                    text: "the saved turn".to_string(),
+                    timestamp: now,
+                    steered: false,
+                    unsent: false,
+                }],
+                crate::session::SessionTokens::default(),
+                now,
+            )
+            .expect("the saved session lands");
+        let mut runner = unreachable_runner().await;
+        let (_, state) = TuiObserverState::new().into_observer();
+        let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+        // No entries: the adoption takes the base's own api wholesale,
+        // blank fallback included — the one the rebuild refuses.
+        let mut base = unreachable_config();
+        base.api.fallback_model = Some(String::new());
+        let mut context = DriverContext {
+            config: unreachable_config(),
+            config_base: std::sync::Arc::new(base),
+            workdir: std::path::PathBuf::from("."),
+            sessions_root: dir.path().to_path_buf(),
+            state,
+            shutting_down: shutdown_flag(false),
+            lanes: InteractiveLanes::detached(),
+            overrides: RunOverrides::default(),
+        };
+        let transcript = parked_transcript();
+        apply_session_command(
+            &mut runner,
+            &transcript,
+            &session_tx,
+            SessionCommand::Resume { id: id.to_string() },
+            &mut context,
+        )
+        .await;
+        assert_eq!(
+            context.config.api.model, "test-model",
+            "the live config stands — the adoption never landed"
+        );
+        let update = tokio::time::timeout(std::time::Duration::from_secs(5), session_rx.recv())
+            .await
+            .expect("the refused adoption reports")
+            .expect("the session channel stays open");
+        let SessionUpdate::Notice { text } = update else {
+            panic!("a refused adoption posts a notice, got {update:?}");
+        };
+        assert!(
+            text.contains("could not be adopted"),
+            "the notice names the refusal: {text}"
+        );
+    }
+
+    #[test]
+    fn the_session_context_carries_the_runs_flag_statements() {
+        // The driver's halves read the flags through this one wiring: a
+        // dropped population would leave every mid-session restore
+        // inert while each arm's own test still passed, so the mapping
+        // from the parsed args is pinned directly.
+        use clap::Parser as _;
+        let args = crate::args::Args::parse_from([
+            "dch",
+            "--model",
+            "flag-model",
+            "--reasoning-effort",
+            "low",
+        ]);
+        let context = session_driver_context(
+            dch_config::DchConfig::default(),
+            std::sync::Arc::new(dch_config::DchConfig::default()),
+            std::path::PathBuf::from("."),
+            TuiObserverState::new(),
+            shutdown_flag(false),
+            InteractiveLanes::detached(),
+            &args,
+        );
+        assert_eq!(context.overrides.model.as_deref(), Some("flag-model"));
+        assert_eq!(context.overrides.reasoning_effort.as_deref(), Some("low"));
+    }
+
+    #[tokio::test]
+    async fn a_live_resume_keeps_the_flag_model_over_the_saved_one() {
+        // The startup adoption's own bow, made on the live path too: a
+        // run launched with `--model` keeps it through a resume — the
+        // saved session's model is provenance, never a replacement for
+        // the user's named run.
+        let dir = tempfile::tempdir().expect("sessions tempdir");
+        let id = uuid::Uuid::new_v4();
+        let saver = crate::session::SessionSaver::with_base_dir(
+            id,
+            "saved-model".to_string(),
+            dir.path().to_path_buf(),
+        );
+        let now = chrono::Utc::now();
+        saver
+            .save_at(
+                &[dch_tui::TuiMessage::User {
+                    text: "the saved turn".to_string(),
+                    timestamp: now,
+                    steered: false,
+                    unsent: false,
+                }],
+                crate::session::SessionTokens::default(),
+                now,
+            )
+            .expect("the saved session lands");
+        let mut runner = unreachable_runner().await;
+        let (_, state) = TuiObserverState::new().into_observer();
+        let (session_tx, _session_rx) = mpsc::unbounded_channel();
+        let mut live = unreachable_config();
+        live.api.model = "flag-model".to_string();
+        let mut context = DriverContext {
+            config: live,
+            config_base: std::sync::Arc::new(unreachable_config()),
+            workdir: std::path::PathBuf::from("."),
+            sessions_root: dir.path().to_path_buf(),
+            state,
+            shutting_down: shutdown_flag(false),
+            lanes: InteractiveLanes::detached(),
+            overrides: RunOverrides {
+                model: Some("flag-model".to_string()),
+                reasoning_effort: None,
+            },
+        };
+        let transcript = parked_transcript();
+        apply_session_command(
+            &mut runner,
+            &transcript,
+            &session_tx,
+            SessionCommand::Resume { id: id.to_string() },
+            &mut context,
+        )
+        .await;
+        assert_eq!(
+            context.config.api.model, "flag-model",
+            "the flag's model stands through the resume"
+        );
     }
 
     #[tokio::test]
@@ -4777,6 +5221,7 @@ mod tests {
                 state,
                 shutting_down: shutdown_flag(false),
                 lanes: InteractiveLanes::detached(),
+                overrides: RunOverrides::default(),
             },
             parked_transcript(),
             session_tx,
@@ -4836,6 +5281,7 @@ mod tests {
                 state,
                 shutting_down: shutdown_flag(false),
                 lanes: InteractiveLanes::detached(),
+                overrides: RunOverrides::default(),
             },
             handle.clone(),
             session_tx,
@@ -6940,6 +7386,7 @@ mod tests {
                 state: state.clone(),
                 shutting_down: shutdown_flag(false),
                 lanes: InteractiveLanes::detached(),
+                overrides: RunOverrides::default(),
             },
             parked_transcript(),
             session_tx,
