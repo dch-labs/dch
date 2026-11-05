@@ -558,9 +558,10 @@ pub enum Command {
 
 /// What a submitted line parsed as.
 ///
-/// The three outcomes are exhaustive: a line either carries no leading `/` and
+/// The four outcomes are exhaustive: a line either carries no leading `/` and
 /// is an ordinary prompt, carries one and names a registered command, or
-/// carries one and names nothing (or the wrong shape). Only
+/// carries one and names nothing — and a fourth reading covers a name that
+/// matched but whose argument shape did not. Only
 /// [`Parsed::NotACommand`] reaches the model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Parsed {
@@ -576,14 +577,41 @@ pub enum Parsed {
     /// already passed for the variant carried.
     Command(Command),
 
-    /// A `/`-prefixed line that names no command, or names one with the
-    /// wrong shape.
+    /// A `/`-prefixed line that names no command.
+    ///
+    /// A name nothing registered carries; a shape mistake is
+    /// [`Parsed::Misused`], which knows the command it mistyped.
     Unknown {
         /// The word the user typed after the `/`, for the notice.
         ///
         /// Said back verbatim in the unknown-command notice so the
         /// user sees exactly what was not recognised.
         name: String,
+    },
+
+    /// A registered command typed with the wrong argument shape.
+    ///
+    /// The name matched; the argument did not fit — missing where one
+    /// is required, present where none is taken, or the surplus second
+    /// word a single-word command refuses. Carries the registry's own
+    /// usage line so the panel can point the user at the shape, not at
+    /// the command list a registered command does not belong in.
+    Misused {
+        /// The command's primary name, for the notice.
+        ///
+        /// The registry's own spelling, whatever alias reached it, so
+        /// the notice names the command that was mistyped — the word
+        /// itself registered fine, and saying so is what separates this
+        /// outcome from [`Parsed::Unknown`].
+        name: String,
+
+        /// The registry's usage line, for the notice.
+        ///
+        /// The same string the palette and `/help` print, carried
+        /// through here so the notice shows the exact shape the command
+        /// takes without the panel re-deriving it from the spec — one
+        /// spelling of the shape, taught everywhere.
+        usage: &'static str,
     },
 }
 
@@ -670,9 +698,11 @@ pub struct CompletionSources<'a> {
 /// starting any other way — including one that merely contains a `/` or is
 /// preceded by whitespace — is [`Parsed::NotACommand`] and flows to the model
 /// unchanged. A name or alias is matched against `REGISTRY` and its argument
-/// checked against that command's `ArgShape`; a name matching nothing, or
-/// matching but breaking the arity, comes back [`Parsed::Unknown`] carrying the
-/// typed word. Total: every input yields one of the three readings.
+/// checked against that command's `ArgShape`; a name matching nothing comes
+/// back [`Parsed::Unknown`] carrying the typed word, and one matching with an
+/// argument shape that does not fit comes back [`Parsed::Misused`] carrying
+/// the registry's usage line. Total: every input yields one of the four
+/// readings.
 #[must_use]
 pub fn parse(line: &str) -> Parsed {
     let Some(body) = line.strip_prefix('/') else {
@@ -933,7 +963,9 @@ fn find_pair(name: &str) -> Option<(&'static Spec, &'static str)> {
 /// single-word commands (`/help`, `/resume`, `/unset`) refuse a surplus
 /// second word the same way — a `/resume <id> new` is as much a mistake as
 /// an argument to `/clear`, not a command whose trailing word deserves to
-/// vanish. When the shape fits, the matching [`Command`] is built carrying
+/// vanish. Either shape mistake comes back [`Parsed::Misused`] carrying
+/// the registry's usage line, so the panel can name the shape the command
+/// takes. When the shape fits, the matching [`Command`] is built carrying
 /// the argument.
 fn build_command(spec: &Spec, argument: &str) -> Parsed {
     let arity_ok = match spec.arg {
@@ -942,14 +974,16 @@ fn build_command(spec: &Spec, argument: &str) -> Parsed {
         ArgShape::Optional => true,
     };
     if !arity_ok {
-        return Parsed::Unknown {
+        return Parsed::Misused {
             name: spec.name.to_string(),
+            usage: spec.usage,
         };
     }
     let single_word = matches!(spec.name, "help" | "resume" | "unset");
     if single_word && argument.split_whitespace().nth(1).is_some() {
-        return Parsed::Unknown {
+        return Parsed::Misused {
             name: spec.name.to_string(),
+            usage: spec.usage,
         };
     }
     let command = match spec.name {
@@ -974,8 +1008,9 @@ fn build_command(spec: &Spec, argument: &str) -> Parsed {
                 value: value.trim().to_string(),
             },
             None => {
-                return Parsed::Unknown {
-                    name: "set".to_string(),
+                return Parsed::Misused {
+                    name: spec.name.to_string(),
+                    usage: spec.usage,
                 };
             }
         },
@@ -1242,38 +1277,57 @@ mod tests {
     }
 
     #[test]
-    fn arity_mistakes_are_unknown_naming_the_command() {
-        // Over-supplied an argumentless command.
+    fn arity_mistakes_carry_the_usage_not_the_unknown_wording() {
+        // A wrong-shape known command is a usage mistake, not an
+        // unknown: the outcome carries the registry's usage line so the
+        // panel can point at the argument, not at the command list.
         assert_eq!(
             parse("/clear me"),
-            Parsed::Unknown {
-                name: "clear".to_string()
+            Parsed::Misused {
+                name: "clear".to_string(),
+                usage: "/clear"
             }
         );
         assert_eq!(
             parse("/compact now"),
-            Parsed::Unknown {
-                name: "compact".to_string()
+            Parsed::Misused {
+                name: "compact".to_string(),
+                usage: "/compact"
             }
         );
-        // Missing a required argument.
         assert_eq!(
             parse("/model"),
-            Parsed::Unknown {
-                name: "model".to_string()
+            Parsed::Misused {
+                name: "model".to_string(),
+                usage: "/model <name>"
             }
         );
-        // `/set` needs a key AND a value.
         assert_eq!(
             parse("/set"),
-            Parsed::Unknown {
-                name: "set".to_string()
+            Parsed::Misused {
+                name: "set".to_string(),
+                usage: "/set <key> <value>"
             }
         );
         assert_eq!(
             parse("/set model"),
+            Parsed::Misused {
+                name: "set".to_string(),
+                usage: "/set <key> <value>"
+            }
+        );
+        assert_eq!(
+            parse("/resume here extra"),
+            Parsed::Misused {
+                name: "resume".to_string(),
+                usage: "/resume [<id>]"
+            }
+        );
+        // A name nothing carries stays Unknown, verbatim.
+        assert_eq!(
+            parse("/modelx now"),
             Parsed::Unknown {
-                name: "set".to_string()
+                name: "modelx".to_string()
             }
         );
     }
@@ -1287,20 +1341,23 @@ mod tests {
         // same way; the one-word forms still parse untouched.
         assert_eq!(
             parse("/resume 3c0f new"),
-            Parsed::Unknown {
-                name: "resume".to_string()
+            Parsed::Misused {
+                name: "resume".to_string(),
+                usage: "/resume [<id>]"
             }
         );
         assert_eq!(
             parse("/unset theme junk"),
-            Parsed::Unknown {
-                name: "unset".to_string()
+            Parsed::Misused {
+                name: "unset".to_string(),
+                usage: "/unset <key>"
             }
         );
         assert_eq!(
             parse("/help model extra"),
-            Parsed::Unknown {
-                name: "help".to_string()
+            Parsed::Misused {
+                name: "help".to_string(),
+                usage: "/help [command]"
             }
         );
         assert_eq!(

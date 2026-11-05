@@ -1615,7 +1615,7 @@ fn active_tools_render_as_running_lines() {
     let rows = row_texts(&terminal);
     assert!(
         rows.iter()
-            .any(|row| row.contains("⏳") && row.contains("Grep \"todo\"")),
+            .any(|row| row.contains("⧗") && row.contains("Grep \"todo\"")),
         "in-flight tools render a running line: {rows:?}"
     );
 }

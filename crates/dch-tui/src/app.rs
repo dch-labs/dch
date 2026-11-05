@@ -363,7 +363,10 @@ const TODO_SECTION_INSET: u16 = 2;
 /// and everything a prefix costs is wording squeezed off the end. Both the
 /// renderer and the tests that read a frame locate the section by this
 /// glyph, so it is the section's identity on screen rather than ornament.
-const QUEUE_MARKER: &str = "\u{231b}";
+/// A text hourglass, outline where the running call's is solid: no emoji
+/// presentation to paint it a vendor color, and a shape that reads as
+/// waiting beside the in-flight clock it never pretends to be.
+const QUEUE_MARKER: &str = "\u{29d6}";
 
 /// The title row the waiting-prompt section opens with.
 ///
@@ -2526,6 +2529,11 @@ impl TuiApp {
             Parsed::Command(command) => self.run_command(command),
             Parsed::Unknown { name } => {
                 self.post_notice(format!("unknown command /{name} — type /help for the list"));
+            }
+            Parsed::Misused { name, usage } => {
+                self.post_notice(format!(
+                    "/{name} is a command, but not with that shape — {usage} (see /help {name})"
+                ));
             }
             Parsed::NotACommand => {}
         }
@@ -17663,6 +17671,24 @@ mod tests {
     }
 
     #[test]
+    fn a_wrong_shape_known_command_points_at_the_usage() {
+        // /model with no name is a usage mistake, not an unknown
+        // command: the notice carries the shape the registry spells,
+        // never the command-list pointer a name nothing carries earns.
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        app.handle_command(commands::parse("/model"));
+        let (notice, _) = app.transient_notice.as_ref().expect("a notice stands");
+        assert!(
+            notice.contains("/model <name>"),
+            "the notice names the shape: {notice}"
+        );
+        assert!(
+            !notice.contains("unknown command"),
+            "a registered command is never called unknown: {notice}"
+        );
+    }
+
+    #[test]
     fn sessions_parse_and_refuse_under_a_run() {
         let commands::Parsed::Command(command) = commands::parse("/sessions") else {
             panic!("the bare spelling is the whole command");
@@ -17671,7 +17697,7 @@ mod tests {
         assert!(
             matches!(
                 commands::parse("/sessions now"),
-                commands::Parsed::Unknown { .. }
+                commands::Parsed::Misused { .. }
             ),
             "the command takes no argument"
         );

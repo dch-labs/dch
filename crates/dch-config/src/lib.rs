@@ -1656,7 +1656,15 @@ impl DchConfig {
     /// The document is validated before anything is staged: a save may
     /// never land a configuration the loader itself would refuse,
     /// because the next start would then die on this file until a hand
-    /// edit fixed it.
+    /// edit fixed it. A symlinked target (stow, a dotfiles repo) is
+    /// resolved before anything is staged: the rename replaces the
+    /// file the link names, never the link itself, so the managed copy
+    /// the user keeps is the one that changes. A staged write that
+    /// fails removes itself — a stray can carry a credential, and its
+    /// pid-and-sequence name could collide with a pid-reusing
+    /// successor (a container's dch is often pid 1 against a
+    /// persistent home) — and the name carries a time nonce so even a
+    /// stray left by a crash cannot wedge a later save.
     ///
     /// # Errors
     ///
@@ -1668,24 +1676,44 @@ impl DchConfig {
         static SAVE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         self.validate()?;
         let document = self.to_toml_string()?;
-        let target = if dir.join("config.local.toml").exists() {
+        let chosen = if dir.join("config.local.toml").exists() {
             dir.join("config.local.toml")
         } else {
             dir.join("config.toml")
         };
         std::fs::create_dir_all(dir)?;
-        let staging = dir.join(format!(
-            ".{}.{}.{}.tmp",
+        let target = std::fs::canonicalize(&chosen).unwrap_or(chosen);
+        let staging = target.with_file_name(format!(
+            ".{}.{}.{}.{}.tmp",
             target
                 .file_name()
                 .and_then(std::ffi::OsStr::to_str)
                 .unwrap_or("config.toml"),
             std::process::id(),
             SAVE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            Self::staging_nonce(),
         ));
         Self::write_staging_file(&staging, &document)?;
-        std::fs::rename(&staging, &target)?;
+        if let Err(err) = std::fs::rename(&staging, &target) {
+            drop(std::fs::remove_file(&staging));
+            return Err(err.into());
+        }
         Ok(())
+    }
+
+    /// A time-based nonce for the staging name.
+    ///
+    /// The pid and the per-process sequence alone collide with a stray
+    /// left by an earlier process whose pid a container reuses — every
+    /// fresh container is pid 1 against the same persistent home. The
+    /// nonce makes the name unique across process generations, so a
+    /// stale `.tmp` can never refuse a successor's first save.
+    fn staging_nonce() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| {
+                u64::try_from(since.as_nanos()).unwrap_or(u64::MAX)
+            })
     }
 
     /// Persist the configuration to the user's [config dir](config_dir).
@@ -1726,8 +1754,9 @@ impl DchConfig {
     /// # Errors
     ///
     /// Returns the filesystem error the create, the write, or the
-    /// sync raises; no file is left behind on a failed write beyond
-    /// the (owner-only) staging path the caller named.
+    /// sync raises; a failed write or sync removes the staging file it
+    /// created, so nothing partial and nothing secret is stranded — an
+    /// open that itself fails owns no file and removes nothing.
     fn write_staging_file(staging: &Path, document: &str) -> std::io::Result<()> {
         #[cfg(unix)]
         {
@@ -1738,8 +1767,14 @@ impl DchConfig {
                 .create_new(true)
                 .mode(0o600)
                 .open(staging)?;
-            file.write_all(document.as_bytes())?;
-            file.sync_all()
+            if let Err(err) = file
+                .write_all(document.as_bytes())
+                .and_then(|()| file.sync_all())
+            {
+                drop(std::fs::remove_file(staging));
+                return Err(err);
+            }
+            Ok(())
         }
         #[cfg(not(unix))]
         {
@@ -3591,6 +3626,93 @@ mod save_roundtrip {
             "the changed field arrives"
         );
         assert_eq!(back.display.theme, "nord", "the theme arrives");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_save_through_a_symlink_replaces_the_managed_file_not_the_link() {
+        // A stow- or dotfiles-managed config is a symlink; the rename
+        // must replace the file the link names, never the link itself —
+        // detaching it would leave the managed copy stale while the
+        // next start loads a different file than the user manages.
+        let managed = tempfile::tempdir().expect("managed tempdir");
+        let real = managed.path().join("real-config.toml");
+        std::fs::write(&real, "[api]\nmodel = \"old\"\n").expect("managed file");
+        let dir = tempfile::tempdir().expect("config tempdir");
+        std::os::unix::fs::symlink(&real, dir.path().join("config.toml")).expect("symlink");
+
+        let mut config = DchConfig::default();
+        config.api.model = "new".to_string();
+        config.save_to_dir(dir.path()).expect("the save lands");
+
+        let link =
+            std::fs::symlink_metadata(dir.path().join("config.toml")).expect("the link stands");
+        assert!(
+            link.file_type().is_symlink(),
+            "the save replaced the managed file, not the link"
+        );
+        let saved = std::fs::read_to_string(&real).expect("the managed file");
+        assert!(
+            saved.contains("\"new\""),
+            "the managed copy changed: {saved}"
+        );
+    }
+
+    #[test]
+    fn a_stray_staging_file_cannot_wedge_a_later_save() {
+        // The pid-and-sequence name alone collides with a stray left by
+        // a crashed process whose pid a container reuses: the successor
+        // creates `create_new` and fails AlreadyExists forever. The
+        // nonce makes the fresh save's staging name its own, so the
+        // stray sits untouched beside a save that lands anyway.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stray = dir
+            .path()
+            .join(format!(".config.toml.{}.0.tmp", std::process::id()));
+        std::fs::write(&stray, "half a document from a crashed process").expect("stray");
+
+        let mut config = DchConfig::default();
+        config.api.model = "fresh".to_string();
+        config
+            .save_to_dir(dir.path())
+            .expect("the save lands beside the stray");
+
+        let landed = std::fs::read_to_string(dir.path().join("config.toml")).expect("the target");
+        assert!(
+            landed.contains("\"fresh\""),
+            "the new document arrived: {landed}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&stray).expect("the stray stands"),
+            "half a document from a crashed process",
+            "the stray is untouched — the fresh save never tried its name"
+        );
+    }
+
+    #[test]
+    fn a_rename_that_cannot_land_cleans_up_its_staging_file() {
+        // The staged file is this save's own: a rename that fails (here
+        // the target name is taken by a directory) must remove it, or
+        // the directory keeps a stray that may carry a credential.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join("config.toml")).expect("a directory target");
+
+        let mut config = DchConfig::default();
+        config.api.model = "wedged".to_string();
+        assert!(
+            config.save_to_dir(dir.path()).is_err(),
+            "a rename onto a directory fails"
+        );
+        let strays: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("the dir reads")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "tmp"))
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            strays.is_empty(),
+            "the failed save strands no staging file: {strays:?}"
+        );
     }
 
     #[test]

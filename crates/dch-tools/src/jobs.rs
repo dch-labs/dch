@@ -856,12 +856,12 @@ mod tests {
         // assertion has landed: a spawn delayed past a fixed `sleep`
         // window would let the first poll race into Completed and fail
         // a correct status machine. The job waits for the file; the
-        // test creates it only once Running is asserted.
+        // test creates it only once Running is asserted. The check is
+        // spelled relative to the job's own working directory so a
+        // tempdir path carrying spaces cannot split the word the shell
+        // tests.
         let gate = tmp.path().join("gate");
-        let command = format!(
-            "while [ ! -e {} ]; do sleep 0.05; done && echo settled",
-            gate.display()
-        );
+        let command = "while [ ! -e ./gate ]; do sleep 0.05; done && echo settled".to_string();
         let spawned = BashTool
             .call(json!({ "command": command, "background": true }), &ctx)
             .await
