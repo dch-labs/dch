@@ -116,9 +116,34 @@ impl ReadWindows {
 /// `skip_linter` flag. Downstream callers (the runner) invoke this once
 /// for the engine registry and again for the dispatch pipeline's core,
 /// so the two positions agree by construction. The read family serves
-/// its file views under the passed [`ReadWindows`] ceilings.
+/// its file views under the passed [`ReadWindows`] ceilings. The
+/// interaction-only `AskUserQuestion` registers here; a composition
+/// with no one to ask (a headless run) builds from
+/// [`non_interactive_registry`] instead.
 #[must_use]
 pub fn builtin_registry(session: &FileSession, windows: ReadWindows) -> ToolRegistry {
+    compose_registry(session, windows, true)
+}
+
+/// Build the builtin registry without the interaction-only tools.
+///
+/// The non-interactive composition: `AskUserQuestion` is absent —
+/// there is no user to ask, so the model is never offered a call that
+/// could only fail — while every other builtin registers exactly as
+/// [`builtin_registry`] registers it. The engine's advertised tools
+/// and the dispatch core built from this registry agree by
+/// construction, the same way the full composition's do.
+#[must_use]
+pub fn non_interactive_registry(session: &FileSession, windows: ReadWindows) -> ToolRegistry {
+    compose_registry(session, windows, false)
+}
+
+/// The shared construction both registry compositions route through.
+///
+/// `ask` gates the one interaction-only registration; everything else
+/// is identical between the compositions, so the omission is provably
+/// the only difference.
+fn compose_registry(session: &FileSession, windows: ReadWindows, ask: bool) -> ToolRegistry {
     let lint: Arc<dyn ContentValidator> = Arc::new(LintGate);
     let registry = ToolRegistry::new();
     let reader = windows.session_reader(session);
@@ -136,7 +161,9 @@ pub fn builtin_registry(session: &FileSession, windows: ReadWindows) -> ToolRegi
     registry.register(TreeInput::default());
     registry.register(TodoTool);
     registry.register(WebFetchTool);
-    registry.register(AskTool);
+    if ask {
+        registry.register(AskTool);
+    }
     registry.register(LspTool);
     registry.register(SubmitTool);
     registry
@@ -178,5 +205,34 @@ mod tests {
             "registries must agree in order"
         );
         assert!(!first_schemas.is_empty(), "registry must not be empty");
+    }
+
+    #[test]
+    fn non_interactive_registry_omits_only_the_ask_tool() {
+        // The headless composition: every builtin still registers, the
+        // one interaction-only tool does not — and the omission is the
+        // only difference between the two compositions.
+        let session = FileSession::new(std::path::PathBuf::from("."));
+        let full: Vec<String> = builtin_registry(&session, ReadWindows::default())
+            .all_tools()
+            .into_iter()
+            .map(|tool| tool.name().to_string())
+            .collect();
+        let bare: Vec<String> = non_interactive_registry(&session, ReadWindows::default())
+            .all_tools()
+            .into_iter()
+            .map(|tool| tool.name().to_string())
+            .collect();
+        assert!(
+            full.iter().any(|name| name == "AskUserQuestion"),
+            "the full composition offers the ask tool"
+        );
+        assert!(
+            !bare.contains(&"AskUserQuestion".to_string()),
+            "the non-interactive composition omits it"
+        );
+        let mut expected = full;
+        expected.retain(|name| name != "AskUserQuestion");
+        assert_eq!(bare, expected, "nothing else is omitted");
     }
 }

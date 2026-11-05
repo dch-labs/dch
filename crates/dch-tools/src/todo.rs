@@ -288,6 +288,55 @@ fn preprocess_todo_input(input: &mut Value) {
     }
 }
 
+/// The most characters a submitted subject, description, or active form
+/// may carry.
+///
+/// The plan's surfaces are windows — the pinned section shows a few
+/// rows, the summary line one — and a single unbounded item can push
+/// everything else off the screen. One hundred sixty characters is a
+/// full sentence with room to spare, and a submission past it is
+/// rejected rather than cut: a silently truncated task is a wording
+/// the model never chose, while a refusal with the limit named makes
+/// the next call carry wording that actually fits.
+const ENTRY_TEXT_LIMIT: usize = 160;
+
+/// Reject any subject, description, or active form past the entry-text
+/// limit.
+///
+/// The refusal names the entry, the field, and both lengths, so the
+/// model can rewrite the item short in one round trip — the same
+/// repair pattern the parse hints use. Every prose field a call can
+/// file on a new entry is bounded; status spellings are enum-bounded,
+/// and ids are deliberately left unbounded — the store's ids are the
+/// model's own, and trimming one would orphan the references that
+/// name it.
+///
+/// # Errors
+///
+/// Returns [`ToolError::InvalidInput`] naming the first over-long
+/// field and how far past it stands.
+fn reject_overlong_entry_text(todos: &[TodoEntryInput]) -> Result<(), ToolError> {
+    for entry in todos {
+        for (field, text) in [
+            ("subject", entry.subject.as_deref().unwrap_or("")),
+            ("description", entry.description.as_str()),
+            ("active_form", entry.active_form.as_deref().unwrap_or("")),
+        ] {
+            let length = text.chars().count();
+            if length > ENTRY_TEXT_LIMIT {
+                return Err(ToolError::InvalidInput(format!(
+                    "Todo '{}' has a {field} of {length} characters; the limit is \
+                     {ENTRY_TEXT_LIMIT}. Shorten the wording — a plan item is a \
+                     sentence, not a paragraph; the detail belongs in the work, \
+                     not in the list.",
+                    entry.id
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The repair hint matching a parse failure.
 ///
 /// Selects on the parse error's wording so the model can repair its call
@@ -759,7 +808,9 @@ impl TodoTool {
     /// Returns [`ToolError::Execution`] when no runner context is installed,
     /// and [`ToolError::InvalidInput`] when the input cannot be parsed, an
     /// id is duplicated within the submission, a new entry carries neither
-    /// a subject nor a description, or a `blocked_by` reference names an
+    /// a subject nor a description, a prose field (subject, description,
+    /// or active form) exceeds the 160-character entry-text limit, or a
+    /// `blocked_by` reference names an
     /// absent id. Status requests are never rejected — the store is
     /// normalize-and-merge: once those checks pass, each carried entry is
     /// adjusted to the rung law and merged into the standing list, every
@@ -820,6 +871,7 @@ impl TodoTool {
         }
 
         reject_duplicate_ids(&parsed.todos)?;
+        reject_overlong_entry_text(&parsed.todos)?;
         let (standing_ids, standing_by_id) = {
             let store = todos
                 .lock()
@@ -922,14 +974,14 @@ impl Tool for TodoTool {
                             "type": "object",
                             "properties": {
                                 "id": { "type": "string", "description": "Stable identifier for the todo; entries keep their ids across calls and runs" },
-                                "subject": { "type": "string", "description": "Short subject/title (imperative form). A new entry needs a subject or a description; an entry already on the plan keeps its own whenever this is omitted" },
-                                "description": { "type": "string", "description": "Detailed description" },
+                                "subject": { "type": "string", "description": "Short subject/title (imperative form), at most 160 characters — longer text is rejected. A new entry needs a subject or a description; an entry already on the plan keeps its own whenever this is omitted" },
+                                "description": { "type": "string", "description": "Detailed description, at most 160 characters — longer text is rejected" },
                                 "status": {
                                     "type": "string",
                                     "enum": ["pending", "in_progress", "completed"],
                                     "description": "Lifecycle status (pending → in_progress → completed; reopen via in_progress). Mark in_progress the moment work begins and completed the moment it lands. A completed request for a pending entry lands in_progress (one rung per call); adjustments are named in the rendered result. Omitted, the entry keeps the status it stands on — a patch that only rewords never moves the rung.",
                                 },
-                                "active_form": { "type": "string", "description": "Present continuous form for display (e.g., \"Running tests\")" },
+                                "active_form": { "type": "string", "description": "Present continuous form for display (e.g., \"Running tests\"), at most 160 characters — longer text is rejected" },
                                 "blocked_by": { "type": "array", "items": { "type": "string" }, "description": "Tasks that must complete before this one (IDs)" },
                                 "blocks": { "type": "array", "items": { "type": "string" }, "description": "Tasks that wait for this one (IDs)" }
                             },
@@ -1123,6 +1175,91 @@ mod tests {
         let tool = TodoTool;
         assert!(!Tool::is_read_only(&tool));
         assert!(!Tool::is_concurrency_safe(&tool));
+    }
+
+    #[test]
+    fn a_long_subject_is_rejected_and_nothing_is_stored() {
+        let (_context, todos) = todo_context();
+        let long: String = "x".repeat(200);
+        let input = serde_json::json!({
+            "todos": [ { "id": "1", "subject": long, "status": "pending" } ]
+        });
+        let refused = TodoTool::todo_write_inner(input, Some(Arc::clone(&todos)))
+            .expect_err("an over-long subject is refused, not cut");
+        let text = refused.to_string();
+        assert!(
+            text.contains("160") && text.contains("subject of 200"),
+            "the refusal names the field, its length, and the limit: {text}"
+        );
+        assert!(
+            text.contains("Shorten"),
+            "the refusal tells the model what to do next: {text}"
+        );
+        assert!(
+            todos.lock().expect("todos lock not poisoned").is_empty(),
+            "a refused submission stores nothing — the model rewrites, nothing is cut"
+        );
+    }
+
+    #[test]
+    fn a_long_active_form_is_rejected_and_nothing_is_stored() {
+        // The third prose field on a new entry: the limit's rationale is
+        // the display windows every entry text can reach, and the active
+        // form is entry text — a stored-but-never-rendered field today,
+        // bounded now so the day a surface renders it does not reopen
+        // the hole the subject limit closed.
+        let (_context, todos) = todo_context();
+        let long: String = "x".repeat(200);
+        let input = serde_json::json!({
+            "todos": [ { "id": "1", "subject": "Ship it", "active_form": long, "status": "pending" } ]
+        });
+        let refused = TodoTool::todo_write_inner(input, Some(Arc::clone(&todos)))
+            .expect_err("an over-long active form is refused, not stored");
+        let text = refused.to_string();
+        assert!(
+            text.contains("160") && text.contains("active_form of 200"),
+            "the refusal names the field, its length, and the limit: {text}"
+        );
+        assert!(
+            todos.lock().expect("todos lock not poisoned").is_empty(),
+            "a refused submission stores nothing"
+        );
+    }
+
+    #[test]
+    fn a_long_description_is_rejected_and_nothing_is_stored() {
+        // The second prose field: a description alone can found a new
+        // entry, so its length is bounded the same way a subject's is —
+        // and a refusal stores nothing; the model rewrites.
+        let (_context, todos) = todo_context();
+        let long: String = "x".repeat(200);
+        let input = serde_json::json!({
+            "todos": [ { "id": "1", "description": long, "status": "pending" } ]
+        });
+        let refused = TodoTool::todo_write_inner(input, Some(Arc::clone(&todos)))
+            .expect_err("an over-long description is refused, not cut");
+        let text = refused.to_string();
+        assert!(
+            text.contains("160") && text.contains("description of 200"),
+            "the refusal names the field, its length, and the limit: {text}"
+        );
+        assert!(
+            todos.lock().expect("todos lock not poisoned").is_empty(),
+            "a refused submission stores nothing"
+        );
+    }
+
+    #[test]
+    fn the_schema_tells_the_model_the_entry_limit() {
+        let schema = TodoTool.schema();
+        let item = &schema.input_schema["properties"]["todos"]["items"]["properties"];
+        for field in ["subject", "description", "active_form"] {
+            let text = item[field]["description"].as_str().unwrap_or_default();
+            assert!(
+                text.contains("160"),
+                "the {field} schema names the limit, got {text:?}"
+            );
+        }
     }
 
     #[test]

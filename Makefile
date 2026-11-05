@@ -96,10 +96,10 @@ install: strip
 	@chmod +x $(HOME)/.local/bin/$(BINARY)
 	@echo "✅ Installed to $(HOME)/.local/bin/$(BINARY)"
 
-## check-zig: Verify the zig compiler is available
+## check-zig: Verify a zig compiler is reachable (bare zig, or the pip ziglang cargo-zigbuild falls back to)
 check-zig:
-	@if ! $(ZIG) version >/dev/null 2>&1; then \
-		echo "❌ zig not found ($(ZIG))"; \
+	@if ! $(ZIG) version >/dev/null 2>&1 && ! python3 -m ziglang version >/dev/null 2>&1; then \
+		echo "❌ zig not found ($(ZIG) or python3 -m ziglang — pip install ziglang)"; \
 		exit 1; \
 	fi
 

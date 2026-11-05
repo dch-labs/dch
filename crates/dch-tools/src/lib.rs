@@ -59,6 +59,7 @@ pub use question::QuestionRequest;
 pub use question::QuestionResponse;
 pub use registry::ReadWindows;
 pub use registry::builtin_registry;
+pub use registry::non_interactive_registry;
 pub use submit::SubmitTool;
 pub use todo::TodoEntry;
 pub use todo::TodoStatus;

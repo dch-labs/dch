@@ -524,6 +524,22 @@ pub struct TuiObserverState {
     /// half.
     pub agent_running: Arc<std::sync::atomic::AtomicBool>,
 
+    /// The live runner's cancel signal, swapped at every rebuild.
+    ///
+    /// A runner rebuild — `/model`, `/resume`, a cross-provider
+    /// switch — creates a new cancel signal; the display's Esc,Esc
+    /// and the signal bridge both must reach the CURRENT one. The
+    /// driver stores it here at startup and after every rebuild, and
+    /// the display reads it live rather than holding a stale closure.
+    pub cancel_signal: Arc<std::sync::Mutex<Arc<loopctl::cancel::CancelSignal>>>,
+
+    /// The live runner's steering slot, swapped at every rebuild.
+    ///
+    /// The same lifetime as the cancel signal: the Ctrl+S steer must
+    /// reach the CURRENT runner's slot, not the one the session
+    /// started with. The driver stores it beside the cancel signal.
+    pub steering: Arc<std::sync::Mutex<Option<Arc<dyn crate::guidance::Guidance>>>>,
+
     /// When the run in flight started, in Unix-epoch milliseconds.
     ///
     /// Written beside [`agent_running`](Self::agent_running) by the
@@ -803,6 +819,24 @@ pub enum HealthNotice {
 }
 
 impl TuiObserverState {
+    /// Swap the live runner's handles after a rebuild.
+    ///
+    /// The driver calls this at startup and after every runner
+    /// rebuild (`/model`, `/resume`, a cross-provider switch): the
+    /// display's Esc,Esc cancel and Ctrl+S steer read these live, so
+    /// they always reach the current runner, never a stale one.
+    pub fn adopt_runner_handles(
+        &self,
+        cancel: Arc<loopctl::cancel::CancelSignal>,
+        steering: Option<Arc<dyn crate::guidance::Guidance>>,
+    ) {
+        *self
+            .cancel_signal
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = cancel;
+        *self.steering.lock().unwrap_or_else(PoisonError::into_inner) = steering;
+    }
+
     /// Mark a run as started, stamping when.
     ///
     /// The display's live elapsed line reads the stamp; call this at
@@ -903,6 +937,10 @@ impl TuiObserverState {
             machine_history: Arc::new(Mutex::new(None)),
             active_tools: Arc::new(Mutex::new(Vec::new())),
             agent_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cancel_signal: Arc::new(std::sync::Mutex::new(Arc::new(
+                loopctl::cancel::CancelSignal::default(),
+            ))),
+            steering: Arc::new(std::sync::Mutex::new(None)),
             run_started_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             correction_cancel: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
             live_claim: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),

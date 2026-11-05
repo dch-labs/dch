@@ -32,7 +32,7 @@ use ratatui::backend::TestBackend;
 use ratatui::style::Color;
 
 /// The glyph marking the section's rows.
-const HOURGLASS: &str = "\u{231b}";
+const HOURGLASS: &str = "\u{29d6}";
 
 fn config() -> DchConfig {
     let mut config = DchConfig::default();
@@ -103,7 +103,7 @@ fn claim(kept: &dch_tui::TuiObserverState, id: u64) -> Option<String> {
 fn run_id(submission: dch_tui::Submission) -> u64 {
     match submission {
         dch_tui::Submission::Run { id } => id,
-        other @ dch_tui::Submission::Correct { .. } => {
+        other @ (dch_tui::Submission::Correct { .. } | dch_tui::Submission::Command { .. }) => {
             panic!("a plain submit hands over a run, got {other:?}")
         }
     }
@@ -427,7 +427,7 @@ fn the_title_rides_as_a_badge_of_the_theme_s_own_colors() {
     let marker_column = painted
         .iter()
         .flat_map(|row| row.iter().enumerate())
-        .find(|(_, (symbol, _, _))| symbol == "\u{231b}")
+        .find(|(_, (symbol, _, _))| symbol == "\u{29d6}")
         .map(|(x, _)| x)
         .expect("the waiting prompt carries the hourglass marker");
     assert_eq!(
@@ -464,7 +464,7 @@ fn the_keys_light_the_marker_and_leave_the_badge_s_accent_steady() {
     let marker = painted
         .iter()
         .flatten()
-        .find(|(symbol, _, _)| symbol == "\u{231b}")
+        .find(|(symbol, _, _)| symbol == "\u{29d6}")
         .expect("the waiting prompt carries the hourglass marker");
     assert_eq!(
         marker.1, app.theme.ui.primary,
@@ -1954,7 +1954,7 @@ fn the_leave_chord_hands_the_keys_back_as_esc_does() {
         painted
             .iter()
             .flatten()
-            .find(|(symbol, _, _)| symbol == "\u{231b}")
+            .find(|(symbol, _, _)| symbol == "\u{29d6}")
             .map(|(_, fg, _)| *fg)
             .expect("the waiting prompt carries the hourglass marker")
     };

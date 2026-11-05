@@ -11,6 +11,7 @@ use crossterm::cursor::SetCursorStyle;
 use std::io::Write as _;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicPtr;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
@@ -37,6 +38,83 @@ use ratatui::style::Color;
 /// changed.
 static ORIGINAL_BACKGROUND: OnceLock<(u8, u8, u8)> = OnceLock::new();
 
+/// What the session has learned about whether this terminal takes an
+/// OSC 11 background override.
+///
+/// `NotAsked` until a query actually runs: the startup query is
+/// skipped whenever input is already waiting (typed-ahead keys are the
+/// user's, not ours to eat), so a fast typist can launch a session the
+/// query never fired in. The mid-session ask upgrades the record the
+/// first time a theme switch needs it — with the event reader
+/// quiesced, so the terminal's reply cannot be stolen — and
+/// [`BackgroundSupport::Answered`] is what
+/// [`finish_theme_burst`]'s canvas write lands against ever after. A
+/// terminal that was asked and stayed
+/// silent is [`BackgroundSupport::Refused`], and a refused terminal is
+/// never asked again: the deferred palette is the honest answer for
+/// the session's whole life, exactly as it was at startup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackgroundSupport {
+    /// No query has completed against this terminal yet.
+    ///
+    /// The session's opening state — the one an ask may upgrade from,
+    /// unlike the settled verdicts below.
+    NotAsked,
+
+    /// The terminal answered, so the override is proven to land.
+    ///
+    /// The palette's canvas color is written on theme changes from
+    /// here on, and no further proof is ever spent.
+    Answered,
+
+    /// The terminal was asked and stayed silent; it will not be asked
+    /// again this session.
+    ///
+    /// The deferred palette is the honest answer from now on — the
+    /// terminal keeps whatever canvas it came with.
+    Refused,
+}
+
+/// The session's [`BackgroundSupport`] verdict — like
+/// [`ORIGINAL_BACKGROUND`] in spirit, but upgradable from `NotAsked`,
+/// because the answer can arrive after startup.
+static BACKGROUND_SUPPORT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// The session's current verdict on the terminal's OSC 11 support.
+///
+/// The display reads this to decide whether a theme change may write
+/// the terminal's canvas or must defer to it; the atomic below is the
+/// storage, upgraded once per session at most.
+#[must_use]
+pub fn background_support() -> BackgroundSupport {
+    match BACKGROUND_SUPPORT.load(std::sync::atomic::Ordering::SeqCst) {
+        1 => BackgroundSupport::Answered,
+        2 => BackgroundSupport::Refused,
+        _ => BackgroundSupport::NotAsked,
+    }
+}
+
+/// Whether a live switch should ask the terminal now: only a session
+/// that never got an answer — skipped at startup, never queried since
+/// — asks. A proven terminal writes; a refused one is never asked
+/// again.
+pub(crate) fn next_ask_warranted(support: BackgroundSupport) -> bool {
+    support == BackgroundSupport::NotAsked
+}
+
+/// Record what a query taught, never downgrading an answer once it
+/// lands.
+fn record_support(support: BackgroundSupport) {
+    let code = match support {
+        BackgroundSupport::NotAsked => 0,
+        BackgroundSupport::Answered => 1,
+        BackgroundSupport::Refused => 2,
+    };
+    if BACKGROUND_SUPPORT.load(std::sync::atomic::Ordering::SeqCst) != 1 {
+        BACKGROUND_SUPPORT.store(code, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// The terminal's line discipline as this process found it, captured
 /// before raw mode was first enabled.
 ///
@@ -50,11 +128,18 @@ static ORIGINAL_BACKGROUND: OnceLock<(u8, u8, u8)> = OnceLock::new();
 static ORIGINAL_TERMIOS: OnceLock<libc::termios> = OnceLock::new();
 
 /// The exact bytes the fatal-signal handler writes to restore the
-/// terminal, built once at arm time from the state the session had
-/// then: the original background when one was captured, the mode
+/// terminal: the original background when one was captured, the mode
 /// teardown, and the alternate screen exit.
+///
+/// Published through a raw pointer rather than a [`OnceLock`] so a
+/// background captured *after* arming can refresh it: the arm call
+/// publishes the first copy, and every later capture republishes with
+/// the original it learned. A handler mid-write of a superseded copy
+/// keeps reading it — the displaced allocation is never freed — so the
+/// publication stays a pointer swap an async-signal-safe load can
+/// observe, and the process leaks at most a few small buffers.
 #[cfg(unix)]
-static SIGNAL_RESTORE_BYTES: OnceLock<Vec<u8>> = OnceLock::new();
+static SIGNAL_RESTORE_BYTES: AtomicPtr<Box<[u8]>> = AtomicPtr::new(std::ptr::null_mut());
 
 /// The SIGINT handler action this process replaced when it armed the
 /// fatal-signal restore, as a raw `sa_sigaction` value; a sentinel
@@ -177,27 +262,193 @@ pub fn init_terminal(mouse_capture: bool) -> io::Result<Terminal<CrosstermBacken
 /// "defer to the terminal" — the palette's terminal-background
 /// colors were chosen against the theme's canvas, which this
 /// terminal is not showing.
+#[must_use]
 pub fn sync_default_background(background: Color) -> bool {
+    query_and_install(background).installed
+}
+
+/// Ask the terminal for its default background and install the new
+/// override when it answers — the mid-session half of the exchange.
+///
+/// # The caller owns stdin
+///
+/// This function reads the terminal's reply from stdin, so it may run
+/// only while the event reader thread is quiesced — the handshake in
+/// [`crate::events::InputQuiesce`] is the intended caller-side gate.
+/// Polled otherwise, the reply's bytes race the reader: they surface
+/// in the composer as key events, and the query's timeout reads as a
+/// refusal that was really a lost race.
+///
+/// Records what the answer taught: an answered terminal is
+/// [`BackgroundSupport::Answered`] from here on (and
+/// [`finish_theme_burst`]'s canvas write serves later switches
+/// without asking),
+/// a silent one is [`BackgroundSupport::Refused`] and is never asked
+/// again this session. A keystroke whose first byte is not an ESC
+/// lead teaches nothing — the record stays
+/// [`BackgroundSupport::NotAsked`], so a later switch may ask again —
+/// and the byte comes back in the outcome for the caller to return
+/// to the composer. An ESC-leading keystroke is the accepted loss
+/// instead: the reply parser consumes it, the session settles
+/// [`BackgroundSupport::Refused`], and no byte comes back — the same
+/// one-shot cost the startup window documents.
+pub(crate) fn ask_default_background(background: Color) -> QueryOutcome {
+    query_and_install(background)
+}
+
+/// What the query-and-override exchange left behind.
+///
+/// The two halves a caller acts on: whether the override landed, and
+/// the keystroke the query consumed instead of a reply — a byte that
+/// was on its way to the composer and must be handed back rather than
+/// dropped.
+#[derive(Default)]
+pub(crate) struct QueryOutcome {
+    /// Whether the terminal answered and the override was written.
+    ///
+    /// False on silence, a stolen keystroke, or a paintless palette —
+    /// in every case the caller keeps the deferred palette.
+    pub(crate) installed: bool,
+
+    /// The one byte a non-reply keystroke lost to the query reader.
+    ///
+    /// `None` on every other path: an answered, silent, or never-run
+    /// exchange touches nothing the composer was owed.
+    pub(crate) stolen: Option<u8>,
+}
+
+/// The query-and-override exchange shared by the startup and
+/// mid-session halves. The caller owns stdin; the halves differ only
+/// in who guarantees that.
+fn query_and_install(background: Color) -> QueryOutcome {
     let Color::Rgb(red, green, blue) = background else {
-        return false;
+        return QueryOutcome::default();
     };
     #[cfg(unix)]
-    if let Some(original) = query_default_background() {
-        let _stored = ORIGINAL_BACKGROUND.set(original);
-        let mut stdout = io::stdout();
-        drop(write!(
-            stdout,
-            "{}",
-            background_sequence((red, green, blue))
-        ));
-        drop(stdout.flush());
-        return true;
-    }
+    let outcome = query_unix(red, green, blue);
     #[cfg(not(unix))]
-    {
+    let outcome = {
         let _ = (red, green, blue);
+        QueryOutcome::default()
+    };
+    outcome
+}
+
+/// The unix half of the exchange: query, record the verdict, install.
+///
+/// Split from [`query_and_install`] so the platform halves each read
+/// as one straight line — the caller owns stdin either way, and only
+/// the byte-level exchange differs.
+#[cfg(unix)]
+fn query_unix(red: u8, green: u8, blue: u8) -> QueryOutcome {
+    let outcome = query_default_background();
+    record_support(reply_verdict(&outcome));
+    match outcome {
+        QueryReply::Answered(original) => {
+            let _stored = ORIGINAL_BACKGROUND.set(original);
+            refresh_signal_restore_bytes(original);
+            let mut stdout = io::stdout();
+            drop(write!(
+                stdout,
+                "{}",
+                background_sequence((red, green, blue))
+            ));
+            drop(stdout.flush());
+            QueryOutcome {
+                installed: true,
+                stolen: None,
+            }
+        }
+        other => QueryOutcome {
+            installed: false,
+            stolen: match other {
+                QueryReply::Stolen(byte) => Some(byte),
+                _ => None,
+            },
+        },
     }
-    false
+}
+
+/// What a query's reply teaches the support record.
+///
+/// The stolen byte is the one that must not teach: a keystroke that
+/// reached the reader first is not the terminal refusing anything, so
+/// the record stays not-asked and a later switch earns its own
+/// answer.
+fn reply_verdict(reply: &QueryReply) -> BackgroundSupport {
+    match reply {
+        QueryReply::Answered(_) => BackgroundSupport::Answered,
+        QueryReply::Refused => BackgroundSupport::Refused,
+        QueryReply::NotAsked | QueryReply::Stolen(_) => BackgroundSupport::NotAsked,
+    }
+}
+
+/// What a live background change writes at this session's state —
+/// the decision separated from the write so it pins without touching
+/// stdout.
+///
+/// [`sync_default_background`] is the startup half and may query the
+/// terminal, because nothing else reads it yet. A live theme switch
+/// cannot query offhand: the event reader thread is parked on the same
+/// stdin, and a query would race it two ways at once — the reply's
+/// escape bytes reaching the composer as key events, or the query's
+/// timeout reading as "the terminal did not answer" and deferring a
+/// palette over a background the override never reached. So the live
+/// half only writes — asking mid-session is
+/// [`ask_default_background`]'s job, under a quiesced reader — and the
+/// write goes one of two ways: an `Rgb` canvas carries the palette's
+/// own color, while a `Color::Reset` canvas (the transparent theme,
+/// whose whole vocabulary is the terminal's own) hands the terminal
+/// its *original* background back — a session that installed an
+/// override and then went paintless must not keep painting the
+/// previous theme's canvas under a palette that never paints one.
+/// Without a captured original, neither direction has anything
+/// honest to write.
+enum LiveOverridePlan {
+    /// Write the palette's own canvas color.
+    ///
+    /// The proof and the color both stand: an `Rgb` background the
+    /// answered terminal takes as its default.
+    Write,
+
+    /// Put the terminal's original background back.
+    ///
+    /// A `Reset` canvas under a proven terminal — the paintless
+    /// palettes, whose whole contract is deferring to the terminal.
+    RestoreOriginal,
+
+    /// Nothing to write: no proof the terminal takes the override.
+    ///
+    /// Writing without proof would strand the previous theme's canvas
+    /// under a palette that never painted one, so the honest plan is
+    /// no plan at all.
+    Decline,
+}
+
+fn live_override_plan(original_captured: bool, background: Color) -> LiveOverridePlan {
+    match (original_captured, background) {
+        (true, Color::Rgb(..)) => LiveOverridePlan::Write,
+        (true, Color::Reset) => LiveOverridePlan::RestoreOriginal,
+        _ => LiveOverridePlan::Decline,
+    }
+}
+
+/// Whether the write-only override would land for `background` as things
+/// stand — the pure half of the theme burst's canvas write
+/// ([`finish_theme_burst`]).
+///
+/// The same conditions the write consults — a captured original
+/// background to lean on, and a palette whose canvas is an RGB color or
+/// the terminal's own `Reset` — answered without writing a byte, so a
+/// caller can decide to defer the write into a later flush (beside the
+/// re-styled cells it belongs with) without paying the write twice or
+/// guessing at the gate.
+pub(crate) fn write_only_warranted(background: Color) -> bool {
+    ORIGINAL_BACKGROUND.get().is_some()
+        && matches!(
+            live_override_plan(true, background),
+            LiveOverridePlan::Write | LiveOverridePlan::RestoreOriginal
+        )
 }
 
 /// The OSC 11 sequence that points the terminal's default background
@@ -213,21 +464,183 @@ fn background_sequence((red, green, blue): (u8, u8, u8)) -> String {
     format!("\x1b]11;rgb:{red:02x}/{green:02x}/{blue:02x}\x1b\\")
 }
 
+/// The OSC 12 sequence that tints the terminal's text cursor.
+///
+/// The hardware cursor's one consumer is the question sheet's inline
+/// caret — the composer's caret is the app's own painted cell and
+/// never reads the tint, so the sheet's caret is what this styles.
+/// The palette carries it the same way it carries the background:
+/// tinted to the theme's accent, with the same two hex digits per
+/// channel and the same wire shape.
+fn cursor_sequence((red, green, blue): (u8, u8, u8)) -> String {
+    format!("\x1b]12;rgb:{red:02x}/{green:02x}/{blue:02x}\x1b\\")
+}
+
+/// The OSC 112 sequence that gives the terminal its own cursor color
+/// back — the reset where [`cursor_sequence`] is the set.
+///
+/// The restore needs no captured original and runs no query: 112
+/// resets the cursor color to the terminal's configured default,
+/// which on a session that never tinted is the color it already had.
+fn cursor_reset_sequence() -> &'static str {
+    "\x1b]112\x1b\\"
+}
+
+/// Tint the terminal cursor to a palette's accent color.
+///
+/// One-way like the background override's live half and riding the
+/// same proof: only a session whose terminal answered the background
+/// query sends it, because a terminal that stayed silent about OSC 11
+/// has said nothing that recommends OSC 12 either. Best effort by
+/// design — the tint is cosmetic, so a failed write is accepted in
+/// silence — and a non-`Rgb` accent (the paintless vocabulary's
+/// `Reset`) is a no-op: the cursor keeps the terminal's own color.
+pub fn set_cursor_color(color: Color) {
+    let Color::Rgb(red, green, blue) = color else {
+        return;
+    };
+    if ORIGINAL_BACKGROUND.get().is_none() {
+        return;
+    }
+    let mut stdout = io::stdout();
+    drop(write!(stdout, "{}", cursor_sequence((red, green, blue))));
+    drop(stdout.flush());
+}
+
+/// The mode-2026 window opener: CSI ? 2026 h.
+///
+/// A constant beside its writer so the burst's framing is one spelled
+/// contract, pinned by shape in the tests below.
+const SYNCHRONIZED_OUTPUT_BEGIN: &str = "\x1b[?2026h";
+
+/// The mode-2026 window closer: CSI ? 2026 l.
+///
+/// See [`SYNCHRONIZED_OUTPUT_BEGIN`]; the pair brackets a burst.
+const SYNCHRONIZED_OUTPUT_END: &str = "\x1b[?2026l";
+
+/// Open a synchronized-update window (DEC private mode 2026).
+///
+/// A terminal that implements the mode buffers everything it receives
+/// between this marker and the burst's closing write, and repaints
+/// once when the window closes — the standard way to land a burst (a
+/// theme's re-styled cells beside its canvas write) as one visible
+/// step even when the cell diff is large. A terminal without the mode
+/// ignores the marker and renders as it always did, so the window
+/// costs nothing.
+pub fn begin_synchronized_output() {
+    let mut stdout = io::stdout();
+    drop(write!(stdout, "{SYNCHRONIZED_OUTPUT_BEGIN}"));
+    drop(stdout.flush());
+}
+
+/// The theme burst's closing bytes: the canvas write, the cursor
+/// write, and the synchronized-update window close, one buffer.
+///
+/// Pure over the captured original so the byte shape pins without a
+/// terminal: a captured terminal taking an RGB palette writes its
+/// canvas and the accent cursor tint; a paintless (`Reset`) palette
+/// restores the terminal's own canvas and resets its cursor; an
+/// uncaptured terminal writes neither — the window close is the only
+/// byte every shape shares, so the markers always pair.
+pub(crate) fn theme_burst_bytes(
+    original: Option<(u8, u8, u8)>,
+    background: Color,
+    primary: Color,
+) -> String {
+    let channels = match (original, live_override_plan(original.is_some(), background)) {
+        (_, LiveOverridePlan::Write) => match background {
+            Color::Rgb(red, green, blue) => Some((red, green, blue)),
+            _ => None,
+        },
+        (Some(original), LiveOverridePlan::RestoreOriginal) => Some(original),
+        _ => None,
+    };
+    let mut burst = String::new();
+    if let Some((red, green, blue)) = channels {
+        burst.push_str(&background_sequence((red, green, blue)));
+        if background == Color::Reset {
+            burst.push_str(cursor_reset_sequence());
+        } else if let Color::Rgb(red, green, blue) = primary {
+            burst.push_str(&cursor_sequence((red, green, blue)));
+        }
+    }
+    burst.push_str(SYNCHRONIZED_OUTPUT_END);
+    burst
+}
+
+/// Close a theme burst: both OSC writes and the synchronized-update
+/// window close, in one write.
+///
+/// The burst's head ([`begin_synchronized_output`]) opens the window
+/// before the cell diff; this closes it after, so the canvas and
+/// cursor land as the burst's final beat beside the diff's last cells.
+/// On a terminal without the mode — whose paints follow its reads —
+/// the coalesced single write means the flip cannot split across the
+/// stream the way separate writes did, and the cells that painted
+/// earliest in the diff never trail the canvas by a whole region.
+pub fn finish_theme_burst(background: Color, primary: Color) {
+    let closer = theme_burst_bytes(ORIGINAL_BACKGROUND.get().copied(), background, primary);
+    let mut stdout = io::stdout();
+    drop(write!(stdout, "{closer}"));
+    drop(stdout.flush());
+}
+
+/// Give the terminal its own cursor color back.
+///
+/// Unconditional on the exit paths: on a session that never tinted,
+/// the OSC 112 reset returns the cursor to the default it already
+/// had, so no bookkeeping decides whether to send it.
+pub fn reset_cursor_color() {
+    let mut stdout = io::stdout();
+    drop(write!(stdout, "{}", cursor_reset_sequence()));
+    drop(stdout.flush());
+}
+
+/// What asking the terminal for its default background produced.
+///
+/// The ask's own three outcomes — the answer the display's palette
+/// rides on, the silence that settles the session's refusal, and the
+/// exchange that never ran because input was already waiting.
+enum QueryReply {
+    /// The terminal answered with its color.
+    ///
+    /// The RGB triple the theme's canvas defers to and the restore
+    /// remembers.
+    Answered((u8, u8, u8)),
+
+    /// The terminal was asked and stayed silent past the deadline.
+    ///
+    /// Silence settles the session's refusal verdict — no second ask
+    /// spends the user's time again.
+    Refused,
+
+    /// The exchange never ran — input was already waiting, and
+    /// typed-ahead keys are the user's, not ours to eat.
+    NotAsked,
+
+    /// A keystroke, not a reply: the first byte to arrive was not an
+    /// ESC, so no answer was read and the byte rides back to whoever
+    /// holds the user's input.
+    Stolen(u8),
+}
+
 /// Ask the terminal for its default background and read the reply.
 ///
 /// Writes the OSC 11 query and waits for the answer under a short
 /// deadline — a terminal that does not implement the query stays
-/// silent and the caller skips the whole override. Runs before any
-/// event reader owns stdin: the reply is raw input, not a key
-/// event, so it is read directly.
+/// silent and the caller skips the whole override. Runs only where
+/// the caller owns stdin — before any event reader exists, or
+/// mid-session with the reader quiesced — because the reply is raw
+/// input, not a key event, so it is read directly.
 ///
 /// Typed-ahead input shares this window, and is gated rather than
 /// blindly consumed. Input already queued when the query would run
 /// skips the sync outright — those bytes are the user's, and the
 /// margin keeps the terminal's own background. Failing that, an OSC
 /// reply always opens with `ESC`, so a first byte that is not one
-/// stops the query at the cost of that single byte instead of
-/// drinking everything the user typed; and every byte is read
+/// stops the query and carries that single byte back to the caller —
+/// the keystroke is the user's, not the terminal's answer — instead
+/// of drinking everything the user typed; and every byte is read
 /// alone, so a keystroke arriving behind a completed reply stays
 /// unconsumed for the event reader.
 ///
@@ -241,10 +654,10 @@ fn background_sequence((red, green, blue): (u8, u8, u8)) -> String {
 /// outran the first deadline; one that outruns both leaves only
 /// bytes that had not yet arrived, and an ESC-leading keystroke (an
 /// arrow key, Esc itself) arriving in the window is consumed with
-/// the failed reply attempt — a one-shot startup window, bounded
-/// well under half a second, that is accepted rather than bridged.
+/// the failed reply attempt — a one-shot window, bounded well under
+/// half a second, that is accepted rather than bridged.
 #[cfg(unix)]
-fn query_default_background() -> Option<(u8, u8, u8)> {
+fn query_default_background() -> QueryReply {
     use std::time::Duration;
     use std::time::Instant;
 
@@ -252,29 +665,44 @@ fn query_default_background() -> Option<(u8, u8, u8)> {
     const REPLY_FINISH_DEADLINE: Duration = Duration::from_millis(200);
 
     if stdin_ready(Duration::ZERO) {
-        return None;
+        return QueryReply::NotAsked;
     }
     let mut stdout = io::stdout();
-    write!(stdout, "\x1b]11;?\x1b\\").ok()?;
-    stdout.flush().ok()?;
+    if write!(stdout, "\x1b]11;?\x1b\\").is_err() {
+        // The query itself never left: the exchange did not run.
+        return QueryReply::NotAsked;
+    }
+    if stdout.flush().is_err() {
+        return QueryReply::NotAsked;
+    }
 
     let mut reply = Vec::new();
-    let query_deadline = Instant::now().checked_add(QUERY_DEADLINE)?;
+    let Some(query_deadline) = Instant::now().checked_add(QUERY_DEADLINE) else {
+        return QueryReply::Refused;
+    };
     while reply.is_empty() {
-        let byte = read_reply_byte(query_deadline)?;
+        let Some(byte) = read_reply_byte(query_deadline) else {
+            return QueryReply::Refused;
+        };
         if byte != 0x1b {
-            return None;
+            return QueryReply::Stolen(byte);
         }
         reply.push(byte);
     }
-    let finish_deadline = Instant::now().checked_add(REPLY_FINISH_DEADLINE)?;
+    let Some(finish_deadline) = Instant::now().checked_add(REPLY_FINISH_DEADLINE) else {
+        return QueryReply::Refused;
+    };
     while !reply_terminated(&reply) {
         let Some(byte) = read_reply_byte(finish_deadline) else {
             break;
         };
         reply.push(byte);
     }
-    parse_background_reply(&reply)
+    if let Some(color) = parse_background_reply(&reply) {
+        QueryReply::Answered(color)
+    } else {
+        QueryReply::Refused
+    }
 }
 
 /// Read one byte of a reply, waiting until `deadline`.
@@ -305,11 +733,20 @@ fn read_reply_byte(deadline: std::time::Instant) -> Option<u8> {
 /// over the descriptor, and one buffered read can drain bytes the
 /// query loop's `poll(2)` can then no longer see — the loop would
 /// time out with half a reply stranded in userspace. Reading the
-/// descriptor keeps every byte where the poll can find it.
+/// descriptor keeps every byte where the poll can find it. A signal
+/// landing mid-read sets `EINTR`, which retries rather than returning
+/// a failure the caller would read as the terminal's refusal — a
+/// raced interrupt must not defer the palette for a session whose
+/// terminal would have answered.
 #[cfg(unix)]
 fn read_stdin_raw(buf: &mut [u8]) -> Option<usize> {
-    let read = unsafe { libc::read(0, buf.as_mut_ptr().cast(), buf.len()) };
-    usize::try_from(read).ok()
+    loop {
+        let read = unsafe { libc::read(0, buf.as_mut_ptr().cast(), buf.len()) };
+        if read == -1 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return usize::try_from(read).ok();
+    }
 }
 
 /// Whether stdin has bytes waiting within `wait`.
@@ -319,7 +756,9 @@ fn read_stdin_raw(buf: &mut [u8]) -> Option<usize> {
 /// it to tell "the terminal is still composing its answer" from "the
 /// terminal has nothing to say"; a zero or elapsed deadline polls
 /// once and returns immediately, so the reader never blocks past its
-/// deadline waiting for bytes that are already there.
+/// deadline waiting for bytes that are already there. `EINTR` — a
+/// signal landing inside the wait — retries the poll, never reads as
+/// an expired deadline.
 #[cfg(unix)]
 fn stdin_ready(wait: std::time::Duration) -> bool {
     use std::os::fd::AsRawFd as _;
@@ -330,7 +769,15 @@ fn stdin_ready(wait: std::time::Duration) -> bool {
         revents: 0,
     }];
     let timeout = i32::try_from(wait.as_millis()).unwrap_or(0);
-    unsafe { libc::poll(polls.as_mut_ptr(), 1, timeout) > 0 }
+    loop {
+        let decided = unsafe { libc::poll(polls.as_mut_ptr(), 1, timeout) };
+        if decided == -1
+            && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+        {
+            continue;
+        }
+        return decided > 0;
+    }
 }
 
 /// Whether an OSC reply buffer already carries its terminator.
@@ -462,6 +909,7 @@ fn signal_restore_bytes(original: Option<(u8, u8, u8)>) -> Vec<u8> {
     if let Some(channels) = original {
         bytes.push_str(&background_sequence(channels));
     }
+    bytes.push_str(cursor_reset_sequence());
     pushed(DisableMouseCapture.write_ansi(&mut bytes));
     pushed(DisableBracketedPaste.write_ansi(&mut bytes));
     pushed(DisableFocusChange.write_ansi(&mut bytes));
@@ -474,20 +922,25 @@ fn signal_restore_bytes(original: Option<(u8, u8, u8)>) -> Vec<u8> {
     bytes.into_bytes()
 }
 
-/// Replay the captured restore bytes and the captured line discipline.
+/// Replay the published restore bytes and the captured line discipline.
 ///
 /// The handler-side twin of [`restore_terminal`]'s first and last
 /// steps, built from raw `write` and `tcsetattr` so a signal arriving
 /// on any thread can run it without touching a lock or an allocator.
+/// The bytes are the *latest* publication — a background captured
+/// after arming rides them — read through an acquire load of the
+/// publication pointer, so the handler sees a fully-written allocation
+/// whatever the session did between publishing and the signal.
 ///
 /// # Safety
 ///
-/// Called from a signal handler: the statics it reads must have been
-/// set before the handler was armed, and the caller must tolerate the
-/// call running on any thread while other threads are mid-operation.
+/// Called from a signal handler: the byte string is an immutable
+/// allocation published before this load and never freed, and the
+/// caller must tolerate the call running on any thread while other
+/// threads are mid-operation.
 #[cfg(unix)]
 unsafe fn run_signal_restore() {
-    if let Some(bytes) = SIGNAL_RESTORE_BYTES.get() {
+    if let Some(bytes) = published_restore_bytes() {
         let mut offset = 0usize;
         while offset < bytes.len() {
             let remaining = bytes.len().saturating_sub(offset);
@@ -639,13 +1092,61 @@ unsafe fn install_fatal_handler(signal: libc::c_int, chain: &AtomicUsize) {
     }
 }
 
+/// Publish `bytes` as the ones the fatal handler writes.
+///
+/// The swap is the whole publication: the displaced allocation is
+/// deliberately never freed — a handler may be mid-write of it — so
+/// the handler-side load stays a plain acquire read of a pointer,
+/// async-signal-safe all the way down.
+#[cfg(unix)]
+fn publish_restore_bytes(bytes: Box<[u8]>) {
+    let fresh = Box::into_raw(Box::new(bytes));
+    SIGNAL_RESTORE_BYTES.swap(fresh, Ordering::SeqCst);
+}
+
+/// The published restore bytes, the latest copy.
+///
+/// `None` before the first publication (an unarmed process). The load
+/// pairs with [`publish_restore_bytes`]'s swap, so a non-null answer
+/// names a fully-written allocation.
+#[cfg(unix)]
+fn published_restore_bytes() -> Option<&'static [u8]> {
+    let published = SIGNAL_RESTORE_BYTES.load(Ordering::Acquire);
+    if published.is_null() {
+        return None;
+    }
+    // SAFETY: the pointer came from `Box::into_raw` in
+    // `publish_restore_bytes`, the allocation is never freed, and the
+    // release publication guarantees its contents are visible to this
+    // acquire load.
+    let boxed = unsafe { &*published };
+    Some(&**boxed)
+}
+
+/// Fold a background captured after arming into the published bytes.
+///
+/// The arm-time copy could not know this background — typed-ahead
+/// input skips the startup query, and a later ask's capture is the
+/// first the session learns of it — so the capture republishes the
+/// bytes with the original embedded. Before arming this is a no-op:
+/// the arm build reads whatever has been captured by then.
+#[cfg(unix)]
+fn refresh_signal_restore_bytes(original: (u8, u8, u8)) {
+    if SIGNAL_RESTORE_ARMED.load(Ordering::SeqCst) {
+        publish_restore_bytes(signal_restore_bytes(Some(original)).into_boxed_slice());
+    }
+}
+
 /// Arm the fatal-signal terminal restore for SIGINT and SIGTERM.
 ///
-/// Builds the restore byte string from the state the session has at
+/// Publishes the restore byte string from the state the session has at
 /// arm time — call after [`sync_default_background`] so a captured
 /// original background rides in it — and replaces both signals'
 /// dispositions, keeping the displaced handlers for the live-phase
-/// chain. Idempotent: the first call arms, later calls return.
+/// chain. A background captured *after* arming republishes the bytes
+/// (see `refresh_signal_restore_bytes`), so the handler always
+/// restores the latest original the session learned. Idempotent: the
+/// first call arms, later calls return.
 ///
 /// The handler is deliberately synchronous rather than a tokio
 /// listener: it must still work when the runtime is blocked in a
@@ -656,8 +1157,9 @@ pub fn arm_fatal_signal_restore() {
     if SIGNAL_RESTORE_ARMED.swap(true, Ordering::SeqCst) {
         return;
     }
-    let _stored =
-        SIGNAL_RESTORE_BYTES.set(signal_restore_bytes(ORIGINAL_BACKGROUND.get().copied()));
+    publish_restore_bytes(
+        signal_restore_bytes(ORIGINAL_BACKGROUND.get().copied()).into_boxed_slice(),
+    );
     // SAFETY: the two calls only register this module's handler and
     // record the actions they displaced.
     unsafe {
@@ -749,6 +1251,7 @@ pub fn restore_terminal() -> io::Result<()> {
         drop(write!(stdout, "{}", background_sequence(*original)));
         drop(stdout.flush());
     }
+    reset_cursor_color();
     let modes_result = execute!(
         io::stdout(),
         DisableMouseCapture,
@@ -896,12 +1399,6 @@ impl Drop for TerminalGuard {
 mod tests {
     use super::*;
 
-    /// Serializes tests that touch process-global signal state: the
-    /// deaf flag and the fatal dispositions are one shared process,
-    /// so parallel signal tests would race each other's stores.
-    #[cfg(unix)]
-    static SIGNAL_STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// Reads one signal's current disposition record.
     #[cfg(unix)]
     fn current_disposition(signal: libc::c_int) -> libc::sigaction {
@@ -952,6 +1449,93 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_stolen_first_byte_is_not_a_refusal_and_carries_the_byte_back() {
+        // A keystroke that reached the query reader is not the terminal
+        // answering anything: the support record must learn nothing
+        // (the ask stays warranted, unlike a genuine silence), and the
+        // byte rides back in the outcome so the caller can return it to
+        // the composer. A paintless background never runs the exchange,
+        // so it takes nothing.
+        let verdict = reply_verdict(&QueryReply::Stolen(b'x'));
+        assert_eq!(
+            verdict,
+            BackgroundSupport::NotAsked,
+            "a stolen keystroke teaches nothing about the terminal"
+        );
+        assert!(
+            next_ask_warranted(verdict),
+            "a later switch may ask again — the terminal never refused"
+        );
+        let outcome = query_and_install(ratatui::style::Color::Reset);
+        assert!(
+            !outcome.installed,
+            "a non-Rgb background has nothing to install"
+        );
+        assert_eq!(
+            outcome.stolen, None,
+            "no exchange ran, so nothing was taken"
+        );
+    }
+
+    #[test]
+    fn a_live_override_writes_the_palette_or_restores_the_original() {
+        // The live switch may only write, never query — the reader thread
+        // owns stdin once the session is running. An Rgb canvas writes the
+        // palette's own color; Reset — the transparent theme's whole
+        // vocabulary — hands the terminal its own background back rather
+        // than keep the previous theme's override under a palette that
+        // never paints one; without a captured original, neither
+        // direction has anything honest to write.
+        assert!(
+            matches!(
+                live_override_plan(true, ratatui::style::Color::Rgb(0x28, 0x2a, 0x36)),
+                LiveOverridePlan::Write
+            ),
+            "a terminal that answered takes the palette's own canvas"
+        );
+        assert!(
+            matches!(
+                live_override_plan(true, ratatui::style::Color::Reset),
+                LiveOverridePlan::RestoreOriginal
+            ),
+            "a paintless palette gets the terminal's original background back"
+        );
+        assert!(
+            matches!(
+                live_override_plan(false, ratatui::style::Color::Rgb(0x28, 0x2a, 0x36)),
+                LiveOverridePlan::Decline
+            ),
+            "a terminal that never answered keeps the deferred palette"
+        );
+        assert!(
+            matches!(
+                live_override_plan(false, ratatui::style::Color::Reset),
+                LiveOverridePlan::Decline
+            ),
+            "with nothing captured there is no original to restore either"
+        );
+    }
+
+    #[test]
+    fn only_a_never_queried_terminal_is_asked_again() {
+        // A skipped startup query (typed-ahead keys) is the one session
+        // shape that earns a later ask; a proven terminal writes, and a
+        // refused one has answered the question for good.
+        assert!(
+            next_ask_warranted(BackgroundSupport::NotAsked),
+            "the session never got an answer, so the first switch asks"
+        );
+        assert!(
+            !next_ask_warranted(BackgroundSupport::Answered),
+            "a proven terminal takes the write, not the question"
+        );
+        assert!(
+            !next_ask_warranted(BackgroundSupport::Refused),
+            "a silent terminal has answered for good; the palette defers"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn each_displaced_disposition_gets_its_own_action() {
@@ -980,6 +1564,25 @@ mod tests {
             disposition_action(0x5555_5555_5000),
             DispositionAction::Chain,
             "a typical PIE handler address chains"
+        );
+    }
+
+    #[test]
+    fn the_cursor_tint_and_reset_are_the_osc_12_family() {
+        // The cursor tint rides the same OSC family as the background
+        // override — 12 where the background is 11 — and resets through
+        // 112, the no-query restore: resetting needs no captured
+        // original, because it returns the cursor to the terminal's own
+        // default, which an untinted session already had.
+        assert_eq!(
+            cursor_sequence((0x28, 0x2a, 0x36)),
+            "\x1b]12;rgb:28/2a/36\x1b\\",
+            "the tint writes the cursor's rgb in OSC 12's shape"
+        );
+        assert_eq!(
+            cursor_reset_sequence(),
+            "\x1b]112\x1b\\",
+            "the reset is OSC 112, parameterless"
         );
     }
 
@@ -1146,5 +1749,156 @@ mod tests {
         ] {
             assert_eq!(parse_background_reply(noise), None, "{noise:?}");
         }
+    }
+}
+
+// Test code panics by design — its asserts are the assertions.
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc
+)]
+mod write_only_warranted_pins {
+    use super::*;
+
+    #[test]
+    fn the_write_gate_mirrors_the_plan_without_capturing() {
+        // The predicate is the write's own gate answered purely: with a
+        // captured original it follows the plan for every canvas shape,
+        // and in this test process — where no query ever captured an
+        // original — it must decline everything, exactly as the write
+        // itself does, so a caller may defer to the flush on its word.
+        let captured = ORIGINAL_BACKGROUND.get().is_some();
+        let lands = |background| {
+            matches!(
+                live_override_plan(true, background),
+                LiveOverridePlan::Write | LiveOverridePlan::RestoreOriginal
+            )
+        };
+        let rgb = Color::Rgb(1, 2, 3);
+        assert_eq!(write_only_warranted(rgb), captured && lands(rgb));
+        let indexed = Color::Indexed(8);
+        assert_eq!(write_only_warranted(indexed), captured && lands(indexed));
+        // No capture, no write — the OnceLock stays unset in tests so
+        // every shape declines, the same answer the theme burst's
+        // canvas write gives for an uncaptured terminal.
+        if ORIGINAL_BACKGROUND.get().is_none() {
+            assert!(
+                !write_only_warranted(rgb),
+                "an uncaptured terminal declines a write"
+            );
+            assert!(!write_only_warranted(Color::Reset));
+        }
+    }
+}
+
+// Test code panics by design — its asserts are the assertions.
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc
+)]
+mod synchronized_output_pins {
+    use super::*;
+
+    // The markers' byte shapes are the contract: a terminal that
+    // implements mode 2026 recognizes exactly these two sequences, and
+    // anything else would silently disable the one-repaint window the
+    // theme burst rides. The writers spell nothing of their own — they
+    // write these constants, so pinning the constants pins the wire.
+    #[test]
+    fn the_window_markers_are_the_2026_set_and_reset() {
+        assert_eq!(SYNCHRONIZED_OUTPUT_BEGIN, "\x1b[?2026h");
+        assert_eq!(SYNCHRONIZED_OUTPUT_END, "\x1b[?2026l");
+    }
+
+    #[test]
+    fn the_burst_closer_carries_canvas_cursor_and_window_close() {
+        // Captured terminal, RGB palette: the canvas write, the accent
+        // cursor tint, and the window close — that order, one buffer,
+        // so a terminal painting as it reads meets the flip once, at
+        // the burst's end, never as a head start the composer's rows
+        // would trail.
+        let original = Some((16, 16, 16));
+        let burst = theme_burst_bytes(original, Color::Rgb(40, 40, 40), Color::Rgb(177, 98, 134));
+        assert!(burst.starts_with("\x1b]11;rgb:28/28/28\x1b\\"));
+        assert!(burst.contains("\x1b]12;rgb:b1/62/86\x1b\\"));
+        assert!(burst.ends_with(SYNCHRONIZED_OUTPUT_END));
+        // Two OSC sequences (opener and ST each) plus the one CSI
+        // close — nothing else rides the buffer.
+        assert_eq!(burst.matches('\x1b').count(), 5);
+
+        // Captured terminal, paintless palette: the terminal's own
+        // canvas restored, its cursor reset, and the close.
+        let reset = theme_burst_bytes(original, Color::Reset, Color::Rgb(1, 2, 3));
+        assert!(reset.starts_with("\x1b]11;rgb:10/10/10\x1b\\"));
+        assert!(reset.contains("\x1b]112\x1b\\"));
+        assert!(reset.ends_with(SYNCHRONIZED_OUTPUT_END));
+
+        // Uncaptured terminal: neither write is warranted — the close
+        // alone, so the window markers always pair.
+        let declined = theme_burst_bytes(None, Color::Rgb(40, 40, 40), Color::Rgb(1, 2, 3));
+        assert_eq!(declined, SYNCHRONIZED_OUTPUT_END);
+    }
+}
+
+/// Serializes tests that touch process-global signal state: the
+/// armed flag, the deaf flag, and the fatal dispositions are one
+/// shared process, so parallel signal tests would race each other's
+/// stores. Module-scope so the arming tests and the publication pins
+/// — separate test mods — serialize against each other too.
+#[cfg(all(test, unix))]
+static SIGNAL_STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+// Test code panics by design — its asserts are the assertions.
+#[cfg(all(test, unix))]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc
+)]
+mod signal_restore_publication_pins {
+    use super::*;
+
+    #[test]
+    fn the_publication_takes_the_latest_bytes_and_skips_the_unarmed() {
+        // A capture after arming must reach the handler: the arm-time
+        // snapshot could not know it, so the capture republishes, and
+        // the handler reads whichever publication is newest. Before
+        // arming a capture publishes nothing — the arm build reads the
+        // captured background directly. The publication static and
+        // the armed flag are process-global, and other tests in this
+        // binary arm the restore for real: the shared state lock plus
+        // a forced-unarmed flag keep the assertion true whatever order
+        // the tests run in, and the swap restores the process's arming
+        // afterward.
+        let _signal_state = SIGNAL_STATE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let was_armed = SIGNAL_RESTORE_ARMED.swap(false, Ordering::SeqCst);
+        let before = published_restore_bytes();
+        refresh_signal_restore_bytes((16, 16, 16));
+        assert_eq!(
+            published_restore_bytes(),
+            before,
+            "an unarmed process publishes nothing on capture"
+        );
+        publish_restore_bytes(b"arm-time".to_vec().into_boxed_slice());
+        assert_eq!(published_restore_bytes(), Some(&b"arm-time"[..]));
+        publish_restore_bytes(b"refreshed".to_vec().into_boxed_slice());
+        assert_eq!(
+            published_restore_bytes(),
+            Some(&b"refreshed"[..]),
+            "the latest publication is the one the handler reads"
+        );
+        SIGNAL_RESTORE_ARMED.store(was_armed, Ordering::SeqCst);
     }
 }

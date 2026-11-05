@@ -4,15 +4,22 @@
 //! argument or a piped stdin. It owns no agent-loop
 //! logic — everything turn/stream/dispatch lives in loopctl via the runner —
 //! and prints nothing of its own beyond the answer the task asked for:
-//! the model's reply reaches stdout through the [`ConsoleObserver`]
-//! stream, and stderr carries only the run's own trouble — a session
+//! the run is quiet by default — stdout carries only the final answer,
+//! printed once at run end, and stderr carries only the run's own
+//! trouble — a session
 //! that could not be built, a resume that had to degrade, a run that
 //! ends with todos still open, a `--done-file` that refused to be
 //! written (each reported panic-proof, as every stderr word here is).
+//! `--verbose` hands the narration to the [`ConsoleObserver`]: one
+//! flag streams the model's reply to stdout as it forms with
+//! tool-call lines on stderr; a second adds durations, token counts,
+//! and the run summary. The run is non-interactive throughout: the
+//! model is offered no `AskUserQuestion` tool, and permission asks it
+//! cannot surface are denied by the gate rather than waited on.
 //! This module resolves the prompt, maps the outcome to the process
 //! exit code, and writes the `--done-file` marker.
 
-use std::io::{IsTerminal, Read};
+use std::io::{IsTerminal, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -117,6 +124,23 @@ impl HeadlessOutcome {
         }
     }
 
+    /// Map a completed run whose answer could not be delivered (exit 2).
+    ///
+    /// The run itself finished — the turn and tool-call totals are real,
+    /// and the done-file carries them — but the product never reached
+    /// the consumer, so the shell owes the run's own failure code and
+    /// the done-file a failure whose message names the delivery error
+    /// rather than an answer nobody read.
+    fn from_delivery_failure(error: &std::io::Error, run: &Run) -> Self {
+        Self {
+            exit_code: 2,
+            success: false,
+            message: format!("failed to write the final answer to stdout: {error}"),
+            turns: Some(run.turn_count()),
+            tools_used: Some(run.tool_call_count()),
+        }
+    }
+
     /// Map a `LoopError` to an outcome, honouring the cancel exit code.
     ///
     /// Cancelled runs exit 130; all other loop errors exit 2. The error
@@ -170,8 +194,9 @@ fn finish_pipeline(result: Result<HeadlessOutcome, HeadlessOutcome>) -> u8 {
 /// session, writes the `--done-file` (if requested), and returns the exit
 /// code. The caller (`main`) turns the code into the process exit status. A
 /// resumed `control` continues the loaded session: the agent starts
-/// from the restored history on the current configuration's model and
-/// provider — the saved model is provenance for the listing — the
+/// from the restored history on the model the session last ran — the
+/// saved model resolved through `[[models]]` as the resume default, an
+/// explicit `--model` still winning — the
 /// session id is the loaded one, and the saved transcript is the whole
 /// resumed conversation rather than the new turn alone; a degradation
 /// warning is printed to stderr before the run starts. The
@@ -293,7 +318,9 @@ async fn run_headless_inner(
     let ConstructedRun {
         prompt,
         mut runner,
+        workdir,
         model,
+        streams_answer,
         resumed_compactions,
         compaction_counter,
     } = built;
@@ -320,7 +347,8 @@ async fn run_headless_inner(
     let saver = match saver_root {
         Some(root) => crate::session::SessionSaver::with_base_dir(session_id, model, root),
         None => crate::session::SessionSaver::with_model(session_id, model),
-    };
+    }
+    .with_workdir(&workdir);
     let mut transcript = match &control {
         crate::resume::ResumeControl::Resumed(outcome) => outcome.messages.clone(),
         crate::resume::ResumeControl::Fresh { .. } => Vec::new(),
@@ -329,7 +357,12 @@ async fn run_headless_inner(
     let turn_outputs = runner.session_turn_outputs();
     match result {
         Ok(run) => {
-            let outcome = HeadlessOutcome::from_run(&run);
+            let delivery = if !streams_answer && let Some(answer) = &run.output {
+                print_final_answer(answer)
+            } else {
+                Ok(())
+            };
+            let outcome = outcome_after_delivery(&run, delivery);
             write_done_file_if_requested(args, &outcome, inherited_mode.as_ref());
             outcome_recorded.store(true, Ordering::SeqCst);
             transcript.extend(crate::messages::transcript_from(
@@ -450,11 +483,27 @@ struct ConstructedRun {
     /// for the run bridge to install.
     runner: dch_loop::Runner,
 
+    /// The process working directory the runner serves.
+    ///
+    /// Carried out of construction so the session saver records the
+    /// directory the run worked in — a headless resume of a TUI-saved
+    /// session keeps that provenance instead of erasing it, and the
+    /// listing shows where the run lived.
+    workdir: std::path::PathBuf,
+
     /// The model the run uses, from the loaded config.
     ///
     /// Carried out of construction so the session transcript records
     /// the model the session actually ran.
     model: String,
+
+    /// Whether the observer narrates the run while it happens.
+    ///
+    /// False at the quiet default, where the observer writes nothing to
+    /// stdout and the run bridge delivers the final answer itself at
+    /// run end; true under `--verbose`, where the observer's stream
+    /// already carried the text and a second print would duplicate it.
+    streams_answer: bool,
 
     /// The compaction count a resumed snapshot already carried.
     ///
@@ -493,12 +542,11 @@ async fn construct_run(
         .await
         .map_err(|message| construction_failure(args, message, inherited_mode))?;
 
-    let mut config = load_config(args.config.config_path.as_deref())
-        .map_err(|message| construction_failure(args, message, inherited_mode))?;
-    apply_cli_overrides(&mut config, args)
+    let (config, _config_base, _config_file) = resolve_session_config_pair(args, control)
         .map_err(|message| construction_failure(args, message, inherited_mode))?;
 
-    let verbosity = resolve_verbosity(&config, args);
+    let verbosity = resolve_verbosity(args);
+    let streams_answer = !matches!(verbosity, Verbosity::Quiet);
     let observer = Arc::new(ConsoleObserver::new(
         verbosity,
         ConsoleObserver::detect_color(),
@@ -514,7 +562,8 @@ async fn construct_run(
     };
     let mut builder = dch_loop::Runner::builder(&config, &workdir)
         .with_observer(Arc::clone(&observer) as Arc<dyn loopctl::observer::LoopObserver>)
-        .with_todo_nudge(|_reminder| {}, || true);
+        .with_todo_nudge(|_reminder| {}, || true)
+        .without_interactive_tools();
     if let crate::resume::ResumeControl::Resumed(outcome) = control {
         builder = builder.with_history(crate::resume::history_for_resume(
             outcome,
@@ -539,7 +588,9 @@ async fn construct_run(
     Ok(ConstructedRun {
         prompt,
         runner,
+        workdir,
         model,
+        streams_answer,
         resumed_compactions,
         compaction_counter: observer.compaction_counter(),
     })
@@ -727,6 +778,12 @@ pub(crate) fn load_config(path: Option<&Path>) -> Result<dch_config::DchConfig, 
 /// runners carry that failure to their own startup error path rather than
 /// beginning a run against the wrong endpoint.
 ///
+/// The non-model overrides land first via
+/// [`apply_non_model_overrides`], then the boot model selection runs —
+/// the file's saved `[api] model` names the default when it matches a
+/// declared entry, else the first entry does — so a host that wants the
+/// pre-selection base for later re-selection snapshots between the two.
+///
 /// # Errors
 ///
 /// Returns the user-facing message for a `--model` name that matches no
@@ -735,12 +792,35 @@ pub(crate) fn apply_cli_overrides(
     config: &mut dch_config::DchConfig,
     args: &Args,
 ) -> Result<(), String> {
+    apply_non_model_overrides(config, args);
     config
         .select_model(args.model.as_deref())
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| err.to_string())
+}
+
+/// Apply every CLI override except the boot model selection.
+///
+/// The base a later model selection layers onto: theme, reasoning
+/// effort, path-safety, permission mode, and redaction are user
+/// statements the selection must not displace, while the model choice
+/// itself is the selection's whole job. Applying exactly these to a
+/// clone of the loaded file yields the pre-selection base the interactive
+/// host carries beside its live config.
+pub(crate) fn apply_non_model_overrides(config: &mut dch_config::DchConfig, args: &Args) {
     if let Some(theme) = &args.theme {
         config.display.theme.clone_from(theme);
     }
+    let mut verbosity = config.display.verbosity;
+    for _ in 0..args.verbose {
+        verbosity = match verbosity {
+            Verbosity::Quiet => Verbosity::Normal,
+            Verbosity::Normal | Verbosity::Verbose => Verbosity::Verbose,
+        };
+    }
+    if args.quiet {
+        verbosity = Verbosity::Quiet;
+    }
+    config.display.verbosity = verbosity;
     if let Some(effort) = &args.config.reasoning_effort {
         config.api.reasoning_effort = Some(effort.clone());
     }
@@ -753,20 +833,158 @@ pub(crate) fn apply_cli_overrides(
     if args.config.no_redact {
         config.security.redact_secrets = false;
     }
-    Ok(())
 }
 
-/// Resolve the effective verbosity from config and CLI flags.
+/// Resolve the session's (live, base, file) config triple: the shared
+/// override order both run modes stand on.
 ///
-/// `--quiet` wins when both flags are passed; with neither, the configured
-/// level stands.
-fn resolve_verbosity(config: &dch_config::DchConfig, args: &Args) -> Verbosity {
+/// The live config is the file with every CLI override applied and the
+/// boot model selection made; the base is the same file with every
+/// override *except* that selection; the file element is the file as
+/// loaded — no overrides, no selection — the panel's write-through
+/// persists, so run-scoped flags and the selected profile's expanded
+/// `[api]` never reach the user's config. Later selections — a
+/// mid-session `/model`, a cross-provider switch — layer onto the base
+/// so each equals a restart naming the model, never a stack of every
+/// selection so far. A resumed session adopts the saved conversation's
+/// own model into the live half — over the base, replacing the boot
+/// selection wholesale — unless the CLI named a model outright, in
+/// which case the flag's selection stands as the overrides left it.
+///
+/// The steps run in one fixed order — non-model overrides onto the
+/// base, the full overrides onto the live config, the boot selection,
+/// the resume adoption, then [`reapply_displaced_flag_overrides`] — so
+/// a per-run flag never loses to a value no word of the user's named.
+///
+/// # Errors
+///
+/// Returns the config loader's message, or the `--model` refusal's,
+/// both as the mode's startup error.
+pub(crate) fn resolve_session_config_pair(
+    args: &Args,
+    control: &crate::resume::ResumeControl,
+) -> Result<
+    (
+        dch_config::DchConfig,
+        dch_config::DchConfig,
+        dch_config::DchConfig,
+    ),
+    String,
+> {
+    let mut config = load_config(args.config.config_path.as_deref())?;
+    let file = config.clone();
+    let mut base = config.clone();
+    apply_non_model_overrides(&mut base, args);
+    apply_cli_overrides(&mut config, args)?;
+    crate::resume::adopt_resumed_model(&mut config, &base, control, args.model.as_deref());
+    reapply_displaced_flag_overrides(&mut config, args);
+    Ok((config, base, file))
+}
+
+/// Re-apply the flag overrides the config's own selection steps may
+/// have displaced.
+///
+/// The reasoning-effort dial is the one flag those steps can overwrite
+/// after the flag first landed: a `[[models]]` entry may state its own
+/// `reasoning_effort`, which the boot selection layers on, and the
+/// resume adoption rebuilds `[api]` wholesale from the base. Running
+/// this after the last of those steps restores the documented
+/// precedence — the flag is a per-run statement and outranks both. Pure
+/// over the config, so the precedence is pinnable without a provider.
+pub(crate) fn reapply_displaced_flag_overrides(config: &mut dch_config::DchConfig, args: &Args) {
+    reapply_reasoning_effort(config, args.config.reasoning_effort.as_deref());
+}
+
+/// Restore the run's `--reasoning-effort` flag over any later selection.
+///
+/// The step every selection shares: a `[[models]]` entry may state its
+/// own dial, and a selection — the boot choice, a mid-session `/model`
+/// or provider switch, a resume's adoption — layers it on after the
+/// flag first landed. Shared here so the boot order and the
+/// mid-session restores spell one precedence: the flag is a per-run
+/// statement and outranks every dial the configuration names. A `None`
+/// effort states no flag, and whatever the selection left stands.
+pub(crate) fn reapply_reasoning_effort(config: &mut dch_config::DchConfig, effort: Option<&str>) {
+    if let Some(effort) = effort {
+        config.api.reasoning_effort = Some(effort.to_string());
+    }
+}
+
+/// Resolve the console verbosity for a headless run from the CLI flags.
+///
+/// A headless run is quiet by default: stdout carries only the final
+/// answer — printed once at run end by the run bridge — and stderr
+/// carries the run's real trouble. Each `--verbose` steps up one
+/// level: `-v` narrates the run (the reply streams to stdout,
+/// tool-call lines join stderr), `-vv` adds the detail chrome
+/// (durations, token counts, the run summary). `--quiet` is the
+/// explicit spelling of the default and wins when both flags are
+/// passed. The configuration's `display.verbosity` governs the
+/// interactive panel and deliberately does not reach this decision:
+/// a piped run's cleanliness cannot depend on a display setting.
+fn resolve_verbosity(args: &Args) -> Verbosity {
     if args.quiet {
-        Verbosity::Quiet
-    } else if args.verbose {
-        Verbosity::Verbose
-    } else {
-        config.display.verbosity
+        return Verbosity::Quiet;
+    }
+    match args.verbose {
+        0 => Verbosity::Quiet,
+        1 => Verbosity::Normal,
+        _ => Verbosity::Verbose,
+    }
+}
+
+/// Print the run's final answer to stdout when the observer did not
+/// stream it.
+///
+/// The quiet default leaves the observer's stdout empty, so the answer —
+/// and only the answer — arrives here, once, at run end. The real
+/// stdout handle is locked for the write, so the answer cannot
+/// interleave with another thread's output; the write's result travels
+/// to the caller, so a delivery that failed — a consumer that closed
+/// the pipe early — fails the run instead of exiting behind an answer
+/// the consumer never saw.
+///
+/// # Errors
+///
+/// Returns the stdout write's own error verbatim; see
+/// [`write_final_answer`].
+fn print_final_answer(answer: &str) -> std::io::Result<()> {
+    let mut out = std::io::stdout().lock();
+    write_final_answer(&mut out, answer)
+}
+
+/// Write the final answer line to `out`.
+///
+/// The testable core of [`print_final_answer`]: one line, the answer,
+/// one trailing newline — nothing else, whatever the run did to get
+/// here.
+///
+/// # Errors
+///
+/// Returns the write's error unchanged: a sink that refuses the line
+/// (a closed pipe, a full disk) is a delivery failure the caller owes
+/// its exit path, not one to swallow behind a success.
+fn write_final_answer(mut out: impl Write, answer: &str) -> std::io::Result<()> {
+    writeln!(out, "{answer}")
+}
+
+/// Map a finished run to its outcome under the answer's delivery verdict.
+///
+/// A delivered answer (or a run with none to deliver) keeps the run's
+/// own outcome; a refused write fails the run instead — exit 2, a
+/// failure done-file with the run's real counts — and warns on stderr,
+/// the one channel still standing when stdout is what failed: without
+/// the warning a shell user sees the failure code and no word of its
+/// cause, the observer having printed nothing in the quiet default.
+fn outcome_after_delivery(run: &Run, delivery: std::io::Result<()>) -> HeadlessOutcome {
+    match delivery {
+        Ok(()) => HeadlessOutcome::from_run(run),
+        Err(err) => {
+            crate::signals::report(&format!(
+                "warning: the final answer could not be written to stdout: {err}"
+            ));
+            HeadlessOutcome::from_delivery_failure(&err, run)
+        }
     }
 }
 
@@ -990,6 +1208,45 @@ mod tests {
         assert!(!outcome.success);
         assert_eq!(outcome.turns, Some(0), "counts survive for the done-file");
         assert_eq!(outcome.tools_used, Some(0));
+    }
+
+    #[test]
+    fn a_delivered_answer_keeps_the_runs_own_outcome() {
+        let mut run = Run::new("task", &RunConfig::default());
+        run.output = Some("the answer".into());
+        let outcome = outcome_after_delivery(&run, Ok(()));
+        assert_eq!(outcome.exit_code, 0);
+        assert!(outcome.success);
+        assert_eq!(outcome.message, "the answer");
+    }
+
+    #[test]
+    fn a_refused_delivery_fails_the_run_with_its_real_counts() {
+        // The shell's verdict and the done-file's status both turn on the
+        // delivery: exit 2, a failure status, the run's turn and tool
+        // totals kept, and the message naming the write's own error —
+        // never an answer the consumer never saw.
+        let mut run = Run::new("task", &RunConfig::default());
+        run.output = Some("the answer".into());
+        let outcome = outcome_after_delivery(&run, Err(std::io::Error::other("pipe closed")));
+        assert_eq!(outcome.exit_code, 2, "a failed delivery is a failed run");
+        assert!(!outcome.success, "the done-file records the failure");
+        assert_eq!(outcome.turns, Some(0), "the run's counts survive");
+        assert_eq!(outcome.tools_used, Some(0));
+        assert!(
+            outcome.message.contains("failed to write the final answer"),
+            "the failure says what failed: {}",
+            outcome.message
+        );
+        assert!(
+            outcome.message.contains("pipe closed"),
+            "the failure names the write's own error: {}",
+            outcome.message
+        );
+        assert_ne!(
+            outcome.message, "the answer",
+            "an undelivered answer is not reported as the run's message"
+        );
     }
 
     #[test]
@@ -1229,8 +1486,9 @@ mod tests {
         let message = apply_cli_overrides(&mut config, &parse(&["--model", "cloude-haiku"]))
             .expect_err("a declared set closes the name before a request is spent on it");
         assert!(
-            message.contains("glm-5.3") && message.contains("qwen-local"),
-            "the failure names what can actually be run: {message}"
+            message.contains("glm-5.3") && !message.contains("qwen-local"),
+            "the failure names what can actually be run — the entries alone, never a base \
+             name no entry claims: {message}"
         );
         assert_eq!(
             config.api.base_url, "http://localhost:8080/v1",
@@ -1327,24 +1585,155 @@ mod tests {
     }
 
     #[test]
-    fn verbosity_resolves_quiet_over_verbose_over_config() {
-        let config = dch_config::DchConfig::default();
+    fn verbosity_steps_quiet_to_normal_to_verbose_with_flags() {
         assert_eq!(
-            resolve_verbosity(&config, &parse(&["-q"])),
-            Verbosity::Quiet
+            resolve_verbosity(&parse(&[])),
+            Verbosity::Quiet,
+            "a headless run is quiet without a flag"
         );
         assert_eq!(
-            resolve_verbosity(&config, &parse(&["-v"])),
-            Verbosity::Verbose
+            resolve_verbosity(&parse(&["-q"])),
+            Verbosity::Quiet,
+            "--quiet is the explicit spelling of the default"
         );
         assert_eq!(
-            resolve_verbosity(&config, &parse(&["-v", "-q"])),
+            resolve_verbosity(&parse(&["-v"])),
+            Verbosity::Normal,
+            "one -v narrates the run: streamed text and tool lines"
+        );
+        assert_eq!(
+            resolve_verbosity(&parse(&["-vv"])),
+            Verbosity::Verbose,
+            "a second -v adds durations, token counts, and the run summary"
+        );
+        assert_eq!(
+            resolve_verbosity(&parse(&["-v", "-q"])),
             Verbosity::Quiet,
             "--quiet wins when both flags are passed"
         );
+    }
+
+    #[test]
+    fn the_flags_set_the_panels_initial_verbosity() {
+        // The panel's first tool-line mode reads display.verbosity: -q
+        // stands it on Quiet, each -v steps the configured level up one
+        // rung, clamped at Verbose. The headless console never reads
+        // this field — its levels come from the flags directly.
+        let mut quiet_panel = dch_config::DchConfig::default();
+        apply_non_model_overrides(&mut quiet_panel, &parse(&["-q"]));
+        assert_eq!(quiet_panel.display.verbosity, Verbosity::Quiet);
+
+        let mut stepped = dch_config::DchConfig::default();
+        stepped.display.verbosity = Verbosity::Quiet;
+        apply_non_model_overrides(&mut stepped, &parse(&["-v"]));
         assert_eq!(
-            resolve_verbosity(&config, &parse(&[])),
-            config.display.verbosity
+            stepped.display.verbosity,
+            Verbosity::Normal,
+            "one -v lifts a quiet panel to normal tool lines"
+        );
+
+        let mut loud = dch_config::DchConfig::default();
+        apply_non_model_overrides(&mut loud, &parse(&["-vv"]));
+        assert_eq!(
+            loud.display.verbosity,
+            Verbosity::Verbose,
+            "two -v reach Verbose from the normal default"
+        );
+
+        let mut clamped = dch_config::DchConfig::default();
+        clamped.display.verbosity = Verbosity::Verbose;
+        apply_non_model_overrides(&mut clamped, &parse(&["-vvv"]));
+        assert_eq!(
+            clamped.display.verbosity,
+            Verbosity::Verbose,
+            "the ladder clamps at Verbose"
+        );
+    }
+
+    #[test]
+    fn the_unstreamed_answer_prints_as_one_line_with_a_newline() {
+        let mut sink: Vec<u8> = Vec::new();
+        write_final_answer(&mut sink, "the answer").expect("a Vec sink takes the line");
+        assert_eq!(
+            sink, b"the answer\n",
+            "the quiet path delivers exactly the answer and one newline"
+        );
+    }
+
+    #[test]
+    fn a_refused_answer_write_surfaces_the_error() {
+        // The quiet path's contract runs the other way too: a stdout
+        // that refuses the write (a consumer closed the pipe) is a
+        // delivery failure the caller reports, not one it swallows
+        // behind an exit 0 and a success done-file.
+        struct RefusingSink;
+        impl Write for RefusingSink {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("the pipe went away"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let err = write_final_answer(&mut RefusingSink, "the answer")
+            .expect_err("a refusing sink fails the delivery");
+        assert!(
+            err.to_string().contains("the pipe went away"),
+            "the surfaced error is the write's own: {err}"
+        );
+    }
+
+    #[test]
+    fn the_reasoning_effort_flag_wins_over_an_entrys_own_dial() {
+        // The entry states its own dial; the flag is a per-run statement
+        // and outranks it on every path — the boot selection layering
+        // the entry's bundle on (a fresh run), and the resume adoption
+        // rebuilding [api] from the base (a resumed run) both land after
+        // the flag first did, so the shared order re-applies the flag
+        // last.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[api]\nmodel = \"qwen\"\n\n[[models]]\nmodel = \"glm\"\nreasoning_effort = \"medium\"\n",
+        )
+        .unwrap();
+        let config_path = path.display().to_string();
+
+        let args = parse(&["--config", &config_path, "--reasoning-effort", "low"]);
+        let (fresh, _base, _file) = resolve_session_config_pair(&args, &fresh_control()).unwrap();
+        assert_eq!(
+            fresh.api.reasoning_effort.as_deref(),
+            Some("low"),
+            "a fresh run: the flag beats the selected entry's own dial"
+        );
+
+        let resumed = crate::resume::ResumeControl::Resumed(crate::resume::ResumeOutcome {
+            session_id: uuid::Uuid::nil(),
+            model: "glm".to_string(),
+            messages: Vec::new(),
+            tokens: crate::session::SessionTokens::default(),
+            machine: None,
+            machine_compactions: 0,
+        });
+        let (resumed_config, _resumed_base, _resumed_file) =
+            resolve_session_config_pair(&args, &resumed).unwrap();
+        assert_eq!(
+            resumed_config.api.reasoning_effort.as_deref(),
+            Some("low"),
+            "a resumed run: the adoption's rebuild of [api] cannot displace the flag"
+        );
+
+        // Without the flag the entry's own dial stands — the re-apply is
+        // a restore of the flag's precedence, not an override of the
+        // entry's own statement.
+        let bare = parse(&["--config", &config_path]);
+        let (no_flag, _no_flag_base, _no_flag_file) =
+            resolve_session_config_pair(&bare, &fresh_control()).unwrap();
+        assert_eq!(
+            no_flag.api.reasoning_effort.as_deref(),
+            Some("medium"),
+            "with no flag the selected entry's dial applies"
         );
     }
 
@@ -1904,7 +2293,7 @@ mod tests {
     /// concurrently delivered test signal would hijack.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn a_resumed_run_uses_the_current_config_s_model_until_the_cli_overrides_it() {
+    async fn a_resumed_run_continues_the_sessions_last_model_until_the_cli_overrides_it() {
         let _signal_lock = SIGNAL_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1959,8 +2348,8 @@ mod tests {
         );
         let (_, model, _, _) = crate::session::load_with_meta_in(*id, sessions.path()).unwrap();
         assert_eq!(
-            model, "m-second",
-            "a resumed session runs — and re-records — the current configuration's model"
+            model, "m-first",
+            "a resumed session continues on — and re-records — the model it last ran, not the configuration's current one"
         );
 
         let third = parse(&[
@@ -1987,7 +2376,7 @@ mod tests {
         let (_, model, _, _) = crate::session::load_with_meta_in(*id, sessions.path()).unwrap();
         assert_eq!(
             model, "m-cli",
-            "an explicit --model overrides the current configuration"
+            "an explicit --model overrides both the envelope and the configuration"
         );
     }
 }

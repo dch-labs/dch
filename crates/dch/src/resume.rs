@@ -4,9 +4,11 @@
 //! [`resolve_resume`] turns the `--resume` flag into one
 //! [`ResumeControl`] both run modes consume: a loaded session seeds
 //! the display and the agent's conversation history and reuses its id
-//! so further auto-saves land in the same file, while the engine runs
-//! on the current configuration's model and provider — the saved
-//! model is provenance for the listing, never an override; a load
+//! so further auto-saves land in the same file, while the session
+//! continues on the model it last ran — the saved model resolved
+//! through `[[models]]` as the resume default, an explicit `--model`
+//! still winning, and the listing reading the same field as
+//! provenance; a load
 //! that fails degrade-able ways starts a fresh session carrying a
 //! warning for the mode to render.
 //! `--list-sessions` prints the saved-session table and exits. The
@@ -80,6 +82,15 @@ pub(crate) struct ResumeOutcome {
     /// overwrite the file that was resumed rather than orphaning it
     /// under a fresh identity.
     pub(crate) session_id: Uuid,
+
+    /// The model the session last ran, from the envelope.
+    ///
+    /// The resume default: a session continues on the model it ended
+    /// on — the file's own record — unless the CLI names a model
+    /// outright. `/model` switches relabel the envelope as they land,
+    /// so this field always names the model the session actually ran
+    /// last.
+    pub(crate) model: String,
 
     /// The saved conversation in display form, verbatim but for the
     /// retired reminder rows the load drops.
@@ -165,6 +176,45 @@ impl From<SessionError> for ResumeError {
 /// rather than resolving — see [`resolve_resume_in`].
 pub(crate) fn resolve_resume(args: &Args) -> ResumeControl {
     resolve_resume_in(args, &crate::session::sessions_dir())
+}
+
+/// Adopt the resumed session's model into the run's configuration.
+///
+/// The resume default: a session continues on the model it last ran,
+/// resolved through `[[models]]` exactly as an explicit `--model`
+/// would be — the profile's context window above all is what the
+/// engine is built on, and a bare assignment would leave the loop
+/// measuring the base window while running another model's
+/// conversation. The selection layers onto `base` — the user-stated
+/// config before any boot selection ran — never onto the live config,
+/// whose boot-selected bundle the resumed model replaces wholesale: a
+/// resume accreting the boot default's unstated fields would measure
+/// the wrong window for the same reason a mid-session switch would. An
+/// explicit CLI model wins untouched; a model no profile names (the
+/// session outlived a config change) keeps the bare name on the base
+/// settings. A session recorded under a blank model (a default
+/// config's empty `api.model` is what a headless save records) carries
+/// no choice to adopt — the configured bundle stands exactly as the
+/// boot selection left it, rather than a blank envelope value winning
+/// over the user's configuration.
+pub(crate) fn adopt_resumed_model(
+    config: &mut dch_config::DchConfig,
+    base: &dch_config::DchConfig,
+    control: &ResumeControl,
+    cli_model: Option<&str>,
+) {
+    if cli_model.is_some() {
+        return;
+    }
+    if let ResumeControl::Resumed(outcome) = control
+        && !outcome.model.trim().is_empty()
+    {
+        let mut fresh = base.clone();
+        if fresh.select_model(Some(&outcome.model)).is_err() {
+            fresh.api.model.clone_from(&outcome.model);
+        }
+        config.api = fresh.api;
+    }
 }
 
 /// Resolve the resume intent against `base` instead of the default
@@ -419,7 +469,7 @@ fn scrub_json_strings(
 /// same conditions the session loader reports, mapped once for the
 /// resume flow.
 pub(crate) fn load_for_resume_in(id: Uuid, base: &Path) -> Result<ResumeOutcome, ResumeError> {
-    let (messages, _model, tokens, saved_at) = crate::session::load_with_meta_in(id, base)?;
+    let (messages, model, tokens, saved_at) = crate::session::load_with_meta_in(id, base)?;
     let messages: Vec<TuiMessage> = messages
         .into_iter()
         .filter(|message| match message {
@@ -438,6 +488,7 @@ pub(crate) fn load_for_resume_in(id: Uuid, base: &Path) -> Result<ResumeOutcome,
     };
     Ok(ResumeOutcome {
         session_id: id,
+        model,
         messages,
         tokens,
         machine,
@@ -669,24 +720,28 @@ fn push_assistant_message(converted: &mut Vec<Message>, parts: Vec<MessagePart>)
     }
 }
 
-/// The file paths a transcript shows the prior session reading.
+/// The file paths a transcript shows the prior session reading —
+/// successfully.
 ///
 /// A `Read` block's input preview carries that call's `file_path`
 /// value — the display layer extracts that field — so blocks named
-/// `Read` hold addressable paths; other tools' previews are
-/// humanized summaries (commands, patterns, edit counts) and yield
-/// nothing. Coverage is bounded by what the transcript recorded:
-/// the display layer caps previews, so a path longer than the cap
-/// survives only truncated (and then resolves to nothing, safely
-/// skipping the re-arm), and transcripts saved by headless runs
-/// carry text-only turns with no tool blocks at all. A relative
-/// preview path re-resolves against the *resume-time* cwd when the
-/// baseline is re-armed — resuming from a different directory misses
-/// the file (the guard stays disarmed, the safe direction) or arms
-/// a different same-named file under the new cwd (a resume-armed
-/// baseline holds the first write for a live Read here either way).
-/// Order is preserved and duplicates kept: re-recording a baseline
-/// is idempotent for the guard's purposes.
+/// `Read` that **succeeded** hold addressable paths; a read that
+/// errored taught the model nothing about the file's bytes, so it
+/// arms nothing — a baseline over content the model never saw would
+/// blind a later write to exactly the staleness the guard exists to
+/// catch. Other tools' previews are humanized summaries (commands,
+/// patterns, edit counts) and yield nothing. Coverage is bounded by
+/// what the transcript recorded: the display layer caps previews, so
+/// a path longer than the cap survives only truncated (and then
+/// resolves to nothing, safely skipping the re-arm), and transcripts
+/// saved by headless runs carry text-only turns with no tool blocks
+/// at all. A relative preview path re-resolves against the
+/// *resume-time* cwd when the baseline is re-armed — resuming from a
+/// different directory misses the file (the guard stays disarmed,
+/// the safe direction) or arms a different same-named file under the
+/// new cwd (a resume-armed baseline holds the first write for a live
+/// Read here either way). Order is preserved and duplicates kept:
+/// re-recording a baseline is idempotent for the guard's purposes.
 pub(crate) fn resumed_read_paths(messages: &[TuiMessage]) -> Vec<String> {
     let mut paths = Vec::new();
     for message in messages {
@@ -695,9 +750,11 @@ pub(crate) fn resumed_read_paths(messages: &[TuiMessage]) -> Vec<String> {
                 if let ContentBlock::Tool {
                     name,
                     input_preview,
+                    success,
                     ..
                 } = block
                     && (name == "read" || name == "Read")
+                    && *success
                     && !input_preview.trim().is_empty()
                 {
                     paths.push(input_preview.trim().to_string());
@@ -708,33 +765,73 @@ pub(crate) fn resumed_read_paths(messages: &[TuiMessage]) -> Vec<String> {
     paths
 }
 
-/// The paths a resume re-arms as read, from the freshest record.
+/// The paths a resume re-arms as read, from the freshest record —
+/// only reads that succeeded.
 ///
 /// Single reads come from the transcript's previews — a `Read` call's
-/// preview is its path. Batch reads come from the machine snapshot
-/// when one exists, because the transcript's `ReadFiles` preview is a
-/// truncated one-line summary that cannot carry the whole files array;
-/// the snapshot carries the full call input verbatim. A resume with
-/// no snapshot arms only what the previews can name.
+/// preview is its path — and from the machine snapshot's `Read` calls
+/// when one exists, whose input names the file verbatim under `path`
+/// (or the `file_path` alias the corpus drifts into) where a preview
+/// can truncate past the display cap. Batch reads come from the
+/// snapshot's `ReadFiles` calls, because the transcript's `ReadFiles`
+/// preview is a truncated one-line summary that cannot carry the whole
+/// files array; the snapshot carries the full call input verbatim. A
+/// read that errored — containment-refused, permission-denied, a
+/// `NotFound` during exploration — armed nothing in its own session and
+/// arms nothing here either: the history's calls are paired to their
+/// results, and only a call whose result came back clean contributes,
+/// because a baseline over bytes the model never saw would blind a
+/// later write to exactly the staleness the guard exists to catch. A
+/// call with no result at all — a cancelled turn's unanswered read —
+/// is held to the same rule. A resume with no snapshot arms only what
+/// the previews can name; a caller holding only a machine history (a
+/// provider switch carrying the conversation) arms everything the
+/// history shows read and clean.
 pub(crate) fn resumed_read_paths_with_machine(
     messages: &[TuiMessage],
     machine: Option<&[Message]>,
 ) -> Vec<String> {
     let mut paths = resumed_read_paths(messages);
-    if let Some(history) = machine {
-        for message in history {
-            for part in &message.parts {
-                let MessagePart::ToolCall { name, input, .. } = part else {
-                    continue;
-                };
-                if name != "ReadFiles" {
-                    continue;
+    let Some(history) = machine else {
+        return paths;
+    };
+    let mut succeeded: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for message in history {
+        for part in &message.parts {
+            if let MessagePart::ToolResult {
+                call_id, is_error, ..
+            } = part
+                && !matches!(is_error, Some(true))
+            {
+                succeeded.insert(call_id.clone());
+            }
+        }
+    }
+    for message in history {
+        for part in &message.parts {
+            let MessagePart::ToolCall { id, name, input } = part else {
+                continue;
+            };
+            if !succeeded.contains(id) {
+                continue;
+            }
+            if name == "read" || name == "Read" {
+                if let Some(path) = input
+                    .get("path")
+                    .or_else(|| input.get("file_path"))
+                    .and_then(serde_json::Value::as_str)
+                {
+                    paths.push(path.to_string());
                 }
-                if let Some(files) = input.get("files").and_then(|value| value.as_array()) {
-                    for file in files {
-                        if let Some(path) = file.as_str() {
-                            paths.push(path.to_string());
-                        }
+                continue;
+            }
+            if name != "ReadFiles" {
+                continue;
+            }
+            if let Some(files) = input.get("files").and_then(|value| value.as_array()) {
+                for file in files {
+                    if let Some(path) = file.as_str() {
+                        paths.push(path.to_string());
                     }
                 }
             }
@@ -884,6 +981,108 @@ mod tests {
     use super::*;
     use chrono::TimeZone as _;
     use clap::Parser as _;
+
+    #[test]
+    fn a_resumed_model_selects_its_profile_not_just_its_name() {
+        // The difference between a right and a wrong bar: adopting the
+        // envelope's model must resolve through `[[models]]` — the
+        // profile's context window above all is what the engine is
+        // built on. A bare assignment would name the model while the
+        // loop kept measuring the base window, and the flag path
+        // selects while the default path didn't.
+        let outcome = ResumeOutcome {
+            session_id: Uuid::nil(),
+            model: "glm-5.3".to_string(),
+            messages: Vec::new(),
+            tokens: crate::session::SessionTokens::default(),
+            machine: None,
+            machine_compactions: 0,
+        };
+        let control = ResumeControl::Resumed(outcome);
+        let mut config = dch_config::DchConfig {
+            models: vec![dch_config::ModelProfile {
+                model: "glm-5.3".to_string(),
+                context_window: Some(400_000),
+                ..dch_config::ModelProfile::default()
+            }],
+            ..dch_config::DchConfig::default()
+        };
+        config.api.context_window = Some(200_000);
+        let base = config.clone();
+        adopt_resumed_model(&mut config, &base, &control, None);
+        assert_eq!(
+            config.api.model, "glm-5.3",
+            "the envelope's model is the resumed default"
+        );
+        assert_eq!(
+            config.api.context_window,
+            Some(400_000),
+            "the profile's window applies — the engine is built on the conversation's own model, not the base"
+        );
+
+        // The CLI names a model outright: the adoption stands down and
+        // the flag's own selection (already applied by the overrides)
+        // is untouched.
+        let mut flagged = config.clone();
+        flagged.api.model = "m-cli".to_string();
+        adopt_resumed_model(&mut flagged, &base, &control, Some("m-cli"));
+        assert_eq!(
+            flagged.api.model, "m-cli",
+            "an explicit --model wins untouched"
+        );
+
+        // A session whose model no profile names — it outlived a config
+        // change — keeps the bare name on the base settings.
+        let mut orphan = dch_config::DchConfig::default();
+        orphan.api.context_window = Some(100_000);
+        let orphan_base = orphan.clone();
+        adopt_resumed_model(&mut orphan, &orphan_base, &control, None);
+        assert_eq!(orphan.api.model, "glm-5.3");
+        assert_eq!(
+            orphan.api.context_window,
+            Some(100_000),
+            "no profile means the base settings stand"
+        );
+    }
+
+    #[test]
+    fn a_blank_saved_model_adopts_nothing() {
+        // A default config's `api.model = ""` is what a headless save
+        // records when no model was configured. Resuming that session
+        // after one is configured must not let the blank envelope value
+        // win: the boot-selected bundle stands exactly as it was, blank
+        // meaning "no choice recorded", not "run no model".
+        for blank in ["", "   "] {
+            let outcome = ResumeOutcome {
+                session_id: Uuid::nil(),
+                model: blank.to_string(),
+                messages: Vec::new(),
+                tokens: crate::session::SessionTokens::default(),
+                machine: None,
+                machine_compactions: 0,
+            };
+            let control = ResumeControl::Resumed(outcome);
+            let mut config = dch_config::DchConfig {
+                models: vec![dch_config::ModelProfile {
+                    model: "glm-5.3".to_string(),
+                    context_window: Some(400_000),
+                    ..dch_config::ModelProfile::default()
+                }],
+                ..dch_config::DchConfig::default()
+            };
+            config
+                .select_model(None)
+                .expect("the boot selection names the top entry");
+            let base = config.clone();
+            let configured = config.api.clone();
+            adopt_resumed_model(&mut config, &base, &control, None);
+            assert_eq!(
+                config.api, configured,
+                "a saved model of {blank:?} adopts nothing — the configured \
+                 bundle stands"
+            );
+        }
+    }
 
     fn now() -> chrono::DateTime<chrono::Utc> {
         chrono::Utc.timestamp_opt(1_800_000_000, 0).unwrap()
@@ -1744,14 +1943,53 @@ mod tests {
                 retained_input: String::new(),
             }]),
         ];
-        let machine = vec![Message::new(
-            Role::Assistant,
-            vec![MessagePart::tool_call(
-                "call_1",
-                "ReadFiles",
-                serde_json::json!({"files": ["a.rs", "b.rs", "c.rs", "deep/nested/path.rs"]}),
-            )],
-        )];
+        let machine = vec![
+            Message::new(
+                Role::Assistant,
+                vec![MessagePart::tool_call(
+                    "call_1",
+                    "ReadFiles",
+                    serde_json::json!({"files": ["a.rs", "b.rs", "c.rs", "deep/nested/path.rs"]}),
+                )],
+            ),
+            Message::new(
+                Role::User,
+                vec![MessagePart::tool_result(
+                    "call_1",
+                    "ReadFiles",
+                    "4 files read",
+                    false,
+                )],
+            ),
+            // A batch that errored whole — permission denied, say — and
+            // one a cancelled turn never answered: neither taught the
+            // model any file's bytes, so neither arms a thing.
+            Message::new(
+                Role::Assistant,
+                vec![MessagePart::tool_call(
+                    "call_2",
+                    "ReadFiles",
+                    serde_json::json!({"files": ["denied.rs"]}),
+                )],
+            ),
+            Message::new(
+                Role::User,
+                vec![MessagePart::tool_result(
+                    "call_2",
+                    "ReadFiles",
+                    "permission denied",
+                    true,
+                )],
+            ),
+            Message::new(
+                Role::Assistant,
+                vec![MessagePart::tool_call(
+                    "call_3",
+                    "ReadFiles",
+                    serde_json::json!({"files": ["never-answered.rs"]}),
+                )],
+            ),
+        ];
         assert_eq!(
             resumed_read_paths_with_machine(&transcript, Some(&machine)),
             vec![
@@ -1760,11 +1998,168 @@ mod tests {
                 "c.rs".to_string(),
                 "deep/nested/path.rs".to_string()
             ],
-            "the snapshot's full files array re-arms every file the batch read"
+            "the snapshot's full files array re-arms every file the clean \
+             batch read — and only the clean batch's files"
         );
         assert!(
             resumed_read_paths_with_machine(&transcript, None).is_empty(),
             "without a snapshot the truncated preview arms nothing it cannot name"
+        );
+    }
+
+    #[test]
+    fn single_reads_re_arm_from_the_machine_history_verbatim() {
+        // The other read shape: a single `Read` call's path comes from
+        // the machine history's own call input — verbatim, where a
+        // transcript preview can truncate past the display cap — under
+        // either spelling the tool accepts. This is also exactly what a
+        // caller holding only a machine history (a provider switch
+        // carrying the conversation) has to arm from.
+        let machine = vec![
+            Message::new(
+                Role::Assistant,
+                vec![MessagePart::tool_call(
+                    "call_1",
+                    "Read",
+                    serde_json::json!({"path": "src/main.rs"}),
+                )],
+            ),
+            Message::new(
+                Role::Assistant,
+                vec![MessagePart::tool_call(
+                    "call_2",
+                    "Read",
+                    serde_json::json!({"file_path": "crates/dch/src/tui.rs"}),
+                )],
+            ),
+            Message::new(
+                Role::User,
+                vec![
+                    MessagePart::tool_result("call_1", "Read", "file bytes", false),
+                    MessagePart::tool_result("call_2", "Read", "file bytes", false),
+                ],
+            ),
+            // A read that errored and a read a cancelled turn left
+            // unanswered: neither showed the model the file's bytes,
+            // so neither may stamp a baseline over them.
+            Message::new(
+                Role::Assistant,
+                vec![
+                    MessagePart::tool_call(
+                        "call_3",
+                        "Read",
+                        serde_json::json!({"path": "denied.rs"}),
+                    ),
+                    MessagePart::tool_call(
+                        "call_4",
+                        "Read",
+                        serde_json::json!({"path": "never-answered.rs"}),
+                    ),
+                ],
+            ),
+            Message::new(
+                Role::User,
+                vec![MessagePart::tool_result(
+                    "call_3",
+                    "Read",
+                    "not found",
+                    true,
+                )],
+            ),
+        ];
+        assert_eq!(
+            resumed_read_paths_with_machine(&[], Some(&machine)),
+            vec![
+                "src/main.rs".to_string(),
+                "crates/dch/src/tui.rs".to_string()
+            ],
+            "each clean single read's own input names the file, in either \
+             spelling the tool accepts — the failed and the unanswered \
+             reads arm nothing"
+        );
+    }
+
+    #[test]
+    fn a_failed_transcript_read_arms_nothing() {
+        // The transcript half of the same rule: a Read block whose
+        // outcome was an error names its path in the preview, but the
+        // model never saw the file's bytes — re-arming it would hold a
+        // later write to a baseline built over content it cannot know.
+        let transcript = vec![assistant(vec![
+            ContentBlock::Tool {
+                call_id: "c1".to_string(),
+                name: "Read".to_string(),
+                input_preview: "denied.rs".to_string(),
+                success: false,
+                elapsed_secs: 0.1,
+                output_preview: "permission denied".to_string(),
+                retained_input: String::new(),
+            },
+            ContentBlock::Tool {
+                call_id: "c2".to_string(),
+                name: "Read".to_string(),
+                input_preview: "fine.rs".to_string(),
+                success: true,
+                elapsed_secs: 0.1,
+                output_preview: "bytes".to_string(),
+                retained_input: String::new(),
+            },
+        ])];
+        assert_eq!(
+            resumed_read_paths(&transcript),
+            vec!["fine.rs".to_string()],
+            "only the read that succeeded contributes its path"
+        );
+    }
+
+    #[test]
+    fn a_resume_adopts_over_the_base_not_the_boot_selection() {
+        // The startup-resume accretion: the boot selection laid the seed
+        // entry's window onto the live config, and adopting the resumed
+        // model on top of that would keep the seed's window for a model
+        // that states none. The adopt selects over the base — the
+        // user-stated config — so the resumed conversation measures the
+        // base's own window, exactly as a restart naming that model
+        // would.
+        let base = dch_config::DchConfig::from_toml_str(
+            r#"
+[api]
+model = "seed"
+context_window = 64_000
+
+[[models]]
+model = "seed"
+context_window = 200_000
+
+[[models]]
+model = "plain"
+"#,
+        )
+        .expect("the fixture parses");
+        let outcome = ResumeOutcome {
+            session_id: Uuid::nil(),
+            model: "plain".to_string(),
+            messages: Vec::new(),
+            tokens: crate::session::SessionTokens::default(),
+            machine: None,
+            machine_compactions: 0,
+        };
+        let control = ResumeControl::Resumed(outcome);
+        let mut booted = base.clone();
+        booted
+            .select_model(None)
+            .expect("the boot selection lays the seed entry");
+        assert_eq!(
+            booted.api.context_window,
+            Some(200_000),
+            "fixture premise: the live config carries the seed's window after boot"
+        );
+        adopt_resumed_model(&mut booted, &base, &control, None);
+        assert_eq!(booted.api.model, "plain", "the resumed model stands");
+        assert_eq!(
+            booted.api.context_window,
+            Some(64_000),
+            "the base's own window is what runs — the seed entry's 200_000 did not accrete"
         );
     }
 
@@ -1798,6 +2193,7 @@ mod tests {
         ];
         let outcome = ResumeOutcome {
             session_id: Uuid::nil(),
+            model: "m".to_string(),
             messages: Vec::new(),
             machine: Some(machine),
             tokens: crate::session::SessionTokens::default(),
@@ -1850,6 +2246,7 @@ mod tests {
         )];
         let outcome = ResumeOutcome {
             session_id: Uuid::nil(),
+            model: "m".to_string(),
             messages: Vec::new(),
             machine: Some(machine),
             tokens: crate::session::SessionTokens::default(),
@@ -1895,6 +2292,7 @@ mod tests {
         ];
         let outcome = ResumeOutcome {
             session_id: Uuid::nil(),
+            model: "m".to_string(),
             messages: Vec::new(),
             machine: Some(machine.clone()),
             tokens: crate::session::SessionTokens::default(),
@@ -2273,6 +2671,7 @@ mod tests {
                 model: "m".to_string(),
                 last_activity: now(),
                 user_message_count: 1,
+                workdir: None,
                 context_tokens: 0,
             }
         }
@@ -2325,6 +2724,10 @@ mod tests {
             ],
         );
         let outcome = load_for_resume_in(id, dir.path()).expect("the saved session loads");
+        assert_eq!(
+            outcome.model, "resume-model",
+            "the envelope's model passes through to the outcome the adopt path reads"
+        );
         assert_eq!(
             outcome.messages.len(),
             3,
@@ -2383,6 +2786,7 @@ mod tests {
                 )
                 .unwrap(),
             user_message_count: count,
+            workdir: None,
             context_tokens: 0,
         }
     }

@@ -6,7 +6,8 @@
 //! provider client, a tool registry, a session config carrying the composed
 //! system prompt, and the observer-bearing managers bundle), wires them into
 //! a [`BareLoop`], and exposes [`Runner::run`] / [`Runner::cancel`] as
-//! one-line delegations.
+//! one-line delegations beside [`Runner::compact_now`], the between-turns
+//! compaction seam.
 //!
 //! The loop offers two extension axes with distinct contracts, and the
 //! builder exposes both symmetrically:
@@ -92,7 +93,8 @@ use crate::with_context;
 /// [`RunnerContext`], a session config carrying the composed system prompt,
 /// and the observer-bearing managers bundle) into one [`BareLoop`], and the
 /// public surface stays thin: runs carry or retire the session's todo plan
-/// and delegate to the loop, the rest are accessors.
+/// and delegate to the loop, the between-turns seams (cancel, one manual
+/// compaction pass) delegate the same way, and the rest are accessors.
 ///
 /// Construct once per agent identity with [`Runner::builder`]…`.build()`,
 /// then drive it with [`Runner::run`]: each call is one prompt → loop →
@@ -218,6 +220,7 @@ impl Runner {
             mcp_providers: Vec::new(),
             history: Vec::new(),
             permission_resolver: None,
+            interactive_tools: true,
             todo_nudge: None,
             retirement_sink: None,
         }
@@ -328,6 +331,36 @@ impl Runner {
     #[must_use]
     pub fn take_claim_retirements(&mut self) -> Vec<dch_tools::TodoEntry> {
         std::mem::take(&mut self.claim_retirements)
+    }
+
+    /// Run one compaction pass over the committed history, now.
+    ///
+    /// The manual `/compact` seam: between runs, the engine's own
+    /// context manager — the same compactor and thresholds the
+    /// automatic passes use — folds the history, and the pruned result
+    /// is installed as the machine's history so the next run continues
+    /// from the compacted context. The returned pair carries the
+    /// notice a host shows — the tokens the pass saved and the size it
+    /// left the context, figures the pass itself measured, never
+    /// derived — beside whether the pass actually changed the history:
+    /// `false` for a fitting context the pass declined to fold, so a
+    /// host's bookkeeping (a snapshot republish, a compaction count)
+    /// can skip its work when nothing changed. A
+    /// machine caught mid-turn refuses: compaction runs
+    /// between runs, not under a live turn.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the engine's own shapes — [`LoopError::InvalidInput`]
+    /// when a turn is in flight, [`LoopError::CompactionFailed`] when
+    /// the compactor itself fails, and
+    /// [`LoopError::ContextExceeded`] when the compacted result still
+    /// exceeds the window.
+    pub async fn compact_now(&mut self) -> Result<(bool, String), LoopError> {
+        let outcome = self.inner.compact_manual().await?;
+        let notice = compaction_notice(&outcome);
+        let compacted = matches!(outcome, loopctl::compact::EnsureContextResult::Compacted(_));
+        Ok((compacted, notice))
     }
 
     /// Signal the in-flight run, if any, to cancel.
@@ -591,6 +624,14 @@ pub struct RunnerBuilder<'a> {
     /// signal, so a cancelled run denies rather than waits.
     permission_resolver: Option<AskResolverFn>,
 
+    /// Whether the interaction-only tools register.
+    ///
+    /// True by default — the interactive host's composition. Turned off
+    /// by [`without_interactive_tools`](Self::without_interactive_tools)
+    /// for hosts with no one to ask (a headless run), so the model is
+    /// never offered a call that could only fail.
+    interactive_tools: bool,
+
     /// How the host echoes an accepted todo-nudge reminder, and
     /// whether it will still take one.
     ///
@@ -706,6 +747,22 @@ impl RunnerBuilder<'_> {
         self
     }
 
+    /// Omit the interaction-only tools from the built runner's registry.
+    ///
+    /// The headless host's spelling of "no one to ask": `AskUserQuestion`
+    /// registers in the default composition and soft-errors when no UI
+    /// answers, but a composition that cannot ask at all is cleaner —
+    /// the model never sees the tool, so it never spends a turn on a
+    /// call that could only fail. Both registry positions (the engine's
+    /// advertised set and the dispatch core) omit it together, keeping
+    /// the two identical by construction. MCP tools are untouched: a
+    /// server's tools are the host's own choice.
+    #[must_use]
+    pub fn without_interactive_tools(mut self) -> Self {
+        self.interactive_tools = false;
+        self
+    }
+
     /// Arm the todo nudge, with the echo an accepted reminder owes
     /// and the host's leave to extend a run.
     ///
@@ -793,8 +850,18 @@ impl RunnerBuilder<'_> {
         let client = Arc::new(crate::create_client(&self.config.api)?);
         let connections = connect_mcp_servers(self.config, &context.cwd).await?;
         let read_windows = read_windows_for(&self.config.runner);
-        let registry = compose_registry(&connections, &fs_session, read_windows);
-        let core_registry = compose_registry(&connections, &fs_session, read_windows);
+        let registry = compose_registry(
+            &connections,
+            &fs_session,
+            read_windows,
+            self.interactive_tools,
+        );
+        let core_registry = compose_registry(
+            &connections,
+            &fs_session,
+            read_windows,
+            self.interactive_tools,
+        );
         for provider in &self.mcp_providers {
             provider.register_into(&registry);
             provider.register_into(&core_registry);
@@ -1066,12 +1133,19 @@ fn fs_resolve_policy_for(runner: &dch_config::RunnerConfig) -> FsResolvePolicy {
 /// registry and the dispatch pipeline's core cannot share boxed tools, so
 /// each gets its own composition from the same connections (an MCP tool
 /// clones into both, keeping the two positions identical by construction).
+/// `ask_tools` selects the builtin half: the full composition or the
+/// non-interactive one that omits `AskUserQuestion`.
 fn compose_registry(
     connections: &[McpConnection],
     fs_session: &FileSession,
     windows: dch_tools::ReadWindows,
+    ask_tools: bool,
 ) -> ToolRegistry {
-    let registry = builtin_registry(fs_session, windows);
+    let registry = if ask_tools {
+        builtin_registry(fs_session, windows)
+    } else {
+        dch_tools::non_interactive_registry(fs_session, windows)
+    };
     for connection in connections {
         match &connection.allowed {
             None => connection.provider.register_into(&registry),
@@ -1321,6 +1395,28 @@ impl ToolMiddleware for ContextInjector {
     }
 }
 
+/// The notice a manual compaction pass earned, from what the pass measured.
+///
+/// Pure over the outcome so the wording is pinnable without an engine:
+/// the compacted arm carries only the figures the pass itself reported —
+/// tokens saved and the size the context now measures, never a figure
+/// derived from them — and the no-action arm says the context fits. The
+/// wildcard arm exists because loopctl marks the outcome non-exhaustive;
+/// its honest answer is a finished-without-figures notice, never a
+/// fabricated number.
+fn compaction_notice(outcome: &loopctl::compact::EnsureContextResult) -> String {
+    match outcome {
+        loopctl::compact::EnsureContextResult::Compacted(result) => format!(
+            "compacted: {} tokens saved — the context now measures {} tokens",
+            result.tokens_saved, result.tokens_after
+        ),
+        loopctl::compact::EnsureContextResult::NoAction(_) => {
+            "nothing to compact — the context fits".to_string()
+        }
+        _ => "compaction pass finished".to_string(),
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -1345,6 +1441,29 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Mutex;
     use tempfile::TempDir;
+
+    #[test]
+    fn the_compaction_notice_carries_only_measured_figures() {
+        // Both arms pinned at the wording level: a compacted pass names
+        // the tokens saved and the size the context now measures —
+        // figures the pass itself reported, never derived from them —
+        // and a no-action pass says the context fits without inventing
+        // numbers.
+        let compacted = loopctl::compact::EnsureContextResult::Compacted(
+            loopctl::compact::CompactionOutcome::compacted(Vec::new(), 1_000, 650),
+        );
+        assert_eq!(
+            compaction_notice(&compacted),
+            "compacted: 350 tokens saved — the context now measures 650 tokens",
+            "the compacted arm prints the pass's own figures"
+        );
+        let fitting = loopctl::compact::EnsureContextResult::NoAction(Vec::new());
+        assert_eq!(
+            compaction_notice(&fitting),
+            "nothing to compact — the context fits",
+            "the no-action arm claims nothing it did not measure"
+        );
+    }
 
     /// A tool that reports the `cwd` it sees via the `RunnerContext` extension
     /// (sentinel `"absent"` when no extension is installed) plus the native
@@ -3306,6 +3425,89 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn compact_now_at_rest_reports_a_fitting_context() {
+        // The no-action arm through the whole method, not just the
+        // formatter: a fresh runner's empty history fits, the pass
+        // declines to fold anything, and the notice says so without
+        // inventing figures. (The mid-turn refusal the doc names is the
+        // engine's own guard, pinned on the engine's side: run() takes
+        // the runner exclusively, so no host of this crate can hold a
+        // live turn and issue compact_now at once — the TUI refuses
+        // /compact while a run holds the agent before the engine's own
+        // check is ever reachable.)
+        let dir = TempDir::new().expect("tempdir");
+        let mut runner = Runner::builder(&offline_config(), dir.path())
+            .build()
+            .await
+            .expect("Runner::new constructs offline");
+        let (compacted, notice) = runner
+            .compact_now()
+            .await
+            .expect("an empty context needs no pass");
+        assert_eq!(
+            notice, "nothing to compact — the context fits",
+            "the no-action notice is the pass's own verdict"
+        );
+        assert!(
+            !compacted,
+            "a fitting context changed no history — the host counts no pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_now_folds_the_committed_history_in_place() {
+        // A history already past the threshold, folded at rest: the
+        // runner's own committed history — the one the next run and the
+        // host's snapshot read — is the folded result, and the notice
+        // carries the figures the pass measured. This is the pass whose
+        // result the TUI driver publishes after; pinned here at the
+        // source, with the truncating selection so the pass is the
+        // machine's own work. One scripted run first: the truncator
+        // folds material older than the last run, so the seeded bulk
+        // must sit behind a completed exchange to be droppable.
+        let dir = TempDir::new().expect("tempdir");
+        let seeds: Vec<loopctl::message::Message> = (0..20)
+            .map(|turn| {
+                let filler = "a line of context for the compactor ".repeat(120);
+                if turn % 2 == 0 {
+                    loopctl::message::Message::user(format!("earlier exchange {turn}: {filler}"))
+                } else {
+                    loopctl::message::Message::assistant(format!("earlier answer {turn}: {filler}"))
+                }
+            })
+            .collect();
+        let server = SseServer::start(vec![sse_text_turn("grown")]).await;
+        let mut config = wire_config(server.port, 5);
+        config.api.context_window = Some(40_000);
+        config.runner.compactor = dch_config::CompactorSelection::Truncating;
+        let mut runner = Runner::builder(&config, dir.path())
+            .with_history(seeds)
+            .build()
+            .await
+            .expect("constructs over a fat history");
+        tokio::time::timeout(std::time::Duration::from_secs(20), runner.run("grow"))
+            .await
+            .expect("the scripted run completes")
+            .expect("the run finishes");
+        let before = runner.committed_history().len();
+        let (compacted, notice) = runner
+            .compact_now()
+            .await
+            .expect("a manual pass at rest runs");
+        assert!(
+            notice.starts_with("compacted: "),
+            "the notice carries the pass's own figures: {notice}"
+        );
+        assert!(compacted, "a real fold changed the history");
+        let after = runner.committed_history().len();
+        assert!(
+            after < before,
+            "the committed history the next run continues from is the folded one \
+             ({before} -> {after})"
+        );
+    }
+
     fn offline_config() -> DchConfig {
         use dch_config::ApiConfig;
         use dch_config::ApiType;
@@ -4132,6 +4334,102 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rebuild_with_carried_history_keeps_the_read_guard_armed() {
+        // The mid-session switch shape: the host rebuilds the runner on
+        // a carried machine history and re-arms the guard from that
+        // history's own Read call inputs — the fresh context's baseline
+        // map starts empty, so without the re-arm an externally changed
+        // file would take the stale write. The refusal wording is the
+        // resumed-baseline shape: the model never saw these bytes in
+        // this session's engine.
+        let server = SseServer::start(vec![
+            sse_tool_call_turn(
+                "Write",
+                &serde_json::json!({"file_path": "note.txt", "content": "clobber"}),
+            ),
+            sse_text_turn("done"),
+        ])
+        .await;
+        let dir = TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join("note.txt"), "original").expect("seed target");
+        let first = Runner::builder(&wire_config(server.port, 10), dir.path())
+            .build()
+            .await
+            .expect("constructs");
+        // The carried history: the conversation's earlier turn read the
+        // file and the read came back clean — recorded verbatim in the
+        // machine shape a switch carries, call paired to its result the
+        // way the host's re-arm pairing reads it.
+        let history = vec![
+            Message::new(
+                loopctl::message::Role::Assistant,
+                vec![MessagePart::tool_call(
+                    "call_1",
+                    "Read",
+                    serde_json::json!({"path": "note.txt"}),
+                )],
+            ),
+            Message::new(
+                loopctl::message::Role::User,
+                vec![MessagePart::tool_result(
+                    "call_1", "Read", "original", false,
+                )],
+            ),
+        ];
+        let rebuilt = Runner::builder(&wire_config(server.port, 10), dir.path())
+            .with_history(history)
+            .build()
+            .await
+            .expect("rebuilds with the carried history");
+        drop(first);
+        // The host's re-arm: every path the carried history shows read
+        // and clean — the pairing rule the resume path ships.
+        let mut succeeded = std::collections::HashSet::new();
+        for message in rebuilt.committed_history() {
+            for part in &message.parts {
+                if let MessagePart::ToolResult {
+                    call_id, is_error, ..
+                } = part
+                    && !matches!(is_error, Some(true))
+                {
+                    succeeded.insert(call_id.clone());
+                }
+            }
+        }
+        for message in rebuilt.committed_history() {
+            for part in &message.parts {
+                let MessagePart::ToolCall { id, name, input } = part else {
+                    continue;
+                };
+                if !succeeded.contains(id) {
+                    continue;
+                }
+                if name == "Read"
+                    && let Some(path) = input.get("path").and_then(serde_json::Value::as_str)
+                {
+                    assert!(
+                        rebuilt.record_resumed_read(path).await,
+                        "the carried read re-arms on the rebuilt context"
+                    );
+                }
+            }
+        }
+        std::fs::write(dir.path().join("note.txt"), "externally changed")
+            .expect("mutate after the rebuild");
+        let mut rebuilt = rebuilt;
+        let run = tokio::time::timeout(std::time::Duration::from_secs(10), rebuilt.run("go"))
+            .await
+            .expect("run settles within timeout")
+            .expect("a refused tool is a soft error, not a run failure");
+        assert_eq!(run.output.as_deref(), Some("done"));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("note.txt")).unwrap_or_default(),
+            "externally changed",
+            "the re-armed guard held the write across the rebuild"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_approved_write_still_refuses_a_target_changed_during_the_ask() {
         // The approval window must not widen the conflict window: the
         // gate parks the dispatch until the resolver answers, and the
@@ -4664,6 +4962,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_unprotected_first_write_at_a_pipe_keeps_the_raw_route() {
+        // The write-protection family installs only beside redaction, and
+        // the tool layer's own refusal is baseline-conditional: a pipe the
+        // session never read holds no baseline, so with redaction off the
+        // staleness check classifies nothing and the atomic rename lands
+        // an ordinary file over the endpoint — the target gate's
+        // documented "raw route". Pinned so the acceptance of that cell
+        // is a fact the suite owns: a future unconditioned WriteTargetGate
+        // flips this pin, and a stall here would mean the tool opened the
+        // pipe instead of renaming over it.
+        let dir = TempDir::new().expect("tempdir");
+        let fifo = dir.path().join("notify");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo runs");
+        assert!(status.success(), "the fifo fixture exists");
+        let pipeline = fs_pipeline(dir.path(), false);
+
+        let write = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            drive(
+                &pipeline,
+                "Write",
+                serde_json::json!({"file_path": "notify", "content": "payload"}),
+            ),
+        )
+        .await
+        .expect("the raw route settles instead of parking on the pipe");
+        assert!(
+            !write.is_error,
+            "the never-read pipe holds no baseline to hold the write with: {}",
+            write.output
+        );
+        assert!(
+            std::fs::metadata(&fifo).is_ok_and(|meta| meta.is_file()),
+            "an ordinary file stands at the endpoint after the rename"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&fifo).unwrap_or_default(),
+            "payload",
+            "the renamed file carries the written bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_batch_whose_second_entry_lost_its_anchor_writes_nothing() {
+        // One MultiEdit call, two files: both read through the pipeline,
+        // the second externally changed before the batch runs. The
+        // anchor the second entry names is gone from the file's current
+        // bytes, so the batch's preparation stage — which reads every
+        // target and substitutes every anchor before any write — refuses
+        // the whole call: nothing lands, ahead-entry included. The
+        // mid-batch partial-landing shape (writes that already reached
+        // the disk when a *later* entry's re-check conflicts) belongs to
+        // the write stage loopctl pins; the deterministic dch-seam fact
+        // is this all-or-nothing refusal at preparation.
+        let dir = TempDir::new().expect("tempdir");
+        std::fs::write(dir.path().join("a.txt"), "alpha\n").expect("seed a");
+        std::fs::write(dir.path().join("b.txt"), "beta\n").expect("seed b");
+        let pipeline = fs_pipeline(dir.path(), false);
+
+        let read = drive(
+            &pipeline,
+            "ReadFiles",
+            serde_json::json!({"files": ["a.txt", "b.txt"]}),
+        )
+        .await;
+        assert!(!read.is_error, "{}", read.output);
+        std::fs::write(dir.path().join("b.txt"), "external\n")
+            .expect("external change to the second file");
+
+        let batch = drive(
+            &pipeline,
+            "MultiEdit",
+            serde_json::json!({
+                "edits": [
+                    {"file_path": "a.txt", "old_text": "alpha", "new_text": "ALPHA"},
+                    {"file_path": "b.txt", "old_text": "beta", "new_text": "BETA"}
+                ]
+            }),
+        )
+        .await;
+        assert!(
+            batch.is_error,
+            "the batch refuses against the changed second file: {batch:?}"
+        );
+        let refusal = batch.output.to_string();
+        assert!(
+            refusal.contains("b.txt"),
+            "the refusal names the file whose anchor is gone: {refusal}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap_or_default(),
+            "alpha\n",
+            "preparation-stage refusal lands nothing — the ahead entry stays as it was"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("b.txt")).unwrap_or_default(),
+            "external\n",
+            "the externally changed file keeps its bytes"
+        );
+    }
+
+    #[tokio::test]
     async fn skip_linter_true_does_not_bypass_the_staleness_guard() {
         // The bypass lifts only the syntax gate: `skip_linter: true` against
         // a stale baseline must still refuse. The two gates are independent,
@@ -4857,11 +5260,13 @@ mod tests {
             std::slice::from_ref(&connection),
             &session,
             dch_tools::ReadWindows::default(),
+            true,
         );
         let core = compose_registry(
             std::slice::from_ref(&connection),
             &session,
             dch_tools::ReadWindows::default(),
+            true,
         );
         for registry in [&engine, &core] {
             assert!(
@@ -6566,6 +6971,7 @@ mod tests {
             &[connection],
             &FileSession::new(PathBuf::from(".")),
             dch_tools::ReadWindows::default(),
+            true,
         );
 
         assert!(
@@ -6936,6 +7342,50 @@ mod tests {
         assert!(
             matches!(result, Err(loopctl::error::LoopError::Cancelled)),
             "expected Cancelled, got {result:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_runner_without_interactive_tools_never_advertises_the_ask() {
+        // The knob the headless host turns: with it, the tools the
+        // provider is offered carry no AskUserQuestion — the model
+        // never sees a tool whose call could only fail — while the
+        // default composition still offers it. The request body is
+        // where the advertised set is visible, so that is what is
+        // pinned.
+        let ask_server = SseServer::start(vec![sse_text_turn("fine")]).await;
+        let dir = TempDir::new().expect("tempdir");
+        let mut ask_runner = Runner::builder(&wire_config(ask_server.port, 5), dir.path())
+            .build()
+            .await
+            .expect("constructs");
+        tokio::time::timeout(std::time::Duration::from_secs(20), ask_runner.run("go"))
+            .await
+            .expect("the default run completes")
+            .expect("the default run finishes");
+        assert!(
+            recorded_requests(&ask_server)
+                .iter()
+                .any(|body| body.contains("AskUserQuestion")),
+            "the default composition advertises the ask tool"
+        );
+
+        let bare_server = SseServer::start(vec![sse_text_turn("fine")]).await;
+        let bare_dir = TempDir::new().expect("tempdir");
+        let mut bare_runner = Runner::builder(&wire_config(bare_server.port, 5), bare_dir.path())
+            .without_interactive_tools()
+            .build()
+            .await
+            .expect("constructs");
+        tokio::time::timeout(std::time::Duration::from_secs(20), bare_runner.run("go"))
+            .await
+            .expect("the non-interactive run completes")
+            .expect("the non-interactive run finishes");
+        assert!(
+            recorded_requests(&bare_server)
+                .iter()
+                .all(|body| !body.contains("AskUserQuestion")),
+            "the non-interactive composition never mentions the ask tool"
         );
     }
 

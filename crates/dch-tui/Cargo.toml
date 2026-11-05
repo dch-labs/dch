@@ -19,6 +19,7 @@ tokio                  = { workspace = true }
 tracing                = { workspace = true }
 serde                  = { workspace = true }
 serde_json             = { workspace = true }
+uuid                   = { workspace = true }
 pest                   = "2.8"
 pest_derive            = "2.8"
 unicode-width          = "0.1"
@@ -80,3 +81,6 @@ syntax-highlight = [
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -188,15 +188,27 @@ impl PromptQueue {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    /// Drop every waiting prompt, keeping nothing for a turn to claim.
+    ///
+    /// `/clear` empties the session between turns: a prompt typed during a
+    /// run and still waiting belongs to the conversation that just ended,
+    /// so it must not surface as the fresh session's first turn. Ids are not
+    /// reused, so a claim for a prompt that had already been named still
+    /// resolves to nothing rather than to one that survived.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
 }
 
 /// What one submit asks the driver to do.
 ///
 /// The panel and the engine's driver are separate tasks, and this is the
 /// whole protocol between them: the display never holds the loop, so a
-/// press of Enter is a request rather than a call. Two requests exist
-/// because the same key can mean two things — send what is waiting, or
-/// replace what already went out.
+/// press of Enter is a request rather than a call. Three requests exist
+/// because the same act can mean three things — send what is waiting,
+/// replace what already went out, or carry out a session command between
+/// turns.
 ///
 /// The queue's own ids ride this boundary on purpose. A prompt still
 /// waiting is *named*, not quoted: the driver reads its text out of the
@@ -257,7 +269,349 @@ pub enum Submission {
         /// this is the only surviving copy of what the user settled on.
         text: String,
     },
+
+    /// Carry out `command` against the loop the driver owns, at rest.
+    ///
+    /// The session lane of the composer's command language: the acts that
+    /// reach the loop (`/clear`, `/model`) ride this rather than a second
+    /// channel, because the driver is the only holder of the runner. A
+    /// command is a between-turns act, so the display raises it only when
+    /// no run is in flight; the running check there and the take-up here
+    /// mean the two halves cannot disagree mid-run.
+    Command {
+        /// The session command to carry out on the driver's loop.
+        ///
+        /// Named rather than executed inline because the loop lives on the
+        /// driver task; the display settles its own half where it can — a
+        /// clear empties the transcript on the spot — and what only the
+        /// driver can produce comes back over the session channel.
+        command: SessionCommand,
+    },
 }
+
+/// A composer command that needs the loop the driver owns.
+///
+/// Only the commands whose effect is on the agent loop appear here. The
+/// purely presentational ones (`/help`, `/theme`) and the unknown-command
+/// notice are carried out by the display itself and never cross this
+/// boundary, so this type names just the acts the driver has to perform on
+/// the runner it holds — and takes up only at rest, since a command is not
+/// a turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionCommand {
+    /// Rewind the committed history to empty and rotate the save target.
+    ///
+    /// The display has already emptied the transcript, the queue, and the
+    /// context display on its own half when it sent this; the driver's part
+    /// is to rewind the live loop's committed history to nothing — the
+    /// same runner, client, and machine state stand — and rotate the
+    /// save target to a fresh session id, so the ended conversation's
+    /// file stands whole and the next turn starts a new one under a new
+    /// identity. A rewind the loop refuses lands as a notice and leaves
+    /// everything — history, identity — exactly as it stood.
+    Clear,
+
+    /// Switch the live loop's model to `name`, rebuilding on its entry.
+    ///
+    /// Carries the name the user resolved, so the driver selects its
+    /// `[[models]]` entry onto the user-stated base — every field the
+    /// entry states, the context window above all, belongs to the
+    /// engine a rebuild installs — and rebuilds the runner on it with
+    /// the conversation carried; a cross-provider entry rides
+    /// [`SessionCommand::SwitchProvider`] instead, which the display
+    /// routes it to before this lane is ever touched.
+    Model {
+        /// The model name to switch the live loop to.
+        ///
+        /// The configured entry's own spelling; the loop's rebuild is
+        /// built around it and the verdict publishes it back.
+        name: String,
+    },
+
+    /// Rebuild the runner on a different provider, carrying the
+    /// conversation.
+    ///
+    /// A cross-provider model switch cannot rename the live client —
+    /// the wire shape differs — so the driver builds a fresh runner on
+    /// the profile's connection settings and seeds it with the
+    /// committed history the old runner holds. What the rebuild
+    /// installed travels back in its own update, and the display's
+    /// configuration and the file take it then — the loop's verdict,
+    /// never the send, is what they record.
+    SwitchProvider {
+        /// The model name on the new provider.
+        ///
+        /// Carried whole because the rebuild names the model it builds
+        /// the new client around.
+        model: String,
+
+        /// The base URL the new provider listens on.
+        ///
+        /// The endpoint the rebuilt runner's client sends every request
+        /// to.
+        base_url: String,
+
+        /// The API type the new provider speaks, spelled as the
+        /// config's `snake_case` name.
+        ///
+        /// The wire shape the rebuild builds the client for; an empty
+        /// spelling inherits the protocol already running.
+        api_type: String,
+    },
+
+    /// Swap the live runner to a saved session's restored history.
+    ///
+    /// The driver alone can load: it parses the id, reads the saved
+    /// pair, and rebuilds the runner on the restored machine history —
+    /// the same shape a launch-time resume builds — so the next
+    /// submission continues the conversation the saved session left.
+    /// What the display cannot do for itself comes back over the
+    /// session channel: the loaded transcript, the restored token
+    /// accounting, and the id whose file later saves write.
+    Resume {
+        /// The saved session's id, as the display resolved it.
+        ///
+        /// The whole address of the load: the driver parses it before it
+        /// reads anything.
+        id: String,
+    },
+
+    /// Run one compaction pass over the committed history, now.
+    ///
+    /// The manual `/compact` seam: the engine's own context manager
+    /// folds the history between runs, the next turn continues from
+    /// the compacted context, and the notice carries the token
+    /// figures the pass measured. The driver publishes the folded
+    /// history to the machine snapshot beside the notice, and the
+    /// payload is the display transcript's Compacted-row count at the
+    /// moment of the command — the one number the driver cannot see
+    /// for itself, so the snapshot it publishes records a truthful
+    /// total (the rows the display carries plus this pass) without
+    /// holding the display.
+    Compact {
+        /// How many Compacted rows the display carries, for the
+        /// machine snapshot this pass publishes.
+        compactions: u32,
+    },
+
+    /// List the saved sessions under the session root, for a picker.
+    ///
+    /// The `/sessions` seam: only the driver holds the sessions root,
+    /// so the display asks and the catalog comes back as a
+    /// [`SessionUpdate::SessionCatalog`] — newest first, exactly what
+    /// the listing reads — for the picker sheet to walk.
+    ListSessions,
+}
+
+/// One saved session as a picker row sees it.
+///
+/// The display-facing half of a saved-session summary: the id a
+/// `--resume` takes, the model the session ran, when its last save
+/// landed, and how many prompts the user submitted. The driver reads
+/// the sessions root and maps its summaries into this shape; the
+/// panel renders and walks it without touching the filesystem —
+/// the crate boundary keeps the root on the host's side of it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionPick {
+    /// The session identity, as `dch --resume <id>` takes it.
+    ///
+    /// The canonical spelling of the uuid naming the session's
+    /// directory — the same address the picker's Enter hands to the
+    /// resume lane.
+    pub id: String,
+
+    /// The model the session ran.
+    ///
+    /// The envelope's own record, so a row tells which model the
+    /// conversation belongs to before it is reopened.
+    pub model: String,
+
+    /// When the session's last save landed.
+    ///
+    /// Newer rows sort first; the picker shows the moment so recent
+    /// conversations stand out from stale ones.
+    pub saved_at: chrono::DateTime<chrono::Utc>,
+
+    /// How many prompts the user submitted over the session.
+    ///
+    /// The summary's own count — submissions only, not tool calls or
+    /// echo rows — one glance at how long the conversation runs.
+    pub prompts: usize,
+
+    /// The working directory the session ran in, when recorded.
+    ///
+    /// The picker's row shows it so sessions on the same model in
+    /// different repos read differently at a glance; `None` on
+    /// sessions saved before the field existed.
+    pub workdir: Option<String>,
+}
+
+/// A between-turns fact the driver hands back to the display.
+///
+/// The reverse direction of [`Submission`]: the driver alone holds the
+/// runner, so when it acts on a [`SessionCommand`] the loop's identity
+/// changes there and only the driver can say so. Rather than a second
+/// protocol, this small enum rides a dedicated channel from driver to panel
+/// and names what the display cannot compute for itself — which session
+/// you are now in, which model the loop will carry next, the transcript a
+/// resumed session restored — plus one shape for everything a command's
+/// outcome leaves to say: a plain line of text for a refusal, a failure,
+/// or a result. Everything else the display reads from the shared
+/// observer state; these are the values that live only on the driver task.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SessionUpdate {
+    /// The session's id is now `id`; the status bar shows it on its next draw.
+    ///
+    /// Posted after a `/clear` rotates the save target to a fresh
+    /// identity, so the id the user reads is the one the ended
+    /// conversation was retired behind and the next save is written
+    /// under. The loop itself was rewound, not swapped: the same runner
+    /// keeps running on an emptied history.
+    SessionId {
+        /// The new session id, rendered as the status bar shows it.
+        ///
+        /// Names the conversation every later save writes.
+        id: String,
+    },
+
+    /// The live loop's model is now `name`; the status bar shows it.
+    ///
+    /// Posted after a `/model` switch lands, so the bar and the next
+    /// request's body agree on the model without the panel having to guess
+    /// whether the driver's apply succeeded. The display carries the name
+    /// into the running configuration and saves it, so the file describes
+    /// the loop that accepted the switch.
+    ModelName {
+        /// The model name now carried by the live loop.
+        ///
+        /// The loop's own report of the switch it accepted — the display
+        /// records and saves it, never assumes it.
+        name: String,
+    },
+
+    /// A cross-provider switch landed: the loop now runs `model` on a new
+    /// endpoint.
+    ///
+    /// Posted after the rebuilt runner takes over, carrying the
+    /// connection settings that rebuild installed — and behind them
+    /// the whole entry the rebuild selected: the display applies the
+    /// wire fields and re-resolves the entry over the user-stated base,
+    /// so its configuration mirrors what the engine runs, field for
+    /// field, and saves the same write-through a same-provider switch
+    /// performs.
+    Provider {
+        /// The model name now carried by the live loop.
+        ///
+        /// The rebuild's own report of the model its client was built
+        /// around.
+        model: String,
+
+        /// The base URL the new provider listens on.
+        ///
+        /// The endpoint the rebuilt runner's client sends every request
+        /// to.
+        base_url: String,
+
+        /// The API type the new provider speaks, spelled as the config's
+        /// `snake_case` name.
+        ///
+        /// The wire shape the rebuild builds the client for; an empty
+        /// spelling inherits the protocol already running.
+        api_type: String,
+    },
+
+    /// A saved session was adopted; the display re-seeds from what this
+    /// carries.
+    ///
+    /// The display half of a live resume: the driver rebuilt the loop on
+    /// the saved machine history and moved the save target onto the
+    /// session's own file, and this brings back what the screen shows —
+    /// the loaded transcript, the session's accounting, and the id now
+    /// being written.
+    Resumed {
+        /// The adopted session's id — the file later saves write.
+        ///
+        /// The identity the save target moved onto; the status bar shows
+        /// it as the session in progress.
+        id: String,
+
+        /// The loaded display transcript, verbatim as saved.
+        ///
+        /// Replaces what the screen shows in one move, the same seeding
+        /// a launch resume performs.
+        transcript: Vec<crate::message::TuiMessage>,
+
+        /// The session's cumulative token accounting at save time.
+        ///
+        /// Restored into the running counters so the resumed session
+        /// continues the saved one's story.
+        tokens: ResumedTokens,
+    },
+
+    /// A line the driver could not keep to itself: a refusal, a failure, or
+    /// a result.
+    ///
+    /// The notice row's text, already user-facing prose: why a switch was
+    /// declined, why a resume or rebuild could not happen, or the figures
+    /// a manual compaction measured. The display posts it as-is; the
+    /// driver has no other way to be heard.
+    Notice {
+        /// The text to post on the notice row.
+        ///
+        /// Already user-facing prose from the driver; the display posts
+        /// it as-is.
+        text: String,
+    },
+
+    /// The saved sessions under the root, newest first, for a picker.
+    ///
+    /// The answer to a [`SessionCommand::ListSessions`]: the catalog a
+    /// `/sessions` picker walks. An empty catalog is itself the
+    /// answer — nothing saved yet — and the display says so rather
+    /// than opening an empty sheet.
+    SessionCatalog {
+        /// The saved sessions, newest first.
+        ///
+        /// The listing's own order: the picker highlights the first
+        /// row — the most recent conversation — on open.
+        rows: Vec<SessionPick>,
+    },
+}
+
+/// The token accounting a resumed session restores, as the driver read it
+/// from the saved envelope.
+///
+/// Plain numbers rather than the host's own accounting type: the panel
+/// writes them into its running counters so the resumed session continues
+/// the saved one's story instead of restarting at zero, and the channel
+/// that carries them crosses into this crate, which owns no session-file
+/// types of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResumedTokens {
+    /// Input tokens since the resumed session began.
+    ///
+    /// The spend figure the status bar's running total shows, continued
+    /// from the save rather than restarted.
+    pub cumulative_input: u64,
+
+    /// Output tokens since the resumed session began.
+    ///
+    /// The output half of the same accounting.
+    pub cumulative_output: u64,
+
+    /// The input tokens of the resumed session's most recent turn.
+    ///
+    /// The approximate size of the context the resume re-loads; the first
+    /// new turn re-reports it.
+    pub last_input: u64,
+
+    /// The engine's context-size estimate at the moment of the save.
+    ///
+    /// What the usage bar shows across the resume, before the first turn
+    /// replaces it with a live figure.
+    pub context_tokens: u64,
+}
+
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -291,6 +645,30 @@ mod tests {
                 queue.index_of(third)
             ),
             (Some(0), Some(1), Some(2))
+        );
+    }
+
+    #[test]
+    fn clearing_drops_every_waiting_prompt_without_reusing_ids() {
+        // `/clear` empties the session between turns: nothing that was waiting
+        // may surface as the fresh session's first turn, and an id named before
+        // the clear must not silently re-point at a prompt issued after it.
+        let mut queue = PromptQueue::default();
+        let first = queue.push("first".to_string());
+        queue.push("second".to_string());
+
+        queue.clear();
+
+        assert!(queue.is_empty(), "nothing survives a clear");
+        assert_eq!(queue.len(), 0);
+        assert_eq!(queue.index_of(first), None, "the old id names nothing");
+        // A prompt issued after the clear takes a fresh id, never a recycled one.
+        let later = queue.push("later".to_string());
+        assert_ne!(later, first, "ids are not reused across a clear");
+        assert_eq!(
+            queue.index_of(first),
+            None,
+            "the old id still names nothing"
         );
     }
 

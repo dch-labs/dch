@@ -293,7 +293,7 @@ fn run_hook_guarded(hook: impl Fn()) {
 /// source so tests can drive it without OS signals.
 ///
 /// Runs until a repeat interrupt lands inside the window — the first
-/// interrupt cooperatively cancels via `cancel` and arms the window with
+/// interrupt cooperatively cancels through `fire` and arms the window with
 /// the listener still attached, the window's expiry re-arms a fresh
 /// first-interrupt, and a repeat inside the window runs `on_force` and
 /// yields [`BridgeOutcome::Forced`] — or until the stop signal fires,
@@ -310,7 +310,7 @@ fn run_hook_guarded(hook: impl Fn()) {
 async fn bridge_loop(
     source: &mut InterruptSource,
     stop: &mut tokio::sync::watch::Receiver<bool>,
-    cancel: Arc<CancelSignal>,
+    fire: impl Fn(),
     on_force: impl Fn(),
 ) -> BridgeOutcome {
     let mut previous: Option<Instant> = None;
@@ -343,7 +343,7 @@ async fn bridge_loop(
         let now = Instant::now();
         match classify_interrupt(previous, now) {
             InterruptDecision::Cancel => {
-                cancel.cancel();
+                fire();
                 report(
                     "dch: interrupt received — cancelling the current turn \
                      (repeat the interrupt to quit immediately)",
@@ -386,15 +386,54 @@ async fn bridge_loop(
 /// Windows persistence across a dropped Ctrl-C stream is unverified.
 /// The signature carries only the signal
 /// and a hook — not the runner — so any mode can install the same
-/// bridge against its own runner's signal.
+/// bridge against its own runner's signal; a session that swaps
+/// runners mid-life installs [`install_live_cancel_handler`]
+/// instead, against the shared cell the swap rewrites.
 pub fn install_cancel_handler(
     cancel: Arc<CancelSignal>,
+    on_force: impl Fn() + Send + 'static,
+) -> CancelBridge {
+    spawn_bridge(move || cancel.cancel(), on_force)
+}
+
+/// Install the SIGINT/SIGTERM bridge against a swapped signal cell.
+///
+/// The TUI session's live cancel signal sits in a shared cell the
+/// driver rewrites at every runner rebuild (`/model`, `/resume`, a
+/// cross-provider switch); locking the cell at each interrupt means
+/// the cooperative stop always reaches the runner in flight, never
+/// the startup runner's dead handle a fixed bridge would keep
+/// cancelling. The force hook and the stop discipline are the fixed
+/// bridge's own.
+pub fn install_live_cancel_handler(
+    shared: Arc<std::sync::Mutex<Arc<CancelSignal>>>,
+    on_force: impl Fn() + Send + 'static,
+) -> CancelBridge {
+    spawn_bridge(
+        move || {
+            shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .cancel();
+        },
+        on_force,
+    )
+}
+
+/// Spawn the bridge task around its cancel fire and its force hook.
+///
+/// The two installers' shared body: the source is installed, the loop
+/// runs to its outcome, and a forced outcome exits the process with
+/// the interrupt status. What differs between the installers is only
+/// the fire — which signal a cooperative stop trips.
+fn spawn_bridge(
+    fire: impl Fn() + Send + 'static,
     on_force: impl Fn() + Send + 'static,
 ) -> CancelBridge {
     let (stop, mut stop_rx) = tokio::sync::watch::channel(false);
     let mut source = InterruptSource::Listeners(InterruptListeners::install());
     let task = tokio::spawn(async move {
-        let outcome = bridge_loop(&mut source, &mut stop_rx, cancel, on_force).await;
+        let outcome = bridge_loop(&mut source, &mut stop_rx, fire, on_force).await;
         if outcome == BridgeOutcome::Forced {
             std::process::exit(130);
         }
@@ -620,9 +659,14 @@ mod tests {
         let mut source = InterruptSource::Channel(ChannelSource { rx: received });
         let (stop, mut stop_rx) = tokio::sync::watch::channel(false);
         let bridge = tokio::spawn(async move {
-            bridge_loop(&mut source, &mut stop_rx, hook_cancel, move || {
-                hook_flag.store(true, std::sync::atomic::Ordering::SeqCst);
-            })
+            bridge_loop(
+                &mut source,
+                &mut stop_rx,
+                move || hook_cancel.cancel(),
+                move || {
+                    hook_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                },
+            )
             .await
         });
         BridgeHarness {
@@ -694,9 +738,14 @@ mod tests {
         let mut source = InterruptSource::Channel(ChannelSource { rx: received });
         let (_keep_open, mut stop_rx) = tokio::sync::watch::channel(false);
         let bridge = tokio::spawn(async move {
-            bridge_loop(&mut source, &mut stop_rx, cancel, || {
-                panic!("the durable-state hook failed");
-            })
+            bridge_loop(
+                &mut source,
+                &mut stop_rx,
+                move || cancel.cancel(),
+                || {
+                    panic!("the durable-state hook failed");
+                },
+            )
             .await
         });
         let _sent = interrupts.send(());
@@ -863,6 +912,45 @@ mod tests {
         assert!(
             !hook_fired.load(std::sync::atomic::Ordering::SeqCst),
             "a single interrupt cooperatively cancels and must not force"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_live_bridge_cancels_the_signal_the_cell_holds_now() {
+        // The rebuild seam's bridge half: the TUI session's signal sits
+        // in a shared cell a runner rebuild swaps, and the interrupt
+        // must cancel the signal the cell holds at that moment — a
+        // bridge bound to the startup signal would keep tripping a
+        // dead handle after the first /model switch.
+        let _signal_lock = SIGNAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_listeners_install();
+        let cell: Arc<std::sync::Mutex<Arc<CancelSignal>>> =
+            Arc::new(std::sync::Mutex::new(Arc::new(CancelSignal::new())));
+        let startup = Arc::new(CancelSignal::new());
+        *cell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::clone(&startup);
+        let bridge = install_live_cancel_handler(Arc::clone(&cell), || {});
+        // The rebuild: the cell now holds the rebuilt runner's signal.
+        let rebuilt = Arc::new(CancelSignal::new());
+        *cell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::clone(&rebuilt);
+
+        unsafe { libc::kill(libc::getpid(), libc::SIGINT) };
+        let cancelled = tokio::time::timeout(Duration::from_secs(5), rebuilt.notified()).await;
+        assert!(
+            cancelled.is_ok(),
+            "the interrupt cancels the swapped signal the cell holds now"
+        );
+        bridge.stop().await;
+        assert!(
+            !startup.is_cancelled(),
+            "the startup signal the cell no longer names stays untouched"
         );
     }
 

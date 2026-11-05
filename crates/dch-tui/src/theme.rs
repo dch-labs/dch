@@ -505,6 +505,23 @@ impl Theme {
     /// the session.
     #[must_use]
     pub fn by_name(name: &str) -> Option<Self> {
+        let key = Self::key_for_name(name)?;
+        theme_data::THEME_CONSTRUCTORS
+            .iter()
+            .find(|(known, _)| *known == key)
+            .map(|(_, constructor)| constructor())
+    }
+
+    /// The registry key a name resolves to, when it resolves at all.
+    ///
+    /// The inverse half of [`Theme::by_name`]'s folding: whatever spelling a
+    /// user types — the key, the display name, any casing or spacing —
+    /// answers with the canonical registry key, the one spelling the
+    /// config file documents and `/themes` lists. Callers that persist
+    /// a theme name store this, so one value has one stored spelling
+    /// everywhere; `None` is the same miss [`Theme::by_name`] reports.
+    #[must_use]
+    pub fn key_for_name(name: &str) -> Option<&'static str> {
         let key = name
             .to_lowercase()
             .split_whitespace()
@@ -513,7 +530,47 @@ impl Theme {
         theme_data::THEME_CONSTRUCTORS
             .iter()
             .find(|(known, _)| *known == key)
-            .map(|(_, constructor)| constructor())
+            .map(|(known, _)| *known)
+    }
+
+    /// The display names every compiled-in theme answers to, in registry order.
+    ///
+    /// Reads the same constructor table [`Theme::by_name`] resolves through,
+    /// so the list is exactly the set of names that resolve — never a separate
+    /// copy that could fall out of step as themes are added or removed. The
+    /// names are the display spelling (`"Gruvbox Dark"`) rather than the
+    /// lowercase lookup key, which is what a user of `/theme` reads and types,
+    /// and [`Theme::by_name`] folds case and whitespace so this spelling still
+    /// resolves. Intended as a completion source; it evaluates every
+    /// constructor, so a caller reaching it on every keypress should cache the
+    /// result rather than call it in a hot path.
+    #[must_use]
+    pub fn names() -> Vec<&'static str> {
+        theme_data::THEME_CONSTRUCTORS
+            .iter()
+            .map(|(_, constructor)| constructor().name)
+            .collect()
+    }
+
+    /// The canonical command spelling of every compiled-in theme.
+    ///
+    /// These are the lookup identifiers — `default`, `nord`, `gruvbox_dark`,
+    /// `tokyo_night` — the spellings a well-formed config file carries under
+    /// `theme =` (the loader itself takes any string; these are the words it
+    /// resolves) and the exact strings [`Theme::by_name`] matches, so what a
+    /// user sees listed by `/themes` or offered by `/theme <Tab>` is
+    /// precisely what they then type. Distinct from [`Theme::names`], which
+    /// returns the pretty display spelling (`"Gruvbox Dark"`) the palette is
+    /// *labelled* by. Because
+    /// the keys are stored beside their constructors, this reads only the
+    /// table's identifiers — it builds no palettes — so it is cheap enough to
+    /// call on every keypress, unlike [`Theme::names`].
+    #[must_use]
+    pub fn command_names() -> Vec<&'static str> {
+        theme_data::THEME_CONSTRUCTORS
+            .iter()
+            .map(|(key, _)| *key)
+            .collect()
     }
 }
 
@@ -631,6 +688,47 @@ mod tests {
             .collect();
         let unique: std::collections::HashSet<&str> = keys.iter().copied().collect();
         assert_eq!(unique.len(), keys.len(), "duplicate registry key: {keys:?}");
+    }
+
+    #[test]
+    fn command_names_are_the_settable_lookup_keys() {
+        // The command spelling is the registry key (`gruvbox_dark`), which is
+        // what `/themes` lists, `/theme <Tab>` offers, and `by_name` accepts —
+        // distinct from the pretty display name (`"Gruvbox Dark"`).
+        let commands = Theme::command_names();
+        assert!(commands.contains(&"default"));
+        assert!(commands.contains(&"gruvbox_dark"));
+        // Not display spellings: no spaces, no capitals.
+        assert!(
+            commands
+                .iter()
+                .all(|key| !key.contains(' ') && *key == key.to_lowercase()),
+            "command names are lower-case identifiers, got {commands:?}"
+        );
+        // Every command name resolves back to itself; every display name too.
+        for key in &commands {
+            assert!(Theme::by_name(key).is_some(), "{key} must resolve");
+        }
+        assert_eq!(
+            commands.len(),
+            Theme::names().len(),
+            "same set, two spellings"
+        );
+    }
+
+    #[test]
+    fn names_lists_every_registered_theme_in_registry_order() {
+        // The completion source for `/theme` must be exactly the set that
+        // `by_name` resolves, in the same order, and spelled so it resolves.
+        let names = Theme::names();
+        assert_eq!(names.len(), theme_data::THEME_CONSTRUCTORS.len());
+        assert!(names.iter().all(|name| !name.is_empty()));
+        for name in names {
+            assert!(
+                Theme::by_name(name).is_some(),
+                "name {name} must resolve through by_name"
+            );
+        }
     }
 
     #[test]
@@ -819,6 +917,39 @@ mod tests {
     }
 
     #[test]
+    fn key_for_name_folds_every_spelling_to_the_registry_key() {
+        // The persistence half of the lookup: whatever spelling a user
+        // types — key, display name, any casing or spacing — the stored
+        // value is the registry key, the one spelling `/themes` lists
+        // and the config file documents, so one theme has one stored
+        // spelling on every surface.
+        for typed in [
+            "nord",
+            "Nord",
+            "NORD",
+            " nord ",
+            "Gruvbox Dark",
+            "gruvbox_dark",
+        ] {
+            let key = Theme::key_for_name(typed).unwrap_or_else(|| panic!("{typed:?} resolves"));
+            assert!(
+                key.chars()
+                    .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit()),
+                "the registry key is the lowercase identifier spelling: {key}"
+            );
+            assert!(
+                Theme::by_name(key).is_some_and(|theme| !theme.name.is_empty()),
+                "the key resolves back through by_name"
+            );
+        }
+        assert_eq!(
+            Theme::key_for_name("not-a-theme"),
+            None,
+            "a miss is by_name's miss"
+        );
+    }
+
+    #[test]
     fn by_name_is_trimmed_and_case_insensitive() {
         for spelling in ["Dracula", "DRACULA", "  dracula  "] {
             assert_eq!(
@@ -905,6 +1036,26 @@ mod tests {
         }
     }
 
+    /// WCAG relative-luminance channel curve, shared by the contrast pins.
+    fn channel(v: u8) -> f32 {
+        let c = f32::from(v) / 255.0;
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    /// WCAG relative luminance of an RGB color; panics on non-RGB, which
+    /// every canvas-repainting theme's tested colors are.
+    fn luminance(color: Color) -> f32 {
+        let (r, g, b) = match color {
+            Color::Rgb(r, g, b) => (r, g, b),
+            other => panic!("theme contrast colors must be RGB, got {other:?}"),
+        };
+        0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+    }
+
     /// Whether a theme defers its canvas to the terminal.
     ///
     /// The transparent theme paints no canvas of its own — `Reset`
@@ -955,21 +1106,6 @@ mod tests {
     fn every_theme_s_status_text_reads_on_its_bar() {
         // WCAG relative luminance: model and token counts must stay
         // legible on the canvas-colored status bar.
-        fn channel(v: u8) -> f32 {
-            let c = f32::from(v) / 255.0;
-            if c <= 0.04045 {
-                c / 12.92
-            } else {
-                ((c + 0.055) / 1.055).powf(2.4)
-            }
-        }
-        fn luminance(color: Color) -> f32 {
-            let (r, g, b) = match color {
-                Color::Rgb(r, g, b) => (r, g, b),
-                other => panic!("bar colors must be RGB, got {other:?}"),
-            };
-            0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
-        }
         for (key, _) in theme_data::THEME_CONSTRUCTORS {
             let ui = Theme::by_name(key).unwrap().ui;
             if defers_to_terminal(&ui) {
@@ -1007,6 +1143,31 @@ mod tests {
             assert_ne!(
                 ui.scrollbar_track, ui.background,
                 "{key}: the scrollbar track must be visible on the canvas"
+            );
+        }
+    }
+
+    #[test]
+    fn every_repainting_theme_keeps_its_standing_text_visible_on_the_canvas() {
+        // The standing foreground is the register the live lane's
+        // running titles and the todo plan's standing rows paint with —
+        // a theme that repaints the canvas owns both ends of the pair,
+        // so the two must read against each other. github_light on a
+        // dark-scheme terminal shipped invisible titles exactly because
+        // a register leaned on the terminal's default foreground
+        // instead of the theme's own; this pins the theme-side half of
+        // that contract for every canvas-repainting theme.
+        for (key, _) in theme_data::THEME_CONSTRUCTORS {
+            let ui = Theme::by_name(key).unwrap().ui;
+            if defers_to_terminal(&ui) {
+                continue;
+            }
+            let (lf, lb) = (luminance(ui.foreground), luminance(ui.background));
+            let (lighter, darker) = if lf > lb { (lf, lb) } else { (lb, lf) };
+            let ratio = (lighter + 0.05) / (darker + 0.05);
+            assert!(
+                ratio >= 3.0,
+                "{key}: standing-text contrast {ratio:.2} is below 3:1"
             );
         }
     }
