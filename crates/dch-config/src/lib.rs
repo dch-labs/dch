@@ -1835,30 +1835,20 @@ impl DchConfig {
 
     /// The model names `--model` can choose among, in file order.
     ///
-    /// `[api]`'s own model leads only when no entry claims that name — an
-    /// entry answering it is the model's real config, and listing the name
-    /// twice would read as two selectable models with one identity. So this is
-    /// the file's order, top first, with `[api]`'s own name leading whenever
-    /// the entries leave it out. It is the closed set
-    /// [`select_model`](Self::select_model) checks a requested name against and
-    /// what its error lists. Empty for every config written before `[[models]]`
-    /// existed with nothing configured to lead: that is the open case, where a
-    /// requested name passes through unvalidated instead of being refused for
+    /// The entries alone: with `[[models]]` declared the list is a
+    /// closed set — only entry names are selectable, so only entry
+    /// names are listed, top first in the file's order. It is the set
+    /// [`select_model`](Self::select_model) checks a requested name
+    /// against and what its error lists. Empty for every config
+    /// without entries: that is the open case, where a requested name
+    /// passes through unvalidated instead of being refused for
     /// matching nothing.
     #[must_use]
     pub fn model_names(&self) -> Vec<&str> {
-        let mut names: Vec<&str> = Vec::with_capacity(self.models.len().saturating_add(1));
-        let base = self.api.model.trim();
-        if !base.is_empty()
-            && !self
-                .models
-                .iter()
-                .any(|entry| entry.model.eq_ignore_ascii_case(base))
-        {
-            names.push(base);
-        }
-        names.extend(self.models.iter().map(|entry| entry.model.as_str()));
-        names
+        self.models
+            .iter()
+            .map(|entry| entry.model.as_str())
+            .collect()
     }
 
     /// Point the run at one of the configured `[[models]]` entries.
@@ -1886,9 +1876,12 @@ impl DchConfig {
     /// is not a conflict: it *is* that model's own config, and being at
     /// the top of the list makes it the default.
     ///
-    /// A name no entry answers but `[api] model` does resolves to the
-    /// settings `[api]` already carries, so listing entries cannot strand the
-    /// model `[api]` names.
+    /// The declared list is a closed set: with entries standing, a name
+    /// is selectable exactly when an entry declares it — `[api]`'s own
+    /// model name included. Naming the base's model as an entry is what
+    /// makes it choosable, so a persisted switch always resolves on the
+    /// next start: its entry if it still stands, the head of the list if
+    /// a hand edit removed it.
     ///
     /// With no entries declared, `Some(name)` renames
     /// [`ApiConfig::model`] exactly as the flag always has — a name of
@@ -1945,7 +1938,6 @@ impl DchConfig {
                 self.api = entry.apply_onto(&self.api);
                 Ok(())
             }
-            None if self.api.model.trim().eq_ignore_ascii_case(wanted) => Ok(()),
             None => Err(DchConfigError::UnknownModel {
                 requested: wanted.to_string(),
                 available: self.model_names().join(", "),
@@ -3327,12 +3319,16 @@ context_window = 210_000
             .select_model(Some("cloude-haiku"))
             .expect_err("a declared set closes the name")
             .to_string();
-        for named in ["qwen-local", "glm-5.3", "qwen-fast"] {
+        for named in ["glm-5.3", "qwen-fast"] {
             assert!(
                 message.contains(named),
                 "the error lists {named}: {message}"
             );
         }
+        assert!(
+            !message.contains("qwen-local"),
+            "a base name no entry claims is not listed as available: {message}"
+        );
         assert_eq!(
             config.api, before,
             "a refused selection leaves the configured bundle exactly as it was"
@@ -3362,13 +3358,20 @@ context_window = 210_000
     }
 
     #[test]
-    fn the_default_model_is_selectable_by_name() {
+    fn the_base_name_selects_only_as_an_entry() {
+        // The closed-set rule cuts both ways: the base's own name is
+        // selectable exactly when an entry declares it — here no entry
+        // does, so the name is refused naming the entries that exist.
+        // Naming the base's model as an entry is what makes it choosable.
         let mut config = config_with_two_models();
-        config
+        let err = config
             .select_model(Some("qwen-local"))
-            .expect("the default answers its own name");
-        assert_eq!(config.api.base_url, "http://localhost:8080/v1");
-        assert_eq!(config.api.api_type, ApiType::Ollama);
+            .expect_err("a base name no entry claims is not selectable");
+        let message = err.to_string();
+        assert!(
+            message.contains("glm-5.3") && message.contains("qwen-fast"),
+            "the refusal names the selectable models: {message}"
+        );
     }
 
     #[test]
@@ -3460,49 +3463,50 @@ context_window = 210_000
     }
 
     #[test]
-    fn model_names_leads_with_the_base_when_no_entry_claims_it() {
+    fn model_names_lists_the_entries_alone() {
+        // A declared list is a closed set: only entry names select, so
+        // only entry names are listed — `[api]`'s own model name is
+        // not a choice once entries exist, and listing it would print
+        // a name in the refusal that the refusal itself rejects.
         let config = config_with_two_models();
         assert_eq!(
             config.model_names(),
-            vec!["qwen-local", "glm-5.3", "qwen-fast"],
+            vec!["glm-5.3", "qwen-fast"],
             "order is the file's order, so the default leads rather than the name that sorts \
              first — a map of tables would have alphabetized this"
         );
     }
 
     #[test]
-    fn model_names_lists_a_padded_base_model_trimmed() {
-        // The list is what a refusal tells the user they can type, and
-        // the comparisons around it read the trimmed name — a base
-        // model carrying editor padding would otherwise be listed
-        // under a spelling no selection could ever match.
+    fn model_names_is_empty_without_entries() {
+        // The open case: with no `[[models]]` declared there is no
+        // closed set to list, and a requested name passes through
+        // unvalidated rather than being refused for matching nothing.
         let config = DchConfig::from_toml_str("[api]\nmodel = \"  glm-5.3  \"\n")
             .expect("a padded base parses");
-        assert_eq!(
-            config.model_names(),
-            vec!["glm-5.3"],
-            "the base is listed by the name a selection matches, not the raw padding"
+        assert!(
+            config.model_names().is_empty(),
+            "no entries declared is no closed set — nothing is listed or refused"
         );
     }
 
     #[test]
-    fn a_padded_base_model_selects_by_the_name_it_is_listed_under() {
-        // Listing and selecting are one contract: the name the refusal
-        // prints is the name `select_model` takes, whatever padding
-        // the file carried. Compared raw, a padded base is listed as
-        // `glm-5.3` and then refused as unknown — an error naming the
-        // model as available while refusing it.
+    fn a_base_name_no_entry_claims_is_refused() {
+        // Listing and selecting are one contract: with entries
+        // declared, only entry names select — `[api]`'s own padded
+        // name is neither listed nor accepted, and naming the base's
+        // model as an entry is what makes it choosable.
         let mut config = DchConfig::from_toml_str(
             "[api]\nmodel = \"  glm-5.3  \"\n\
              [[models]]\nmodel = \"other\"\n",
         )
         .expect("a padded base parses");
-        config
+        let err = config
             .select_model(Some("glm-5.3"))
-            .expect("the listed name selects its own base model");
-        assert_eq!(
-            config.api.model, "glm-5.3",
-            "selection keeps [api]'s settings for the base's own name"
+            .expect_err("a name no entry declares is refused, base or not");
+        assert!(
+            err.to_string().contains("other"),
+            "the refusal names the entries that exist: {err}"
         );
     }
 

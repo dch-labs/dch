@@ -301,6 +301,7 @@ async fn run_headless_inner(
     let ConstructedRun {
         prompt,
         mut runner,
+        workdir,
         model,
         streams_answer,
         resumed_compactions,
@@ -329,7 +330,8 @@ async fn run_headless_inner(
     let saver = match saver_root {
         Some(root) => crate::session::SessionSaver::with_base_dir(session_id, model, root),
         None => crate::session::SessionSaver::with_model(session_id, model),
-    };
+    }
+    .with_workdir(&workdir);
     let mut transcript = match &control {
         crate::resume::ResumeControl::Resumed(outcome) => outcome.messages.clone(),
         crate::resume::ResumeControl::Fresh { .. } => Vec::new(),
@@ -462,6 +464,14 @@ struct ConstructedRun {
     /// for the run bridge to install.
     runner: dch_loop::Runner,
 
+    /// The process working directory the runner serves.
+    ///
+    /// Carried out of construction so the session saver records the
+    /// directory the run worked in — a headless resume of a TUI-saved
+    /// session keeps that provenance instead of erasing it, and the
+    /// listing shows where the run lived.
+    workdir: std::path::PathBuf,
+
     /// The model the run uses, from the loaded config.
     ///
     /// Carried out of construction so the session transcript records
@@ -559,6 +569,7 @@ async fn construct_run(
     Ok(ConstructedRun {
         prompt,
         runner,
+        workdir,
         model,
         streams_answer,
         resumed_compactions,
@@ -1372,8 +1383,9 @@ mod tests {
         let message = apply_cli_overrides(&mut config, &parse(&["--model", "cloude-haiku"]))
             .expect_err("a declared set closes the name before a request is spent on it");
         assert!(
-            message.contains("glm-5.3") && message.contains("qwen-local"),
-            "the failure names what can actually be run: {message}"
+            message.contains("glm-5.3") && !message.contains("qwen-local"),
+            "the failure names what can actually be run — the entries alone, never a base \
+             name no entry claims: {message}"
         );
         assert_eq!(
             config.api.base_url, "http://localhost:8080/v1",

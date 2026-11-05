@@ -505,11 +505,7 @@ impl Theme {
     /// the session.
     #[must_use]
     pub fn by_name(name: &str) -> Option<Self> {
-        let key = name
-            .to_lowercase()
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join("_");
+        let key = Self::key_for_name(name)?;
         theme_data::THEME_CONSTRUCTORS
             .iter()
             .find(|(known, _)| *known == key)

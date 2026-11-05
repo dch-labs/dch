@@ -204,7 +204,21 @@ pub fn set(config: &mut DchConfig, key: &str, value: &str) -> Result<(), String>
         ));
     }
     match key {
-        "model" => config.api.model = value.to_string(),
+        "model" => {
+            if !value.trim().is_empty()
+                && !config.models.is_empty()
+                && !config
+                    .models
+                    .iter()
+                    .any(|entry| entry.model.eq_ignore_ascii_case(value.trim()))
+            {
+                return Err(format!(
+                    "model: with [[models]] declared the name must be one of them — {}",
+                    config.model_names().join(", ")
+                ));
+            }
+            config.api.model = value.to_string();
+        }
         "base_url" => config.api.base_url = value.to_string(),
         "api_type" => config.api.api_type = parse::<ApiType>(key, value)?,
         "max_tokens" => config.api.max_tokens = parse::<u32>(key, value)?,
