@@ -145,10 +145,10 @@ pub struct ConsoleObserver {
 impl ConsoleObserver {
     /// Build an observer writing to the process's real stdout and stderr.
     ///
-    /// `use_color` should be the AND of a TTY check on stderr and an
-    /// unset-or-empty `NO_COLOR` environment variable — headless output is
-    /// frequently piped, and ANSI escapes in a captured log are noise. See
-    /// `ConsoleObserver::detect_color`.
+    /// `use_color` should be the AND of [`Self::detect_color`] and the
+    /// host's own no-color setting, when it has one — any single veto
+    /// renders plain text. Headless output is frequently piped, and ANSI
+    /// escapes in a captured log are noise.
     #[must_use]
     pub fn new(verbosity: Verbosity, use_color: bool) -> Self {
         Self::with_sinks(

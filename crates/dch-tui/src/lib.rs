@@ -28,7 +28,10 @@ pub use events::TerminalEvents;
 pub use guidance::Guidance;
 pub use input::{InputAction, InputEditor, InputHistory};
 pub use message::{ActiveTool, ContentBlock, TokenCounts, TuiMessage};
-pub use observer::{Graduation, HealthNotice, ToolResultDisplay, TuiObserver, TuiObserverState};
+pub use observer::{
+    CompactionEvent, CompactionFiling, Graduation, HealthNotice, ToolResultDisplay, TuiObserver,
+    TuiObserverState, TurnPublication,
+};
 pub use permission::PermissionRequest;
 pub use question::{QuestionChoice, QuestionPrompt};
 pub use queue::{

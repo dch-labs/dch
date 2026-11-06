@@ -75,9 +75,11 @@ pub struct TodoEntry {
 /// The stored graph walks `Pending → InProgress → Completed`, with the
 /// backwards edges (`InProgress → Pending`, `Completed → InProgress`)
 /// for revisited work. The tool layer enforces it by adjustment, not
-/// rejection — a forward skip lands one rung short, each adjustment is
-/// named in the result, and any number of entries may stand
-/// `InProgress` at once.
+/// rejection: a `completed` request for a pending entry completes with
+/// the skipped `in_progress` rung passed implicitly and named, while a
+/// newborn id filed `completed` onto a standing list lands one rung
+/// short — each adjustment is named in the result, and any number of
+/// entries may stand `InProgress` at once.
 ///
 /// Serialized as a `snake_case` string (`"pending"`, `"in_progress"`,
 /// `"completed"`); a missing status defaults to
@@ -275,17 +277,41 @@ fn derive_subject(description: &str, id: &str) -> String {
 /// Repair transport-level mistakes in the raw input before parsing.
 ///
 /// Unwraps a doubly-serialized `todos` string — the model JSON-encoded
-/// the array a second time — which needs no notice. Subjects are left
-/// exactly as sent: the identity gate and the standing-name rule read
-/// presence and absence as meaning, and a repair pass that filled them
-/// would erase that meaning.
+/// the array a second time — which needs no notice. A `todos` string
+/// that fails to parse is tried again with markdown code fences peeled
+/// off — the model wrapped the array in a fence, the same class of
+/// transport mistake — and that repair stays silent for the same
+/// reason. Subjects are left exactly as sent: the identity gate and
+/// the standing-name rule read presence and absence as meaning, and a
+/// repair pass that filled them would erase that meaning.
 fn preprocess_todo_input(input: &mut Value) {
     if let Some(todos_val) = input.get_mut("todos")
         && let Some(s) = todos_val.as_str()
-        && let Ok(parsed) = serde_json::from_str::<Value>(s)
     {
-        *todos_val = parsed;
+        let parsed = serde_json::from_str::<Value>(s).or_else(|first| {
+            strip_code_fence(s)
+                .and_then(|stripped| serde_json::from_str::<Value>(stripped).ok())
+                .ok_or(first)
+        });
+        if let Ok(parsed) = parsed {
+            *todos_val = parsed;
+        }
     }
+}
+
+/// Peel markdown code fences off a `todos` payload.
+///
+/// The fence shape the transcripts carry: an opening line of three
+/// backticks (optionally tagging a language) and a closing one, with
+/// the JSON between. `None` when the payload carries no closing fence
+/// or no line break after the opening one — shapes this cannot mend,
+/// left for the parse error to name.
+fn strip_code_fence(payload: &str) -> Option<&str> {
+    let trimmed = payload.trim();
+    let after_open = trimmed.strip_prefix("```")?;
+    let (_, body) = after_open.split_once('\n')?;
+    let body = body.trim_end().strip_suffix("```")?;
+    Some(body.trim())
 }
 
 /// The most characters a submitted subject, description, or active form
@@ -294,47 +320,112 @@ fn preprocess_todo_input(input: &mut Value) {
 /// The plan's surfaces are windows — the pinned section shows a few
 /// rows, the summary line one — and a single unbounded item can push
 /// everything else off the screen. One hundred sixty characters is a
-/// full sentence with room to spare, and a submission past it is
-/// rejected rather than cut: a silently truncated task is a wording
-/// the model never chose, while a refusal with the limit named makes
-/// the next call carry wording that actually fits.
+/// full sentence with room to spare. A submission past the cap is cut
+/// at the boundary rather than refused: the observed models cannot
+/// count characters reliably — the median overshoot is a couple dozen —
+/// so a refusal bought a wasted round trip over wording whose exact
+/// length the model never chose. The cut is never silent: each one is
+/// named in the result beside the stored list, the same soft-accept
+/// pattern the reword notes use.
 const ENTRY_TEXT_LIMIT: usize = 160;
 
-/// Reject any subject, description, or active form past the entry-text
-/// limit.
+/// Cut `text` to the entry-text limit when it runs past, returning its
+/// original length in characters.
 ///
-/// The refusal names the entry, the field, and both lengths, so the
-/// model can rewrite the item short in one round trip — the same
-/// repair pattern the parse hints use. Every prose field a call can
-/// file on a new entry is bounded; status spellings are enum-bounded,
-/// and ids are deliberately left unbounded — the store's ids are the
-/// model's own, and trimming one would orphan the references that
-/// name it.
+/// Characters, never bytes: the cap counts what the model wrote, and a
+/// multibyte glyph is one of those. The boundary cut may land mid-word;
+/// the note that accompanies it names the entry and the field, so the
+/// wording never drifts silently.
+fn cap_text(text: &mut String) -> Option<usize> {
+    let length = text.chars().count();
+    if length > ENTRY_TEXT_LIMIT {
+        *text = text.chars().take(ENTRY_TEXT_LIMIT).collect();
+        Some(length)
+    } else {
+        None
+    }
+}
+
+/// Collapse any run of line breaks inside `text` to one space.
 ///
-/// # Errors
-///
-/// Returns [`ToolError::InvalidInput`] naming the first over-long
-/// field and how far past it stands.
-fn reject_overlong_entry_text(todos: &[TodoEntryInput]) -> Result<(), ToolError> {
-    for entry in todos {
-        for (field, text) in [
-            ("subject", entry.subject.as_deref().unwrap_or("")),
-            ("description", entry.description.as_str()),
-            ("active_form", entry.active_form.as_deref().unwrap_or("")),
-        ] {
-            let length = text.chars().count();
-            if length > ENTRY_TEXT_LIMIT {
-                return Err(ToolError::InvalidInput(format!(
-                    "Todo '{}' has a {field} of {length} characters; the limit is \
-                     {ENTRY_TEXT_LIMIT}. Shorten the wording — a plan item is a \
-                     sentence, not a paragraph; the detail belongs in the work, \
-                     not in the list.",
-                    entry.id
-                )));
+/// The render is a transport — a host's resume seeding recovers the
+/// standing plan from the last rendered list — so every field the
+/// store keeps must hold one line: a newline inside a subject once
+/// rendered as a second row the parser read back as its own phantom
+/// entry, and a newline inside an id replaced the entry outright.
+/// Leading and trailing breaks collapse away; a run in the middle
+/// becomes one space at a word bound.
+fn single_line(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut pending_space = false;
+    for glyph in text.chars() {
+        if glyph == '\n' || glyph == '\r' {
+            pending_space = true;
+        } else {
+            if pending_space && !out.is_empty() {
+                out.push(' ');
             }
+            pending_space = false;
+            out.push(glyph);
         }
     }
-    Ok(())
+    out
+}
+
+/// The intake pass over a submission's entry text: single-line, then
+/// bound, naming every cut.
+///
+/// Stored text renders back as the transport hosts recover plans
+/// from, so every stored field is made one line before it is bounded
+/// to the entry-text limit — status spellings are enum-bounded, and
+/// ids are deliberately left unbounded in length, for the store's ids
+/// are the model's own and trimming one would orphan the references
+/// that name it. Ids are single-lined silently: the id is the join
+/// key, and newline hygiene is not a wording change. A field past the
+/// limit is cut at the boundary with one note per cut, for the
+/// result's adjustment line. Started entries are passed over whole:
+/// their sent text is refused downstream as a reword that never
+/// files, and a cut here would describe wording the store never
+/// takes.
+fn soften_overlong_entry_text(
+    todos: &mut [TodoEntryInput],
+    standing: &std::collections::HashMap<String, TodoEntry>,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    for entry in todos {
+        entry.id = single_line(&entry.id);
+        let started = standing
+            .get(&entry.id)
+            .is_some_and(|base| base.status != TodoStatus::Pending);
+        if started {
+            continue;
+        }
+        let mut cuts: Vec<(usize, &str)> = Vec::new();
+        if let Some(subject) = entry.subject.as_mut() {
+            *subject = single_line(subject);
+            if let Some(length) = cap_text(subject) {
+                cuts.push((length, "subject"));
+            }
+        }
+        entry.description = single_line(&entry.description);
+        if let Some(length) = cap_text(&mut entry.description) {
+            cuts.push((length, "description"));
+        }
+        if let Some(active_form) = entry.active_form.as_mut() {
+            *active_form = single_line(active_form);
+            if let Some(length) = cap_text(active_form) {
+                cuts.push((length, "active_form"));
+            }
+        }
+        for (length, field) in cuts {
+            notes.push(format!(
+                "'{}' {field} of {length} characters truncated to \
+                 {ENTRY_TEXT_LIMIT} — keep new wording inside the limit",
+                entry.id
+            ));
+        }
+    }
+    notes
 }
 
 /// The repair hint matching a parse failure.
@@ -431,10 +522,12 @@ fn reject_unknown_blocked_by(
 /// merge the result into the stored list.
 ///
 /// A structurally valid call never fails: the law is enforced by
-/// adjustment, not refusal. Each standing entry advances at most one
-/// rung per call (a `completed` request from pending lands as
-/// `in_progress`; a `pending` request from completed reopens to
-/// `in_progress` — the legal first rung of reopening), and a newborn id
+/// adjustment, not refusal. A `completed` request for a pending
+/// standing entry completes — the skipped `in_progress` rung passed
+/// implicitly and named — for the request is the model closing work it
+/// did, and the walk must not tax it; a `pending` request from
+/// completed reopens to `in_progress` — the legal first rung of
+/// reopening — and a newborn id
 /// filed `completed` onto a standing list lands `in_progress` — fresh
 /// ids cannot skip rungs, though births on an empty store file as
 /// submitted. Entries the submission omits stand unchanged — omission
@@ -496,12 +589,11 @@ fn normalize_and_store(
         match (previous, entry.status) {
             (TodoStatus::Pending, TodoStatus::Completed) => {
                 notes.push(format!(
-                    "'{}' requested completed from pending — advanced to \
-                     in progress (one rung per call — mark it in_progress \
-                     when work begins, completed when work lands)",
+                    "'{}' requested completed from pending — completed, \
+                     in_progress passed implicitly (mark entries \
+                     in_progress the moment work begins)",
                     entry.id
                 ));
-                entry.status = TodoStatus::InProgress;
             }
             (TodoStatus::Completed, TodoStatus::Pending) => {
                 notes.push(format!(
@@ -560,17 +652,19 @@ fn reject_identity_free_entries(
 ///
 /// Drops the wire-only fields (`blocked_by`, `blocks`) and applies the
 /// name-authority rule: an entry's text — subject, description, active
-/// form — is read-only once the entry stands. A differing send against
-/// a standing id keeps the filed wording and earns the note this
-/// returns, so the plan's words are the words it was filed with, start
-/// to finish; a patch that omits the text keeps the standing values as
-/// silently as before, so `{id, status}` updates can never rename
-/// anything, and a restatement identical to the filed text is no send
-/// at all and costs no note. Descriptions derive subjects only for
-/// entries with no standing name; the identity gate guarantees every
-/// newborn arrives with one or the other.
+/// form — is read-only once work has begun, and a differing send
+/// against a started entry keeps the filed wording and earns the
+/// read-only note this returns. A still-pending entry accepts the
+/// reword — no work has begun, so no audit trail is at stake — and
+/// earns a note saying the new wording filed. A patch that omits the
+/// text keeps the standing values as silently as before, so `{id,
+/// status}` updates can never rename anything, and a restatement
+/// identical to the filed text is no send at all and costs no note.
+/// Descriptions derive subjects only for entries with no standing
+/// name; the identity gate guarantees every newborn arrives with one
+/// or the other.
 ///
-/// Returns the stored entries and the read-only notes, one per entry
+/// Returns the stored entries and the reword notes, one per entry
 /// whose sent text differed from its filed text.
 fn stored_entries(
     todos: &[TodoEntryInput],
@@ -594,19 +688,42 @@ fn stored_entries(
                         .active_form
                         .as_deref()
                         .is_some_and(|sent| Some(sent) != base.active_form.as_deref());
-                if reworded {
+                if !reworded {
+                    (
+                        base.subject.clone(),
+                        base.description.clone(),
+                        base.active_form.clone(),
+                    )
+                } else if base.status == TodoStatus::Pending {
                     notes.push(format!(
-                        "'{}' reworded — the filed text stands (entries are \
-                         read-only once created; send only status and \
+                        "'{}' reworded while pending — new wording filed \
+                         (text is read-only once work begins)",
+                        todo.id
+                    ));
+                    (
+                        literal.map_or_else(|| base.subject.clone(), str::to_string),
+                        if todo.description.trim().is_empty() {
+                            base.description.clone()
+                        } else {
+                            todo.description.clone()
+                        },
+                        todo.active_form
+                            .clone()
+                            .or_else(|| base.active_form.clone()),
+                    )
+                } else {
+                    notes.push(format!(
+                        "'{}' reworded — the filed text stands (text is \
+                         read-only once work begins; send only status and \
                          dependencies)",
                         todo.id
                     ));
+                    (
+                        base.subject.clone(),
+                        base.description.clone(),
+                        base.active_form.clone(),
+                    )
                 }
-                (
-                    base.subject.clone(),
-                    base.description.clone(),
-                    base.active_form.clone(),
-                )
             } else {
                 let subject = literal
                     .map(str::to_string)
@@ -808,9 +925,7 @@ impl TodoTool {
     /// Returns [`ToolError::Execution`] when no runner context is installed,
     /// and [`ToolError::InvalidInput`] when the input cannot be parsed, an
     /// id is duplicated within the submission, a new entry carries neither
-    /// a subject nor a description, a prose field (subject, description,
-    /// or active form) exceeds the 160-character entry-text limit, or a
-    /// `blocked_by` reference names an
+    /// a subject nor a description, or a `blocked_by` reference names an
     /// absent id. Status requests are never rejected — the store is
     /// normalize-and-merge: once those checks pass, each carried entry is
     /// adjusted to the rung law and merged into the standing list, every
@@ -826,7 +941,7 @@ impl TodoTool {
         };
 
         preprocess_todo_input(&mut input);
-        let parsed = parse_todo_input(input)?;
+        let mut parsed = parse_todo_input(input)?;
 
         if parsed.todos.is_empty() {
             let entries = todos
@@ -871,7 +986,6 @@ impl TodoTool {
         }
 
         reject_duplicate_ids(&parsed.todos)?;
-        reject_overlong_entry_text(&parsed.todos)?;
         let (standing_ids, standing_by_id) = {
             let store = todos
                 .lock()
@@ -887,6 +1001,7 @@ impl TodoTool {
                 .collect::<std::collections::HashMap<_, _>>();
             (ids, by_id)
         };
+        let truncation_notes = soften_overlong_entry_text(&mut parsed.todos, &standing_by_id);
         reject_identity_free_entries(&parsed.todos, &standing_ids)?;
         reject_unknown_blocked_by(&parsed.todos, &standing_ids)?;
         let recovered = parsed
@@ -896,6 +1011,7 @@ impl TodoTool {
         let (entries, reword_notes) = stored_entries(&parsed.todos, &standing_by_id);
         let (mut adjustments, enforced) = normalize_and_store(&todos, entries);
         adjustments.splice(0..0, reword_notes);
+        adjustments.splice(0..0, truncation_notes);
         let wire_by_id: std::collections::HashMap<String, (Vec<String>, Vec<String>)> = parsed
             .todos
             .iter()
@@ -946,12 +1062,13 @@ impl Tool for TodoTool {
          entries are never removed. Mark an entry in_progress the moment \
          you begin its work and completed the moment its work lands; never \
          batch plan updates to the end of the run — a completed request \
-         for a pending entry lands in_progress (one rung per call, the \
-         adjustment named in the result), and reopening completed work \
+         for a pending entry completes with the in_progress rung passed \
+         implicitly, named in the result, and reopening completed work \
          goes through in_progress. New entries need a subject (or a \
          description to derive one from); an entry's text — subject, \
-         description, active_form — is read-only once it is filed: a \
-         reword sent against a standing id keeps the filed wording, \
+         description, active_form — is read-only once work begins: a \
+         reword against a started entry keeps the filed wording, named \
+         in the result, while a still-pending entry accepts the reword, \
          named in the result — so id and status alone update standing \
          entries. The plan belongs \
          to the session: a run that ends with unfinished entries carries \
@@ -974,14 +1091,14 @@ impl Tool for TodoTool {
                             "type": "object",
                             "properties": {
                                 "id": { "type": "string", "description": "Stable identifier for the todo; entries keep their ids across calls and runs" },
-                                "subject": { "type": "string", "description": "Short subject/title (imperative form), at most 160 characters — longer text is rejected. A new entry needs a subject or a description; an entry already on the plan keeps its own whenever this is omitted" },
-                                "description": { "type": "string", "description": "Detailed description, at most 160 characters — longer text is rejected" },
+                                "subject": { "type": "string", "description": "Short subject/title (imperative form), at most 160 characters — longer text is truncated at the limit and named in the result. A new entry needs a subject or a description; an entry already on the plan keeps its own whenever this is omitted" },
+                                "description": { "type": "string", "description": "Detailed description, at most 160 characters — longer text is truncated at the limit and named in the result" },
                                 "status": {
                                     "type": "string",
                                     "enum": ["pending", "in_progress", "completed"],
-                                    "description": "Lifecycle status (pending → in_progress → completed; reopen via in_progress). Mark in_progress the moment work begins and completed the moment it lands. A completed request for a pending entry lands in_progress (one rung per call); adjustments are named in the rendered result. Omitted, the entry keeps the status it stands on — a patch that only rewords never moves the rung.",
+                                    "description": "Lifecycle status (pending → in_progress → completed; reopen via in_progress). Mark in_progress the moment work begins and completed the moment it lands. A completed request for a pending entry completes, the implicit in_progress passage named in the result; every adjustment is named in the rendered result. Omitted, the entry keeps the status it stands on — a patch that only rewords never moves the rung.",
                                 },
-                                "active_form": { "type": "string", "description": "Present continuous form for display (e.g., \"Running tests\"), at most 160 characters — longer text is rejected" },
+                                "active_form": { "type": "string", "description": "Present continuous form for display (e.g., \"Running tests\"), at most 160 characters — longer text is truncated at the limit and named in the result" },
                                 "blocked_by": { "type": "array", "items": { "type": "string" }, "description": "Tasks that must complete before this one (IDs)" },
                                 "blocks": { "type": "array", "items": { "type": "string" }, "description": "Tasks that wait for this one (IDs)" }
                             },
@@ -1018,11 +1135,13 @@ impl Tool for TodoTool {
              work and completed the moment its work lands — never batch \
              updates to the end of the run. Send only the entries that \
              changed; omitted entries stand unchanged, entries are never \
-             removed, and a completed request from pending lands \
-             in_progress first (one rung per call). New entries need a \
-             subject; an entry's text is read-only once it is filed — \
-             standing entries keep the wording they were filed with, so \
-             id and status alone update them. The rendered list the \
+             removed, and a completed request for a pending entry \
+             completes, the implicit in_progress passage named in the \
+             result. New entries need a \
+             subject; an entry's text is read-only once work begins — \
+             started entries keep the wording they were filed with, \
+             while a still-pending entry accepts a reword; id and \
+             status alone update started entries. The rendered list the \
              tool returns is the authoritative state; it survives context \
              compaction and carries into the session's next run when \
              entries remain unfinished. A finished run leaves every entry \
@@ -1045,6 +1164,7 @@ mod tests {
     use super::*;
     use crate::context::RunnerContext;
     use crate::registry::builtin_registry;
+    use proptest::prelude::*;
 
     fn entry(status: TodoStatus, active_form: Option<&str>) -> TodoEntry {
         TodoEntry {
@@ -1178,74 +1298,106 @@ mod tests {
     }
 
     #[test]
-    fn a_long_subject_is_rejected_and_nothing_is_stored() {
+    fn a_long_subject_is_truncated_and_the_cut_is_named() {
+        // The field evidence: the model cannot count characters, and
+        // the median overshoot was a couple dozen — a refusal bought a
+        // wasted round trip over wording whose exact length the model
+        // never chose. The tool now cuts at the boundary and names the
+        // cut, the same soft-accept pattern the reword notes use, so
+        // the stored plan never carries an unbounded item either.
         let (_context, todos) = todo_context();
         let long: String = "x".repeat(200);
         let input = serde_json::json!({
             "todos": [ { "id": "1", "subject": long, "status": "pending" } ]
         });
-        let refused = TodoTool::todo_write_inner(input, Some(Arc::clone(&todos)))
-            .expect_err("an over-long subject is refused, not cut");
-        let text = refused.to_string();
+        let out = TodoTool::todo_write_inner(input, Some(Arc::clone(&todos)))
+            .expect("an over-long subject is cut, not refused");
+        let text = out.text_content();
         assert!(
-            text.contains("160") && text.contains("subject of 200"),
-            "the refusal names the field, its length, and the limit: {text}"
+            text.contains("'1' subject of 200 characters truncated to 160"),
+            "the note names the entry, the field, and both lengths: {text}"
         );
-        assert!(
-            text.contains("Shorten"),
-            "the refusal tells the model what to do next: {text}"
-        );
-        assert!(
-            todos.lock().expect("todos lock not poisoned").is_empty(),
-            "a refused submission stores nothing — the model rewrites, nothing is cut"
+        assert_eq!(
+            todos
+                .lock()
+                .expect("todos lock not poisoned")
+                .first()
+                .expect("the entry stored")
+                .subject
+                .chars()
+                .count(),
+            160,
+            "the stored subject carries exactly the limit"
         );
     }
 
     #[test]
-    fn a_long_active_form_is_rejected_and_nothing_is_stored() {
+    fn a_long_active_form_is_truncated_and_the_cut_is_named() {
         // The third prose field on a new entry: the limit's rationale is
         // the display windows every entry text can reach, and the active
         // form is entry text — a stored-but-never-rendered field today,
         // bounded now so the day a surface renders it does not reopen
-        // the hole the subject limit closed.
+        // the hole the subject limit closed. The cut is named like
+        // every other soft acceptance.
         let (_context, todos) = todo_context();
         let long: String = "x".repeat(200);
         let input = serde_json::json!({
             "todos": [ { "id": "1", "subject": "Ship it", "active_form": long, "status": "pending" } ]
         });
-        let refused = TodoTool::todo_write_inner(input, Some(Arc::clone(&todos)))
-            .expect_err("an over-long active form is refused, not stored");
-        let text = refused.to_string();
+        let out = TodoTool::todo_write_inner(input, Some(Arc::clone(&todos)))
+            .expect("an over-long active form is cut, not refused");
         assert!(
-            text.contains("160") && text.contains("active_form of 200"),
-            "the refusal names the field, its length, and the limit: {text}"
+            out.text_content()
+                .contains("'1' active_form of 200 characters truncated to 160"),
+            "the note names the cut: {}",
+            out.text_content()
         );
-        assert!(
-            todos.lock().expect("todos lock not poisoned").is_empty(),
-            "a refused submission stores nothing"
+        assert_eq!(
+            todos
+                .lock()
+                .expect("todos lock not poisoned")
+                .first()
+                .expect("the entry stored")
+                .active_form
+                .as_deref()
+                .map(|text: &str| text.chars().count()),
+            Some(160),
+            "the stored active form carries exactly the limit"
         );
     }
 
     #[test]
-    fn a_long_description_is_rejected_and_nothing_is_stored() {
+    fn a_long_description_is_truncated_and_derives_a_bounded_subject() {
         // The second prose field: a description alone can found a new
         // entry, so its length is bounded the same way a subject's is —
-        // and a refusal stores nothing; the model rewrites.
+        // and a subject derived from the cut description inherits the
+        // bound rather than smuggling the overshoot back in.
         let (_context, todos) = todo_context();
         let long: String = "x".repeat(200);
         let input = serde_json::json!({
             "todos": [ { "id": "1", "description": long, "status": "pending" } ]
         });
-        let refused = TodoTool::todo_write_inner(input, Some(Arc::clone(&todos)))
-            .expect_err("an over-long description is refused, not cut");
-        let text = refused.to_string();
+        let out = TodoTool::todo_write_inner(input, Some(Arc::clone(&todos)))
+            .expect("an over-long description is cut, not refused");
+        let text = out.text_content();
         assert!(
-            text.contains("160") && text.contains("description of 200"),
-            "the refusal names the field, its length, and the limit: {text}"
+            text.contains("'1' description of 200 characters truncated to 160"),
+            "the note names the cut: {text}"
+        );
+        let entry = todos
+            .lock()
+            .expect("todos lock not poisoned")
+            .first()
+            .expect("the entry stored")
+            .clone();
+        assert_eq!(
+            entry.description.chars().count(),
+            160,
+            "the stored description carries exactly the limit"
         );
         assert!(
-            todos.lock().expect("todos lock not poisoned").is_empty(),
-            "a refused submission stores nothing"
+            entry.subject.chars().count() <= 160,
+            "a subject derived from the cut description fits the limit too"
         );
     }
 
@@ -1717,11 +1869,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pending_to_completed_advances_one_rung() {
+    async fn pending_to_completed_completes_with_the_passage_named() {
         // The stumble every observed model made — the work is done,
-        // mark it done — now succeeds as far as the law allows: the
-        // entry lands in progress, the adjustment is named, and the
-        // follow-up call completes it.
+        // mark it done — was taxed a follow-up call for wording the
+        // rung law liked better. The law now answers the intent: the
+        // entry completes, the in_progress rung it skipped is named as
+        // passed implicitly, and the discipline is taught beside the
+        // truth instead of charged for it.
         let (ctx, todos) = todo_context();
         seed(&todos, "1", TodoStatus::Pending);
         let out = TodoTool
@@ -1733,28 +1887,16 @@ mod tests {
             .unwrap();
         assert!(!out.is_error, "{}", out.text_content());
         assert!(
-            out.text_content()
-                .contains("'1' requested completed from pending — advanced"),
+            out.text_content().contains(
+                "'1' requested completed from pending — completed, in_progress passed implicitly"
+            ),
             "the adjustment is named: {}",
             out.text_content()
         );
         assert_eq!(
             todos.lock().unwrap().first().unwrap().status,
-            TodoStatus::InProgress,
-            "one rung advanced, one rung kept for the follow-up call"
-        );
-        let done = TodoTool
-            .call(
-                json!({"todos": [{"id": "1", "subject": "Seed 1", "status": "completed"}]}),
-                &ctx,
-            )
-            .await
-            .unwrap();
-        assert!(!done.is_error, "{}", done.text_content());
-        assert_eq!(
-            todos.lock().unwrap().first().unwrap().status,
             TodoStatus::Completed,
-            "the follow-up call walks the last rung"
+            "the work landed — no follow-up call owed"
         );
     }
 
@@ -1932,12 +2074,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_batch_complete_request_advances_each_standing_item_one_rung() {
+    async fn a_batch_complete_request_completes_each_standing_item() {
         // The live-session shape: one item done, one running, one
-        // waiting, and the model sends everything completed. The call
-        // succeeds — the legal edge completes the runner, the skip
-        // lands the waiter in progress — and the rendered truth shows
-        // the model exactly what remains.
+        // waiting, and the model sends everything completed — closing
+        // the plan. Every request lands: the runner completes on its
+        // legal edge, the waiter completes with its skipped rung named
+        // as passed implicitly, and the rendered truth shows the closed
+        // plan the model meant.
         let (ctx, todos) = todo_context();
         seed(&todos, "1", TodoStatus::Completed);
         seed(&todos, "2", TodoStatus::InProgress);
@@ -1956,18 +2099,18 @@ mod tests {
         assert!(!out.is_error, "{}", out.text_content());
         assert!(
             out.text_content()
-                .contains("'3' requested completed from pending"),
+                .contains("'3' requested completed from pending — completed"),
             "the skip is named: {}",
             out.text_content()
         );
         assert!(
             out.text_content()
-                .contains("Summary: 0 pending, 1 in progress, 2 completed"),
+                .contains("Summary: 0 pending, 0 in progress, 3 completed"),
             "the summary counts the enforced list, not the request: {}",
             out.text_content()
         );
         assert!(
-            out.text_content().contains("◐ [3]"),
+            out.text_content().contains("● [3]"),
             "the waiter's icon shows the rung it landed on: {}",
             out.text_content()
         );
@@ -1978,9 +2121,10 @@ mod tests {
             vec![
                 TodoStatus::Completed,
                 TodoStatus::Completed,
-                TodoStatus::InProgress
+                TodoStatus::Completed
             ],
-            "the legal edge completes, the skip advances one rung"
+            "the legal edge completes and the closing skip completes with \
+             its passage named"
         );
     }
 
@@ -2008,7 +2152,7 @@ mod tests {
             "tool description must state the identity rule: {description}"
         );
         assert!(
-            description.contains("read-only once it is filed"),
+            description.contains("read-only once work begins"),
             "tool description must state the text freeze: {description}"
         );
         assert!(
@@ -2124,6 +2268,99 @@ mod tests {
             parse_task_list_render("Empty plan — nothing stands.").is_none(),
             "output without a task list parses to None"
         );
+    }
+
+    proptest::proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// The render/parse round-trip, as a property over line-free
+        /// text: whatever the model files, the render the resume path
+        /// seeds from must read back the same ids, subjects, and
+        /// statuses. The comparison is by id, because the render sorts
+        /// (in progress → pending → completed) — the parsed order is
+        /// the render's, not the submission's. The domain excludes the
+        /// render's one documented ambiguity — an id containing `] `
+        /// reads back as its shortest prefix — and stays line-free by
+        /// construction: the intake pass single-lines every stored
+        /// field, so a newline cannot reach the render at all. The id
+        /// strategy appends the row's index so generated plans never
+        /// repeat an id (a repeat the tool would refuse, outside this
+        /// property's contract).
+        #[test]
+        fn the_render_round_trips_line_free_plans(
+            plan in proptest::collection::vec(
+                (
+                    "[a-zA-Z0-9_-]{1,8}",
+                    // A non-space first character: a whitespace-only
+                    // subject reads as absent and the identity gate
+                    // rejects it — outside this property's contract.
+                    "[a-zA-Z0-9,!.'-][a-zA-Z0-9 ,.!'-]{0,23}",
+                    proptest::sample::select(vec![
+                        TodoStatus::Pending,
+                        TodoStatus::InProgress,
+                        TodoStatus::Completed,
+                    ])
+                ),
+                1..6
+            ),
+        ) {
+            let submitted: Vec<serde_json::Value> = plan
+                .iter()
+                .enumerate()
+                .map(|(index, (id, subject, status))| {
+                    serde_json::json!({
+                        "id": format!("{id}{index}"),
+                        "subject": subject,
+                        "status": match status {
+                            TodoStatus::Pending => "pending",
+                            TodoStatus::InProgress => "in_progress",
+                            TodoStatus::Completed => "completed",
+                        }
+                    })
+                })
+                .collect();
+            let (ctx, _todos) = todo_context();
+            let out = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a runtime for one call")
+                .block_on(async {
+                    TodoTool
+                        .call(json!({"todos": submitted}), &ctx)
+                        .await
+                        .expect("a line-free plan stores")
+                });
+            let parsed = parse_task_list_render(&out.text_content())
+                .expect("the render parses back");
+            let by_id: std::collections::HashMap<String, (String, TodoStatus)> = parsed
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.id.clone(),
+                        (entry.subject.clone(), entry.status),
+                    )
+                })
+                .collect();
+            prop_assert_eq!(
+                by_id.len(),
+                plan.len(),
+                "every entry reads back under its own id, no more and no fewer: {:?}",
+                out.text_content()
+            );
+            for (index, (id, subject, status)) in plan.iter().enumerate() {
+                let expected_id = format!("{id}{index}");
+                let Some((read_subject, read_status)) = by_id.get(&expected_id) else {
+                    prop_assert!(false, "id {expected_id} did not read back: {:?}", out.text_content());
+                    return Ok(());
+                };
+                prop_assert_eq!(
+                    read_subject.as_str(),
+                    subject.trim(),
+                    "subjects round-trip (trimmed, as the tool stores them)"
+                );
+                prop_assert_eq!(read_status, status, "statuses round-trip");
+            }
+        }
     }
 
     #[test]
@@ -2296,15 +2533,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_explicit_subject_never_rewords_a_standing_entry() {
-        // The model's reword is refused, not applied: an entry's text
-        // is the text it was filed with, and a literal subject sent
-        // against a standing id keeps the filed wording with the
-        // read-only note naming the refusal — the plan's words are
-        // fixed at filing, so what tracks the work is the status, and
-        // what identifies the work never drifts.
+    async fn an_explicit_subject_never_rewords_a_started_entry() {
+        // The model's reword is refused on started work, not applied:
+        // once an entry has begun, its text is the text it was filed
+        // with, and a literal subject sent against a started id keeps
+        // the filed wording with the read-only note naming the refusal
+        // — what tracks the work is the status, and what identifies
+        // the work never drifts. A still-pending entry answers the
+        // same send the other way (the test below).
         let (ctx, todos) = todo_context();
-        seed(&todos, "7", TodoStatus::Pending);
+        seed(&todos, "7", TodoStatus::InProgress);
         let out = TodoTool
             .call(
                 json!({"todos": [{"id": "7", "subject": "Repair the parser",
@@ -2324,6 +2562,37 @@ mod tests {
             out.text_content()
                 .contains("'7' reworded — the filed text stands"),
             "and the receipt names the refusal: {}",
+            out.text_content()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pending_entry_reword_files_the_new_wording() {
+        // The friction the transcripts named: nearly half of all
+        // successful calls carried a reword the tool refused, because
+        // the schema keeps inviting text on every send. While an entry
+        // is still pending — no work begun, no status semantics at
+        // stake — the reword files, named in the result; once work
+        // begins the wording freezes (the test above).
+        let (ctx, todos) = todo_context();
+        seed(&todos, "7", TodoStatus::Pending);
+        let out = TodoTool
+            .call(
+                json!({"todos": [{"id": "7", "subject": "Repair the parser",
+                                  "status": "pending"}]}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.text_content());
+        assert_eq!(
+            todos.lock().unwrap().first().unwrap().subject,
+            "Repair the parser",
+            "a still-pending entry files the reworded wording"
+        );
+        assert!(
+            out.text_content().contains("'7' reworded while pending"),
+            "and the receipt names the filing: {}",
             out.text_content()
         );
     }
@@ -2608,12 +2877,14 @@ mod tests {
     }
 
     #[test]
-    fn a_standing_entrys_text_is_read_only() {
-        // The plan's words are the words it was filed with: a reword
-        // sent against a standing id — subject, description, or an
-        // active form added against one never filed — keeps the filed
-        // wording and earns the note naming the law, while the status
-        // the same patch carries still lands.
+    fn a_started_entrys_text_is_read_only_and_a_pending_one_rewords() {
+        // The plan's words freeze at two different moments: a started
+        // entry — in progress or completed — keeps the wording it was
+        // filed with, a reword against it refused with the note naming
+        // the law while the status the same patch carries still lands;
+        // a still-pending entry accepts the reword, for no work has
+        // begun and no audit trail is at stake, and the note names the
+        // filing instead of the refusal.
         let standing = std::collections::HashMap::from([
             (
                 "p1".to_string(),
@@ -2665,17 +2936,22 @@ mod tests {
         );
         let p2 = entries.get(1).unwrap();
         assert_eq!(
-            p2.active_form, None,
-            "an active form added against a standing entry never files"
+            p2.active_form.as_deref(),
+            Some("Handing off the canon amendment"),
+            "an active form added against a still-pending entry files"
         );
         assert_eq!(notes.len(), 2, "one note per reworded entry: {notes:?}");
         assert!(
-            notes.iter().all(|note| note.contains("read-only")),
-            "each note names the law: {notes:?}"
+            notes
+                .iter()
+                .any(|note| note.contains("'p1'") && note.contains("read-only")),
+            "the started entry's note names the law: {notes:?}"
         );
         assert!(
-            notes.iter().any(|note| note.contains("'p1'")),
-            "and its entry: {notes:?}"
+            notes
+                .iter()
+                .any(|note| note.contains("'p2'") && note.contains("reworded while pending")),
+            "the pending entry's note names the filing: {notes:?}"
         );
     }
 
@@ -2824,6 +3100,143 @@ mod tests {
         let (ctx, todos) = todo_context();
         let inner = json!([{"id": "1", "subject": "Real subject"}]).to_string();
         let out = TodoTool.call(json!({"todos": inner}), &ctx).await.unwrap();
+        assert!(
+            !out.text_content().contains("Auto-recovered"),
+            "{}",
+            out.text_content()
+        );
+        assert_eq!(
+            todos.lock().unwrap().first().unwrap().subject,
+            "Real subject"
+        );
+    }
+
+    #[tokio::test]
+    async fn newline_bearing_entry_text_single_lines_into_the_store() {
+        // The stress probe's shape: a subject carrying an icon-led
+        // second line once rendered a phantom entry the parser read
+        // back — seeding a resumed runner with rows the model never
+        // filed — and a newline id replaced the entry outright. The
+        // intake pass single-lines every stored field, so the render
+        // stays a faithful transport: what parses back is exactly
+        // what the store holds.
+        let (ctx, todos) = todo_context();
+        let out = TodoTool
+            .call(
+                json!({"todos": [
+                    {"id": "one", "subject": "fix the login\n● [phantom] injected row",
+                     "status": "pending"},
+                    {"id": "a\nb", "subject": "split id", "status": "pending"},
+                    {"id": "3", "subject": "plain",
+                     "description": "two\r\nlines of detail", "status": "pending"}
+                ]}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        {
+            let store = todos.lock().unwrap();
+            for entry in store.iter() {
+                assert!(
+                    !entry.id.contains('\n') && !entry.id.contains('\r'),
+                    "ids hold one line"
+                );
+                assert!(
+                    !entry.subject.contains('\n') && !entry.subject.contains('\r'),
+                    "subjects hold one line"
+                );
+                assert!(
+                    !entry.description.contains('\n') && !entry.description.contains('\r'),
+                    "descriptions hold one line"
+                );
+            }
+            assert!(
+                store
+                    .get(2)
+                    .map(|entry| entry.description.as_str())
+                    .is_some_and(|description| description == "two lines of detail"),
+                "the multiline description collapses to one spaced line"
+            );
+            assert_eq!(
+                store.get(1).map(|entry| entry.id.as_str()),
+                Some("a b"),
+                "a newline id collapses to one spaced line, staying the join key"
+            );
+        }
+        let parsed = parse_task_list_render(&out.text_content()).expect("the render parses back");
+        assert_eq!(
+            parsed.len(),
+            3,
+            "no phantom rows ride the render: {}",
+            out.text_content()
+        );
+        let ids: Vec<&str> = parsed.iter().map(|entry| entry.id.as_str()).collect();
+        assert!(
+            ids.contains(&"one") && ids.contains(&"a b") && ids.contains(&"3"),
+            "exactly the stored ids read back: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"phantom"),
+            "the injected row never existed: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_over_long_reword_against_started_work_owes_no_truncation_note() {
+        // The cut note once described wording the reword refusal then
+        // discarded — a started entry's sent text never stores, so the
+        // intake pass leaves it untouched and only the refusal speaks.
+        // The pending twin still cuts and files: its wording lands.
+        let (ctx, todos) = todo_context();
+        seed(&todos, "1", TodoStatus::InProgress);
+        seed(&todos, "2", TodoStatus::Pending);
+        let long: String = "x".repeat(200);
+        let out = TodoTool
+            .call(
+                json!({"todos": [
+                    {"id": "1", "subject": long.clone()},
+                    {"id": "2", "subject": long, "status": "pending"}
+                ]}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let text = out.text_content();
+        assert!(
+            !text.contains("'1' subject of 200 characters truncated"),
+            "the started entry's refusal owes no cut note of its own: {text}"
+        );
+        assert!(
+            text.contains("'1' reworded — the filed text stands"),
+            "the refusal is the one note that speaks: {text}"
+        );
+        assert!(
+            text.contains("'2' subject of 200 characters truncated to 160"),
+            "the pending entry's wording lands, cut and named: {text}"
+        );
+        let store = todos.lock().unwrap();
+        assert_eq!(
+            store.first().unwrap().subject,
+            "Seed 1",
+            "the started entry's filed wording stands, uncut and unstored-over"
+        );
+        assert_eq!(
+            store.get(1).unwrap().subject.chars().count(),
+            160,
+            "the pending entry stores the bounded wording"
+        );
+    }
+
+    #[tokio::test]
+    async fn fenced_todos_unwrap_like_the_double_encoded() {
+        // The fence is the same class of transport mistake as the
+        // double encoding: the array rides a markdown code block, and
+        // peeling it needs no notice when every subject was already
+        // real.
+        let (ctx, todos) = todo_context();
+        let inner = json!([{"id": "1", "subject": "Real subject"}]).to_string();
+        let fenced = format!("```json\n{inner}\n```");
+        let out = TodoTool.call(json!({"todos": fenced}), &ctx).await.unwrap();
         assert!(
             !out.text_content().contains("Auto-recovered"),
             "{}",

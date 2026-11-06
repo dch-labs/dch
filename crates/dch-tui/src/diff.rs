@@ -4,7 +4,9 @@
 //! numbers (the `@@` headers the tool emits). This module parses that
 //! shape into structured hunks and renders it as a review-grade
 //! diff: a GitHub-style stats bar, then full-width solid bands —
-//! green under insertions, red under removals, bright text on both —
+//! insertions and removals under the configured
+//! [`DiffPalette`](dch_config::DiffPalette)'s pair of hues, bright
+//! text on both —
 //! each row led by its real line number and the seam. The inline
 //! layout is the default; the side-by-side layout pairs removals with
 //! their replacements across a center gutter. Receipts that carry no
@@ -39,18 +41,58 @@ const CENTER_GUTTER: &str = " │ ";
 /// terminal cannot refuse.
 const SIDE_BY_SIDE_FLOOR: usize = 80;
 
-/// The insertions' band: the `GitHub`-style green.
+/// The classic insertions' band: the `GitHub`-style green.
 ///
-/// The hue a code review taught the eye to read as "added"; fixed
-/// for every theme because a solid band carries its own contrast and
-/// needs no palette's permission.
+/// The hue a code review taught the eye to read as "added"; the
+/// classic entry of
+/// [`DiffPalette`](dch_config::DiffPalette), and the one a solid
+/// band carries best — fixed at the palette's side so every theme
+/// that keeps the classic pairing paints it identically.
 const ADD_BAND: Color = Color::Rgb(35, 134, 54);
 
-/// The removals' band: the `GitHub`-style red.
+/// The classic removals' band: the `GitHub`-style red.
 ///
-/// The hue a code review taught the eye to read as "removed"; fixed
-/// for every theme, the twin of [`ADD_BAND`].
+/// The hue a code review taught the eye to read as "removed"; the
+/// classic entry's twin of [`ADD_BAND`].
 const DEL_BAND: Color = Color::Rgb(218, 54, 51);
+
+/// The soft palette's insertions' band: a lighter green.
+///
+/// Lifted and desaturated from the classic green, for palettes whose
+/// own hues sit pale or warm — the band still reads as a change
+/// without shouting over them.
+const SOFT_ADD_BAND: Color = Color::Rgb(73, 138, 96);
+
+/// The soft palette's removals' band: a dimmed red.
+///
+/// Held back from the classic red's saturation for the same reason
+/// [`SOFT_ADD_BAND`] lightens: presence without the shout.
+const SOFT_DEL_BAND: Color = Color::Rgb(160, 79, 77);
+
+/// The blue-orange palette's insertions' band: blue.
+///
+/// Half of the color-blind-safe pairing — blue and orange stay
+/// distinguishable under the deficiencies where green and red
+/// collapse into one.
+const BLUE_ADD_BAND: Color = Color::Rgb(37, 100, 199);
+
+/// The blue-orange palette's removals' band: orange.
+///
+/// The pairing's other half, warm against [`BLUE_ADD_BAND`]'s cool.
+const ORANGE_DEL_BAND: Color = Color::Rgb(203, 111, 17);
+
+/// The insertions' and removals' bands a palette paints with.
+///
+/// One pair per [`dch_config::DiffPalette`] spelling; the classic
+/// pair is the review-taught default, the other two the recolors a
+/// palette whose own hues fight saturated green and red reaches for.
+fn bands(palette: dch_config::DiffPalette) -> (Color, Color) {
+    match palette {
+        dch_config::DiffPalette::Classic => (ADD_BAND, DEL_BAND),
+        dch_config::DiffPalette::Soft => (SOFT_ADD_BAND, SOFT_DEL_BAND),
+        dch_config::DiffPalette::BlueOrange => (BLUE_ADD_BAND, ORANGE_DEL_BAND),
+    }
+}
 
 /// The banded rows' text: bright white on either band.
 ///
@@ -429,14 +471,17 @@ pub(crate) struct DiffColors {
     seam_fg: Color,
 }
 
-/// Derive the diff palette from `theme`.
+/// Derive the diff palette from `theme` and the configured palette.
 ///
-/// Only the neutral registers read the theme; the bands are fixed by
-/// [`ADD_BAND`] / [`DEL_BAND`] and never vary with the palette.
-pub(crate) fn diff_colors(theme: &Theme) -> DiffColors {
+/// Only the neutral registers read the theme; the bands answer to
+/// [`DiffPalette`](dch_config::DiffPalette) alone — the configured
+/// pair, identical under every color scheme, because a solid band
+/// carries its own contrast and needs no palette's permission.
+pub(crate) fn diff_colors(theme: &Theme, palette: dch_config::DiffPalette) -> DiffColors {
+    let (add_bg, del_bg) = bands(palette);
     DiffColors {
-        add_bg: ADD_BAND,
-        del_bg: DEL_BAND,
+        add_bg,
+        del_bg,
         band_fg: BAND_TEXT,
         ctx_fg: theme.ui.dim,
         num_fg: theme.ui.dim,
@@ -843,6 +888,56 @@ mod tests {
     }
 
     #[test]
+    fn each_diff_palette_paints_its_own_pair_of_bands() {
+        // The palette is the whole point of the setting: every
+        // spelling paints a distinct pair, classic keeps the
+        // review-taught hues a reader already knows, and the rows
+        // carry them — the rendered bands answer to the configured
+        // pair, never to the theme.
+        let theme = crate::theme::Theme::default();
+        let classic = diff_colors(&theme, dch_config::DiffPalette::Classic);
+        let soft = diff_colors(&theme, dch_config::DiffPalette::Soft);
+        let blue_orange = diff_colors(&theme, dch_config::DiffPalette::BlueOrange);
+        assert_eq!(
+            (classic.add_bg, classic.del_bg),
+            (Color::Rgb(35, 134, 54), Color::Rgb(218, 54, 51)),
+            "classic keeps the GitHub-style green and red"
+        );
+        assert_eq!(
+            (soft.add_bg, soft.del_bg),
+            (Color::Rgb(73, 138, 96), Color::Rgb(160, 79, 77)),
+            "soft lightens the green and dims the red"
+        );
+        assert_eq!(
+            (blue_orange.add_bg, blue_orange.del_bg),
+            (Color::Rgb(37, 100, 199), Color::Rgb(203, 111, 17)),
+            "blue-orange paints the color-blind-safe pairing"
+        );
+        for colors in [classic, soft, blue_orange] {
+            assert_ne!(colors.add_bg, colors.del_bg, "a pair must separate");
+        }
+        let diff = parse_receipt(&changed_receipt()).expect("the receipt is diff-shaped");
+        for palette in [
+            dch_config::DiffPalette::Classic,
+            dch_config::DiffPalette::Soft,
+            dch_config::DiffPalette::BlueOrange,
+        ] {
+            let colors = diff_colors(&theme, palette);
+            let rows = render_diff(&diff, dch_config::DiffLayout::Inline, 60, colors);
+            let bgs: Vec<Color> = rows
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .filter_map(|span| span.style.bg)
+                .collect();
+            assert!(
+                bgs.contains(&colors.add_bg) && bgs.contains(&colors.del_bg),
+                "the rows carry the palette's pair, additions and \
+                 removals both: {bgs:?}"
+            );
+        }
+    }
+
+    #[test]
     fn a_changed_receipt_parses_with_real_line_numbers() {
         let diff = parse_receipt(&changed_receipt()).expect("the receipt is diff-shaped");
         assert_eq!(diff.files.len(), 1, "one file section");
@@ -882,7 +977,10 @@ mod tests {
         // The render keeps the receipt honest about its cap: the chips
         // count what the preview carried, and the elision tail rides
         // after the rows as its own dim line.
-        let colors = diff_colors(&crate::theme::Theme::default());
+        let colors = diff_colors(
+            &crate::theme::Theme::default(),
+            dch_config::DiffPalette::Classic,
+        );
         let rows = render_diff(&diff, dch_config::DiffLayout::Inline, 40, colors);
         let flat: String = rows
             .iter()
@@ -969,7 +1067,10 @@ mod tests {
         ]
         .join("\n");
         let diff = parse_receipt(&receipt).expect("the receipt parses");
-        let colors = diff_colors(&crate::theme::Theme::default());
+        let colors = diff_colors(
+            &crate::theme::Theme::default(),
+            dch_config::DiffPalette::Classic,
+        );
         let rows = render_diff(&diff, dch_config::DiffLayout::Inline, 80, colors);
         let flat: String = rows
             .iter()
@@ -1039,7 +1140,10 @@ mod tests {
         let hunk = second.hunks.first().expect("b.txt's hunk");
         let inserted = hunk.lines.last().expect("the insertion");
         assert_eq!(inserted.new_no, Some(7));
-        let colors = diff_colors(&crate::theme::Theme::default());
+        let colors = diff_colors(
+            &crate::theme::Theme::default(),
+            dch_config::DiffPalette::Classic,
+        );
         let rows = render_diff(&diff, dch_config::DiffLayout::Inline, 60, colors);
         let stats_bars = rows
             .iter()
@@ -1071,7 +1175,10 @@ mod tests {
         assert_eq!(hunk.lines.len(), 3);
         assert_eq!(hunk.lines[1].text, "fn two() {}");
         assert_eq!(hunk.lines[2].text, "fn two() { todo!() }");
-        let colors = diff_colors(&crate::theme::Theme::default());
+        let colors = diff_colors(
+            &crate::theme::Theme::default(),
+            dch_config::DiffPalette::Classic,
+        );
         let rows = render_diff(&diff, dch_config::DiffLayout::Inline, 60, colors);
         let flat: String = rows
             .iter()
@@ -1105,7 +1212,10 @@ mod tests {
     #[test]
     fn inline_rows_match_the_poc_look() {
         let diff = parse_receipt(&changed_receipt()).expect("parses");
-        let colors = diff_colors(&crate::theme::Theme::default());
+        let colors = diff_colors(
+            &crate::theme::Theme::default(),
+            dch_config::DiffPalette::Classic,
+        );
         let rows = render_diff(&diff, dch_config::DiffLayout::Inline, 80, colors);
         // The stats bar opens the block: two chips and a dim total.
         let stats: String = rows[0]
@@ -1194,9 +1304,18 @@ mod tests {
         // Solid bands carry their own contrast — the fixed greens
         // and reds read on light and dark palettes alike, and
         // no theme re-tints them.
-        let dark = diff_colors(&crate::theme::Theme::default());
-        let light = diff_colors(&crate::theme::Theme::gruvbox_light());
-        let bare = diff_colors(&crate::theme::Theme::transparent());
+        let dark = diff_colors(
+            &crate::theme::Theme::default(),
+            dch_config::DiffPalette::Classic,
+        );
+        let light = diff_colors(
+            &crate::theme::Theme::gruvbox_light(),
+            dch_config::DiffPalette::Classic,
+        );
+        let bare = diff_colors(
+            &crate::theme::Theme::transparent(),
+            dch_config::DiffPalette::Classic,
+        );
         assert_eq!(dark.add_bg, ADD_BAND);
         assert_eq!(light.add_bg, ADD_BAND);
         assert_eq!(bare.add_bg, ADD_BAND);
@@ -1219,7 +1338,10 @@ mod tests {
         ]
         .join("\n");
         let diff = parse_receipt(&receipt).expect("parses");
-        let colors = diff_colors(&crate::theme::Theme::default());
+        let colors = diff_colors(
+            &crate::theme::Theme::default(),
+            dch_config::DiffPalette::Classic,
+        );
         let rows = render_diff(&diff, dch_config::DiffLayout::Inline, 40, colors);
         let first = &rows[1];
         assert!(
@@ -1251,7 +1373,10 @@ mod tests {
     #[test]
     fn side_by_side_pairs_a_replacement_across_the_gutter() {
         let diff = parse_receipt(&changed_receipt()).expect("parses");
-        let colors = diff_colors(&crate::theme::Theme::default());
+        let colors = diff_colors(
+            &crate::theme::Theme::default(),
+            dch_config::DiffPalette::Classic,
+        );
         let rows = render_diff(&diff, dch_config::DiffLayout::SideBySide, 120, colors);
         // The hunk renders: context, then removal and insertion PAIRED
         // on one row, then closing context — each pane carrying the
@@ -1323,7 +1448,10 @@ mod tests {
         ]
         .join("\n");
         let diff = parse_receipt(&receipt).expect("parses");
-        let colors = diff_colors(&crate::theme::Theme::default());
+        let colors = diff_colors(
+            &crate::theme::Theme::default(),
+            dch_config::DiffPalette::Classic,
+        );
         let rows = render_diff(&diff, dch_config::DiffLayout::SideBySide, 100, colors);
         let paired_rows: Vec<&Line> = rows
             .iter()
@@ -1350,7 +1478,10 @@ mod tests {
     #[test]
     fn narrow_terminals_fall_back_to_inline_whatever_the_setting() {
         let diff = parse_receipt(&changed_receipt()).expect("parses");
-        let colors = diff_colors(&crate::theme::Theme::default());
+        let colors = diff_colors(
+            &crate::theme::Theme::default(),
+            dch_config::DiffPalette::Classic,
+        );
         let wide = render_diff(&diff, dch_config::DiffLayout::Inline, 60, colors);
         let requested = render_diff(&diff, dch_config::DiffLayout::SideBySide, 60, colors);
         let shape = |rows: &[Line]| {

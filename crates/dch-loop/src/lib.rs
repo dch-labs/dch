@@ -13,6 +13,7 @@ pub mod provider;
 pub mod question_bridge;
 pub mod redaction_guard;
 pub mod runner;
+pub mod title;
 pub(crate) mod todo_nudge;
 pub(crate) mod write_target_gate;
 
@@ -36,5 +37,7 @@ pub use question_bridge::QuestionPath;
 pub use question_bridge::{PromptOption, PromptedQuestion, spawn_question_bridge};
 pub use runner::Runner;
 pub use runner::RunnerBuilder;
+pub use title::NAME_SYSTEM_PROMPT;
+pub use title::session_title;
 pub use todo_nudge::history_without_nudge;
 pub use todo_nudge::is_nudge_wording;

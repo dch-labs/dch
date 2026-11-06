@@ -1049,10 +1049,14 @@ fn cleared(declared: Option<&String>, base: Option<&str>) -> Option<String> {
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct DisplayConfig {
-    /// Disable ANSI color output.
+    /// Disable ANSI color in a single-run invocation's console output.
     ///
-    /// When true, output is plain text with no color escapes. Defaults to
-    /// `false` (color enabled).
+    /// When true, the lines a headless run streams — tool lines, streamed
+    /// reply text — carry no ANSI escapes. Color is equally off when
+    /// `NO_COLOR` is set to a non-empty value or stderr is not a
+    /// terminal; this flag turns it off even on an interactive terminal.
+    /// The interactive TUI is unaffected: its colors come from `theme`.
+    /// Defaults to `false` (color follows the terminal's own verdict).
     pub no_color: bool,
 
     /// How much to print.
@@ -1122,6 +1126,15 @@ pub struct DisplayConfig {
     /// [`DiffLayout`].
     pub diff_layout: DiffLayout,
 
+    /// The color pair a file edit's diff bands paint with.
+    ///
+    /// `classic` (the default) keeps the review-taught green under
+    /// insertions and red under removals; `soft` lightens the green
+    /// and dims the red for palettes the saturated hues fight;
+    /// `blue-orange` swaps in the color-blind-safe pairing. See
+    /// [`DiffPalette`].
+    pub diff_palette: DiffPalette,
+
     /// A custom clipboard command for the TUI's selection copy.
     ///
     /// When set, a completed selection's text is piped to this command's
@@ -1159,6 +1172,38 @@ pub enum DiffLayout {
     /// the shape an edit reads fastest in.
     #[default]
     Inline,
+}
+
+/// Which hues a file edit's diff bands paint with.
+///
+/// The bands are solid, bright-text carriers; the palette names the
+/// pair. `classic` keeps the green and red a code review taught the
+/// eye for every theme; `soft` and `blue-orange` are the recolors a
+/// palette whose own hues fight saturated green and red reaches for
+/// — the softer register, and the pairing that separates under every
+/// common color-vision deficiency the way green and red never do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DiffPalette {
+    /// Lighter green insertions, dimmed red removals.
+    ///
+    /// The softer register for palettes whose own greens and reds
+    /// sit pale or warm: bands that read as changes without
+    /// shouting over the theme.
+    Soft,
+
+    /// Blue insertions, orange removals.
+    ///
+    /// The color-blind-safe pairing — the hues stay distinguishable
+    /// under deuteranopia and protanopia, where green and red
+    /// collapse into one.
+    BlueOrange,
+
+    /// GitHub-style green insertions, red removals.
+    ///
+    /// The default: the hues a code review taught the eye.
+    #[default]
+    Classic,
 }
 
 /// Which compaction strategy an automatically compacting session runs.
@@ -1528,6 +1573,7 @@ impl Default for DisplayConfig {
             strip_style: StripStyle::default(),
             path_style: PathStyle::default(),
             diff_layout: DiffLayout::default(),
+            diff_palette: DiffPalette::default(),
             mouse_capture: true,
             caret_display: CaretDisplay::default(),
             copy_command: None,
@@ -2689,6 +2735,31 @@ redact_secrets = false
         assert!(
             toml::from_str::<DisplayConfig>("diff_layout = \"diagonal\"").is_err(),
             "an unknown layout is a config error, not a silent default"
+        );
+    }
+
+    #[test]
+    fn the_default_diff_palette_is_classic_and_every_spelling_loads() {
+        assert_eq!(
+            DisplayConfig::default().diff_palette,
+            DiffPalette::Classic,
+            "a config that never names a palette runs the classic bands"
+        );
+        for (spelling, expected) in [
+            ("soft", DiffPalette::Soft),
+            ("blue-orange", DiffPalette::BlueOrange),
+            ("classic", DiffPalette::Classic),
+        ] {
+            let parsed: DisplayConfig =
+                toml::from_str(&format!("diff_palette = \"{spelling}\"")).unwrap();
+            assert_eq!(
+                parsed.diff_palette, expected,
+                "the {spelling} spelling loads"
+            );
+        }
+        assert!(
+            toml::from_str::<DisplayConfig>("diff_palette = \"neon\"").is_err(),
+            "an unknown palette is a config error, not a silent default"
         );
     }
 

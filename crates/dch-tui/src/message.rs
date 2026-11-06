@@ -161,6 +161,20 @@ pub enum TuiMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         compression_ratio: Option<f64>,
 
+        /// The summary the pass left the context under, when known.
+        ///
+        /// The compacted history's leading message — the compactor's
+        /// own words for what the folded exchanges established —
+        /// backfilled onto the row when a published history leads with
+        /// the marked ledger head the structured and rolling
+        /// compactors leave. The QA compactor's summary carries no
+        /// mark, so its rows keep no summary rather than a wrong one.
+        /// Absent until then, on legacy rows, and when the pass folded
+        /// nothing; skipped in the serialized form rather than written
+        /// as `null`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+
         /// When the pass fired.
         ///
         /// Recorded at the compaction event.

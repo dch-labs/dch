@@ -320,6 +320,7 @@ async fn run_headless_inner(
         mut runner,
         workdir,
         model,
+        api,
         streams_answer,
         resumed_compactions,
         compaction_counter,
@@ -344,17 +345,40 @@ async fn run_headless_inner(
             session_id: None, ..
         } => runner.session_id(),
     };
+    let resumed_title = match &control {
+        crate::resume::ResumeControl::Resumed(outcome) => outcome.title.clone(),
+        crate::resume::ResumeControl::Fresh { .. } => None,
+    };
     let saver = match saver_root {
         Some(root) => crate::session::SessionSaver::with_base_dir(session_id, model, root),
         None => crate::session::SessionSaver::with_model(session_id, model),
     }
-    .with_workdir(&workdir);
+    .with_workdir(&workdir)
+    .with_title(resumed_title);
     let mut transcript = match &control {
         crate::resume::ResumeControl::Resumed(outcome) => outcome.messages.clone(),
         crate::resume::ResumeControl::Fresh { .. } => Vec::new(),
     };
+    let naming = if saver.title().is_none() {
+        let naming_api = api.clone();
+        let first_prompt = prompt.clone();
+        Some(tokio::spawn(async move {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                dch_loop::session_title(&naming_api, &first_prompt),
+            )
+            .await
+            .unwrap_or_default()
+        }))
+    } else {
+        None
+    };
     let result = runner.run(&prompt).await;
     let turn_outputs = runner.session_turn_outputs();
+    let saver = match naming {
+        Some(task) => saver.with_title(task.await.unwrap_or(None)),
+        None => saver,
+    };
     match result {
         Ok(run) => {
             let delivery = if !streams_answer && let Some(answer) = &run.output {
@@ -497,6 +521,13 @@ struct ConstructedRun {
     /// the model the session actually ran.
     model: String,
 
+    /// The API settings the run was built from.
+    ///
+    /// Carried out of construction so the session's naming call — the
+    /// one-shot title request fired beside the run — speaks to the
+    /// same endpoint, model, and credential the run itself used.
+    api: dch_config::ApiConfig,
+
     /// Whether the observer narrates the run while it happens.
     ///
     /// False at the quiet default, where the observer writes nothing to
@@ -549,7 +580,7 @@ async fn construct_run(
     let streams_answer = !matches!(verbosity, Verbosity::Quiet);
     let observer = Arc::new(ConsoleObserver::new(
         verbosity,
-        ConsoleObserver::detect_color(),
+        console_use_color(ConsoleObserver::detect_color(), &config),
     ));
 
     let workdir = std::env::current_dir().map_err(|err| {
@@ -590,6 +621,7 @@ async fn construct_run(
         runner,
         workdir,
         model,
+        api: config.api.clone(),
         streams_answer,
         resumed_compactions,
         compaction_counter: observer.compaction_counter(),
@@ -933,6 +965,19 @@ fn resolve_verbosity(args: &Args) -> Verbosity {
     }
 }
 
+/// The console color verdict for a headless run under `config`.
+///
+/// `detected` is the environment's own verdict — a terminal on stderr
+/// with `NO_COLOR` unset or empty, per
+/// [`ConsoleObserver::detect_color`]. The configuration's
+/// `display.no_color` is a further veto: color needs both the
+/// environment's yes and the configuration's not-no, so either alone
+/// renders the streamed lines plain. The final answer line carries no
+/// escapes whatever this says.
+fn console_use_color(detected: bool, config: &dch_config::DchConfig) -> bool {
+    detected && !config.display.no_color
+}
+
 /// Print the run's final answer to stdout when the observer did not
 /// stream it.
 ///
@@ -1092,6 +1137,29 @@ mod tests {
         assert!(
             err.contains("read_max_bytes = 1000") && err.contains("max_tool_output_chars = 512"),
             "the --config route names both ceilings of a crossing pair: {err}"
+        );
+    }
+
+    #[test]
+    fn the_config_no_color_veto_turns_color_off_on_a_color_capable_terminal() {
+        let mut config = dch_config::DchConfig::default();
+        config.display.no_color = true;
+        assert!(
+            !console_use_color(true, &config),
+            "the configuration's veto wins even when the environment says color"
+        );
+    }
+
+    #[test]
+    fn console_color_needs_both_the_environment_and_the_configuration() {
+        let config = dch_config::DchConfig::default();
+        assert!(
+            console_use_color(true, &config),
+            "the default configuration leaves the environment's verdict alone"
+        );
+        assert!(
+            !console_use_color(false, &config),
+            "a piped or NO_COLOR environment stays plain whatever the configuration says"
         );
     }
 
@@ -1715,6 +1783,7 @@ mod tests {
             tokens: crate::session::SessionTokens::default(),
             machine: None,
             machine_compactions: 0,
+            title: None,
         });
         let (resumed_config, _resumed_base, _resumed_file) =
             resolve_session_config_pair(&args, &resumed).unwrap();
@@ -2122,6 +2191,30 @@ mod tests {
                             break;
                         }
                     }
+                    // The session's naming call is not a conversation
+                    // turn: it answers from the canned title below
+                    // instead of the streamed answer, so every
+                    // conversation connection still resolves one
+                    // clean turn and the naming side call settles on
+                    // its own reply.
+                    if String::from_utf8_lossy(&seen).contains(dch_loop::NAME_SYSTEM_PROMPT) {
+                        let title = serde_json::json!({
+                            "id": "title", "model": "test-model",
+                            "choices": [{
+                                "message": {"role": "assistant",
+                                    "content": "Canned Session Title"},
+                                "finish_reason": "stop"
+                            }]
+                        })
+                        .to_string();
+                        let answer = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                             content-length: {}\r\nconnection: close\r\n\r\n{title}",
+                            title.len()
+                        );
+                        let _written = stream.write_all(answer.as_bytes()).await;
+                        continue;
+                    }
                     let body = [
                         serde_json::json!({
                             "id": "c1", "model": "test-model",
@@ -2254,8 +2347,9 @@ mod tests {
             vec![*id],
             "the resumed run reuses the loaded session's identity — no second directory"
         );
-        let (messages, _model, _tokens, _saved_at) =
-            crate::session::load_with_meta_in(*id, sessions.path()).unwrap();
+        let messages = crate::session::load_with_meta_in(*id, sessions.path())
+            .unwrap()
+            .messages;
         assert_eq!(
             messages.len(),
             4,
@@ -2278,6 +2372,52 @@ mod tests {
                 _ => panic!("unexpected message at position {at}: {message:?}"),
             }
         }
+    }
+
+    /// A fresh run's first prompt names the session, and the
+    /// single save a headless run makes files the name.
+    ///
+    /// The end-to-end persistence pin: the naming call the fresh
+    /// run fires is answered with the server's canned title, the
+    /// run's one save lands after the naming task resolves, and the
+    /// envelope on disk carries the name a listing or resume reads.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_fresh_headless_run_files_the_session_under_its_canned_title() {
+        let _signal_lock = SIGNAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let server = TurnServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, server.config_toml()).unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let args = parse(&[
+            "name this session",
+            "--config",
+            config_path.to_str().unwrap(),
+        ]);
+        assert_eq!(
+            run_headless_rooted(
+                &args,
+                crate::signals::install_construction_handler(|| {}),
+                sessions.path().to_path_buf(),
+                fresh_control(),
+            )
+            .await,
+            0,
+            "the run completes against the canned turn"
+        );
+        let saved = session_ids(sessions.path());
+        assert_eq!(saved.len(), 1, "one fresh session was saved");
+        let title = crate::session::load_with_meta_in(*saved.first().unwrap(), sessions.path())
+            .unwrap()
+            .title;
+        assert_eq!(
+            title.as_deref(),
+            Some("Canned Session Title"),
+            "the session file carries the name its first prompt coined"
+        );
     }
 
     /// A resumed session runs on the current configuration's model; the
@@ -2320,7 +2460,9 @@ mod tests {
         let Some(id) = saved.first() else {
             panic!("the saved session id is readable: {saved:?}")
         };
-        let (_, model, _, _) = crate::session::load_with_meta_in(*id, sessions.path()).unwrap();
+        let model = crate::session::load_with_meta_in(*id, sessions.path())
+            .unwrap()
+            .model;
         assert_eq!(
             model, "m-first",
             "the first save records the model the config named"
@@ -2346,7 +2488,9 @@ mod tests {
             0,
             "the resumed run completes against the canned turn"
         );
-        let (_, model, _, _) = crate::session::load_with_meta_in(*id, sessions.path()).unwrap();
+        let model = crate::session::load_with_meta_in(*id, sessions.path())
+            .unwrap()
+            .model;
         assert_eq!(
             model, "m-first",
             "a resumed session continues on — and re-records — the model it last ran, not the configuration's current one"
@@ -2373,7 +2517,9 @@ mod tests {
             0,
             "the CLI-overridden resume completes against the canned turn"
         );
-        let (_, model, _, _) = crate::session::load_with_meta_in(*id, sessions.path()).unwrap();
+        let model = crate::session::load_with_meta_in(*id, sessions.path())
+            .unwrap()
+            .model;
         assert_eq!(
             model, "m-cli",
             "an explicit --model overrides both the envelope and the configuration"

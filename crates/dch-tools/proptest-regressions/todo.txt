@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc eb9af31d2ff441cab294190c267b33a3deca4f49379fdc5ea2fd235ac70d5344 # shrinks to plan = [("0", "a", Completed), ("A", ",", Pending)]
+cc 26efcad0c0f52249321ccfb618d34c29c743061504eeabf360c23b954d2821f3 # shrinks to plan = [("A", "0 ", Pending)]

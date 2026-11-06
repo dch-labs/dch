@@ -310,15 +310,6 @@ const REGISTRY: &[Spec] = &[
         detail: "Cancels the current run — the answer being generated stops and the queue waits — but leaves the session and its history standing, unlike /exit. A no-op notice when nothing is running.",
     },
     Spec {
-        name: "session",
-        aliases: &["id"],
-        category: Category::Sessions,
-        arg: ArgShape::None,
-        usage: "/session",
-        summary: "Show the session's id, model, and turns.",
-        detail: "Reports the session id (as `dch --resume` would take it), the model the loop runs, the turn count, and the working directory.",
-    },
-    Spec {
         name: "sessions",
         aliases: &[],
         category: Category::Sessions,
@@ -523,12 +514,6 @@ pub enum Command {
     /// The final assistant message of the standing conversation, whole;
     /// a session with no answer yet says so.
     Copy,
-
-    /// Show the session's id, model, and shape (`/session`).
-    ///
-    /// The identity line the exit echo prints — the id a later
-    /// `--resume` takes, the model in effect, and the message count.
-    Session,
 
     /// List the saved sessions and pick one to resume (`/sessions`).
     ///
@@ -817,6 +802,14 @@ pub fn complete(line: &str, sources: CompletionSources<'_>) -> Vec<String> {
     // any argument is typed, so `/model ` completes values, not the command
     // name again. `split_command` cannot tell the two apart on its own.
     if body.contains(char::is_whitespace) {
+        // `/set` reads its two-token shape off the raw tail — a value
+        // position is a space after the key, and the trimmed argument
+        // would erase exactly that signal for a just-typed space.
+        if let Some(rest) = body.strip_prefix("set")
+            && rest.starts_with(char::is_whitespace)
+        {
+            return set_argument_candidates(rest.trim_start(), sources);
+        }
         let (name, argument) = split_command(body);
         argument_candidates(name, argument, sources)
     } else {
@@ -899,9 +892,56 @@ fn argument_candidates(name: &str, argument: &str, sources: CompletionSources<'_
     let pool: &[String] = match name {
         "model" => sources.models,
         "theme" => sources.themes,
-        "set" | "unset" => sources.keys,
+        "unset" => sources.keys,
         _ => return Vec::new(),
     };
+    ranked_from_pool(pool, argument)
+}
+
+/// `/set`'s candidates: the key while it is being typed, the key's
+/// own accepted values once a second token begins.
+///
+/// Takes the tail after the command word with its spacing intact — a
+/// value position is a space behind the key, and the trimmed argument
+/// would erase exactly that signal for a just-typed space. With no
+/// second token the fragment is still naming a key and the keys are
+/// the candidates; once a value fragment begins, the key's own
+/// vocabulary is — the fixed spellings
+/// [`value_candidates`](crate::config_fields::value_candidates)
+/// tables, or the live sources for the two keys whose values are
+/// registries (`theme` the compiled-in palettes, `model` the
+/// configured profiles). A key with no fixed vocabulary offers
+/// nothing rather than guess.
+fn set_argument_candidates(tail: &str, sources: CompletionSources<'_>) -> Vec<String> {
+    let Some((key, value)) = tail.split_once(char::is_whitespace) else {
+        return ranked_from_pool(sources.keys, tail);
+    };
+    let key = key.trim();
+    let value = value.trim();
+    if key == "theme" {
+        return ranked_from_pool(sources.themes, value);
+    }
+    if key == "model" {
+        return ranked_from_pool(sources.models, value);
+    }
+    match crate::config_fields::value_candidates(key) {
+        Some(values) => {
+            let pool: Vec<String> = values.iter().map(|value| (*value).to_string()).collect();
+            ranked_from_pool(&pool, value)
+        }
+        None => Vec::new(),
+    }
+}
+
+/// Rank a pool against a fragment, dropping an exact match.
+///
+/// The one shape every value position offers: prefix matches lead,
+/// containing matches follow, and a fragment already typed complete is
+/// dropped so a repeated `Tab` offers the rest rather than repeating
+/// itself. Case-insensitive, so a differently-cased fragment still
+/// finds its candidates, while the value is offered in its own
+/// spelling.
+fn ranked_from_pool(pool: &[String], argument: &str) -> Vec<String> {
     let exact = argument.to_lowercase();
     let mut ranked: Vec<(MatchRank, &String)> = pool
         .iter()
@@ -1020,7 +1060,6 @@ fn build_command(spec: &Spec, argument: &str) -> Parsed {
         "compact" => Command::Compact,
         "exit" => Command::Exit,
         "stop" => Command::Stop,
-        "session" => Command::Session,
         "sessions" => Command::Sessions,
         "themes" => Command::Themes,
         "verbosity" => Command::Verbosity {
@@ -1174,7 +1213,6 @@ mod tests {
     fn the_conversation_control_commands_parse() {
         assert_eq!(parse("/exit"), Parsed::Command(Command::Exit));
         assert_eq!(parse("/stop"), Parsed::Command(Command::Stop));
-        assert_eq!(parse("/session"), Parsed::Command(Command::Session));
         assert_eq!(parse("/themes"), Parsed::Command(Command::Themes));
         assert_eq!(parse("/cost"), Parsed::Command(Command::Cost));
         assert_eq!(parse("/copy"), Parsed::Command(Command::Copy));
@@ -1486,6 +1524,86 @@ mod tests {
         assert_eq!(complete("/verbosity q", none), vec!["quiet".to_string()]);
         // A level already spelled out completes to nothing.
         assert_eq!(complete("/verbosity quiet", none), Vec::<String>::new());
+    }
+
+    #[test]
+    fn set_completes_the_key_while_it_is_being_typed() {
+        // The first token is the key's own name: the keys are the
+        // candidates, exactly as before the value position existed.
+        let keys: Vec<String> = ["diff_layout", "diff_palette", "theme", "model", "max_turns"]
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect();
+        let sources = CompletionSources {
+            models: &[],
+            themes: &[],
+            keys: &keys,
+        };
+        let out = complete("/set dif", sources);
+        assert!(out.contains(&"diff_layout".to_string()), "{out:?}");
+        assert!(out.contains(&"diff_palette".to_string()), "{out:?}");
+        assert_eq!(complete("/set ", sources), keys);
+    }
+
+    #[test]
+    fn set_completes_the_keys_accepted_values_once_a_value_begins() {
+        // The point of the value position: what can be pasted is
+        // offered, not the current value — a bare fragment lists the
+        // whole vocabulary, a start narrows to it, and a value already
+        // typed complete is dropped like every other pool.
+        let none = CompletionSources::default();
+        assert_eq!(
+            complete("/set diff_palette ", none),
+            vec![
+                "classic".to_string(),
+                "soft".to_string(),
+                "blue-orange".to_string()
+            ]
+        );
+        assert_eq!(
+            complete("/set diff_palette bl", none),
+            vec!["blue-orange".to_string()]
+        );
+        assert_eq!(
+            complete("/set diff_palette soft", none),
+            Vec::<String>::new(),
+            "a value already typed complete is not offered again"
+        );
+        assert_eq!(
+            complete("/set mouse_capture ", none),
+            vec!["true".to_string(), "false".to_string()]
+        );
+        assert_eq!(
+            complete("/set permission_mode a", none),
+            vec![
+                "auto".to_string(),
+                "accept_edits".to_string(),
+                "plan".to_string(),
+                "interactive".to_string()
+            ],
+            "prefix matches lead, contains matches follow in pool order"
+        );
+    }
+
+    #[test]
+    fn set_completes_theme_and_model_from_the_live_sources() {
+        // The two keys whose values are registries draw from the same
+        // sources their dedicated commands complete against.
+        assert_eq!(
+            complete("/set theme no", sources()),
+            vec!["Nord".to_string()]
+        );
+        assert_eq!(
+            complete("/set model gpt", sources()),
+            vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()]
+        );
+        // Free-form keys carry no fixed vocabulary and offer nothing
+        // rather than guess.
+        assert_eq!(complete("/set max_turns ", sources()), Vec::<String>::new());
+        assert_eq!(
+            complete("/set copy_command x", sources()),
+            Vec::<String>::new()
+        );
     }
 
     #[test]

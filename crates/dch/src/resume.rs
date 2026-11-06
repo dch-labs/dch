@@ -21,6 +21,8 @@ use std::path::Path;
 
 use dch_tui::{ContentBlock, TuiMessage};
 use loopctl::message::{Message, MessagePart, Role};
+use unicode_width::UnicodeWidthChar as _;
+use unicode_width::UnicodeWidthStr as _;
 use uuid::Uuid;
 
 use crate::args::Args;
@@ -123,6 +125,14 @@ pub(crate) struct ResumeOutcome {
     /// headless session's transcript carries none and the snapshot's
     /// count is its only witness of a legitimate shrink.
     pub(crate) machine_compactions: u32,
+
+    /// The session's recorded name, when it has one.
+    ///
+    /// Carried out of the envelope so the adopting host's saver
+    /// keeps writing the name the resumed session already owns — a
+    /// resume never renames. A title-less old session stays
+    /// title-less until a later prompt names it.
+    pub(crate) title: Option<String>,
 }
 
 /// Why a resume could not load a session.
@@ -469,8 +479,9 @@ fn scrub_json_strings(
 /// same conditions the session loader reports, mapped once for the
 /// resume flow.
 pub(crate) fn load_for_resume_in(id: Uuid, base: &Path) -> Result<ResumeOutcome, ResumeError> {
-    let (messages, model, tokens, saved_at) = crate::session::load_with_meta_in(id, base)?;
-    let messages: Vec<TuiMessage> = messages
+    let loaded = crate::session::load_with_meta_in(id, base)?;
+    let messages: Vec<TuiMessage> = loaded
+        .messages
         .into_iter()
         .filter(|message| match message {
             TuiMessage::User { text, steered, .. } => {
@@ -479,20 +490,22 @@ pub(crate) fn load_for_resume_in(id: Uuid, base: &Path) -> Result<ResumeOutcome,
             _ => true,
         })
         .collect();
-    let (machine, machine_compactions) = match crate::session::load_machine_in(id, base, saved_at) {
-        Some((messages, compactions)) => (
-            Some(dch_loop::history_without_nudge(&messages)),
-            compactions,
-        ),
-        None => (None, 0),
-    };
+    let (machine, machine_compactions) =
+        match crate::session::load_machine_in(id, base, loaded.saved_at) {
+            Some((messages, compactions)) => (
+                Some(dch_loop::history_without_nudge(&messages)),
+                compactions,
+            ),
+            None => (None, 0),
+        };
     Ok(ResumeOutcome {
         session_id: id,
-        model,
+        model: loaded.model,
         messages,
-        tokens,
+        tokens: loaded.tokens,
         machine,
         machine_compactions,
+        title: loaded.title,
     })
 }
 
@@ -874,14 +887,20 @@ pub(crate) fn run_list_sessions(limit: crate::args::ListCount) -> ! {
     std::process::exit(0);
 }
 
-/// The table's column widths: id, model, last activity, messages.
+/// The table's column widths: id, title, model, workdir, last
+/// activity, messages, context.
 ///
 /// One set for the header, the rule, and every row, so the columns
 /// line up without measuring content. The id column is two wider
 /// than a UUID to give the copy-paste target breathing room; the
-/// message count is right-aligned against the rest.
+/// message count is right-aligned against the rest. The workdir
+/// column is a display-cell cap like the title's — a longer path
+/// truncates with an ellipsis rather than shifting the columns that
+/// follow it.
 const ID_WIDTH: usize = 38;
+const TITLE_WIDTH: usize = 28;
 const MODEL_WIDTH: usize = 24;
+const WORKDIR_WIDTH: usize = 26;
 const ACTIVITY_WIDTH: usize = 17;
 const CONTEXT_WIDTH: usize = 10;
 
@@ -908,10 +927,12 @@ fn cap_for_listing(
 /// Render the session table, newest-first as given, to `out`.
 ///
 /// One row per session — full UUID (users copy-paste it into
-/// `--resume`), model, last activity, message count — preceded by a
-/// header and a rule. An empty listing prints only the no-sessions
-/// notice. Rows render in the order received; sorting is the data
-/// layer's, not the renderer's.
+/// `--resume`), title, model, working directory, last activity,
+/// message count — preceded by a header and a rule. A session whose
+/// envelope recorded no working directory renders a dash there, the
+/// same absence spelling the title column uses. An empty listing
+/// prints only the no-sessions notice. Rows render in the order
+/// received; sorting is the data layer's, not the renderer's.
 ///
 /// # Errors
 ///
@@ -926,14 +947,16 @@ pub(crate) fn render_sessions(
     }
     writeln!(
         out,
-        "{:<ID_WIDTH$} {:<MODEL_WIDTH$} {:<ACTIVITY_WIDTH$} {:>4} {:>CONTEXT_WIDTH$}",
-        "SESSION ID", "MODEL", "LAST ACTIVITY", "MSGS", "CONTEXT",
+        "{:<ID_WIDTH$} {:<TITLE_WIDTH$} {:<MODEL_WIDTH$} {:<WORKDIR_WIDTH$} {:<ACTIVITY_WIDTH$} {:>4} {:>CONTEXT_WIDTH$}",
+        "SESSION ID", "TITLE", "MODEL", "WORKDIR", "LAST ACTIVITY", "MSGS", "CONTEXT",
     )?;
     writeln!(
         out,
-        "{:<ID_WIDTH$} {:<MODEL_WIDTH$} {:<ACTIVITY_WIDTH$} {:>4} {:>CONTEXT_WIDTH$}",
+        "{:<ID_WIDTH$} {:<TITLE_WIDTH$} {:<MODEL_WIDTH$} {:<WORKDIR_WIDTH$} {:<ACTIVITY_WIDTH$} {:>4} {:>CONTEXT_WIDTH$}",
         "─".repeat(ID_WIDTH),
+        "─".repeat(TITLE_WIDTH),
         "─".repeat(MODEL_WIDTH),
+        "─".repeat(WORKDIR_WIDTH),
         "─".repeat(ACTIVITY_WIDTH),
         "─".repeat(4),
         "─".repeat(CONTEXT_WIDTH),
@@ -941,9 +964,11 @@ pub(crate) fn render_sessions(
     for summary in sessions {
         writeln!(
             out,
-            "{:<ID_WIDTH$} {} {:<ACTIVITY_WIDTH$} {:>4} {:>CONTEXT_WIDTH$}",
+            "{:<ID_WIDTH$} {} {:<MODEL_WIDTH$} {} {:<ACTIVITY_WIDTH$} {:>4} {:>CONTEXT_WIDTH$}",
             summary.id.to_string(),
+            fit_column(summary.title.as_deref().unwrap_or("—"), TITLE_WIDTH),
             fit_column(&summary.model, MODEL_WIDTH),
+            fit_column(summary.workdir.as_deref().unwrap_or("—"), WORKDIR_WIDTH),
             summary.last_activity.format("%Y-%m-%d %H:%M"),
             summary.user_message_count,
             summary.context_tokens,
@@ -952,19 +977,31 @@ pub(crate) fn render_sessions(
     Ok(())
 }
 
-/// Pad `text` to `width`, truncating with an ellipsis when longer.
+/// Pad `text` to `width` display cells, truncating with an
+/// ellipsis when it is wider.
 ///
-/// Keeps one row's over-long model name from shifting the columns
-/// that follow it. Capped by characters — model names are plain
-/// identifiers, not prose.
+/// Keeps one row's over-long title or model name from shifting the
+/// columns that follow it. A title is prose in any script, so both
+/// the pad and the cap measure display cells — a wide glyph counts
+/// twice — never characters, and the ellipsis's one cell is reserved
+/// inside the cap.
 fn fit_column(text: &str, width: usize) -> String {
-    if text.chars().count() <= width {
-        return format!("{text:<width$}");
+    let cells = text.width();
+    if cells <= width {
+        let pad = " ".repeat(width.saturating_sub(cells));
+        return format!("{text}{pad}");
     }
-    let kept = text
-        .chars()
-        .take(width.saturating_sub(1))
-        .collect::<String>();
+    let budget = width.saturating_sub(1);
+    let mut used = 0usize;
+    let mut kept = String::new();
+    for glyph in text.chars() {
+        let span = glyph.width().unwrap_or(0);
+        if used.saturating_add(span) > budget {
+            break;
+        }
+        kept.push(glyph);
+        used = used.saturating_add(span);
+    }
     format!("{kept}…")
 }
 
@@ -997,6 +1034,7 @@ mod tests {
             tokens: crate::session::SessionTokens::default(),
             machine: None,
             machine_compactions: 0,
+            title: None,
         };
         let control = ResumeControl::Resumed(outcome);
         let mut config = dch_config::DchConfig {
@@ -1060,6 +1098,7 @@ mod tests {
                 tokens: crate::session::SessionTokens::default(),
                 machine: None,
                 machine_compactions: 0,
+                title: None,
             };
             let control = ResumeControl::Resumed(outcome);
             let mut config = dch_config::DchConfig {
@@ -1744,6 +1783,7 @@ mod tests {
             duration_ms: 12,
             compactor: Some("qa".to_string()),
             compression_ratio: Some(2.5),
+            summary: None,
             timestamp: chrono::Utc::now(),
         };
         let without = vec![user("hi"), assistant(vec![text_block("hello")])];
@@ -2143,6 +2183,7 @@ model = "plain"
             tokens: crate::session::SessionTokens::default(),
             machine: None,
             machine_compactions: 0,
+            title: None,
         };
         let control = ResumeControl::Resumed(outcome);
         let mut booted = base.clone();
@@ -2198,6 +2239,7 @@ model = "plain"
             machine: Some(machine),
             tokens: crate::session::SessionTokens::default(),
             machine_compactions: 0,
+            title: None,
         };
         let redacted = history_for_resume(&outcome, true);
         let raw = redacted
@@ -2251,6 +2293,7 @@ model = "plain"
             machine: Some(machine),
             tokens: crate::session::SessionTokens::default(),
             machine_compactions: 0,
+            title: None,
         };
         let replayed = serde_json::to_string(&history_for_resume(&outcome, true)).unwrap();
         assert!(
@@ -2297,6 +2340,7 @@ model = "plain"
             machine: Some(machine.clone()),
             tokens: crate::session::SessionTokens::default(),
             machine_compactions: 0,
+            title: None,
         };
         let replayed = serde_json::to_string(&history_for_resume(&outcome, true)).unwrap();
         assert!(
@@ -2518,6 +2562,7 @@ model = "plain"
             duration_ms: 300_000,
             compactor: Some("qa".to_string()),
             compression_ratio: Some(5.2),
+            summary: None,
             timestamp: now(),
         });
         let compacted: Vec<loopctl::message::Message> = (0..5)
@@ -2673,6 +2718,7 @@ model = "plain"
                 user_message_count: 1,
                 workdir: None,
                 context_tokens: 0,
+                title: None,
             }
         }
         let sessions: Vec<_> = (0..13).map(summary).collect();
@@ -2788,6 +2834,7 @@ model = "plain"
             user_message_count: count,
             workdir: None,
             context_tokens: 0,
+            title: None,
         }
     }
 
@@ -2807,9 +2854,17 @@ model = "plain"
         let header = lines.next().expect("the header line");
         let rule = lines.next().expect("the separator rule");
         assert!(
-            ["SESSION ID", "MODEL", "LAST ACTIVITY", "MSGS", "CONTEXT"]
-                .iter()
-                .all(|column| header.contains(column)),
+            [
+                "SESSION ID",
+                "TITLE",
+                "MODEL",
+                "WORKDIR",
+                "LAST ACTIVITY",
+                "MSGS",
+                "CONTEXT"
+            ]
+            .iter()
+            .all(|column| header.contains(column)),
             "the header names every column: {header}"
         );
         assert!(
@@ -2825,6 +2880,15 @@ model = "plain"
         let digits_end = data_row
             .rfind(&total)
             .map(|start| start.saturating_add(total.len()))
+            // Chars, not bytes: an untitled session's dash (like any
+            // multibyte title) renders one cell wide but spans three
+            // bytes, and alignment is a cell question.
+            .map(|byte_end| {
+                data_row
+                    .char_indices()
+                    .take_while(|(byte, _)| *byte < byte_end)
+                    .count()
+            })
             .expect("the total renders");
         assert_eq!(
             digits_end,
@@ -2859,12 +2923,98 @@ model = "plain"
     }
 
     #[test]
+    fn a_titled_session_leads_its_row_with_the_name() {
+        let mut titled = summary(Uuid::new_v4(), "m", 0, 1);
+        titled.title = Some("Fix the login loop".to_string());
+        let table = rendered(&[titled, summary(Uuid::new_v4(), "m", 9, 1)]);
+        let mut lines = table.lines();
+        let _header = lines.next();
+        let _rule = lines.next();
+        let titled_row = lines.next().expect("the titled row");
+        assert!(
+            titled_row.contains("Fix the login loop"),
+            "the row names the conversation: {titled_row}"
+        );
+        let untitled_row = lines.next().expect("the untitled row");
+        assert!(
+            untitled_row.contains('—'),
+            "a session without a title reads as a dash: {untitled_row}"
+        );
+    }
+
+    #[test]
+    fn a_session_with_a_workdir_names_it_in_its_row() {
+        let mut located = summary(Uuid::new_v4(), "m", 0, 1);
+        located.workdir = Some("/home/dch/repos/dch".to_string());
+        let table = rendered(&[located, summary(Uuid::new_v4(), "m", 9, 1)]);
+        let mut lines = table.lines();
+        let _header = lines.next();
+        let _rule = lines.next();
+        let located_row = lines.next().expect("the located row");
+        assert!(
+            located_row.contains("/home/dch/repos/dch"),
+            "the row names the directory the session ran in: {located_row}"
+        );
+        let bare_row = lines.next().expect("the row without a workdir");
+        assert!(
+            !bare_row.contains("/home"),
+            "an unrecorded workdir leaves the column bare: {bare_row}"
+        );
+    }
+
+    #[test]
+    fn wide_script_titles_hold_their_column_by_display_cells() {
+        // A title is prose in any script: a row titled with wide
+        // glyphs must not push the columns that follow it, and an
+        // over-long title must not blow the column it lives in. Both
+        // are cell questions — the pad and the cap measure what the
+        // terminal spends, never characters.
+        let ascii = summary(Uuid::new_v4(), "m", 0, 1);
+        let mut wide = summary(Uuid::new_v4(), "m", 1, 1);
+        wide.title = Some("終端機セッションのタイトル".to_string());
+        let mut over_long = summary(Uuid::new_v4(), "m", 2, 1);
+        over_long.title = Some("題".repeat(40));
+        let table = rendered(&[ascii, wide, over_long]);
+        let mut lines = table.lines();
+        let _header = lines.next();
+        let _rule = lines.next();
+        let offsets: Vec<usize> = lines
+            .map(|row| {
+                let model_at = row.find(" m ").expect("the model column");
+                row[..model_at].width()
+            })
+            .collect();
+        assert_eq!(
+            offsets.first(),
+            offsets.get(1),
+            "a wide-script title pads to the same column edge an ASCII \
+             one does"
+        );
+        assert!(
+            offsets.first().is_some_and(|edge| edge
+                .saturating_sub(*offsets.get(2).expect("the over-long row's edge"))
+                <= 1)
+                && table.contains('…'),
+            "an over-long wide-script title never blows past the column, \
+             and the cap is visible: {offsets:?}"
+        );
+    }
+
+    #[test]
     fn an_over_long_model_is_truncated_to_its_column() {
         let long = "x".repeat(40);
         let table = rendered(&[summary(Uuid::new_v4(), &long, 0, 1)]);
         let row = table.lines().last().expect("the data row");
         assert!(
-            row.chars().count() <= ID_WIDTH + MODEL_WIDTH + ACTIVITY_WIDTH + 4 + CONTEXT_WIDTH + 7,
+            row.chars().count()
+                <= ID_WIDTH
+                    + TITLE_WIDTH
+                    + MODEL_WIDTH
+                    + WORKDIR_WIDTH
+                    + ACTIVITY_WIDTH
+                    + 4
+                    + CONTEXT_WIDTH
+                    + 9,
             "a long model must not shift the columns that follow: {row}"
         );
         assert!(row.contains('…'), "the cap is visible: {row}");

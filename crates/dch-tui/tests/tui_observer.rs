@@ -539,10 +539,11 @@ fn a_turn_end_queues_its_history_for_the_host() {
         .lock()
         .expect("the histories lock")
         .iter()
-        .map(|history| {
+        .map(|publication| {
             (
-                history.len(),
-                history
+                publication.history.len(),
+                publication
+                    .history
                     .first()
                     .map(loopctl::message::Message::text_content)
                     .unwrap_or_default(),
