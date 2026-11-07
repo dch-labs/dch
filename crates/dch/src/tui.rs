@@ -12,6 +12,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use dch_tui::CompactionFiling;
+use dch_tui::HealthNotice;
 use dch_tui::PermissionRequest;
 use dch_tui::QuestionPrompt;
 use dch_tui::ResumedTokens;
@@ -119,6 +121,27 @@ fn cancel_the_live_runner(state: &TuiObserverState) {
         .cancel();
 }
 
+/// The launch saver: the resolved identity under the model the loop
+/// starts with, in the workdir the session serves, carrying the name
+/// a launch resume adopts.
+///
+/// One constructor call lifted out of the session setup so the setup
+/// reads as the wiring it is; the title is the resumed session's own —
+/// `None` on a fresh start, where the first claimed prompt's naming
+/// call coins one.
+fn launch_saver(
+    session_id: uuid::Uuid,
+    model: String,
+    workdir: &std::path::Path,
+    title: Option<String>,
+) -> Arc<crate::session::SessionSaver> {
+    Arc::new(
+        crate::session::SessionSaver::with_model(session_id, model)
+            .with_workdir(workdir)
+            .with_title(title),
+    )
+}
+
 /// Host one interactive session end to end.
 ///
 /// Every construction step — config, working directory, agent,
@@ -221,10 +244,12 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
     app.set_git_branch(git_branch(&workdir));
 
     let mut resumed_machine: Option<Vec<loopctl::message::Message>> = None;
+    let mut resumed_title: Option<String> = None;
     let session_id = match control {
         ResumeControl::Resumed(outcome) => {
             app.seed_messages(outcome.messages);
             resumed_machine = outcome.machine;
+            resumed_title = outcome.title;
             outcome.session_id
         }
         ResumeControl::Fresh { session_id, warn } => {
@@ -239,9 +264,7 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
     };
     app.set_session_id(session_id.to_string());
 
-    let saver = Arc::new(
-        crate::session::SessionSaver::with_model(session_id, model).with_workdir(&workdir),
-    );
+    let saver = launch_saver(session_id, model, &workdir, resumed_title);
     let (transcript_handle, transcript_worker) = TranscriptWorker::spawn(saver);
     let initial_transcript = transcript_handle.clone();
     let exit_saver = Arc::clone(&initial_transcript.saver);
@@ -629,6 +652,19 @@ struct TranscriptHandle {
     /// aimed at — a swap mid-write cannot rename it onto the new
     /// file.
     saver: Arc<std::sync::Mutex<Arc<crate::session::SessionSaver>>>,
+
+    /// The session id a naming call is currently in flight for.
+    ///
+    /// Armed for exactly the session whose claim spawned the
+    /// one-shot title call and cleared when that call settles, so a
+    /// prompt claimed while its own session's name is still being
+    /// coined buys no second call. The slot follows identity: a
+    /// session the host swapped in meanwhile — a `/clear` rotation, a
+    /// live resume — owes its own call and fires it, and the retired
+    /// session's settling task can neither arm nor disarm another
+    /// session's naming. Shared by every clone — the spawned task
+    /// settles it through its own handle.
+    naming_in_flight: Arc<std::sync::Mutex<Option<uuid::Uuid>>>,
 }
 
 impl Clone for TranscriptHandle {
@@ -642,6 +678,7 @@ impl Clone for TranscriptHandle {
             pending: Arc::clone(&self.pending),
             signal: Arc::clone(&self.signal),
             saver: Arc::clone(&self.saver),
+            naming_in_flight: Arc::clone(&self.naming_in_flight),
         }
     }
 }
@@ -729,7 +766,9 @@ impl TranscriptHandle {
             .saver
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let fresh = saver.with_identity(uuid::Uuid::new_v4(), model.to_string());
+        let fresh = saver
+            .with_identity(uuid::Uuid::new_v4(), model.to_string())
+            .with_title(None);
         let id = fresh.session_id().to_string();
         *saver = Arc::new(fresh);
         id
@@ -745,13 +784,100 @@ impl TranscriptHandle {
     /// recorded is the loop's current one, the same provenance a
     /// launch resume files under. Returns the id as the status bar
     /// renders it, so the driver can publish it to the display.
-    fn retarget(&self, id: uuid::Uuid, model: &str) -> String {
+    fn retarget(&self, id: uuid::Uuid, model: &str, title: Option<String>) -> String {
         let mut saver = self
             .saver
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *saver = Arc::new(saver.with_identity(id, model.to_string()));
+        *saver = Arc::new(saver.with_identity(id, model.to_string()).with_title(title));
         id.to_string()
+    }
+
+    /// Whether the session's name has landed on the save target.
+    ///
+    /// The claim path reads this through [`name_session_if_owed`]:
+    /// a session with a title is never renamed, and one without
+    /// tries again on its next claimed prompt.
+    fn has_title(&self) -> bool {
+        self.saver
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .title()
+            .is_some()
+    }
+
+    /// The session identity the save target currently writes under.
+    ///
+    /// Read under the saver lock alone — never nested with the
+    /// naming slot — so the claim path can arm the slot for exactly
+    /// the session it is about to name.
+    fn current_session_id(&self) -> uuid::Uuid {
+        self.saver
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .session_id()
+    }
+
+    /// Arm the naming slot for `id` unless its call is in flight.
+    ///
+    /// Returns whether the caller owes the call: `false` only when
+    /// the slot already holds this session, the shape that keeps a
+    /// quick second prompt in one session from buying a second call.
+    /// A slot held for a different session — the one a rotation or
+    /// retarget just retired — gives way, so the fresh session's
+    /// first prompt always fires its own naming.
+    fn arm_naming(&self, id: uuid::Uuid) -> bool {
+        let mut slot = self
+            .naming_in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *slot == Some(id) {
+            return false;
+        }
+        *slot = Some(id);
+        true
+    }
+
+    /// Settle the naming slot for `id`.
+    ///
+    /// The spawned task calls this when its call answers or fails,
+    /// clearing the slot only when it still names that session. A
+    /// session swapped in meanwhile owns the slot now, and disarming
+    /// its in-flight call is not the stale task's to do — its own
+    /// settle must leave that session's naming armed.
+    fn settle_naming(&self, id: uuid::Uuid) {
+        let mut slot = self
+            .naming_in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *slot == Some(id) {
+            *slot = None;
+        }
+    }
+
+    /// Record the session's name on the save target, if it still is
+    /// that session.
+    ///
+    /// The naming task calls this when its one-shot call answers —
+    /// usually mid-run, between two publishes — with the identity it
+    /// captured at spawn. The cell may have moved meanwhile: a
+    /// `/clear` rotated it onto a fresh session, a live resume onto
+    /// an adopted one, and words coined for the retired conversation
+    /// belong to neither. The compare-and-set applies the title only
+    /// when the cell still holds the named session, so a stale
+    /// answer strands itself while the ended session's file stands as
+    /// it saved. The identity and model ride untouched: a name
+    /// changes nothing about where or as whom the session saves.
+    fn set_title_for(&self, id: uuid::Uuid, title: String) {
+        let mut saver = self
+            .saver
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if saver.session_id() != id {
+            return;
+        }
+        let model = saver.model.clone();
+        *saver = Arc::new(saver.with_identity(id, model).with_title(Some(title)));
     }
 }
 
@@ -1036,6 +1162,7 @@ impl TranscriptWorker {
                 pending,
                 signal: Arc::clone(&signal),
                 saver: saver_cell,
+                naming_in_flight: Arc::new(std::sync::Mutex::new(None)),
             },
             TranscriptWorker {
                 pending: worker_pending,
@@ -1542,6 +1669,47 @@ struct DriverContext {
     overrides: RunOverrides,
 }
 
+/// Fire the session's naming call when a claim runs its first prompt.
+///
+/// A session is named once, off the first prompt that actually runs:
+/// the ask that opens the conversation is its subject, and a prompt
+/// still waiting — queued behind a run, or dropped — has not opened
+/// anything. A session that already carries a title (a resume, or an
+/// earlier answer that landed) is never renamed; a call already in
+/// flight for the same session stands that session's later claims
+/// down until it settles, while a session the host swapped in
+/// meanwhile owes — and fires — its own. The call is fire-and-forget
+/// and bounded: a run never waits on its session's name, the answer
+/// lands on the saver cell only if the cell still holds the session
+/// the call was fired for, and a call that fails or outlives its
+/// bound leaves the session as it was — unnamed, its slot settled,
+/// and named on a later claim.
+fn name_session_if_owed(
+    transcript: &TranscriptHandle,
+    api: &dch_config::ApiConfig,
+    first_prompt: &str,
+) {
+    let id = transcript.current_session_id();
+    if transcript.has_title() || !transcript.arm_naming(id) {
+        return;
+    }
+    let transcript = transcript.clone();
+    let api = api.clone();
+    let prompt = first_prompt.to_string();
+    tokio::spawn(async move {
+        let title = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            dch_loop::session_title(&api, &prompt),
+        )
+        .await
+        .unwrap_or_default();
+        if let Some(title) = title {
+            transcript.set_title_for(id, title);
+        }
+        transcript.settle_naming(id);
+    });
+}
+
 /// The claim-edge publisher that carries retired plan entries to
 /// the display.
 ///
@@ -1790,6 +1958,7 @@ async fn run_driver_loop(
                 continue;
             }
         };
+        name_session_if_owed(&transcript, &context.config.api, &text);
         context.state.mark_run_started();
         context.state.push_sent(text.clone());
         context
@@ -1990,6 +2159,7 @@ async fn apply_session_command(
                             model: summary.model,
                             saved_at: summary.last_activity,
                             prompts: summary.user_message_count,
+                            title: summary.title,
                             workdir: summary.workdir,
                         })
                         .collect();
@@ -2006,28 +2176,79 @@ async fn apply_session_command(
                 ),
             }
         }
-        SessionCommand::Compact { compactions } => match runner.compact_now().await {
-            Ok((true, figures)) => {
-                let folded = filtered_machine_history(&Arc::new(runner.committed_history()));
-                *context
-                    .state
-                    .machine_history
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&folded));
-                transcript.send_machine(MachineSnapshot {
-                    messages: folded,
-                    saved_at: chrono::Utc::now(),
-                    compactions: compactions.saturating_add(1),
-                    saver: None,
-                });
-                post_session_notice(session_tx, figures);
-            }
-            Ok((false, figures)) => {
-                post_session_notice(session_tx, figures);
-            }
-            Err(err) => post_session_notice(session_tx, format!("compaction was declined ({err})")),
-        },
+        SessionCommand::Compact { compactions } => {
+            apply_manual_compaction(runner, transcript, session_tx, context, compactions).await;
+        }
     }
+}
+
+/// Apply one manual compaction pass, between runs.
+///
+/// The `/compact` seam's driver half: the pass folds (or declines) —
+/// a settled pass publishes the folded history to the writer,
+/// refreshes the cached copy the exit flush reads, and counts itself
+/// into the snapshot's total; a declined one yields the running row
+/// the engine's observer contract never closes on its own; a refusal
+/// names its cause. Every path lands a notice on the session lane.
+async fn apply_manual_compaction(
+    runner: &mut dch_loop::Runner,
+    transcript: &TranscriptHandle,
+    session_tx: &mpsc::UnboundedSender<SessionUpdate>,
+    context: &mut DriverContext,
+    compactions: u32,
+) {
+    match runner.compact_now().await {
+        Ok((true, figures)) => {
+            let folded = filtered_machine_history(&Arc::new(runner.committed_history()));
+            *context
+                .state
+                .machine_history
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&folded));
+            context
+                .state
+                .compaction_publications
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(CompactionFiling {
+                    pass: context
+                        .state
+                        .compaction_passes
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    folded: Arc::clone(&folded),
+                });
+            transcript.send_machine(MachineSnapshot {
+                messages: folded,
+                saved_at: chrono::Utc::now(),
+                compactions: compactions.saturating_add(1),
+                saver: None,
+            });
+            post_session_notice(session_tx, figures);
+        }
+        Ok((false, figures)) => {
+            yield_the_running_row(context);
+            post_session_notice(session_tx, figures);
+        }
+        Err(err) => {
+            yield_the_running_row(context);
+            post_session_notice(session_tx, format!("compaction was declined ({err})"));
+        }
+    }
+}
+
+/// Yield the conversation's running row once a compaction settles.
+///
+/// The engine's observer contract has no declined event, so the row
+/// the pass's opening event raised has no closer on the decline path —
+/// this is the closer. An early refusal (a live turn) never raised
+/// the row, and an engine failure clears it through the failed
+/// event; setting the lane idle is right either way.
+fn yield_the_running_row(context: &DriverContext) {
+    *context
+        .state
+        .health
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = HealthNotice::Idle;
 }
 
 /// Post one driver notice, or drop it with a warn when the display is gone.
@@ -2253,7 +2474,7 @@ async fn resume_into_session(
         .machine_history
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&adopted));
-    transcript.retarget(target, &context.config.api.model);
+    transcript.retarget(target, &context.config.api.model, outcome.title.clone());
     transcript.send_machine(MachineSnapshot {
         messages: adopted,
         saved_at: chrono::Utc::now(),
@@ -2596,7 +2817,9 @@ mod tests {
             crate::session::SessionTokens::default(),
         );
         worker.join();
-        let (_, _, _, session_at) = crate::session::load_with_meta_in(id, &root).unwrap();
+        let session_at = crate::session::load_with_meta_in(id, &root)
+            .unwrap()
+            .saved_at;
         assert!(
             crate::session::load_machine_in(id, &root, session_at).is_none(),
             "a display-only save never adopts a machine half it did not write"
@@ -2610,10 +2833,98 @@ mod tests {
             saver: None,
         });
         worker.join();
-        let (_, _, _, session_at) = crate::session::load_with_meta_in(id, &root).unwrap();
+        let session_at = crate::session::load_with_meta_in(id, &root)
+            .unwrap()
+            .saved_at;
         assert!(
             crate::session::load_machine_in(id, &root, session_at).is_some(),
             "the machine half landing after restores the pair"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_declining_manual_compact_yields_the_running_row() {
+        // /compact on a fitting context is the decline path, and the
+        // engine's observer contract has no declined event: the running
+        // row the pass's opening event raised has no closer but this
+        // arm. Pin that the driver yields the lane beside the notice —
+        // an orphaned "Compacting" row reads as a pass that never
+        // ends, which is what every small session's manual compact
+        // showed before the yield.
+        let dir = tempfile::tempdir().expect("session tempdir");
+        let root = dir.keep();
+        let id = uuid::Uuid::new_v4();
+        let saver = Arc::new(crate::session::SessionSaver::with_base_dir(
+            id,
+            "m".to_string(),
+            root.clone(),
+        ));
+        let (transcript, worker) = TranscriptWorker::spawn(Arc::clone(&saver));
+        let workdir = tempfile::tempdir().expect("temp workdir");
+        let server =
+            SseServer::start_with_delay(vec![sse_text_turn("grown")], std::time::Duration::ZERO)
+                .await;
+        let mut config = sse_config(server.port);
+        config.api.context_window = Some(1_000_000);
+        let mut runner = dch_loop::Runner::builder(&config, workdir.path())
+            .with_history(vec![
+                loopctl::message::Message::user("hi"),
+                loopctl::message::Message::assistant("hello"),
+            ])
+            .build()
+            .await
+            .expect("runner over a tiny history");
+        let (_, state) = TuiObserverState::new().into_observer();
+        {
+            let mut health = state
+                .health
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *health = HealthNotice::Compacting {
+                began: std::time::Instant::now(),
+            };
+        }
+        let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+        let mut context = DriverContext {
+            config: config.clone(),
+            config_base: std::sync::Arc::new(config),
+            workdir: workdir.path().to_path_buf(),
+            sessions_root: root.clone(),
+            state: state.clone(),
+            shutting_down: shutdown_flag(false),
+            lanes: InteractiveLanes::detached(),
+            overrides: RunOverrides::default(),
+        };
+        apply_session_command(
+            &mut runner,
+            &transcript,
+            &session_tx,
+            SessionCommand::Compact { compactions: 0 },
+            &mut context,
+        )
+        .await;
+        worker.join();
+        let notice = tokio::time::timeout(std::time::Duration::from_secs(5), session_rx.recv())
+            .await
+            .expect("the decline reports its verdict")
+            .expect("the session channel is open");
+        if let SessionUpdate::Notice { text } = notice {
+            assert!(
+                text.contains("nothing to compact"),
+                "the decline notice carries the pass's verdict: {text}"
+            );
+        } else {
+            panic!("expected a notice from the declined pass");
+        }
+        assert!(
+            matches!(
+                *state
+                    .health
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                HealthNotice::Idle
+            ),
+            "the running row yields with the decline"
         );
     }
 
@@ -2667,8 +2978,10 @@ mod tests {
         let mut config = sse_config(server.port);
         config.api.context_window = Some(40_000);
         config.runner.compactor = dch_config::CompactorSelection::Truncating;
+        let (observer, state) = TuiObserverState::new().into_observer();
         let mut runner = dch_loop::Runner::builder(&config, workdir.path())
             .with_history(seeds)
+            .with_observer(Arc::new(observer))
             .build()
             .await
             .expect("runner over a fat history");
@@ -2676,7 +2989,6 @@ mod tests {
             .await
             .expect("the scripted run completes")
             .expect("the run finishes");
-        let (_, state) = TuiObserverState::new().into_observer();
         let (session_tx, mut session_rx) = mpsc::unbounded_channel();
         let mut context = DriverContext {
             config: config.clone(),
@@ -2696,6 +3008,38 @@ mod tests {
             &mut context,
         )
         .await;
+        let cached = context
+            .state
+            .machine_history
+            .lock()
+            .expect("the machine-history lock")
+            .as_ref()
+            .map(|history| history.len());
+        let filed = context
+            .state
+            .compaction_publications
+            .lock()
+            .expect("the publications lock")
+            .first()
+            .map(|filing| (filing.pass, filing.folded.len()));
+        assert_eq!(
+            filed,
+            cached.map(|len| (1, len)),
+            "the manual pass files its folded feed under its own pass's \
+             stamp — the session's first compaction — beside the cache \
+             the same path refreshed"
+        );
+        assert_eq!(
+            context
+                .state
+                .compactions
+                .lock()
+                .expect("the compaction lock")
+                .last()
+                .map(|event| event.pass),
+            Some(1),
+            "the observer numbered the pass's row one — the stamp the filing carries"
+        );
         worker.join();
 
         let notice = tokio::time::timeout(std::time::Duration::from_secs(5), session_rx.recv())
@@ -2795,7 +3139,9 @@ mod tests {
             text.contains("nothing to compact"),
             "the notice names the decline: {text}"
         );
-        let (_, _, _, session_at) = crate::session::load_with_meta_in(id, &root).unwrap();
+        let session_at = crate::session::load_with_meta_in(id, &root)
+            .unwrap()
+            .saved_at;
         assert!(
             crate::session::load_machine_in(id, &root, session_at).is_none(),
             "a declined pass republishes nothing"
@@ -3638,6 +3984,25 @@ mod tests {
         .collect()
     }
 
+    /// A canned non-streaming completion naming the session.
+    ///
+    /// What the naming call is answered with when the endpoint routes
+    /// on the naming marker, in the JSON shape a non-streaming
+    /// OpenAI reply parses. Numbered by arrival: a race pin reads the
+    /// number to tell which session's prompt coined the title that
+    /// landed.
+    fn canned_title_body(which: usize) -> String {
+        serde_json::json!({
+            "id": "title", "model": "test-model",
+            "choices": [{
+                "message": {"role": "assistant",
+                    "content": format!("Canned Session Title {which}")},
+                "finish_reason": "stop"
+            }]
+        })
+        .to_string()
+    }
+
     /// A canned-SSE provider endpoint on an ephemeral local port.
     ///
     /// Serves the queued bodies one per accepted connection in order,
@@ -3668,17 +4033,43 @@ mod tests {
         ///
         /// The shape an interleaving needs: some turns answer at once
         /// while one sits held, so a mid-flight event lands against
-        /// exactly the run the test names.
+        /// exactly the run the test names. Naming replies answer at
+        /// once.
         async fn start_timed(responses: Vec<(String, std::time::Duration)>) -> Self {
-            Self::start_shared(responses).await
+            Self::start_shared(responses, std::time::Duration::ZERO).await
         }
 
         async fn start_with_delay(responses: Vec<String>, delay: std::time::Duration) -> Self {
-            Self::start_shared(responses.into_iter().map(|body| (body, delay)).collect()).await
+            Self::start_shared(
+                responses.into_iter().map(|body| (body, delay)).collect(),
+                std::time::Duration::ZERO,
+            )
+            .await
         }
 
-        /// The accept loop both starters share.
-        async fn start_shared(responses: Vec<(String, std::time::Duration)>) -> Self {
+        /// Start the endpoint where every naming reply waits out a delay.
+        ///
+        /// The shape a naming-race pin needs: the turn bodies answer on
+        /// their own schedule while each title reply sits held for the
+        /// delay, so a test can move the host onto another session
+        /// before a session's name lands. Titles are numbered by
+        /// arrival, so the pin can tell which prompt's words landed.
+        async fn start_with_naming_delay(
+            responses: Vec<(String, std::time::Duration)>,
+            naming_delay: std::time::Duration,
+        ) -> Self {
+            Self::start_shared(responses, naming_delay).await
+        }
+
+        /// The accept loop the starters share.
+        ///
+        /// Serves the queued turn bodies one connection at a time, in
+        /// order, while the naming arm answers off the loop — a held
+        /// title never blocks a turn.
+        async fn start_shared(
+            responses: Vec<(String, std::time::Duration)>,
+            naming_delay: std::time::Duration,
+        ) -> Self {
             // Bind here (not inside the task) so the port is known
             // before the first request is sent.
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -3695,14 +4086,45 @@ mod tests {
                 use tokio::io::AsyncWriteExt as _;
                 let mut queue: std::collections::VecDeque<(String, std::time::Duration)> =
                     responses.into();
+                let naming_arrivals = std::sync::atomic::AtomicUsize::new(0);
                 loop {
                     let Ok((mut sock, _)) = listener.accept().await else {
                         break;
                     };
-                    let body = queue.pop_front();
-                    if let (Some(req), Ok(mut recorded)) =
-                        (read_http_request(&mut sock).await, task_requests.lock())
+                    let req = read_http_request(&mut sock).await;
+                    // The session's naming call is not a conversation
+                    // turn: answer it from a canned title, spend no
+                    // scripted body, and record nothing — the counts a
+                    // test reads stay the turns' alone. The reply waits
+                    // out the naming delay, carries its arrival
+                    // number, and leaves the accept loop for its own
+                    // task — a held-back name never blocks the turns
+                    // queued behind it, so a race pin can move the host
+                    // onto another session before a name lands.
+                    if req
+                        .as_deref()
+                        .is_some_and(|body| body.contains(dch_loop::NAME_SYSTEM_PROMPT))
                     {
+                        let which = naming_arrivals
+                            .fetch_add(1, Ordering::SeqCst)
+                            .saturating_add(1);
+                        tokio::spawn(async move {
+                            use tokio::io::AsyncWriteExt as _;
+                            if naming_delay > std::time::Duration::ZERO {
+                                tokio::time::sleep(naming_delay).await;
+                            }
+                            let title = canned_title_body(which);
+                            let answer = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                                 Content-Length: {}\r\nConnection: close\r\n\r\n{title}",
+                                title.len()
+                            );
+                            let _ = sock.write_all(answer.as_bytes()).await;
+                        });
+                        continue;
+                    }
+                    let body = queue.pop_front();
+                    if let (Some(req), Ok(mut recorded)) = (req, task_requests.lock()) {
                         recorded.push(req);
                     }
                     if let Some((_, wait)) = body.as_ref()
@@ -4201,8 +4623,9 @@ mod tests {
         }));
         app.apply_session_update(update);
         worker.join();
-        let (_, model, _, _) =
-            crate::session::load_with_meta_in(id, dir.path()).expect("the file the writer left");
+        let model = crate::session::load_with_meta_in(id, dir.path())
+            .expect("the file the writer left")
+            .model;
         assert_eq!(
             model, "wide-model",
             "session.json names the switched model, read off disk"
@@ -4320,8 +4743,9 @@ mod tests {
             "the shared window carries the selected profile's figure — what the bar and the compaction threshold read"
         );
         worker.join();
-        let (_, model, _, _) =
-            crate::session::load_with_meta_in(id, dir.path()).expect("the file the writer left");
+        let model = crate::session::load_with_meta_in(id, dir.path())
+            .expect("the file the writer left")
+            .model;
         assert_eq!(
             model, "wide-model",
             "session.json names the switched model, read off disk"
@@ -5389,7 +5813,7 @@ mod tests {
             "a cleared session's exit names the fresh id"
         );
         let adopted = uuid::Uuid::new_v4();
-        handle.retarget(adopted, "m");
+        handle.retarget(adopted, "m", None);
         assert_eq!(
             exit_reads(),
             adopted,
@@ -5415,6 +5839,7 @@ mod tests {
             pending: Arc::new(std::sync::Mutex::new(PendingSaves::default())),
             signal: Arc::new(std::sync::Condvar::new()),
             saver: Arc::new(std::sync::Mutex::new(saver)),
+            naming_in_flight: Arc::new(std::sync::Mutex::new(None)),
         };
         handle.send(
             vec![dch_tui::TuiMessage::User {
@@ -6600,6 +7025,207 @@ mod tests {
              finished turn as the one in flight"
         );
         let _ = driver.await;
+    }
+
+    #[test]
+    fn a_naming_slot_armed_for_one_session_does_not_disarm_another() {
+        // The naming slot's compare-and-set, driven worker-free:
+        // identity is the only thing that may arm, apply, or clear
+        // it. A retired session's settle must leave the live
+        // session's naming armed, and its late answer must not title
+        // the session that replaced it.
+        let dir = tempfile::tempdir().expect("sessions tempdir");
+        let first = uuid::Uuid::new_v4();
+        let saver = Arc::new(crate::session::SessionSaver::with_base_dir(
+            first,
+            "m".to_string(),
+            dir.path().to_path_buf(),
+        ));
+        let (handle, _worker) = TranscriptWorker::spawn(saver);
+        assert!(
+            handle.arm_naming(first),
+            "the first session's claim arms the slot"
+        );
+        assert!(
+            !handle.arm_naming(first),
+            "a second prompt in the same session buys no second call"
+        );
+        handle.rotate("m");
+        let fresh = handle.current_session_id();
+        assert_ne!(first, fresh, "the rotation moved the save target");
+        assert!(
+            handle.arm_naming(fresh),
+            "the fresh session's first prompt arms its own call — a slot \
+             held for the retired session does not stand it down"
+        );
+        handle.settle_naming(first);
+        assert_eq!(
+            *handle.naming_in_flight.lock().expect("naming slot"),
+            Some(fresh),
+            "the stale session's settle leaves the live session's naming armed"
+        );
+        handle.set_title_for(first, "a stale subject".to_string());
+        assert!(
+            !handle.has_title(),
+            "a stale answer cannot title the session that replaced its own"
+        );
+        handle.set_title_for(fresh, "the fresh subject".to_string());
+        assert!(
+            handle.has_title(),
+            "the live session's own answer titles it"
+        );
+        handle.settle_naming(fresh);
+        assert_eq!(
+            *handle.naming_in_flight.lock().expect("naming slot"),
+            None,
+            "settling the live session's call clears the slot for a retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_late_naming_answer_titles_the_session_whose_prompt_coined_it() {
+        // The first session's name is held past the turn it rode
+        // beside, and the host rotates onto a fresh session before it
+        // lands. The stale answer must strand itself: the fresh
+        // session files a title its own prompt coined — proving its
+        // first prompt bought a naming call at all — while the
+        // retired session's file keeps the shape it saved.
+        let server = SseServer::start_with_naming_delay(
+            vec![
+                (sse_text_turn("first answer"), std::time::Duration::ZERO),
+                (
+                    sse_text_turn("second answer"),
+                    std::time::Duration::from_millis(2400),
+                ),
+            ],
+            std::time::Duration::from_millis(1500),
+        )
+        .await;
+        let dir = tempfile::tempdir().expect("workdir tempdir");
+        let mut config = sse_config(server.port);
+        config.api.context_window = Some(200_000);
+        let runner = dch_loop::Runner::builder(&config, dir.path())
+            .build()
+            .await
+            .expect("offline runner construction");
+        let sessions = tempfile::tempdir().expect("sessions tempdir");
+        let root = sessions.keep();
+        let first = uuid::Uuid::new_v4();
+        let saver = Arc::new(crate::session::SessionSaver::with_base_dir(
+            first,
+            "test-model".to_string(),
+            root.clone(),
+        ));
+        let (transcript, worker) = TranscriptWorker::spawn(saver);
+        let (_, state) = TuiObserverState::new().into_observer();
+        let (tx, rx) = mpsc::unbounded_channel();
+        queue_prompt(&state, &tx, "open the first conversation");
+        let (session_tx, _session_rx) = mpsc::unbounded_channel();
+        let driver = tokio::spawn(Box::pin(run_driver_loop(
+            runner,
+            rx,
+            DriverContext {
+                config: config.clone(),
+                config_base: std::sync::Arc::new(config),
+                workdir: dir.path().to_path_buf(),
+                sessions_root: root.clone(),
+                state: state.clone(),
+                shutting_down: shutdown_flag(false),
+                lanes: InteractiveLanes::detached(),
+                overrides: RunOverrides::default(),
+            },
+            transcript.clone(),
+            session_tx,
+        )));
+        let mut first_done = false;
+        for _ in 0..1800 {
+            if state
+                .machine_history
+                .lock()
+                .expect("history lock")
+                .is_some()
+            {
+                first_done = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            first_done,
+            "the first turn completes while its session's name is still held back"
+        );
+        transcript.send(
+            vec![TuiMessage::User {
+                text: "open the first conversation".to_string(),
+                timestamp: chrono::Utc::now(),
+                steered: false,
+                unsent: false,
+            }],
+            crate::session::SessionTokens::default(),
+        );
+        tx.send(Submission::Command {
+            command: SessionCommand::Clear,
+        })
+        .expect("driver channel open");
+        let mut fresh = first;
+        let mut rotated = false;
+        for _ in 0..1800 {
+            let current = transcript.current_session_id();
+            if current != first {
+                fresh = current;
+                rotated = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            rotated,
+            "the clear moves the save target onto a fresh session"
+        );
+        queue_prompt(&state, &tx, "open the second conversation");
+        drop(tx);
+        let machine_path = root.join(fresh.to_string()).join("machine.json");
+        let mut second_done = false;
+        for _ in 0..1800 {
+            if machine_path.exists() && transcript.has_title() {
+                second_done = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            second_done,
+            "the fresh session's turn completed and its own naming answer landed \
+             on the cell — the publish that follows files whichever title the \
+             cell holds"
+        );
+        transcript.send(
+            vec![TuiMessage::User {
+                text: "open the second conversation".to_string(),
+                timestamp: chrono::Utc::now(),
+                steered: false,
+                unsent: false,
+            }],
+            crate::session::SessionTokens::default(),
+        );
+        let _ = driver.await;
+        worker.join();
+        let retired =
+            crate::session::load_with_meta_in(first, &root).expect("the retired session's file");
+        assert_eq!(
+            retired.title, None,
+            "the retired session's file keeps the shape it saved — a stale naming \
+             answer never reaches it"
+        );
+        let fresh_file =
+            crate::session::load_with_meta_in(fresh, &root).expect("the fresh session's file");
+        assert_eq!(
+            fresh_file.title.as_deref(),
+            Some("Canned Session Title 2"),
+            "the fresh session files the title its own prompt coined — the retired \
+             conversation's words never land on it, and its first prompt always \
+             buys a naming call"
+        );
     }
 
     #[tokio::test]

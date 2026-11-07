@@ -63,13 +63,16 @@ pub fn spinner_frame_at(elapsed: std::time::Duration) -> &'static str {
 
 /// The running indicator for the per-tool line.
 ///
-/// The static hourglass the spec names for in-flight calls; the
-/// animated braille frames are the Quiet mode's quieter pulse. A
-/// plain text glyph rather than the emoji clock: U+29D7 carries no
-/// emoji presentation anywhere, so every terminal draws it in the
-/// line's own color instead of a vendor emoji font, and it stays a
-/// cell wide like the ✓/✗ it sits beside.
-pub const RUNNING_GLYPH: &str = "⧗";
+/// The static hourglass with flowing sand for in-flight calls; the
+/// animated braille frames are the Quiet mode's quieter pulse. An
+/// emoji glyph by choice: a terminal with a vendor emoji font paints
+/// it in that font's colors rather than the line's own, and it
+/// measures two cells wide where the ✓/✗ it sits beside measure one —
+/// the wrap that shapes these lines measures display width, so the
+/// wider glyph costs a column of summary, never correctness. The
+/// waiting rows answer it with the settled hourglass (⌛), the same
+/// family at rest.
+pub const RUNNING_GLYPH: &str = "⏳";
 
 /// The completed-success indicator.
 ///

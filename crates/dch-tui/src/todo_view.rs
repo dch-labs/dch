@@ -21,7 +21,7 @@ use ratatui::text::{Line, Span};
 /// The title the plan section opens with.
 ///
 /// Rendered as a badge — the waiting section's pill — over the
-/// secondary accent rather than the primary, so the two panels read
+/// primary accent rather than the secondary, so the two panels read
 /// as one family of chrome with two names. In a theme that defers
 /// to the terminal the fill resets and the word degrades to plain
 /// text, the same concession the queue's badge makes.
@@ -458,7 +458,7 @@ pub(crate) struct TodoColors {
 
     /// The fill the plan section's badge rides on.
     ///
-    /// The secondary accent — the queue's badge wears the primary,
+    /// The primary accent — the queue's badge wears the secondary,
     /// and the two panels read as one family of chrome with two
     /// names. In a theme that defers to the terminal this is
     /// `Reset`, and the pill becomes plain text.
@@ -754,11 +754,12 @@ mod tests {
 
     #[test]
     fn the_rendered_result_parses_as_the_enforced_truth() {
-        // A live session's shape: the model requested eight completed,
-        // the rung law advanced six of them to in progress, and the
-        // rendered result is the list the run holds — the panel reads
-        // this, not the request that preceded it.
-        let rendered = "Adjusted: 'modrs' requested completed from pending — \
+        // A live session's shape: the model filed a fresh entry
+        // completed onto a standing list and the rung law advanced it to
+        // in progress, and the rendered result is the list the run
+        // holds — the panel reads this, not the request that preceded
+        // it.
+        let rendered = "Adjusted: 'modrs' filed completed onto a standing list — \
 advanced to in progress (one rung per call)\n\n# Task List\n\n\
 Summary: 9 pending, 1 in progress, 2 completed\n\n\
 ◐ [origin] Strip origin metadata\n\n\

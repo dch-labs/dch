@@ -26,6 +26,9 @@ A terminal-based agentic coding assistant written in Rust, built on the
 - **Roles** — `general` (default), `coding`, `refactor`, `debug`,
   `review`, `docs`, `tests`; each tunes the system prompt, set in
   config without rebuilding.
+- **Named sessions** — every session gets a few-word title coined by
+  the model from its first prompt, carried in the session file and
+  shown by `--list-sessions` and the `/sessions` picker.
 - **Containment** — file tools are confined to the working directory
   unless `--unsafe-paths` is given for the run.
 
@@ -118,6 +121,13 @@ dch --list-sessions 30       # the 30 most recent
 dch --list-sessions all      # everything
 ```
 
+Every saved session carries a TITLE — a few words the model coins
+from the conversation's first prompt (a one-shot side call to the
+session's own model; a session whose naming call never answered reads
+as a dash, and its next run tries again). A resumed session keeps its
+title; `/clear` starts the fresh one untitled until its own first
+prompt names it.
+
 The MSGS column counts your submitted prompts — tool calls, replies,
 error rows, and steered echo rows (a steer the run read, a hook's
 reminder) all stay out. CONTEXT is the engine's context-size estimate
@@ -125,6 +135,11 @@ at the moment of the last save — the figure a running TUI's context
 bar fills against and a headless run's save records from the loop
 itself, and approximately the context a resume re-loads — not the
 session's lifetime token spend.
+
+WORKDIR is the directory the session ran in, as the envelope recorded
+it at save time — the provenance that tells two same-model sessions in
+different repositories apart. A session saved before the field existed
+reads as a dash.
 
 A missing session id warns and starts fresh; a corrupt file warns
 loudly, starts fresh, and is never modified; a session file that
@@ -193,6 +208,7 @@ Conversation:
 | Key | Action |
 | --- | --- |
 | `Up` / `Down` | Scroll one line (only while the input is empty with nothing recallable) |
+| `Alt+Up` / `Alt+Down` | Jump to the previous / next prompt you sent — the target prompt's first row lands at the top of the viewport, whatever the composer holds. Steered echoes and unsent drafts are not stops |
 | `PageUp` / `PageDown` | Scroll ten lines |
 | Mouse wheel | Scroll the transcript, one line per event |
 | Mouse drag | Select characters; the highlight stays after release and the text is copied to the clipboard. Dragging on the pane's top or bottom line scrolls the transcript with the selection |
@@ -297,7 +313,7 @@ corrected words are the only copy of what was typed.
 
 While the run's todo list holds unfinished tasks, it stands pinned
 above the composer — no key, no overlay: a `TODO` badge (the waiting
-section's pill, over the secondary accent) with the done fraction
+section's pill, over the primary accent) with the done fraction
 beside it (`2/5 done`), then one checkbox row per task (◐ the task in
 progress and newly filed rows in the accent; ☑ finished rows uniform
 in the dim register, the words struck through and the box plain), and
@@ -426,6 +442,12 @@ theme = "default"
                                   # bands; side-by-side pairs each removed
                                   # line with its replacement. Narrow
                                   # terminals fall back to inline
+# diff_palette = "classic"        # the hues those bands paint with:
+                                  # classic green/red (default), soft
+                                  # lighter-green/dimmed-red for palettes
+                                  # the saturated hues fight, or
+                                  # blue-orange — the color-blind-safe
+                                  # pairing
 # mouse_capture = true            # the wheel scrolls dch; false hands
                                   # selection back to the terminal
 verbosity = "normal"              # quiet | normal | verbose

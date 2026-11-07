@@ -438,6 +438,15 @@ pub struct SessionPick {
     /// echo rows — one glance at how long the conversation runs.
     pub prompts: usize,
 
+    /// The session's name, when the naming call has answered.
+    ///
+    /// The few words that say what the conversation was about — the
+    /// thing a user actually picks a resume by, which no id or
+    /// timestamp can say. `None` on sessions saved before titles
+    /// existed and on ones whose naming call never answered; the
+    /// picker's row renders the absence as a dash.
+    pub title: Option<String>,
+
     /// The working directory the session ran in, when recorded.
     ///
     /// The picker's row shows it so sessions on the same model in

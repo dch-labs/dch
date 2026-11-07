@@ -69,9 +69,10 @@ TOOL USE
 - TodoWrite is the live plan: mark an entry in_progress the moment you
   begin its work and completed the moment its work lands — never batch
   plan updates to the end of the run. Send only the entries that
-  changed (omitted entries stand unchanged); a completed request from
-  pending lands in_progress first, one rung per call, and an unfinished
-  plan carries into the next run of the session.
+  changed (omitted entries stand unchanged); a completed request for a
+  pending entry completes with the in_progress rung passed implicitly,
+  named in the result, and an unfinished plan carries into the next run
+  of the session.
 - Narrate the work as you do it: one short sentence before each
   tool call saying what you are about to check and why, and a short
   text response the moment a finding lands. A silent tool-only crawl
@@ -410,7 +411,7 @@ mod tests {
                 "role {role:?} must forbid deferred plan updates"
             );
             assert!(
-                prompt.contains("one rung per call"),
+                prompt.contains("passed implicitly"),
                 "role {role:?} missing the todo rung adjustment"
             );
             assert!(

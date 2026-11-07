@@ -196,17 +196,24 @@ fn dispatch_targets(ctx: &ToolDispatchContext) -> Vec<String> {
 /// top-level `file_path`, so the gate mirrors the tool's precedence
 /// exactly: the entry's own path when it names one (canonical first,
 /// alias when the canonical is absent entirely), the batch default when
-/// the entry names nothing at all, and nothing only when the entry
-/// mistypes its own `file_path` — a call the tool refuses on the entry
-/// itself, before the default is ever consulted, so the default is no
-/// target that batch reaches.
+/// the entry names nothing at all, and nothing when the entry mistypes
+/// a path of its own — the canonical spelling, or a present-but-mistyped
+/// alias — a call the tool refuses on the entry itself, before the
+/// default is ever consulted, so the default is no target that batch
+/// reaches and the refusal that answers is the tool's own teaching
+/// error.
 fn edit_target(edit: &serde_json::Value, batch_default: Option<&str>) -> Option<String> {
     match write_family_path(edit) {
         Some(path) => Some(path.to_string()),
         None => edit
             .get(FILE_PATH_FIELD)
             .is_none()
-            .then(|| batch_default.map(str::to_string))
+            .then(|| {
+                edit.get(PATH_FIELD)
+                    .is_none()
+                    .then(|| batch_default.map(str::to_string))
+                    .flatten()
+            })
             .flatten(),
     }
 }
