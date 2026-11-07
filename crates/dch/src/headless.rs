@@ -268,8 +268,10 @@ pub(crate) fn capture_marker_mode(
 /// before the run bridge is stopped, so an interrupt landing during the
 /// write fails closed through the force hook rather than killing the
 /// process with no marker. Once the run's own marker is written the
-/// force hook stands down: a repeat interrupt still exits 130, but the
-/// recorded outcome survives in the done-file. The session's title is
+/// force hook stands down and finalization begins: a repeat interrupt
+/// from there is recorded rather than honored, the transcript still
+/// lands, and the run then reports the interrupt's 130 beside the
+/// already-recorded done-file. The session's title is
 /// bookkeeping that never outranks the outcome: the answer is printed
 /// and the done-file written before the naming task is waited on, and
 /// the transcript save waits only [`NAMING_SETTLE_BUDGET`] for a title
@@ -397,6 +399,7 @@ async fn run_headless_inner(
     };
     write_done_file_if_requested(args, &outcome, inherited_mode.as_ref());
     outcome_recorded.store(true, Ordering::SeqCst);
+    bridge.begin_finalization();
     let saver = match naming {
         Some(task) => saver.with_title(settle_naming(task, NAMING_SETTLE_BUDGET).await),
         None => saver,
@@ -428,7 +431,11 @@ async fn run_headless_inner(
             save_transcript(&saver, &runner, &transcript, compactions);
         }
     }
+    let pending_force = bridge.pending_force();
     bridge.stop().await;
+    if pending_force {
+        return Ok(HeadlessOutcome::failure(130, FORCE_CANCEL_MESSAGE));
+    }
     Ok(outcome)
 }
 
@@ -2593,6 +2600,94 @@ mod tests {
             meta.title, None,
             "a title that never answered saves as untitled — the run \
              does not wait for it"
+        );
+    }
+
+    /// A repeated interrupt inside the title settle cannot exit over the
+    /// transcript.
+    ///
+    /// The interleaving the finalization latch exists for: the run
+    /// resolves and its done-file lands, the settle holds finalization
+    /// open for its two-second budget, and a double interrupt inside
+    /// that window once killed the process from the bridge task before
+    /// the transcript saved. The bridge now records the repeat as
+    /// pending; the save lands, and the run then reports the
+    /// interrupt's 130 beside the intact success done-file.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_repeated_interrupt_inside_the_title_settle_spares_the_transcript() {
+        let _signal_lock = crate::signals::SIGNAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::signals::assert_listeners_install();
+        let server = TurnServer::start_stalling_title().await;
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[api]\napi_type = \"openai\"\nbase_url = \"http://127.0.0.1:{}\"\
+                 \napi_key = \"dummy\"\nmodel = \"test-model\"\nrequest_timeout_secs = 120\n\
+                 context_window = 200000\n",
+                server.port
+            ),
+        )
+        .unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let done = dir.path().join("done.json");
+        let args = parse(&[
+            "name this session",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--done-file",
+            done.to_str().unwrap(),
+        ]);
+        let task_args = args.clone();
+        let sessions_root = sessions.path().to_path_buf();
+        let run = tokio::spawn(async move {
+            run_headless_rooted(
+                &task_args,
+                crate::signals::install_construction_handler(|| {}),
+                sessions_root,
+                fresh_control(),
+            )
+            .await
+        });
+        // The done-file's arrival proves the outcome is recorded and the
+        // settle holds finalization open — the exact window the deferral
+        // exists to protect.
+        let opened = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            while !done.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(opened.is_ok(), "the run must record its outcome first");
+        unsafe { libc::kill(libc::getpid(), libc::SIGINT) };
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        unsafe { libc::kill(libc::getpid(), libc::SIGINT) };
+        let code = tokio::time::timeout(std::time::Duration::from_secs(30), run)
+            .await
+            .expect("the deferred run still finishes on its own")
+            .unwrap();
+        assert_eq!(code, 130, "the pending interrupt is honored after the save");
+        let done_text = std::fs::read_to_string(&done).unwrap();
+        assert!(
+            done_text.contains("\"success\""),
+            "the success marker survives the deferred exit: {done_text}"
+        );
+        let saved = session_ids(sessions.path());
+        assert_eq!(
+            saved.len(),
+            1,
+            "the transcript saved despite the interrupts"
+        );
+        let meta =
+            crate::session::load_with_meta_in(*saved.first().unwrap(), sessions.path()).unwrap();
+        assert!(
+            !meta.messages.is_empty(),
+            "the completed turn is in the saved transcript"
         );
     }
 
