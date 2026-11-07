@@ -2190,11 +2190,11 @@ mod tests {
 
         /// Bind a server whose naming calls never answer.
         ///
-        /// The naming connection is parked by its own task — off the
-        /// accept loop, so the conversation connections behind it
-        /// still resolve their canned turns — and never receives a
-        /// byte: the shape of a provider whose title side call stalls
-        /// past every budget that matters.
+        /// The naming connection is parked by its own task — a task
+        /// that owns the socket, holding it open and silent, off the
+        /// accept loop so the conversation connections behind it still
+        /// resolve their canned turns: the shape of a provider whose
+        /// title side call stalls past every budget that matters.
         async fn start_stalling_title() -> Self {
             Self::bind(true).await
         }
@@ -2240,15 +2240,12 @@ mod tests {
                             break;
                         }
                     }
-                    // The session's naming call is not a conversation
-                    // turn: it answers from the canned title below
-                    // instead of the streamed answer, so every
-                    // conversation connection still resolves one
-                    // clean turn and the naming side call settles on
-                    // its own reply.
                     if String::from_utf8_lossy(&seen).contains(dch_loop::NAME_SYSTEM_PROMPT) {
                         if stall_title {
-                            tokio::spawn(std::future::pending::<()>());
+                            tokio::spawn(async move {
+                                let _held = stream;
+                                std::future::pending::<()>().await;
+                            });
                             continue;
                         }
                         let title = serde_json::json!({
@@ -2573,6 +2570,11 @@ mod tests {
             "the run completes against the canned turn regardless of the title"
         );
         let elapsed = began.elapsed();
+        assert!(
+            elapsed >= NAMING_SETTLE_BUDGET,
+            "the stall is real — the parked socket never answers, so the \
+             settle spends its whole budget: {elapsed:?}"
+        );
         assert!(
             elapsed < std::time::Duration::from_secs(15),
             "the outcome waits only the settle budget, never the naming \
