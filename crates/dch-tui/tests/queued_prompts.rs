@@ -446,7 +446,31 @@ fn the_title_rides_as_a_badge_of_the_theme_s_own_colors() {
 #[test]
 fn the_keys_light_the_marker_and_leave_the_badge_s_accent_steady() {
     let (mut app, _kept, _rx) = app_with_waiting(&["first waiting"]);
+
+    // At rest the marker sits in the dim register; Ctrl+W lights it in
+    // the primary accent — a voice distinct from the unfocused one
+    // under every theme. Dracula is the pin's premise: its secondary
+    // accent and dim are the same color, so a cue painted in the
+    // secondary vanished exactly where it was needed.
+    let resting = painted_rows(&mut app, 80, 24);
+    let marker = resting
+        .iter()
+        .flatten()
+        .find(|(symbol, _, _)| symbol == "\u{231b}")
+        .expect("the waiting prompt carries the hourglass marker");
+    assert_eq!(
+        marker.1, app.theme.ui.dim,
+        "the marker rests in the dim register while the composer holds the keys"
+    );
+    drop(resting);
+
     press(&mut app, &ctrl(KeyCode::Char('w')));
+    app.theme = Theme::by_name("dracula").expect("the dracula theme is shipped");
+    assert_eq!(
+        app.theme.ui.secondary, app.theme.ui.dim,
+        "Dracula collapses the secondary accent into dim — the theme the \
+         focus cue must survive"
+    );
 
     let painted = painted_rows(&mut app, 80, 24);
     let (row, column) = badge_at(&painted);
@@ -466,9 +490,14 @@ fn the_keys_light_the_marker_and_leave_the_badge_s_accent_steady() {
         .flatten()
         .find(|(symbol, _, _)| symbol == "\u{231b}")
         .expect("the waiting prompt carries the hourglass marker");
+    assert_ne!(
+        marker.1, app.theme.ui.dim,
+        "the focused marker never renders in the resting voice"
+    );
     assert_eq!(
-        marker.1, app.theme.ui.secondary,
-        "the keys light the marker's voice, not the label's fill"
+        marker.1, app.theme.ui.primary,
+        "the keys light the marker in the primary accent, a cue no theme \
+         can collapse away"
     );
 }
 
@@ -1964,7 +1993,7 @@ fn the_leave_chord_hands_the_keys_back_as_esc_does() {
     press(&mut app, &ctrl(KeyCode::Char('w')));
     assert_eq!(
         marker_fg(&mut app),
-        app.theme.ui.secondary,
+        app.theme.ui.primary,
         "the enter chord hands the section the keys — the marker lights"
     );
 
@@ -1979,7 +2008,7 @@ fn the_leave_chord_hands_the_keys_back_as_esc_does() {
     press(&mut app, &ctrl(KeyCode::Char('w')));
     assert_eq!(
         marker_fg(&mut app),
-        app.theme.ui.secondary,
+        app.theme.ui.primary,
         "the enter chord re-enters — not a one-way door"
     );
 }

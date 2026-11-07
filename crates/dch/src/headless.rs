@@ -269,7 +269,11 @@ pub(crate) fn capture_marker_mode(
 /// write fails closed through the force hook rather than killing the
 /// process with no marker. Once the run's own marker is written the
 /// force hook stands down: a repeat interrupt still exits 130, but the
-/// recorded outcome survives in the done-file. `saver_root` overrides
+/// recorded outcome survives in the done-file. The session's title is
+/// bookkeeping that never outranks the outcome: the answer is printed
+/// and the done-file written before the naming task is waited on, and
+/// the transcript save waits only [`NAMING_SETTLE_BUDGET`] for a title
+/// still pending. `saver_root` overrides
 /// where the session transcript is written; `None` uses the user's
 /// sessions directory. `control` carries the resume resolution — a
 /// degradation warning prints to stderr before anything else runs.
@@ -375,32 +379,38 @@ async fn run_headless_inner(
     };
     let result = runner.run(&prompt).await;
     let turn_outputs = runner.session_turn_outputs();
-    let saver = match naming {
-        Some(task) => saver.with_title(task.await.unwrap_or(None)),
-        None => saver,
-    };
-    match result {
+    // The outcome outranks the name: the answer reaches stdout and the
+    // done-file its orchestrator polls land before the naming task is
+    // waited on, and the save waits only the settle budget for a title
+    // still pending — a stalled naming call once held all four for its
+    // whole request timeout, and a cancelled run waited too.
+    let outcome = match &result {
         Ok(run) => {
             let delivery = if !streams_answer && let Some(answer) = &run.output {
                 print_final_answer(answer)
             } else {
                 Ok(())
             };
-            let outcome = outcome_after_delivery(&run, delivery);
-            write_done_file_if_requested(args, &outcome, inherited_mode.as_ref());
-            outcome_recorded.store(true, Ordering::SeqCst);
+            outcome_after_delivery(run, delivery)
+        }
+        Err(err) => HeadlessOutcome::from_loop_error(err),
+    };
+    write_done_file_if_requested(args, &outcome, inherited_mode.as_ref());
+    outcome_recorded.store(true, Ordering::SeqCst);
+    let saver = match naming {
+        Some(task) => saver.with_title(settle_naming(task, NAMING_SETTLE_BUDGET).await),
+        None => saver,
+    };
+    let compactions = resumed_compactions
+        .saturating_add(compaction_counter.load(std::sync::atomic::Ordering::SeqCst));
+    match &result {
+        Ok(_) => {
             transcript.extend(crate::messages::transcript_from(
                 &prompt,
                 &turn_outputs,
                 None,
             ));
-            save_transcript(
-                &saver,
-                &runner,
-                &transcript,
-                resumed_compactions
-                    .saturating_add(compaction_counter.load(std::sync::atomic::Ordering::SeqCst)),
-            );
+            save_transcript(&saver, &runner, &transcript, compactions);
             let undone = runner.todo_undone();
             if undone > 0 {
                 let plural = if undone == 1 { "" } else { "s" };
@@ -408,28 +418,46 @@ async fn run_headless_inner(
                     "warning: {undone} todo item{plural} left unfinished"
                 ));
             }
-            bridge.stop().await;
-            Ok(outcome)
         }
         Err(err) => {
-            let outcome = HeadlessOutcome::from_loop_error(&err);
-            write_done_file_if_requested(args, &outcome, inherited_mode.as_ref());
-            outcome_recorded.store(true, Ordering::SeqCst);
             transcript.extend(crate::messages::transcript_from(
                 &prompt,
                 &turn_outputs,
-                Some(&err),
+                Some(err),
             ));
-            save_transcript(
-                &saver,
-                &runner,
-                &transcript,
-                resumed_compactions
-                    .saturating_add(compaction_counter.load(std::sync::atomic::Ordering::SeqCst)),
-            );
-            bridge.stop().await;
-            Ok(outcome)
+            save_transcript(&saver, &runner, &transcript, compactions);
         }
+    }
+    bridge.stop().await;
+    Ok(outcome)
+}
+
+/// The longest a resolved run waits for a still-pending title.
+///
+/// The title is bookkeeping; the answer, the done-file, and the exit
+/// are the outcome. A naming call that has not answered by the time
+/// the run ends is given this long to land beside the transcript it
+/// names — most answer in well under a second on a local server — and
+/// no longer: a stalled call once held the answer, the done-file, the
+/// save, and the exit for as long as its own 30-second request
+/// timeout.
+const NAMING_SETTLE_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Resolve the naming task into a title under `budget`.
+///
+/// A task that has already answered — the common case, the run having
+/// outlasted its own first turn — resolves with its title the moment
+/// this is polled. One still pending is given the budget and no more:
+/// the elapsed arm returns `None`, and the task is left to finish on
+/// its own, for nothing waits on it anymore. A joined panic reads as
+/// no title, matching the spawn's own tolerance.
+async fn settle_naming(
+    task: tokio::task::JoinHandle<Option<String>>,
+    budget: std::time::Duration,
+) -> Option<String> {
+    match tokio::time::timeout(budget, task).await {
+        Ok(joined) => joined.unwrap_or(None),
+        Err(_) => None,
     }
 }
 
@@ -2155,8 +2183,29 @@ mod tests {
         ///
         /// The port is bound before returning so the temp config can
         /// name it; the loop keeps serving until the test process
-        /// exits.
+        /// exits. Naming calls are answered with the canned title.
         async fn start() -> Self {
+            Self::bind(false).await
+        }
+
+        /// Bind a server whose naming calls never answer.
+        ///
+        /// The naming connection is parked by its own task — off the
+        /// accept loop, so the conversation connections behind it
+        /// still resolve their canned turns — and never receives a
+        /// byte: the shape of a provider whose title side call stalls
+        /// past every budget that matters.
+        async fn start_stalling_title() -> Self {
+            Self::bind(true).await
+        }
+
+        /// Bind the accept loop under the chosen naming behavior.
+        ///
+        /// One body serves both servers: the flag only decides whether
+        /// a naming connection is answered with the canned title or
+        /// parked unanswered, leaving every conversation connection's
+        /// canned turn identical between them.
+        async fn bind(stall_title: bool) -> Self {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("ephemeral bind");
@@ -2198,6 +2247,10 @@ mod tests {
                     // clean turn and the naming side call settles on
                     // its own reply.
                     if String::from_utf8_lossy(&seen).contains(dch_loop::NAME_SYSTEM_PROMPT) {
+                        if stall_title {
+                            tokio::spawn(std::future::pending::<()>());
+                            continue;
+                        }
                         let title = serde_json::json!({
                             "id": "title", "model": "test-model",
                             "choices": [{
@@ -2417,6 +2470,127 @@ mod tests {
             title.as_deref(),
             Some("Canned Session Title"),
             "the session file carries the name its first prompt coined"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_title_that_already_arrived_settles_as_the_title() {
+        // The common case: the run outlasted its own first turn, and
+        // the naming call answered long before completion — the settle
+        // hands the arrived title over at once.
+        let task = tokio::spawn(async { Some("coined early".to_string()) });
+        assert_eq!(
+            settle_naming(task, std::time::Duration::from_secs(1)).await,
+            Some("coined early".to_string()),
+            "an answered naming call settles with its title"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pending_naming_call_settles_untitled_at_its_budget() {
+        // The stall the budget exists for: the call is still pending,
+        // so the settle returns untitled when the budget elapses —
+        // never when the call's own timeout does.
+        let task = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+            None
+        });
+        let began = std::time::Instant::now();
+        assert_eq!(
+            settle_naming(task, std::time::Duration::from_millis(100)).await,
+            None,
+            "a stalled call settles untitled rather than waiting"
+        );
+        assert!(
+            began.elapsed() < std::time::Duration::from_secs(5),
+            "the budget bounds the wait, not the call's own timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_title_landing_inside_the_budget_joins_the_save() {
+        // A title that answers just after the run ends still lands if
+        // it beats the budget — the arrive-late window is real, not a
+        // second refusal.
+        let task = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            Some("late but inside".to_string())
+        });
+        assert_eq!(
+            settle_naming(task, std::time::Duration::from_secs(5)).await,
+            Some("late but inside".to_string()),
+            "a title landing inside the budget is preserved"
+        );
+    }
+
+    /// A stalled naming call cannot hold the run's outcome hostage.
+    ///
+    /// The end-to-end shape the settle budget exists for: the naming
+    /// route answers nothing, yet the run still prints its answer,
+    /// writes the done-file its orchestrator polls, saves its
+    /// transcript untitled, and exits — inside the settle budget, not
+    /// the naming call's 30-second request timeout. The generous
+    /// request timeout in the config keeps the settle budget the only
+    /// bound in play.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_stalled_naming_call_never_delays_the_headless_outcome() {
+        let _signal_lock = SIGNAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let server = TurnServer::start_stalling_title().await;
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[api]\napi_type = \"openai\"\nbase_url = \"http://127.0.0.1:{}\"\
+                 \napi_key = \"dummy\"\nmodel = \"test-model\"\nrequest_timeout_secs = 120\n\
+                 context_window = 200000\n",
+                server.port
+            ),
+        )
+        .unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let done = dir.path().join("done.json");
+        let args = parse(&[
+            "name this session",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--done-file",
+            done.to_str().unwrap(),
+        ]);
+        let began = std::time::Instant::now();
+        assert_eq!(
+            run_headless_rooted(
+                &args,
+                crate::signals::install_construction_handler(|| {}),
+                sessions.path().to_path_buf(),
+                fresh_control(),
+            )
+            .await,
+            0,
+            "the run completes against the canned turn regardless of the title"
+        );
+        let elapsed = began.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(15),
+            "the outcome waits only the settle budget, never the naming \
+             call's own timeout: {elapsed:?}"
+        );
+        let done_text = std::fs::read_to_string(&done).unwrap();
+        assert!(
+            done_text.contains("\"success\""),
+            "the done-file landed with the outcome: {done_text}"
+        );
+        let saved = session_ids(sessions.path());
+        assert_eq!(saved.len(), 1, "the session saved untitled, not unsaved");
+        let meta =
+            crate::session::load_with_meta_in(*saved.first().unwrap(), sessions.path()).unwrap();
+        assert_eq!(
+            meta.title, None,
+            "a title that never answered saves as untitled — the run \
+             does not wait for it"
         );
     }
 

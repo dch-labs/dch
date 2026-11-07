@@ -2600,15 +2600,17 @@ impl TuiApp {
     /// session's own file; this replaces what is shown with the loaded
     /// conversation — the same seeding a launch resume performs — empties
     /// the waiting queue (those prompts belonged to the conversation that
-    /// just ended), and restores the session's token accounting so the
-    /// counters continue the saved session's story instead of restarting
-    /// at zero.
+    /// just ended), releases the summary debts the replaced conversation
+    /// still owed (their indexes name rows the replacement removes), and
+    /// restores the session's token accounting so the counters continue
+    /// the saved session's story instead of restarting at zero.
     fn adopt_resumed_session(
         &mut self,
         id: String,
         transcript: Vec<TuiMessage>,
         tokens: ResumedTokens,
     ) {
+        self.compaction_summary_owed.clear();
         self.conversation.clear();
         self.seed_messages(transcript);
         self.conversation_generation = self.conversation_generation.saturating_add(1);
@@ -3637,10 +3639,11 @@ impl TuiApp {
 
     /// Empty the session at rest: the display here, the loop in the driver.
     ///
-    /// The transcript, the waiting queue, and the selection are the app's
-    /// half and clear on the spot; the loop rewind and the fresh save target
-    /// are the driver's, asked for by the command sent beside it. Refused
-    /// while a run is in flight.
+    /// The transcript, the waiting queue, the selection, and the summary
+    /// debts the compacted rows still owe are the app's half and clear on
+    /// the spot; the loop rewind and the fresh save target are the
+    /// driver's, asked for by the command sent beside it. Refused while a
+    /// run is in flight.
     fn clear_command(&mut self) {
         if self.state.agent_running.load(Ordering::SeqCst) {
             self.post_notice(
@@ -3648,6 +3651,7 @@ impl TuiApp {
             );
             return;
         }
+        self.compaction_summary_owed.clear();
         self.conversation.clear();
         self.conversation_generation = self.conversation_generation.saturating_add(1);
         self.selection = None;
@@ -10206,7 +10210,11 @@ impl TuiApp {
     /// The marker and the `[n/total]` count ride the prompt's first row
     /// rather than spending columns of their own, and the count stands
     /// down for a lone prompt — being one of one is not a fact worth two
-    /// columns.
+    /// columns. The marker itself carries the focus cue: dim while the
+    /// composer holds the keys, the primary accent once the section
+    /// does — a voice the dim register never renders, so the cue
+    /// survives a theme (Dracula among them) whose secondary accent
+    /// and dim are the same color.
     ///
     /// The keys ride the section's last row when the width can pay for
     /// them, and name only what the current mode answers: the walk's
@@ -10282,7 +10290,7 @@ impl TuiApp {
         let limit = width.saturating_sub(prefix.width()).max(1);
         let body = wrap_prompt_rows(&text, limit, body_rows);
         let marker_style = Style::default().fg(if focused {
-            self.theme.ui.secondary
+            self.theme.ui.primary
         } else {
             self.theme.ui.dim
         });
@@ -16874,6 +16882,154 @@ mod tests {
                 .expect("the publications lock")
                 .is_empty(),
             "each filing served exactly the row carrying its stamp"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_message_addition_keeps_a_standing_debt_standing() {
+        // The release is the replacement's, not the list's: a conversation
+        // that merely grows — a reply landing, a tool result arriving —
+        // keeps its debts, for their indexes still name the rows they
+        // were stamped against.
+        let mut app = app();
+        app.state
+            .compactions
+            .lock()
+            .expect("the compaction lock")
+            .push(CompactionEvent {
+                pass: 1,
+                record: compacted_row("threshold exceeded"),
+            });
+        app.drain_shared_state();
+        assert_eq!(
+            app.compaction_summary_owed,
+            vec![(1, 0)],
+            "the unmarked pass leaves its debt"
+        );
+        app.push_message(TuiMessage::Assistant {
+            blocks: vec![ContentBlock::Text {
+                text: "work continues".to_string(),
+            }],
+            timestamp: chrono::Utc::now(),
+            duration_ms: None,
+        });
+        app.drain_shared_state();
+        assert_eq!(
+            app.compaction_summary_owed,
+            vec![(1, 0)],
+            "an ordinary addition never releases a debt"
+        );
+    }
+
+    #[test]
+    fn a_live_resume_releases_the_replaced_conversation_s_debts() {
+        // The interleaving the debt list cannot survive: a resume
+        // replaces the conversation wholesale, so an owed index names a
+        // row that no longer exists — and a turn publishing the same
+        // pass count over the resumed history would pin its summary
+        // onto whatever now sits at that index. The replacement
+        // releases the debt, and the resumed rows keep their own words.
+        let mut app = app();
+        app.state
+            .compactions
+            .lock()
+            .expect("the compaction lock")
+            .push(CompactionEvent {
+                pass: 1,
+                record: compacted_row("threshold exceeded"),
+            });
+        app.drain_shared_state();
+        assert_eq!(
+            app.compaction_summary_owed,
+            vec![(1, 0)],
+            "the debt stands before the resume"
+        );
+        app.apply_session_update(crate::queue::SessionUpdate::Resumed {
+            id: "resumed-id".to_string(),
+            transcript: vec![TuiMessage::Compacted {
+                tokens_before: 20,
+                tokens_after: 8,
+                reason: "the resumed session's own pass".to_string(),
+                evicted: 2,
+                duration_ms: 90,
+                compactor: Some("structured".to_string()),
+                compression_ratio: Some(2.5),
+                summary: Some("the resumed session's own summary".to_string()),
+                timestamp: chrono::Utc::now(),
+            }],
+            tokens: crate::queue::ResumedTokens {
+                cumulative_input: 11,
+                cumulative_output: 7,
+                last_input: 5,
+                context_tokens: 3,
+            },
+        });
+        assert!(
+            app.compaction_summary_owed.is_empty(),
+            "the replacement releases the replaced conversation's debts"
+        );
+        let history = std::sync::Arc::new(vec![loopctl::message::Message::user(
+            "## Conversation summary (compacted)\n- a later turn's publication",
+        )]);
+        app.state
+            .turn_histories
+            .lock()
+            .expect("the turn-history lock")
+            .push(TurnPublication { passes: 1, history });
+        app.drain_shared_state();
+        match app.conversation().first() {
+            Some(TuiMessage::Compacted { summary, .. }) => assert!(
+                summary
+                    .as_deref()
+                    .is_some_and(|text| text.contains("the resumed session's own summary")),
+                "the released debt never backfills the resumed row: {summary:?}"
+            ),
+            other => panic!("the resumed compacted row stands: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_cleared_session_owes_nothing_from_the_one_before_it() {
+        // `/clear` is the other replacement: the fresh conversation owes
+        // no summary from the one it displaces, and a publication
+        // arriving afterwards finds no debtor to serve.
+        let mut app = app();
+        app.state
+            .compactions
+            .lock()
+            .expect("the compaction lock")
+            .push(CompactionEvent {
+                pass: 1,
+                record: compacted_row("threshold exceeded"),
+            });
+        app.drain_shared_state();
+        assert_eq!(
+            app.compaction_summary_owed,
+            vec![(1, 0)],
+            "the debt stands before the clear"
+        );
+        app.clear_command();
+        assert!(
+            app.compaction_summary_owed.is_empty(),
+            "the clear releases the debt with the conversation it named"
+        );
+        assert!(
+            app.conversation().is_empty(),
+            "the clear emptied the display"
+        );
+        let history = std::sync::Arc::new(vec![loopctl::message::Message::user(
+            "## Conversation summary (compacted)\n- a late publication",
+        )]);
+        app.state
+            .turn_histories
+            .lock()
+            .expect("the turn-history lock")
+            .push(TurnPublication { passes: 1, history });
+        app.drain_shared_state();
+        assert!(
+            app.conversation().is_empty(),
+            "a publication after the clear attaches nothing — no row \
+             exists to take it"
         );
     }
 

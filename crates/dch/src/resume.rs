@@ -968,7 +968,7 @@ pub(crate) fn render_sessions(
             summary.id.to_string(),
             fit_column(summary.title.as_deref().unwrap_or("—"), TITLE_WIDTH),
             fit_column(&summary.model, MODEL_WIDTH),
-            fit_column(summary.workdir.as_deref().unwrap_or("—"), WORKDIR_WIDTH),
+            fit_column_tail(summary.workdir.as_deref().unwrap_or("—"), WORKDIR_WIDTH),
             summary.last_activity.format("%Y-%m-%d %H:%M"),
             summary.user_message_count,
             summary.context_tokens,
@@ -1003,6 +1003,37 @@ fn fit_column(text: &str, width: usize) -> String {
         used = used.saturating_add(span);
     }
     format!("{kept}…")
+}
+
+/// Pad `text` to `width` display cells, truncating with a leading
+/// ellipsis — the tail kept — when it is wider.
+///
+/// The WORKDIR column's shape of the cap: two sessions under
+/// `/home/user/projects/work/repo-one` and `…/repo-two` differ only
+/// at the end, so a cap that keeps the prefix renders both rows the
+/// same; keeping the suffix keeps the repository directory name —
+/// the part that tells the listings apart — on the page. Short
+/// values pad exactly as [`fit_column`] pads them, and the ellipsis's
+/// one cell is reserved inside the cap the same way.
+fn fit_column_tail(text: &str, width: usize) -> String {
+    let cells = text.width();
+    if cells <= width {
+        let pad = " ".repeat(width.saturating_sub(cells));
+        return format!("{text}{pad}");
+    }
+    let budget = width.saturating_sub(1);
+    let mut used = 0usize;
+    let mut kept = String::new();
+    for glyph in text.chars().rev() {
+        let span = glyph.width().unwrap_or(0);
+        if used.saturating_add(span) > budget {
+            break;
+        }
+        kept.push(glyph);
+        used = used.saturating_add(span);
+    }
+    let tail: String = kept.chars().rev().collect();
+    format!("…{tail}")
 }
 
 #[cfg(test)]
@@ -3018,6 +3049,60 @@ model = "plain"
             "a long model must not shift the columns that follow: {row}"
         );
         assert!(row.contains('…'), "the cap is visible: {row}");
+    }
+
+    #[test]
+    fn long_workdirs_keep_their_repository_name_on_the_page() {
+        // Two sessions differing only in their repository directory
+        // once rendered the same WORKDIR — a prefix-keeping cap spent
+        // its cells on the shared `/home/user/projects/work/` and cut
+        // exactly the part that tells them apart. The column keeps
+        // the suffix instead.
+        let mut one = summary(Uuid::new_v4(), "m", 0, 1);
+        one.workdir = Some("/home/user/projects/work/repo-one".to_string());
+        let mut two = summary(Uuid::new_v4(), "m", 1, 1);
+        two.workdir = Some("/home/user/projects/work/repo-two".to_string());
+        let table = rendered(&[one, two]);
+        let mut lines = table.lines();
+        let _header = lines.next();
+        let _rule = lines.next();
+        let row_one = lines.next().expect("the first row");
+        let row_two = lines.next().expect("the second row");
+        assert!(
+            row_one.contains("repo-one") && row_one.contains('…'),
+            "the repository name survives the cap, visibly cut: {row_one}"
+        );
+        assert!(
+            row_two.contains("repo-two") && row_two.contains('…'),
+            "the sibling keeps its own name — the rows differ where the \
+             sessions do: {row_two}"
+        );
+        let edge_one = row_one.find("…").expect("the first row's cut");
+        let edge_two = row_two.find("…").expect("the second row's cut");
+        assert_eq!(
+            edge_one, edge_two,
+            "both rows cut at the same column — the cap holds the column edge"
+        );
+    }
+
+    #[test]
+    fn a_short_workdir_fits_whole_and_a_missing_one_reads_as_a_dash() {
+        let mut located = summary(Uuid::new_v4(), "m", 0, 1);
+        located.workdir = Some("/home/dch/repos/dch".to_string());
+        let table = rendered(&[located, summary(Uuid::new_v4(), "m", 1, 1)]);
+        let mut lines = table.lines();
+        let _header = lines.next();
+        let _rule = lines.next();
+        let located_row = lines.next().expect("the located row");
+        assert!(
+            !located_row.contains('…'),
+            "a short path fits whole — no cut where none is owed: {located_row}"
+        );
+        let bare_row = lines.next().expect("the bare row");
+        assert!(
+            bare_row.contains('—'),
+            "a session that recorded no workdir keeps its dash: {bare_row}"
+        );
     }
 
     fn parse(args: &[&str]) -> Args {

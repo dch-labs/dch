@@ -165,7 +165,7 @@ pub fn value_candidates(key: &str) -> Option<&'static [&'static str]> {
         "path_style" => &["full", "relative"],
         "diff_layout" => &["side-by-side", "inline"],
         "diff_palette" => &["classic", "soft", "blue-orange"],
-        "compactor" => &["truncating", "qa", "structured"],
+        "compactor" => &["truncating", "qa", "structured", "rolling"],
         "permission_mode" => &["auto", "plan", "accept_edits", "interactive"],
         "no_color" | "mouse_capture" | "auto_compact" => &["true", "false"],
         _ => return None,
@@ -710,6 +710,19 @@ mod tests {
                     .unwrap_or_else(|err| panic!("{key} accepts {candidate}: {err}"));
             }
         }
+    }
+
+    #[test]
+    fn the_compactor_completion_offers_every_configured_spelling() {
+        // `rolling` is a selection the config parses and the runner
+        // wires — example.config documents all four — so the
+        // completion owes it too: a table one short would teach the
+        // picker to avoid a spelling the setter accepts.
+        assert_eq!(
+            value_candidates("compactor"),
+            Some(&["truncating", "qa", "structured", "rolling"][..]),
+            "the completion table and the config's vocabulary stay one list"
+        );
     }
 
     #[test]

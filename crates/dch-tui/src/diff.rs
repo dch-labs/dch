@@ -60,8 +60,10 @@ const DEL_BAND: Color = Color::Rgb(218, 54, 51);
 ///
 /// Lifted and desaturated from the classic green, for palettes whose
 /// own hues sit pale or warm — the band still reads as a change
-/// without shouting over them.
-const SOFT_ADD_BAND: Color = Color::Rgb(73, 138, 96);
+/// without shouting over them. Held just dark enough that the shared
+/// white band text clears the WCAG normal-text floor (4.7:1): the
+/// lightness is a courtesy of the palette, the legibility is not.
+const SOFT_ADD_BAND: Color = Color::Rgb(61, 128, 87);
 
 /// The soft palette's removals' band: a dimmed red.
 ///
@@ -79,7 +81,10 @@ const BLUE_ADD_BAND: Color = Color::Rgb(37, 100, 199);
 /// The blue-orange palette's removals' band: orange.
 ///
 /// The pairing's other half, warm against [`BLUE_ADD_BAND`]'s cool.
-const ORANGE_DEL_BAND: Color = Color::Rgb(203, 111, 17);
+/// Held deep enough that the shared white band text clears the WCAG
+/// normal-text floor (4.7:1) — the hue belongs to the pairing, the
+/// legibility to the reader.
+const ORANGE_DEL_BAND: Color = Color::Rgb(182, 91, 10);
 
 /// The insertions' and removals' bands a palette paints with.
 ///
@@ -905,12 +910,12 @@ mod tests {
         );
         assert_eq!(
             (soft.add_bg, soft.del_bg),
-            (Color::Rgb(73, 138, 96), Color::Rgb(160, 79, 77)),
+            (Color::Rgb(61, 128, 87), Color::Rgb(160, 79, 77)),
             "soft lightens the green and dims the red"
         );
         assert_eq!(
             (blue_orange.add_bg, blue_orange.del_bg),
-            (Color::Rgb(37, 100, 199), Color::Rgb(203, 111, 17)),
+            (Color::Rgb(37, 100, 199), Color::Rgb(182, 91, 10)),
             "blue-orange paints the color-blind-safe pairing"
         );
         for colors in [classic, soft, blue_orange] {
@@ -924,15 +929,89 @@ mod tests {
         ] {
             let colors = diff_colors(&theme, palette);
             let rows = render_diff(&diff, dch_config::DiffLayout::Inline, 60, colors);
-            let bgs: Vec<Color> = rows
+            // The per-row law, not the anywhere law: the removal row
+            // and the insertion row each paint every span they hold —
+            // address, seam, sign, text — in their own band, so the
+            // stats chips alone can never satisfy the pair.
+            let removal = rows
                 .iter()
-                .flat_map(|line| line.spans.iter())
-                .filter_map(|span| span.style.bg)
-                .collect();
+                .find(|line| {
+                    line.spans
+                        .last()
+                        .is_some_and(|span| span.content.contains("let old = previous();"))
+                })
+                .expect("the removal row renders");
             assert!(
-                bgs.contains(&colors.add_bg) && bgs.contains(&colors.del_bg),
-                "the rows carry the palette's pair, additions and \
-                 removals both: {bgs:?}"
+                !removal.spans.is_empty()
+                    && removal
+                        .spans
+                        .iter()
+                        .all(|span| span.style.bg == Some(colors.del_bg)),
+                "the removal row carries the removal background on every span"
+            );
+            let insertion = rows
+                .iter()
+                .find(|line| {
+                    line.spans
+                        .last()
+                        .is_some_and(|span| span.content.contains("let new = followup();"))
+                })
+                .expect("the insertion row renders");
+            assert!(
+                !insertion.spans.is_empty()
+                    && insertion
+                        .spans
+                        .iter()
+                        .all(|span| span.style.bg == Some(colors.add_bg)),
+                "the insertion row carries the addition background on every span"
+            );
+        }
+    }
+
+    /// The WCAG relative luminance of an sRGB color.
+    ///
+    /// The standard's own channel linearization — the math every
+    /// contrast ratio is built from, inlined so the floor test below
+    /// is self-contained.
+    fn luminance(color: Color) -> f64 {
+        fn linear(channel: u8) -> f64 {
+            let share = f64::from(channel) / 255.0;
+            if share <= 0.04045 {
+                share / 12.92
+            } else {
+                ((share + 0.055) / 1.055).powf(2.4)
+            }
+        }
+        let Color::Rgb(red, green, blue) = color else {
+            return 0.0;
+        };
+        0.2126 * linear(red) + 0.7152 * linear(green) + 0.0722 * linear(blue)
+    }
+
+    // A threshold test compares its computed ratio against the
+    // standard's constant — the comparison is the assertion.
+    #[allow(clippy::float_cmp)]
+    #[test]
+    fn every_band_holds_its_white_text_above_the_contrast_floor() {
+        // The bands carry one shared foreground — bright white — so a
+        // pair is only as legible as its weaker member: both members
+        // must clear the WCAG normal-text floor of 4.5:1. The soft
+        // insertion band (4.1:1) and the blue-orange removal band
+        // (3.6:1) once sat under it.
+        for (name, band) in [
+            ("classic addition", ADD_BAND),
+            ("classic removal", DEL_BAND),
+            ("soft addition", SOFT_ADD_BAND),
+            ("soft removal", SOFT_DEL_BAND),
+            ("blue-orange addition", BLUE_ADD_BAND),
+            ("blue-orange removal", ORANGE_DEL_BAND),
+        ] {
+            let lighter = luminance(band).max(luminance(BAND_TEXT));
+            let darker = luminance(band).min(luminance(BAND_TEXT));
+            let ratio = (lighter + 0.05) / (darker + 0.05);
+            assert!(
+                ratio >= 4.5,
+                "{name} band holds white text at {ratio:.2}:1 — under the floor"
             );
         }
     }
