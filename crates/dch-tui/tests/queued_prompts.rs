@@ -32,7 +32,7 @@ use ratatui::backend::TestBackend;
 use ratatui::style::Color;
 
 /// The glyph marking the section's rows.
-const HOURGLASS: &str = "\u{29d6}";
+const HOURGLASS: &str = "\u{231b}";
 
 fn config() -> DchConfig {
     let mut config = DchConfig::default();
@@ -406,8 +406,8 @@ fn the_title_rides_as_a_badge_of_the_theme_s_own_colors() {
     for offset in 0..5 {
         let (symbol, fg, bg) = &painted[row][column + offset];
         assert_eq!(
-            *bg, app.theme.ui.primary,
-            "the word rides the accent fill the composer's edge wears: {symbol:?}"
+            *bg, app.theme.ui.secondary,
+            "the word rides the plan's traded accent, a pill of its own: {symbol:?}"
         );
         assert_eq!(
             *fg, app.theme.ui.background,
@@ -417,7 +417,7 @@ fn the_title_rides_as_a_badge_of_the_theme_s_own_colors() {
     for proud in [column - 1, column + 5] {
         let (_, _, bg) = &painted[row][proud];
         assert_eq!(
-            *bg, app.theme.ui.primary,
+            *bg, app.theme.ui.secondary,
             "one fill cell proud of the word on either side"
         );
     }
@@ -427,7 +427,7 @@ fn the_title_rides_as_a_badge_of_the_theme_s_own_colors() {
     let marker_column = painted
         .iter()
         .flat_map(|row| row.iter().enumerate())
-        .find(|(_, (symbol, _, _))| symbol == "\u{29d6}")
+        .find(|(_, (symbol, _, _))| symbol == "\u{231b}")
         .map(|(x, _)| x)
         .expect("the waiting prompt carries the hourglass marker");
     assert_eq!(
@@ -446,14 +446,38 @@ fn the_title_rides_as_a_badge_of_the_theme_s_own_colors() {
 #[test]
 fn the_keys_light_the_marker_and_leave_the_badge_s_accent_steady() {
     let (mut app, _kept, _rx) = app_with_waiting(&["first waiting"]);
+
+    // At rest the marker sits in the dim register; Ctrl+W lights it in
+    // the primary accent — a voice distinct from the unfocused one
+    // under every theme. Dracula is the pin's premise: its secondary
+    // accent and dim are the same color, so a cue painted in the
+    // secondary vanished exactly where it was needed.
+    let resting = painted_rows(&mut app, 80, 24);
+    let marker = resting
+        .iter()
+        .flatten()
+        .find(|(symbol, _, _)| symbol == "\u{231b}")
+        .expect("the waiting prompt carries the hourglass marker");
+    assert_eq!(
+        marker.1, app.theme.ui.dim,
+        "the marker rests in the dim register while the composer holds the keys"
+    );
+    drop(resting);
+
     press(&mut app, &ctrl(KeyCode::Char('w')));
+    app.theme = Theme::by_name("dracula").expect("the dracula theme is shipped");
+    assert_eq!(
+        app.theme.ui.secondary, app.theme.ui.dim,
+        "Dracula collapses the secondary accent into dim — the theme the \
+         focus cue must survive"
+    );
 
     let painted = painted_rows(&mut app, 80, 24);
     let (row, column) = badge_at(&painted);
     for offset in 0..5 {
         let (_, fg, bg) = &painted[row][column + offset];
         assert_eq!(
-            *bg, app.theme.ui.primary,
+            *bg, app.theme.ui.secondary,
             "the badge keeps its accent — focus is the marker's to tell"
         );
         assert_eq!(
@@ -464,11 +488,16 @@ fn the_keys_light_the_marker_and_leave_the_badge_s_accent_steady() {
     let marker = painted
         .iter()
         .flatten()
-        .find(|(symbol, _, _)| symbol == "\u{29d6}")
+        .find(|(symbol, _, _)| symbol == "\u{231b}")
         .expect("the waiting prompt carries the hourglass marker");
+    assert_ne!(
+        marker.1, app.theme.ui.dim,
+        "the focused marker never renders in the resting voice"
+    );
     assert_eq!(
         marker.1, app.theme.ui.primary,
-        "the keys light the marker's voice, not the label's fill"
+        "the keys light the marker in the primary accent, a cue no theme \
+         can collapse away"
     );
 }
 
@@ -1104,10 +1133,10 @@ fn the_composer_greys_out_while_the_section_holds_the_keys() {
         .filter(|row| row.first().is_some_and(|(_, _, bg)| *bg == primary))
         .count();
     assert_eq!(
-        primary_edges, 5,
+        primary_edges, 4,
         "the composer's edge speaks in the primary while the composer holds \
-         the keys — four edge rows plus the badge, which rides flush with \
-         the section's left edge and shares the composer's accent column"
+         the keys — four edge rows; the badge rides the secondary now and \
+         no longer joins the composer's accent column"
     );
     assert!(
         app.composer_caret_visible(),
@@ -1121,8 +1150,9 @@ fn the_composer_greys_out_while_the_section_holds_the_keys() {
         .filter(|row| row.first().is_some_and(|(_, _, bg)| *bg == dim))
         .count();
     assert_eq!(
-        dim_edges, 4,
-        "the section's focus greys the composer's edge out"
+        dim_edges, 5,
+        "the section's focus greys the composer's edge out — four edge rows, \
+         plus the badge whose traded secondary is dracula's dim twin"
     );
     assert!(
         !app.composer_caret_visible(),
@@ -1137,10 +1167,10 @@ fn the_composer_greys_out_while_the_section_holds_the_keys() {
         .filter(|row| row.first().is_some_and(|(_, _, bg)| *bg == primary))
         .count();
     assert_eq!(
-        restored_edges, 5,
+        restored_edges, 4,
         "editing lifts the prompt into the composer and the composer speaks \
-         again — the section's badge stays up through the edit, sharing \
-         the accent column"
+         again — the badge stays up through the edit in its own traded \
+         accent, no longer the composer's"
     );
     assert!(
         app.composer_caret_visible(),
@@ -1954,7 +1984,7 @@ fn the_leave_chord_hands_the_keys_back_as_esc_does() {
         painted
             .iter()
             .flatten()
-            .find(|(symbol, _, _)| symbol == "\u{29d6}")
+            .find(|(symbol, _, _)| symbol == "\u{231b}")
             .map(|(_, fg, _)| *fg)
             .expect("the waiting prompt carries the hourglass marker")
     };

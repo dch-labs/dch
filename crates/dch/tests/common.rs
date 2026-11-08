@@ -193,11 +193,34 @@ impl CannedServer {
                     break;
                 };
                 let mut logged = String::new();
+                let mut naming = false;
                 if let Some(request) = read_request(&mut stream) {
                     logged.clone_from(&request);
-                    if let Ok(mut log) = recorded.lock() {
+                    naming = request.contains(dch_loop::NAME_SYSTEM_PROMPT);
+                    if !naming && let Ok(mut log) = recorded.lock() {
                         log.push(request);
                     }
+                }
+                if naming {
+                    let body = serde_json::json!({
+                        "id": "title", "model": "test-model",
+                        "choices": [{
+                            "message": {
+                                "role": "assistant",
+                                "content": "Canned Session Title"
+                            },
+                            "finish_reason": "stop"
+                        }]
+                    })
+                    .to_string();
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    stream.write_all(head.as_bytes()).ok();
+                    stream.write_all(body.as_bytes()).ok();
+                    continue;
                 }
                 if logged.contains("\"stream\":false")
                     && let Some(response) = nonstream.as_ref()

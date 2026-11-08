@@ -303,3 +303,108 @@ fn a_write_at_a_new_file_is_not_refused() {
         "the new file landed"
     );
 }
+
+#[test]
+fn a_per_edit_path_alias_at_a_fifo_is_refused_like_the_canonical_spelling() {
+    // The fs family serves the recorded model drift — a per-edit `path`
+    // where the schema advertises `file_path` — so the gate reads the
+    // alias too: a destination cannot slip the refusal by its spelling.
+    // The untested corner this pins: the alias leg of the gate's
+    // `write_family_path`, which nothing else in the suite drives.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let target = fifo(dir.path(), "pipe.txt");
+
+    let (is_error, text) = dispatched(
+        "MultiEdit",
+        dir.path(),
+        json!({"edits": [
+            {"path": "pipe.txt", "old_text": "a", "new_text": "b"}
+        ]}),
+    );
+
+    assert!(
+        is_error,
+        "an alias-spelled destination meets the same refusal: {text}"
+    );
+    assert!(
+        text.contains("pipe.txt") && text.contains("FIFO") && text.contains(REDIRECTION_MARK),
+        "the refusal names the alias-spelled target and its kind: {text}"
+    );
+    assert!(
+        still_a_fifo(&target),
+        "the refusal moves no bytes, whatever spelling named the destination"
+    );
+}
+
+#[test]
+fn a_multi_edit_batch_default_at_a_fifo_is_refused_for_a_pathless_entry() {
+    // A pathless MultiEdit entry falls onto the top-level `file_path`
+    // batch default — the destination the tool would write — so the
+    // gate settles the default too, in the canonical spelling the tool
+    // resolves it under. The untested corner this pins: the
+    // batch-default leg of the gate's `edit_target`, which nothing else
+    // in the suite drives.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let target = fifo(dir.path(), "pipe.txt");
+
+    let (is_error, text) = dispatched(
+        "MultiEdit",
+        dir.path(),
+        json!({
+            "file_path": "pipe.txt",
+            "edits": [
+                {"old_text": "a", "new_text": "b"}
+            ]
+        }),
+    );
+
+    assert!(
+        is_error,
+        "the destination a pathless entry would fall onto is a target the gate settles: {text}"
+    );
+    assert!(
+        text.contains("pipe.txt") && text.contains("FIFO") && text.contains(REDIRECTION_MARK),
+        "the refusal names the batch default the entry would have written: {text}"
+    );
+    assert!(
+        still_a_fifo(&target),
+        "the refusal moves no bytes and unlinks nothing"
+    );
+}
+
+#[test]
+fn a_mistyped_per_edit_alias_reaches_the_tool_before_the_batch_default() {
+    // A present-but-mistyped `path` alias is the entry mistyping its
+    // own path, exactly like a mistyped canonical `file_path`: the
+    // tool refuses it on the entry itself with a teaching error, so
+    // the gate offers the batch default no target to settle — the
+    // refusal that answers is the tool's own, never the gate's
+    // destination verdict for a path the call never reached.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let target = fifo(dir.path(), "pipe.txt");
+
+    let (is_error, text) = dispatched(
+        "MultiEdit",
+        dir.path(),
+        json!({
+            "file_path": "pipe.txt",
+            "edits": [
+                {"path": 123, "old_text": "a", "new_text": "b"}
+            ]
+        }),
+    );
+
+    assert!(
+        is_error,
+        "the mistyped alias is refused, by the tool's own gate: {text}"
+    );
+    assert!(
+        text.contains("path") && text.contains("string"),
+        "the refusal names the mistyped field and its expected type: {text}"
+    );
+    assert!(
+        !text.contains("FIFO") && !text.contains(REDIRECTION_MARK),
+        "no gate verdict for a destination the call never reached: {text}"
+    );
+    assert!(still_a_fifo(&target), "nothing was written either way");
+}

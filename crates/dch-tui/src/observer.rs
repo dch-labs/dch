@@ -58,6 +58,7 @@ fn compaction_notice(
         } else {
             None
         },
+        summary: None,
         timestamp: chrono::Utc::now(),
     }
 }
@@ -79,6 +80,76 @@ fn compaction_failure_text(tokens_before: u64, context_window: u64, cause: Optio
              the pass completed but the history still did not fit"
         ),
     }
+}
+
+/// One compaction event, as the display drains it.
+///
+/// The transcript row the observer coins, riding the pass number the
+/// observer stamped it with — the same number every summary
+/// publication carries, so the display settles the row's summary debt
+/// only from the pass's own publication.
+#[derive(Debug, Clone)]
+pub struct CompactionEvent {
+    /// The observer's number for the pass that fired.
+    ///
+    /// One-based, from the running count the observer keeps; a
+    /// summary publication settles this row only when it carries this
+    /// number exactly.
+    pub pass: u64,
+
+    /// The transcript row the pass left.
+    ///
+    /// A compacted record carrying the pass's stats, summary-less
+    /// until a publication the drain can attribute settles it.
+    pub record: crate::message::TuiMessage,
+}
+
+/// One turn-end publication of the engine's committed history.
+///
+/// The history a successful turn ended with, stamped with the count
+/// of compaction passes the observer had noted when the turn ended.
+/// The stamp is the whole attribution gate: a marked head settles the
+/// row of exactly the pass whose number the stamp equals, because the
+/// count cannot hold that number until the pass has happened and
+/// cannot still hold it once a later pass has folded.
+#[derive(Debug, Clone)]
+pub struct TurnPublication {
+    /// Compaction passes noted when the turn ended.
+    ///
+    /// The observer's running count at publication time; the
+    /// publication answers the pass numbered exactly this and no
+    /// other.
+    pub passes: u64,
+
+    /// The committed history as the turn ended.
+    ///
+    /// The engine's own snapshot; its head, when marked, is the words
+    /// of the last fold before this turn ended.
+    pub history: Arc<Vec<loopctl::message::Message>>,
+}
+
+/// One manual compaction pass's folded feed, filed for its own row.
+///
+/// A manual pass owns no turn end to carry its publication, so the
+/// driver files the folded feed here the moment the pass settles —
+/// stamped with the pass's number, which the display matches exactly
+/// before the filing settles anything. A filing whose row settles
+/// through the turn-end channel instead is dropped rather than left
+/// to linger, and a number is never reused, so a stale filing cannot
+/// serve a later row.
+#[derive(Debug, Clone)]
+pub struct CompactionFiling {
+    /// The pass the filing answers.
+    ///
+    /// The observer's number of the compaction event that opened the
+    /// pass; the filing settles exactly the row carrying this number.
+    pub pass: u64,
+
+    /// The folded history the pass left.
+    ///
+    /// The engine's committed set after the fold; its head, when
+    /// marked, is the pass's own summary words.
+    pub folded: Arc<Vec<loopctl::message::Message>>,
 }
 
 /// How many stashed input summaries accumulate before the stash drops.
@@ -473,16 +544,19 @@ pub struct TuiObserverState {
     /// carries the engine's own coherent snapshot — the committed
     /// history plus the run's turns so far — behind an Arc, and
     /// drained by the display, which hands the newest to the
-    /// turn-end hook beside the conversation. Failed turns publish
-    /// nothing here: their committed-only set is stale against the
-    /// resolution read the mode driver takes when the run lands, and
-    /// a late stale publish would overwrite it. Entries left behind
-    /// by a slow frame are superseded, not replayed: the persistence
-    /// layer keeps only the newest machine half anyway. Not cleared
-    /// by [`reset`](TuiObserver::reset) — like the prompt queue, it
-    /// is persistence-bound state that outlives the turn it came
-    /// from.
-    pub turn_histories: Arc<Mutex<Vec<Arc<Vec<loopctl::message::Message>>>>>,
+    /// turn-end hook beside the conversation. Each publication rides
+    /// the compaction-pass count of its turn end
+    /// ([`compaction_passes`](Self::compaction_passes)), which the
+    /// drain reads to attribute a marked head to the pass that coined
+    /// it. Failed turns publish nothing here: their committed-only
+    /// set is stale against the resolution read the mode driver takes
+    /// when the run lands, and a late stale publish would overwrite
+    /// it. Entries left behind by a slow frame are superseded, not
+    /// replayed: the persistence layer keeps only the newest machine
+    /// half anyway. Not cleared by [`reset`](TuiObserver::reset) —
+    /// like the prompt queue, it is persistence-bound state that
+    /// outlives the turn it came from.
+    pub turn_histories: Arc<Mutex<Vec<TurnPublication>>>,
 
     /// Steers a run accepted but no turn boundary has read yet, in
     /// send order.
@@ -510,6 +584,23 @@ pub struct TuiObserverState {
     /// content is always a coherent committed set, so a re-stamp
     /// never claims more truth than the history has.
     pub machine_history: Arc<Mutex<Option<Arc<Vec<loopctl::message::Message>>>>>,
+
+    /// The folded feeds manual compaction passes filed, stamped with
+    /// the pass each answers, oldest first.
+    ///
+    /// A manual pass owns no turn end to carry its publication through
+    /// [`turn_histories`](Self::turn_histories), so the driver files
+    /// the folded feed here the moment the pass settles, stamped with
+    /// the pass's number from
+    /// [`compaction_passes`](Self::compaction_passes). The drain
+    /// settles a summary-less row from a filing only when the stamps
+    /// match exactly — a publication serves exactly the pass that
+    /// produced it and never a later row — and drops a filing whose
+    /// row settled through the turn-end channel instead. The standing
+    /// [`machine_history`](Self::machine_history) stays a cache for
+    /// readers, never a backfill source: past the first fold its head
+    /// is a marked summary that outlives the pass that coined it.
+    pub compaction_publications: Arc<Mutex<Vec<CompactionFiling>>>,
 
     /// Tools currently executing.
     ///
@@ -621,10 +712,26 @@ pub struct TuiObserverState {
     ///
     /// Pushed by the compaction event and drained by the display into
     /// transcript rows: one pass, one row, carrying the token counts
-    /// and the pass's facts. Persisted in the session file like every
-    /// other lifecycle row and dropped on replay — the engine's
-    /// context is the machine snapshot's business, never the notice's.
-    pub compactions: Arc<Mutex<Vec<crate::message::TuiMessage>>>,
+    /// and the pass's facts beside the pass number the observer
+    /// stamped the event with — the number the drain matches against
+    /// every summary publication before attributing one. Persisted in
+    /// the session file like every other lifecycle row and dropped on
+    /// replay — the engine's context is the machine snapshot's
+    /// business, never the notice's.
+    pub compactions: Arc<Mutex<Vec<CompactionEvent>>>,
+
+    /// Compaction passes the observer has noted this session.
+    ///
+    /// Incremented once per compaction event and read by both
+    /// publication channels — the turn-end publication carries the
+    /// count at its turn end, the manual pass's filing the count after
+    /// its event — so every channel speaks one numbering and the
+    /// display can match a summary publication to the pass that
+    /// coined it. Monotone and never reused; a
+    /// [`reset`](TuiObserver::reset) may drop undrained records but
+    /// cannot renumber the passes they belonged to, so a stamp always
+    /// names the pass it was minted for.
+    pub compaction_passes: Arc<AtomicU64>,
 
     /// The context window the engine is actually running against.
     ///
@@ -935,6 +1042,8 @@ impl TuiObserverState {
             turn_histories: Arc::new(Mutex::new(Vec::new())),
             pending_steers: Arc::new(Mutex::new(Vec::new())),
             machine_history: Arc::new(Mutex::new(None)),
+            compaction_publications: Arc::new(Mutex::new(Vec::new())),
+            compaction_passes: Arc::new(AtomicU64::new(0)),
             active_tools: Arc::new(Mutex::new(Vec::new())),
             agent_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cancel_signal: Arc::new(std::sync::Mutex::new(Arc::new(
@@ -1374,17 +1483,25 @@ impl LoopObserver for TuiObserver {
         // at the pre-pass size beside a row that just announced the
         // shrink.
         recover(&self.state.tokens).context_tokens = ctx.tokens_after;
-        recover(&self.state.compactions).push(compaction_notice(
-            ctx.tokens_before,
-            ctx.tokens_after,
-            ctx.reason,
-            ctx.evicted_messages,
-            ctx.telemetry.duration,
-            ctx.stage
-                .as_deref()
-                .or(ctx.telemetry.compactor_name.as_deref()),
-            ctx.telemetry.compression_ratio,
-        ));
+        let pass = self
+            .state
+            .compaction_passes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            .saturating_add(1);
+        recover(&self.state.compactions).push(CompactionEvent {
+            pass,
+            record: compaction_notice(
+                ctx.tokens_before,
+                ctx.tokens_after,
+                ctx.reason,
+                ctx.evicted_messages,
+                ctx.telemetry.duration,
+                ctx.stage
+                    .as_deref()
+                    .or(ctx.telemetry.compactor_name.as_deref()),
+                ctx.telemetry.compression_ratio,
+            ),
+        });
         self.notify();
     }
 
@@ -1518,7 +1635,14 @@ impl LoopObserver for TuiObserver {
             // event — and publishing it would overwrite the larger,
             // later resolution read with an older, smaller history.
             let history = Arc::clone(&ctx.history);
-            recover(&self.state.turn_histories).push(Arc::clone(&history));
+            let passes = self
+                .state
+                .compaction_passes
+                .load(std::sync::atomic::Ordering::SeqCst);
+            recover(&self.state.turn_histories).push(TurnPublication {
+                passes,
+                history: Arc::clone(&history),
+            });
             *recover(&self.state.machine_history) = Some(history);
         }
         if let Some(window) = ctx.context_window {

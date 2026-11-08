@@ -24,8 +24,8 @@
 //! over the keys the surface takes, not over the file's every leaf.
 
 use dch_config::{
-    ApiType, CaretDisplay, CompactorSelection, DchConfig, DiffLayout, PathStyle, PermissionMode,
-    StripPosition, StripStyle, TURN_TIMEOUT_FLOOR_SECS, Verbosity,
+    ApiType, CaretDisplay, CompactorSelection, DchConfig, DiffLayout, DiffPalette, PathStyle,
+    PermissionMode, StripPosition, StripStyle, TURN_TIMEOUT_FLOOR_SECS, Verbosity,
 };
 
 /// How a changed value takes effect, so the command can tell the user
@@ -76,6 +76,7 @@ pub const KEYS: &[&str] = &[
     "strip_style",
     "path_style",
     "diff_layout",
+    "diff_palette",
     "mouse_capture",
     "caret_display",
     "copy_command",
@@ -118,10 +119,57 @@ pub fn is_secret(key: &str) -> bool {
 #[must_use]
 pub fn live(key: &str) -> Option<Live> {
     match key {
-        "theme" | "verbosity" | "caret_display" | "diff_layout" => Some(Live::Display),
+        "theme" | "verbosity" | "caret_display" | "diff_layout" | "diff_palette"
+        | "strip_position" | "strip_style" | "path_style" | "copy_command" => Some(Live::Display),
         _ if is_key(key) => Some(Live::Restart),
         _ => None,
     }
+}
+
+/// The fixed values a key accepts, as completion offers them.
+///
+/// Enum keys spell their variants and boolean keys spell their two
+/// words — the same spellings [`set`] accepts and the config file
+/// documents, so what a completion offers is always pasteable. Keys
+/// whose values are free-form (names, numbers, secrets) carry no
+/// fixed vocabulary to offer and answer `None`.
+#[must_use]
+pub fn value_candidates(key: &str) -> Option<&'static [&'static str]> {
+    Some(match key {
+        "api_type" => &[
+            "ollama",
+            "openai",
+            "anthropic",
+            "gemini",
+            "deepseek",
+            "grok",
+            "azure",
+            "moonshot",
+            "zai",
+            "bedrock",
+            "self_hosted",
+        ],
+        "verbosity" => &["quiet", "normal", "verbose"],
+        "strip_position" => &["composer", "top"],
+        "strip_style" => &[
+            "breathe",
+            "sweep",
+            "bounce",
+            "travel",
+            "snake",
+            "worm",
+            "worm_long",
+            "off",
+            "glow",
+        ],
+        "path_style" => &["full", "relative"],
+        "diff_layout" => &["side-by-side", "inline"],
+        "diff_palette" => &["classic", "soft", "blue-orange"],
+        "compactor" => &["truncating", "qa", "structured", "rolling"],
+        "permission_mode" => &["auto", "plan", "accept_edits", "interactive"],
+        "no_color" | "mouse_capture" | "auto_compact" => &["true", "false"],
+        _ => return None,
+    })
 }
 
 /// The current value of `key` rendered as the file would spell it, or `None`.
@@ -152,6 +200,7 @@ pub fn get(config: &DchConfig, key: &str) -> Option<String> {
         "strip_style" => name_of(&config.display.strip_style),
         "path_style" => name_of(&config.display.path_style),
         "diff_layout" => name_of(&config.display.diff_layout),
+        "diff_palette" => name_of(&config.display.diff_palette),
         "mouse_capture" => config.display.mouse_capture.to_string(),
         "caret_display" => name_of(&config.display.caret_display),
         "copy_command" => opt_render(config.display.copy_command.as_ref()),
@@ -252,6 +301,9 @@ pub fn set(config: &mut DchConfig, key: &str, value: &str) -> Result<(), String>
         "strip_style" => config.display.strip_style = parse::<StripStyle>(key, value)?,
         "path_style" => config.display.path_style = parse::<PathStyle>(key, value)?,
         "diff_layout" => config.display.diff_layout = parse::<DiffLayout>(key, value)?,
+        "diff_palette" => {
+            config.display.diff_palette = parse::<DiffPalette>(key, value)?;
+        }
         "mouse_capture" => config.display.mouse_capture = parse::<bool>(key, value)?,
         "caret_display" => config.display.caret_display = parse::<CaretDisplay>(key, value)?,
         "copy_command" => config.display.copy_command = Some(value.to_string()),
@@ -586,6 +638,7 @@ mod tests {
             "strip_style",
             "path_style",
             "diff_layout",
+            "diff_palette",
             "compactor",
             "permission_mode",
         ] {
@@ -601,6 +654,74 @@ mod tests {
         assert!(
             set(&mut config, "diff_layout", "Inline").is_err(),
             "a display-cased spelling is refused, not folded"
+        );
+        assert!(
+            set(&mut config, "diff_palette", "Soft").is_err(),
+            "a display-cased palette spelling is refused, not folded"
+        );
+    }
+
+    #[test]
+    fn display_side_keys_classify_live_and_runner_keys_restart() {
+        // The honest split the footer and the /set notice speak from:
+        // keys the renderer answers classify Display — including the
+        // strip pair, the place row's spelling, and the copier the
+        // live arm rebuilds — while terminal setup and everything the
+        // loop owns stays Restart.
+        for key in [
+            "theme",
+            "verbosity",
+            "caret_display",
+            "diff_layout",
+            "diff_palette",
+            "strip_position",
+            "strip_style",
+            "path_style",
+            "copy_command",
+        ] {
+            assert_eq!(live(key), Some(Live::Display), "{key} renders live");
+        }
+        assert_eq!(
+            live("mouse_capture"),
+            Some(Live::Restart),
+            "mouse capture is terminal setup, not a render read"
+        );
+        assert_eq!(live("max_turns"), Some(Live::Restart));
+        assert_eq!(live("compactor"), Some(Live::Restart));
+    }
+
+    #[test]
+    fn every_offered_value_candidate_is_accepted() {
+        // The completion tables promise pasteable spellings; this pins
+        // the promise against the one authority — the setter itself —
+        // so a table entry can never drift from what the config
+        // accepts.
+        let mut config = DchConfig::default();
+        for key in KEYS {
+            let Some(candidates) = value_candidates(key) else {
+                continue;
+            };
+            assert!(
+                !candidates.is_empty(),
+                "{key} offers a fixed vocabulary, so it offers something"
+            );
+            for candidate in candidates {
+                set(&mut config, key, candidate)
+                    .unwrap_or_else(|err| panic!("{key} accepts {candidate}: {err}"));
+            }
+        }
+    }
+
+    #[test]
+    fn the_compactor_completion_offers_every_configured_spelling() {
+        // `rolling` is a selection the config parses and the runner
+        // wires — example.config documents all four — so the
+        // completion owes it too: a table one short would teach the
+        // picker to avoid a spelling the setter accepts.
+        assert_eq!(
+            value_candidates("compactor"),
+            Some(&["truncating", "qa", "structured", "rolling"][..]),
+            "the completion table and the config's vocabulary stay one list"
         );
     }
 

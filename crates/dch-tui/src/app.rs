@@ -38,7 +38,9 @@ use crate::guidance::Guidance;
 use crate::input::{InputAction, InputEditor};
 use crate::markdown;
 use crate::message::{ActiveTool, ContentBlock, TokenCounts, TuiMessage};
-use crate::observer::{HealthNotice, ToolResultDisplay, TuiObserverState};
+use crate::observer::{
+    CompactionEvent, HealthNotice, ToolResultDisplay, TuiObserverState, TurnPublication,
+};
 use crate::permission::PermissionRequest;
 use crate::question::QuestionPrompt;
 use crate::queue::{ResumedTokens, SessionCommand, SessionPick, SessionUpdate, Submission};
@@ -363,10 +365,12 @@ const TODO_SECTION_INSET: u16 = 2;
 /// and everything a prefix costs is wording squeezed off the end. Both the
 /// renderer and the tests that read a frame locate the section by this
 /// glyph, so it is the section's identity on screen rather than ornament.
-/// A text hourglass, outline where the running call's is solid: no emoji
-/// presentation to paint it a vendor color, and a shape that reads as
-/// waiting beside the in-flight clock it never pretends to be.
-const QUEUE_MARKER: &str = "\u{29d6}";
+/// The settled hourglass (U+231B), kin to the running call's flowing one
+/// (⏳): one sand-clock family, a shape at rest reading as waiting beside
+/// the in-flight clock it never pretends to be. Both twins measure two
+/// cells wide, and the wrap that sizes the section measures display width,
+/// so the wider marker costs wording columns, never rows.
+const QUEUE_MARKER: &str = "\u{231b}";
 
 /// The title row the waiting-prompt section opens with.
 ///
@@ -399,13 +403,15 @@ fn queue_prompt_prefix(total: usize, shown: usize) -> String {
     }
 }
 
-/// The plan section's posture, as Ctrl+T leaves it.
+/// The plan section's posture, as Ctrl+T or a click on the section
+/// leaves it.
 ///
-/// One chord walks the three: capped at its four task rows with the
-/// cut named, opened to the whole list however tall, or folded away
-/// entirely. A posture is a view preference — the plan keeps updating
-/// underneath every one of them, and the run's landing clears the
-/// section out of whatever posture it was in.
+/// One chord — or one click on the section — walks the three: capped
+/// at its four task rows with the cut named, opened to the whole list
+/// however tall, or folded away entirely. A posture is a view
+/// preference — the plan keeps updating underneath every one of them,
+/// and the run's landing clears the section out of whatever posture
+/// it was in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PlanView {
     /// Capped at [`TODO_SECTION_BODY_ROWS`] task rows, the ellipsis
@@ -423,13 +429,15 @@ enum PlanView {
     Hidden,
 }
 
-/// The waiting section's posture, as `Ctrl+Q` leaves it.
+/// The waiting section's posture, as `Ctrl+Q` or a click on the
+/// section leaves it.
 ///
-/// One chord walks the two: standing at whatever height the waiting
-/// prompt's wording needs, or folded to the one-row badge that keeps a
-/// hidden backlog a fact on screen. Like the plan's postures this is a
-/// view preference — the queue keeps updating underneath both, and an
-/// emptied queue closes the section out of either one.
+/// One chord — or one click on the section — walks the two: standing
+/// at whatever height the waiting prompt's wording needs, or folded
+/// to the one-row badge that keeps a hidden backlog a fact on screen.
+/// Like the plan's postures this is a view preference — the queue
+/// keeps updating underneath both, and an emptied queue closes the
+/// section out of either one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QueuePosture {
     /// The section at its full height, the waiting prompt's wording
@@ -1333,12 +1341,21 @@ pub struct TuiApp {
     /// steady as the streaming region extends below it or collapses.
     last_layout_lines: usize,
 
+    /// The viewport height the last layout measured.
+    ///
+    /// The jump's arithmetic needs the top row's absolute index —
+    /// total minus viewport minus offset — outside the render pass,
+    /// so the same settle that records the line count records the
+    /// pane height it laid out against.
+    last_layout_viewport: usize,
+
     /// The mouse selection over the transcript, if any.
     ///
-    /// Both ends are display cells — conversation line index plus
-    /// column — in the coordinate space of the rendered lines, so
-    /// the selection is character-granular and holds still while the
-    /// view scrolls. It survives the release — the copy happens then,
+    /// Both ends are display cells — an index into the rendered
+    /// document's lines, conversation and live lane alike, plus a
+    /// column — so the selection is character-granular and holds
+    /// still while the view scrolls. It survives the release — the
+    /// copy happens then,
     /// the highlight stays up — until the next press replaces it; a
     /// press-release without travel clears it.
     selection: Option<CellSelection>,
@@ -1474,6 +1491,47 @@ pub struct TuiApp {
     /// baked for the old width.
     live_width: u16,
 
+    /// The live lane's seam row, as the frame last rendered it.
+    ///
+    /// The blank row between the settled conversation and the live
+    /// lane belongs to the rendered document a selection walks, so
+    /// the frame parks its copy here: the copy path runs between
+    /// frames and must read the lane exactly as the frame the user
+    /// is looking at drew it.
+    live_seam_lines: Vec<Line<'static>>,
+
+    /// The live thinking block's rows, as the frame last rendered them.
+    ///
+    /// Parked beside the seam row for the same reason — the
+    /// selection's line space covers the thinking rows, and a copy
+    /// made between frames reads them from this cache rather than
+    /// re-deriving the block from shared state.
+    live_thinking_cache: Vec<Line<'static>>,
+
+    /// The running compaction row, as the frame last rendered it.
+    ///
+    /// One row while the pass holds and none otherwise; parked with
+    /// the other lane segments so the selection's copy path sees the
+    /// same document the pane showed.
+    live_compaction_cache: Vec<Line<'static>>,
+
+    /// The running tool blocks' rows, as the frame last rendered them.
+    ///
+    /// Rebuilt every frame from the active-tool list, with any
+    /// expanded call's input and output rows included; parked here so
+    /// a selection covering a running block copies what the pane
+    /// showed at the press, not a fresh rebuild.
+    live_tools_cache: Vec<Line<'static>>,
+
+    /// The selectable document's segment lengths last frame.
+    ///
+    /// One number per segment in render order — conversation, seam,
+    /// thinking, frozen, live, compaction, tools. Any change
+    /// renumbers the lane at or below it, so the frame compares
+    /// against this to decide whether a live selection still names
+    /// the lines it was drawn over.
+    selectable_shape: SelectableShape,
+
     /// Rendered lines of the settled conversation.
     ///
     /// The conversation changes only when a message graduates, a
@@ -1561,6 +1619,16 @@ pub struct TuiApp {
     /// rows, so a tail user turn is boxed the frame it lands.
     user_turn_ranges: Vec<(usize, usize, usize)>,
 
+    /// The cache rows where each submitted prompt's text begins.
+    ///
+    /// Alt+Up and Alt+Down walk these: every prompt the user actually
+    /// sent — steered echoes and unsent drafts excluded, the same
+    /// population the session listing's MSGS column counts — seated at
+    /// the viewport's top by its first text row. Rebuilt with the
+    /// conversation cache; conversation rows open the layout, so the
+    /// marks are absolute row indexes into the whole transcript.
+    user_prompt_marks: Vec<usize>,
+
     /// The quit lifecycle.
     ///
     /// Exit is a deliberate chord, not a slip: the state carries
@@ -1634,6 +1702,19 @@ pub struct TuiApp {
     /// Same positional-key scheme as the thinking sections, so the
     /// expand gesture covers the notices with one vocabulary.
     expanded_compactions: std::collections::HashSet<String>,
+
+    /// The compaction rows still awaiting their summary text, oldest
+    /// first.
+    ///
+    /// The pass's stats ride the event, but the summary itself is the
+    /// compacted history's leading message, which a publication
+    /// carries only after the pass settles. Each owed row keeps the
+    /// pass number the observer stamped its event with beside its
+    /// conversation index, and a row settles only from a publication
+    /// carrying its pass number exactly — so a drain that lands
+    /// several owed rows keeps them all, each waiting for its own
+    /// pass, and a publication of one pass never answers another.
+    compaction_summary_owed: Vec<(u64, usize)>,
 
     /// Conversation lines that sit inside a thinking section, by key.
     ///
@@ -1824,16 +1905,17 @@ pub struct TuiApp {
     /// irrelevant either way.
     plan_interrupted: bool,
 
-    /// The plan section's posture, as Ctrl+T leaves it.
+    /// The plan section's posture, as Ctrl+T or a click leaves it.
     ///
     /// Capped by default — four task rows and the ellipsis — with one
-    /// press opening the whole list and the next folding the section
-    /// away. A view preference, not a mode: no keys are owned, the
-    /// plan keeps updating underneath, and every claim starts the
-    /// next run's plan from the capped posture whatever the last run
-    /// left. The cycle skips the open posture when the capped one
-    /// already shows every entry — opening a list that stands whole
-    /// changes nothing, so the chord spends that press on the fold.
+    /// press, the chord or a click on the section, opening the whole
+    /// list and the next folding the section away. A view preference,
+    /// not a mode: no keys are owned, the plan keeps updating
+    /// underneath, and every claim starts the next run's plan from the
+    /// capped posture whatever the last run left. The cycle skips the
+    /// open posture when the capped one already shows every entry —
+    /// opening a list that stands whole changes nothing, so the press
+    /// spends itself on the fold.
     plan_view: PlanView,
 
     /// Whether the capped posture's last render cut an entry.
@@ -1858,10 +1940,20 @@ pub struct TuiApp {
 
     /// The rect the last frame painted the pinned section into.
     ///
-    /// The wheel needs to know whether the pointer stands on the
-    /// section; the render records the rect it filled so the next
-    /// mouse event answers against the same geometry.
+    /// The wheel and the section's click toggle need to know whether
+    /// the pointer stands on the section; the render records the rect
+    /// it filled — the folded marker row included — so the next mouse
+    /// event answers against the same geometry, and the layout clears
+    /// it when the section stands empty.
     todo_section_rect: Rect,
+
+    /// The rect the last frame painted the waiting section into.
+    ///
+    /// A click folds or lifts the section; the render records the
+    /// rect it filled — standing rows or the folded badge alike — and
+    /// the layout clears it when the queue empties, so a press only
+    /// ever answers against geometry the last frame actually painted.
+    queue_section_rect: Rect,
 
     /// The full view's body-row budget the layout settled on.
     ///
@@ -1904,16 +1996,18 @@ pub struct TuiApp {
     /// pulls every row behind it up a place.
     queue_view: usize,
 
-    /// The waiting section's posture, as `Ctrl+Q` leaves it.
+    /// The waiting section's posture, as `Ctrl+Q` or a click leaves
+    /// it.
     ///
-    /// A view preference, not queue state: the chord folds the section
-    /// to its one-row badge and lifts it back, and the folded row names
-    /// the count and the chord so a hidden backlog is still a fact on
-    /// screen. The fold never survives into the section's own modes —
-    /// the fold opens only on `Ctrl+Q` — the walk's chord runs inert
-    /// over a fold — and an edit or a confirm
-    /// rides the full section — so a folded posture under a non-plain
-    /// mode is a display relic the render refuses to honor.
+    /// A view preference, not queue state: the chord — or a click on
+    /// the section — folds the section to its one-row badge and lifts
+    /// it back, and the folded row names the count and the chord so a
+    /// hidden backlog is still a fact on screen. The fold never
+    /// survives into the section's own modes — the fold opens only on
+    /// `Ctrl+Q` or a click — the walk's chord runs inert over a fold
+    /// — and an edit or a confirm rides the full section — so a
+    /// folded posture under a non-plain mode is a display relic the
+    /// render refuses to honor.
     queue_posture: QueuePosture,
 
     /// Whose hands the keyboard is in, as far as waiting prompts go.
@@ -2131,6 +2225,13 @@ struct BakeOutputs {
     /// draws on.
     user_turn_ranges: Vec<(usize, usize, usize)>,
 
+    /// The rows where submitted prompts' texts begin.
+    ///
+    /// One entry per user message the user actually sent — steered
+    /// and unsent rows stay out — at the row the prompt's first text
+    /// line lands on.
+    user_prompt_marks: Vec<usize>,
+
     /// The row spans of the conversation's inline todo blocks.
     ///
     /// Whole-block ranges, so the scroll can keep an inline plan
@@ -2171,6 +2272,12 @@ struct BakeMeta {
     /// rows, grown as turns bake and never holding the tail's
     /// relative rows.
     user_turn_ranges: Vec<(usize, usize, usize)>,
+
+    /// The rows where baked submitted prompts' texts begin.
+    ///
+    /// Bake-absolute rows, the prefix-only half of the merged marks
+    /// the frame's products rebuild each render.
+    user_prompt_marks: Vec<usize>,
 
     /// The row spans of the baked conversation's inline todo blocks.
     ///
@@ -2225,6 +2332,7 @@ impl TuiApp {
             render_pending: false,
             last_frame: None,
             last_layout_lines: 0,
+            last_layout_viewport: 0,
             selection: None,
             last_view: None,
             drag_position: None,
@@ -2249,11 +2357,17 @@ impl TuiApp {
             live_stamp: 0,
             live_frozen_upto: 0,
             live_width: 0,
+            live_seam_lines: Vec::new(),
+            live_thinking_cache: Vec::new(),
+            live_compaction_cache: Vec::new(),
+            live_tools_cache: Vec::new(),
+            selectable_shape: (0, 0, 0, 0, 0, 0, 0),
             conversation_cache: Vec::new(),
             conversation_bake: Vec::new(),
             frame_stats: FrameStats::default(),
             conversation_cache_width: 0,
             user_turn_ranges: Vec::new(),
+            user_prompt_marks: Vec::new(),
             conversation_generation: 1,
             conversation_cache_generation: 0,
             conversation_baked_through: 0,
@@ -2268,6 +2382,7 @@ impl TuiApp {
             thinking_mode: ThinkingMode::Follow,
             expanded_thinking: std::collections::HashSet::new(),
             expanded_compactions: std::collections::HashSet::new(),
+            compaction_summary_owed: Vec::new(),
             thinking_summary_lines: HashMap::new(),
             compaction_summary_lines: HashMap::new(),
             strip_position: config.display.strip_position,
@@ -2292,6 +2407,7 @@ impl TuiApp {
             plan_cut: std::cell::Cell::new(false),
             todo_scroll: 0,
             todo_section_rect: Rect::default(),
+            queue_section_rect: Rect::default(),
             full_body_cap: std::cell::Cell::new(usize::MAX),
             working_dir: None,
             git_branch: None,
@@ -2484,15 +2600,17 @@ impl TuiApp {
     /// session's own file; this replaces what is shown with the loaded
     /// conversation — the same seeding a launch resume performs — empties
     /// the waiting queue (those prompts belonged to the conversation that
-    /// just ended), and restores the session's token accounting so the
-    /// counters continue the saved session's story instead of restarting
-    /// at zero.
+    /// just ended), releases the summary debts the replaced conversation
+    /// still owed (their indexes name rows the replacement removes), and
+    /// restores the session's token accounting so the counters continue
+    /// the saved session's story instead of restarting at zero.
     fn adopt_resumed_session(
         &mut self,
         id: String,
         transcript: Vec<TuiMessage>,
         tokens: ResumedTokens,
     ) {
+        self.compaction_summary_owed.clear();
         self.conversation.clear();
         self.seed_messages(transcript);
         self.conversation_generation = self.conversation_generation.saturating_add(1);
@@ -2565,7 +2683,6 @@ impl TuiApp {
             Command::Compact => self.compact_command(),
             Command::Exit => self.exit_command(),
             Command::Stop => self.stop_command(),
-            Command::Session => self.session_command(),
             Command::Sessions => self.sessions_command(),
             Command::Themes => self.list_themes_command(),
             Command::Verbosity { level } => self.verbosity_command(level),
@@ -2724,7 +2841,8 @@ impl TuiApp {
         }
         self.push_message(TuiMessage::System {
             text:
-                "The theme, verbosity, caret_display, and diff_layout rows change live; the rest \
+                "The theme, verbosity, caret_display, diff_layout, diff_palette, strip_position, \
+                   strip_style, path_style, and copy_command rows change live; the rest \
                    are read at startup. /set <key> <value> · /unset <key> · /config shows the \
                    value in effect."
                     .to_string(),
@@ -2935,8 +3053,22 @@ impl TuiApp {
                 let verbosity = self.config.display.verbosity;
                 self.set_verbosity(verbosity);
             }
-            "diff_layout" => {
+            "diff_layout" | "diff_palette" => {
                 self.invalidate_conversation_renders();
+            }
+            "strip_position" => {
+                self.strip_position = self.config.display.strip_position;
+            }
+            "strip_style" => {
+                self.strip_style = self.config.display.strip_style;
+            }
+            "copy_command" => {
+                let copy_command = self.config.display.copy_command.clone();
+                let outcomes = Arc::clone(&self.copy_outcomes);
+                let wake = Arc::clone(&self.state.render_notify);
+                self.set_selection_copier(Box::new(move |attempt, text| {
+                    copy_via_transports(copy_command.as_deref(), attempt, text, &outcomes, &wake)
+                }));
             }
             _ => {}
         }
@@ -3089,52 +3221,6 @@ impl TuiApp {
         }
         self.send_command(SessionCommand::ListSessions);
         self.post_notice("reading the saved sessions…".to_string());
-    }
-
-    /// Report the session's identity, model, and shape.
-    ///
-    /// Reads what the status bar and the save path already know — the session
-    /// id (the handle `dch --resume` would take), the model the loop runs, the
-    /// assistant turns so far, and the working directory — into the transcript.
-    /// Read-only; nothing is sent.
-    fn session_command(&mut self) {
-        let now = chrono::Utc::now();
-        let id = self
-            .session_id
-            .clone()
-            .unwrap_or_else(|| "(no id yet)".to_string());
-        let model = self.config.api.model.clone();
-        let turns = self
-            .conversation
-            .iter()
-            .filter(|message| matches!(message, TuiMessage::Assistant { .. }))
-            .count();
-        let workdir = self
-            .working_dir
-            .clone()
-            .unwrap_or_else(|| "(unknown directory)".to_string());
-        let branch = self.git_branch.clone();
-        self.push_message(TuiMessage::System {
-            text: format!("Session {id}"),
-            timestamp: now,
-        });
-        self.push_message(TuiMessage::System {
-            text: format!("  model {model} · {turns} assistant turn(s)"),
-            timestamp: now,
-        });
-        let where_row = match branch {
-            Some(branch) => format!("  in {workdir} ({branch})"),
-            None => format!("  in {workdir}"),
-        };
-        self.push_message(TuiMessage::System {
-            text: where_row,
-            timestamp: now,
-        });
-        self.push_message(TuiMessage::System {
-            text: "  resume this session later with: dch --resume <id>".to_string(),
-            timestamp: now,
-        });
-        self.scroll_to_bottom();
     }
 
     /// List every compiled-in theme, marking the live one.
@@ -3553,10 +3639,11 @@ impl TuiApp {
 
     /// Empty the session at rest: the display here, the loop in the driver.
     ///
-    /// The transcript, the waiting queue, and the selection are the app's
-    /// half and clear on the spot; the loop rewind and the fresh save target
-    /// are the driver's, asked for by the command sent beside it. Refused
-    /// while a run is in flight.
+    /// The transcript, the waiting queue, the selection, and the summary
+    /// debts the compacted rows still owe are the app's half and clear on
+    /// the spot; the loop rewind and the fresh save target are the
+    /// driver's, asked for by the command sent beside it. Refused while a
+    /// run is in flight.
     fn clear_command(&mut self) {
         if self.state.agent_running.load(Ordering::SeqCst) {
             self.post_notice(
@@ -3564,6 +3651,7 @@ impl TuiApp {
             );
             return;
         }
+        self.compaction_summary_owed.clear();
         self.conversation.clear();
         self.conversation_generation = self.conversation_generation.saturating_add(1);
         self.selection = None;
@@ -5822,12 +5910,7 @@ impl TuiApp {
             (KeyCode::Esc, KeyModifiers::NONE) => self.esc_under_run_or_idle(),
             (KeyCode::Char('s'), KeyModifiers::CONTROL) => self.steer_now(),
             (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
-                self.plan_view = match self.plan_view {
-                    PlanView::Capped if self.plan_cut.get() => PlanView::Full,
-                    PlanView::Capped | PlanView::Full => PlanView::Hidden,
-                    PlanView::Hidden => PlanView::Capped,
-                };
-                self.todo_scroll = 0;
+                self.cycle_plan_view();
                 true
             }
             (KeyCode::Char('c'), mods) if mods == KeyModifiers::CONTROL | KeyModifiers::SHIFT => {
@@ -5873,6 +5956,14 @@ impl TuiApp {
             (KeyCode::PageDown, _) => {
                 self.scroll_offset = self.scroll_offset.saturating_sub(10);
                 self.rearm_if_near_bottom();
+                true
+            }
+            (KeyCode::Up, KeyModifiers::ALT) => {
+                self.jump_user_message(true);
+                true
+            }
+            (KeyCode::Down, KeyModifiers::ALT) => {
+                self.jump_user_message(false);
                 true
             }
             (KeyCode::Up, KeyModifiers::NONE)
@@ -5972,6 +6063,11 @@ impl TuiApp {
                 } else {
                     let retired = self.selection.take().is_some();
                     self.drag_position = None;
+                    if self.toggle_plan_section_at(mouse.column, mouse.row)
+                        || self.toggle_queue_section_at(mouse.column, mouse.row)
+                    {
+                        return true;
+                    }
                     self.place_input_caret(mouse.column, mouse.row) || retired
                 }
             }
@@ -6050,7 +6146,8 @@ impl TuiApp {
     /// per beat while the push continues. The scroll stops at the
     /// document's first or last line whatever the drag state says,
     /// and the head clamps into the selectable document, so an edge
-    /// push never extends the highlight onto the tool rows. The
+    /// push stops at the document's last content line, running
+    /// tools included. The
     /// state itself ends on the release or, when that
     /// arrived outside the terminal's view, on the first buttonless
     /// motion — so a lost release cannot carry the scroll far.
@@ -6211,8 +6308,9 @@ impl TuiApp {
     ///
     /// `None` past the end of the document the selection walks — the
     /// same line segments [`Self::selectable_window`] windows over,
-    /// with running tools excluded. Left and Right use the width as
-    /// their wrap boundary and Down uses existence as its floor.
+    /// running tools included, with the pending-steer and run-timer
+    /// rows below left out. Left and Right use the width as their
+    /// wrap boundary and Down uses existence as its floor.
     fn line_width(&self, index: usize) -> Option<usize> {
         self.selectable_window(index, 1)
             .into_iter()
@@ -6222,19 +6320,24 @@ impl TuiApp {
 
     /// A window over the lines a selection can cover.
     ///
-    /// The settled conversation, the frozen streaming prefix, and
-    /// the live region — running tools render after these but are
-    /// not selectable, so they stay out of the selection's line
-    /// space: what a copy walks and what the highlight spans are the
-    /// same lines the pane shows above any tool block.
+    /// The whole rendered document through the running tools — the
+    /// settled conversation, the seam and thinking rows, the frozen
+    /// and live streaming segments, the compaction row, and the
+    /// running tool blocks — shares one line space with the frame's
+    /// render order, so what a copy walks, what the highlight spans,
+    /// and what the pane shows are the same lines. The pending-steer
+    /// and run-timer rows render below the document and stay out of
+    /// it: a press on them clamps to the last line above.
     fn selectable_window(&self, skip: usize, height: usize) -> Vec<Line<'_>> {
         visible_window(
             &[
                 &self.conversation_cache,
+                &self.live_seam_lines,
+                &self.live_thinking_cache,
                 &self.frozen_lines,
                 &self.live_lines,
-                &NO_LINES,
-                &NO_LINES,
+                &self.live_compaction_cache,
+                &self.live_tools_cache,
                 &NO_LINES,
                 &NO_LINES,
             ],
@@ -6274,12 +6377,12 @@ impl TuiApp {
     /// The transcript cell under screen column/row, if the position
     /// lands inside the last frame's conversation pane.
     ///
-    /// The line clamps into the selectable document: running tools
-    /// render below it but never join the selection's line space,
-    /// so a press on a tool row — or on the empty pane under short
-    /// content — anchors on the last line a copy can walk, the way
-    /// an editor clamps a click below a document's end. A pane with
-    /// nothing selectable offers no cell at all.
+    /// The line clamps into the selectable document: the steer and
+    /// timer rows that render below it never join the selection's
+    /// line space, so a press on them — or on the empty pane under
+    /// short content — anchors on the last line a copy can walk, the
+    /// way an editor clamps a click below a document's end. A pane
+    /// with nothing selectable offers no cell at all.
     fn cell_at(&self, column: u16, row: u16) -> Option<CellPos> {
         let view = self.last_view.as_ref()?;
         if column < view.area.x
@@ -6296,6 +6399,125 @@ impl TuiApp {
             .min(last);
         let col = usize::from(column.saturating_sub(view.area.x));
         Some(CellPos { line, col })
+    }
+
+    /// Give every summary-less compaction row the pass's own words,
+    /// when a publication stamped with its pass settles the debt.
+    ///
+    /// Each owed row carries the pass number the observer stamped its
+    /// event with, and a publication settles it only when it carries
+    /// that number exactly — a filing the manual pass made, or a
+    /// turn-end publication whose count equals the pass, a count the
+    /// turn end cannot hold until the pass has happened and cannot
+    /// still hold once a later pass has folded. Anything else — an
+    /// older turn's marked head, a filing minted for another pass —
+    /// leaves the debt standing, and a filing whose row settled
+    /// through the turn-end channel is dropped so it cannot linger.
+    fn settle_compaction_summary(&mut self, publications: &[TurnPublication]) {
+        if self.compaction_summary_owed.is_empty() {
+            return;
+        }
+        let owed = self.compaction_summary_owed.clone();
+        let mut settled: Vec<u64> = Vec::new();
+        for (pass, index) in owed {
+            let summary = self.take_filed_summary(pass).or_else(|| {
+                publications
+                    .iter()
+                    .rev()
+                    .find(|publication| publication.passes == pass)
+                    .and_then(|publication| marked_compaction_summary(&publication.history))
+            });
+            if let Some(summary) = summary {
+                self.attach_compaction_summary(index, summary);
+                self.drop_filed_summary(pass);
+                settled.push(pass);
+            }
+        }
+        self.compaction_summary_owed
+            .retain(|(pass, _)| !settled.contains(pass));
+    }
+
+    /// Take the filing stamped for `pass`, when one is filed.
+    ///
+    /// The manual pass's own folded feed, removed from the channel as
+    /// it is taken — a filing serves exactly the row carrying its
+    /// stamp, never a later one. The reduction to a marked summary
+    /// happens after the take: a filing whose head carries no ledger
+    /// mark is consumed and settles nothing, keeping the channel in
+    /// step with the passes it files for.
+    fn take_filed_summary(&mut self, pass: u64) -> Option<String> {
+        let mut filed = self
+            .state
+            .compaction_publications
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let stamped = filed
+            .iter()
+            .position(|filing| filing.pass == pass)
+            .map(|at| filed.remove(at));
+        drop(filed);
+        stamped.and_then(|filing| marked_compaction_summary(&filing.folded))
+    }
+
+    /// Drop any filing stamped for `pass`.
+    ///
+    /// The pair cleanup when a row settles through the turn-end
+    /// channel: the pass's own filing, if the driver filed one, has
+    /// nothing left to serve and must not outlive its row.
+    fn drop_filed_summary(&mut self, pass: u64) {
+        self.state
+            .compaction_publications
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|filing| filing.pass != pass);
+    }
+
+    /// Attach a compacted context's summary to the row awaiting it.
+    ///
+    /// The row the drain named when the summary-less compaction
+    /// notice landed takes the published history's head text. The
+    /// attach mutates a row the bake may already hold rendered, so it
+    /// bumps the conversation's generation and rebakes whole — the
+    /// same discipline any mutation of a baked row keeps. A row that
+    /// no longer sits where the drain named it takes nothing.
+    fn attach_compaction_summary(&mut self, index: usize, summary: String) {
+        let attached = match self.conversation.get_mut(index) {
+            Some(TuiMessage::Compacted {
+                summary: slot @ None,
+                ..
+            }) => {
+                *slot = Some(summary);
+                true
+            }
+            _ => false,
+        };
+        if attached {
+            self.conversation_generation = self.conversation_generation.saturating_add(1);
+            self.rebake_whole();
+        }
+    }
+
+    /// Record the frame's lane shape, dropping a selection it
+    /// stranded.
+    ///
+    /// The live lane rebuilds every frame, so its segment lengths
+    /// moving — or the streaming region rewriting itself — can leave
+    /// a selection naming lines that no longer sit where it was
+    /// drawn. Only a selection reaching past the stable conversation
+    /// prefix can be stranded: shallower ones keep their numbering,
+    /// and the drag ends with the selection it was steering.
+    fn settle_selectable_shape(&mut self, streaming_changed: bool, shape: SelectableShape) {
+        let shape_before = self.selectable_shape;
+        self.selectable_shape = shape;
+        let stranded = (streaming_changed || shape != shape_before)
+            && self
+                .selection
+                .as_ref()
+                .is_some_and(|selection| ordered(selection).1.line >= shape.0.min(shape_before.0));
+        if stranded {
+            self.selection = None;
+            self.drag_position = None;
+        }
     }
 
     /// Toggle the tool expansion at screen column/row, if any.
@@ -6345,6 +6567,84 @@ impl TuiApp {
             self.drag_position = None;
         }
         true
+    }
+
+    /// Fold or lift the plan section a press landed on.
+    ///
+    /// A click anywhere on the pinned section — open rows or the
+    /// folded marker row alike — walks the same posture cycle
+    /// [`cycle_plan_view`](Self::cycle_plan_view) walks, so hiding
+    /// the plan and bringing it back costs the mouse alone. Returns
+    /// whether the press belonged to the section at all.
+    fn toggle_plan_section_at(&mut self, column: u16, row: u16) -> bool {
+        let rect = self.todo_section_rect;
+        if self.latest_todos.is_empty()
+            || rect.height == 0
+            || column < rect.x
+            || column >= rect.right()
+            || row < rect.y
+            || row >= rect.bottom()
+        {
+            return false;
+        }
+        self.cycle_plan_view();
+        true
+    }
+
+    /// Fold or lift the waiting section a press landed on.
+    ///
+    /// A click on the section flips it between its standing and
+    /// folded postures — the flip
+    /// [`toggle_queue_posture`](Self::toggle_queue_posture) makes —
+    /// badge and body rows alike. The plain mode alone answers: the
+    /// fold is a display posture the section's own modes refuse, so a
+    /// press while the queue holds the keyboard changes nothing.
+    /// Returns whether the press belonged to the section.
+    fn toggle_queue_section_at(&mut self, column: u16, row: u16) -> bool {
+        if self.queue_mode != QueueMode::Plain || self.queued_display_len() == 0 {
+            return false;
+        }
+        let rect = self.queue_section_rect;
+        if rect.height == 0
+            || column < rect.x
+            || column >= rect.right()
+            || row < rect.y
+            || row >= rect.bottom()
+        {
+            return false;
+        }
+        self.toggle_queue_posture();
+        true
+    }
+
+    /// Walk the plan section's posture one step.
+    ///
+    /// Capped opens to the whole list when the cap is actually
+    /// cutting entries — opening a list that already stands whole
+    /// changes nothing — otherwise the next step folds the section
+    /// away, and a fold steps back to the capped posture. The chord
+    /// and a click on the section both spend one press on one step,
+    /// and every step resets the section's scroll window.
+    fn cycle_plan_view(&mut self) {
+        self.plan_view = match self.plan_view {
+            PlanView::Capped if self.plan_cut.get() => PlanView::Full,
+            PlanView::Capped | PlanView::Full => PlanView::Hidden,
+            PlanView::Hidden => PlanView::Capped,
+        };
+        self.todo_scroll = 0;
+    }
+
+    /// Flip the waiting section between its two postures.
+    ///
+    /// Standing folds to the one-row badge and a fold lifts back to
+    /// the standing section; the chord and a click on the section
+    /// share the flip, and the queue keeps updating underneath
+    /// either posture.
+    fn toggle_queue_posture(&mut self) {
+        self.queue_posture = match self.queue_posture {
+            QueuePosture::Standing => QueuePosture::Folded,
+            QueuePosture::Folded => QueuePosture::Standing,
+        };
     }
 
     /// The live thinking section's rows, and where its row sits.
@@ -6911,8 +7211,9 @@ impl TuiApp {
     /// standing where the view last stood, and once the section holds
     /// the keys the chord steps the walk forward; over a folded section
     /// or an empty queue the chord is inert or the composer's — the
-    /// fold opens only on `Ctrl+Q`, and a queue with nothing waiting
-    /// hands the chord back so the composer keeps its delete-a-word.
+    /// fold opens only on `Ctrl+Q` or a click on the section, and a
+    /// queue with nothing waiting hands the chord back so the composer
+    /// keeps its delete-a-word.
     /// `Ctrl+Q` folds and
     /// unfolds the section from the composer, commits an edit from
     /// inside it, and leaves a focused section. Leaving a
@@ -6949,10 +7250,7 @@ impl TuiApp {
         if let (KeyCode::Char('q'), KeyModifiers::CONTROL) = (key.code, key.modifiers)
             && self.queued_display_len() > 0
         {
-            self.queue_posture = match self.queue_posture {
-                QueuePosture::Standing => QueuePosture::Folded,
-                QueuePosture::Folded => QueuePosture::Standing,
-            };
+            self.toggle_queue_posture();
             return Some(true);
         }
         None
@@ -7491,6 +7789,48 @@ impl TuiApp {
         }
     }
 
+    /// Jump the viewport to the previous or next submitted prompt.
+    ///
+    /// Alt+Up and Alt+Down walk the user's own prompts — steered
+    /// echoes and unsent drafts are not stops — seating the target
+    /// prompt's first text row at the top of the viewport, Up the
+    /// older direction as it is everywhere else in the scroll model.
+    /// A jump holds the stick; one that lands within the follow
+    /// tolerance rearms it, so walking back to the newest prompt
+    /// returns the view to live tailing. Past the ends the walk
+    /// refuses with a notice naming the boundary it stands on.
+    fn jump_user_message(&mut self, older: bool) {
+        let top = self
+            .last_layout_lines
+            .saturating_sub(self.last_layout_viewport)
+            .saturating_sub(self.scroll_offset);
+        let target = if older {
+            self.user_prompt_marks
+                .iter()
+                .rev()
+                .find(|&&mark| mark < top)
+        } else {
+            self.user_prompt_marks.iter().find(|&&mark| mark > top)
+        };
+        let Some(&mark) = target else {
+            self.post_notice(
+                if older {
+                    "no earlier prompt — already at the first one"
+                } else {
+                    "no later prompt — already at the newest one"
+                }
+                .to_string(),
+            );
+            return;
+        };
+        self.scroll_offset = self
+            .last_layout_lines
+            .saturating_sub(self.last_layout_viewport)
+            .saturating_sub(mark);
+        self.stick = Stick::Hold;
+        self.rearm_if_near_bottom();
+    }
+
     /// Decide whether a background-requested redraw may run now.
     ///
     /// A queued graduation always forces the frame — the graduated
@@ -7763,6 +8103,8 @@ impl TuiApp {
         self.render_conversation(frame, pane(&chunks, base, fallback));
         if todo_shown {
             self.render_todo_section(frame, pane(&chunks, base.saturating_add(1), fallback));
+        } else {
+            self.todo_section_rect = Rect::default();
         }
         if queue_shown {
             self.render_queue(
@@ -7773,6 +8115,8 @@ impl TuiApp {
                     fallback,
                 ),
             );
+        } else {
+            self.queue_section_rect = Rect::default();
         }
         let notice_rows = usize::from(!place_shown);
         if notice_rows > 0 {
@@ -7887,7 +8231,7 @@ impl TuiApp {
             dim: self.theme.ui.dim,
             accent: self.theme.ui.primary,
             moved: self.theme.ui.secondary,
-            badge_fill: self.theme.ui.secondary,
+            badge_fill: self.theme.ui.primary,
             badge_letters: self.theme.ui.background,
         };
         let inner = width
@@ -7974,7 +8318,8 @@ impl TuiApp {
     /// ellipsis naming whatever the cap cut. Read-only by design: the
     /// tasks are the agent's bookkeeping, the model owns the list, and
     /// the section asks for no keys at all — it is furniture, not a
-    /// sheet.
+    /// sheet, and its one interaction is the posture cycle a click on
+    /// it walks.
     fn render_todo_section(&mut self, frame: &mut Frame, area: Rect) {
         if area.height == 0 || area.width == 0 {
             return;
@@ -7985,11 +8330,10 @@ impl TuiApp {
             dim: self.theme.ui.dim,
             accent: self.theme.ui.primary,
             moved: self.theme.ui.secondary,
-            badge_fill: self.theme.ui.secondary,
+            badge_fill: self.theme.ui.primary,
             badge_letters: self.theme.ui.background,
         };
         if self.plan_view == PlanView::Hidden {
-            self.todo_section_rect = Rect::default();
             frame.render_widget(
                 Paragraph::new(todo_view::folded_lines(&self.latest_todos, &colors)),
                 Rect {
@@ -8580,6 +8924,9 @@ impl TuiApp {
                 .user_turn_ranges
                 .extend(baked.user_turn_ranges);
             self.conversation_bake_meta
+                .user_prompt_marks
+                .extend(baked.user_prompt_marks);
+            self.conversation_bake_meta
                 .todo_block_ranges
                 .extend(baked.todo_block_ranges);
         }
@@ -8622,6 +8969,12 @@ impl TuiApp {
                     mark.saturating_add(tail_base),
                 )
             }));
+        self.user_prompt_marks = self.conversation_bake_meta.user_prompt_marks.clone();
+        self.user_prompt_marks.extend(
+            tail.user_prompt_marks
+                .iter()
+                .map(|mark| mark.saturating_add(tail_base)),
+        );
         self.todo_block_ranges = self.conversation_bake_meta.todo_block_ranges.clone();
         self.todo_block_ranges
             .extend(tail.todo_block_ranges.iter().map(|range| {
@@ -8684,16 +9037,7 @@ impl TuiApp {
             self.bake_conversation_cache(text_area, width);
         }
 
-        let conversation_len = self.conversation_cache.len();
-        if self.refresh_streaming_region(width)
-            && self
-                .selection
-                .as_ref()
-                .is_some_and(|selection| ordered(selection).1.line >= conversation_len)
-        {
-            self.selection = None;
-            self.drag_position = None;
-        }
+        let streaming_changed = self.refresh_streaming_region(width);
         let (tools, running_rows) = self.active_tool_lines(width);
         let thinking_rows = self.live_thinking_lines(width);
         let compaction_rows = self.live_compaction_lines();
@@ -8707,11 +9051,16 @@ impl TuiApp {
         } else {
             Vec::new()
         };
-        let selectable_lines = self
-            .conversation_cache
-            .len()
-            .saturating_add(self.frozen_lines.len())
-            .saturating_add(self.live_lines.len());
+        let shape: SelectableShape = (
+            self.conversation_cache.len(),
+            seam.len(),
+            thinking_rows.0.len(),
+            self.frozen_lines.len(),
+            self.live_lines.len(),
+            compaction_rows.len(),
+            tools.len(),
+        );
+        self.settle_selectable_shape(streaming_changed, shape);
         self.thinking_live_rows = thinking_rows.1.map(|row| {
             let start = row
                 .saturating_add(self.conversation_cache.len())
@@ -8732,9 +9081,13 @@ impl TuiApp {
             .collect();
         let run_timer = self.live_run_timer();
         let pending_steer_rows = self.pending_steer_lines(width);
-        let lane_end = selectable_lines
+        let lane_end = self
+            .conversation_cache
+            .len()
             .saturating_add(seam.len())
             .saturating_add(thinking_rows.0.len())
+            .saturating_add(self.frozen_lines.len())
+            .saturating_add(self.live_lines.len())
             .saturating_add(compaction_rows.len())
             .saturating_add(tools.len());
         let pinned_steer = (!pending_steer_rows.is_empty())
@@ -8749,27 +9102,6 @@ impl TuiApp {
                 .saturating_sub(self.scroll_offset),
             conversation_height,
         );
-        let segments: Vec<&[Line<'_>]> = vec![
-            &self.conversation_cache,
-            &seam,
-            &thinking_rows.0,
-            &self.frozen_lines,
-            &self.live_lines,
-            &compaction_rows,
-            &tools,
-            &pending_steer_rows,
-            &run_timer,
-        ];
-        let mut visible = visible_window(&segments, skip, conversation_height);
-        self.last_view = Some(ViewState {
-            area: text_area,
-            skip,
-            total: total_lines,
-            selectable: selectable_lines,
-        });
-        if let Some(selection) = &self.selection {
-            reverse_selection(&mut visible, skip, selection);
-        }
         self.paint_user_turn_chrome(
             frame,
             pane,
@@ -8778,6 +9110,31 @@ impl TuiApp {
             conversation_height,
             pinned_steer,
         );
+        self.live_seam_lines = seam;
+        self.live_thinking_cache = thinking_rows.0;
+        self.live_compaction_cache = compaction_rows;
+        self.live_tools_cache = tools;
+        let segments: Vec<&[Line<'_>]> = vec![
+            &self.conversation_cache,
+            &self.live_seam_lines,
+            &self.live_thinking_cache,
+            &self.frozen_lines,
+            &self.live_lines,
+            &self.live_compaction_cache,
+            &self.live_tools_cache,
+            &pending_steer_rows,
+            &run_timer,
+        ];
+        let mut visible = visible_window(&segments, skip, conversation_height);
+        self.last_view = Some(ViewState {
+            area: text_area,
+            skip,
+            total: total_lines,
+            selectable: lane_end,
+        });
+        if let Some(selection) = &self.selection {
+            reverse_selection(&mut visible, skip, selection);
+        }
         frame.render_widget(Paragraph::new(visible), text_area);
         if let Some(gutter) = scrollbar_area
             && let Some((thumb_pos, thumb_len)) =
@@ -9006,6 +9363,7 @@ impl TuiApp {
             self.scroll_offset = self.scroll_offset.min(total_lines.saturating_sub(viewport));
         }
         self.last_layout_lines = total_lines;
+        self.last_layout_viewport = viewport;
     }
 
     /// Retain a graduated call's full detail, evicting at the cap.
@@ -9079,7 +9437,9 @@ impl TuiApp {
             .iter()
             .any(|graduation| !matches!(graduation, Graduation::Sent { .. }));
         let turn_histories = take_locked(&self.state.turn_histories);
-        let machine_history = turn_histories.last().cloned();
+        let machine_history = turn_histories
+            .last()
+            .map(|publication| Arc::clone(&publication.history));
         turn_ended |= machine_history.is_some();
         for graduation in graduations {
             match graduation {
@@ -9163,9 +9523,16 @@ impl TuiApp {
                 timestamp: now,
             });
         }
-        for record in compactions {
+        for event in compactions {
+            let CompactionEvent { pass, record } = event;
+            let owed = matches!(&record, TuiMessage::Compacted { summary: None, .. });
+            let index = self.conversation.len();
             self.push_message(record);
+            if owed {
+                self.compaction_summary_owed.push((pass, index));
+            }
         }
+        self.settle_compaction_summary(&turn_histories);
         let verdicts = take_locked(&self.copy_outcomes);
         if let Some(latest) = verdicts.into_iter().max_by_key(|verdict| verdict.attempt)
             && latest.attempt >= self.posted_copy_attempt
@@ -9250,6 +9617,7 @@ impl TuiApp {
             thinking_summary_lines: thinking_lines,
             compaction_summary_lines: compaction_lines,
             user_turn_ranges: user_turns,
+            user_prompt_marks: prompt_marks,
             todo_block_ranges: todo_blocks,
         } = outputs;
         let width = area.width.max(1);
@@ -9278,7 +9646,7 @@ impl TuiApp {
                     lines.push(Line::default());
                     user_turns.push((tint_start, lines.len(), mark_row));
                 }
-                TuiMessage::User { text, .. } => {
+                TuiMessage::User { text, steered, .. } => {
                     let tint_start = lines.len();
                     lines.push(Line::default());
                     let mark_row = lines.len();
@@ -9291,6 +9659,9 @@ impl TuiApp {
                     }
                     lines.push(Line::default());
                     user_turns.push((tint_start, lines.len(), mark_row));
+                    if !*steered {
+                        prompt_marks.push(mark_row);
+                    }
                 }
                 TuiMessage::Assistant {
                     blocks,
@@ -9368,6 +9739,7 @@ impl TuiApp {
                         message,
                         self.expanded_compactions.contains(&key),
                         self.theme.ui.dim,
+                        width,
                     ));
                     index_summary_rows(compaction_lines, first, lines.len(), &key);
                 }
@@ -9441,7 +9813,7 @@ impl TuiApp {
                         &diff,
                         self.config.display.diff_layout,
                         width,
-                        crate::diff::diff_colors(&self.theme),
+                        crate::diff::diff_colors(&self.theme, self.config.display.diff_palette),
                     ));
                 } else if name == "TodoWrite"
                     && let Some(rows) = crate::todo_view::parse_rendered(&detail.output)
@@ -9455,7 +9827,7 @@ impl TuiApp {
                         dim: self.theme.ui.dim,
                         accent: self.theme.ui.primary,
                         moved: self.theme.ui.secondary,
-                        badge_fill: self.theme.ui.secondary,
+                        badge_fill: self.theme.ui.primary,
                         badge_letters: self.theme.ui.background,
                     };
                     let changes = self
@@ -9838,7 +10210,11 @@ impl TuiApp {
     /// The marker and the `[n/total]` count ride the prompt's first row
     /// rather than spending columns of their own, and the count stands
     /// down for a lone prompt — being one of one is not a fact worth two
-    /// columns.
+    /// columns. The marker itself carries the focus cue: dim while the
+    /// composer holds the keys, the primary accent once the section
+    /// does — a voice the dim register never renders, so the cue
+    /// survives a theme (Dracula among them) whose secondary accent
+    /// and dim are the same color.
     ///
     /// The keys ride the section's last row when the width can pay for
     /// them, and name only what the current mode answers: the walk's
@@ -9857,13 +10233,16 @@ impl TuiApp {
     /// is a badge rather than a panel — a pill a few cells wide is a
     /// label, not a filled box — stood in from the section's left edge,
     /// held a blank row clear of the prompt below it and another clear
-    /// of the transcript above, and filled with the primary, the same
-    /// accent the composer's edge column wears, letters in the canvas
+    /// of the transcript above, and filled with the secondary — the
+    /// voice the plan's badge traded it, so the two pills keep one
+    /// family and two names — letters in the canvas
     /// color, at rest and under the keys alike. In a theme that defers
     /// to the terminal the fill resets and the badge degrades to plain
     /// text — the letters keep at most a foreground voice, which
-    /// paints nothing.
-    fn render_queue(&self, frame: &mut Frame, area: Rect) {
+    /// paints nothing. The render records the rect it filled — either
+    /// posture's rows — so a later click on the section answers
+    /// against the geometry this frame painted.
+    fn render_queue(&mut self, frame: &mut Frame, area: Rect) {
         if area.height == 0 || area.width == 0 {
             return;
         }
@@ -9871,11 +10250,8 @@ impl TuiApp {
         if total == 0 {
             return;
         }
+        self.queue_section_rect = area;
         if self.queue_posture == QueuePosture::Folded && self.queue_mode == QueueMode::Plain {
-            // The fold's two rows, the todo fold's shape: a row of air,
-            // then the badge pill and a dim count naming the chord that
-            // lifts the section back — a hidden backlog stays a fact on
-            // screen, and the section above keeps its separation.
             frame.render_widget(
                 Paragraph::new(vec![
                     Line::from(Vec::new()),
@@ -9884,7 +10260,7 @@ impl TuiApp {
                             format!(" {QUEUE_TITLE} "),
                             Style::default()
                                 .fg(self.theme.ui.background)
-                                .bg(self.theme.ui.primary),
+                                .bg(self.theme.ui.secondary),
                         ),
                         Span::raw(" "),
                         Span::styled(
@@ -9918,7 +10294,7 @@ impl TuiApp {
         } else {
             self.theme.ui.dim
         });
-        let (fill, letters) = (self.theme.ui.primary, self.theme.ui.background);
+        let (fill, letters) = (self.theme.ui.secondary, self.theme.ui.background);
         let mut lines: Vec<Line<'static>> = Vec::with_capacity(rows);
         if top_standoff > 0 {
             lines.push(Line::from(Vec::new()));
@@ -10049,11 +10425,11 @@ impl TuiApp {
     ///
     /// The same floating shape the completion popup takes: rows above
     /// the composer, the cursor row highlighted — inverting under a
-    /// palette that defers its colors, exactly the popup's rule — a
-    /// dim header naming the keys, and a window that follows the
+    /// palette that defers its colors, exactly the popup's rule —
+    /// a dim header naming the keys, and a window that follows the
     /// cursor so a long catalog always keeps the chosen row on
-    /// screen. Each row spells the short id, the model, when the
-    /// session last saved, and its prompt count.
+    /// screen. Each row spells the short id, the session's name, the
+    /// model, when the session last saved, and its prompt count.
     fn render_session_picker(&mut self, frame: &mut Frame, input_area: Rect) {
         const SHOWN: usize = 8;
         let Some(picker) = self.session_picker.as_ref() else {
@@ -10098,7 +10474,8 @@ impl TuiApp {
                         .unwrap_or("—");
                     Line::from(Span::styled(
                         format!(
-                            " {short}  {:<20} {:<12} {}  {}p ",
+                            " {short}  {}  {:<20} {:<12} {}  {}p ",
+                            fit_picker_title(pick.title.as_deref()),
                             pick.model,
                             dir,
                             pick.saved_at.format("%b %d %H:%M"),
@@ -11098,6 +11475,38 @@ impl QuitState {
     }
 }
 
+/// Fit a session's name to the picker's title column.
+///
+/// The name is the reason a row is readable, so it stands right of
+/// the short id and before the model — but never at the cost of the
+/// row it shares: an over-long title keeps its head with an
+/// ellipsis, and a session without one (saved before titles existed,
+/// or a naming call that never answered) takes a dash so the column
+/// stays aligned across rows. A title is prose in any script, so
+/// both the pad and the cap measure display cells — the same
+/// measure the pane spends — never characters.
+fn fit_picker_title(title: Option<&str>) -> String {
+    const WIDTH: usize = 24;
+    let text = title.unwrap_or("—");
+    let cells = text.width();
+    if cells <= WIDTH {
+        let pad = " ".repeat(WIDTH.saturating_sub(cells));
+        return format!("{text}{pad}");
+    }
+    let budget = WIDTH.saturating_sub(1);
+    let mut used = 0usize;
+    let mut kept = String::new();
+    for glyph in text.chars() {
+        let span = glyph.width().unwrap_or(0);
+        if used.saturating_add(span) > budget {
+            break;
+        }
+        kept.push(glyph);
+        used = used.saturating_add(span);
+    }
+    format!("{kept}…")
+}
+
 /// The saved-session picker `/sessions` stands on.
 ///
 /// The catalog the driver listed with the cursor's row. Rows arrive
@@ -11322,6 +11731,15 @@ struct FrameLayout {
     sections: Sections,
 }
 
+/// The selectable document's per-segment line counts, in render
+/// order.
+///
+/// Conversation, seam, thinking, frozen, live, compaction, tools —
+/// the segments whose concatenation is the selection's line space.
+/// Comparing two shapes says whether the lane renumbered; the counts
+/// themselves never leave the frame that computed them.
+type SelectableShape = (usize, usize, usize, usize, usize, usize, usize);
+
 /// What the last frame's conversation pane looked like.
 ///
 /// The bridge between mouse events (screen cells, between frames)
@@ -11346,14 +11764,16 @@ struct ViewState {
 
     /// The conversation's total line count that frame.
     ///
-    /// The scroll space's size: running-tool rows are included,
-    /// because the viewport scrolls over them even though a
-    /// selection cannot cover them.
+    /// The scroll space's size: every rendered row counts, the
+    /// pending-steer and run-timer chrome below the document
+    /// included, because the viewport scrolls over them all.
     total: usize,
 
-    /// The line count a selection can cover — the total without the
-    /// running-tool rows, which render below the selectable document
-    /// and never join the selection's line space.
+    /// The line count a selection can cover.
+    ///
+    /// The rendered document through the running tools; the steer
+    /// and timer rows below it stay chrome, so a press on them
+    /// clamps to the last line above.
     selectable: usize,
 }
 
@@ -12601,17 +13021,76 @@ const LIVE_THINKING_BODY_CAP: usize = 500;
 /// nothing, so the section says what happened instead.
 const THINKING_REDACTED_PLACEHOLDER: &str = "reasoning withheld by the provider";
 
+/// The header a structured or rolling compaction pass marks its
+/// summary message with — the one ledger spelling every marked
+/// compactor shares.
+///
+/// The mark is how a folded feed's head is told from the conversation
+/// it replaced; see [`marked_compaction_summary`].
+const COMPACTED_LEDGER_HEADER: &str = "## Conversation summary";
+
+/// The pass's own words a folded history leads with, when it leads
+/// with any.
+///
+/// The structured and rolling compactors mark their summary message
+/// with the ledger header, so a folded feed's head can be recognized
+/// for what it is. The gate is the whole safety of the backfill: a
+/// pre-fold history's head is an ordinary prompt — often the
+/// session's first — and attaching it would dress conversation up as
+/// the pass's output. The QA compactor's summary carries no mark, so
+/// its rows keep no summary rather than a wrong one.
+fn marked_compaction_summary(history: &[loopctl::message::Message]) -> Option<String> {
+    let head = history.first()?.text_content();
+    if head.starts_with(COMPACTED_LEDGER_HEADER) {
+        Some(head.trim().to_string())
+    } else {
+        None
+    }
+}
+
+/// The collapsed row's one-line peek at the pass's summary.
+///
+/// The ledger header is boilerplate every pass carries; the reader's
+/// question is what the pass kept, so the preview is the first line
+/// with content past any headers, capped to the pane in display
+/// cells — a wide glyph spends two — with the ellipsis reserved
+/// inside the budget, the same measure every column fit keeps.
+/// `None` when the summary holds no content line at all.
+fn summary_preview_line(summary: &str, width: usize) -> Option<String> {
+    let line = summary
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with("## "))?;
+    let budget = width.saturating_sub(2).max(1);
+    if line.width() <= budget {
+        return Some(line.to_string());
+    }
+    let cell_budget = budget.saturating_sub(1);
+    let mut used = 0usize;
+    let mut kept = String::new();
+    for glyph in line.chars() {
+        let span = glyph.width().unwrap_or(0);
+        if used.saturating_add(span) > cell_budget {
+            break;
+        }
+        kept.push(glyph);
+        used = used.saturating_add(span);
+    }
+    Some(format!("{kept}…"))
+}
+
 /// The rows a compaction notice renders as.
 ///
-/// Collapsed, one dim row — the trigger and the before-to-after
-/// token counts a scrolling reader needs; expanded, the pass's
-/// remaining facts follow beneath. The marker mirrors the thinking
-/// sections' shape so one gesture vocabulary covers every
-/// expandable row.
+/// Collapsed, one dim row — the marker and the pass duration a
+/// scrolling reader needs, with a one-line peek at the summary when
+/// the row carries one; expanded, the pass's remaining facts follow
+/// beneath. The marker mirrors the thinking sections' shape so one
+/// gesture vocabulary covers every expandable row.
 fn compaction_notice_lines(
     message: &TuiMessage,
     expanded: bool,
     dim: ratatui::style::Color,
+    width: u16,
 ) -> Vec<Line<'static>> {
     let TuiMessage::Compacted {
         tokens_before,
@@ -12621,6 +13100,7 @@ fn compaction_notice_lines(
         duration_ms,
         compactor,
         compression_ratio,
+        summary,
         ..
     } = message
     else {
@@ -12636,6 +13116,13 @@ fn compaction_notice_lines(
         format!("{marker} Compacted · {}", format_duration(duration_ms)),
         dim,
     )];
+    if !expanded
+        && let Some(preview) = summary
+            .as_deref()
+            .and_then(|text| summary_preview_line(text, usize::from(width)))
+    {
+        lines.push(Line::styled(format!("  {preview}"), dim));
+    }
     if expanded {
         let saved = tokens_before.saturating_sub(tokens_after);
         lines.push(Line::styled(
@@ -12649,6 +13136,20 @@ fn compaction_notice_lines(
         }
         if let Some(ratio) = compression_ratio {
             lines.push(Line::styled(format!("  compression {ratio:.1}x"), dim));
+        }
+        if let Some(summary) = summary.as_deref().filter(|text| !text.is_empty()) {
+            lines.push(Line::styled(String::new(), dim));
+            let limit = usize::from(width).saturating_sub(2).max(1);
+            for source_line in summary.lines() {
+                let trimmed = source_line.trim();
+                if trimmed.is_empty() {
+                    lines.push(Line::styled(String::new(), dim));
+                    continue;
+                }
+                for row in wrap_prompt_rows(trimmed, limit, usize::MAX) {
+                    lines.push(Line::styled(format!("  {row}"), dim));
+                }
+            }
         }
         lines.push(Line::styled(
             "  earlier exchanges now live in the summary — durable state is \
@@ -13316,6 +13817,55 @@ mod tests {
     )]
 
     use super::*;
+    use crate::observer::CompactionFiling;
+
+    /// A summary-less compacted row for the attribution pins.
+    ///
+    /// The stats are fixtures; the reason rides through so a pin can
+    /// name the pass's trigger where the wording matters.
+    fn compacted_row(reason: &str) -> TuiMessage {
+        TuiMessage::Compacted {
+            tokens_before: 10,
+            tokens_after: 5,
+            reason: reason.to_string(),
+            evicted: 3,
+            duration_ms: 100,
+            compactor: Some("structured".to_string()),
+            compression_ratio: Some(2.0),
+            summary: None,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn fit_picker_title_pads_and_truncates_by_display_cells() {
+        // The picker's title column is a cell budget: a wide-script
+        // title pads to the same column edge an ASCII one does, and
+        // an over-long one keeps a head that fits the budget with the
+        // ellipsis inside it. A character count would let a wide
+        // title push the model column sideways.
+        let padded = fit_picker_title(Some("端末のセッション"));
+        assert_eq!(
+            padded.width(),
+            24,
+            "a wide-script title pads to the column's cell width: {padded:?}"
+        );
+        let over_long = "題".repeat(40);
+        let capped = fit_picker_title(Some(&over_long));
+        assert!(
+            capped.width() <= 24,
+            "the cap is a cell budget, never a character count: {capped:?}"
+        );
+        assert!(
+            capped.ends_with('…'),
+            "the cap keeps its head visible: {capped:?}"
+        );
+        assert_eq!(
+            fit_picker_title(None).width(),
+            24,
+            "the untitled dash pads to the same column edge"
+        );
+    }
 
     #[test]
     fn the_auto_expanded_todo_block_folds_when_the_conversation_moves_on() {
@@ -14148,6 +14698,7 @@ mod tests {
             duration_ms: 312,
             compactor: Some("qa".to_string()),
             compression_ratio: Some(3.9),
+            summary: Some("The session mapped the login flow and fixed the retry loop".to_string()),
             timestamp: chrono::Utc::now(),
         });
         let mut terminal =
@@ -14157,6 +14708,11 @@ mod tests {
         assert!(
             collapsed.contains("Compacted · <1s"),
             "the collapsed row carries the pass duration like every other block: {collapsed}"
+        );
+        assert!(
+            collapsed.contains("mapped the login flow"),
+            "the collapsed row peeks at the pass's own words — the text \
+             the model continues from, without the expansion: {collapsed}"
         );
         assert!(
             !collapsed.contains("16686"),
@@ -14174,6 +14730,10 @@ mod tests {
         assert!(expanded.contains("reason: threshold"), "{expanded}");
         assert!(expanded.contains("compactor: qa"), "{expanded}");
         assert!(expanded.contains("compression 3.9x"), "{expanded}");
+        assert!(
+            expanded.contains("The session mapped the login flow and fixed the retry loop"),
+            "the summary the pass left the context under shows beside the stats: {expanded}"
+        );
         assert!(
             expanded.contains("durable state is the findings file and todo list"),
             "the expanded details remind the reader what survived: {expanded}"
@@ -14196,6 +14756,7 @@ mod tests {
             duration_ms: 312,
             compactor: Some("qa".to_string()),
             compression_ratio: Some(3.9),
+            summary: None,
             timestamp: chrono::Utc::now(),
         });
         app.push_message(TuiMessage::User {
@@ -15894,6 +16455,664 @@ mod tests {
     }
 
     #[test]
+    fn a_wide_script_summary_preview_caps_by_display_cells() {
+        // Forty wide glyphs read as forty characters but spend eighty
+        // cells; the preview must fit the pane's cells, ellipsis
+        // reserved inside the budget — the same measure every column
+        // fit keeps.
+        let summary = format!("## Conversation summary (compacted)\n{}", "題".repeat(40));
+        let preview = summary_preview_line(&summary, 78).expect("a content line");
+        assert!(
+            preview.width() <= 78,
+            "the preview fits the pane's cells, a wide glyph spending \
+             two: {} cells",
+            preview.width()
+        );
+        assert!(
+            preview.ends_with('…'),
+            "an over-long line is ellipsized inside the budget, never \
+             clipped past it"
+        );
+    }
+
+    #[test]
+    fn a_compaction_row_takes_its_summary_from_the_folded_history_head() {
+        let mut app = app();
+        let folded = std::sync::Arc::new(vec![loopctl::message::Message::user(
+            "## Conversation summary (compacted)\n- the work stood here",
+        )]);
+        app.state
+            .turn_histories
+            .lock()
+            .expect("the turn-history lock")
+            .push(TurnPublication {
+                passes: 1,
+                history: std::sync::Arc::clone(&folded),
+            });
+        app.state
+            .compactions
+            .lock()
+            .expect("the compaction lock")
+            .push(CompactionEvent {
+                pass: 1,
+                record: TuiMessage::Compacted {
+                    tokens_before: 10,
+                    tokens_after: 5,
+                    reason: "threshold exceeded".to_string(),
+                    evicted: 3,
+                    duration_ms: 100,
+                    compactor: Some("structured".to_string()),
+                    compression_ratio: Some(2.0),
+                    summary: None,
+                    timestamp: chrono::Utc::now(),
+                },
+            });
+        app.drain_shared_state();
+        match app.conversation().last() {
+            Some(TuiMessage::Compacted { summary, .. }) => assert!(
+                summary
+                    .as_deref()
+                    .is_some_and(|text| text.starts_with("## Conversation summary")),
+                "the row carries the pass's own words: {summary:?}"
+            ),
+            other => panic!("the compacted row landed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_compaction_row_never_takes_a_pre_fold_historys_head() {
+        let mut app = app();
+        app.state
+            .turn_histories
+            .lock()
+            .expect("the turn-history lock")
+            .push(TurnPublication {
+                passes: 1,
+                history: std::sync::Arc::new(vec![loopctl::message::Message::user(
+                    "the original first prompt",
+                )]),
+            });
+        app.state
+            .compactions
+            .lock()
+            .expect("the compaction lock")
+            .push(CompactionEvent {
+                pass: 1,
+                record: TuiMessage::Compacted {
+                    tokens_before: 10,
+                    tokens_after: 5,
+                    reason: "threshold exceeded".to_string(),
+                    evicted: 3,
+                    duration_ms: 100,
+                    compactor: None,
+                    compression_ratio: None,
+                    summary: None,
+                    timestamp: chrono::Utc::now(),
+                },
+            });
+        app.drain_shared_state();
+        match app.conversation().last() {
+            Some(TuiMessage::Compacted { summary, .. }) => assert!(
+                summary.is_none(),
+                "a pre-fold history's head is conversation, not the pass's \
+                 output — the row keeps waiting: {summary:?}"
+            ),
+            other => panic!("the compacted row landed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_manual_compactions_row_takes_its_summary_from_its_own_filing() {
+        // The manual pass owns no turn end to carry its publication, so
+        // the driver files the folded feed in the pass's own channel —
+        // taken once per summary-less row, never shared.
+        let mut app = app();
+        let folded = std::sync::Arc::new(vec![loopctl::message::Message::user(
+            "## Conversation summary (compacted)\n- the folded ledger",
+        )]);
+        app.state
+            .compaction_publications
+            .lock()
+            .expect("the publications lock")
+            .push(CompactionFiling {
+                pass: 1,
+                folded: std::sync::Arc::clone(&folded),
+            });
+        app.state
+            .compactions
+            .lock()
+            .expect("the compaction lock")
+            .push(CompactionEvent {
+                pass: 1,
+                record: TuiMessage::Compacted {
+                    tokens_before: 10,
+                    tokens_after: 5,
+                    reason: "manual".to_string(),
+                    evicted: 3,
+                    duration_ms: 100,
+                    compactor: Some("structured".to_string()),
+                    compression_ratio: Some(2.0),
+                    summary: None,
+                    timestamp: chrono::Utc::now(),
+                },
+            });
+        app.drain_shared_state();
+        match app.conversation().last() {
+            Some(TuiMessage::Compacted { summary, .. }) => assert!(
+                summary
+                    .as_deref()
+                    .is_some_and(|text| text.starts_with("## Conversation summary")),
+                "the manual row carries the pass's own words: {summary:?}"
+            ),
+            other => panic!("the compacted row landed: {other:?}"),
+        }
+        assert!(
+            app.state
+                .compaction_publications
+                .lock()
+                .expect("the publications lock")
+                .is_empty(),
+            "a filing serves exactly the row that drained it"
+        );
+    }
+
+    #[test]
+    fn a_compaction_row_ignores_the_standing_history() {
+        // Past the first fold the standing machine history's head is a
+        // marked summary that outlives the pass that coined it — a
+        // resumed session seeds the slot with the previous
+        // conversation's words. A new summary-less row must not read
+        // it: only a publication attributable to the pass settles the
+        // debt, so the row keeps waiting here.
+        let mut app = app();
+        let stale = std::sync::Arc::new(vec![loopctl::message::Message::user(
+            "## Conversation summary (compacted)\n- a previous pass's ledger",
+        )]);
+        *app.state
+            .machine_history
+            .lock()
+            .expect("the machine-history lock") = Some(std::sync::Arc::clone(&stale));
+        app.state
+            .compactions
+            .lock()
+            .expect("the compaction lock")
+            .push(CompactionEvent {
+                pass: 1,
+                record: TuiMessage::Compacted {
+                    tokens_before: 10,
+                    tokens_after: 5,
+                    reason: "threshold exceeded".to_string(),
+                    evicted: 3,
+                    duration_ms: 100,
+                    compactor: Some("structured".to_string()),
+                    compression_ratio: Some(2.0),
+                    summary: None,
+                    timestamp: chrono::Utc::now(),
+                },
+            });
+        app.drain_shared_state();
+        match app.conversation().last() {
+            Some(TuiMessage::Compacted { summary, .. }) => assert!(
+                summary.is_none(),
+                "the standing cache's marked head is a previous pass's \
+                 words — the row keeps its debt: {summary:?}"
+            ),
+            other => panic!("the compacted row landed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_stale_turn_publication_never_backfills_a_later_manual_pass() {
+        // The interleaving the attribution stamps exist for: an earlier
+        // fold's marked head sits in a pending turn-end publication
+        // when a later manual pass's row lands in the same drain. The
+        // publication answers pass one and the row is pass two, so the
+        // row takes its own filing's words and the stale publication
+        // settles nothing.
+        let mut app = app();
+        let stale = std::sync::Arc::new(vec![loopctl::message::Message::user(
+            "## Conversation summary (compacted)\n- the first pass's ledger",
+        )]);
+        app.state
+            .turn_histories
+            .lock()
+            .expect("the turn-history lock")
+            .push(TurnPublication {
+                passes: 1,
+                history: stale,
+            });
+        let own = std::sync::Arc::new(vec![loopctl::message::Message::user(
+            "## Conversation summary (compacted)\n- the second pass's ledger",
+        )]);
+        app.state
+            .compaction_publications
+            .lock()
+            .expect("the publications lock")
+            .push(CompactionFiling {
+                pass: 2,
+                folded: own,
+            });
+        app.state
+            .compactions
+            .lock()
+            .expect("the compaction lock")
+            .push(CompactionEvent {
+                pass: 2,
+                record: TuiMessage::Compacted {
+                    tokens_before: 10,
+                    tokens_after: 5,
+                    reason: "manual".to_string(),
+                    evicted: 3,
+                    duration_ms: 100,
+                    compactor: Some("structured".to_string()),
+                    compression_ratio: Some(2.0),
+                    summary: None,
+                    timestamp: chrono::Utc::now(),
+                },
+            });
+        app.drain_shared_state();
+        match app.conversation().last() {
+            Some(TuiMessage::Compacted { summary, .. }) => assert!(
+                summary
+                    .as_deref()
+                    .is_some_and(|text| text.contains("the second pass's ledger")),
+                "the row takes its own pass's words, never the earlier fold's: {summary:?}"
+            ),
+            other => panic!("the compacted row landed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_late_filing_never_serves_a_later_pass() {
+        // The orphaned-filing interleaving: a row settles through the
+        // turn-end channel and its own filing arrives only afterwards,
+        // too late to pair. The late filing must linger inert — its
+        // pass is spent, its number never reused — while the next
+        // manual pass's row takes exactly its own filing's words.
+        let mut app = app();
+        let settled = std::sync::Arc::new(vec![loopctl::message::Message::user(
+            "## Conversation summary (compacted)\n- the first pass's ledger",
+        )]);
+        app.state
+            .turn_histories
+            .lock()
+            .expect("the turn-history lock")
+            .push(TurnPublication {
+                passes: 1,
+                history: settled,
+            });
+        app.state
+            .compactions
+            .lock()
+            .expect("the compaction lock")
+            .push(CompactionEvent {
+                pass: 1,
+                record: compacted_row("threshold exceeded"),
+            });
+        app.drain_shared_state();
+        let late = std::sync::Arc::new(vec![loopctl::message::Message::user(
+            "## Conversation summary (compacted)\n- the first pass's late filing",
+        )]);
+        let own = std::sync::Arc::new(vec![loopctl::message::Message::user(
+            "## Conversation summary (compacted)\n- the second pass's ledger",
+        )]);
+        {
+            let mut filings = app
+                .state
+                .compaction_publications
+                .lock()
+                .expect("the publications lock");
+            filings.push(CompactionFiling {
+                pass: 1,
+                folded: late,
+            });
+            filings.push(CompactionFiling {
+                pass: 2,
+                folded: own,
+            });
+        }
+        app.state
+            .compactions
+            .lock()
+            .expect("the compaction lock")
+            .push(CompactionEvent {
+                pass: 2,
+                record: compacted_row("manual"),
+            });
+        app.drain_shared_state();
+        let rows = app.conversation();
+        match rows.first() {
+            Some(TuiMessage::Compacted { summary, .. }) => assert!(
+                summary
+                    .as_deref()
+                    .is_some_and(|text| text.contains("the first pass's ledger")),
+                "the first row keeps the words its own publication carried: {summary:?}"
+            ),
+            other => panic!("the first compacted row landed: {other:?}"),
+        }
+        match rows.last() {
+            Some(TuiMessage::Compacted { summary, .. }) => assert!(
+                summary
+                    .as_deref()
+                    .is_some_and(|text| text.contains("the second pass's ledger")),
+                "the later row takes its own filing's words, never the \
+                 orphan's: {summary:?}"
+            ),
+            other => panic!("the second compacted row landed: {other:?}"),
+        }
+        let lingering: Vec<u64> = app
+            .state
+            .compaction_publications
+            .lock()
+            .expect("the publications lock")
+            .iter()
+            .map(|filing| filing.pass)
+            .collect();
+        assert_eq!(
+            lingering,
+            vec![1],
+            "the late filing lingers inert — spent passes are never reused"
+        );
+    }
+
+    #[test]
+    fn two_manual_passes_in_one_drain_each_take_their_own_words() {
+        // Two manual passes land between drains: both rows are owed at
+        // once, each filing sits stamped behind its own pass, and one
+        // drain settles both — each row with its own pass's words, the
+        // earlier row's debt surviving alongside the later's instead
+        // of being silently dropped.
+        let mut app = app();
+        let first = std::sync::Arc::new(vec![loopctl::message::Message::user(
+            "## Conversation summary (compacted)\n- the first pass's ledger",
+        )]);
+        let second = std::sync::Arc::new(vec![loopctl::message::Message::user(
+            "## Conversation summary (compacted)\n- the second pass's ledger",
+        )]);
+        {
+            let mut filings = app
+                .state
+                .compaction_publications
+                .lock()
+                .expect("the publications lock");
+            filings.push(CompactionFiling {
+                pass: 1,
+                folded: first,
+            });
+            filings.push(CompactionFiling {
+                pass: 2,
+                folded: second,
+            });
+        }
+        {
+            let mut events = app.state.compactions.lock().expect("the compaction lock");
+            events.push(CompactionEvent {
+                pass: 1,
+                record: compacted_row("manual"),
+            });
+            events.push(CompactionEvent {
+                pass: 2,
+                record: compacted_row("manual"),
+            });
+        }
+        app.drain_shared_state();
+        let rows = app.conversation();
+        match rows.first() {
+            Some(TuiMessage::Compacted { summary, .. }) => assert!(
+                summary
+                    .as_deref()
+                    .is_some_and(|text| text.contains("the first pass's ledger")),
+                "the earlier row keeps its own debt and its own words: {summary:?}"
+            ),
+            other => panic!("the first compacted row landed: {other:?}"),
+        }
+        match rows.last() {
+            Some(TuiMessage::Compacted { summary, .. }) => assert!(
+                summary
+                    .as_deref()
+                    .is_some_and(|text| text.contains("the second pass's ledger")),
+                "the later row takes its own pass's words: {summary:?}"
+            ),
+            other => panic!("the second compacted row landed: {other:?}"),
+        }
+        assert!(
+            app.state
+                .compaction_publications
+                .lock()
+                .expect("the publications lock")
+                .is_empty(),
+            "each filing served exactly the row carrying its stamp"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_message_addition_keeps_a_standing_debt_standing() {
+        // The release is the replacement's, not the list's: a conversation
+        // that merely grows — a reply landing, a tool result arriving —
+        // keeps its debts, for their indexes still name the rows they
+        // were stamped against.
+        let mut app = app();
+        app.state
+            .compactions
+            .lock()
+            .expect("the compaction lock")
+            .push(CompactionEvent {
+                pass: 1,
+                record: compacted_row("threshold exceeded"),
+            });
+        app.drain_shared_state();
+        assert_eq!(
+            app.compaction_summary_owed,
+            vec![(1, 0)],
+            "the unmarked pass leaves its debt"
+        );
+        app.push_message(TuiMessage::Assistant {
+            blocks: vec![ContentBlock::Text {
+                text: "work continues".to_string(),
+            }],
+            timestamp: chrono::Utc::now(),
+            duration_ms: None,
+        });
+        app.drain_shared_state();
+        assert_eq!(
+            app.compaction_summary_owed,
+            vec![(1, 0)],
+            "an ordinary addition never releases a debt"
+        );
+    }
+
+    #[test]
+    fn a_live_resume_releases_the_replaced_conversation_s_debts() {
+        // The interleaving the debt list cannot survive: a resume
+        // replaces the conversation wholesale, so an owed index names a
+        // row that no longer exists — and a turn publishing the same
+        // pass count over the resumed history would pin its summary
+        // onto whatever now sits at that index. The replacement
+        // releases the debt, and the resumed rows keep their own words.
+        let mut app = app();
+        app.state
+            .compactions
+            .lock()
+            .expect("the compaction lock")
+            .push(CompactionEvent {
+                pass: 1,
+                record: compacted_row("threshold exceeded"),
+            });
+        app.drain_shared_state();
+        assert_eq!(
+            app.compaction_summary_owed,
+            vec![(1, 0)],
+            "the debt stands before the resume"
+        );
+        app.apply_session_update(crate::queue::SessionUpdate::Resumed {
+            id: "resumed-id".to_string(),
+            transcript: vec![TuiMessage::Compacted {
+                tokens_before: 20,
+                tokens_after: 8,
+                reason: "the resumed session's own pass".to_string(),
+                evicted: 2,
+                duration_ms: 90,
+                compactor: Some("structured".to_string()),
+                compression_ratio: Some(2.5),
+                summary: Some("the resumed session's own summary".to_string()),
+                timestamp: chrono::Utc::now(),
+            }],
+            tokens: crate::queue::ResumedTokens {
+                cumulative_input: 11,
+                cumulative_output: 7,
+                last_input: 5,
+                context_tokens: 3,
+            },
+        });
+        assert!(
+            app.compaction_summary_owed.is_empty(),
+            "the replacement releases the replaced conversation's debts"
+        );
+        let history = std::sync::Arc::new(vec![loopctl::message::Message::user(
+            "## Conversation summary (compacted)\n- a later turn's publication",
+        )]);
+        app.state
+            .turn_histories
+            .lock()
+            .expect("the turn-history lock")
+            .push(TurnPublication { passes: 1, history });
+        app.drain_shared_state();
+        match app.conversation().first() {
+            Some(TuiMessage::Compacted { summary, .. }) => assert!(
+                summary
+                    .as_deref()
+                    .is_some_and(|text| text.contains("the resumed session's own summary")),
+                "the released debt never backfills the resumed row: {summary:?}"
+            ),
+            other => panic!("the resumed compacted row stands: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_cleared_session_owes_nothing_from_the_one_before_it() {
+        // `/clear` is the other replacement: the fresh conversation owes
+        // no summary from the one it displaces, and a publication
+        // arriving afterwards finds no debtor to serve.
+        let mut app = app();
+        app.state
+            .compactions
+            .lock()
+            .expect("the compaction lock")
+            .push(CompactionEvent {
+                pass: 1,
+                record: compacted_row("threshold exceeded"),
+            });
+        app.drain_shared_state();
+        assert_eq!(
+            app.compaction_summary_owed,
+            vec![(1, 0)],
+            "the debt stands before the clear"
+        );
+        app.clear_command();
+        assert!(
+            app.compaction_summary_owed.is_empty(),
+            "the clear releases the debt with the conversation it named"
+        );
+        assert!(
+            app.conversation().is_empty(),
+            "the clear emptied the display"
+        );
+        let history = std::sync::Arc::new(vec![loopctl::message::Message::user(
+            "## Conversation summary (compacted)\n- a late publication",
+        )]);
+        app.state
+            .turn_histories
+            .lock()
+            .expect("the turn-history lock")
+            .push(TurnPublication { passes: 1, history });
+        app.drain_shared_state();
+        assert!(
+            app.conversation().is_empty(),
+            "a publication after the clear attaches nothing — no row \
+             exists to take it"
+        );
+    }
+
+    #[test]
+    fn alt_arrows_walk_the_submitted_prompts() {
+        // Three prompts with tall answers between them and a steered
+        // echo beside the last: Alt+Up seats each prompt's first row
+        // at the viewport's top in turn — the echo is not a stop — the
+        // walk past the first prompt answers with a notice instead of
+        // a move, and Alt+Down walks back the other way.
+        let mut app = app();
+        let tall = "an answer paragraph of some length, wrapping across \
+             several rows when the pane is narrow\n"
+            .repeat(6);
+        for prompt in ["first ask", "second ask", "third ask"] {
+            app.push_message(TuiMessage::User {
+                text: prompt.to_string(),
+                timestamp: chrono::Utc::now(),
+                steered: false,
+                unsent: false,
+            });
+            app.push_message(TuiMessage::Assistant {
+                blocks: vec![ContentBlock::Text { text: tall.clone() }],
+                timestamp: chrono::Utc::now(),
+                duration_ms: None,
+            });
+        }
+        app.push_message(TuiMessage::User {
+            text: "a steered echo beside the tail".to_string(),
+            timestamp: chrono::Utc::now(),
+            steered: true,
+            unsent: false,
+        });
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 20)).expect("terminal");
+        terminal.draw(|frame| app.render(frame)).expect("draw");
+        assert_eq!(
+            app.user_prompt_marks.len(),
+            3,
+            "only submitted prompts are stops: {:?}",
+            app.user_prompt_marks
+        );
+        let total = app.last_layout_lines;
+        let viewport = app.last_layout_viewport;
+        let marks = app.user_prompt_marks.clone();
+        let mark = |index: usize| marks.get(index).copied().unwrap_or_default();
+        let expected = |mark: usize| total.saturating_sub(viewport).saturating_sub(mark);
+
+        app.handle_key_inner(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+        assert_eq!(
+            app.scroll_offset(),
+            expected(mark(2)),
+            "Alt+Up seats the newest submitted prompt at the top"
+        );
+        app.handle_key_inner(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+        assert_eq!(
+            app.scroll_offset(),
+            expected(mark(1)),
+            "the second press walks one prompt older"
+        );
+        app.handle_key_inner(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+        assert_eq!(
+            app.scroll_offset(),
+            expected(mark(0)),
+            "the third press seats the first prompt"
+        );
+        app.handle_key_inner(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+        assert!(
+            app.transient_notice
+                .as_ref()
+                .is_some_and(|(text, _)| text.contains("no earlier prompt")),
+            "past the oldest prompt the walk answers with a notice: {:?}",
+            app.transient_notice
+        );
+        app.handle_key_inner(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT));
+        assert_eq!(
+            app.scroll_offset(),
+            expected(mark(1)),
+            "Alt+Down walks back toward the newer prompt"
+        );
+    }
+
+    #[test]
     fn a_finished_run_stamps_its_total_onto_the_final_reply_only() {
         let mut app = app();
         let mut queue = app.state.graduations.lock().expect("the graduation lock");
@@ -16494,7 +17713,7 @@ mod tests {
 
     /// Run a slash command and return everything it surfaced, as one
     /// newline-joined string. Reads both lanes a command may write to: the
-    /// transcript rows it appended (`/session`, `/cost`, `/themes`, `/version`)
+    /// transcript rows it appended (`/cost`, `/themes`, `/version`)
     /// and the transient status line it raised (`/exit`, `/stop`, `/copy`).
     fn command_output(app: &mut TuiApp, line: &str) -> String {
         let commands::Parsed::Command(command) = commands::parse(line) else {
@@ -16561,14 +17780,6 @@ mod tests {
         let out = command_output(&mut app, "/cost");
         assert!(out.contains("Context:"), "got {out:?}");
         assert!(out.contains("tokens used"), "got {out:?}");
-    }
-
-    #[test]
-    fn session_command_reports_identity_and_model() {
-        let mut app = TuiApp::new(dch_config::DchConfig::default());
-        let out = command_output(&mut app, "/session");
-        assert!(out.contains("Session"), "got {out:?}");
-        assert!(out.contains(&app.config.api.model), "got {out:?}");
     }
 
     #[test]
@@ -17725,6 +18936,7 @@ mod tests {
                 model: "newest-model".to_string(),
                 saved_at: chrono::Utc::now(),
                 prompts: 3,
+                title: None,
                 workdir: None,
             },
             SessionPick {
@@ -17732,6 +18944,7 @@ mod tests {
                 model: "older-model".to_string(),
                 saved_at: chrono::Utc::now(),
                 prompts: 7,
+                title: None,
                 workdir: None,
             },
         ];
@@ -17779,6 +18992,7 @@ mod tests {
                 model: "m".to_string(),
                 saved_at: chrono::Utc::now(),
                 prompts: 1,
+                title: None,
                 workdir: None,
             }],
         });
@@ -18237,6 +19451,97 @@ mod tests {
         };
         assert_eq!(cumulative_input, 11, "the spend continues the save's count");
         assert_eq!(context_tokens, 3, "the usage bar opens on the saved fill");
+    }
+
+    #[test]
+    fn strip_settings_apply_live_without_a_restart() {
+        // The strip pair is display state copied at construction; the
+        // live arm re-copies it from the config the /set just edited,
+        // so the next frame animates in the new shape and row — no
+        // restart owed.
+        let mut app = app();
+        assert_eq!(app.strip_style, dch_config::StripStyle::Breathe);
+        app.run_command(Command::Set {
+            key: "strip_style".to_string(),
+            value: "sweep".to_string(),
+        });
+        assert_eq!(
+            app.strip_style,
+            dch_config::StripStyle::Sweep,
+            "the very next frame animates the configured style"
+        );
+        assert_eq!(app.strip_position, dch_config::StripPosition::Composer);
+        app.run_command(Command::Set {
+            key: "strip_position".to_string(),
+            value: "top".to_string(),
+        });
+        assert_eq!(
+            app.strip_position,
+            dch_config::StripPosition::Top,
+            "the strip answers its new row without a restart"
+        );
+    }
+
+    #[test]
+    fn path_style_re_spells_the_place_row_live() {
+        // The place row reads the config's own spelling every frame,
+        // so the promotion is classification alone — the row answers
+        // a /set path_style the moment the config changes.
+        let Some(home) = std::env::var("HOME").ok().filter(|home| !home.is_empty()) else {
+            return;
+        };
+        let mut app = app();
+        app.set_working_dir(std::path::Path::new(&home));
+        assert_eq!(app.place_text(), home, "the default spells it in full");
+        app.run_command(Command::Set {
+            key: "path_style".to_string(),
+            value: "relative".to_string(),
+        });
+        assert_eq!(
+            app.place_text(),
+            "~",
+            "home itself re-spells as the bare tilde, live"
+        );
+    }
+
+    #[test]
+    fn a_set_copy_command_takes_effect_without_a_restart() {
+        // The copier closes over the configured command at
+        // construction; the live arm rebuilds it, so a mid-session
+        // /set copy_command routes the very next copy through the new
+        // command — pinned with a real shell writing the copied text.
+        let target = tempfile::NamedTempFile::new().expect("the copy target");
+        let path = target.path().to_string_lossy().into_owned();
+        let mut app = app();
+        app.run_command(Command::Set {
+            key: "copy_command".to_string(),
+            value: format!("cat > '{path}'"),
+        });
+        app.push_message(TuiMessage::Assistant {
+            blocks: vec![ContentBlock::Text {
+                text: "the answer".to_string(),
+            }],
+            timestamp: chrono::Utc::now(),
+            duration_ms: None,
+        });
+        let _ = command_output(&mut app, "/copy");
+        let mut landed = false;
+        for _ in 0..40 {
+            app.drain_shared_state();
+            if std::fs::read_to_string(&path)
+                .unwrap_or_default()
+                .contains("the answer")
+            {
+                landed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            landed,
+            "the copy rode the newly configured command, not the one the \
+             session started with"
+        );
     }
 
     #[test]

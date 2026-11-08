@@ -72,6 +72,18 @@ pub struct SessionSaver {
     /// construction.
     workdir: Option<String>,
 
+    /// The session's name: a few words the model coined from the
+    /// conversation's first prompt.
+    ///
+    /// Set once, asynchronously, when the first prompt of a session
+    /// is claimed — the host swaps a titled saver in through
+    /// [`with_title`](Self::with_title) the moment the naming call
+    /// answers. `None` until then, on a naming call that failed, and
+    /// on every session saved before titles existed; a listing row
+    /// renders the absence as a dash. The title rides the envelope
+    /// so a resume carries the name forward under the same id.
+    title: Option<String>,
+
     /// The root sessions directory, injectable for tests.
     ///
     /// Every path the saver touches derives from it, so pointing it
@@ -124,6 +136,16 @@ pub struct SessionSummary {
     /// in different repos read differently at a glance. `None` on
     /// sessions saved before the field existed.
     pub workdir: Option<String>,
+
+    /// The session's name, when the naming call answered.
+    ///
+    /// A few words the model coined from the conversation's first
+    /// prompt — the column a user actually picks a resume by, since
+    /// ids and timestamps cannot say what a conversation was about.
+    /// `None` on sessions saved before titles existed and on ones
+    /// whose naming call never answered; the listing renders the
+    /// absence as a dash.
+    pub title: Option<String>,
 
     /// The engine's context-size estimate at the last save.
     ///
@@ -284,6 +306,17 @@ struct StoredSession {
     /// files saved before the field existed; those read as none.
     #[serde(default)]
     workdir: Option<String>,
+
+    /// The session's name: a few words the model coined from the
+    /// conversation's first prompt.
+    ///
+    /// Written by the host once the naming call answers, so every
+    /// save after that carries it. Absent on files saved before
+    /// titles existed and on sessions whose naming call never
+    /// answered; those read as none and a listing renders the
+    /// absence as a dash.
+    #[serde(default)]
+    title: Option<String>,
 }
 
 /// A session's cumulative token accounting.
@@ -341,6 +374,7 @@ impl SessionSaver {
             session_id,
             model,
             workdir: None,
+            title: None,
             base_dir: sessions_dir(),
         }
     }
@@ -355,6 +389,7 @@ impl SessionSaver {
             session_id,
             model,
             workdir: None,
+            title: None,
             base_dir,
         }
     }
@@ -380,15 +415,43 @@ impl SessionSaver {
     /// pointed at a throwaway directory stays there) and record the
     /// model the loop actually runs — the caller's current one, not
     /// the ended saver's — so the fresh file's provenance names the
-    /// loop that writes it.
+    /// loop that writes it. The title is a fact about the
+    /// conversation, not the identity: it rides to a same-id relabel
+    /// and a resume's moved target, while a `/clear`'s fresh
+    /// conversation starts untitled — that caller drops it explicitly
+    /// with [`with_title`](Self::with_title).
     #[must_use]
     pub fn with_identity(&self, session_id: Uuid, model: String) -> Self {
         Self {
             session_id,
             model,
             workdir: self.workdir.clone(),
+            title: self.title.clone(),
             base_dir: self.base_dir.clone(),
         }
+    }
+
+    /// Record the session's name in the envelope.
+    ///
+    /// The host calls this when the naming call answers — usually
+    /// between the first turn's start and its save, so the first save
+    /// already carries the name, and at worst the next one does.
+    /// Passing `None` drops the title, which a `/clear`'s fresh
+    /// identity does on purpose.
+    #[must_use]
+    pub fn with_title(mut self, title: Option<String>) -> Self {
+        self.title = title;
+        self
+    }
+
+    /// The session's recorded name, if the naming call has answered.
+    ///
+    /// `None` until the first prompt's title lands, on a failed
+    /// naming call, and on sessions saved before titles existed. The
+    /// claim path reads this to know whether a name is still owed.
+    #[must_use]
+    pub fn title(&self) -> Option<&str> {
+        self.title.as_deref()
     }
 
     /// The session identity this saver writes under.
@@ -531,6 +594,7 @@ impl SessionSaver {
             messages: messages.to_vec(),
             tokens,
             workdir: self.workdir.clone(),
+            title: self.title.clone(),
         };
         let json = serde_json::to_string_pretty(&stored)?;
         let mut temp = tempfile::NamedTempFile::new_in(dir)?;
@@ -569,7 +633,56 @@ pub(crate) fn sessions_dir() -> PathBuf {
     dch_config::config_dir().join("sessions")
 }
 
-/// Load a session's messages together with the model its envelope
+/// What loading a session's envelope yields: the conversation and
+/// every fact recorded around it.
+///
+/// The resume path's read: one parse yields the display model, the
+/// model the session ran, the accounting to continue, the stamp the
+/// machine-history pair rule judges against, and the name the
+/// session already owns — so a resumed host never re-reads the file
+/// for a fact it already loaded.
+#[derive(Debug)]
+pub(crate) struct LoadedSession {
+    /// The saved conversation in display form, verbatim.
+    ///
+    /// Ordered as it rendered; the resume path hands it to the
+    /// display untouched, and the machine half — when the sibling
+    /// pair is fresh — seeds the engine from its own snapshot
+    /// rather than deriving from these rows.
+    pub(crate) messages: Vec<TuiMessage>,
+
+    /// The model the session ran, from the envelope.
+    ///
+    /// What the next run of this session defaults to: a resumed
+    /// host adopts it over the configuration's own name, and the
+    /// saver it rebuilds records it as the file's provenance.
+    pub(crate) model: String,
+
+    /// The session's cumulative token totals at save time.
+    ///
+    /// Seeds the resumed display's running count so the
+    /// conversation continues the session's accounting instead of
+    /// restarting at zero.
+    pub(crate) tokens: SessionTokens,
+
+    /// When this save happened.
+    ///
+    /// The stamp the machine-history pair rule judges against: a
+    /// sibling snapshot older than this is stale, and resume
+    /// derives from the display transcript instead of seeding from
+    /// it.
+    pub(crate) saved_at: chrono::DateTime<chrono::Utc>,
+
+    /// The session's name, when it has one.
+    ///
+    /// `None` until the first prompt's naming call answers, on a
+    /// call that failed, and on sessions saved before titles
+    /// existed; the adopting host carries it into its own saver so
+    /// a resume never renames.
+    pub(crate) title: Option<String>,
+}
+
+/// Load a session's messages together with the facts its envelope
 /// records, rooted at `base`.
 ///
 /// The resume path's read: one parse yields both the display model
@@ -581,25 +694,15 @@ pub(crate) fn sessions_dir() -> PathBuf {
 ///
 /// Same conditions as [`load_envelope`], with the envelope's model
 /// carried out alongside the messages.
-pub(crate) fn load_with_meta_in(
-    id: Uuid,
-    base: &Path,
-) -> Result<
-    (
-        Vec<TuiMessage>,
-        String,
-        SessionTokens,
-        chrono::DateTime<chrono::Utc>,
-    ),
-    SessionError,
-> {
+pub(crate) fn load_with_meta_in(id: Uuid, base: &Path) -> Result<LoadedSession, SessionError> {
     let stored = load_envelope(&base.join(id.to_string()).join("session.json"), id, base)?;
-    Ok((
-        stored.messages,
-        stored.model,
-        stored.tokens,
-        stored.saved_at,
-    ))
+    Ok(LoadedSession {
+        messages: stored.messages,
+        model: stored.model,
+        tokens: stored.tokens,
+        saved_at: stored.saved_at,
+        title: stored.title,
+    })
 }
 
 /// Load a session's machine-history snapshot when the pair is fresh.
@@ -788,6 +891,7 @@ pub(crate) fn list_sessions_in(base: &Path) -> Result<Vec<SessionSummary>, Sessi
                 .count(),
             context_tokens: stored.tokens.context_tokens,
             workdir: stored.workdir,
+            title: stored.title,
         });
     }
     sessions.sort_by_key(|summary| std::cmp::Reverse(summary.last_activity));
@@ -907,6 +1011,7 @@ mod tests {
             messages: messages.to_vec(),
             tokens: SessionTokens::default(),
             workdir: None,
+            title: None,
         };
         let path = dir.join(id.to_string()).join("session.json");
         std::fs::create_dir_all(path.parent().expect("the session dir")).expect("mkdir");
@@ -932,6 +1037,55 @@ mod tests {
         assert_eq!(
             loaded, messages,
             "variants, blocks, and ordering survive the round trip"
+        );
+    }
+
+    #[test]
+    fn a_titled_saver_round_trips_its_name_through_the_listing() {
+        // The envelope's title field, both directions through real
+        // serialization: a titled saver's save lands the name in the
+        // file, the listing and the load read it back out, and an
+        // envelope written before the field existed loads untitled.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let id = Uuid::new_v4();
+        saver(dir.path(), id)
+            .with_title(Some("Fix the login loop".to_string()))
+            .save(&sample_messages(), SessionTokens::default())
+            .expect("the titled save lands");
+
+        let summaries = list_sessions_in(dir.path()).expect("the listing reads the root");
+        let summary = summaries.first().expect("the saved session lists");
+        assert_eq!(
+            summary.title.as_deref(),
+            Some("Fix the login loop"),
+            "the name a session was saved under is the name the listing shows"
+        );
+        let loaded = load_with_meta_in(id, dir.path()).expect("the envelope loads");
+        assert_eq!(
+            loaded.title.as_deref(),
+            Some("Fix the login loop"),
+            "the load carries the same name to the resume path"
+        );
+
+        let legacy = Uuid::new_v4();
+        let path = dir.path().join(legacy.to_string()).join("session.json");
+        std::fs::create_dir_all(path.parent().expect("the session dir")).expect("mkdir");
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"format\":\"{FORMAT}\",\"session_id\":\"{legacy}\",\
+                 \"model\":\"test-model\",\"saved_at\":\"2026-09-16T12:00:00Z\",\
+                 \"messages\":[],\"tokens\":{{\"cumulative_input\":0,\
+                 \"cumulative_output\":0}}}}"
+            ),
+        )
+        .expect("write a title-less envelope");
+        assert_eq!(
+            load_with_meta_in(legacy, dir.path())
+                .expect("the legacy envelope loads")
+                .title,
+            None,
+            "an envelope written before titles existed reads as untitled"
         );
     }
 
@@ -1034,7 +1188,7 @@ mod tests {
         )
         .save(&sample_messages(), totals)
         .expect("save");
-        let (_, _, loaded, _) = load_with_meta_in(id, dir.path()).expect("load");
+        let loaded = load_with_meta_in(id, dir.path()).expect("load").tokens;
         assert_eq!(loaded, totals, "the accounting rides the envelope");
         let listed = list_sessions_in(dir.path()).expect("list");
         assert_eq!(
@@ -1055,8 +1209,9 @@ mod tests {
             legacy.replace("ID", &legacy_id.to_string()),
         )
         .expect("legacy file");
-        let (_, _, legacy_tokens, _) =
-            load_with_meta_in(legacy_id, dir.path()).expect("load legacy");
+        let legacy_tokens = load_with_meta_in(legacy_id, dir.path())
+            .expect("load legacy")
+            .tokens;
         assert_eq!(
             legacy_tokens,
             SessionTokens::default(),

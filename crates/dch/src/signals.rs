@@ -3,9 +3,13 @@
 //! [`install_cancel_handler`] connects SIGINT and SIGTERM to the agent's
 //! shared [`CancelSignal`]: the first interrupt asks the loop to stop at
 //! its next cooperative check point, and a second interrupt within the
-//! repeat window runs the force hook and exits immediately.
+//! repeat window runs the force hook and exits immediately — unless the
+//! host has begun finalizing the resolved run, in which case the exit is
+//! recorded as pending for the host to honor once its durable writes
+//! land (see [`CancelBridge::begin_finalization`]).
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use loopctl::cancel::CancelSignal;
@@ -268,6 +272,15 @@ enum BridgeOutcome {
     /// everything up to the last cooperative check point is already
     /// durable at this point.
     Forced,
+
+    /// A repeat interrupt landed while the host was finalizing.
+    ///
+    /// The force hook ran and the exit was recorded as pending instead
+    /// of taken: the host is persisting a resolved run's durable state,
+    /// and an immediate exit would void it. The host reads the pending
+    /// flag after its writes land and honors the interrupt's status on
+    /// its own exit path — nothing here terminates the process.
+    Deferred,
 }
 
 /// Report a message to stderr without letting a broken stream take the
@@ -306,12 +319,17 @@ fn run_hook_guarded(hook: impl Fn()) {
 /// cancellation. The cancel trips before its
 /// notice is written, and a panicking hook is contained — a broken
 /// stderr or a failing hook cannot strand the run without either
-/// exit path.
+/// exit path. A repeat that lands while `finalizing` is armed never
+/// exits the process: the hook still runs, the repeat is recorded in
+/// `pending_force`, and the loop yields [`BridgeOutcome::Deferred`]
+/// for the host to honor once its durable writes have landed.
 async fn bridge_loop(
     source: &mut InterruptSource,
     stop: &mut tokio::sync::watch::Receiver<bool>,
     fire: impl Fn(),
     on_force: impl Fn(),
+    finalizing: &AtomicBool,
+    pending_force: &AtomicBool,
 ) -> BridgeOutcome {
     let mut previous: Option<Instant> = None;
     loop {
@@ -351,8 +369,16 @@ async fn bridge_loop(
                 previous = Some(now);
             }
             InterruptDecision::Force => {
-                report("dch: second interrupt received — forcing exit (130)");
                 run_hook_guarded(on_force);
+                if finalizing.load(Ordering::SeqCst) {
+                    report(
+                        "dch: second interrupt received — exit deferred \
+                         until the run's transcript is saved",
+                    );
+                    pending_force.store(true, Ordering::SeqCst);
+                    return BridgeOutcome::Deferred;
+                }
+                report("dch: second interrupt received — forcing exit (130)");
                 return BridgeOutcome::Forced;
             }
         }
@@ -369,7 +395,10 @@ async fn bridge_loop(
 /// second interrupt within [`DOUBLE_CTRL_C_WINDOW`] runs `on_force` — a
 /// host hook for durable state, such as the done-file marker — and exits
 /// the process with 130; the hook runs contained, so its panic cannot
-/// void the exit. The listener stays armed across the window, so the
+/// void the exit. Once the host calls [`CancelBridge::begin_finalization`]
+/// the second interrupt no longer exits the process: the hook still runs,
+/// the exit is recorded as pending, and the host honors it after
+/// persisting its durable state. The listener stays armed across the window, so the
 /// repeat is never lost to a re-registration gap — though a repeat
 /// arriving before the previous interrupt is consumed can coalesce with
 /// it (see `InterruptListeners`); once the window elapses, a fresh
@@ -431,14 +460,31 @@ fn spawn_bridge(
     on_force: impl Fn() + Send + 'static,
 ) -> CancelBridge {
     let (stop, mut stop_rx) = tokio::sync::watch::channel(false);
+    let finalizing = std::sync::Arc::new(AtomicBool::new(false));
+    let pending_force = std::sync::Arc::new(AtomicBool::new(false));
+    let loop_finalizing = std::sync::Arc::clone(&finalizing);
+    let loop_pending_force = std::sync::Arc::clone(&pending_force);
     let mut source = InterruptSource::Listeners(InterruptListeners::install());
     let task = tokio::spawn(async move {
-        let outcome = bridge_loop(&mut source, &mut stop_rx, fire, on_force).await;
+        let outcome = bridge_loop(
+            &mut source,
+            &mut stop_rx,
+            fire,
+            on_force,
+            &loop_finalizing,
+            &loop_pending_force,
+        )
+        .await;
         if outcome == BridgeOutcome::Forced {
             std::process::exit(130);
         }
     });
-    CancelBridge { stop, task }
+    CancelBridge {
+        stop,
+        task,
+        finalizing,
+        pending_force,
+    }
 }
 
 /// Install a construction-phase interrupt handler.
@@ -462,7 +508,12 @@ pub fn install_construction_handler(on_interrupt: impl Fn() + Send + 'static) ->
             std::process::exit(130);
         }
     });
-    CancelBridge { stop, task }
+    CancelBridge {
+        stop,
+        task,
+        finalizing: std::sync::Arc::new(AtomicBool::new(false)),
+        pending_force: std::sync::Arc::new(AtomicBool::new(false)),
+    }
 }
 
 /// The construction bridge's single decision step, parameterized over the
@@ -517,6 +568,22 @@ pub struct CancelBridge {
     /// only after the bridge is quiescent — a forced exit skips the wait
     /// because the process is already terminating.
     task: tokio::task::JoinHandle<()>,
+
+    /// Whether the host has begun finalizing the resolved run.
+    ///
+    /// Shared with the bridge task, which reads it when classifying a
+    /// repeat interrupt: once set, a `Force` decision runs the hook and
+    /// records the pending exit instead of terminating the process over
+    /// the host's durable writes.
+    finalizing: std::sync::Arc<AtomicBool>,
+
+    /// Whether a repeat interrupt landed during finalization.
+    ///
+    /// Set by the bridge task when a `Force` decision defers; read by the
+    /// host after its writes land, through
+    /// [`pending_force`](Self::pending_force), to honor the interrupt's
+    /// exit status on its own return path.
+    pending_force: std::sync::Arc<AtomicBool>,
 }
 
 impl CancelBridge {
@@ -535,6 +602,28 @@ impl CancelBridge {
                 "dch: the signal bridge task ended abnormally: {err}"
             ));
         }
+    }
+
+    /// Arm finalization: repeat interrupts defer from this point.
+    ///
+    /// The host calls this once its resolved outcome is durable and only
+    /// bookkeeping remains — the title settle and the transcript save in
+    /// the headless path. A repeat interrupt after this call runs the
+    /// force hook and records a pending exit instead of terminating the
+    /// process, so the host's remaining writes cannot be voided; the
+    /// host honors the pending exit when they have landed.
+    pub fn begin_finalization(&self) {
+        self.finalizing.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether a repeat interrupt was recorded during finalization.
+    ///
+    /// True once a `Force` decision deferred — exactly one repeat is
+    /// recorded, for the bridge stops listening after deferring. The
+    /// host reads this after persisting its durable state and exits with
+    /// the interrupt's status on its own return path when set.
+    pub fn pending_force(&self) -> bool {
+        self.pending_force.load(Ordering::SeqCst)
     }
 }
 
@@ -623,26 +712,43 @@ mod tests {
         /// One queued item models one delivered interrupt; sending is
         /// the test's only way to advance the loop.
         interrupts: tokio::sync::mpsc::UnboundedSender<()>,
+
         /// The shared cancel signal the first interrupt trips.
         ///
         /// Observed through [`until_cancelled`] to confirm the
         /// cooperative leg before a test exercises the repeat.
         cancel: Arc<CancelSignal>,
+
         /// Whether the force hook has run.
         ///
         /// Set inside the hook closure itself, so an assertion on it
         /// proves the loop ran the hook before returning.
         hook_fired: Arc<std::sync::atomic::AtomicBool>,
+
         /// Stop sender for the loop's watch channel.
         ///
         /// Dropping it ends the loop the same way a stop request does,
         /// so a test that never stops must keep the harness alive.
         stop: tokio::sync::watch::Sender<bool>,
+
         /// Handle to the spawned loop.
         ///
         /// Awaiting it yields the loop's [`BridgeOutcome`], which every
         /// test asserts on.
         bridge: tokio::task::JoinHandle<BridgeOutcome>,
+
+        /// The finalization latch shared with the loop.
+        ///
+        /// Stored by the harness so a test arms finalization exactly the
+        /// way a host does, through the same shared flag the production
+        /// handle exposes.
+        finalizing: std::sync::Arc<AtomicBool>,
+
+        /// The pending-exit latch shared with the loop.
+        ///
+        /// Read by a test after a deferred repeat to prove the loop
+        /// recorded the exit it declined to take.
+        pending_force: std::sync::Arc<AtomicBool>,
     }
 
     /// Spawn a `bridge_loop` driven by a channel interrupt source.
@@ -658,6 +764,10 @@ mod tests {
         let hook_flag = Arc::clone(&hook_fired);
         let mut source = InterruptSource::Channel(ChannelSource { rx: received });
         let (stop, mut stop_rx) = tokio::sync::watch::channel(false);
+        let finalizing = std::sync::Arc::new(AtomicBool::new(false));
+        let pending_force = std::sync::Arc::new(AtomicBool::new(false));
+        let loop_finalizing = std::sync::Arc::clone(&finalizing);
+        let loop_pending_force = std::sync::Arc::clone(&pending_force);
         let bridge = tokio::spawn(async move {
             bridge_loop(
                 &mut source,
@@ -666,6 +776,8 @@ mod tests {
                 move || {
                     hook_flag.store(true, std::sync::atomic::Ordering::SeqCst);
                 },
+                &loop_finalizing,
+                &loop_pending_force,
             )
             .await
         });
@@ -675,6 +787,8 @@ mod tests {
             hook_fired,
             stop,
             bridge,
+            finalizing,
+            pending_force,
         }
     }
 
@@ -732,11 +846,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_repeat_interrupt_during_finalization_defers_the_exit() {
+        // The finalization contract: the outcome is durable, only
+        // bookkeeping remains, and a repeat interrupt must not terminate
+        // the process over it. The loop records the pending exit instead
+        // — the hook still runs, the outcome defers, and the host reads
+        // the latch to honor the interrupt once its writes land.
+        let harness = spawn_bridge_loop();
+        harness.finalizing.store(true, Ordering::SeqCst);
+
+        // Both interrupts queued before any waiting: the repeat lands
+        // inside the window no matter how the scheduler interleaves.
+        let _sent = harness.interrupts.send(());
+        let _sent = harness.interrupts.send(());
+        until_cancelled(&harness.cancel).await;
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), harness.bridge)
+            .await
+            .expect("the bridge must decide within the test timeout")
+            .unwrap();
+        assert_eq!(
+            outcome,
+            BridgeOutcome::Deferred,
+            "a repeat during finalization defers instead of forcing"
+        );
+        assert!(
+            harness.hook_fired.load(std::sync::atomic::Ordering::SeqCst),
+            "the force hook still runs before the deferral records"
+        );
+        assert!(
+            harness
+                .pending_force
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the deferred exit is recorded for the host to honor"
+        );
+    }
+
+    #[tokio::test]
     async fn a_panicking_force_hook_still_yields_the_forced_outcome() {
         let (interrupts, received) = tokio::sync::mpsc::unbounded_channel::<()>();
         let cancel = Arc::new(CancelSignal::new());
         let mut source = InterruptSource::Channel(ChannelSource { rx: received });
         let (_keep_open, mut stop_rx) = tokio::sync::watch::channel(false);
+        let finalizing = AtomicBool::new(false);
+        let pending_force = AtomicBool::new(false);
         let bridge = tokio::spawn(async move {
             bridge_loop(
                 &mut source,
@@ -745,6 +898,8 @@ mod tests {
                 || {
                     panic!("the durable-state hook failed");
                 },
+                &finalizing,
+                &pending_force,
             )
             .await
         });

@@ -15,6 +15,7 @@
 use std::sync::Arc;
 
 use unicode_width::UnicodeWidthChar as _;
+use unicode_width::UnicodeWidthStr as _;
 
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
@@ -1615,8 +1616,68 @@ fn active_tools_render_as_running_lines() {
     let rows = row_texts(&terminal);
     assert!(
         rows.iter()
-            .any(|row| row.contains("⧗") && row.contains("Grep \"todo\"")),
+            .any(|row| row.contains("⏳") && row.contains("Grep \"todo\"")),
         "in-flight tools render a running line: {rows:?}"
+    );
+}
+
+#[test]
+fn the_session_picker_names_each_row() {
+    // Both columns a row owes its reader: the title a session was
+    // named, and the dash when it never was. The untitled row's
+    // workdir is a real directory, so the row's only dash is the
+    // title column's own, and the model text starts at the same
+    // display offset on both rows — the title column is a cell
+    // budget every row fills exactly.
+    let mut app = app();
+    app.apply_session_update(dch_tui::queue::SessionUpdate::SessionCatalog {
+        rows: vec![
+            dch_tui::queue::SessionPick {
+                id: "11111111-1111-1111-1111-111111111111".to_string(),
+                model: "newest-model".to_string(),
+                saved_at: chrono::Utc::now(),
+                prompts: 3,
+                title: Some("Fix the login loop".to_string()),
+                workdir: Some("/home/user/omega".to_string()),
+            },
+            dch_tui::queue::SessionPick {
+                id: "22222222-2222-2222-2222-222222222222".to_string(),
+                model: "older-model".to_string(),
+                saved_at: chrono::Utc::now(),
+                prompts: 7,
+                title: None,
+                workdir: Some("/home/user/alpha".to_string()),
+            },
+        ],
+    });
+    let terminal = render_to_buffer(&mut app, 100, 30);
+    let rows = row_texts(&terminal);
+    let titled_row = rows
+        .iter()
+        .find(|row| row.contains("newest-model"))
+        .expect("the titled row renders");
+    assert!(
+        titled_row.contains("Fix the login loop") && titled_row.contains("3p"),
+        "a titled session's row carries its name and prompt count: {rows:?}"
+    );
+    let untitled_row = rows
+        .iter()
+        .find(|row| row.contains("older-model"))
+        .expect("the untitled row renders");
+    assert!(
+        untitled_row.contains("alpha") && untitled_row.contains('—') && untitled_row.contains("7p"),
+        "an untitled session's row reads as a dash beside its dir and count \
+         — with a real dir, the dash can only be the title's: {rows:?}"
+    );
+    let title_edge = titled_row
+        .find("newest-model")
+        .map(|at| titled_row[..at].width());
+    let untitled_edge = untitled_row
+        .find("older-model")
+        .map(|at| untitled_row[..at].width());
+    assert_eq!(
+        title_edge, untitled_edge,
+        "the model text starts at the same display offset on both rows"
     );
 }
 
@@ -1915,7 +1976,16 @@ fn a_turn_end_hook_receives_the_newest_turn_end_history() {
     kept.turn_histories
         .lock()
         .expect("the histories lock")
-        .extend([older, newer]);
+        .extend([
+            dch_tui::TurnPublication {
+                passes: 0,
+                history: older,
+            },
+            dch_tui::TurnPublication {
+                passes: 0,
+                history: newer,
+            },
+        ]);
     let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
     let histories: Arc<std::sync::Mutex<Vec<usize>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&histories);
@@ -1940,9 +2010,10 @@ fn a_history_without_display_events_still_fires_the_hook() {
     kept.turn_histories
         .lock()
         .expect("the histories lock")
-        .push(Arc::new(vec![loopctl::message::Message::user(
-            "the prompt",
-        )]));
+        .push(dch_tui::TurnPublication {
+            passes: 0,
+            history: Arc::new(vec![loopctl::message::Message::user("the prompt")]),
+        });
     let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
     let snapshots: Arc<std::sync::Mutex<Snapshots>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&snapshots);
@@ -3512,11 +3583,164 @@ fn a_rebuilt_line_space_forfeits_the_selection() {
 }
 
 #[test]
-fn a_press_on_a_running_tool_row_anchors_on_the_selectable_transcript() {
-    // Tool rows render below the transcript but never join the
-    // selection's line space: a press on one — or on the empty pane
-    // under short content — clamps onto the last line a copy can
-    // walk, so the highlight never spans rows the copy cannot read.
+fn a_press_on_a_running_tool_row_selects_it_alongside_the_transcript() {
+    // Tool rows share the transcript's line space: a press on the
+    // running block anchors on the tool row itself, and a drag up
+    // into the turn copies the block's row together with the
+    // transcript text it spans — the seam row riding along as the
+    // blank line it renders as.
+    let mut app = app();
+    let now = chrono::Utc::now();
+    app.push_message(TuiMessage::User {
+        text: "abcdefghij".to_string(),
+        timestamp: now,
+        steered: false,
+        unsent: false,
+    });
+    app.active_tools()
+        .lock()
+        .expect("the tools lock")
+        .push(ActiveTool {
+            call_id: String::new(),
+            name: "Grep".to_string(),
+            input_summary: "\"todo\"".to_string(),
+            start: std::time::Instant::now(),
+        });
+    let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&copied);
+    app.set_selection_copier(Box::new(move |_attempt, text| {
+        sink.lock().expect("sink").push(text.to_string());
+        dch_tui::CopyAnswer::Verified
+    }));
+
+    let probe = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&probe);
+    let row = rows
+        .iter()
+        .position(|r| r.contains("abcdefghij"))
+        .unwrap_or(0);
+    let col = cell_col(&rows[row], "abcdefghij");
+    let tool_row = rows.iter().position(|r| r.contains("Grep")).unwrap_or(0);
+    // the running row's head — glyph, spacing, and the name's first
+    // cell — is what a press one measured cell left of "Grep"
+    // covers; the elapsed tail stays outside the span
+    let before_grep = u16::try_from(cell_col(&rows[tool_row], "Grep"))
+        .unwrap_or(3)
+        .saturating_sub(1);
+
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        before_grep,
+        u16::try_from(tool_row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 3).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 3).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+
+    let copied = copied.lock().expect("sink").clone();
+    assert_eq!(copied.len(), 1, "exactly one silent copy");
+    assert_eq!(
+        copied[0], "defghij\n\n\n⏳ G",
+        "the drag copies the turn's tail and the tool row's head, seam and padding rows included"
+    );
+    let selected = render_to_buffer(&mut app, 80, 24);
+    assert!(
+        reversed_cells_on_row(&selected, u16::try_from(row).unwrap_or(0)) >= 1,
+        "the highlight covers the transcript text"
+    );
+    assert!(
+        reversed_cells_on_row(&selected, u16::try_from(tool_row).unwrap_or(0)) >= 1,
+        "the highlight reaches the tool row"
+    );
+}
+
+#[test]
+fn a_press_with_nothing_selectable_starts_no_selection() {
+    // A bare pane — no transcript, nothing running — offers no
+    // selectable line at all: a press there creates no anchor, so
+    // nothing highlights and a later drag has nothing to grow.
+    let mut app = app();
+    let _ = render_to_buffer(&mut app, 80, 24);
+    let press = mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        5,
+        2,
+    );
+    assert!(
+        !app.handle_event(&press),
+        "a press over a bare pane creates no selection"
+    );
+    let frame = render_to_buffer(&mut app, 80, 24);
+    assert_eq!(reversed_cells(&frame), 0, "nothing highlights");
+}
+
+#[test]
+fn a_press_below_a_running_tool_clamps_onto_the_tool_row() {
+    // The running block is the document's last line: a press in the
+    // empty pane under it anchors on the block itself — the same
+    // clamp an editor applies below a document's end — so a drag
+    // back over the row selects the running tool's own text.
+    let mut app = app();
+    app.active_tools()
+        .lock()
+        .expect("the tools lock")
+        .push(ActiveTool {
+            call_id: String::new(),
+            name: "Grep".to_string(),
+            input_summary: "\"todo\"".to_string(),
+            start: std::time::Instant::now(),
+        });
+    let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&copied);
+    app.set_selection_copier(Box::new(move |_attempt, text| {
+        sink.lock().expect("sink").push(text.to_string());
+        dch_tui::CopyAnswer::Verified
+    }));
+
+    let probe = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&probe);
+    let tool_row = rows.iter().position(|r| r.contains("Grep")).unwrap_or(0);
+    // the covered head of the running row is its glyph, spacing, and
+    // the name — the elapsed tail stays outside the span
+    let row_start = cell_col(&rows[tool_row], "Grep").saturating_sub(3);
+
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        u16::try_from(row_start).unwrap_or(0),
+        u16::try_from(tool_row + 4).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+        u16::try_from(row_start + 6).unwrap_or(0),
+        u16::try_from(tool_row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        u16::try_from(row_start + 6).unwrap_or(0),
+        u16::try_from(tool_row).unwrap_or(0),
+    ));
+
+    let copied = copied.lock().expect("sink").clone();
+    assert_eq!(copied.len(), 1, "exactly one silent copy");
+    assert_eq!(
+        copied[0], "⏳ Grep ",
+        "the clamp anchors the press on the running block's own row"
+    );
+}
+
+#[test]
+fn a_renumbered_running_lane_forfeits_a_selection_reaching_into_it() {
+    // Running blocks join and leave the lane as tools start and
+    // finish, renumbering its rows: a selection stored against the
+    // old lines — here one reaching into the running block — is
+    // dropped rather than left naming rows that moved under it.
     let mut app = app();
     let now = chrono::Utc::now();
     app.push_message(TuiMessage::User {
@@ -3552,65 +3776,86 @@ fn a_press_on_a_running_tool_row_anchors_on_the_selectable_transcript() {
 
     app.handle_event(&mouse_event(
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
-        u16::try_from(col).unwrap_or(0),
-        u16::try_from(tool_row).unwrap_or(0),
+        u16::try_from(col + 2).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
     ));
     app.handle_event(&mouse_event(
         MouseEventKind::Drag(crossterm::event::MouseButton::Left),
-        u16::try_from(col + 3).unwrap_or(0),
+        u16::try_from(col + 2).unwrap_or(0),
+        u16::try_from(tool_row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Up(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 2).unwrap_or(0),
+        u16::try_from(tool_row).unwrap_or(0),
+    ));
+
+    let held = render_to_buffer(&mut app, 80, 24);
+    assert!(
+        reversed_cells(&held) >= 1,
+        "the selection holds its highlight after the release"
+    );
+    app.active_tools()
+        .lock()
+        .expect("the tools lock")
+        .push(ActiveTool {
+            call_id: String::new(),
+            name: "Read".to_string(),
+            input_summary: "app.rs".to_string(),
+            start: std::time::Instant::now(),
+        });
+    let renumbered = render_to_buffer(&mut app, 80, 24);
+    assert_eq!(
+        reversed_cells(&renumbered),
+        0,
+        "a second running block renumbers the lane and forfeits the selection"
+    );
+}
+
+#[test]
+fn a_press_on_the_live_thinking_body_selects_it() {
+    // The live thinking block is part of the selectable document:
+    // a drag across its body row copies exactly the covered words —
+    // the same character-granular contract the transcript carries.
+    let (observer, mut app) = live_thinking_app();
+    observer.on_thinking_delta(&thinking_delta(0, "pondering the thing"));
+    let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&copied);
+    app.set_selection_copier(Box::new(move |_attempt, text| {
+        sink.lock().expect("sink").push(text.to_string());
+        dch_tui::CopyAnswer::Verified
+    }));
+
+    let probe = render_to_buffer(&mut app, 80, 24);
+    let rows = row_texts(&probe);
+    let row = rows
+        .iter()
+        .position(|r| r.contains("pondering the thing"))
+        .expect("the live body renders");
+    let col = cell_col(&rows[row], "pondering the thing");
+
+    app.handle_event(&mouse_event(
+        MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        u16::try_from(col).unwrap_or(0),
+        u16::try_from(row).unwrap_or(0),
+    ));
+    app.handle_event(&mouse_event(
+        MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+        u16::try_from(col + 5).unwrap_or(0),
         u16::try_from(row).unwrap_or(0),
     ));
     app.handle_event(&mouse_event(
         MouseEventKind::Up(crossterm::event::MouseButton::Left),
-        u16::try_from(col + 3).unwrap_or(0),
+        u16::try_from(col + 5).unwrap_or(0),
         u16::try_from(row).unwrap_or(0),
     ));
 
     let copied = copied.lock().expect("sink").clone();
     assert_eq!(copied.len(), 1, "exactly one silent copy");
     assert_eq!(
-        copied[0], "defghij\n",
-        "the press clamps onto the turn's trailing pad, anchoring where a copy can walk"
+        copied[0], "ponder",
+        "the thinking body selects like transcript text"
     );
-    let selected = render_to_buffer(&mut app, 80, 24);
-    assert!(
-        reversed_cells_on_row(&selected, u16::try_from(row).unwrap_or(0)) >= 1,
-        "the highlight covers the transcript text"
-    );
-    assert_eq!(
-        reversed_cells_on_row(&selected, u16::try_from(tool_row).unwrap_or(0)),
-        0,
-        "the highlight never reaches the tool row"
-    );
-}
-
-#[test]
-fn a_press_with_nothing_selectable_starts_no_selection() {
-    // With the transcript empty and only a tool running, the pane
-    // offers no selectable line: a press there creates no anchor,
-    // so nothing highlights and a later drag has nothing to grow.
-    let mut app = app();
-    app.active_tools()
-        .lock()
-        .expect("the tools lock")
-        .push(ActiveTool {
-            call_id: String::new(),
-            name: "Grep".to_string(),
-            input_summary: "\"todo\"".to_string(),
-            start: std::time::Instant::now(),
-        });
-    let _ = render_to_buffer(&mut app, 80, 24);
-    let press = mouse_event(
-        MouseEventKind::Down(crossterm::event::MouseButton::Left),
-        5,
-        2,
-    );
-    assert!(
-        !app.handle_event(&press),
-        "a press over unselectable rows creates no selection"
-    );
-    let frame = render_to_buffer(&mut app, 80, 24);
-    assert_eq!(reversed_cells(&frame), 0, "nothing highlights");
 }
 
 #[test]
@@ -10018,8 +10263,8 @@ fn a_todo_update_renders_as_checkbox_rows_in_the_conversation() {
 
 #[test]
 fn the_conversation_block_shows_the_enforced_fraction() {
-    // The closing-sweep shape the live sessions exposed: the model
-    // submits three completed, the rung law lands the skipper one rung
+    // The enforced-fraction shape the live sessions exposed: the model
+    // files a newborn completed and the rung law lands it one rung
     // short, and the conversation block renders the enforced list —
     // "2/3 done" with the skipper half-filled — never the request that
     // would read "3/3 done".
@@ -10765,7 +11010,7 @@ fn a_restored_session_reads_the_plan_from_the_render_not_the_request() {
 fn the_plan_badge_names_the_section_in_the_queue_s_own_style() {
     // The plan opens with the waiting section's badge — a filled pill
     // stood in from the frame, the done fraction dim beside it — over
-    // the secondary accent rather than the primary, so the two panels
+    // the primary accent rather than the secondary, so the two panels
     // read as one family of chrome with two names. A theme that defers
     // to the terminal fills nothing: the badge degrades to plain text,
     // the same concession the queue's makes.
@@ -10800,8 +11045,8 @@ fn the_plan_badge_names_the_section_in_the_queue_s_own_style() {
     for offset in 0..6u16 {
         assert_eq!(
             buffer[(column + offset, row)].bg,
-            app.theme.ui.secondary,
-            "the word rides the secondary fill — the queue's pill, another name"
+            app.theme.ui.primary,
+            "the word rides the primary fill — the queue's pill, another name"
         );
     }
     for letters in 1..5u16 {
@@ -11617,6 +11862,191 @@ fn a_folded_queue_keeps_its_air_over_the_plan() {
     assert!(
         rows.iter().any(|row| row.contains("\u{25d0} one thing")),
         "the plan stands above the fold: {rows:?}"
+    );
+}
+
+#[test]
+fn a_click_folds_the_plan_section_and_a_click_stands_it_back_up() {
+    // The pinned section answers the mouse: one click on its rows
+    // folds them away to the marker line, and a click on the marker
+    // stands the capped section back up — the same cycle Ctrl+T
+    // walks, spent from the pointer.
+    let mut app = app();
+    todo_graduation(
+        &app,
+        "call-1",
+        r#"{"todos":[
+            {"id":"1","subject":"survey the land","status":"completed"},
+            {"id":"2","subject":"dig the trench","status":"pending"}
+        ]}"#,
+    );
+    let probe = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&probe);
+    // the section's own title row — the chord hint names the fold, and
+    // the conversation's own todo block carries no such hint, so the
+    // click aims at the section even beside an auto-expanded block
+    let section_row = rows
+        .iter()
+        .position(|row| row.contains("ctrl+t to hide"))
+        .expect("the plan section renders its title row");
+    drop(probe);
+
+    click(&mut app, 20, u16::try_from(section_row).unwrap_or(0));
+
+    let folded = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&folded);
+    assert!(
+        rows.iter().any(|row| row.contains("ctrl+t to show")),
+        "the fold leaves the marker line standing: {rows:?}"
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.contains("dig the trench"))
+            .count(),
+        1,
+        "the section's task rows fold away; only the conversation's own \
+         todo block keeps its copy: {rows:?}"
+    );
+    let marker_row = rows
+        .iter()
+        .position(|row| row.contains("ctrl+t to show"))
+        .expect("the marker line renders");
+    drop(folded);
+
+    click(&mut app, 20, u16::try_from(marker_row).unwrap_or(0));
+
+    let standing = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&standing);
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.contains("dig the trench"))
+            .count(),
+        2,
+        "a click on the marker stands the section back up beside the \
+         conversation's own todo block: {rows:?}"
+    );
+}
+
+#[test]
+fn a_click_folds_the_waiting_section_and_a_click_lifts_it() {
+    // The waiting section answers the mouse the same way: a click on
+    // its rows folds it to the badge line naming the count, and a
+    // click on that badge stands the prompt back up — Ctrl+Q's flip
+    // from the pointer.
+    let (mut app, kept) = app_with_state();
+    {
+        let mut queue = kept
+            .queued
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        queue.push("first waiting".to_string());
+        queue.push("second waiting".to_string());
+    }
+    let probe = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&probe);
+    let prompt_row = rows
+        .iter()
+        .position(|row| row.contains("first waiting"))
+        .expect("the standing section shows the waiting prompt");
+    drop(probe);
+
+    click(&mut app, 20, u16::try_from(prompt_row).unwrap_or(0));
+
+    let folded = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&folded);
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("2 waiting · ctrl+q to show")),
+        "the fold leaves the count badge standing: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|row| row.contains("first waiting")),
+        "the prompt's wording folds away: {rows:?}"
+    );
+    let badge_row = rows
+        .iter()
+        .position(|row| row.contains("ctrl+q to show"))
+        .expect("the badge renders");
+    drop(folded);
+
+    click(&mut app, 20, u16::try_from(badge_row).unwrap_or(0));
+
+    let standing = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&standing);
+    assert!(
+        rows.iter().any(|row| row.contains("first waiting")),
+        "a click on the badge lifts the section back: {rows:?}"
+    );
+}
+
+#[test]
+fn a_published_history_backfills_the_compaction_rows_summary() {
+    // The pass's stats ride the event; its summary — the compacted
+    // history's leading message — arrives only when the next turn end
+    // publishes the compacted context. The row takes the text when the
+    // published head carries the ledger mark every marked compactor
+    // leaves — an unmarked head is conversation, not the pass's
+    // output, and never backfills — and both the collapsed preview and
+    // the expanded block show it beside the stats the event carried.
+    let (mut app, kept) = app_with_state();
+    kept.compactions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(dch_tui::CompactionEvent {
+            pass: 1,
+            record: TuiMessage::Compacted {
+                tokens_before: 16_686,
+                tokens_after: 4_231,
+                reason: "threshold".to_string(),
+                evicted: 7,
+                duration_ms: 312,
+                compactor: Some("structured".to_string()),
+                compression_ratio: Some(3.9),
+                summary: None,
+                timestamp: chrono::Utc::now(),
+            },
+        });
+    let standing = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&standing);
+    let notice_row = rows
+        .iter()
+        .position(|row| row.contains("Compacted"))
+        .expect("the compaction row lands");
+    drop(standing);
+
+    let history: Vec<loopctl::message::Message> = vec![
+        loopctl::message::Message::user(
+            "## Conversation summary (compacted)\nThe session mapped the login flow and fixed the retry loop",
+        ),
+        loopctl::message::Message::user("kept after the fold"),
+    ];
+    kept.turn_histories
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(dch_tui::TurnPublication {
+            passes: 1,
+            history: std::sync::Arc::new(history),
+        });
+    let folded = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&folded);
+    assert!(
+        rows.iter().any(|row| row.contains("mapped the login flow")),
+        "the collapsed row previews the backfilled summary — no \
+         expansion needed: {rows:?}"
+    );
+    drop(folded);
+
+    click(&mut app, 10, u16::try_from(notice_row).unwrap_or(0));
+    let expanded = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&expanded);
+    let flat: String = rows.join("\n");
+    assert!(
+        flat.contains("The session mapped the login flow and fixed the retry loop"),
+        "the published history's head text backfills onto the row: {flat}"
+    );
+    assert!(
+        flat.contains("16686 → 4231 tokens"),
+        "the stats still show beside the summary: {flat}"
     );
 }
 

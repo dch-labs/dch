@@ -268,8 +268,14 @@ pub(crate) fn capture_marker_mode(
 /// before the run bridge is stopped, so an interrupt landing during the
 /// write fails closed through the force hook rather than killing the
 /// process with no marker. Once the run's own marker is written the
-/// force hook stands down: a repeat interrupt still exits 130, but the
-/// recorded outcome survives in the done-file. `saver_root` overrides
+/// force hook stands down and finalization begins: a repeat interrupt
+/// from there is recorded rather than honored, the transcript still
+/// lands, and the run then reports the interrupt's 130 beside the
+/// already-recorded done-file. The session's title is
+/// bookkeeping that never outranks the outcome: the answer is printed
+/// and the done-file written before the naming task is waited on, and
+/// the transcript save waits only [`NAMING_SETTLE_BUDGET`] for a title
+/// still pending. `saver_root` overrides
 /// where the session transcript is written; `None` uses the user's
 /// sessions directory. `control` carries the resume resolution — a
 /// degradation warning prints to stderr before anything else runs.
@@ -320,6 +326,7 @@ async fn run_headless_inner(
         mut runner,
         workdir,
         model,
+        api,
         streams_answer,
         resumed_compactions,
         compaction_counter,
@@ -344,39 +351,69 @@ async fn run_headless_inner(
             session_id: None, ..
         } => runner.session_id(),
     };
+    let resumed_title = match &control {
+        crate::resume::ResumeControl::Resumed(outcome) => outcome.title.clone(),
+        crate::resume::ResumeControl::Fresh { .. } => None,
+    };
     let saver = match saver_root {
         Some(root) => crate::session::SessionSaver::with_base_dir(session_id, model, root),
         None => crate::session::SessionSaver::with_model(session_id, model),
     }
-    .with_workdir(&workdir);
+    .with_workdir(&workdir)
+    .with_title(resumed_title);
     let mut transcript = match &control {
         crate::resume::ResumeControl::Resumed(outcome) => outcome.messages.clone(),
         crate::resume::ResumeControl::Fresh { .. } => Vec::new(),
     };
+    let naming = if saver.title().is_none() {
+        let naming_api = api.clone();
+        let first_prompt = prompt.clone();
+        Some(tokio::spawn(async move {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                dch_loop::session_title(&naming_api, &first_prompt),
+            )
+            .await
+            .unwrap_or_default()
+        }))
+    } else {
+        None
+    };
     let result = runner.run(&prompt).await;
     let turn_outputs = runner.session_turn_outputs();
-    match result {
+    // The outcome outranks the name: the answer reaches stdout and the
+    // done-file its orchestrator polls land before the naming task is
+    // waited on, and the save waits only the settle budget for a title
+    // still pending — a stalled naming call once held all four for its
+    // whole request timeout, and a cancelled run waited too.
+    let outcome = match &result {
         Ok(run) => {
             let delivery = if !streams_answer && let Some(answer) = &run.output {
                 print_final_answer(answer)
             } else {
                 Ok(())
             };
-            let outcome = outcome_after_delivery(&run, delivery);
-            write_done_file_if_requested(args, &outcome, inherited_mode.as_ref());
-            outcome_recorded.store(true, Ordering::SeqCst);
+            outcome_after_delivery(run, delivery)
+        }
+        Err(err) => HeadlessOutcome::from_loop_error(err),
+    };
+    write_done_file_if_requested(args, &outcome, inherited_mode.as_ref());
+    outcome_recorded.store(true, Ordering::SeqCst);
+    bridge.begin_finalization();
+    let saver = match naming {
+        Some(task) => saver.with_title(settle_naming(task, NAMING_SETTLE_BUDGET).await),
+        None => saver,
+    };
+    let compactions = resumed_compactions
+        .saturating_add(compaction_counter.load(std::sync::atomic::Ordering::SeqCst));
+    match &result {
+        Ok(_) => {
             transcript.extend(crate::messages::transcript_from(
                 &prompt,
                 &turn_outputs,
                 None,
             ));
-            save_transcript(
-                &saver,
-                &runner,
-                &transcript,
-                resumed_compactions
-                    .saturating_add(compaction_counter.load(std::sync::atomic::Ordering::SeqCst)),
-            );
+            save_transcript(&saver, &runner, &transcript, compactions);
             let undone = runner.todo_undone();
             if undone > 0 {
                 let plural = if undone == 1 { "" } else { "s" };
@@ -384,28 +421,50 @@ async fn run_headless_inner(
                     "warning: {undone} todo item{plural} left unfinished"
                 ));
             }
-            bridge.stop().await;
-            Ok(outcome)
         }
         Err(err) => {
-            let outcome = HeadlessOutcome::from_loop_error(&err);
-            write_done_file_if_requested(args, &outcome, inherited_mode.as_ref());
-            outcome_recorded.store(true, Ordering::SeqCst);
             transcript.extend(crate::messages::transcript_from(
                 &prompt,
                 &turn_outputs,
-                Some(&err),
+                Some(err),
             ));
-            save_transcript(
-                &saver,
-                &runner,
-                &transcript,
-                resumed_compactions
-                    .saturating_add(compaction_counter.load(std::sync::atomic::Ordering::SeqCst)),
-            );
-            bridge.stop().await;
-            Ok(outcome)
+            save_transcript(&saver, &runner, &transcript, compactions);
         }
+    }
+    let pending_force = bridge.pending_force();
+    bridge.stop().await;
+    if pending_force {
+        return Ok(HeadlessOutcome::failure(130, FORCE_CANCEL_MESSAGE));
+    }
+    Ok(outcome)
+}
+
+/// The longest a resolved run waits for a still-pending title.
+///
+/// The title is bookkeeping; the answer, the done-file, and the exit
+/// are the outcome. A naming call that has not answered by the time
+/// the run ends is given this long to land beside the transcript it
+/// names — most answer in well under a second on a local server — and
+/// no longer: a stalled call once held the answer, the done-file, the
+/// save, and the exit for as long as its own 30-second request
+/// timeout.
+const NAMING_SETTLE_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Resolve the naming task into a title under `budget`.
+///
+/// A task that has already answered — the common case, the run having
+/// outlasted its own first turn — resolves with its title the moment
+/// this is polled. One still pending is given the budget and no more:
+/// the elapsed arm returns `None`, and the task is left to finish on
+/// its own, for nothing waits on it anymore. A joined panic reads as
+/// no title, matching the spawn's own tolerance.
+async fn settle_naming(
+    task: tokio::task::JoinHandle<Option<String>>,
+    budget: std::time::Duration,
+) -> Option<String> {
+    match tokio::time::timeout(budget, task).await {
+        Ok(joined) => joined.unwrap_or(None),
+        Err(_) => None,
     }
 }
 
@@ -497,6 +556,13 @@ struct ConstructedRun {
     /// the model the session actually ran.
     model: String,
 
+    /// The API settings the run was built from.
+    ///
+    /// Carried out of construction so the session's naming call — the
+    /// one-shot title request fired beside the run — speaks to the
+    /// same endpoint, model, and credential the run itself used.
+    api: dch_config::ApiConfig,
+
     /// Whether the observer narrates the run while it happens.
     ///
     /// False at the quiet default, where the observer writes nothing to
@@ -549,7 +615,7 @@ async fn construct_run(
     let streams_answer = !matches!(verbosity, Verbosity::Quiet);
     let observer = Arc::new(ConsoleObserver::new(
         verbosity,
-        ConsoleObserver::detect_color(),
+        console_use_color(ConsoleObserver::detect_color(), &config),
     ));
 
     let workdir = std::env::current_dir().map_err(|err| {
@@ -590,6 +656,7 @@ async fn construct_run(
         runner,
         workdir,
         model,
+        api: config.api.clone(),
         streams_answer,
         resumed_compactions,
         compaction_counter: observer.compaction_counter(),
@@ -933,6 +1000,19 @@ fn resolve_verbosity(args: &Args) -> Verbosity {
     }
 }
 
+/// The console color verdict for a headless run under `config`.
+///
+/// `detected` is the environment's own verdict — a terminal on stderr
+/// with `NO_COLOR` unset or empty, per
+/// [`ConsoleObserver::detect_color`]. The configuration's
+/// `display.no_color` is a further veto: color needs both the
+/// environment's yes and the configuration's not-no, so either alone
+/// renders the streamed lines plain. The final answer line carries no
+/// escapes whatever this says.
+fn console_use_color(detected: bool, config: &dch_config::DchConfig) -> bool {
+    detected && !config.display.no_color
+}
+
 /// Print the run's final answer to stdout when the observer did not
 /// stream it.
 ///
@@ -1092,6 +1172,29 @@ mod tests {
         assert!(
             err.contains("read_max_bytes = 1000") && err.contains("max_tool_output_chars = 512"),
             "the --config route names both ceilings of a crossing pair: {err}"
+        );
+    }
+
+    #[test]
+    fn the_config_no_color_veto_turns_color_off_on_a_color_capable_terminal() {
+        let mut config = dch_config::DchConfig::default();
+        config.display.no_color = true;
+        assert!(
+            !console_use_color(true, &config),
+            "the configuration's veto wins even when the environment says color"
+        );
+    }
+
+    #[test]
+    fn console_color_needs_both_the_environment_and_the_configuration() {
+        let config = dch_config::DchConfig::default();
+        assert!(
+            console_use_color(true, &config),
+            "the default configuration leaves the environment's verdict alone"
+        );
+        assert!(
+            !console_use_color(false, &config),
+            "a piped or NO_COLOR environment stays plain whatever the configuration says"
         );
     }
 
@@ -1715,6 +1818,7 @@ mod tests {
             tokens: crate::session::SessionTokens::default(),
             machine: None,
             machine_compactions: 0,
+            title: None,
         });
         let (resumed_config, _resumed_base, _resumed_file) =
             resolve_session_config_pair(&args, &resumed).unwrap();
@@ -2086,8 +2190,29 @@ mod tests {
         ///
         /// The port is bound before returning so the temp config can
         /// name it; the loop keeps serving until the test process
-        /// exits.
+        /// exits. Naming calls are answered with the canned title.
         async fn start() -> Self {
+            Self::bind(false).await
+        }
+
+        /// Bind a server whose naming calls never answer.
+        ///
+        /// The naming connection is parked by its own task — a task
+        /// that owns the socket, holding it open and silent, off the
+        /// accept loop so the conversation connections behind it still
+        /// resolve their canned turns: the shape of a provider whose
+        /// title side call stalls past every budget that matters.
+        async fn start_stalling_title() -> Self {
+            Self::bind(true).await
+        }
+
+        /// Bind the accept loop under the chosen naming behavior.
+        ///
+        /// One body serves both servers: the flag only decides whether
+        /// a naming connection is answered with the canned title or
+        /// parked unanswered, leaving every conversation connection's
+        /// canned turn identical between them.
+        async fn bind(stall_title: bool) -> Self {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("ephemeral bind");
@@ -2121,6 +2246,31 @@ mod tests {
                         if request_complete {
                             break;
                         }
+                    }
+                    if String::from_utf8_lossy(&seen).contains(dch_loop::NAME_SYSTEM_PROMPT) {
+                        if stall_title {
+                            tokio::spawn(async move {
+                                let _held = stream;
+                                std::future::pending::<()>().await;
+                            });
+                            continue;
+                        }
+                        let title = serde_json::json!({
+                            "id": "title", "model": "test-model",
+                            "choices": [{
+                                "message": {"role": "assistant",
+                                    "content": "Canned Session Title"},
+                                "finish_reason": "stop"
+                            }]
+                        })
+                        .to_string();
+                        let answer = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                             content-length: {}\r\nconnection: close\r\n\r\n{title}",
+                            title.len()
+                        );
+                        let _written = stream.write_all(answer.as_bytes()).await;
+                        continue;
                     }
                     let body = [
                         serde_json::json!({
@@ -2254,8 +2404,9 @@ mod tests {
             vec![*id],
             "the resumed run reuses the loaded session's identity — no second directory"
         );
-        let (messages, _model, _tokens, _saved_at) =
-            crate::session::load_with_meta_in(*id, sessions.path()).unwrap();
+        let messages = crate::session::load_with_meta_in(*id, sessions.path())
+            .unwrap()
+            .messages;
         assert_eq!(
             messages.len(),
             4,
@@ -2278,6 +2429,266 @@ mod tests {
                 _ => panic!("unexpected message at position {at}: {message:?}"),
             }
         }
+    }
+
+    /// A fresh run's first prompt names the session, and the
+    /// single save a headless run makes files the name.
+    ///
+    /// The end-to-end persistence pin: the naming call the fresh
+    /// run fires is answered with the server's canned title, the
+    /// run's one save lands after the naming task resolves, and the
+    /// envelope on disk carries the name a listing or resume reads.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_fresh_headless_run_files_the_session_under_its_canned_title() {
+        let _signal_lock = SIGNAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let server = TurnServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, server.config_toml()).unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let args = parse(&[
+            "name this session",
+            "--config",
+            config_path.to_str().unwrap(),
+        ]);
+        assert_eq!(
+            run_headless_rooted(
+                &args,
+                crate::signals::install_construction_handler(|| {}),
+                sessions.path().to_path_buf(),
+                fresh_control(),
+            )
+            .await,
+            0,
+            "the run completes against the canned turn"
+        );
+        let saved = session_ids(sessions.path());
+        assert_eq!(saved.len(), 1, "one fresh session was saved");
+        let title = crate::session::load_with_meta_in(*saved.first().unwrap(), sessions.path())
+            .unwrap()
+            .title;
+        assert_eq!(
+            title.as_deref(),
+            Some("Canned Session Title"),
+            "the session file carries the name its first prompt coined"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_title_that_already_arrived_settles_as_the_title() {
+        // The common case: the run outlasted its own first turn, and
+        // the naming call answered long before completion — the settle
+        // hands the arrived title over at once.
+        let task = tokio::spawn(async { Some("coined early".to_string()) });
+        assert_eq!(
+            settle_naming(task, std::time::Duration::from_secs(1)).await,
+            Some("coined early".to_string()),
+            "an answered naming call settles with its title"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pending_naming_call_settles_untitled_at_its_budget() {
+        // The stall the budget exists for: the call is still pending,
+        // so the settle returns untitled when the budget elapses —
+        // never when the call's own timeout does.
+        let task = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+            None
+        });
+        let began = std::time::Instant::now();
+        assert_eq!(
+            settle_naming(task, std::time::Duration::from_millis(100)).await,
+            None,
+            "a stalled call settles untitled rather than waiting"
+        );
+        assert!(
+            began.elapsed() < std::time::Duration::from_secs(5),
+            "the budget bounds the wait, not the call's own timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_title_landing_inside_the_budget_joins_the_save() {
+        // A title that answers just after the run ends still lands if
+        // it beats the budget — the arrive-late window is real, not a
+        // second refusal.
+        let task = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            Some("late but inside".to_string())
+        });
+        assert_eq!(
+            settle_naming(task, std::time::Duration::from_secs(5)).await,
+            Some("late but inside".to_string()),
+            "a title landing inside the budget is preserved"
+        );
+    }
+
+    /// A stalled naming call cannot hold the run's outcome hostage.
+    ///
+    /// The end-to-end shape the settle budget exists for: the naming
+    /// route answers nothing, yet the run still prints its answer,
+    /// writes the done-file its orchestrator polls, saves its
+    /// transcript untitled, and exits — inside the settle budget, not
+    /// the naming call's 30-second request timeout. The generous
+    /// request timeout in the config keeps the settle budget the only
+    /// bound in play.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_stalled_naming_call_never_delays_the_headless_outcome() {
+        let _signal_lock = SIGNAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let server = TurnServer::start_stalling_title().await;
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[api]\napi_type = \"openai\"\nbase_url = \"http://127.0.0.1:{}\"\
+                 \napi_key = \"dummy\"\nmodel = \"test-model\"\nrequest_timeout_secs = 120\n\
+                 context_window = 200000\n",
+                server.port
+            ),
+        )
+        .unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let done = dir.path().join("done.json");
+        let args = parse(&[
+            "name this session",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--done-file",
+            done.to_str().unwrap(),
+        ]);
+        let began = std::time::Instant::now();
+        assert_eq!(
+            run_headless_rooted(
+                &args,
+                crate::signals::install_construction_handler(|| {}),
+                sessions.path().to_path_buf(),
+                fresh_control(),
+            )
+            .await,
+            0,
+            "the run completes against the canned turn regardless of the title"
+        );
+        let elapsed = began.elapsed();
+        assert!(
+            elapsed >= NAMING_SETTLE_BUDGET,
+            "the stall is real — the parked socket never answers, so the \
+             settle spends its whole budget: {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(15),
+            "the outcome waits only the settle budget, never the naming \
+             call's own timeout: {elapsed:?}"
+        );
+        let done_text = std::fs::read_to_string(&done).unwrap();
+        assert!(
+            done_text.contains("\"success\""),
+            "the done-file landed with the outcome: {done_text}"
+        );
+        let saved = session_ids(sessions.path());
+        assert_eq!(saved.len(), 1, "the session saved untitled, not unsaved");
+        let meta =
+            crate::session::load_with_meta_in(*saved.first().unwrap(), sessions.path()).unwrap();
+        assert_eq!(
+            meta.title, None,
+            "a title that never answered saves as untitled — the run \
+             does not wait for it"
+        );
+    }
+
+    /// A repeated interrupt inside the title settle cannot exit over the
+    /// transcript.
+    ///
+    /// The interleaving the finalization latch exists for: the run
+    /// resolves and its done-file lands, the settle holds finalization
+    /// open for its two-second budget, and a double interrupt inside
+    /// that window once killed the process from the bridge task before
+    /// the transcript saved. The bridge now records the repeat as
+    /// pending; the save lands, and the run then reports the
+    /// interrupt's 130 beside the intact success done-file.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_repeated_interrupt_inside_the_title_settle_spares_the_transcript() {
+        let _signal_lock = crate::signals::SIGNAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::signals::assert_listeners_install();
+        let server = TurnServer::start_stalling_title().await;
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[api]\napi_type = \"openai\"\nbase_url = \"http://127.0.0.1:{}\"\
+                 \napi_key = \"dummy\"\nmodel = \"test-model\"\nrequest_timeout_secs = 120\n\
+                 context_window = 200000\n",
+                server.port
+            ),
+        )
+        .unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let done = dir.path().join("done.json");
+        let args = parse(&[
+            "name this session",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--done-file",
+            done.to_str().unwrap(),
+        ]);
+        let task_args = args.clone();
+        let sessions_root = sessions.path().to_path_buf();
+        let run = tokio::spawn(async move {
+            run_headless_rooted(
+                &task_args,
+                crate::signals::install_construction_handler(|| {}),
+                sessions_root,
+                fresh_control(),
+            )
+            .await
+        });
+        // The done-file's arrival proves the outcome is recorded and the
+        // settle holds finalization open — the exact window the deferral
+        // exists to protect.
+        let opened = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            while !done.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(opened.is_ok(), "the run must record its outcome first");
+        unsafe { libc::kill(libc::getpid(), libc::SIGINT) };
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        unsafe { libc::kill(libc::getpid(), libc::SIGINT) };
+        let code = tokio::time::timeout(std::time::Duration::from_secs(30), run)
+            .await
+            .expect("the deferred run still finishes on its own")
+            .unwrap();
+        assert_eq!(code, 130, "the pending interrupt is honored after the save");
+        let done_text = std::fs::read_to_string(&done).unwrap();
+        assert!(
+            done_text.contains("\"success\""),
+            "the success marker survives the deferred exit: {done_text}"
+        );
+        let saved = session_ids(sessions.path());
+        assert_eq!(
+            saved.len(),
+            1,
+            "the transcript saved despite the interrupts"
+        );
+        let meta =
+            crate::session::load_with_meta_in(*saved.first().unwrap(), sessions.path()).unwrap();
+        assert!(
+            !meta.messages.is_empty(),
+            "the completed turn is in the saved transcript"
+        );
     }
 
     /// A resumed session runs on the current configuration's model; the
@@ -2320,7 +2731,9 @@ mod tests {
         let Some(id) = saved.first() else {
             panic!("the saved session id is readable: {saved:?}")
         };
-        let (_, model, _, _) = crate::session::load_with_meta_in(*id, sessions.path()).unwrap();
+        let model = crate::session::load_with_meta_in(*id, sessions.path())
+            .unwrap()
+            .model;
         assert_eq!(
             model, "m-first",
             "the first save records the model the config named"
@@ -2346,7 +2759,9 @@ mod tests {
             0,
             "the resumed run completes against the canned turn"
         );
-        let (_, model, _, _) = crate::session::load_with_meta_in(*id, sessions.path()).unwrap();
+        let model = crate::session::load_with_meta_in(*id, sessions.path())
+            .unwrap()
+            .model;
         assert_eq!(
             model, "m-first",
             "a resumed session continues on — and re-records — the model it last ran, not the configuration's current one"
@@ -2373,7 +2788,9 @@ mod tests {
             0,
             "the CLI-overridden resume completes against the canned turn"
         );
-        let (_, model, _, _) = crate::session::load_with_meta_in(*id, sessions.path()).unwrap();
+        let model = crate::session::load_with_meta_in(*id, sessions.path())
+            .unwrap()
+            .model;
         assert_eq!(
             model, "m-cli",
             "an explicit --model overrides both the envelope and the configuration"

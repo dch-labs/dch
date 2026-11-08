@@ -111,7 +111,7 @@ async fn the_context_figure_refreshes_the_moment_a_pass_lands() {
     let Some(last) = passes.last() else {
         panic!("the fixture must compact: no pass recorded");
     };
-    let (tokens_after, recorded_compactor) = match last {
+    let (tokens_after, recorded_compactor) = match &last.record {
         dch_tui::message::TuiMessage::Compacted {
             tokens_after,
             compactor,
