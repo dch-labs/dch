@@ -131,11 +131,19 @@ fn a_failed_run_still_leaves_the_machine_history_sibling() {
         "the run fails once the script runs dry: stderr: {}",
         lossy(&out.stderr)
     );
+    let stderr = lossy(&out.stderr);
+    let stray: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.starts_with("dch: ") && !line.starts_with("dch: session "))
+        .collect();
     assert!(
-        !lossy(&out.stderr).contains("dch: "),
+        stray.is_empty(),
         "a run-level failure is narrated once by the observer — the \
-         construction-failure prefix would be a second report: {}",
-        lossy(&out.stderr)
+         construction-failure prefix would be a second report: {stderr}"
+    );
+    assert!(
+        stderr.lines().any(|line| line.starts_with("dch: session ")),
+        "the run names the session it saved under: {stderr}"
     );
     let id = sole_session_id(&sb);
     let machine = sb.sessions_dir().join(&id).join("machine.json");

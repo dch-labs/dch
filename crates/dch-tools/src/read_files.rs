@@ -475,6 +475,107 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn the_overflow_file_arms_the_staleness_baseline_its_marker_promises() {
+        // The module docs promise the overflow file — the one whose
+        // section cannot fit, served under the "not returned" marker —
+        // is still read, "which arms its staleness baseline." The
+        // never-read marker's side is pinned; this is the marker's own
+        // side, unpinned before: knowing a file cannot fit required
+        // reading it, so the session holds those bytes, and a write
+        // over a file that changed since the overflow must refuse.
+        use loopctl::tool::builtin::fs::WriteTool;
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("a.rs"), payload(3_000)).unwrap();
+        std::fs::write(tmp.path().join("b.rs"), payload(3_000)).unwrap();
+        let session = FileSession::new(tmp.path().to_path_buf());
+        let tool = ReadFilesTool::new(ReadTool::new(FileSource::new(session.clone())), 1_500);
+        let mut ctx = ToolContext::default();
+        ctx.cwd = tmp.path().to_string_lossy().to_string();
+        ctx.set_extension(RunnerContext::new(tmp.path().to_path_buf()));
+        session.attach(&mut ctx);
+        let out = tool
+            .call(json!({ "files": ["a.rs", "b.rs"] }), &ctx)
+            .await
+            .unwrap();
+        let text = out.text_content();
+        assert!(
+            text.contains("=== a.rs ===") && text.contains("not returned"),
+            "the fixture must overflow on a.rs: {text}"
+        );
+
+        std::fs::write(tmp.path().join("a.rs"), "externally changed\n").unwrap();
+        let writer = WriteTool::new();
+        let held = writer
+            .call(json!({ "file_path": "a.rs", "content": "ours\n" }), &ctx)
+            .await
+            .expect("a refused write is a soft error, not a failure");
+        assert!(
+            held.is_error,
+            "the overflow read armed the baseline its marker promises: {}",
+            held.text_content()
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("a.rs")).unwrap(),
+            "externally changed\n",
+            "the held write moves no bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_reads_through_one_session_arm_every_baseline() {
+        // The census claim made real: the session's baseline map is the
+        // one shared mutable record behind concurrent read dispatches —
+        // `ReadFilesTool` is concurrency-safe, so several in-flight
+        // reads through one session must each land their own baseline
+        // with none lost to the interleaving. Externally change every
+        // file after the join, and each file's write must be held: a
+        // lost baseline would let one of the clobbers through.
+        use futures::future::join_all;
+        use loopctl::tool::builtin::fs::WriteTool;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let session = FileSession::new(tmp.path().to_path_buf());
+        let tool = ReadFilesTool::new(ReadTool::new(FileSource::new(session.clone())), 0);
+        let mut ctx = ToolContext::default();
+        ctx.cwd = tmp.path().to_string_lossy().to_string();
+        ctx.set_extension(RunnerContext::new(tmp.path().to_path_buf()));
+        session.attach(&mut ctx);
+
+        let names: Vec<String> = (0..8).map(|i| format!("shared{i}.rs")).collect();
+        for name in &names {
+            std::fs::write(tmp.path().join(name), "observed\n").unwrap();
+        }
+        let reads = names.iter().map(|name| {
+            let input = json!({ "files": [name] });
+            tool.call(input, &ctx)
+        });
+        let outputs = join_all(reads).await;
+        assert!(
+            outputs.iter().all(Result::is_ok),
+            "every concurrent read dispatch must succeed"
+        );
+
+        for name in &names {
+            std::fs::write(tmp.path().join(name), "externally changed\n").unwrap();
+        }
+        let writer = WriteTool::new();
+        for name in &names {
+            let held = writer
+                .call(json!({ "file_path": name, "content": "ours\n" }), &ctx)
+                .await
+                .expect("a refused write is a soft error, not a failure");
+            assert!(
+                held.is_error,
+                "the shared history must hold {name}: a lost baseline would let this clobber land"
+            );
+            assert_eq!(
+                std::fs::read_to_string(tmp.path().join(name)).unwrap(),
+                "externally changed\n",
+                "{name} survives its held write"
+            );
+        }
+    }
+
     /// A reader over an existing directory whose batch carries
     /// `max_batch_bytes`.
     ///
@@ -709,10 +810,10 @@ mod tests {
         assert_eq!(tool.name(), "ReadFiles");
         assert!(tool.is_read_only());
         assert!(tool.is_concurrency_safe());
-        assert_eq!(
-            crate::permission::tool_category("ReadFiles"),
-            crate::permission::ToolCategory::FileRead
-        );
+        // The read-only contract's permission side — ReadFiles classifying
+        // as a file read — is pinned by the permission domain's category
+        // table and the loop's registry-drift test; this side pins the
+        // tool trait itself.
         let reg =
             crate::registry::builtin_registry(&session, crate::registry::ReadWindows::default());
         assert!(reg.get("ReadFiles").is_some(), "ReadFiles registered");

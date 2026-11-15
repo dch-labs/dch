@@ -41,6 +41,7 @@ tempfile   = "3"
 base64     = "0.22"
 ignore     = "0.4"
 regex      = "1"
+globset    = "0.4"
 lru        = "0.18.2"
 portable-pty = "0.9"
 
@@ -49,6 +50,7 @@ dch-loop    = { path = "crates/dch-loop" }
 dch-tools  = { path = "crates/dch-tools" }
 dch-tui    = { path = "crates/dch-tui" }
 dch-config = { path = "crates/dch-config" }
+dch-permissions = { path = "crates/dch-permissions" }
 
 [workspace.lints.clippy]
 pedantic            = { level = "warn", priority = -1 }

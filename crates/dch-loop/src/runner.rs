@@ -62,8 +62,8 @@ use loopctl::mcp::McpClient;
 use loopctl::mcp::McpToolProvider;
 use loopctl::message::Message;
 use loopctl::message::MessagePart;
-use loopctl::middleware::AskResolverFn;
 use loopctl::middleware::OutputLimitMiddleware;
+use loopctl::middleware::PermissionAskResolver;
 use loopctl::middleware::PermissionMiddleware;
 use loopctl::middleware::ToolDispatchContext;
 use loopctl::middleware::ToolMiddleware;
@@ -80,8 +80,7 @@ use crate::DchClient;
 use crate::RunnerError;
 use crate::detect_tech_stack;
 use crate::merge_by_language;
-use crate::permission::permission_layer;
-use crate::permission::tools_mode;
+use crate::permission::permission_layer_live;
 use crate::question_bridge::QuestionPath;
 use crate::with_context;
 
@@ -220,6 +219,9 @@ impl Runner {
             mcp_providers: Vec::new(),
             history: Vec::new(),
             permission_resolver: None,
+            permission_mode_cell: None,
+            permission_config_rules: std::sync::Arc::new(Vec::new),
+            permission_memory: None,
             interactive_tools: true,
             todo_nudge: None,
             retirement_sink: None,
@@ -615,14 +617,40 @@ pub struct RunnerBuilder<'a> {
     /// continues from the restored point instead of an empty history.
     history: Vec<Message>,
 
-    /// Optional async resolver for the permission gate's `Ask` verdicts.
+    /// Optional typed resolver for the permission gate's `Ask` verdicts.
     ///
     /// Interactive hosts (the TUI) supply one so `Ask` cells prompt the
     /// user; without it the gate denies asks outright, which is the
-    /// headless contract. The resolver runs on the dispatch task, so it
-    /// must not block — and a pending resolution races the run's cancel
-    /// signal, so a cancelled run denies rather than waits.
-    permission_resolver: Option<AskResolverFn>,
+    /// headless contract. The resolver receives the whole call — the
+    /// typed [`loopctl::middleware::PermissionAsk`] — and answers a
+    /// [`loopctl::middleware::PermissionResolution`], whose
+    /// `DenyWithFeedback` carries the user's words to the model. It runs
+    /// on the dispatch task, so it must not block — and a pending
+    /// resolution races the run's cancel signal, so a cancelled run
+    /// denies rather than waits.
+    permission_resolver: Option<std::sync::Arc<dyn PermissionAskResolver>>,
+
+    /// The shared, live permission mode, when the host wired one.
+    ///
+    /// `None` builds freeze the config's mode — the standing contract
+    /// for hosts that never move a mode mid-run.
+    permission_mode_cell: Option<dch_config::SharedPermissionMode>,
+
+    /// The config's `[permissions]` rules, compiled to engine rules.
+    ///
+    /// Set by [`with_permission_config_rules`](Self::with_permission_config_rules);
+    /// the gate evaluates them ahead of the remembered layer and the
+    /// matrix on every dispatch. Empty by default — a config without the
+    /// section adds nothing.
+    permission_config_rules: crate::permission::ConfigRulesView,
+
+    /// The live remembered-approvals snapshot, when the host wired one.
+    ///
+    /// The interactive host's bridge over its "allow always" memory; the
+    /// gate consults it per dispatch, so a remember made one call ago
+    /// covers the next. `None` evaluates the remembered layer as always
+    /// empty — the headless contract, and the pre-remember spelling.
+    permission_memory: Option<crate::permission::MemorySnapshot>,
 
     /// Whether the interaction-only tools register.
     ///
@@ -733,17 +761,67 @@ impl RunnerBuilder<'_> {
         self
     }
 
-    /// Register the resolver the permission gate consults on `Ask`.
+    /// Register the typed resolver the permission gate consults on `Ask`.
     ///
     /// The gate is always installed — it enforces the configured
     /// `[runner] permission_mode` matrix on every dispatch; the
     /// resolver decides what an `Ask` cell does. Without one, `Ask`
-    /// denies (headless); with one, the resolver's `bool` answer
-    /// allows or denies the call. The same resolver serves every run
-    /// of the built runner.
+    /// denies (headless); with one, the resolver's
+    /// [`loopctl::middleware::PermissionResolution`] decides — allow,
+    /// plain deny, or deny with the user's words as the reason. The
+    /// same resolver serves every run of the built runner.
     #[must_use]
-    pub fn with_permission_resolver(mut self, resolver: AskResolverFn) -> Self {
+    pub fn with_permission_resolver(
+        mut self,
+        resolver: std::sync::Arc<dyn PermissionAskResolver>,
+    ) -> Self {
         self.permission_resolver = Some(resolver);
+        self
+    }
+
+    /// Share the permission mode as a live cell the gate re-reads per
+    /// dispatch.
+    ///
+    /// The host's wiring for a mode that moves while a run is in
+    /// flight: the cell outlives every runner (it belongs to the
+    /// session's lanes), and the gate consults it on each tool call,
+    /// so `/mode` mid-run lands on the very next dispatch. Without
+    /// one, the build freezes the config's mode at construction, as
+    /// it always did.
+    #[must_use]
+    pub fn with_permission_mode_cell(mut self, mode: dch_config::SharedPermissionMode) -> Self {
+        self.permission_mode_cell = Some(mode);
+        self
+    }
+
+    /// Install the config's `[permissions]` rules into the gate.
+    ///
+    /// The host's conversion of the config section to engine rules —
+    /// [`config_rules`](crate::permission::config_rules) is the one
+    /// translation — so a `deny` on `**/.env` or an `ask` on `WebFetch`
+    /// holds in every mode the config can reach, ahead of remembered
+    /// approvals and the matrix. Nothing installed is the default: the
+    /// section's absence changes no verdict.
+    #[must_use]
+    pub fn with_permission_config_rules(
+        mut self,
+        rules: crate::permission::ConfigRulesView,
+    ) -> Self {
+        self.permission_config_rules = rules;
+        self
+    }
+
+    /// Share the live remembered-approvals snapshot with the gate.
+    ///
+    /// The interactive host's bridge over its "allow always" memory: the
+    /// snapshot is read on **every dispatch**, so a remember made one call
+    /// ago covers the very next variant of the same work — an ask that is
+    /// covered never reaches the resolver at all, and the verdict log
+    /// names `remembered` as the rule that allowed it. Nothing installed
+    /// is the default: the remembered layer evaluates as always empty.
+    #[must_use]
+    pub fn with_permission_memory(mut self, memory: crate::permission::MemorySnapshot) -> Self {
+        self.permission_memory = Some(memory);
         self
     }
 
@@ -850,22 +928,13 @@ impl RunnerBuilder<'_> {
         let client = Arc::new(crate::create_client(&self.config.api)?);
         let connections = connect_mcp_servers(self.config, &context.cwd).await?;
         let read_windows = read_windows_for(&self.config.runner);
-        let registry = compose_registry(
+        let (registry, core_registry) = compose_twin_registries(
             &connections,
             &fs_session,
             read_windows,
             self.interactive_tools,
+            &self.mcp_providers,
         );
-        let core_registry = compose_registry(
-            &connections,
-            &fs_session,
-            read_windows,
-            self.interactive_tools,
-        );
-        for provider in &self.mcp_providers {
-            provider.register_into(&registry);
-            provider.register_into(&core_registry);
-        }
 
         let mut session_config = build_session(self.config, &registry, &self.workdir);
         let mut resolved_window = session_config.context_window;
@@ -902,9 +971,15 @@ impl RunnerBuilder<'_> {
             managers =
                 managers.with_fallback(arm_fallback(&self.config.api.model, fallback_model)?);
         }
-        let gate = permission_layer(
-            tools_mode(self.config.runner.permission_mode),
+        let gate = permission_layer_live(
+            self.permission_mode_cell.clone().unwrap_or_else(|| {
+                std::sync::Arc::new(std::sync::Mutex::new(self.config.runner.permission_mode))
+            }),
             self.permission_resolver,
+            std::sync::Arc::clone(&self.permission_config_rules),
+            self.permission_memory
+                .clone()
+                .unwrap_or_else(|| Arc::new(dch_permissions::empty_view)),
         );
         managers.set_pipeline(build_pipeline(
             &context,
@@ -1159,6 +1234,34 @@ fn compose_registry(
         }
     }
     registry
+}
+
+/// The two registries one runner serves: advertised and dispatchable.
+///
+/// What the engine's registry advertises to the model and what the
+/// pipeline's core registry can run are the same composition of the
+/// same inputs — builtins, interactive-tool gating, every MCP
+/// connection, and the extra MCP providers landing in both — so the
+/// twin composition lives in this one seam. The legs share every
+/// argument by construction and the provider loop names both
+/// registries, and the registry-twin pin drives this seam itself: a
+/// change that wires one leg differently fails there rather than
+/// shipping a runner whose advertised tools and dispatchable tools
+/// disagree.
+fn compose_twin_registries(
+    connections: &[McpConnection],
+    fs_session: &FileSession,
+    windows: dch_tools::ReadWindows,
+    ask_tools: bool,
+    mcp_providers: &[McpToolProvider],
+) -> (ToolRegistry, ToolRegistry) {
+    let registry = compose_registry(connections, fs_session, windows, ask_tools);
+    let core_registry = compose_registry(connections, fs_session, windows, ask_tools);
+    for provider in mcp_providers {
+        provider.register_into(&registry);
+        provider.register_into(&core_registry);
+    }
+    (registry, core_registry)
 }
 
 /// The read-family window ceilings the config's `[runner]` section selects.
@@ -1431,6 +1534,7 @@ fn compaction_notice(outcome: &loopctl::compact::EnsureContextResult) -> String 
 )]
 mod tests {
     use super::*;
+    use crate::permission::permission_layer;
     use dch_config::DchConfig;
     use loopctl::tool::Tool;
     use loopctl::tool::ToolContext;
@@ -1640,7 +1744,7 @@ mod tests {
             &sample_context("/tmp/probe-cwd"),
             &FileSession::new(PathBuf::from(".")),
             &[],
-            permission_layer(dch_tools::permission::PermissionMode::Auto, None),
+            permission_layer(dch_permissions::PermissionMode::Auto, None),
             false,
             0,
             registry,
@@ -1672,7 +1776,7 @@ mod tests {
             &sample_context("/tmp/probe-cwd"),
             &FileSession::new(PathBuf::from(".")),
             &[],
-            permission_layer(dch_tools::permission::PermissionMode::Auto, None),
+            permission_layer(dch_permissions::PermissionMode::Auto, None),
             false,
             dch_config::RunnerConfig::default().max_tool_output_chars,
             builtin_registry(
@@ -1696,7 +1800,7 @@ mod tests {
             &sample_context("/tmp/probe-cwd"),
             &FileSession::new(PathBuf::from(".")),
             &[],
-            permission_layer(dch_tools::permission::PermissionMode::Auto, None),
+            permission_layer(dch_permissions::PermissionMode::Auto, None),
             true,
             cap,
             builtin_registry(
@@ -1722,7 +1826,7 @@ mod tests {
             &sample_context("/tmp/probe-cwd"),
             &FileSession::new(PathBuf::from(".")),
             &[Arc::new(HostProbe)],
-            permission_layer(dch_tools::permission::PermissionMode::Auto, None),
+            permission_layer(dch_permissions::PermissionMode::Auto, None),
             true,
             cap,
             builtin_registry(
@@ -1795,7 +1899,7 @@ mod tests {
             &sample_context("/tmp/probe-cwd"),
             &FileSession::new(PathBuf::from(".")),
             &[],
-            permission_layer(dch_tools::permission::PermissionMode::Auto, None),
+            permission_layer(dch_permissions::PermissionMode::Auto, None),
             true,
             0,
             registry,
@@ -1854,7 +1958,7 @@ mod tests {
             &sample_context("/tmp/probe-cwd"),
             &FileSession::new(PathBuf::from(".")),
             &[],
-            permission_layer(dch_tools::permission::PermissionMode::Auto, None),
+            permission_layer(dch_permissions::PermissionMode::Auto, None),
             false,
             output_limit,
             registry,
@@ -1868,7 +1972,7 @@ mod tests {
             &sample_context("/tmp/probe-cwd"),
             &FileSession::new(PathBuf::from(".")),
             &[],
-            permission_layer(dch_tools::permission::PermissionMode::Auto, None),
+            permission_layer(dch_permissions::PermissionMode::Auto, None),
             false,
             dch_config::RunnerConfig::default().max_tool_output_chars,
             builtin_registry(
@@ -1891,7 +1995,7 @@ mod tests {
             &sample_context("/tmp/probe-cwd"),
             &FileSession::new(PathBuf::from(".")),
             &[],
-            permission_layer(dch_tools::permission::PermissionMode::Auto, None),
+            permission_layer(dch_permissions::PermissionMode::Auto, None),
             false,
             0,
             builtin_registry(
@@ -1972,7 +2076,7 @@ mod tests {
             &[Arc::new(RecordingCapture {
                 recorded: Arc::clone(&recorded),
             })],
-            permission_layer(dch_tools::permission::PermissionMode::Auto, None),
+            permission_layer(dch_permissions::PermissionMode::Auto, None),
             false,
             200,
             registry,
@@ -2986,6 +3090,78 @@ mod tests {
         assert!(
             runner.take_claim_retirements().is_empty(),
             "the take drains the batch — a polling host never re-reads a claim"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_seeded_plan_carries_the_first_claim_and_retires_at_the_second() {
+        // The resume composition the arms only half describe: the plan
+        // arrives through the seed writer (a restored history's last
+        // TodoWrite render), the first claim carries it whole, and the
+        // second claim — a new prompt the model answered without
+        // touching the plan — retires the never-started entry while
+        // the in-progress one carries as owed work. The seed writer is
+        // pinned in isolation (seed_standing_plan_adopted_iff_undone)
+        // and the claim edges on a hand-pushed store
+        // (a_second_claim_retires_never_started_entries); this walks
+        // the writer combination a resumed session actually drives.
+        fn ids_of(runner: &Runner) -> Vec<String> {
+            runner
+                .context
+                .todos
+                .lock()
+                .expect("todos lock")
+                .iter()
+                .map(|entry| entry.id.clone())
+                .collect()
+        }
+        let config = offline_config();
+        let dir = TempDir::new().expect("tempdir");
+        let seeded_render = "# Task List\n\nSummary: 1 pending, 1 in progress, 0 \
+             completed\n\n○ [idea] the idea\n◐ [owed] the owed\n\n";
+        let mut runner = Runner::builder(&config, dir.path())
+            .with_history(vec![loopctl::message::Message::new(
+                loopctl::message::Role::User,
+                vec![loopctl::message::MessagePart::tool_result(
+                    "c1",
+                    "TodoWrite",
+                    seeded_render,
+                    false,
+                )],
+            )])
+            .build()
+            .await
+            .expect("constructs");
+        assert_eq!(
+            ids_of(&runner),
+            ["idea".to_string(), "owed".to_string()],
+            "the seed writer installs the restored plan"
+        );
+        drop(runner.run("first prompt").await);
+        assert_eq!(
+            ids_of(&runner),
+            ["idea".to_string(), "owed".to_string()],
+            "the first claim carries the seeded plan whole"
+        );
+        drop(runner.run("second prompt").await);
+        assert_eq!(
+            ids_of(&runner),
+            ["owed".to_string()],
+            "the second claim retires the seeded never-started entry"
+        );
+        let retired = runner.take_claim_retirements();
+        assert_eq!(
+            retired
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            ["idea"],
+            "the retired entry is the seed's own, handed to the host"
+        );
+        assert_eq!(
+            runner.todo_undone(),
+            1,
+            "the owed work is all that reads undone"
         );
     }
 
@@ -4017,7 +4193,7 @@ mod tests {
         .await;
         let dir = TempDir::new().expect("tempdir");
         let mut config = wire_config(server.port, 10);
-        config.runner.permission_mode = dch_config::PermissionMode::Plan;
+        config.runner.permission_mode = dch_config::PermissionMode::ReadOnly;
         let mut runner = Runner::builder(&config, dir.path())
             .build()
             .await
@@ -4034,31 +4210,31 @@ mod tests {
         let requests = recorded_requests(&server);
         assert_eq!(requests.len(), 2, "denied call, then the closing turn");
         assert!(
-            requests[1].contains("denied by Plan mode") && requests[1].contains("Write"),
+            requests[1].contains("denied by ReadOnly mode") && requests[1].contains("Write"),
             "the denial riding the second request must name the mode and the tool: {}",
             requests[1]
         );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn accept_edits_ask_resolves_through_the_builder_resolver_end_to_end() {
+    async fn interactive_ask_resolves_through_the_builder_resolver_end_to_end() {
         let server = SseServer::start(vec![
-            sse_tool_call_turn("Bash", &serde_json::json!({"command": "echo bridge-probe"})),
+            sse_tool_call_turn(
+                "Bash",
+                &serde_json::json!({"command": "touch bridge-probe"}),
+            ),
             sse_text_turn("done"),
         ])
         .await;
         let dir = TempDir::new().expect("tempdir");
         let mut config = wire_config(server.port, 10);
-        config.runner.permission_mode = dch_config::PermissionMode::AcceptEdits;
-        let consultations = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
-        let resolver: loopctl::middleware::AskResolverFn = {
+        config.runner.permission_mode = dch_config::PermissionMode::Interactive;
+        let consultations = Arc::new(Mutex::new(Vec::<(String, String, Value)>::new()));
+        let resolver: std::sync::Arc<dyn loopctl::middleware::PermissionAskResolver> = {
             let consultations = Arc::clone(&consultations);
-            Arc::new(move |prompt: &str, tool: &str| {
-                consultations
-                    .lock()
-                    .expect("consultations lock")
-                    .push((prompt.to_string(), tool.to_string()));
-                Box::pin(async { true })
+            Arc::new(RecordingResolver {
+                seen: consultations,
+                park: None,
             })
         };
         let mut runner = Runner::builder(&config, dir.path())
@@ -4073,11 +4249,16 @@ mod tests {
         assert_eq!(run.output.as_deref(), Some("done"));
         let recorded = consultations.lock().expect("consultations lock").clone();
         assert_eq!(recorded.len(), 1, "exactly one Ask consults the resolver");
-        let (prompt, tool) = recorded.into_iter().next().expect("one consultation");
+        let (tool, prompt, input) = recorded.into_iter().next().expect("one consultation");
         assert_eq!(tool, "Bash");
         assert!(
-            prompt.contains("Bash") && prompt.contains("AcceptEdits"),
+            prompt.contains("Bash") && prompt.contains("Interactive"),
             "the prompt must label the tool and the mode: {prompt}"
+        );
+        assert_eq!(
+            input,
+            serde_json::json!({"command": "touch bridge-probe"}),
+            "the typed ask carries the raw call input, verbatim"
         );
         let requests = recorded_requests(&server);
         assert_eq!(requests.len(), 2, "approved call, then the closing turn");
@@ -4448,24 +4629,16 @@ mod tests {
         std::fs::write(dir.path().join("note.txt"), "original").expect("seed target");
         let mut config = wire_config(server.port, 10);
         config.runner.permission_mode = dch_config::PermissionMode::Interactive;
-        let consultations: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let parked: Arc<Mutex<Vec<tokio::sync::oneshot::Sender<bool>>>> =
-            Arc::new(Mutex::new(Vec::new()));
-        let resolver: loopctl::middleware::AskResolverFn = {
+        let consultations = Arc::new(Mutex::new(Vec::<(String, String, Value)>::new()));
+        let parked: Arc<
+            Mutex<Vec<tokio::sync::oneshot::Sender<loopctl::middleware::PermissionResolution>>>,
+        > = Arc::new(Mutex::new(Vec::new()));
+        let resolver: std::sync::Arc<dyn loopctl::middleware::PermissionAskResolver> = {
             let consultations = Arc::clone(&consultations);
             let parked = Arc::clone(&parked);
-            Arc::new(move |_prompt: &str, tool: &str| {
-                consultations
-                    .lock()
-                    .expect("consultations lock")
-                    .push(tool.to_string());
-                if tool == "Read" {
-                    Box::pin(async { true })
-                } else {
-                    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                    parked.lock().expect("parked lock").push(reply_tx);
-                    Box::pin(async move { reply_rx.await.unwrap_or(false) })
-                }
+            Arc::new(RecordingResolver {
+                seen: consultations,
+                park: Some(parked),
             })
         };
         let mut runner = Runner::builder(&config, dir.path())
@@ -4484,14 +4657,22 @@ mod tests {
             .expect("parked lock")
             .pop()
             .expect("the write ask parked a reply");
+        let consulted: Vec<String> = consultations
+            .lock()
+            .expect("consultations lock")
+            .iter()
+            .map(|(tool, _prompt, _input)| tool.clone())
+            .collect();
         assert_eq!(
-            consultations.lock().expect("consultations lock").as_slice(),
-            ["Read", "Write"],
-            "the read ask resolves immediately; only the write parks"
+            consulted,
+            ["Write"],
+            "reads are free in Interactive; only the write consults"
         );
         std::fs::write(dir.path().join("note.txt"), "externally changed")
             .expect("mutate during the ask");
-        release.send(true).expect("the resolver still awaits");
+        release
+            .send(loopctl::middleware::PermissionResolution::AllowOnce)
+            .expect("the resolver still awaits");
         let run = tokio::time::timeout(std::time::Duration::from_secs(10), driving)
             .await
             .expect("run settles within timeout")
@@ -4510,6 +4691,110 @@ mod tests {
             "the conflict refusal must ride the closing request: {}",
             requests[2]
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_advertised_and_executable_registries_carry_the_same_tools() {
+        // The engine's registry and the pipeline's core registry are
+        // one seam's two hands — [`compose_twin_registries`], the
+        // helper `build()` serves both legs from — so what the engine
+        // advertises is exactly what a dispatch can run. The pin
+        // drives the seam itself with a live provider aboard, not a
+        // composition of its own: a change that composes one leg
+        // differently, gates one leg only, or registers the provider
+        // into one registry fails here rather than shipping a runner
+        // whose halves disagree.
+        let fs_session = FileSession::new(PathBuf::from("."));
+        let windows = read_windows_for(&dch_config::RunnerConfig::default());
+        let names = |registry: &loopctl::tool::ToolRegistry| {
+            let mut names: Vec<String> = registry
+                .all_tools()
+                .into_iter()
+                .map(|tool| tool.name().to_string())
+                .collect();
+            names.sort();
+            names
+        };
+        let client = loopctl::mcp::McpClient::in_process(GreetServer::new())
+            .await
+            .expect("mcp handshake");
+        let provider = loopctl::mcp::McpToolProvider::connect(client, Some("demo".to_string()))
+            .await
+            .expect("tool discovery");
+        let providers = [provider];
+        let (advertised, core) =
+            compose_twin_registries(&[], &fs_session, windows, true, &providers);
+        assert_eq!(
+            names(&advertised),
+            names(&core),
+            "the seam's two hands agree"
+        );
+        assert!(
+            names(&advertised).iter().any(|name| name == "Read"),
+            "the builtin family is present"
+        );
+        assert!(
+            names(&advertised).iter().any(|name| name == "demo__greet"),
+            "the provider's tool is aboard the advertised half"
+        );
+        assert!(
+            names(&core).iter().any(|name| name == "demo__greet"),
+            "the provider's tool is aboard the dispatchable half"
+        );
+        // The interactive gating holds identically on both legs: the
+        // one interaction-only tool drops out together or not at all.
+        let (quiet_advertised, quiet_core) =
+            compose_twin_registries(&[], &fs_session, windows, false, &[]);
+        assert!(
+            !names(&quiet_advertised)
+                .iter()
+                .any(|name| name == "AskUserQuestion"),
+            "the quiet composition drops the interaction-only tool"
+        );
+        assert_eq!(names(&quiet_advertised), names(&quiet_core));
+    }
+
+    /// The typed resolver fixture: records every ask's tool, prompt, and
+    /// raw input, then either answers `AllowOnce` outright or parks the
+    /// ask on a channel the test resolves.
+    struct RecordingResolver {
+        seen: Arc<Mutex<Vec<(String, String, Value)>>>,
+        park: Option<
+            Arc<
+                Mutex<Vec<tokio::sync::oneshot::Sender<loopctl::middleware::PermissionResolution>>>,
+            >,
+        >,
+    }
+
+    impl loopctl::middleware::PermissionAskResolver for RecordingResolver {
+        fn resolve<'a>(
+            &'a self,
+            ask: &'a loopctl::middleware::PermissionAsk,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = loopctl::middleware::PermissionResolution>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            if let Ok(mut seen) = self.seen.lock() {
+                seen.push((ask.tool_name.clone(), ask.prompt.clone(), ask.input.clone()));
+            }
+            match &self.park {
+                Some(park) => {
+                    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                    if let Ok(mut parked) = park.lock() {
+                        parked.push(reply_tx);
+                    }
+                    Box::pin(async move {
+                        reply_rx
+                            .await
+                            .unwrap_or(loopctl::middleware::PermissionResolution::DenyOnce)
+                    })
+                }
+                None => Box::pin(async { loopctl::middleware::PermissionResolution::AllowOnce }),
+            }
+        }
     }
 
     /// A dispatch context for one named tool call, for pipeline-seam drives.
@@ -4543,7 +4828,7 @@ mod tests {
             &context,
             &session,
             &[],
-            permission_layer(dch_tools::permission::PermissionMode::Auto, None),
+            permission_layer(dch_permissions::PermissionMode::Auto, None),
             redact,
             dch_config::RunnerConfig::default().max_tool_output_chars,
             builtin_registry(&session, dch_tools::ReadWindows::default()),

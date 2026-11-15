@@ -97,7 +97,13 @@ const LOOPCTL_GIT_URL: &str = "https://github.com/dch-labs/loopctl.git";
 /// Rule 4 enforces this set against `cargo metadata`, and the tests
 /// hold the binary's own manifest to it — a widening edits this list
 /// and every check reads the same names.
-const BINARY_DCH_DEPS: [&str; 4] = ["dch-config", "dch-loop", "dch-tools", "dch-tui"];
+const BINARY_DCH_DEPS: [&str; 5] = [
+    "dch-config",
+    "dch-loop",
+    "dch-permissions",
+    "dch-tools",
+    "dch-tui",
+];
 
 /// Whether config text declares the local bridge.
 ///
@@ -175,7 +181,7 @@ impl<'a> Checker<'a> {
         Self { pkgs }
     }
 
-    /// Run all five rules, collecting every violation.
+    /// Run all six rules, collecting every violation.
     ///
     /// The rules are independent, so one pass reports every boundary
     /// problem in the manifest rather than stopping at the first; an
@@ -200,11 +206,39 @@ impl<'a> Checker<'a> {
     pub fn check_with_local_bridge(&self, local_bridge: bool) -> Vec<Violation> {
         let mut out = Vec::new();
         out.extend(self.rule_dch_tools_loopctl_only());
-        out.extend(self.rule_dch_tui_dch_config_only());
+        out.extend(self.rule_dch_permissions_no_dch());
+        out.extend(self.rule_dch_tui_exact_deps());
         out.extend(self.rule_loopctl_no_dch());
         out.extend(self.rule_exact_dch_dep_sets());
         out.extend(self.rule_no_foreign_path_deps(local_bridge));
         out
+    }
+
+    /// Rule 1b: `dch-permissions` depends on no `dch-*` crate.
+    ///
+    /// The permission domain is the crate meant to be reusable beyond
+    /// this product — pure vocabulary, engine, memory, and policy seam —
+    /// so it may not reach back into configuration, tools, or the loop
+    /// wiring; any `dch-*` edge there turns the domain into a component
+    /// of one binary.
+    fn rule_dch_permissions_no_dch(&self) -> Vec<Violation> {
+        let Some(pkg) = find(self.pkgs, "dch-permissions") else {
+            return vec![Violation {
+                crate_name: "dch-permissions".into(),
+                detail: "package not present in cargo metadata".into(),
+            }];
+        };
+        let dch_deps = dch_deps_of(pkg);
+        if dch_deps.is_empty() {
+            return vec![];
+        }
+        vec![Violation {
+            crate_name: "dch-permissions".into(),
+            detail: format!(
+                "must depend on no dch-* crate (pure domain), but declares: {}",
+                dch_deps.join(", ")
+            ),
+        }]
     }
 
     /// Rule 1: `dch-tools` depends on `loopctl` and on no `dch-*` crate.
@@ -233,12 +267,14 @@ impl<'a> Checker<'a> {
         }]
     }
 
-    /// Rule 2: `dch-tui`'s `dch-*` dependencies are exactly `dch-config`.
+    /// Rule 2: `dch-tui`'s `dch-*` dependencies are exactly
+    /// `dch-config` and `dch-permissions`.
     ///
-    /// The display layer reads configuration and nothing else from inside
-    /// the workspace — neither the tool implementations nor the agent
-    /// loop — which is what keeps a transcript renderable on its own.
-    fn rule_dch_tui_dch_config_only(&self) -> Vec<Violation> {
+    /// The display layer reads configuration, the permission rules it
+    /// renders, and nothing else from inside the workspace — neither the
+    /// tool implementations nor the agent loop — which is what keeps a
+    /// transcript renderable on its own.
+    fn rule_dch_tui_exact_deps(&self) -> Vec<Violation> {
         let Some(pkg) = find(self.pkgs, "dch-tui") else {
             return vec![Violation {
                 crate_name: "dch-tui".into(),
@@ -246,14 +282,14 @@ impl<'a> Checker<'a> {
             }];
         };
         let actual = dch_deps_of(pkg);
-        let expected = vec!["dch-config".to_string()];
+        let expected = vec!["dch-config".to_string(), "dch-permissions".to_string()];
         if actual == expected {
             return vec![];
         }
         vec![Violation {
             crate_name: "dch-tui".into(),
             detail: format!(
-                "dch-* deps must be exactly {{dch-config}}, but are {{{}}}",
+                "dch-* deps must be exactly {{dch-config, dch-permissions}}, but are {{{}}}",
                 actual.join(", ")
             ),
         }]
@@ -295,14 +331,18 @@ impl<'a> Checker<'a> {
     /// else violates this rule even where rules 1 to 3 would allow it.
     fn rule_exact_dch_dep_sets(&self) -> Vec<Violation> {
         let mut out = Vec::new();
-        let dch_loop_expected = vec!["dch-config".to_string(), "dch-tools".to_string()];
+        let dch_loop_expected = vec![
+            "dch-config".to_string(),
+            "dch-permissions".to_string(),
+            "dch-tools".to_string(),
+        ];
         if let Some(pkg) = find(self.pkgs, "dch-loop") {
             let actual = dch_deps_of(pkg);
             if actual != dch_loop_expected {
                 out.push(Violation {
                     crate_name: "dch-loop".into(),
                     detail: format!(
-                        "dch-* deps must be exactly {{dch-tools, dch-config}}, but are {{{}}}",
+                        "dch-* deps must be exactly {{dch-tools, dch-permissions, dch-config}}, but are {{{}}}",
                         actual.join(", ")
                     ),
                 });
@@ -501,7 +541,7 @@ pub fn run_check() -> ExitCode {
         }
     }
     if violations.is_empty() {
-        println!("xtask: boundary check passed (5 rules, 0 violations)");
+        println!("xtask: boundary check passed (6 rules, 0 violations)");
         ExitCode::SUCCESS
     } else {
         eprintln!(
@@ -577,16 +617,30 @@ mod tests {
                 &[
                     "dch-config",
                     "dch-loop",
+                    "dch-permissions",
                     "dch-tools",
                     "dch-tui",
                     "loopctl",
                     "clap",
                 ],
             ),
-            pkg("dch-config", &["loopctl", "serde"]),
-            pkg("dch-loop", &["dch-config", "dch-tools", "loopctl", "tokio"]),
+            pkg("dch-config", &["dch-permissions", "loopctl", "serde"]),
+            pkg(
+                "dch-loop",
+                &[
+                    "dch-config",
+                    "dch-permissions",
+                    "dch-tools",
+                    "loopctl",
+                    "tokio",
+                ],
+            ),
+            pkg("dch-permissions", &["serde", "globset"]),
             pkg("dch-tools", &["loopctl", "serde_json", "syn"]),
-            pkg("dch-tui", &["dch-config", "loopctl", "ratatui"]),
+            pkg(
+                "dch-tui",
+                &["dch-config", "dch-permissions", "loopctl", "ratatui"],
+            ),
             pkg("loopctl", &["serde", "tokio"]),
         ]
     }
@@ -742,6 +796,27 @@ mod tests {
         let ws = with_pkg(&good_workspace(), "dch-tools", &bad);
         let v = Checker::new(&ws).check();
         assert!(has_violation(&v, "dch-tools", "dch-config"));
+    }
+
+    #[test]
+    fn rule1b_catches_dch_permissions_gaining_dch_dep() {
+        // The domain stays pure: no configuration, no tools, no loop
+        // wiring — any dch-* edge there is a component of one binary.
+        let bad = pkg("dch-permissions", &["serde", "globset", "dch-config"]);
+        let ws = with_pkg(&good_workspace(), "dch-permissions", &bad);
+        let v = Checker::new(&ws).check();
+        assert!(has_violation(&v, "dch-permissions", "dch-config"));
+    }
+
+    #[test]
+    fn rule2_catches_dch_tui_missing_dch_permissions() {
+        // The TUI renders the permission rules, so the domain edge is
+        // part of its enforced set — losing it is as wrong as gaining
+        // an unlisted crate.
+        let bad = pkg("dch-tui", &["dch-config", "loopctl", "ratatui"]);
+        let ws = with_pkg(&good_workspace(), "dch-tui", &bad);
+        let v = Checker::new(&ws).check();
+        assert!(has_violation(&v, "dch-tui", "dch-permissions"));
     }
 
     #[test]

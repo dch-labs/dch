@@ -1503,6 +1503,9 @@ fn a_permission_prompt_outranks_the_queue_chords() {
         .send(dch_tui::PermissionRequest {
             tool_name: "Bash".to_string(),
             prompt: "allow bash?".to_string(),
+            input: serde_json::Value::Null,
+            always: Vec::new(),
+            never: Vec::new(),
             reply: reply_tx,
         })
         .expect("receiver alive");

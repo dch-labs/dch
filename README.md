@@ -6,14 +6,29 @@ A terminal-based agentic coding assistant written in Rust, built on the
 ## Features
 
 - **Interactive TUI** — live streaming output, Markdown rendering with
-  syntax highlighting, configurable themes.
+  syntax highlighting, configurable themes, and a fresh-session welcome
+  screen — the fjord above a centered composer box, until the first
+  prompt. The splash shows its original truecolors everywhere they can
+  reach the screen — any direct launch, and tmux whenever the attached
+  client carries the RGB feature — and, where tmux would re-encode
+  direct colors (a client without RGB), a rendition of the same
+  photograph authored natively for the fixed 256-color palette, so the
+  art is never mangled by a conversion it cannot survive. When that
+  rendition engages, dch says so on the welcome notice and names the
+  one `tmux.conf` line — `set -as terminal-features ',<TERM>:RGB'` —
+  that lets truecolor through again for terminals that can show it.
+  The choice is also a setting: `display.splash_colors` is `auto`
+  (the default), or `truecolor` / `palette` to force one rendition
+  everywhere.
 - **Single-run mode** — run one task non-interactively (as an argument
   or piped on stdin), print only the final answer, exit with a
   meaningful shell status, and optionally write a JSON completion
   report for CI and orchestration.
 - **Built-in tools** — file reads and paginated viewing, batched
-  multi-file reads (`ReadFiles`) under one byte budget, single and atomic
-  multi-file edits, writes behind a linter gate, `bash` with
+  multi-file reads (`ReadFiles`) under one byte budget, single writes
+  and per-file atomic multi-file edits (a batch is not transactional;
+  a conflicting entry aborts the rest with a durable receipt naming
+  what landed), writes behind a linter gate, `bash` with
   timeouts and background jobs, `glob` / `grep` / `tree` /
   code-search, and per-session todos.
 - **Providers** — Ollama (local, the default), OpenAI, Anthropic,
@@ -79,7 +94,10 @@ echo "summarize this repo" | dch
 
 A single run is quiet by default: stdout carries only the final
 answer, printed once when the run ends, and stderr carries only the
-run's real trouble (warnings and failures). Pass `-v` to watch the run
+run's real trouble (warnings and failures) and then one closing line
+naming the session id the run's transcript saved under
+(`dch: session <uuid>` — the exact spelling `--resume` takes).
+Pass `-v` to watch the run
 instead — the reply streams to stdout as it forms and tool-call lines
 narrate on stderr; a second `-v` adds durations, token counts, and the
 run summary. A single run is non-interactive throughout: the model is
@@ -147,7 +165,11 @@ cannot be read at all exits non-zero. Files the restored transcript
 shows being read are guarded for writes, but the first `Write` to one
 requires a fresh `read` — the transcript cannot carry what the model
 originally saw, so a stale overwrite of externally-changed files is
-refused until the current bytes are read.
+refused until the current bytes are read. A mid-session runner rebuild
+(a `/model` switch) re-arms the same guard for every file the restored
+transcript shows read — stricter than a resume, since the same UI
+session saw those bytes moments ago: the first write after a rebuild
+demands a fresh `read`.
 
 Common options:
 
@@ -159,6 +181,7 @@ Common options:
 | `--theme NAME` | Override the configured theme |
 | `--config PATH` | Use an alternate config file |
 | `--unsafe-paths` | Let file tools reach paths outside the working directory |
+| `--permissions-preset NAME` | Select a `[permissions.presets.<name>]` bundle for this run | 
 | `--reasoning-effort LEVEL` | Override the configured thinking budget for this run |
 | `--no-redact` | Disable secrets redaction for this run |
 | `--done-file PATH` | Write a JSON completion status to PATH (single-run mode) |
@@ -184,8 +207,14 @@ colors of their own. An unknown name falls back to the default.
 Single-run mode exits `0` on success, `1` on a construction or usage
 failure, `2` when the run itself fails, and `130` when cancelled by an
 interrupt. With `--done-file PATH`, a JSON status (`success`,
-`message`, `turns`, `tools_used`) is written on every terminal path —
-including cancellation — so a polling orchestrator never hangs.
+`message`, `turns`, `tools_used`, `session_id`) is written on every
+terminal path — including cancellation — so a polling orchestrator
+never hangs. The marker records the outcome the run itself reached;
+the exit code stays the source of truth — a double interrupt landing
+after the marker was written exits `130` beside that earlier
+outcome's marker. `session_id` names the session the run's transcript
+saved under (`null` on failures that end before a session exists),
+so a script can chain straight into `dch "follow-up" --resume <id>`.
 
 ### Keys
 
@@ -384,21 +413,93 @@ later.
 
 How aggressively the agent may act is a mode, set by
 `[runner] permission_mode` (default `auto`) or per-run with
-`--permission-mode <auto|plan|accept-edits|interactive>`:
+`--permission-mode <auto|read-only|interactive>`:
 
 | Mode | Behavior |
 | --- | --- |
 | `auto` | Runs everything without confirmation |
-| `plan` | Read-only tools run; writes, shell, network, and meta tools are blocked |
-| `accept-edits` | Reads and file edits run; shell, network, and meta tools prompt |
-| `interactive` | Every tool prompts, reads included |
+| `read-only` | Reads run — file tools and read-only shell — plus the session's own todo and question tools; writes, mutating shell, network, and outward meta tools are blocked, never asked |
+| `interactive` | Uncovered side-effecting calls prompt; answers record into the two remembered lists (always allow / always deny) so each kind of work is decided once. The old `accept-edits` dissolves into this mode — auto-applied edits become an explicit allow rule |
+
+
+Two carve-outs run inside every mode. The session's own furniture —
+the todo list and the question tool — never prompts, in any mode: a
+note and a question touch the conversation, not the world. And a
+shell command that only looks reads like the file tools, `read_only`
+included — a conservative reader allowlist decides, so `git log`,
+`ls`, and `rg … | wc -l` qualify while `cargo`, any redirection or
+substitution, and writing flags (`find -delete`, `sort -o`, `git log
+--output`) never do. Read-only keeps its line through both, sharpened
+from "executes nothing" to "touches nothing": it looks and takes
+notes freely, and blocks what it blocks without asking.
 
 In the TUI a prompt renders as a sheet over the prompt box,
 answered with `y`/`n` (see
 the key tables above); a headless run denies whatever it cannot ask
-about, so `plan` and `accept-edits` stay meaningful there too. Unknown
+about. Unknown
 tool names fail closed: only `auto` runs them without confirmation —
 every other mode asks or blocks.
+
+Rules sit above the mode. A `[permissions]` section in the config
+pre-seeds the gate with verdict-and-matcher rules — `deny` a path glob
+(`**/.env`), `ask` for a tool, `allow` a shell verb — evaluated ahead
+of the mode matrix: a `deny` applies in every mode including
+`read_only`; `ask` and `allow` are skipped under `read_only`, which
+touches nothing beyond its reads regardless of what is configured. A
+`deny` or `ask` fires on any match
+(one bad target in a batch is enough); an `allow` loosens only when it
+covers every axis of the call:
+
+```toml
+# [permissions]
+# [[permissions.rules]]
+# id = "no-env-writes"     # optional; a missing id takes the rule's position
+# outcome = "deny"         # allow | ask | deny
+# path_glob = "**/.env"    # tool | shell_prefix | path_glob — exactly one
+```
+
+An "allow always" (`a`) or "deny always" (`d`) answer records typed
+rules, never prose. For a shell ask it remembers one verb prefix per
+command segment — readers included (`cargo test`, not the whole
+command), so the same work with different flags runs free while a new
+segment still asks. For
+a write ask it remembers the target's directory scope
+(`crates/dch-loop/**`) — a root-level file remembers itself exactly,
+since a subtree glob at the root would be the whole workspace. The
+sheet names the scope before the press lands. The deny list is checked
+before the allow list in every mode: `allow: cargo test` +
+`deny: cargo test` denies, and a matched deny blocks silently in every
+mode including read-only — the user's "never" outranks the posture.
+Remembered rules persist to the session's `permissions.json` and ride a
+resume; `/permissions` lists configured rules, the allow list, and the
+deny list, and `/permissions forget <n>` takes a remembered rule out of
+the memory and the file in one motion, so that work asks again the next
+time.
+
+Named presets make the session's choices reusable:
+
+```toml
+# [permissions]
+# preset = "rust-dev"      # select a bundle below
+# [permissions.presets.rust-dev]
+# [[permissions.presets.rust-dev.rules]]
+# outcome = "allow"
+# shell_prefix = "cargo test"
+```
+
+`--permissions-preset rust-dev` selects one for a single run; `/preset
+rust-dev` swaps the selection live — the very next dispatch evaluates
+under the new join.
+
+The mode is session state. `/mode <mode>` moves it live — even
+mid-run, the very next tool call runs under the new mode — and the
+session file remembers it, so a resume re-seats the session's own
+mode whatever the configuration now says. The configuration's
+`[runner] permission_mode` is the global default a fresh session
+starts on, `--permission-mode` names the mode for one run and becomes
+that session's standing override, and a `/clear`'s fresh session
+falls back to the configured default. A `/mode` never writes the
+config file: what one session chose cannot govern the next.
 
 ## Configuration
 
@@ -432,7 +533,7 @@ model = "qwen3.8:27b"
 max_turns = 200
 turn_timeout_secs = 300            # per-model-call streaming budget; ≥120 s, and the first-token wait is separately capped at 120 s
 role = "general"                  # general | coding | refactor | debug | review | docs | tests
-# permission_mode = "auto"        # auto | plan | accept_edits | interactive (see Permissions)
+# permission_mode = "auto"        # auto | read_only | interactive (retired plan/accept_edits load, migrated) (see Permissions)
 
 [display]
 theme = "default"

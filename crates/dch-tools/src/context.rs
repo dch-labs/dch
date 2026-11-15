@@ -49,8 +49,11 @@ pub struct RunnerContext {
     /// Replaced wholesale by the `TodoWrite` tool on each call — the model
     /// sends the complete desired list, not a delta. The `Arc<Mutex<>>`
     /// wrapper lets concurrent tool calls read and mutate it safely; cloning
-    /// [`RunnerContext`] shares the same list (no copy). Per-run: the runner
-    /// clears it at the top of each `run()` so a new prompt starts fresh.
+    /// [`RunnerContext`] shares the same list (no copy). The plan carries
+    /// into the next run until every entry is completed: a run that begins
+    /// with the whole list done starts fresh, and once work has been
+    /// claimed, still-pending entries retire at the turn while entries in
+    /// flight or done carry on.
     pub todos: Arc<Mutex<Vec<TodoEntry>>>,
 
     /// Channel for asking the user interactive questions, behind a shared slot.

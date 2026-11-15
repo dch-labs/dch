@@ -7,6 +7,7 @@ license.workspace = true
 description = "Composition layer for dch: loop, provider factory, system prompt, observers"
 
 [dependencies]
+dch-permissions = { workspace = true }
 loopctl = { workspace = true, features = ["ollama", "openai", "anthropic", "gemini", "redaction", "bedrock", "mcp", "self_hosted"] }
 dch-tools = { workspace = true }
 dch-config = { workspace = true }

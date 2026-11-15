@@ -50,6 +50,17 @@ fn app() -> TuiApp {
     TuiApp::new(config_with_theme("dracula"))
 }
 
+fn docked_app() -> TuiApp {
+    let mut app = TuiApp::new(config_with_theme("dracula"));
+    app.push_message(TuiMessage::User {
+        text: "hello".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
+    app
+}
+
 /// An app over observer state the test keeps a handle to, plus that state.
 ///
 /// The shared queue is the seam between the two halves of a session, so a
@@ -217,7 +228,7 @@ fn a_known_theme_name_resolves() {
 
 #[test]
 fn typing_echoes_into_the_input() {
-    let mut app = app();
+    let mut app = docked_app();
     for c in ['h', 'e', 'l', 'l', 'o'] {
         assert!(app.handle_event(&plain(KeyCode::Char(c))));
     }
@@ -233,7 +244,7 @@ fn typing_echoes_into_the_input() {
 
 #[test]
 fn the_caret_follows_display_width_not_bytes() {
-    let mut app = app();
+    let mut app = docked_app();
     for c in ['h', 'é', 'x'] {
         app.handle_event(&plain(KeyCode::Char(c)));
     }
@@ -245,7 +256,7 @@ fn the_caret_follows_display_width_not_bytes() {
         "the padding columns plus three display columns of text"
     );
 
-    let mut wide_app = TuiApp::new(config_with_theme("dracula"));
+    let mut wide_app = docked_app();
     for c in ['h', '😀'] {
         wide_app.handle_event(&plain(KeyCode::Char(c)));
     }
@@ -890,6 +901,14 @@ fn the_status_bar_shows_the_model_and_the_session_id() {
     let (observer, kept) = state.into_observer();
     drop(observer);
     let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    // The footer belongs to a conversation with turns — the welcome
+    // paints none — so the bar rides a landed prompt.
+    app.push_message(TuiMessage::User {
+        text: "hello".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
     app.set_session_id("f005d097-c4ce-477a-88c0-2fc2cec5a466".to_string());
     let bar = render_to_buffer(&mut app, 100, 24);
     let rows = row_texts(&bar);
@@ -908,7 +927,7 @@ fn the_notice_bar_carries_the_armed_quit_hint_above_the_composer() {
     // The hint lives on its own reserved row above the prompt box —
     // not the status bar — so the row can host glance-worthy
     // messages without shifting anything when one arrives.
-    let mut app = app();
+    let mut app = docked_app();
     let calm = render_to_buffer(&mut app, 80, 24);
     assert!(
         !view_text(&calm, 80, 24).contains("ctrl+c again"),
@@ -1053,16 +1072,21 @@ fn the_composer_info_row_names_the_current_permission_mode() {
     // shows is exactly what the user set.
     for (mode, segment) in [
         (dch_config::PermissionMode::Auto, "mode: auto"),
-        (dch_config::PermissionMode::Plan, "mode: plan"),
-        (
-            dch_config::PermissionMode::AcceptEdits,
-            "mode: accept_edits",
-        ),
+        (dch_config::PermissionMode::ReadOnly, "mode: read_only"),
         (dch_config::PermissionMode::Interactive, "mode: interactive"),
     ] {
         let mut config = config_with_theme("dracula");
         config.runner.permission_mode = mode;
         let mut app = TuiApp::new(config);
+        // The info row's full spelling belongs to the docked composer:
+        // the welcome box hugs the art's width and may cut the segment,
+        // so the mode rides a conversation with traffic.
+        app.push_message(TuiMessage::User {
+            text: "hello".to_string(),
+            timestamp: chrono::Utc::now(),
+            steered: false,
+            unsent: false,
+        });
         let rows = row_texts(&render_to_buffer(&mut app, 80, 30));
         let info = rows
             .iter()
@@ -1112,6 +1136,14 @@ fn clicking_the_session_id_segment_copies_it() {
     drop(observer);
     let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
     let id = "f005d097-c4ce-477a-88c0-2fc2cec5a466";
+    // The footer belongs to a conversation with turns — the welcome
+    // paints none — so the bar rides a landed prompt.
+    app.push_message(TuiMessage::User {
+        text: "hello".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
     app.set_session_id(id.to_string());
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
@@ -1214,7 +1246,7 @@ fn the_place_row_names_the_working_directory_above_the_composer() {
     // `path_style` — full by default, `~/`-relative on request — with
     // the git branch in parentheses when the host named one, and a
     // row the frame never spends until a directory is named.
-    let mut app = app();
+    let mut app = docked_app();
     let unset = render_to_buffer(&mut app, 100, 24);
     assert!(
         !row_texts(&unset).iter().any(|row| row.contains("repos")),
@@ -1272,6 +1304,12 @@ fn the_place_row_names_the_working_directory_above_the_composer() {
     let mut relative_config = config_with_theme("dracula");
     relative_config.display.path_style = dch_config::PathStyle::Relative;
     let mut relative = TuiApp::new(relative_config);
+    relative.push_message(TuiMessage::User {
+        text: "hello".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
     relative.set_working_dir(std::path::Path::new(&format!("{home}/repos/dch")));
     relative.set_git_branch(Some("master".to_string()));
     let spelled = row_texts(&render_to_buffer(&mut relative, 100, 24));
@@ -1284,6 +1322,12 @@ fn the_place_row_names_the_working_directory_above_the_composer() {
     let mut outside_config = config_with_theme("dracula");
     outside_config.display.path_style = dch_config::PathStyle::Relative;
     let mut outside = TuiApp::new(outside_config);
+    outside.push_message(TuiMessage::User {
+        text: "hello".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
     outside.set_working_dir(std::path::Path::new("/srv/work"));
     let spelled = row_texts(&render_to_buffer(&mut outside, 100, 24));
     assert!(
@@ -1294,7 +1338,7 @@ fn the_place_row_names_the_working_directory_above_the_composer() {
 
 #[test]
 fn layout_shows_three_panes() {
-    let mut app = app();
+    let mut app = docked_app();
     let terminal = render_to_buffer(&mut app, 80, 30);
     let buffer = terminal.backend().buffer();
 
@@ -1602,7 +1646,7 @@ fn growth_after_a_frozen_closer_renders_without_waiting_for_a_newline() {
 
 #[test]
 fn active_tools_render_as_running_lines() {
-    let mut app = app();
+    let mut app = docked_app();
     app.active_tools()
         .lock()
         .expect("the tools lock")
@@ -1630,6 +1674,15 @@ fn the_session_picker_names_each_row() {
     // display offset on both rows — the title column is a cell
     // budget every row fills exactly.
     let mut app = app();
+    // The full row — every column, the prompt count included — belongs
+    // to the docked composer's width; the welcome's picker is as wide
+    // as its own composer and sheds the trailing column.
+    app.push_message(TuiMessage::User {
+        text: "hello".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
     app.apply_session_update(dch_tui::queue::SessionUpdate::SessionCatalog {
         rows: vec![
             dch_tui::queue::SessionPick {
@@ -2333,13 +2386,124 @@ fn a_user_turn_opens_with_the_primary_chevron() {
 
     // The paintless chrome paints nothing: no surface block, the turn
     // keeps the terminal's own background beside its chevron glyph.
+    // The ruled app carries the same turn, for the assertion speaks
+    // about the user turn's surface — an empty conversation's splash
+    // is a different painter entirely.
     let mut ruled = TuiApp::new(config_with_theme("transparent"));
+    ruled.push_message(TuiMessage::User {
+        text: "first line of the question\nsecond line".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
     let frame = render_to_buffer(&mut ruled, 80, 24);
     let buffer = frame.backend().buffer();
     assert_eq!(
         buffer[(40, marked_row)].bg,
         ratatui::style::Color::Reset,
         "the paintless theme draws no user-turn surface"
+    );
+}
+
+/// A row inside `band` whose background is the theme's primary.
+///
+/// The composer's caret lane, scanned wherever the calling test knows
+/// the composer sits — mid-frame for the fresh session's centered
+/// shape, the bottom quarter for the docked one. Blank fillers, the
+/// splash's own colors, and the transcript never paint the primary as
+/// a background inside these bands.
+fn primary_row_in(
+    terminal: &Terminal<TestBackend>,
+    band: std::ops::Range<u16>,
+    primary: ratatui::style::Color,
+) -> Option<u16> {
+    let buffer = terminal.backend().buffer();
+    (band.start..band.end)
+        .find(|&row| (0..buffer.area.width).any(|column| buffer[(column, row)].bg == primary))
+}
+
+#[test]
+fn an_empty_session_centers_the_composer_under_the_splash() {
+    // The fresh session's welcome shape: with nothing said and nothing
+    // in flight, the composer takes the middle of the frame with the
+    // splash band above it; the first message docks the composer back
+    // to the bottom, and the two positions are far apart.
+    let mut fresh = app();
+    let terminal = render_to_buffer(&mut fresh, 80, 100);
+    let primary = fresh.theme.ui.primary;
+    let Some(centered_row) = primary_row_in(&terminal, 40..75, primary) else {
+        panic!("the centered composer paints its caret lane mid-frame");
+    };
+    let rows = row_texts(&terminal);
+    let splash_bottom = rows
+        .iter()
+        .rposition(|row| row.contains('▀'))
+        .expect("the splash band above the composer");
+    assert!(
+        u16::try_from(splash_bottom).unwrap_or(0) < centered_row,
+        "the composer sits below the splash: {centered_row}"
+    );
+
+    let mut busy = app();
+    busy.push_message(TuiMessage::User {
+        text: "first words".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
+    let docked = render_to_buffer(&mut busy, 80, 100);
+    let Some(docked_row) = primary_row_in(&docked, 85..100, busy.theme.ui.primary) else {
+        panic!("the docked composer paints its caret lane at the bottom");
+    };
+    assert!(
+        centered_row + 3 < docked_row,
+        "the fresh composer sits well above the docked one: \
+         centered {centered_row}, docked {docked_row}"
+    );
+    let docked_rows = row_texts(&docked);
+    assert!(
+        !docked_rows.iter().any(|row| row.contains('▀')),
+        "traffic displaces the splash and the centered shape with it"
+    );
+}
+
+#[test]
+fn the_welcome_composer_is_an_open_field_with_a_greeting() {
+    // The welcome composer is its own look, not the docked one: an
+    // open, borderless field the width of the art, carrying the name
+    // in night colors while the input stands empty — and the murmur
+    // stands down at the first keystroke.
+    let mut fresh = app();
+    let terminal = render_to_buffer(&mut fresh, 80, 24);
+    let rows = row_texts(&terminal);
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("dream, create, harness")),
+        "the empty field carries the name"
+    );
+    assert!(
+        rows.iter().any(|row| row.contains("dch-tui")),
+        "the folder the session stands in rides above the composer"
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row.contains('╭') || row.contains('╰')),
+        "the welcome composer draws no border of its own"
+    );
+
+    fresh.handle_event(&plain(KeyCode::Char('h')));
+    let typed = render_to_buffer(&mut fresh, 80, 24);
+    let typed_rows = row_texts(&typed);
+    assert!(
+        !typed_rows
+            .iter()
+            .any(|row| row.contains("dream, create, harness")),
+        "the first keystroke stands the murmur down"
+    );
+    assert!(
+        typed_rows.iter().any(|row| row.contains('h')),
+        "the typed glyph renders in the field"
     );
 }
 
@@ -2388,6 +2552,12 @@ fn the_transparent_theme_underlines_its_composer() {
     // identity line, so the model and mode hang below the box rather
     // than sitting on their own border.
     let mut ruled = TuiApp::new(config_with_theme("transparent"));
+    ruled.push_message(TuiMessage::User {
+        text: "hello".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
     let frame = render_to_buffer(&mut ruled, 80, 25);
     let buffer = frame.backend().buffer();
     for x in [1u16, 40, 78] {
@@ -2431,7 +2601,7 @@ fn the_transparent_theme_underlines_its_composer() {
     assert_eq!(buffer[(1, 19)].symbol(), " ", "no border glyphs remain");
 
     // opaque themes keep their painted, borderless composer
-    let mut plain = app();
+    let mut plain = docked_app();
     let plain_frame = render_to_buffer(&mut plain, 80, 25);
     let buffer = plain_frame.backend().buffer();
     let style = buffer[(40, 20)].style();
@@ -2450,6 +2620,12 @@ fn the_transparent_theme_stands_its_captions_outside_the_rules() {
     // themes keep the caption tight against the composer's surface,
     // where nothing crosses anything.
     let mut ruled = TuiApp::new(config_with_theme("transparent"));
+    ruled.push_message(TuiMessage::User {
+        text: "hello".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
     ruled.set_working_dir(std::path::Path::new("/home/tester/repos/dch"));
     let rows = row_texts(&render_to_buffer(&mut ruled, 80, 25));
     let caption_row = rows
@@ -2493,7 +2669,7 @@ fn the_transparent_theme_stands_its_captions_outside_the_rules() {
 
     // Painted themes keep the caption against the composer's paint,
     // unchanged: the surface opens on the very row after the caption.
-    let mut painted = app();
+    let mut painted = docked_app();
     painted.set_working_dir(std::path::Path::new("/home/tester/repos/dch"));
     let frame = render_to_buffer(&mut painted, 80, 25);
     let buffer = frame.backend().buffer();
@@ -2515,7 +2691,7 @@ fn the_composer_carries_a_solid_primary_column_on_its_left_edge() {
     // 25 rows put the composer pane on rows 18..=21 with the text
     // window on row 19, starting two columns in — the edge column owns
     // column 0 alone, thick by construction (paint, not glyphs).
-    let mut plain = app();
+    let mut plain = docked_app();
     let frame = render_to_buffer(&mut plain, 80, 25);
     let buffer = frame.backend().buffer();
     for y in 18..=21u16 {
@@ -2577,7 +2753,7 @@ fn a_press_in_the_composer_places_the_caret_where_it_landed() {
     // composer's text puts the painted caret where it pointed, and a
     // press past the text's end clamps to the end — the caret never
     // leaves the typed run's own extent.
-    let mut app = TuiApp::new(config_with_theme("dracula"));
+    let mut app = docked_app();
     app.handle_event(&Event::Paste("hello world".to_string()));
     let composed = render_to_buffer(&mut app, 80, 24);
     let (end, row) = painted_caret_pos(&composed, app.theme.ui.primary)
@@ -3687,7 +3863,7 @@ fn a_press_below_a_running_tool_clamps_onto_the_tool_row() {
     // empty pane under it anchors on the block itself — the same
     // clamp an editor applies below a document's end — so a drag
     // back over the row selects the running tool's own text.
-    let mut app = app();
+    let mut app = docked_app();
     app.active_tools()
         .lock()
         .expect("the tools lock")
@@ -4331,7 +4507,7 @@ fn mouse_traffic_leaves_the_caret_blink_alone() {
     // one used to restart the blink phase — the caret sat solid
     // through a whole mouse-driven session. Only keyboard input
     // resolidifies the caret now.
-    let mut app = app();
+    let mut app = docked_app();
     let base = std::time::Instant::now();
     let _ = render_to_buffer(&mut app, 80, 24);
     // Advance the clock past the blink interval: the caret goes dark.
@@ -4378,7 +4554,7 @@ fn the_caret_blinks_on_the_tick_and_input_resolidifies_it() {
     // The app owns the blink: half a second visible, half a second
     // gone, beaten on the clock — and any keyboard input resolidifies
     // it and restarts the phase.
-    let mut app = app();
+    let mut app = docked_app();
     app.handle_event(&Event::Paste("hi".to_string()));
     let base = std::time::Instant::now();
     let _ = render_to_buffer(&mut app, 80, 24);
@@ -4462,6 +4638,12 @@ fn the_input_field_grows_with_its_buffer_up_to_the_cap() {
     let (observer, kept) = state.into_observer();
     drop(observer);
     let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    app.push_message(TuiMessage::User {
+        text: "hello".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
 
     // empty composer: one text row — the pane is four rows (a
     // padding row, the text row, another padding row, and the
@@ -4520,7 +4702,7 @@ fn the_input_field_grows_with_its_buffer_up_to_the_cap() {
 
 #[test]
 fn an_exactly_filled_line_stays_visible_with_its_caret_at_the_end() {
-    let mut app = TuiApp::new(config_with_theme("dracula"));
+    let mut app = docked_app();
     let width = 40usize;
     let mut text = String::new();
     for _ in 0..width.saturating_sub(4) {
@@ -4584,7 +4766,7 @@ fn the_caret_stays_inside_the_composer_in_undersized_terminals() {
     // entirely paints no caret at all, and containment holds by
     // absence there.
     for height in [2u16, 3, 4, 5, 6] {
-        let mut app = TuiApp::new(config_with_theme("dracula"));
+        let mut app = docked_app();
         app.handle_event(&plain(KeyCode::Char('x')));
         let typed = render_to_buffer(&mut app, 40, height);
         let buffer = typed.backend().buffer();
@@ -4620,7 +4802,7 @@ fn the_status_bar_paints_only_its_own_rows_in_undersized_terminals() {
     // block grows with the width's demand — air, the context bar, the
     // numbers, and wrapped status text above them on narrow frames.
     for height in [2u16, 3, 4, 5, 6] {
-        let mut app = app();
+        let mut app = docked_app();
         let terminal = render_to_buffer(&mut app, 40, height);
         let buffer = terminal.backend().buffer();
         let bar_rows: Vec<u16> = (0..height)
@@ -4647,16 +4829,16 @@ fn the_conversation_pane_renders_on_the_terminal_s_own_background() {
     // no per-cell paint can differ from the margin beside it. Only the
     // raised surfaces paint: the composer on `surface`, the bar on its
     // own row.
-    let mut app = app();
+    let mut app = docked_app();
     let terminal = render_to_buffer(&mut app, 40, 14);
     let buffer = terminal.backend().buffer();
+    let composer = composer_chunk(40, 14, 4);
     assert_eq!(
-        buffer[(5, 2)].bg,
+        buffer[(5, composer.y.saturating_sub(2))].bg,
         ratatui::style::Color::Reset,
         "the conversation pane leaves its cells to the terminal default — \
          painting them is what shows a seam against the margin"
     );
-    let composer = composer_chunk(40, 14, 4);
     assert_eq!(
         buffer[(1, composer.y)].bg,
         app.theme.ui.surface,
@@ -5108,7 +5290,7 @@ fn f2_cycles_verbosity_and_rerenders_completed_tools() {
 
 #[test]
 fn running_tools_render_their_humanized_summary() {
-    let mut app = app();
+    let mut app = docked_app();
     app.active_tools()
         .lock()
         .expect("the tools lock")
@@ -5327,6 +5509,12 @@ fn a_running_tool_row_expands_to_its_captured_input() {
         },
     );
     let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    app.push_message(TuiMessage::User {
+        text: "hello".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
     app.active_tools()
         .lock()
         .expect("the tools lock")
@@ -5391,6 +5579,12 @@ fn an_expansion_opened_while_running_survives_the_calls_completion() {
         },
     );
     let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    app.push_message(TuiMessage::User {
+        text: "hello".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
     app.active_tools()
         .lock()
         .expect("the tools lock")
@@ -6425,7 +6619,7 @@ fn permission_app(
 ) -> (
     TuiApp,
     tokio::sync::mpsc::UnboundedSender<dch_tui::PermissionRequest>,
-    Vec<tokio::sync::oneshot::Receiver<bool>>,
+    Vec<tokio::sync::oneshot::Receiver<loopctl::middleware::PermissionResolution>>,
 ) {
     let mut app = app();
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -6435,6 +6629,9 @@ fn permission_app(
         tx.send(dch_tui::PermissionRequest {
             tool_name: (*tool).to_string(),
             prompt: (*prompt).to_string(),
+            input: serde_json::Value::Null,
+            always: Vec::new(),
+            never: Vec::new(),
             reply,
         })
         .expect("receiver alive");
@@ -6638,7 +6835,7 @@ fn y_allows_the_pending_request_and_enter_is_swallowed() {
     assert!(app.handle_event(&plain(KeyCode::Char('y'))));
     assert_eq!(
         replies.pop().expect("one reply staged").blocking_recv(),
-        Ok(true),
+        Ok(loopctl::middleware::PermissionResolution::AllowOnce),
         "'y' must answer the ask with allow"
     );
 
@@ -6657,7 +6854,7 @@ fn y_allows_the_pending_request_and_enter_is_swallowed() {
     assert!(app.handle_event(&plain(KeyCode::Char('y'))));
     assert_eq!(
         reply.blocking_recv(),
-        Ok(true),
+        Ok(loopctl::middleware::PermissionResolution::AllowOnce),
         "a later 'y' still answers the ask Enter left pending"
     );
 }
@@ -6668,7 +6865,7 @@ fn n_and_esc_deny_the_pending_request() {
     assert!(app.handle_event(&plain(KeyCode::Char('n'))));
     assert_eq!(
         replies.pop().expect("one reply staged").blocking_recv(),
-        Ok(false),
+        Ok(loopctl::middleware::PermissionResolution::DenyOnce),
         "'n' must answer the ask with deny"
     );
 
@@ -6676,7 +6873,7 @@ fn n_and_esc_deny_the_pending_request() {
     assert!(app.handle_event(&plain(KeyCode::Esc)));
     assert_eq!(
         replies.pop().expect("one reply staged").blocking_recv(),
-        Ok(false),
+        Ok(loopctl::middleware::PermissionResolution::DenyOnce),
         "Esc must answer the ask with deny"
     );
 }
@@ -6697,6 +6894,9 @@ fn other_keys_are_inert_while_a_request_is_pending() {
         .send(dch_tui::PermissionRequest {
             tool_name: "Bash".to_string(),
             prompt: "allow bash?".to_string(),
+            input: serde_json::Value::Null,
+            always: Vec::new(),
+            never: Vec::new(),
             reply,
         })
         .expect("receiver alive");
@@ -6747,6 +6947,9 @@ fn a_burst_of_ready_requests_lands_together() {
             .send(dch_tui::PermissionRequest {
                 tool_name: tool.to_string(),
                 prompt: prompt.to_string(),
+                input: serde_json::Value::Null,
+                always: Vec::new(),
+                never: Vec::new(),
                 reply,
             })
             .expect("receiver alive");
@@ -6756,7 +6959,7 @@ fn a_burst_of_ready_requests_lands_together() {
     let terminal = render_to_buffer(&mut app, 80, 30);
     let screen = screen_text(&terminal);
     assert!(
-        screen.contains("first ask?") && screen.contains("1 more waiting"),
+        screen.contains("first ask?") && screen.contains("more waiting"),
         "the burst lands together and the count reports it: {screen}"
     );
 }
@@ -6774,14 +6977,14 @@ fn queued_requests_render_front_first() {
         "only the front of the queue renders: {screen}"
     );
     assert!(
-        screen.contains("1 more waiting"),
+        screen.contains("more waiting"),
         "the overlay must count what waits behind: {screen}"
     );
 
     assert!(app.handle_event(&plain(KeyCode::Char('y'))));
     assert_eq!(
         replies.remove(0).blocking_recv(),
-        Ok(true),
+        Ok(loopctl::middleware::PermissionResolution::AllowOnce),
         "the keypress answers the front request only"
     );
     let terminal = render_to_buffer(&mut app, 80, 30);
@@ -8337,6 +8540,9 @@ fn a_click_behind_a_pending_prompt_leaves_the_hidden_caret_alone() {
         .send(dch_tui::PermissionRequest {
             tool_name: "Bash".to_string(),
             prompt: "allow bash?".to_string(),
+            input: serde_json::Value::Null,
+            always: Vec::new(),
+            never: Vec::new(),
             reply,
         })
         .expect("receiver alive");
@@ -8352,7 +8558,7 @@ fn a_click_behind_a_pending_prompt_leaves_the_hidden_caret_alone() {
     assert!(app.handle_event(&plain(KeyCode::Char('y'))));
     assert_eq!(
         reply_rx.blocking_recv(),
-        Ok(true),
+        Ok(loopctl::middleware::PermissionResolution::AllowOnce),
         "the prompt still answers after the swallowed click"
     );
     let answered = render_to_buffer(&mut app, 80, 25);
@@ -8401,6 +8607,9 @@ fn a_parked_drag_does_not_scroll_behind_a_pending_prompt() {
         .send(dch_tui::PermissionRequest {
             tool_name: "Bash".to_string(),
             prompt: "allow bash?".to_string(),
+            input: serde_json::Value::Null,
+            always: Vec::new(),
+            never: Vec::new(),
             reply,
         })
         .expect("receiver alive");
@@ -8438,6 +8647,9 @@ fn control_chords_stay_inert_behind_a_pending_prompt() {
         .send(dch_tui::PermissionRequest {
             tool_name: "Bash".to_string(),
             prompt: "allow bash?".to_string(),
+            input: serde_json::Value::Null,
+            always: Vec::new(),
+            never: Vec::new(),
             reply,
         })
         .expect("receiver alive");
@@ -8463,7 +8675,7 @@ fn control_chords_stay_inert_behind_a_pending_prompt() {
     assert!(app.handle_event(&plain(KeyCode::Char('y'))));
     assert_eq!(
         reply_rx.blocking_recv(),
-        Ok(true),
+        Ok(loopctl::middleware::PermissionResolution::AllowOnce),
         "the prompt still answers after the chords"
     );
 }
@@ -8482,16 +8694,18 @@ fn modifier_decorated_keys_do_not_answer_the_prompt() {
     assert!(app.handle_event(&plain(KeyCode::Char('y'))));
     assert_eq!(
         reply.blocking_recv(),
-        Ok(true),
+        Ok(loopctl::middleware::PermissionResolution::AllowOnce),
         "the plain key still answers"
     );
 }
 
 #[test]
 fn ctrl_c_ctrl_c_under_a_pending_prompt_is_one_action_as_ever() {
-    // A permission ask passes the chord (it owns Esc, not Ctrl+C):
-    // the double action behaves exactly as it does without the
-    // sheet — arm, then the one fire that cancels and exits.
+    // The hint's promise: under a permission ask, Ctrl+C cancels the
+    // ask itself — a denial — before the chord ever reaches the app.
+    // The double-press quit returns the moment no ask stands: the
+    // first press after the sheet clears only arms, the second is the
+    // one fire that cancels and exits, exactly as without the sheet.
     let state = dch_tui::TuiObserverState::new();
     let (observer, kept) = state.into_observer();
     drop(observer);
@@ -8505,11 +8719,14 @@ fn ctrl_c_ctrl_c_under_a_pending_prompt_is_one_action_as_ever() {
     }));
 
     let (requests_tx, requests_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (reply, _reply_rx) = tokio::sync::oneshot::channel();
+    let (reply, mut reply_rx) = tokio::sync::oneshot::channel();
     requests_tx
         .send(dch_tui::PermissionRequest {
             tool_name: "Bash".to_string(),
             prompt: "allow bash?".to_string(),
+            input: serde_json::Value::Null,
+            always: Vec::new(),
+            never: Vec::new(),
             reply,
         })
         .expect("receiver alive");
@@ -8518,9 +8735,21 @@ fn ctrl_c_ctrl_c_under_a_pending_prompt_is_one_action_as_ever() {
 
     assert!(app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL)));
     assert_eq!(
+        reply_rx.try_recv(),
+        Ok(loopctl::middleware::PermissionResolution::DenyOnce),
+        "under the sheet, the first press cancels the ask — a denial"
+    );
+    assert_eq!(
         cancels.lock().expect("sink").len(),
         0,
-        "through the sheet the first press still only arms"
+        "the ask's cancel is not the run's cancel — nothing armed or fired"
+    );
+
+    assert!(app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+    assert_eq!(
+        cancels.lock().expect("sink").len(),
+        0,
+        "with no ask standing, the first press still only arms"
     );
     assert!(!app.is_quitting(), "the arming press leaves nothing");
 
@@ -8528,7 +8757,7 @@ fn ctrl_c_ctrl_c_under_a_pending_prompt_is_one_action_as_ever() {
     assert_eq!(
         cancels.lock().expect("sink").len(),
         1,
-        "the fire cancels through the sheet as without it"
+        "the fire cancels as without the sheet"
     );
     assert!(app.is_quitting(), "and the same fire terminates");
 }
@@ -8783,6 +9012,12 @@ fn the_pulse_strip_sits_above_the_composer_in_the_border_color() {
 #[test]
 fn an_idle_frame_draws_no_pulse_strip() {
     let (_observer, mut app) = thinking_app();
+    app.push_message(TuiMessage::User {
+        text: "hello".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
     let terminal = render_to_buffer(&mut app, 80, 24);
     let theme = dch_tui::theme::Theme::by_name("dracula").expect("the theme exists");
     let buffer = terminal.backend().buffer();
@@ -8890,6 +9125,12 @@ fn a_stale_living_buffer_after_the_run_draws_nothing() {
         .agent_running
         .store(true, std::sync::atomic::Ordering::Relaxed);
     let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), state.clone());
+    app.push_message(TuiMessage::User {
+        text: "hello".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
     observer.on_thinking_delta(&thinking_delta(
         0,
         "orphaned by a cancel that fired no event",
@@ -9644,6 +9885,9 @@ fn page_keys_page_the_transcript_behind_a_permission_ask() {
         .send(dch_tui::PermissionRequest {
             tool_name: "Bash".to_string(),
             prompt: "allow bash?".to_string(),
+            input: serde_json::Value::Null,
+            always: Vec::new(),
+            never: Vec::new(),
             reply,
         })
         .expect("receiver alive");
@@ -9660,7 +9904,7 @@ fn page_keys_page_the_transcript_behind_a_permission_ask() {
     assert!(app.handle_event(&plain(KeyCode::Char('y'))));
     assert_eq!(
         reply_rx.try_recv(),
-        Ok(true),
+        Ok(loopctl::middleware::PermissionResolution::AllowOnce),
         "the ask still answers after the paging key"
     );
 }
@@ -9679,6 +9923,9 @@ fn a_click_behind_the_permission_sheet_moves_nothing() {
             .send(dch_tui::PermissionRequest {
                 tool_name: "Bash".to_string(),
                 prompt: "allow bash?".to_string(),
+                input: serde_json::Value::Null,
+                always: Vec::new(),
+                never: Vec::new(),
                 reply,
             })
             .expect("receiver alive");
@@ -9695,7 +9942,7 @@ fn a_click_behind_the_permission_sheet_moves_nothing() {
 
     // The map first: with nothing on the screen this press is a click on
     // the composer's text, and the caret goes where it was pointed.
-    let mut bare = app();
+    let mut bare = docked_app();
     bare.handle_event(&Event::Paste("hello world".to_string()));
     let _ = render_to_buffer(&mut bare, 80, 25);
     assert!(click_the_composer(&mut bare));
@@ -11427,7 +11674,7 @@ fn the_readout_leads_the_footer_and_the_session_id_centers_it() {
     // too narrow for the id to clear the bar forgoes it rather than
     // truncating it, and the directory the bar once carried rides
     // the place row above the composer instead.
-    let mut app = app();
+    let mut app = docked_app();
     app.set_working_dir(std::path::Path::new("/home/tester/repos/dch"));
     app.set_git_branch(Some("master".to_string()));
     app.set_session_id("f005d097-c4ce-477a-88c0-2fc2fc000000".to_string());
@@ -11507,6 +11754,14 @@ fn autumn_night_keeps_its_track_a_visible_step_off_the_bar() {
     // step — every channel at least sixteen off the bar's background —
     // and the empty track must actually paint on the bar's row.
     let mut app = TuiApp::new(config_with_theme("autumn_night"));
+    // The footer belongs to a conversation with turns — the welcome
+    // paints none — so the bar rides a landed prompt.
+    app.push_message(TuiMessage::User {
+        text: "hello".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
     let (track, bar_bg) = (app.theme.ui.scrollbar_track, app.theme.ui.status_bar_bg);
     let (track_rgb, bar_rgb) = (rgb_of(track), rgb_of(bar_bg));
     let delta = std::iter::zip(track_rgb, bar_rgb)
@@ -13093,6 +13348,12 @@ fn the_notice_rides_the_place_row_and_saves_its_own() {
     // keeps the row for the conversation, and the notice is exactly as
     // visible as it ever was.
     let (mut app, _kept) = app_with_state();
+    app.push_message(TuiMessage::User {
+        text: "hello".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
     app.set_working_dir(std::path::Path::new("/home/dch/repos/dch"));
     app.set_git_branch(Some("feat/x".to_string()));
     app.post_notice("THE NOTICE SPEAKS".to_string());
@@ -13122,6 +13383,12 @@ fn a_place_less_frame_keeps_the_reserved_notice_row() {
     // always had: reserved, blank when silent, right-aligned when it
     // speaks — nothing on screen shifts when a message arrives.
     let (mut app, _kept) = app_with_state();
+    app.push_message(TuiMessage::User {
+        text: "hello".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
     app.post_notice("THE NOTICE SPEAKS".to_string());
     let terminal = render_to_buffer(&mut app, 80, 26);
     let rows = row_texts(&terminal);
@@ -13145,6 +13412,12 @@ fn a_wide_glyph_notice_reserves_its_full_width() {
     // in cells, the place keeps the columns the notice needs and both
     // texts stand whole on the row.
     let (mut app, _kept) = app_with_state();
+    app.push_message(TuiMessage::User {
+        text: "hello".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
     app.set_working_dir(std::path::Path::new("/home/dch/repos/dch"));
     app.post_notice("ワイドゴ通知".to_string());
     let terminal = render_to_buffer(&mut app, 80, 26);
@@ -13356,6 +13629,12 @@ fn a_notice_that_fills_the_row_leaves_the_place_no_cell() {
     // notice stands whole, right-aligned, with the row's first cell
     // blank beside it.
     let (mut app, _kept) = app_with_state();
+    app.push_message(TuiMessage::User {
+        text: "hello".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
     app.set_working_dir(std::path::Path::new("/home/dch/repos/dch"));
     let notice = "THE NOTICE FILLS THE ROW IT SITS ON";
     assert_eq!(

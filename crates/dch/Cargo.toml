@@ -51,6 +51,7 @@ name = "resume_stale_real"
 name = "tui_final_settle"
 
 [dependencies]
+dch-permissions = { workspace = true }
 dch-loop = { workspace = true }
 dch-tui = { workspace = true }
 dch-config = { workspace = true }

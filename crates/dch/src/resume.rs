@@ -133,6 +133,16 @@ pub(crate) struct ResumeOutcome {
     /// resume never renames. A title-less old session stays
     /// title-less until a later prompt names it.
     pub(crate) title: Option<String>,
+
+    /// The session's permission-mode override, from the envelope.
+    ///
+    /// What the resumed session runs under instead of the
+    /// configuration's global default: the launching host folds it
+    /// into its config before the gate exists, and the saver keeps
+    /// recording it, so later auto-saves never lose the choice. An
+    /// absent override — the field is `None` — means the
+    /// configuration governs, as always.
+    pub(crate) permission_mode: Option<dch_config::PermissionMode>,
 }
 
 /// Why a resume could not load a session.
@@ -227,6 +237,35 @@ pub(crate) fn adopt_resumed_model(
     }
 }
 
+/// Fold the resumed session's permission-mode override into the boot
+/// config, unless the CLI names a mode outright.
+///
+/// A session that was moved — `/mode` — or launched with a flag keeps
+/// its own mode on resume: the envelope's record outranks the
+/// configuration's global default, the same precedence the model
+/// adoption applies. The CLI flag outranks both — an explicit
+/// `--permission-mode` is a per-run statement — and the launching
+/// saver records whatever it names, so the flag becomes the session's
+/// standing override from this run forward. The live config moves
+/// alone: the base keeps the configuration's own default, so a
+/// `/clear`'s fresh session falls back to exactly what the user
+/// configured, and a session without an override of its own reads the
+/// same default from a resume.
+pub(crate) fn adopt_resumed_permission_mode(
+    config: &mut dch_config::DchConfig,
+    control: &ResumeControl,
+    cli_named: bool,
+) {
+    if cli_named {
+        return;
+    }
+    if let ResumeControl::Resumed(outcome) = control
+        && let Some(mode) = outcome.permission_mode
+    {
+        config.runner.permission_mode = mode;
+    }
+}
+
 /// Resolve the resume intent against `base` instead of the default
 /// sessions directory.
 ///
@@ -254,53 +293,7 @@ pub(crate) fn resolve_resume_in(args: &Args, base: &Path) -> ResumeControl {
         }
     };
     match load_for_resume_in(id, base) {
-        Ok(mut outcome) => {
-            // A snapshot can be stamped fresh yet hold far less than
-            // the transcript beside it — a mid-run publish freeze
-            // stamps the stale half with every save. When the engine
-            // half is implausibly behind a long transcript that shows
-            // no compaction (the one legitimate way a snapshot
-            // shrinks), adopting it would silently amneses everything
-            // after the freeze; deriving from the transcript instead
-            // loses formatting, never content.
-            if let Some(machine) = &outcome.machine {
-                let exchanges = outcome
-                    .messages
-                    .iter()
-                    .filter(|message| {
-                        matches!(
-                            message,
-                            TuiMessage::User { .. } | TuiMessage::Assistant { .. }
-                        )
-                    })
-                    .count();
-                let compacted = outcome.machine_compactions > 0
-                    || outcome
-                        .messages
-                        .iter()
-                        .any(|message| matches!(message, TuiMessage::Compacted { .. }));
-                let frozen =
-                    machine.len().saturating_mul(3) < exchanges && exchanges >= 12 && !compacted;
-                if frozen {
-                    tracing::warn!(
-                        session = %id,
-                        machine_messages = machine.len(),
-                        transcript_exchanges = exchanges,
-                        "machine history implausibly behind the transcript; deriving \
-                         the resume from the display transcript"
-                    );
-                    outcome.machine = None;
-                    outcome.messages.push(TuiMessage::System {
-                        text: "the session's engine snapshot was stale; the resume \
-                               derived its context from the transcript — formatting \
-                               was lost, content was not"
-                            .to_string(),
-                        timestamp: chrono::Utc::now(),
-                    });
-                }
-            }
-            ResumeControl::Resumed(outcome)
-        }
+        Ok(outcome) => ResumeControl::Resumed(checked_resume_outcome(id, outcome)),
         Err(ResumeError::NotFound(missing)) => ResumeControl::Fresh {
             session_id: None,
             warn: Some(format!(
@@ -314,36 +307,94 @@ pub(crate) fn resolve_resume_in(args: &Args, base: &Path) -> ResumeControl {
                  starting a fresh session — the file was not modified"
             )),
         },
-        Err(ResumeError::Io(err)) => {
-            // The session's own file is unreadable — worth a hard
-            // stop, not a silent degrade. A headless caller polling a
-            // done-file must hear about this exit, so the bootstrap
-            // marker rules apply here exactly as they do for a
-            // runtime that fails to construct.
-            let (message, marker) = io_exit_report(args, std::io::stdin().is_terminal(), &err);
-            if let Some(path) = marker
-                && let Err(write_err) = crate::done::write_done_file(
-                    &path,
-                    &crate::done::DoneStatus::failure(message.clone()),
-                    None,
-                )
-            {
-                crate::signals::report(&format!(
-                    "dch: cannot write the done-file at {}: {write_err}",
-                    path.display()
-                ));
-            }
-            crate::signals::report(&format!("dch: {message}"));
-            std::process::exit(1);
-        }
+        Err(ResumeError::Io(err)) => io_exit(args, &err),
     }
+}
+
+/// The resumed outcome, minus an engine snapshot that fell behind.
+///
+/// [`resolve_resume_in`]'s plausibility rule: the freshness rule
+/// covers timestamps, and this covers arithmetic — a machine history
+/// holding less than a third of the transcript's user/assistant
+/// exchanges, over at least twelve of them, with no compaction on
+/// either half to explain the gap, was written by something other
+/// than this session's turns and would seed the runner with a
+/// fraction of the conversation. Such a snapshot is dropped — the
+/// resume derives from the display transcript, formatting lost,
+/// content not — and a system message tells the user what happened.
+fn checked_resume_outcome(id: Uuid, mut outcome: ResumeOutcome) -> ResumeOutcome {
+    let Some(machine) = outcome.machine.as_ref() else {
+        return outcome;
+    };
+    let machine_messages = machine.len();
+    let exchanges = outcome
+        .messages
+        .iter()
+        .filter(|message| {
+            matches!(
+                message,
+                TuiMessage::User { .. } | TuiMessage::Assistant { .. }
+            )
+        })
+        .count();
+    let compacted = outcome.machine_compactions > 0
+        || outcome
+            .messages
+            .iter()
+            .any(|message| matches!(message, TuiMessage::Compacted { .. }));
+    let frozen = machine_messages.saturating_mul(3) < exchanges && exchanges >= 12 && !compacted;
+    if !frozen {
+        return outcome;
+    }
+    tracing::warn!(
+        session = %id,
+        machine_messages,
+        transcript_exchanges = exchanges,
+        "machine history implausibly behind the transcript; deriving \
+         the resume from the display transcript"
+    );
+    outcome.machine = None;
+    outcome.messages.push(TuiMessage::System {
+        text: "the session's engine snapshot was stale; the resume \
+               derived its context from the transcript — formatting \
+               was lost, content was not"
+            .to_string(),
+        timestamp: chrono::Utc::now(),
+    });
+    outcome
+}
+
+/// The hard stop an unreadable session file earns.
+///
+/// [`resolve_resume_in`]'s `Io` arm, split out whole: a session whose
+/// own file cannot be read is worth a hard stop, not a silent
+/// degrade — and a headless caller polling a done-file must hear
+/// about this exit, so the bootstrap marker rules apply here exactly
+/// as they do for a runtime that fails to construct. Never returns.
+fn io_exit(args: &Args, err: &std::io::Error) -> ! {
+    let (message, marker) = io_exit_report(args, std::io::stdin().is_terminal(), err);
+    if let Some(path) = marker
+        && let Err(write_err) = crate::done::write_done_file(
+            &path,
+            &crate::done::DoneStatus::failure(message.clone()),
+            None,
+        )
+    {
+        crate::signals::report(&format!(
+            "dch: cannot write the done-file at {}: {write_err}",
+            path.display()
+        ));
+    }
+    crate::signals::report(&format!("dch: {message}"));
+    std::process::exit(1)
 }
 
 /// What the unreadable-session-file exit reports, and where its
 /// done-file marker lands.
 ///
-/// The decision half of the resume `Io` arm, split from the exit it
-/// ends in so the marker rules are pinnable without killing a test
+/// The decision half of the resume `Io` arm, split from [`io_exit`]
+/// — the exit it ends in — so the marker rules are pinnable without
+/// killing a test
 /// process: the message names the failing read, and the marker goes
 /// exactly where a headless run's runtime-failure marker would —
 /// single-run shapes with `--done-file`, nothing else.
@@ -506,6 +557,7 @@ pub(crate) fn load_for_resume_in(id: Uuid, base: &Path) -> Result<ResumeOutcome,
         machine,
         machine_compactions,
         title: loaded.title,
+        permission_mode: loaded.permission_mode,
     })
 }
 
@@ -1061,6 +1113,7 @@ mod tests {
         let outcome = ResumeOutcome {
             session_id: Uuid::nil(),
             model: "glm-5.3".to_string(),
+            permission_mode: None,
             messages: Vec::new(),
             tokens: crate::session::SessionTokens::default(),
             machine: None,
@@ -1115,6 +1168,59 @@ mod tests {
     }
 
     #[test]
+    fn a_resumed_mode_override_adopts_unless_the_flag_named_one() {
+        // The session's own mode outranks the configuration's global
+        // default, the CLI flag outranks the session, and a session
+        // without an override leaves the configuration standing.
+        let mut config = dch_config::DchConfig::default();
+        let base = config.clone();
+        let outcome = ResumeOutcome {
+            session_id: Uuid::nil(),
+            model: String::new(),
+            permission_mode: Some(dch_config::PermissionMode::Interactive),
+            messages: Vec::new(),
+            tokens: crate::session::SessionTokens::default(),
+            machine: None,
+            machine_compactions: 0,
+            title: None,
+        };
+        let control = ResumeControl::Resumed(outcome);
+
+        adopt_resumed_permission_mode(&mut config, &control, false);
+        assert_eq!(
+            config.runner.permission_mode,
+            dch_config::PermissionMode::Interactive,
+            "the session's own override is what a resume runs under"
+        );
+        assert_eq!(
+            base.runner.permission_mode,
+            dch_config::PermissionMode::Auto,
+            "the base keeps the configuration's default for a fresh session"
+        );
+
+        let mut flagged = config.clone();
+        flagged.runner.permission_mode = dch_config::PermissionMode::Interactive;
+        adopt_resumed_permission_mode(&mut flagged, &control, true);
+        assert_eq!(
+            flagged.runner.permission_mode,
+            dch_config::PermissionMode::Interactive,
+            "the CLI flag outranks the session file's own record"
+        );
+
+        let mut plain = dch_config::DchConfig::default();
+        let fresh_start = ResumeControl::Fresh {
+            session_id: None,
+            warn: None,
+        };
+        adopt_resumed_permission_mode(&mut plain, &fresh_start, false);
+        assert_eq!(
+            plain.runner.permission_mode,
+            dch_config::PermissionMode::Auto,
+            "a fresh start runs the configuration's default"
+        );
+    }
+
+    #[test]
     fn a_blank_saved_model_adopts_nothing() {
         // A default config's `api.model = ""` is what a headless save
         // records when no model was configured. Resuming that session
@@ -1125,6 +1231,7 @@ mod tests {
             let outcome = ResumeOutcome {
                 session_id: Uuid::nil(),
                 model: blank.to_string(),
+                permission_mode: None,
                 messages: Vec::new(),
                 tokens: crate::session::SessionTokens::default(),
                 machine: None,
@@ -2210,6 +2317,7 @@ model = "plain"
         let outcome = ResumeOutcome {
             session_id: Uuid::nil(),
             model: "plain".to_string(),
+            permission_mode: None,
             messages: Vec::new(),
             tokens: crate::session::SessionTokens::default(),
             machine: None,
@@ -2266,6 +2374,7 @@ model = "plain"
         let outcome = ResumeOutcome {
             session_id: Uuid::nil(),
             model: "m".to_string(),
+            permission_mode: None,
             messages: Vec::new(),
             machine: Some(machine),
             tokens: crate::session::SessionTokens::default(),
@@ -2320,6 +2429,7 @@ model = "plain"
         let outcome = ResumeOutcome {
             session_id: Uuid::nil(),
             model: "m".to_string(),
+            permission_mode: None,
             messages: Vec::new(),
             machine: Some(machine),
             tokens: crate::session::SessionTokens::default(),
@@ -2367,6 +2477,7 @@ model = "plain"
         let outcome = ResumeOutcome {
             session_id: Uuid::nil(),
             model: "m".to_string(),
+            permission_mode: None,
             messages: Vec::new(),
             machine: Some(machine.clone()),
             tokens: crate::session::SessionTokens::default(),

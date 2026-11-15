@@ -14,7 +14,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use dch_tui::CompactionFiling;
 use dch_tui::HealthNotice;
+use dch_tui::PermissionMemory;
 use dch_tui::PermissionRequest;
+use dch_tui::PermissionRule;
 use dch_tui::QuestionPrompt;
 use dch_tui::ResumedTokens;
 use dch_tui::SessionCommand;
@@ -134,11 +136,73 @@ fn launch_saver(
     model: String,
     workdir: &std::path::Path,
     title: Option<String>,
+    permission_mode: Option<dch_config::PermissionMode>,
 ) -> Arc<crate::session::SessionSaver> {
     Arc::new(
         crate::session::SessionSaver::with_model(session_id, model)
             .with_workdir(workdir)
-            .with_title(title),
+            .with_title(title)
+            .with_permission_mode(permission_mode),
+    )
+}
+
+/// Lifted for length: the launch identity and the save target it
+/// writes through.
+///
+/// Consumes the resume control into the session id — a resumed display
+/// is seeded with its transcript, a degraded fresh start says its warn
+/// — and builds the saver: model, workdir, resumed title, and the
+/// session's standing permission override recorded together. The
+/// override is the CLI flag's choice when it named one — from this run
+/// forward the session's own — otherwise the resumed file's record,
+/// and none at all on a fresh start without the flag. Returns the
+/// saver, the id the status bar shows, and the machine snapshot the
+/// engine seeding consumes later.
+fn launch_identity(
+    app: &mut TuiApp,
+    control: ResumeControl,
+    runner: &dch_loop::Runner,
+    args: &Args,
+    flag_mode: dch_config::PermissionMode,
+    model: String,
+    workdir: &std::path::Path,
+) -> (
+    Arc<crate::session::SessionSaver>,
+    uuid::Uuid,
+    Option<Vec<loopctl::message::Message>>,
+) {
+    let mut resumed_machine: Option<Vec<loopctl::message::Message>> = None;
+    let mut resumed_title: Option<String> = None;
+    let mut resumed_permission_mode: Option<dch_config::PermissionMode> = None;
+    let session_id = match control {
+        ResumeControl::Resumed(outcome) => {
+            resumed_machine = outcome.machine;
+            resumed_title = outcome.title;
+            resumed_permission_mode = outcome.permission_mode;
+            app.seed_messages(outcome.messages);
+            outcome.session_id
+        }
+        ResumeControl::Fresh { session_id, warn } => {
+            report_fresh_warn(app, warn);
+            session_id.unwrap_or_else(|| runner.session_id())
+        }
+    };
+    app.set_session_id(session_id.to_string());
+    let permission_override = if args.permission_mode.is_some() {
+        Some(flag_mode)
+    } else {
+        resumed_permission_mode
+    };
+    (
+        launch_saver(
+            session_id,
+            model,
+            workdir,
+            resumed_title,
+            permission_override,
+        ),
+        session_id,
+        resumed_machine,
     )
 }
 
@@ -167,23 +231,16 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
         crate::signals::report(&format!("dch: {warn}"));
     }
     let (config, config_base, config_file) = resolve_session_config_pair(args, &control)?;
-
+    let flag_mode = config.runner.permission_mode;
     let workdir = std::env::current_dir().map_err(|err| format!("cannot determine cwd: {err}"))?;
-
     let (observer, state) = TuiObserverState::new()
         .with_secret_redaction(config.security.redact_secrets)
         .into_observer();
     seed_resumed_tokens(&state, &control);
-    let (lanes, permission_rx, prompt_rx) = InteractiveLanes::bridges();
+    let (lanes, permission_rx, prompt_rx, permission_memory) = InteractiveLanes::bridges(&config);
     let shutting_down = Arc::new(AtomicBool::new(false));
-    let mut builder = assemble_runner_builder(
-        &config,
-        &workdir,
-        observer,
-        &state,
-        Arc::clone(&lanes.permission),
-        &shutting_down,
-    );
+    let mut builder =
+        assemble_runner_builder(&config, &workdir, observer, &state, &lanes, &shutting_down);
     if let ResumeControl::Resumed(outcome) = &control {
         builder = builder.with_history(crate::resume::history_for_resume(
             outcome,
@@ -209,12 +266,10 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
 
     // The cooperative interrupt bridge: the first external SIGINT or
     // SIGTERM cancels the run in flight; the forced second press
-    // restores the terminal before the bridge's own exit.
-    // The live handles the display reads: stored once here and after
-    // every runner rebuild, so Esc,Esc and Ctrl+S always reach the
-    // CURRENT runner, never a stale one from before a /model or
-    // /resume swap. The guidance share is the panel's own steer handle —
-    // the same Arc the adopted state holds.
+    // restores the terminal before the bridge's own exit. The live
+    // handles the display reads — stored once here and after every
+    // runner rebuild, so Esc,Esc and Ctrl+S always reach the CURRENT
+    // runner. The guidance share is the panel's own steer handle.
     let guidance: Option<Arc<dyn dch_tui::Guidance>> = Some(Arc::new(LoopGuidance {
         steering: runner.steering(),
     }));
@@ -228,53 +283,39 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
     let (submit_tx, submit_rx) = mpsc::unbounded_channel();
     let (session_tx, session_rx) = mpsc::unbounded_channel();
     let model = config.api.model.clone();
-    let mouse_capture = config.display.mouse_capture;
     let driver_config = config.clone();
     let driver_base = Arc::new(config_base.clone());
     let mut app = TuiApp::from_observer_state(config, state.clone());
     app.set_config_base(config_base);
+    let file_permission_default = config_file.runner.permission_mode;
     app.set_config_file(config_file);
     app.set_submit_tx(submit_tx);
     app.set_guidance(guidance.clone());
     app.set_permission_requests(permission_rx);
+    app.set_permission_memory(permission_memory.clone());
+    app.set_permission_mode_cell(Some(Arc::clone(&lanes.mode_cell)));
+    app.set_permission_config_rules_cell(Some(Arc::clone(&lanes.config_rules_cell)));
     app.set_question_requests(prompt_rx);
     app.set_session_requests(session_rx);
     app.set_working_dir(&workdir);
     app.set_config_persist_dir(Some(dch_config::config_dir()));
     app.set_git_branch(git_branch(&workdir));
-
-    let mut resumed_machine: Option<Vec<loopctl::message::Message>> = None;
-    let mut resumed_title: Option<String> = None;
-    let session_id = match control {
-        ResumeControl::Resumed(outcome) => {
-            app.seed_messages(outcome.messages);
-            resumed_machine = outcome.machine;
-            resumed_title = outcome.title;
-            outcome.session_id
-        }
-        ResumeControl::Fresh { session_id, warn } => {
-            if let Some(warn) = warn {
-                app.push_message(TuiMessage::System {
-                    text: warn,
-                    timestamp: chrono::Utc::now(),
-                });
-            }
-            session_id.unwrap_or_else(|| runner.session_id())
-        }
-    };
-    app.set_session_id(session_id.to_string());
-
-    let saver = launch_saver(session_id, model, &workdir, resumed_title);
+    if let Some(notice) = dch_tui::terminal::tmux_color_notice() {
+        app.post_notice(notice);
+    }
+    let (saver, _session_id, resumed_machine) =
+        launch_identity(&mut app, control, &runner, args, flag_mode, model, &workdir);
     let (transcript_handle, transcript_worker) = TranscriptWorker::spawn(saver);
     let initial_transcript = transcript_handle.clone();
+    wire_permission_memory(&permission_memory, &initial_transcript);
     let exit_saver = Arc::clone(&initial_transcript.saver);
     install_turn_end_hook(&mut app, &state, transcript_handle);
 
     initial_transcript.send(app.conversation().to_vec(), snapshot_tokens(&state.tokens));
 
     TerminalGuard::install_panic_hook();
-    let (guard, mut terminal) =
-        TerminalGuard::new(mouse_capture).map_err(|err| format!("terminal init: {err}"))?;
+    let (guard, mut terminal) = TerminalGuard::new(driver_config.display.mouse_capture)
+        .map_err(|err| format!("terminal init: {err}"))?;
     if dch_tui::sync_default_background(app.theme.ui.background) {
         dch_tui::set_cursor_color(app.theme.ui.primary);
     } else {
@@ -292,18 +333,20 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
         app.conversation(),
         &initial_transcript,
     );
+    let mut driver_context = session_driver_context(
+        driver_config,
+        driver_base,
+        workdir.clone(),
+        state.clone(),
+        Arc::clone(&shutting_down),
+        lanes,
+        args,
+    );
+    driver_context.overrides.permission_default = file_permission_default;
     let driver = tokio::spawn(Box::pin(run_driver_loop(
         runner,
         submit_rx,
-        session_driver_context(
-            driver_config,
-            driver_base,
-            workdir.clone(),
-            state.clone(),
-            Arc::clone(&shutting_down),
-            lanes,
-            args,
-        ),
+        driver_context,
         initial_transcript,
         session_tx,
     )));
@@ -355,6 +398,8 @@ fn session_driver_context(
         overrides: RunOverrides {
             model: args.model.clone(),
             reasoning_effort: args.config.reasoning_effort.clone(),
+            permission_named: args.permission_mode.is_some(),
+            permission_default: dch_config::PermissionMode::default(),
         },
     }
 }
@@ -414,7 +459,7 @@ fn assemble_runner_builder<'a>(
     workdir: &std::path::Path,
     observer: dch_tui::TuiObserver,
     state: &dch_tui::TuiObserverState,
-    permission_resolver: dch_loop::AskResolverFn,
+    lanes: &InteractiveLanes,
     shutting_down: &Arc<AtomicBool>,
 ) -> dch_loop::RunnerBuilder<'a> {
     let nudge_gate = Arc::clone(shutting_down);
@@ -427,7 +472,10 @@ fn assemble_runner_builder<'a>(
                 config.security.redact_secrets,
             ),
         ))
-        .with_permission_resolver(permission_resolver)
+        .with_permission_resolver(Arc::clone(&lanes.permission))
+        .with_permission_mode_cell(Arc::clone(&lanes.mode_cell))
+        .with_permission_config_rules(lanes.config_rules_view())
+        .with_permission_memory(lanes.memory_snapshot())
         .with_retirement_sink(retirements)
         .with_todo_nudge(
             move |_reminder| {
@@ -758,7 +806,9 @@ impl TranscriptHandle {
     /// the writer thread, so the turn-end hook's own handle — a clone of
     /// this one — begins writing under the new id from its next publish.
     /// The recorded model is the loop's current one, so the fresh file's
-    /// provenance names the loop that writes it. Returns the new session id
+    /// provenance names the loop that writes it, and the fresh identity
+    /// drops any permission-mode override — a fresh session runs the
+    /// configuration's default. Returns the new session id
     /// as the status bar renders it, so the driver can publish it to the
     /// display.
     fn rotate(&self, model: &str) -> String {
@@ -768,7 +818,8 @@ impl TranscriptHandle {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let fresh = saver
             .with_identity(uuid::Uuid::new_v4(), model.to_string())
-            .with_title(None);
+            .with_title(None)
+            .with_permission_mode(None);
         let id = fresh.session_id().to_string();
         *saver = Arc::new(fresh);
         id
@@ -782,14 +833,28 @@ impl TranscriptHandle {
     /// rather than orphaning it under a fresh one. Like a rotation, a
     /// save already published keeps its own destination. The model
     /// recorded is the loop's current one, the same provenance a
-    /// launch resume files under. Returns the id as the status bar
-    /// renders it, so the driver can publish it to the display.
-    fn retarget(&self, id: uuid::Uuid, model: &str, title: Option<String>) -> String {
+    /// launch resume files under, and the adopted session's own
+    /// permission-mode override rides along — `None` when it never
+    /// carried one, dropping whatever the ended session had. Returns
+    /// the id as the status bar renders it, so the driver can publish
+    /// it to the display.
+    fn retarget(
+        &self,
+        id: uuid::Uuid,
+        model: &str,
+        title: Option<String>,
+        permission_mode: Option<dch_config::PermissionMode>,
+    ) -> String {
         let mut saver = self
             .saver
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *saver = Arc::new(saver.with_identity(id, model.to_string()).with_title(title));
+        *saver = Arc::new(
+            saver
+                .with_identity(id, model.to_string())
+                .with_title(title)
+                .with_permission_mode(permission_mode),
+        );
         id.to_string()
     }
 
@@ -878,6 +943,24 @@ impl TranscriptHandle {
         }
         let model = saver.model.clone();
         *saver = Arc::new(saver.with_identity(id, model).with_title(Some(title)));
+    }
+
+    /// Record the session's permission-mode override on the save target.
+    ///
+    /// A `/mode` move's remembering half: the mode the loop enforces is
+    /// the session's own from the next save on. The identity, model,
+    /// workdir, and title ride untouched — like a title, the override
+    /// belongs to whatever session the cell currently targets — and
+    /// passing `None` drops the override, which a `/clear`'s fresh
+    /// identity does on purpose.
+    fn set_permission_mode(&self, mode: Option<dch_config::PermissionMode>) {
+        let mut saver = self
+            .saver
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let id = saver.session_id();
+        let model = saver.model.clone();
+        *saver = Arc::new(saver.with_identity(id, model).with_permission_mode(mode));
     }
 }
 
@@ -1132,9 +1215,6 @@ impl TranscriptWorker {
                 if display.is_none() && machine.is_none() {
                     break;
                 }
-                // Each snapshot carries the destination it was published
-                // under: a rotation that lands after the publish cannot
-                // redirect a save already in flight.
                 if let Some(snapshot) = display
                     && let Err(err) = snapshot.saver.save_at(
                         &snapshot.messages,
@@ -1256,35 +1336,157 @@ impl dch_tui::Guidance for LoopGuidance {
     }
 }
 
+/// The startup half of the "allow always" lane: a resumed session
+/// adopts its own remembered choices at open (a fresh one finds
+/// nothing to adopt), and every later remember writes through the
+/// live saver cell — a rotation — `/clear`, a live resume — swaps the
+/// target, and the hook reads the cell, so a choice always lands in
+/// the session file that is current when it is made.
+fn wire_permission_memory(memory: &PermissionMemory, transcript: &TranscriptHandle) {
+    let launch_saver = transcript
+        .saver
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let (allow, deny) = launch_saver.load_permissions();
+    memory.adopt(allow, deny);
+    let persist_cell = Arc::clone(&transcript.saver);
+    memory.persist_through(Arc::new(move |allow, deny| {
+        let saver = persist_cell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Err(why) = saver.save_permissions(allow, deny) {
+            tracing::warn!(error = %why, "remembered permissions could not be saved");
+        }
+    }));
+}
+
+/// Post a fresh session's boot warning, when one was earned, as the
+/// transcript's opening system row.
+///
+/// Lifted from the launch path so [`launch_identity`] reads as one
+/// shape: the resumed half seeds messages wholesale, the fresh half
+/// opens with its warning, if any, and nothing else.
+fn report_fresh_warn(app: &mut dch_tui::TuiApp, warn: Option<String>) {
+    if let Some(warn) = warn {
+        app.push_message(dch_tui::TuiMessage::System {
+            text: warn,
+            timestamp: chrono::Utc::now(),
+        });
+    }
+}
+
 /// Bridge the runner's permission gate to the app's overlay.
 ///
-/// Returns the resolver the runner's `Ask` cells consult and the
-/// receiver end of the channel the resolver hands requests to: each
-/// consultation creates a oneshot reply, ships the request to the UI,
-/// and awaits the answer — a dropped request or a closed channel
-/// reads as a denial, and the gate itself races the run's cancel
-/// signal so a cancelled prompt never waits on the UI.
+/// Returns the typed resolver the runner's `Ask` cells consult and the
+/// receiver end of the channel the resolver hands requests to. Every
+/// ask that reaches here is fresh: the gate consults the session's
+/// remembered approvals itself, per dispatch, and answers a covered ask
+/// on its own — so the resolver re-derives from the ask's raw input the
+/// rules an "always" answer would record (the same pure derivation the
+/// gate computes, deterministic, so nothing needs to travel beside the
+/// ask), ships the request to the UI, and awaits the typed answer. A
+/// dropped request or a closed channel reads as a denial, and the gate
+/// itself races the run's cancel signal so a cancelled prompt never
+/// waits on the UI.
 fn permission_bridge() -> (
-    loopctl::middleware::AskResolverFn,
+    std::sync::Arc<dyn loopctl::middleware::PermissionAskResolver>,
     mpsc::UnboundedReceiver<PermissionRequest>,
 ) {
     let (requests_tx, requests_rx) = mpsc::unbounded_channel();
-    let resolver: loopctl::middleware::AskResolverFn = Arc::new(move |prompt: &str, tool: &str| {
+    let resolver: std::sync::Arc<dyn loopctl::middleware::PermissionAskResolver> =
+        Arc::new(PanelBridge { requests_tx });
+    (resolver, requests_rx)
+}
+
+/// The typed permission resolver: loopctl's ask in, the panel's
+/// request out.
+///
+/// The rules each press would record are derived from the ask's raw
+/// input at answer time — [`dch_permissions::remember_rules`] and
+/// [`dch_permissions::deny_rules`] are pure and deterministic, so
+/// these derivations are exactly the ones the gate's evaluation would
+/// have computed — grounded on the ask's own working directory, the
+/// base the gate spelled the call's write targets on. The allow side
+/// mints every segment (readers included); the deny side is the
+/// narrow derivation — readers mint nothing, so a refusal bans
+/// the work, not the pipe beside it.
+struct PanelBridge {
+    /// The channel the panel's requests travel on.
+    ///
+    /// Each ask becomes a [`PermissionRequest`] carrying a oneshot
+    /// reply, and the resolver awaits that reply: a send that fails
+    /// (the panel is gone) and a dropped reply alike resolve as
+    /// [`loopctl::middleware::PermissionResolution::DenyOnce`], so a
+    /// dead panel can only ever deny.
+    requests_tx: mpsc::UnboundedSender<PermissionRequest>,
+}
+
+impl loopctl::middleware::PermissionAskResolver for PanelBridge {
+    fn resolve<'a>(
+        &'a self,
+        ask: &'a loopctl::middleware::PermissionAsk,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = loopctl::middleware::PermissionResolution> + Send + 'a,
+        >,
+    > {
+        let always =
+            dch_permissions::remember_rules(&ask.tool_name, &ask.input, Path::new(&ask.cwd));
+        let never = dch_permissions::deny_rules(&ask.tool_name, &ask.input, Path::new(&ask.cwd));
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        let sent = requests_tx.send(PermissionRequest {
-            tool_name: tool.to_string(),
-            prompt: prompt.to_string(),
+        let sent = self.requests_tx.send(PermissionRequest {
+            tool_name: ask.tool_name.clone(),
+            prompt: ask.prompt.clone(),
+            input: ask.input.clone(),
+            always: tui_rules(&always),
+            never: tui_rules(&never),
             reply: reply_tx,
         });
         Box::pin(async move {
             if sent.is_ok() {
-                reply_rx.await.unwrap_or(false)
+                reply_rx
+                    .await
+                    .unwrap_or(loopctl::middleware::PermissionResolution::DenyOnce)
             } else {
-                false
+                loopctl::middleware::PermissionResolution::DenyOnce
             }
         })
-    });
-    (resolver, requests_rx)
+    }
+}
+
+/// Translate the gate's remember-rules into the panel's rule records.
+///
+/// The two types say the same thing on either side of the crate
+/// boundary: the gate's rules are the wire format, the panel's are
+/// the session's own state — and this is the one place they meet.
+fn tui_rules(rules: &dch_loop::permission::RememberRules) -> Vec<PermissionRule> {
+    match rules {
+        dch_loop::permission::RememberRules::Tool(tool) => {
+            vec![PermissionRule::Tool { tool: tool.clone() }]
+        }
+        dch_loop::permission::RememberRules::Segments { prefixes, texts } => {
+            let mut out: Vec<PermissionRule> = prefixes
+                .iter()
+                .map(|prefix| PermissionRule::ShellPrefix {
+                    prefix: prefix.clone(),
+                })
+                .collect();
+            out.extend(
+                texts
+                    .iter()
+                    .map(|text| PermissionRule::CommandText { text: text.clone() }),
+            );
+            out
+        }
+        dch_loop::permission::RememberRules::PathGlobs(patterns) => patterns
+            .iter()
+            .map(|pattern| PermissionRule::PathGlob {
+                pattern: pattern.clone(),
+            })
+            .collect(),
+    }
 }
 
 /// The session's interactive lanes: the permission gate and the ask
@@ -1303,12 +1505,12 @@ fn permission_bridge() -> (
 /// rebuild hands to the new runner.
 #[derive(Clone)]
 struct InteractiveLanes {
-    /// The resolver the permission middleware asks through.
+    /// The typed resolver the permission middleware asks through.
     ///
     /// The same clone the first runner was built with; every rebuild
     /// receives it again, so the panel's receiver — held since
     /// startup — stays the live one.
-    permission: loopctl::middleware::AskResolverFn,
+    permission: std::sync::Arc<dyn loopctl::middleware::PermissionAskResolver>,
 
     /// The channel ask-tool prompts arrive on, overlay-shaped.
     ///
@@ -1323,20 +1525,50 @@ struct InteractiveLanes {
     /// The same [`overlay_prompt`] the startup supervision installs,
     /// so a rebuilt runner's prompts render in the identical shape.
     overlay: fn(dch_loop::PromptedQuestion) -> QuestionPrompt,
+
+    /// The session's live permission mode.
+    ///
+    /// Every runner build shares this one cell — the gate re-reads it
+    /// per dispatch — so the mode moves with `/mode` even while a run
+    /// is in flight, and every rebuild (a `/model` switch, a resume)
+    /// carries the session's current mode forward instead of
+    /// resurrecting the boot config's.
+    mode_cell: dch_config::SharedPermissionMode,
+
+    /// The session's remembered approvals: the memory the sheet's
+    /// "allow always" records into, the resumed file adopts, and the
+    /// gate's snapshot consults per dispatch.
+    ///
+    /// Held on the lanes so every runner build shares one memory —
+    /// the snapshot closure the builder receives reads it live, so a
+    /// remember made one call ago covers the next, across rebuilds as
+    /// across turns.
+    memory: PermissionMemory,
+
+    /// The session's live config-rules cell: `/preset` swaps the
+    /// contents, and the gate's snapshot re-reads per dispatch.
+    config_rules_cell: std::sync::Arc<std::sync::Mutex<Vec<dch_permissions::Rule>>>,
 }
 
 impl InteractiveLanes {
     /// The session's bridges, before any runner exists to supervise.
     ///
-    /// Both channels and the resolver in one call: the panel's
-    /// receivers come back beside the lanes that will carry the
-    /// sender halves through every rebuild — the wiring a session
-    /// does exactly once, at startup.
-    fn bridges() -> (
+    /// Both channels, the resolver, and the session's permission
+    /// memory in one call: the panel's receivers and the memory come
+    /// back beside the lanes that will carry the sender halves
+    /// through every rebuild — the wiring a session does exactly once,
+    /// at startup.
+    fn bridges(
+        config: &dch_config::DchConfig,
+    ) -> (
         Self,
         mpsc::UnboundedReceiver<PermissionRequest>,
         mpsc::UnboundedReceiver<QuestionPrompt>,
+        PermissionMemory,
     ) {
+        let memory = PermissionMemory::default();
+        let config_rules_cell =
+            std::sync::Arc::new(std::sync::Mutex::new(dch_loop::config_rules(config)));
         let (permission, permission_rx) = permission_bridge();
         let (prompt_tx, prompt_rx) = mpsc::unbounded_channel();
         (
@@ -1344,10 +1576,46 @@ impl InteractiveLanes {
                 permission,
                 prompt_tx,
                 overlay: overlay_prompt,
+                mode_cell: std::sync::Arc::new(std::sync::Mutex::new(
+                    config.runner.permission_mode,
+                )),
+                memory: memory.clone(),
+                config_rules_cell,
             },
             permission_rx,
             prompt_rx,
+            memory,
         )
+    }
+
+    /// The config rules as a live view the gate consults per dispatch.
+    ///
+    /// The closure re-reads the shared cell the panel swaps on a
+    /// `/preset`, so the very next dispatch evaluates under the new
+    /// join — nothing is captured at build time, and caching the
+    /// result would break that promise.
+    fn config_rules_view(&self) -> dch_loop::permission::ConfigRulesView {
+        let cell = Arc::clone(&self.config_rules_cell);
+        Arc::new(move || {
+            cell.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        })
+    }
+
+    /// The remembered-approvals snapshot the gate consults per dispatch.
+    ///
+    /// The closure reads the memory live — the same object the sheet's
+    /// "allow always" records into and the resumed file adopts — and
+    /// projects it into the engine's vocabulary: a path-glob rule the
+    /// file carries that no longer compiles is skipped with a warning,
+    /// so one unreadable rule must not silence the rest of the memory.
+    fn memory_snapshot(&self) -> dch_loop::MemorySnapshot {
+        // The memory shares its rule lists through internal `Arc`s, so the
+        // clone is the cheap handle the closure captures; the projection
+        // runs per evaluation on the live cell.
+        let memory = self.memory.clone();
+        Arc::new(move || memory.snapshot())
     }
 
     /// Install the first ask supervision on the session's first
@@ -1395,6 +1663,13 @@ impl InteractiveLanes {
             permission,
             prompt_tx,
             overlay: overlay_prompt,
+            mode_cell: std::sync::Arc::new(std::sync::Mutex::new(
+                dch_config::PermissionMode::default(),
+            )),
+            memory: PermissionMemory::default(),
+            config_rules_cell: std::sync::Arc::new(std::sync::Mutex::new(dch_loop::config_rules(
+                &dch_config::DchConfig::default(),
+            ))),
         }
     }
 }
@@ -1581,6 +1856,22 @@ struct RunOverrides {
     /// Restored over whatever dial a mid-session selection lays on, on
     /// every path that selects.
     reasoning_effort: Option<String>,
+
+    /// Whether the `--permission-mode` flag named the run's mode.
+    ///
+    /// A live resume adopts no saved mode over it — the same bow the
+    /// startup adoption makes — and the flag's value stays the
+    /// session's standing override, recorded on the save target.
+    permission_named: bool,
+
+    /// The permission mode the configuration file itself states.
+    ///
+    /// A launch `--permission-mode` is the opened session's own
+    /// override, not a property of every fresh session after it: a
+    /// `/clear` returns to this value — exactly what `[runner]
+    /// permission_mode` names in the file — never to the flag-tainted
+    /// base the session carries.
+    permission_default: dch_config::PermissionMode,
 }
 
 /// The pieces a driver command needs beyond the runner it holds.
@@ -1669,25 +1960,28 @@ struct DriverContext {
     overrides: RunOverrides,
 }
 
-/// Fire the session's naming call when a claim runs its first prompt.
+/// Fire the session's naming call when a claim owes one.
 ///
-/// A session is named once, off the first prompt that actually runs:
-/// the ask that opens the conversation is its subject, and a prompt
-/// still waiting — queued behind a run, or dropped — has not opened
-/// anything. A session that already carries a title (a resume, or an
-/// earlier answer that landed) is never renamed; a call already in
-/// flight for the same session stands that session's later claims
-/// down until it settles, while a session the host swapped in
-/// meanwhile owes — and fires — its own. The call is fire-and-forget
-/// and bounded: a run never waits on its session's name, the answer
-/// lands on the saver cell only if the cell still holds the session
-/// the call was fired for, and a call that fails or outlives its
-/// bound leaves the session as it was — unnamed, its slot settled,
-/// and named on a later claim.
+/// A session is named once: the ask that opens the conversation is
+/// its subject, and the caller hands that subject over — the claimed
+/// prompt for a fresh session, the restored history's first user
+/// prompt for a resumed one whose naming never answered (see
+/// [`crate::messages::naming_subject`]). A prompt still waiting —
+/// queued behind a run, or dropped — has not opened anything. A
+/// session that already carries a title (a resume, or an earlier
+/// answer that landed) is never renamed; a call already in flight for
+/// the same session stands that session's later claims down until it
+/// settles, while a session the host swapped in meanwhile owes — and
+/// fires — its own. The call is fire-and-forget and bounded: a run
+/// never waits on its session's name, the answer lands on the saver
+/// cell only if the cell still holds the session the call was fired
+/// for, and a call that fails or outlives its bound leaves the
+/// session as it was — unnamed, its slot settled, and named on a
+/// later claim.
 fn name_session_if_owed(
     transcript: &TranscriptHandle,
     api: &dch_config::ApiConfig,
-    first_prompt: &str,
+    naming_prompt: &str,
 ) {
     let id = transcript.current_session_id();
     if transcript.has_title() || !transcript.arm_naming(id) {
@@ -1695,7 +1989,7 @@ fn name_session_if_owed(
     }
     let transcript = transcript.clone();
     let api = api.clone();
-    let prompt = first_prompt.to_string();
+    let prompt = naming_prompt.to_string();
     tokio::spawn(async move {
         let title = tokio::time::timeout(
             std::time::Duration::from_secs(30),
@@ -1923,9 +2217,6 @@ async fn run_driver_loop(
             }
         };
         if context.shutting_down.load(Ordering::SeqCst) {
-            // The submission was pulled in good faith a moment before
-            // the flag rose; hand it to the exit drain below rather
-            // than deciding its fate here.
             revived.push_front(submission);
             break;
         }
@@ -1958,7 +2249,8 @@ async fn run_driver_loop(
                 continue;
             }
         };
-        name_session_if_owed(&transcript, &context.config.api, &text);
+        let naming_prompt = crate::messages::naming_subject(&runner.committed_history(), &text);
+        name_session_if_owed(&transcript, &context.config.api, &naming_prompt);
         context.state.mark_run_started();
         context.state.push_sent(text.clone());
         context
@@ -2085,7 +2377,7 @@ async fn apply_session_command(
                 &context.workdir,
                 observer,
                 &context.state,
-                Arc::clone(&context.lanes.permission),
+                &context.lanes,
                 &context.shutting_down,
             )
             .with_history(history)
@@ -2125,13 +2417,11 @@ async fn apply_session_command(
                 ),
             }
         }
+        SessionCommand::Mode { mode } => {
+            Box::pin(move_mode(runner, transcript, session_tx, context, mode)).await;
+        }
         SessionCommand::Clear => {
-            land_session_clear(
-                runner.rewind_history_to(0),
-                transcript,
-                session_tx,
-                &context.config.api.model,
-            );
+            land_session_clear(runner.rewind_history_to(0), transcript, session_tx, context);
         }
         SessionCommand::SwitchProvider {
             model,
@@ -2178,6 +2468,89 @@ async fn apply_session_command(
         }
         SessionCommand::Compact { compactions } => {
             apply_manual_compaction(runner, transcript, session_tx, context, compactions).await;
+        }
+    }
+}
+
+/// Move the live loop's permission mode, from the next turn.
+///
+/// `/mode`'s driver half: the running gate re-reads the shared mode
+/// cell on every dispatch, so the move updates that cell and rebuilds
+/// the runner on the new mode — the conversation and its recorded
+/// reads carried whole, everything else as it stood — and the loop's
+/// own config names the mode the next dispatch enforces. The panel
+/// flips the cell before dispatching — that is the mid-run liveness —
+/// so the failure direction is this function's to write: a rebuild
+/// that cannot stand restores the cell to the mode still in the
+/// loop's config, leaving the loop exactly as it was, mode included,
+/// and the notice says so.
+async fn move_mode(
+    runner: &mut dch_loop::Runner,
+    transcript: &TranscriptHandle,
+    session_tx: &mpsc::UnboundedSender<SessionUpdate>,
+    context: &mut DriverContext,
+    mode: dch_config::PermissionMode,
+) {
+    let mut config = context.config.clone();
+    config.runner.permission_mode = mode;
+    let history = runner.committed_history();
+    let read_paths = crate::resume::resumed_read_paths_with_machine(&[], Some(&history));
+    let observer = context.state.clone().into_observer().0;
+    let new_runner = assemble_runner_builder(
+        &config,
+        &context.workdir,
+        observer,
+        &context.state,
+        &context.lanes,
+        &context.shutting_down,
+    )
+    .with_history(history)
+    .build()
+    .await;
+    match new_runner {
+        Ok(built) => {
+            for path in read_paths {
+                let _recorded = built.record_resumed_read(&path).await;
+            }
+            context.lanes.attach(&built);
+            *context
+                .lanes
+                .mode_cell
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = mode;
+            transcript.set_permission_mode(Some(mode));
+            *runner = built;
+            context.state.adopt_runner_handles(
+                runner.cancel_signal(),
+                Some(Arc::new(LoopGuidance {
+                    steering: runner.steering(),
+                })),
+            );
+            context.config = config;
+            post_session_notice(
+                session_tx,
+                format!("mode is {} — the next turn runs under it", mode.as_str()),
+            );
+        }
+        Err(err) => {
+            *context
+                .lanes
+                .mode_cell
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                context.config.runner.permission_mode;
+            if session_tx
+                .send(SessionUpdate::PermissionMode {
+                    mode: context.config.runner.permission_mode,
+                })
+                .is_err()
+            {
+                tracing::warn!("mode restore landed but the display is gone");
+            }
+            post_session_notice(
+                session_tx,
+                format!("the loop kept its mode: the rebuild failed ({err})"),
+            );
         }
     }
 }
@@ -2314,7 +2687,7 @@ async fn switch_provider(
         &context.workdir,
         observer,
         &context.state,
-        Arc::clone(&context.lanes.permission),
+        &context.lanes,
         &context.shutting_down,
     )
     .with_history(history)
@@ -2414,13 +2787,26 @@ async fn resume_into_session(
         &mut config,
         context.overrides.reasoning_effort.as_deref(),
     );
+    let standing_mode = if context.overrides.permission_named {
+        context.config.runner.permission_mode
+    } else {
+        outcome
+            .permission_mode
+            .unwrap_or_else(|| context.config_base.runner.permission_mode)
+    };
+    let recorded_mode = if context.overrides.permission_named {
+        Some(standing_mode)
+    } else {
+        outcome.permission_mode
+    };
+    config.runner.permission_mode = standing_mode;
     let observer = context.state.clone().into_observer().0;
     let new_runner = assemble_runner_builder(
         &config,
         &context.workdir,
         observer,
         &context.state,
-        Arc::clone(&context.lanes.permission),
+        &context.lanes,
         &context.shutting_down,
     )
     .with_history(machine.clone())
@@ -2457,6 +2843,11 @@ async fn resume_into_session(
         })),
     );
     context.config = config;
+    *context
+        .lanes
+        .mode_cell
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = standing_mode;
     {
         let mut tokens = context
             .state
@@ -2474,7 +2865,18 @@ async fn resume_into_session(
         .machine_history
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&adopted));
-    transcript.retarget(target, &context.config.api.model, outcome.title.clone());
+    transcript.retarget(
+        target,
+        &context.config.api.model,
+        outcome.title.clone(),
+        recorded_mode,
+    );
+    let (allow, deny) = transcript
+        .saver
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .load_permissions();
+    context.lanes.memory.adopt(allow, deny);
     transcript.send_machine(MachineSnapshot {
         messages: adopted,
         saved_at: chrono::Utc::now(),
@@ -2490,6 +2892,7 @@ async fn resume_into_session(
             last_input: outcome.tokens.last_input_tokens,
             context_tokens: outcome.tokens.context_tokens,
         },
+        permission_mode: standing_mode,
     };
     if session_tx.send(update).is_err() {
         tracing::warn!("session resumed but the display is gone");
@@ -2522,11 +2925,25 @@ fn land_session_clear<E: std::fmt::Display>(
     rewind: Result<usize, E>,
     transcript: &TranscriptHandle,
     session_tx: &mpsc::UnboundedSender<SessionUpdate>,
-    model: &str,
+    context: &mut DriverContext,
 ) {
     if rewind_earned_fresh_session(&rewind) {
-        let id = transcript.rotate(model);
+        let id = transcript.rotate(&context.config.api.model);
+        let default = context.overrides.permission_default;
+        context.config.runner.permission_mode = default;
+        *context
+            .lanes
+            .mode_cell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = default;
+        context.lanes.memory.adopt(Vec::new(), Vec::new());
         if session_tx.send(SessionUpdate::SessionId { id }).is_err() {
+            tracing::warn!("session cleared but the display is gone");
+        }
+        if session_tx
+            .send(SessionUpdate::PermissionMode { mode: default })
+            .is_err()
+        {
             tracing::warn!("session cleared but the display is gone");
         }
     } else if let Err(err) = rewind {
@@ -2588,6 +3005,7 @@ async fn drive_submissions(
 )]
 mod tests {
     use super::*;
+    use clap::Parser as _;
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use dch_config::ApiType;
 
@@ -2650,6 +3068,99 @@ mod tests {
         tx.send(Submission::Run { id })
             .expect("driver channel open");
         id
+    }
+
+    #[test]
+    fn a_flag_preset_selection_reaches_the_interactive_rules_cell() {
+        // The startup chain the interactive mode stands on: the flag
+        // is a per-run statement, so the boot resolution folds it
+        // into the live config — the same fold the headless mode
+        // makes — and the lanes the session builds read that folded
+        // config, so the gate's rules cell carries the preset's
+        // rules from the first dispatch. A wiring that re-read the
+        // file instead would silently run the file's own selection.
+        let tmp = tempfile::TempDir::new().expect("config tempdir");
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            concat!(
+                "[permissions]\n",
+                "rules = [{ id = \"base-deny\", outcome = \"deny\", tool = \"WebFetch\" }]\n",
+                "[permissions.presets.rust-dev]\n",
+                "rules = [{ outcome = \"allow\", shell_prefix = \"cargo test\" }]\n",
+            ),
+        )
+        .expect("the config file lands");
+        let args = Args::try_parse_from([
+            "dch",
+            "--config",
+            path.to_str().expect("a utf-8 tempdir path"),
+            "--permissions-preset",
+            "rust-dev",
+        ])
+        .expect("the flags parse");
+        let control = crate::resume::ResumeControl::Fresh {
+            session_id: None,
+            warn: None,
+        };
+        let (config, _base, _file) =
+            resolve_session_config_pair(&args, &control).expect("the selection resolves");
+        assert_eq!(
+            config.permissions.preset.as_deref(),
+            Some("rust-dev"),
+            "the flag's selection is the boot config's own"
+        );
+        let (lanes, _permission_rx, _prompt_rx, _memory) = InteractiveLanes::bridges(&config);
+        let rules = lanes
+            .config_rules_cell
+            .lock()
+            .expect("rules cell lock")
+            .clone();
+        assert!(
+            rules.iter().any(|rule| rule.id == "preset.rust-dev.rule-0"),
+            "the preset's rules join the cell the gate consults: {rules:?}"
+        );
+        assert!(
+            rules.iter().any(|rule| rule.id == "base-deny"),
+            "the top-level rules stand ahead of the preset's"
+        );
+    }
+
+    #[test]
+    fn a_flag_preset_typo_refuses_the_interactive_startup() {
+        // The interactive startup shares the headless resolution, so
+        // the flag's typo gets the same named refusal — the error
+        // lists the presets that do exist, and run_tui carries it to
+        // its own report-and-exit rather than opening a session that
+        // silently runs no preset at all.
+        let tmp = tempfile::TempDir::new().expect("config tempdir");
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            concat!(
+                "[permissions.presets.rust-dev]\n",
+                "rules = [{ outcome = \"allow\", shell_prefix = \"cargo test\" }]\n",
+            ),
+        )
+        .expect("the config file lands");
+        let args = Args::try_parse_from([
+            "dch",
+            "--config",
+            path.to_str().expect("a utf-8 tempdir path"),
+            "--permissions-preset",
+            "rust-ev",
+        ])
+        .expect("the flags parse");
+        let control = crate::resume::ResumeControl::Fresh {
+            session_id: None,
+            warn: None,
+        };
+        let err = resolve_session_config_pair(&args, &control)
+            .expect_err("a typo'd selection refuses the startup");
+        assert!(
+            err.contains("rust-dev"),
+            "the refusal names the preset that does exist: {err}"
+        );
     }
 
     #[test]
@@ -2839,6 +3350,240 @@ mod tests {
         assert!(
             crate::session::load_machine_in(id, &root, session_at).is_some(),
             "the machine half landing after restores the pair"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mode_move_rebuilds_the_loop_under_the_new_mode() {
+        // /mode's driver half: the gate re-reads the shared mode cell
+        // on every dispatch, so the move updates that cell and
+        // rebuilds the runner — the conversation carried — and the
+        // loop's own config names the mode the next dispatch enforces.
+        let dir = tempfile::tempdir().expect("session tempdir");
+        let root = dir.keep();
+        let id = uuid::Uuid::new_v4();
+        let saver = Arc::new(crate::session::SessionSaver::with_base_dir(
+            id,
+            "m".to_string(),
+            root.clone(),
+        ));
+        let (transcript, worker) = TranscriptWorker::spawn(Arc::clone(&saver));
+        let workdir = tempfile::tempdir().expect("temp workdir");
+        let server =
+            SseServer::start_with_delay(vec![sse_text_turn("grown")], std::time::Duration::ZERO)
+                .await;
+        let mut config = sse_config(server.port);
+        config.api.context_window = Some(1_000_000);
+        let mut runner = dch_loop::Runner::builder(&config, workdir.path())
+            .with_history(vec![
+                loopctl::message::Message::user("hi"),
+                loopctl::message::Message::assistant("hello"),
+            ])
+            .build()
+            .await
+            .expect("runner over a tiny history");
+        let (_, state) = TuiObserverState::new().into_observer();
+        let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+        let mut context = DriverContext {
+            config: config.clone(),
+            config_base: std::sync::Arc::new(config),
+            workdir: workdir.path().to_path_buf(),
+            sessions_root: root.clone(),
+            state: state.clone(),
+            shutting_down: shutdown_flag(false),
+            lanes: InteractiveLanes::detached(),
+            overrides: RunOverrides::default(),
+        };
+        apply_session_command(
+            &mut runner,
+            &transcript,
+            &session_tx,
+            SessionCommand::Mode {
+                mode: dch_config::PermissionMode::ReadOnly,
+            },
+            &mut context,
+        )
+        .await;
+        worker.join();
+        let notice = tokio::time::timeout(std::time::Duration::from_secs(5), session_rx.recv())
+            .await
+            .expect("the move reports its verdict")
+            .expect("the session channel is open");
+        if let SessionUpdate::Notice { text } = notice {
+            assert!(
+                text.contains("mode is read_only"),
+                "the notice names the mode the loop took: {text}"
+            );
+        } else {
+            panic!("expected a notice from the mode move");
+        }
+        assert_eq!(
+            context.config.runner.permission_mode,
+            dch_config::PermissionMode::ReadOnly,
+            "the loop's config carries the mode the next dispatch reads"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fresh_ask_crosses_carrying_what_always_would_remember() {
+        // The resolver's contract after coverage moved into the gate:
+        // every ask that arrives is fresh — the gate answered the covered
+        // ones itself — so the resolver always ships a request, deriving
+        // from the ask's raw input what an "always" answer would record.
+        // Nothing is stashed anywhere: the derivation is pure, and the
+        // typed answer rides back as a PermissionResolution.
+        let (resolver, mut requests_rx) = permission_bridge();
+        let ask = loopctl::middleware::PermissionAsk::new(
+            "Bash",
+            "Allow 'Bash' (ShellExecute) in Interactive mode?",
+            serde_json::json!({ "command": "cargo build" }),
+            "call_1",
+            3,
+            ".",
+        );
+        let pending = resolver.resolve(&ask);
+        let request = requests_rx.recv().await.expect("a fresh ask crosses");
+        assert_eq!(
+            request.prompt, "Allow 'Bash' (ShellExecute) in Interactive mode?",
+            "the request carries the ask's prompt"
+        );
+        assert_eq!(
+            request.input,
+            serde_json::json!({ "command": "cargo build" }),
+            "the request carries the raw call input"
+        );
+        assert_eq!(
+            request.always,
+            vec![PermissionRule::ShellPrefix {
+                prefix: "cargo build".to_string()
+            }],
+            "the request carries what an always-answer would remember"
+        );
+        assert_eq!(
+            request.never,
+            vec![PermissionRule::ShellPrefix {
+                prefix: "cargo build".to_string()
+            }],
+            "a clean non-reader ask denies by the same verb prefix"
+        );
+        let _replied = request
+            .reply
+            .send(loopctl::middleware::PermissionResolution::AllowOnce);
+        assert_eq!(
+            pending.await,
+            loopctl::middleware::PermissionResolution::AllowOnce,
+            "the panel's answer resolves the ask"
+        );
+
+        let ask = loopctl::middleware::PermissionAsk::new(
+            "Write",
+            "Allow 'Write' (FileWrite) in Interactive mode?",
+            serde_json::json!({ "file_path": "README.md" }),
+            "call_2",
+            4,
+            ".",
+        );
+        let pending = resolver.resolve(&ask);
+        let request = requests_rx.recv().await.expect("the write ask crosses");
+        assert_eq!(
+            request.always,
+            vec![PermissionRule::PathGlob {
+                pattern: "README.md".to_string()
+            }],
+            "a write ask carries its directory scope"
+        );
+        assert_eq!(
+            request.never, request.always,
+            "a write refusal mints the same scope the approval would"
+        );
+        let _replied = request
+            .reply
+            .send(loopctl::middleware::PermissionResolution::DenyOnce);
+        assert_eq!(
+            pending.await,
+            loopctl::middleware::PermissionResolution::DenyOnce,
+            "a refusal resolves the ask as a denial"
+        );
+
+        let ask = loopctl::middleware::PermissionAsk::new(
+            "Jobs",
+            "Allow 'Jobs' (Meta) in Interactive mode?",
+            serde_json::json!({ "operation": "cleanup_jobs" }),
+            "call_3",
+            5,
+            ".",
+        );
+        let pending = resolver.resolve(&ask);
+        let request = requests_rx.recv().await.expect("a tool ask still crosses");
+        assert_eq!(
+            request.always,
+            vec![PermissionRule::Tool {
+                tool: "Jobs".to_string()
+            }],
+            "a tool ask remembers the tool itself"
+        );
+        assert_eq!(
+            request.never, request.always,
+            "a tool refusal mints the tool"
+        );
+        let _replied = request
+            .reply
+            .send(loopctl::middleware::PermissionResolution::AllowOnce);
+        assert_eq!(
+            pending.await,
+            loopctl::middleware::PermissionResolution::AllowOnce,
+            "the panel's answer resolves the ask"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_deny_derivation_is_narrow_at_the_seam() {
+        // The narrow-deny pin on the bridge — a chain mixing reader
+        // and writer segments: the same ask ships both verb prefixes as
+        // what an `a` press
+        // records (readers included, the approval's chain) and only
+        // the writer verb as what a `d` press records. `tail` is never
+        // banned by association; the redirect rides the scrub like any
+        // allow derivation sees it.
+        let (resolver, mut requests_rx) = permission_bridge();
+        let ask = loopctl::middleware::PermissionAsk::new(
+            "Bash",
+            "Allow 'Bash' (ShellExecute) in Interactive mode?",
+            serde_json::json!({
+                "command": "cargo build --workspace --quiet 2>&1 | tail -30"
+            }),
+            "call_live",
+            7,
+            "/work",
+        );
+        let pending = resolver.resolve(&ask);
+        let request = requests_rx.recv().await.expect("the live-case ask crosses");
+        assert_eq!(
+            request.always,
+            vec![
+                PermissionRule::ShellPrefix {
+                    prefix: "cargo build".to_string()
+                },
+                PermissionRule::ShellPrefix {
+                    prefix: "tail".to_string()
+                },
+            ],
+            "the allow derivation mints every segment"
+        );
+        assert_eq!(
+            request.never,
+            vec![PermissionRule::ShellPrefix {
+                prefix: "cargo build".to_string()
+            }],
+            "the deny derivation mints the writer alone"
+        );
+        let _replied = request
+            .reply
+            .send(loopctl::middleware::PermissionResolution::DenyOnce);
+        assert_eq!(
+            pending.await,
+            loopctl::middleware::PermissionResolution::DenyOnce,
+            "the panel's refusal resolves the ask"
         );
     }
 
@@ -3929,28 +4674,51 @@ mod tests {
     #[tokio::test]
     async fn the_bridge_delivers_requests_and_replies() {
         let (resolver, mut requests_rx) = permission_bridge();
-        let pending = resolver("Allow 'Bash' (ShellExecute) in AcceptEdits mode?", "Bash");
+        let ask = loopctl::middleware::PermissionAsk::new(
+            "Bash",
+            "Allow 'Bash' (ShellExecute) in Interactive mode?",
+            serde_json::json!({ "command": "make ci" }),
+            "call_probe",
+            0,
+            ".",
+        );
+        let pending = resolver.resolve(&ask);
         let request = tokio::time::timeout(std::time::Duration::from_secs(1), requests_rx.recv())
             .await
             .expect("the request arrives")
             .expect("the channel is open");
         assert_eq!(request.tool_name, "Bash");
         assert!(
-            request.prompt.contains("Bash") && request.prompt.contains("AcceptEdits"),
+            request.prompt.contains("Bash") && request.prompt.contains("Interactive"),
             "the request carries the gate's prompt: {}",
             request.prompt
         );
-        request.reply.send(true).expect("the reply channel is live");
+        request
+            .reply
+            .send(loopctl::middleware::PermissionResolution::AllowOnce)
+            .expect("the reply channel is live");
         let answered = tokio::time::timeout(std::time::Duration::from_secs(1), pending)
             .await
             .expect("the resolver future settles once replied");
-        assert!(answered, "a reply of true resolves the ask as allow");
+        assert_eq!(
+            answered,
+            loopctl::middleware::PermissionResolution::AllowOnce,
+            "the panel's allow resolves the ask"
+        );
     }
 
     #[tokio::test]
     async fn a_dropped_request_resolves_as_a_denial() {
         let (resolver, mut requests_rx) = permission_bridge();
-        let pending = resolver("Allow 'Bash'?", "Bash");
+        let ask = loopctl::middleware::PermissionAsk::new(
+            "Bash",
+            "Allow 'Bash' (ShellExecute) in Interactive mode?",
+            serde_json::json!({ "command": "cargo build" }),
+            "call_probe",
+            0,
+            ".",
+        );
+        let pending = resolver.resolve(&ask);
         let request = tokio::time::timeout(std::time::Duration::from_secs(1), requests_rx.recv())
             .await
             .expect("the request arrives")
@@ -3959,7 +4727,48 @@ mod tests {
         let answered = tokio::time::timeout(std::time::Duration::from_secs(1), pending)
             .await
             .expect("a dropped request still settles the resolver");
-        assert!(!answered, "an unanswered request reads as a denial");
+        assert_eq!(
+            answered,
+            loopctl::middleware::PermissionResolution::DenyOnce,
+            "an unanswered request reads as a denial"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_ask_leaves_no_state_behind() {
+        // The stale-entry pin, now structural: the old stash kept an
+        // entry per unanswered ask, bounded at 256 — there is no stash
+        // to leak anymore. A dropped request (the cancel race winning)
+        // settles the resolver as a denial, and nothing is recorded:
+        // the memory the sheet shares is untouched by the cancelled ask.
+        let (resolver, mut requests_rx) = permission_bridge();
+        let memory = PermissionMemory::default();
+        let ask = loopctl::middleware::PermissionAsk::new(
+            "Bash",
+            "Allow 'Bash' (ShellExecute) in Interactive mode?",
+            serde_json::json!({ "command": "cargo build" }),
+            "call_cancelled",
+            0,
+            ".",
+        );
+        let pending = resolver.resolve(&ask);
+        let request = tokio::time::timeout(std::time::Duration::from_secs(1), requests_rx.recv())
+            .await
+            .expect("the request arrives")
+            .expect("the channel is open");
+        drop(request); // the cancel race wins: the sheet never answers
+        let answered = tokio::time::timeout(std::time::Duration::from_secs(1), pending)
+            .await
+            .expect("the cancelled ask still settles");
+        assert_eq!(
+            answered,
+            loopctl::middleware::PermissionResolution::DenyOnce,
+            "a cancelled ask denies"
+        );
+        assert!(
+            memory.allow_rules().is_empty() && memory.deny_rules().is_empty(),
+            "a cancelled ask recorded nothing — and there is no stash to hold a stale entry"
+        );
     }
 
     /// One canned SSE text turn, framed for the OpenAI streaming wire.
@@ -4021,6 +4830,13 @@ mod tests {
         /// Shared with the accept task; a test reads the count to
         /// prove how many runs actually reached a provider.
         requests: Arc<std::sync::Mutex<Vec<String>>>,
+
+        /// Every naming request body the endpoint has read, in order.
+        ///
+        /// Kept apart from the turn bodies: the naming side-call is
+        /// not a conversation turn, so the turn count stays clean
+        /// while a pin reads exactly what the title ask carried.
+        naming_requests: Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     impl SseServer {
@@ -4082,6 +4898,9 @@ mod tests {
             let requests: Arc<std::sync::Mutex<Vec<String>>> =
                 Arc::new(std::sync::Mutex::new(Vec::new()));
             let task_requests = Arc::clone(&requests);
+            let naming_requests: Arc<std::sync::Mutex<Vec<String>>> =
+                Arc::new(std::sync::Mutex::new(Vec::new()));
+            let task_naming = Arc::clone(&naming_requests);
             tokio::spawn(async move {
                 use tokio::io::AsyncWriteExt as _;
                 let mut queue: std::collections::VecDeque<(String, std::time::Duration)> =
@@ -4093,18 +4912,22 @@ mod tests {
                     };
                     let req = read_http_request(&mut sock).await;
                     // The session's naming call is not a conversation
-                    // turn: answer it from a canned title, spend no
-                    // scripted body, and record nothing — the counts a
-                    // test reads stay the turns' alone. The reply waits
-                    // out the naming delay, carries its arrival
-                    // number, and leaves the accept loop for its own
-                    // task — a held-back name never blocks the turns
-                    // queued behind it, so a race pin can move the host
-                    // onto another session before a name lands.
+                    // turn: answer it from a canned title and spend no
+                    // scripted body — the counts a test reads stay the
+                    // turns' alone, while the naming capture keeps its
+                    // own list. The reply waits out the naming delay,
+                    // carries its arrival number, and leaves the accept
+                    // loop for its own task — a held-back name never
+                    // blocks the turns queued behind it, so a race pin
+                    // can move the host onto another session before a
+                    // name lands.
                     if req
                         .as_deref()
                         .is_some_and(|body| body.contains(dch_loop::NAME_SYSTEM_PROMPT))
                     {
+                        if let (Some(body), Ok(mut recorded)) = (req, task_naming.lock()) {
+                            recorded.push(body);
+                        }
                         let which = naming_arrivals
                             .fetch_add(1, Ordering::SeqCst)
                             .saturating_add(1);
@@ -4149,7 +4972,11 @@ mod tests {
                     let _ = sock.write_all(bytes.as_bytes()).await;
                 }
             });
-            Self { port, requests }
+            Self {
+                port,
+                requests,
+                naming_requests,
+            }
         }
 
         /// How many requests have reached the endpoint so far.
@@ -4167,6 +4994,18 @@ mod tests {
         /// show that a piece of text was *not* among them.
         fn bodies(&self) -> Vec<String> {
             self.requests
+                .lock()
+                .map(|reqs| reqs.clone())
+                .unwrap_or_default()
+        }
+
+        /// The body of every naming request received, oldest first.
+        ///
+        /// The naming side-call's wire truth: what prompt the title
+        /// ask actually carried, whatever the run that armed it
+        /// claimed.
+        fn naming_bodies(&self) -> Vec<String> {
+            self.naming_requests
                 .lock()
                 .map(|reqs| reqs.clone())
                 .unwrap_or_default()
@@ -4418,6 +5257,157 @@ mod tests {
         assert!(
             !notice.contains("wanted-model"),
             "the requested model is not the one the loop kept: {notice}"
+        );
+        let _ = driver.await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_rebuild_leaves_the_enforced_mode_untouched() {
+        // The `/mode` twin of the model pin: a switch whose rebuild
+        // cannot be built posts the kept-mode notice — and, because the
+        // shared cell moves only after the rebuild stands, the gate the
+        // old runner reads still enforces the boot mode. Before the
+        // ordering fix the cell moved first: the notice said "kept"
+        // while the very next dispatch ran under the requested mode.
+        let runner = unreachable_runner().await;
+        let (_, state) = TuiObserverState::new().into_observer();
+        let (submit_tx, submit_rx) = mpsc::unbounded_channel();
+        let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+        let mut context = unreachable_config();
+        context.api.fallback_model = Some(String::new());
+        let lanes = InteractiveLanes::detached();
+        let mode_cell = Arc::clone(&lanes.mode_cell);
+        submit_tx
+            .send(Submission::Command {
+                command: SessionCommand::Mode {
+                    mode: dch_config::PermissionMode::ReadOnly,
+                },
+            })
+            .expect("driver channel open");
+        drop(submit_tx);
+        let driver = tokio::spawn(Box::pin(run_driver_loop(
+            runner,
+            submit_rx,
+            DriverContext {
+                config_base: std::sync::Arc::new(context.clone()),
+                config: context,
+                workdir: std::path::PathBuf::from("."),
+                sessions_root: crate::session::sessions_dir(),
+                state,
+                shutting_down: shutdown_flag(false),
+                lanes,
+                overrides: RunOverrides::default(),
+            },
+            parked_transcript(),
+            session_tx,
+        )));
+        let mut notice = None;
+        for _ in 0..3 {
+            let update = tokio::time::timeout(std::time::Duration::from_secs(5), session_rx.recv())
+                .await
+                .expect("the driver answers the command")
+                .expect("the session channel is open when the command lands");
+            if let SessionUpdate::Notice { text } = update {
+                notice = Some(text);
+                break;
+            }
+        }
+        let notice = notice.unwrap_or_else(|| {
+            panic!("a failed rebuild posts a notice, not a silent drop");
+        });
+        assert!(
+            notice.contains("the loop kept its mode"),
+            "the notice names the mode still enforced: {notice}"
+        );
+        assert_eq!(
+            *mode_cell
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            dch_config::PermissionMode::default(),
+            "the enforced mode is still the boot mode — the cell moves only after the rebuild stands"
+        );
+        let _ = driver.await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_mode_rebuild_restores_a_preflipped_cell_to_the_boot_mode() {
+        // The panel half of the same contract: `/mode` flips the shared
+        // cell before the command dispatches — that is the mid-run
+        // liveness — so a rebuild that cannot stand must hand the old
+        // mode back. The cell arrives armed with the requested mode and
+        // must leave holding the boot mode; the no-app pin above cannot
+        // see this shape, because nothing there pre-flips the cell it
+        // watches.
+        let runner = unreachable_runner().await;
+        let (_, state) = TuiObserverState::new().into_observer();
+        let (submit_tx, submit_rx) = mpsc::unbounded_channel();
+        let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+        let mut context = unreachable_config();
+        context.api.fallback_model = Some(String::new());
+        let lanes = InteractiveLanes::detached();
+        let mode_cell = Arc::clone(&lanes.mode_cell);
+        *mode_cell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            dch_config::PermissionMode::ReadOnly;
+        submit_tx
+            .send(Submission::Command {
+                command: SessionCommand::Mode {
+                    mode: dch_config::PermissionMode::ReadOnly,
+                },
+            })
+            .expect("driver channel open");
+        drop(submit_tx);
+        let driver = tokio::spawn(Box::pin(run_driver_loop(
+            runner,
+            submit_rx,
+            DriverContext {
+                config_base: std::sync::Arc::new(context.clone()),
+                config: context,
+                workdir: std::path::PathBuf::from("."),
+                sessions_root: crate::session::sessions_dir(),
+                state,
+                shutting_down: shutdown_flag(false),
+                lanes,
+                overrides: RunOverrides::default(),
+            },
+            parked_transcript(),
+            session_tx,
+        )));
+        let mut notice = None;
+        let mut restored = None;
+        for _ in 0..6 {
+            let update = tokio::time::timeout(std::time::Duration::from_secs(5), session_rx.recv())
+                .await
+                .expect("the driver answers the command")
+                .expect("the session channel is open when the command lands");
+            match update {
+                SessionUpdate::Notice { text } => notice = Some(text),
+                SessionUpdate::PermissionMode { mode } => restored = Some(mode),
+                _ => {}
+            }
+            if notice.is_some() && restored.is_some() {
+                break;
+            }
+        }
+        let notice =
+            notice.unwrap_or_else(|| panic!("a failed rebuild posts a notice, not a silent drop"));
+        assert!(
+            notice.contains("the loop kept its mode"),
+            "the notice names the mode still enforced: {notice}"
+        );
+        assert_eq!(
+            *mode_cell
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            dch_config::PermissionMode::default(),
+            "the pre-flipped cell is restored to the boot mode the loop still runs under"
+        );
+        assert_eq!(
+            restored,
+            Some(dch_config::PermissionMode::default()),
+            "the standing mode is published back — the panel's display \
+             copy rolls to what the loop enforces"
         );
         let _ = driver.await;
     }
@@ -4850,6 +5840,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_mode_move_records_the_override_and_a_rotation_drops_it() {
+        // `/mode`'s remembering half: the move lands the override on
+        // the save target, so the next crash-atomic save writes it —
+        // and a `/clear`'s rotation drops it, because a fresh session
+        // has no override of its own and runs the configured default.
+        let dir = tempfile::tempdir().expect("sessions tempdir");
+        let id = uuid::Uuid::new_v4();
+        let saver = Arc::new(crate::session::SessionSaver::with_base_dir(
+            id,
+            "m".to_string(),
+            dir.path().to_path_buf(),
+        ));
+        let (handle, worker) = TranscriptWorker::spawn(Arc::clone(&saver));
+        handle.set_permission_mode(Some(dch_config::PermissionMode::Interactive));
+        assert_eq!(
+            handle
+                .saver
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .permission_mode,
+            Some(dch_config::PermissionMode::Interactive),
+            "the move records the session's standing override"
+        );
+
+        let fresh = handle.rotate("m");
+        assert_ne!(fresh, id.to_string(), "the rotation mints a fresh id");
+        assert_eq!(
+            handle
+                .saver
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .permission_mode,
+            None,
+            "a fresh session carries no override — the configured default governs"
+        );
+        worker.join();
+    }
+
+    #[tokio::test]
     async fn a_refused_clear_lands_as_a_notice_and_rotates_nothing() {
         // The Clear arm's caller-side wiring, not only its predicate: a
         // rewind that refuses must post the notice, publish no fresh
@@ -4865,7 +5894,17 @@ mod tests {
         let (handle, worker) = TranscriptWorker::spawn(Arc::clone(&saver));
         let (session_tx, mut session_rx) = mpsc::unbounded_channel();
         let refused = loopctl::error::LoopError::InvalidInput("a turn is in flight".to_string());
-        land_session_clear(Err(refused), &handle, &session_tx, "m");
+        let mut context = DriverContext {
+            config: dch_config::DchConfig::default(),
+            config_base: Arc::new(dch_config::DchConfig::default()),
+            workdir: std::path::PathBuf::from("."),
+            sessions_root: dir.path().to_path_buf(),
+            state: TuiObserverState::new().into_observer().1,
+            shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            lanes: InteractiveLanes::detached(),
+            overrides: RunOverrides::default(),
+        };
+        land_session_clear(Err(refused), &handle, &session_tx, &mut context);
         let notice = tokio::time::timeout(std::time::Duration::from_secs(5), session_rx.recv())
             .await
             .expect("the refusal is said aloud")
@@ -4894,6 +5933,240 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_cleared_session_resets_the_live_mode_to_the_configured_default() {
+        // The live half of the rotation's mode reset — the save-file
+        // half is the rotation pin's ("a rotation drops it"): a `/clear`
+        // after a mid-session `/mode` hands the loop's config and the
+        // gate's shared cell back to the configured default and tells
+        // the display, so a fresh session visibly runs what the config
+        // wrote, not the ended session's last move.
+        let dir = tempfile::tempdir().expect("sessions tempdir");
+        let id = uuid::Uuid::new_v4();
+        let saver = Arc::new(crate::session::SessionSaver::with_base_dir(
+            id,
+            "m".to_string(),
+            dir.path().to_path_buf(),
+        ));
+        let (handle, worker) = TranscriptWorker::spawn(Arc::clone(&saver));
+        let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+        let base = dch_config::DchConfig::default();
+        let mut moved = base.clone();
+        moved.runner.permission_mode = dch_config::PermissionMode::Interactive;
+        let lanes = InteractiveLanes::detached();
+        *lanes
+            .mode_cell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            dch_config::PermissionMode::Interactive;
+        let mut context = DriverContext {
+            config: moved,
+            config_base: Arc::new(base),
+            workdir: std::path::PathBuf::from("."),
+            sessions_root: dir.path().to_path_buf(),
+            state: TuiObserverState::new().into_observer().1,
+            shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            lanes,
+            overrides: RunOverrides::default(),
+        };
+        land_session_clear::<loopctl::error::LoopError>(
+            Ok(2_usize),
+            &handle,
+            &session_tx,
+            &mut context,
+        );
+        let SessionUpdate::SessionId { id: fresh } =
+            tokio::time::timeout(std::time::Duration::from_secs(5), session_rx.recv())
+                .await
+                .expect("the rotation publishes its fresh id")
+                .expect("the session channel is open")
+        else {
+            panic!("a landed clear publishes a fresh session id first")
+        };
+        assert_ne!(fresh, id.to_string(), "the rotation minted a fresh id");
+        let SessionUpdate::PermissionMode { mode } =
+            tokio::time::timeout(std::time::Duration::from_secs(5), session_rx.recv())
+                .await
+                .expect("the reset is said aloud")
+                .expect("the session channel is open")
+        else {
+            panic!("a landed clear publishes the mode the fresh session runs under")
+        };
+        assert_eq!(
+            mode,
+            dch_config::PermissionMode::Auto,
+            "the fresh session runs the configured default"
+        );
+        assert_eq!(
+            context.config.runner.permission_mode,
+            dch_config::PermissionMode::Auto,
+            "the loop's own config carries the default the next dispatch reads"
+        );
+        assert_eq!(
+            *context
+                .lanes
+                .mode_cell
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            dch_config::PermissionMode::Auto,
+            "the gate's shared cell hands the ended session's move back"
+        );
+        worker.join();
+    }
+
+    #[tokio::test]
+    async fn a_cleared_session_starts_with_no_remembered_rules() {
+        // The memory is session state: the ended session answered
+        // "allow always" on `cargo test` and "always deny" on a
+        // tool, then a `/clear` landed. The fresh session must ask
+        // again for both — a carried rule would auto-run work the
+        // fresh conversation never approved, and the next remember
+        // press would persist the carried pair into the fresh
+        // session's own file, the carryover made durable.
+        let dir = tempfile::tempdir().expect("sessions tempdir");
+        let id = uuid::Uuid::new_v4();
+        let saver = Arc::new(crate::session::SessionSaver::with_base_dir(
+            id,
+            "m".to_string(),
+            dir.path().to_path_buf(),
+        ));
+        let (handle, worker) = TranscriptWorker::spawn(Arc::clone(&saver));
+        let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+        let lanes = InteractiveLanes::detached();
+        lanes.memory.adopt(
+            vec![dch_tui::PermissionRule::ShellPrefix {
+                prefix: "cargo test".to_string(),
+            }],
+            vec![dch_tui::PermissionRule::Tool {
+                tool: "WebFetch".to_string(),
+            }],
+        );
+        let mut context = DriverContext {
+            config: dch_config::DchConfig::default(),
+            config_base: Arc::new(dch_config::DchConfig::default()),
+            workdir: std::path::PathBuf::from("."),
+            sessions_root: dir.path().to_path_buf(),
+            state: TuiObserverState::new().into_observer().1,
+            shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            lanes,
+            overrides: RunOverrides::default(),
+        };
+        land_session_clear::<loopctl::error::LoopError>(
+            Ok(2_usize),
+            &handle,
+            &session_tx,
+            &mut context,
+        );
+        let SessionUpdate::SessionId { id: fresh } =
+            tokio::time::timeout(std::time::Duration::from_secs(5), session_rx.recv())
+                .await
+                .expect("the rotation publishes its fresh id")
+                .expect("the session channel is open")
+        else {
+            panic!("a landed clear publishes a fresh session id first")
+        };
+        assert!(
+            context.lanes.memory.allow_rules().is_empty(),
+            "the fresh session asks again on verbs the ended session allowed"
+        );
+        assert!(
+            context.lanes.memory.deny_rules().is_empty(),
+            "the fresh session asks again on tools the ended session refused"
+        );
+        assert!(
+            !dir.path().join(&fresh).join("permissions.json").exists(),
+            "the fresh session's own file stays empty until its own press"
+        );
+        worker.join();
+    }
+
+    #[tokio::test]
+    async fn a_cleared_session_returns_to_the_files_default_not_the_launch_flags_mode() {
+        // A launch `--permission-mode` is the opened session's own
+        // override, not a property of every fresh session after it:
+        // the base the driver carries is flag-tainted, and a clear
+        // that read it would run the fresh session under the ended
+        // session's flag — while the rotated save file records no
+        // override, so a resume would disagree with what it ran as.
+        // The driver carries the file's own default pristine, and the
+        // clear lands there, exactly the reference's chain.
+        let dir = tempfile::tempdir().expect("sessions tempdir");
+        let id = uuid::Uuid::new_v4();
+        let saver = Arc::new(crate::session::SessionSaver::with_base_dir(
+            id,
+            "m".to_string(),
+            dir.path().to_path_buf(),
+        ));
+        let (handle, _worker) = TranscriptWorker::spawn(Arc::clone(&saver));
+        let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+        // The base carries the flag's mode — what a clear must not
+        // land on — and the file's own default says otherwise.
+        let mut base = dch_config::DchConfig::default();
+        base.runner.permission_mode = dch_config::PermissionMode::ReadOnly;
+        let lanes = InteractiveLanes::detached();
+        *lanes
+            .mode_cell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            dch_config::PermissionMode::ReadOnly;
+        let mut context = DriverContext {
+            config: base.clone(),
+            config_base: Arc::new(base),
+            workdir: std::path::PathBuf::from("."),
+            sessions_root: dir.path().to_path_buf(),
+            state: TuiObserverState::new().into_observer().1,
+            shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            lanes,
+            overrides: RunOverrides {
+                model: None,
+                reasoning_effort: None,
+                permission_named: true,
+                permission_default: dch_config::PermissionMode::Auto,
+            },
+        };
+        land_session_clear::<loopctl::error::LoopError>(
+            Ok(2_usize),
+            &handle,
+            &session_tx,
+            &mut context,
+        );
+        let SessionUpdate::SessionId { .. } =
+            tokio::time::timeout(std::time::Duration::from_secs(5), session_rx.recv())
+                .await
+                .expect("the rotation publishes its fresh id")
+                .expect("the session channel is open")
+        else {
+            panic!("a landed clear publishes a fresh session id first")
+        };
+        let SessionUpdate::PermissionMode { mode } =
+            tokio::time::timeout(std::time::Duration::from_secs(5), session_rx.recv())
+                .await
+                .expect("the reset is said aloud")
+                .expect("the session channel is open")
+        else {
+            panic!("a landed clear publishes the mode the fresh session runs under")
+        };
+        assert_eq!(
+            mode,
+            dch_config::PermissionMode::Auto,
+            "the fresh session runs the file's default, not the flag's mode"
+        );
+        assert_eq!(
+            context.config.runner.permission_mode,
+            dch_config::PermissionMode::Auto,
+            "the loop's own config carries the file's default"
+        );
+        assert_eq!(
+            *context
+                .lanes
+                .mode_cell
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            dch_config::PermissionMode::Auto,
+            "the gate's shared cell lands on the file's default"
+        );
+    }
+
+    #[tokio::test]
     async fn a_rebuilt_runner_keeps_both_interactive_lanes() {
         // What a rebuild must never lose: the ask tool's channel and
         // the permission gate. The lanes a session carries attach a
@@ -4908,6 +6181,11 @@ mod tests {
             permission: Arc::clone(&permission),
             prompt_tx,
             overlay: overlay_prompt,
+            mode_cell: std::sync::Arc::new(std::sync::Mutex::new(
+                dch_config::PermissionMode::default(),
+            )),
+            memory: PermissionMemory::default(),
+            config_rules_cell: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         };
         let rebuilt = unreachable_runner().await;
         lanes.attach(&rebuilt);
@@ -4941,7 +6219,15 @@ mod tests {
 
         // The permission lane: the resolver a rebuild reuses reaches
         // the panel's receiver and returns its verdict.
-        let verdict = permission("may I run this?", "Bash");
+        let ask = loopctl::middleware::PermissionAsk::new(
+            "Bash",
+            "may I run this?",
+            serde_json::json!({ "command": "cargo build" }),
+            "call_rebuild",
+            0,
+            ".",
+        );
+        let verdict = permission.resolve(&ask);
         let request = tokio::time::timeout(std::time::Duration::from_secs(5), permission_rx.recv())
             .await
             .expect("the panel's permission channel carries the ask")
@@ -4949,10 +6235,11 @@ mod tests {
         assert_eq!(request.tool_name, "Bash");
         request
             .reply
-            .send(true)
+            .send(loopctl::middleware::PermissionResolution::AllowOnce)
             .expect("the panel answers while the resolver waits");
-        assert!(
+        assert_eq!(
             verdict.await,
+            loopctl::middleware::PermissionResolution::AllowOnce,
             "the verdict the panel sent is the verdict the gate reads"
         );
     }
@@ -5108,6 +6395,7 @@ mod tests {
             id: resumed_id,
             transcript,
             tokens: resumed_tokens,
+            permission_mode: _,
         } = update
         else {
             panic!("a resume publishes the loaded transcript, got {update:?}");
@@ -5311,6 +6599,8 @@ mod tests {
             overrides: RunOverrides {
                 model: None,
                 reasoning_effort: Some("low".to_string()),
+                permission_named: false,
+                ..RunOverrides::default()
             },
         };
         let transcript = parked_transcript();
@@ -5357,6 +6647,8 @@ mod tests {
             overrides: RunOverrides {
                 model: None,
                 reasoning_effort: Some("low".to_string()),
+                permission_named: false,
+                ..RunOverrides::default()
             },
         };
         let transcript = parked_transcript();
@@ -5428,6 +6720,8 @@ mod tests {
             overrides: RunOverrides {
                 model: None,
                 reasoning_effort: Some("low".to_string()),
+                permission_named: false,
+                ..RunOverrides::default()
             },
         };
         let transcript = parked_transcript();
@@ -5457,6 +6751,94 @@ mod tests {
             window_probe.context_window.load(Ordering::SeqCst),
             123_456,
             "the context bar measures the adopted model's own window"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_resume_adopts_the_resumed_sessions_remembered_rules_wholesale() {
+        // The memory is session state: session A answered "allow
+        // always" on `cargo test`, then the user resumes session B
+        // live. A's rule must not ride into B — B's own pair replaces
+        // the memory wholesale, exactly what adoption promises. The
+        // drift shape: the next dispatch in B would auto-run under a
+        // rule B never made, and the persist hook would write A's
+        // carried pair into B's permissions.json — the carryover made
+        // durable on disk.
+        let dir = tempfile::tempdir().expect("sessions tempdir");
+        let root = dir.keep();
+        let a = uuid::Uuid::new_v4();
+        let b = uuid::Uuid::new_v4();
+        for (id, prefix) in [a, b].iter().zip(["cargo test", "cargo build"]) {
+            let saver = crate::session::SessionSaver::with_base_dir(
+                *id,
+                "test-model".to_string(),
+                root.clone(),
+            );
+            saver
+                .save_at(
+                    &[dch_tui::TuiMessage::User {
+                        text: "the saved turn".to_string(),
+                        timestamp: chrono::Utc::now(),
+                        steered: false,
+                        unsent: false,
+                    }],
+                    crate::session::SessionTokens::default(),
+                    chrono::Utc::now(),
+                )
+                .expect("the saved session lands");
+            saver
+                .save_permissions(
+                    &[dch_tui::PermissionRule::ShellPrefix {
+                        prefix: prefix.to_string(),
+                    }],
+                    &[],
+                )
+                .expect("the remembered pair saves");
+        }
+        let mut runner = unreachable_runner().await;
+        let (_, state) = TuiObserverState::new().into_observer();
+        let (session_tx, _session_rx) = mpsc::unbounded_channel();
+        let mut context = DriverContext {
+            config: unreachable_config(),
+            config_base: std::sync::Arc::new(unreachable_config()),
+            workdir: std::path::PathBuf::from("."),
+            sessions_root: root.clone(),
+            state,
+            shutting_down: shutdown_flag(false),
+            lanes: InteractiveLanes::detached(),
+            overrides: RunOverrides::default(),
+        };
+        // Session A is live and has remembered its verb — the state the
+        // resume must replace, not keep.
+        context.lanes.memory.adopt(
+            vec![dch_tui::PermissionRule::ShellPrefix {
+                prefix: "cargo test".to_string(),
+            }],
+            vec![],
+        );
+        // One root, the production shape: the save cell the resume
+        // retargets reads the same base the load read, so the
+        // adoption's `load_permissions` lands on B's own sibling.
+        let parked_saver = Arc::new(crate::session::SessionSaver::with_base_dir(
+            uuid::Uuid::new_v4(),
+            "m".to_string(),
+            root.clone(),
+        ));
+        let (transcript, _worker) = TranscriptWorker::spawn(parked_saver);
+        apply_session_command(
+            &mut runner,
+            &transcript,
+            &session_tx,
+            SessionCommand::Resume { id: b.to_string() },
+            &mut context,
+        )
+        .await;
+        assert_eq!(
+            context.lanes.memory.allow_rules(),
+            vec![dch_tui::PermissionRule::ShellPrefix {
+                prefix: "cargo build".to_string(),
+            }],
+            "the resumed session's own pair replaces the previous session's wholesale"
         );
     }
 
@@ -5598,6 +6980,8 @@ mod tests {
             overrides: RunOverrides {
                 model: Some("flag-model".to_string()),
                 reasoning_effort: None,
+                permission_named: false,
+                ..RunOverrides::default()
             },
         };
         let transcript = parked_transcript();
@@ -5813,7 +7197,7 @@ mod tests {
             "a cleared session's exit names the fresh id"
         );
         let adopted = uuid::Uuid::new_v4();
-        handle.retarget(adopted, "m", None);
+        handle.retarget(adopted, "m", None, None);
         assert_eq!(
             exit_reads(),
             adopted,
@@ -7024,6 +8408,97 @@ mod tests {
             "the landing clears the mirror — no correction can name a \
              finished turn as the one in flight"
         );
+        let _ = driver.await;
+    }
+
+    #[tokio::test]
+    async fn a_resumed_untitled_session_names_from_the_restored_first_prompt() {
+        // A resumed session whose naming never answered owes a retry,
+        // and the retry must coin from the conversation's opening ask
+        // — the restored history's first user message — not from the
+        // follow-up that armed it. The run itself rides the claimed
+        // prompt; only the naming side-call carries the old one.
+        let server = SseServer::start_with_naming_delay(
+            vec![(sse_text_turn("the tides answer"), std::time::Duration::ZERO)],
+            std::time::Duration::ZERO,
+        )
+        .await;
+        let workdir = tempfile::tempdir().expect("workdir tempdir");
+        let mut config = sse_config(server.port);
+        config.api.context_window = Some(200_000);
+        let runner = dch_loop::Runner::builder(&config, workdir.path())
+            .with_history(vec![
+                loopctl::message::Message::user("map the coastline roads"),
+                loopctl::message::Message::assistant("the coast is mapped"),
+            ])
+            .build()
+            .await
+            .expect("runner over the restored history");
+        let sessions = tempfile::tempdir().expect("sessions tempdir");
+        let root = sessions.keep();
+        let saver = Arc::new(crate::session::SessionSaver::with_base_dir(
+            uuid::Uuid::new_v4(),
+            "test-model".to_string(),
+            root.clone(),
+        ));
+        let (transcript, _worker) = TranscriptWorker::spawn(saver);
+        let (_, state) = TuiObserverState::new().into_observer();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (session_tx, _session_rx) = mpsc::unbounded_channel();
+        let driver = tokio::spawn(Box::pin(run_driver_loop(
+            runner,
+            rx,
+            DriverContext {
+                config: config.clone(),
+                config_base: std::sync::Arc::new(config),
+                workdir: workdir.path().to_path_buf(),
+                sessions_root: root.clone(),
+                state: state.clone(),
+                shutting_down: shutdown_flag(false),
+                lanes: InteractiveLanes::detached(),
+                overrides: RunOverrides::default(),
+            },
+            transcript.clone(),
+            session_tx,
+        )));
+        queue_prompt(&state, &tx, "now chart the tides");
+        for _ in 0..1800 {
+            if transcript.has_title() && server.request_count() >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            transcript.has_title(),
+            "the retry's answer lands on the session it armed for"
+        );
+        assert!(
+            server.request_count() >= 1,
+            "the claimed prompt's turn reached the provider"
+        );
+        let naming = server.naming_bodies();
+        assert_eq!(
+            naming.len(),
+            1,
+            "the untitled resume fires exactly one naming call"
+        );
+        let naming_body = naming.first().expect("the one naming request");
+        assert!(
+            naming_body.contains("map the coastline roads"),
+            "the naming call coins from the restored first prompt: {naming_body}"
+        );
+        assert!(
+            !naming_body.contains("now chart the tides"),
+            "the arming follow-up never rides the naming call: {naming_body}"
+        );
+        assert!(
+            server
+                .bodies()
+                .iter()
+                .any(|body| body.contains("now chart the tides")),
+            "the run itself rode the claimed prompt"
+        );
+        drop(tx);
         let _ = driver.await;
     }
 
@@ -8757,6 +10232,33 @@ mod tests {
             matches!(revived[0], Submission::Correct { id: 1, .. })
                 && matches!(revived[1], Submission::Run { id: 9 }),
             "revived keeps the channel's own order"
+        );
+    }
+
+    #[test]
+    fn an_always_answer_for_a_quoted_verb_phrases_the_exact_command() {
+        // The sheet's phrase is the user's record of what the approval
+        // covers. A quoted first word mints no verb prefix — no
+        // `every future run` wording exists for the placeholder — so
+        // the ask's rules carry the exact command and the phrase says
+        // so.
+        let minted = dch_permissions::remember_rules(
+            "Bash",
+            &serde_json::json!({ "command": "'cat' notes.txt" }),
+            std::path::Path::new("/work"),
+        );
+        let rules = tui_rules(&minted);
+        assert_eq!(
+            rules,
+            vec![PermissionRule::CommandText {
+                text: "'cat' notes.txt".to_string()
+            }]
+        );
+        assert!(
+            rules
+                .iter()
+                .all(|rule| rule.remember_phrase() == "the exact command"),
+            "no phrase names a placeholder run"
         );
     }
 }

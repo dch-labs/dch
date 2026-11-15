@@ -12,6 +12,7 @@ loopctl = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }
+dch-permissions = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

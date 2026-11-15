@@ -9,7 +9,9 @@
 //! trouble — a session
 //! that could not be built, a resume that had to degrade, a run that
 //! ends with todos still open, a `--done-file` that refused to be
-//! written (each reported panic-proof, as every stderr word here is).
+//! written (each reported panic-proof, as every stderr word here is)
+//! — beside one closing line, printed once the transcript has saved,
+//! naming the session id it saved under.
 //! `--verbose` hands the narration to the [`ConsoleObserver`]: one
 //! flag streams the model's reply to stdout as it forms with
 //! tool-call lines on stderr; a second adds durations, token counts,
@@ -279,6 +281,10 @@ pub(crate) fn capture_marker_mode(
 /// where the session transcript is written; `None` uses the user's
 /// sessions directory. `control` carries the resume resolution — a
 /// degradation warning prints to stderr before anything else runs.
+/// The session id resolves before the run bridge is armed so every
+/// marker written from that point — the run's own and the force
+/// hook's — carries it; the stderr line naming it for the operator
+/// prints at the end, once the transcript it names has saved.
 ///
 /// # Errors
 ///
@@ -332,46 +338,50 @@ async fn run_headless_inner(
         compaction_counter,
     } = built;
 
+    let session_id = resolve_session_id(&control, &runner);
     let force_args = args.clone();
     let hook_mode = inherited_mode.clone();
     let outcome_recorded = Arc::new(AtomicBool::new(false));
     let hook_recorded = Arc::clone(&outcome_recorded);
     let bridge = crate::signals::install_cancel_handler(runner.cancel_signal(), move || {
-        write_force_marker_unless_recorded(&force_args, &hook_recorded, hook_mode.as_ref());
+        write_force_marker_unless_recorded(
+            &force_args,
+            session_id,
+            &hook_recorded,
+            hook_mode.as_ref(),
+        );
     });
     startup_bridge.stop().await;
-
-    let session_id = match &control {
-        crate::resume::ResumeControl::Resumed(outcome) => outcome.session_id,
-        crate::resume::ResumeControl::Fresh {
-            session_id: Some(id),
-            ..
-        } => *id,
-        crate::resume::ResumeControl::Fresh {
-            session_id: None, ..
-        } => runner.session_id(),
-    };
     let resumed_title = match &control {
         crate::resume::ResumeControl::Resumed(outcome) => outcome.title.clone(),
         crate::resume::ResumeControl::Fresh { .. } => None,
+    };
+    let permission_override = if let Some(mode) = args.permission_mode {
+        Some(mode.into())
+    } else {
+        match &control {
+            crate::resume::ResumeControl::Resumed(outcome) => outcome.permission_mode,
+            crate::resume::ResumeControl::Fresh { .. } => None,
+        }
     };
     let saver = match saver_root {
         Some(root) => crate::session::SessionSaver::with_base_dir(session_id, model, root),
         None => crate::session::SessionSaver::with_model(session_id, model),
     }
     .with_workdir(&workdir)
-    .with_title(resumed_title);
+    .with_title(resumed_title)
+    .with_permission_mode(permission_override);
     let mut transcript = match &control {
         crate::resume::ResumeControl::Resumed(outcome) => outcome.messages.clone(),
         crate::resume::ResumeControl::Fresh { .. } => Vec::new(),
     };
     let naming = if saver.title().is_none() {
         let naming_api = api.clone();
-        let first_prompt = prompt.clone();
+        let naming_prompt = crate::messages::naming_subject(&runner.committed_history(), &prompt);
         Some(tokio::spawn(async move {
             tokio::time::timeout(
                 std::time::Duration::from_secs(30),
-                dch_loop::session_title(&naming_api, &first_prompt),
+                dch_loop::session_title(&naming_api, &naming_prompt),
             )
             .await
             .unwrap_or_default()
@@ -381,11 +391,6 @@ async fn run_headless_inner(
     };
     let result = runner.run(&prompt).await;
     let turn_outputs = runner.session_turn_outputs();
-    // The outcome outranks the name: the answer reaches stdout and the
-    // done-file its orchestrator polls land before the naming task is
-    // waited on, and the save waits only the settle budget for a title
-    // still pending — a stalled naming call once held all four for its
-    // whole request timeout, and a cancelled run waited too.
     let outcome = match &result {
         Ok(run) => {
             let delivery = if !streams_answer && let Some(answer) = &run.output {
@@ -397,7 +402,7 @@ async fn run_headless_inner(
         }
         Err(err) => HeadlessOutcome::from_loop_error(err),
     };
-    write_done_file_if_requested(args, &outcome, inherited_mode.as_ref());
+    write_done_file_if_requested(args, Some(session_id), &outcome, inherited_mode.as_ref());
     outcome_recorded.store(true, Ordering::SeqCst);
     bridge.begin_finalization();
     let saver = match naming {
@@ -431,6 +436,7 @@ async fn run_headless_inner(
             save_transcript(&saver, &runner, &transcript, compactions);
         }
     }
+    crate::signals::report(&session_notice(session_id));
     let pending_force = bridge.pending_force();
     bridge.stop().await;
     if pending_force {
@@ -466,6 +472,41 @@ async fn settle_naming(
         Ok(joined) => joined.unwrap_or(None),
         Err(_) => None,
     }
+}
+
+/// The session id this run saves its transcript under.
+///
+/// A resumed run keeps the loaded session's identity — the notice
+/// line and every marker name the file the follow-up continues —
+/// and a fresh run takes the id the runner minted at construction.
+/// Resolved before the run bridge is armed so the notice, the
+/// markers, and the saver all share one id.
+fn resolve_session_id(
+    control: &crate::resume::ResumeControl,
+    runner: &dch_loop::Runner,
+) -> uuid::Uuid {
+    match control {
+        crate::resume::ResumeControl::Resumed(outcome) => outcome.session_id,
+        crate::resume::ResumeControl::Fresh {
+            session_id: Some(id),
+            ..
+        } => *id,
+        crate::resume::ResumeControl::Fresh {
+            session_id: None, ..
+        } => runner.session_id(),
+    }
+}
+
+/// The stderr line naming the session a headless run saved under.
+///
+/// Printed once at the end of the run — after the transcript has
+/// saved, success and failure alike — so the id closes the run as
+/// its last word: the uuid is the exact spelling `--resume` takes
+/// and the sessions directory names, and the markers already carry
+/// it for the machines. stdout stays answer-only; this line is the
+/// whole announcement.
+fn session_notice(session_id: uuid::Uuid) -> String {
+    format!("dch: session {session_id}")
 }
 
 /// Persist the run's transcript, the engine's committed history,
@@ -508,9 +549,12 @@ fn save_transcript(
 /// interrupt during the write fails closed; after that write completes,
 /// the recorded outcome is authoritative — a repeat interrupt still
 /// exits 130 through the force path, but no longer replaces the
-/// done-file's real outcome with the fixed cancel message.
+/// done-file's real outcome with the fixed cancel message. The
+/// marker carries the session id the run was bound to — the hook is
+/// armed only after the id resolves.
 fn write_force_marker_unless_recorded(
     args: &Args,
+    session_id: uuid::Uuid,
     recorded: &AtomicBool,
     inherited_mode: Option<&std::fs::Permissions>,
 ) {
@@ -519,6 +563,7 @@ fn write_force_marker_unless_recorded(
     }
     write_done_file_if_requested(
         args,
+        Some(session_id),
         &HeadlessOutcome::failure(130, FORCE_CANCEL_MESSAGE),
         inherited_mode,
     );
@@ -629,6 +674,10 @@ async fn construct_run(
     let mut builder = dch_loop::Runner::builder(&config, &workdir)
         .with_observer(Arc::clone(&observer) as Arc<dyn loopctl::observer::LoopObserver>)
         .with_todo_nudge(|_reminder| {}, || true)
+        .with_permission_config_rules(std::sync::Arc::new({
+            let permissions = config.permissions.clone();
+            move || permissions.engine_rules()
+        }))
         .without_interactive_tools();
     if let crate::resume::ResumeControl::Resumed(outcome) = control {
         builder = builder.with_history(crate::resume::history_for_resume(
@@ -639,9 +688,6 @@ async fn construct_run(
     let runner = builder.build().await.map_err(|err| {
         construction_failure(args, format!("agent construction: {err}"), inherited_mode)
     })?;
-    // Rebuild the read-before-write guard's baselines for the files
-    // the restored transcript shows being read: without this, a
-    // resumed Write treats every previously-read file as never-read.
     if let crate::resume::ResumeControl::Resumed(outcome) = control {
         for path in crate::resume::resumed_read_paths_with_machine(
             &outcome.messages,
@@ -674,6 +720,7 @@ async fn construct_run(
 pub(crate) fn write_startup_done_file(args: &Args, inherited_mode: Option<&std::fs::Permissions>) {
     write_done_file_if_requested(
         args,
+        None,
         &HeadlessOutcome::failure(130, STARTUP_CANCEL_MESSAGE),
         inherited_mode,
     );
@@ -690,7 +737,7 @@ fn construction_failure(
     inherited_mode: Option<&std::fs::Permissions>,
 ) -> HeadlessOutcome {
     let outcome = HeadlessOutcome::failure(1, message);
-    write_done_file_if_requested(args, &outcome, inherited_mode);
+    write_done_file_if_requested(args, None, &outcome, inherited_mode);
     outcome
 }
 
@@ -854,12 +901,15 @@ pub(crate) fn load_config(path: Option<&Path>) -> Result<dch_config::DchConfig, 
 /// # Errors
 ///
 /// Returns the user-facing message for a `--model` name that matches no
-/// configured entry — the text names the entries that do exist.
+/// configured entry — the text names the entries that do exist — and
+/// the same message for a `--permissions-preset` selection that names
+/// no configured preset.
 pub(crate) fn apply_cli_overrides(
     config: &mut dch_config::DchConfig,
     args: &Args,
 ) -> Result<(), String> {
     apply_non_model_overrides(config, args);
+    config.permissions.validate()?;
     config
         .select_model(args.model.as_deref())
         .map_err(|err| err.to_string())
@@ -897,6 +947,9 @@ pub(crate) fn apply_non_model_overrides(config: &mut dch_config::DchConfig, args
     if let Some(mode) = args.permission_mode {
         config.runner.permission_mode = mode.into();
     }
+    if let Some(preset) = &args.permissions_preset {
+        config.permissions.preset = Some(preset.clone());
+    }
     if args.config.no_redact {
         config.security.redact_secrets = false;
     }
@@ -916,11 +969,14 @@ pub(crate) fn apply_non_model_overrides(config: &mut dch_config::DchConfig, args
 /// selection so far. A resumed session adopts the saved conversation's
 /// own model into the live half — over the base, replacing the boot
 /// selection wholesale — unless the CLI named a model outright, in
-/// which case the flag's selection stands as the overrides left it.
+/// which case the flag's selection stands as the overrides left it. It
+/// adopts the saved conversation's permission mode the same way — the
+/// session's own override outranks the configuration's global default
+/// — unless the CLI named a mode outright.
 ///
 /// The steps run in one fixed order — non-model overrides onto the
 /// base, the full overrides onto the live config, the boot selection,
-/// the resume adoption, then [`reapply_displaced_flag_overrides`] — so
+/// the resume adoptions, then [`reapply_displaced_flag_overrides`] — so
 /// a per-run flag never loses to a value no word of the user's named.
 ///
 /// # Errors
@@ -944,6 +1000,11 @@ pub(crate) fn resolve_session_config_pair(
     apply_non_model_overrides(&mut base, args);
     apply_cli_overrides(&mut config, args)?;
     crate::resume::adopt_resumed_model(&mut config, &base, control, args.model.as_deref());
+    crate::resume::adopt_resumed_permission_mode(
+        &mut config,
+        control,
+        args.permission_mode.is_some(),
+    );
     reapply_displaced_flag_overrides(&mut config, args);
     Ok((config, base, file))
 }
@@ -1072,11 +1133,15 @@ fn outcome_after_delivery(run: &Run, delivery: std::io::Result<()>) -> HeadlessO
 ///
 /// Called on every terminal path. Successful runs and answerless runs carry
 /// their turn/tool counts; other failures carry the message alone. The
-/// inherited mode — captured before the stale marker was cleared — is
-/// applied to the replacement atomically, before the rename. Write
-/// failures are logged to stderr but do not change the exit code.
+/// status is stamped with `session_id` — the session the run is bound
+/// to where the writer knows it, `None` on the paths that end before
+/// one resolves. The inherited mode — captured before the stale marker
+/// was cleared — is applied to the replacement atomically, before the
+/// rename. Write failures are logged to stderr but do not change the
+/// exit code.
 fn write_done_file_if_requested(
     args: &Args,
+    session_id: Option<uuid::Uuid>,
     outcome: &HeadlessOutcome,
     inherited_mode: Option<&std::fs::Permissions>,
 ) {
@@ -1093,7 +1158,8 @@ fn write_done_file_if_requested(
         DoneStatus::failure_with_counts(outcome.message.clone(), turns, tools_used)
     } else {
         DoneStatus::failure(outcome.message.clone())
-    };
+    }
+    .with_session_id(session_id);
     if let Err(err) = write_done_file(path, &status, inherited_mode) {
         crate::signals::report(&format!(
             "warning: failed to write done-file {}: {err}",
@@ -1359,8 +1425,10 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("done.json");
         let args = parse(&["x", "--done-file", path.to_str().unwrap()]);
+        let id = uuid::Uuid::new_v4();
         write_done_file_if_requested(
             &args,
+            Some(id),
             &HeadlessOutcome::failure(130, FORCE_CANCEL_MESSAGE),
             None,
         );
@@ -1368,6 +1436,11 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(written.message.as_deref(), Some(FORCE_CANCEL_MESSAGE));
         assert_eq!(written.turns, None);
+        assert_eq!(
+            written.session_id,
+            Some(id),
+            "the marker names the session the run was bound to"
+        );
     }
 
     #[test]
@@ -1377,18 +1450,19 @@ mod tests {
         let args = parse(&["x", "--done-file", path.to_str().unwrap()]);
 
         let recorded = AtomicBool::new(false);
-        write_force_marker_unless_recorded(&args, &recorded, None);
+        write_force_marker_unless_recorded(&args, uuid::Uuid::nil(), &recorded, None);
         let first: DoneStatus =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(first.message.as_deref(), Some(FORCE_CANCEL_MESSAGE));
 
         write_done_file_if_requested(
             &args,
+            None,
             &HeadlessOutcome::failure(2, "engine error text"),
             None,
         );
         recorded.store(true, Ordering::SeqCst);
-        write_force_marker_unless_recorded(&args, &recorded, None);
+        write_force_marker_unless_recorded(&args, uuid::Uuid::nil(), &recorded, None);
         let final_status: DoneStatus =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(
@@ -1407,6 +1481,7 @@ mod tests {
         let args = parse(&["x", "--done-file", path.to_str().unwrap()]);
         write_done_file_if_requested(
             &args,
+            None,
             &HeadlessOutcome::failure(130, STARTUP_CANCEL_MESSAGE),
             None,
         );
@@ -1414,6 +1489,18 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(written.message.as_deref(), Some(STARTUP_CANCEL_MESSAGE));
         assert_eq!(written.turns, None);
+        assert_eq!(
+            written.session_id, None,
+            "no session exists before the runner does"
+        );
+    }
+
+    #[test]
+    fn the_notice_line_names_the_session_in_the_resume_spelling() {
+        let id = uuid::Uuid::new_v4();
+        let line = session_notice(id);
+        assert!(line.contains("dch: session"), "{line}");
+        assert!(line.contains(&id.to_string()), "{line}");
     }
 
     #[test]
@@ -1443,6 +1530,10 @@ mod tests {
         assert_eq!(written.turns, None);
         assert_eq!(written.tools_used, None);
         assert_eq!(written.message.as_deref(), Some("config unreadable"));
+        assert_eq!(
+            written.session_id, None,
+            "a construction failure ends before any session resolves"
+        );
     }
 
     #[test]
@@ -1452,7 +1543,7 @@ mod tests {
         let args = parse(&["x", "--done-file", path.to_str().unwrap()]);
         let mut run = Run::new("task", &RunConfig::default());
         run.output = Some("done".into());
-        write_done_file_if_requested(&args, &HeadlessOutcome::from_run(&run), None);
+        write_done_file_if_requested(&args, None, &HeadlessOutcome::from_run(&run), None);
         let written: DoneStatus =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert!(written.success);
@@ -1466,7 +1557,7 @@ mod tests {
         let path = tmp.path().join("done.json");
         let args = parse(&["x", "--done-file", path.to_str().unwrap()]);
         let run = Run::new("task", &RunConfig::default());
-        write_done_file_if_requested(&args, &HeadlessOutcome::from_run(&run), None);
+        write_done_file_if_requested(&args, None, &HeadlessOutcome::from_run(&run), None);
         let written: DoneStatus =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert!(!written.success);
@@ -1478,7 +1569,7 @@ mod tests {
     fn no_done_file_flag_writes_nothing() {
         let tmp = tempfile::TempDir::new().unwrap();
         let args = parse(&["x"]);
-        write_done_file_if_requested(&args, &HeadlessOutcome::failure(1, "boom"), None);
+        write_done_file_if_requested(&args, None, &HeadlessOutcome::failure(1, "boom"), None);
         assert_eq!(
             std::fs::read_dir(tmp.path()).unwrap().count(),
             0,
@@ -1508,6 +1599,7 @@ mod tests {
         let args = parse(&["x", "--done-file", path.to_str().unwrap()]);
         write_done_file_if_requested(
             &args,
+            None,
             &HeadlessOutcome::from_loop_error(&LoopError::Cancelled),
             None,
         );
@@ -1673,16 +1765,16 @@ mod tests {
         apply_cli_overrides(&mut config, &parse(&["--permission-mode", "plan"])).unwrap();
         assert_eq!(
             config.runner.permission_mode,
-            dch_config::PermissionMode::Plan,
+            dch_config::PermissionMode::ReadOnly,
             "the flag beats the configured mode"
         );
 
         let mut config = dch_config::DchConfig::default();
-        config.runner.permission_mode = dch_config::PermissionMode::AcceptEdits;
+        config.runner.permission_mode = dch_config::PermissionMode::Interactive;
         apply_cli_overrides(&mut config, &parse(&[])).unwrap();
         assert_eq!(
             config.runner.permission_mode,
-            dch_config::PermissionMode::AcceptEdits,
+            dch_config::PermissionMode::Interactive,
             "with no flag the configured mode stands"
         );
     }
@@ -1754,6 +1846,42 @@ mod tests {
     }
 
     #[test]
+    fn a_cli_preset_typo_is_a_startup_error_not_a_silent_noop() {
+        // The CLI preset override lands after the file's load-time
+        // validation, so the selection is re-validated here: a typo'd
+        // selection used to proceed with zero preset rules and no
+        // message — the refusal now names the configured selection. A
+        // typo'd field inside the preset table is refused earlier
+        // still, at the parse: an unknown key cannot silently produce
+        // an empty preset. The correctly-spelled selection applies as
+        // before.
+        let typo = dch_config::DchConfig::from_toml_str(concat!(
+            "[permissions.presets.rust-dev]\n",
+            "outcome = \"allow\"\n",
+            "shell_prefix = \"cargo test\"\n",
+        ));
+        let parse_err = typo.unwrap_err();
+        assert!(
+            format!("{parse_err:?}").contains("unknown field"),
+            "the parse names the unknown field: {parse_err:?}"
+        );
+        let mut config = dch_config::DchConfig::from_toml_str(concat!(
+            "[permissions.presets.rust-dev]\n",
+            "rules = [{ outcome = \"allow\", shell_prefix = \"cargo test\" }]\n",
+        ))
+        .unwrap();
+        let args = parse(&["--permissions-preset", "rust-ev"]);
+        let err = apply_cli_overrides(&mut config, &args).unwrap_err();
+        assert!(
+            err.contains("rust-dev"),
+            "the error names the preset that does exist: {err}"
+        );
+        let args = parse(&["--permissions-preset", "rust-dev"]);
+        apply_cli_overrides(&mut config, &args).unwrap();
+        assert_eq!(config.permissions.preset.as_deref(), Some("rust-dev"));
+    }
+
+    #[test]
     fn the_unstreamed_answer_prints_as_one_line_with_a_newline() {
         let mut sink: Vec<u8> = Vec::new();
         write_final_answer(&mut sink, "the answer").expect("a Vec sink takes the line");
@@ -1787,6 +1915,52 @@ mod tests {
     }
 
     #[test]
+    fn a_resumed_sessions_mode_adopts_and_the_flag_outranks_it() {
+        // The session file's own permission mode is what a resume runs
+        // under — the configuration's global default yields to it — and
+        // an explicit --permission-mode outranks the file, becoming the
+        // session's standing override from that run forward.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[api]\nmodel = \"qwen\"\n").unwrap();
+        let config_path = path.display().to_string();
+
+        let resumed = crate::resume::ResumeControl::Resumed(crate::resume::ResumeOutcome {
+            session_id: uuid::Uuid::nil(),
+            model: "qwen".to_string(),
+            permission_mode: Some(dch_config::PermissionMode::Interactive),
+            messages: Vec::new(),
+            tokens: crate::session::SessionTokens::default(),
+            machine: None,
+            machine_compactions: 0,
+            title: None,
+        });
+        let bare = parse(&["--config", &config_path]);
+        let (config, _base, _file) = resolve_session_config_pair(&bare, &resumed).unwrap();
+        assert_eq!(
+            config.runner.permission_mode,
+            dch_config::PermissionMode::Interactive,
+            "the session's own override outranks the configured default"
+        );
+
+        let flagged = parse(&["--config", &config_path, "--permission-mode", "plan"]);
+        let (flagged_config, _base, _file) =
+            resolve_session_config_pair(&flagged, &resumed).unwrap();
+        assert_eq!(
+            flagged_config.runner.permission_mode,
+            dch_config::PermissionMode::ReadOnly,
+            "the CLI flag outranks the session file's own record"
+        );
+
+        let (fresh, _base, _file) = resolve_session_config_pair(&bare, &fresh_control()).unwrap();
+        assert_eq!(
+            fresh.runner.permission_mode,
+            dch_config::PermissionMode::Auto,
+            "a fresh run without the flag stays on the configured default"
+        );
+    }
+
+    #[test]
     fn the_reasoning_effort_flag_wins_over_an_entrys_own_dial() {
         // The entry states its own dial; the flag is a per-run statement
         // and outranks it on every path — the boot selection layering
@@ -1814,6 +1988,7 @@ mod tests {
         let resumed = crate::resume::ResumeControl::Resumed(crate::resume::ResumeOutcome {
             session_id: uuid::Uuid::nil(),
             model: "glm".to_string(),
+            permission_mode: None,
             messages: Vec::new(),
             tokens: crate::session::SessionTokens::default(),
             machine: None,
@@ -2183,6 +2358,20 @@ mod tests {
         /// successive runs at the one server needs no name
         /// resolution or a fixed port.
         port: u16,
+
+        /// Every naming request's raw bytes, oldest first.
+        ///
+        /// The title side-call's wire truth, kept apart from the
+        /// conversation turns: a pin reads exactly what the ask
+        /// carried.
+        naming_bodies: Arc<std::sync::Mutex<Vec<String>>>,
+
+        /// Every conversation request's raw bytes, oldest first.
+        ///
+        /// The turns' wire truth — the same split the naming capture
+        /// makes, so a pin can prove a prompt rode the run and not
+        /// the naming call.
+        bodies: Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     impl TurnServer {
@@ -2217,6 +2406,12 @@ mod tests {
                 .await
                 .expect("ephemeral bind");
             let port = listener.local_addr().expect("bound address").port();
+            let naming_bodies: Arc<std::sync::Mutex<Vec<String>>> =
+                Arc::new(std::sync::Mutex::new(Vec::new()));
+            let task_naming = Arc::clone(&naming_bodies);
+            let bodies: Arc<std::sync::Mutex<Vec<String>>> =
+                Arc::new(std::sync::Mutex::new(Vec::new()));
+            let task_bodies = Arc::clone(&bodies);
             tokio::spawn(async move {
                 while let Ok((mut stream, _)) = listener.accept().await {
                     let mut seen = Vec::new();
@@ -2247,7 +2442,11 @@ mod tests {
                             break;
                         }
                     }
-                    if String::from_utf8_lossy(&seen).contains(dch_loop::NAME_SYSTEM_PROMPT) {
+                    let request = String::from_utf8_lossy(&seen).into_owned();
+                    if request.contains(dch_loop::NAME_SYSTEM_PROMPT) {
+                        if let Ok(mut recorded) = task_naming.lock() {
+                            recorded.push(request);
+                        }
                         if stall_title {
                             tokio::spawn(async move {
                                 let _held = stream;
@@ -2272,6 +2471,9 @@ mod tests {
                         let _written = stream.write_all(answer.as_bytes()).await;
                         continue;
                     }
+                    if let Ok(mut recorded) = task_bodies.lock() {
+                        recorded.push(request);
+                    }
                     let body = [
                         serde_json::json!({
                             "id": "c1", "model": "test-model",
@@ -2291,7 +2493,32 @@ mod tests {
                     let _written = stream.write_all(response.as_bytes()).await;
                 }
             });
-            Self { port }
+            Self {
+                port,
+                naming_bodies,
+                bodies,
+            }
+        }
+
+        /// The body of every naming request received, oldest first.
+        ///
+        /// The naming side-call's wire truth: what prompt the title
+        /// ask actually carried, whatever the run that armed it
+        /// claimed.
+        fn naming_bodies(&self) -> Vec<String> {
+            self.naming_bodies
+                .lock()
+                .map(|reqs| reqs.clone())
+                .unwrap_or_default()
+        }
+
+        /// The body of every conversation request received, oldest
+        /// first.
+        fn bodies(&self) -> Vec<String> {
+            self.bodies
+                .lock()
+                .map(|reqs| reqs.clone())
+                .unwrap_or_default()
         }
 
         /// A config pointing the agent at this server.
@@ -2594,12 +2821,113 @@ mod tests {
         );
         let saved = session_ids(sessions.path());
         assert_eq!(saved.len(), 1, "the session saved untitled, not unsaved");
+        let status: DoneStatus = serde_json::from_str(&done_text).unwrap();
+        assert_eq!(
+            status.session_id,
+            saved.first().copied(),
+            "the marker names the session the transcript saved under"
+        );
         let meta =
             crate::session::load_with_meta_in(*saved.first().unwrap(), sessions.path()).unwrap();
         assert_eq!(
             meta.title, None,
             "a title that never answered saves as untitled — the run \
              does not wait for it"
+        );
+    }
+
+    /// A resumed untitled session's naming retry coins from the
+    /// conversation's opening ask.
+    ///
+    /// The title is coined from the session's first prompt; a session
+    /// whose naming never answered gets its retry armed by a follow-up
+    /// run, and the side-call must carry the restored history's first
+    /// user message — not the follow-up — while the run itself rides
+    /// the follow-up.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_resumed_untitled_session_names_from_the_restored_first_prompt() {
+        let _signal_lock = SIGNAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let server = TurnServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, server.config_toml()).unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let done = dir.path().join("done.json");
+        let outcome = crate::resume::ResumeOutcome {
+            session_id: uuid::Uuid::new_v4(),
+            model: "test-model".to_string(),
+            messages: vec![
+                dch_tui::TuiMessage::User {
+                    text: "map the coastline roads".to_string(),
+                    timestamp: chrono::Utc::now(),
+                    steered: false,
+                    unsent: false,
+                },
+                dch_tui::TuiMessage::Assistant {
+                    blocks: vec![dch_tui::ContentBlock::Text {
+                        text: "the coast is mapped".to_string(),
+                    }],
+                    timestamp: chrono::Utc::now(),
+                    duration_ms: None,
+                },
+            ],
+            machine: Some(vec![
+                loopctl::message::Message::user("map the coastline roads"),
+                loopctl::message::Message::assistant("the coast is mapped"),
+            ]),
+            tokens: crate::session::SessionTokens::default(),
+            machine_compactions: 0,
+            title: None,
+            permission_mode: None,
+        };
+        let args = parse(&[
+            "now chart the tides",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--done-file",
+            done.to_str().unwrap(),
+        ]);
+        let code = run_headless_rooted(
+            &args,
+            crate::signals::install_construction_handler(|| {}),
+            sessions.path().to_path_buf(),
+            crate::resume::ResumeControl::Resumed(outcome),
+        )
+        .await;
+        assert_eq!(code, 0, "the resumed run itself succeeds");
+        let naming = server.naming_bodies();
+        assert_eq!(
+            naming.len(),
+            1,
+            "the untitled resume fires exactly one naming call"
+        );
+        let naming_body = naming.first().unwrap();
+        assert!(
+            naming_body.contains("map the coastline roads"),
+            "the naming call coins from the restored first prompt: {naming_body}"
+        );
+        assert!(
+            !naming_body.contains("now chart the tides"),
+            "the arming follow-up never rides the naming call: {naming_body}"
+        );
+        assert!(
+            server
+                .bodies()
+                .iter()
+                .any(|body| body.contains("now chart the tides")),
+            "the run itself rode the claimed prompt"
+        );
+        let saved = session_ids(sessions.path());
+        assert_eq!(saved.len(), 1, "the resumed save lands on one session");
+        let meta =
+            crate::session::load_with_meta_in(*saved.first().unwrap(), sessions.path()).unwrap();
+        assert_eq!(
+            meta.title,
+            Some("Canned Session Title".to_string()),
+            "the retry's answer titles the session"
         );
     }
 

@@ -661,7 +661,20 @@ fn query_default_background() -> QueryReply {
     use std::time::Duration;
     use std::time::Instant;
 
+    // The window the reply's first byte must land inside. A terminal
+    // that answers at all answers in single-digit milliseconds; a
+    // terminal that never implements the query stays silent, and this
+    // bound is how long the wait admits the possibility before
+    // settling the refusal — short enough that bring-up never hangs
+    // on a terminal that will never speak.
     const QUERY_DEADLINE: Duration = Duration::from_millis(200);
+
+    // The window a started reply owns until it terminates. Once the
+    // first `ESC` has arrived the exchange is the terminal's, not the
+    // user's: this second bound holds the read open for the reply's
+    // remainder — an abandoned tail would reach the composer as
+    // keystrokes — while a reply that outruns even it leaves only
+    // bytes that had not yet arrived.
     const REPLY_FINISH_DEADLINE: Duration = Duration::from_millis(200);
 
     if stdin_ready(Duration::ZERO) {
@@ -724,6 +737,426 @@ fn read_reply_byte(deadline: std::time::Instant) -> Option<u8> {
         return None;
     }
     byte.first().copied()
+}
+
+/// The graphics capability a terminal reports at bring-up.
+///
+/// kitty, `Ghostty`, and `WezTerm` answer the kitty-graphics query and
+/// receive the welcome's photograph as real pixels; every other
+/// terminal — including every terminal behind tmux, which swallows
+/// the APC escapes rather than passing them — stays on the cell art
+/// alone, unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphicsSupport {
+    /// The terminal answered the kitty-graphics query.
+    ///
+    /// The welcome may transmit the photograph as real pixels: the
+    /// terminal speaks the protocol — kitty, `Ghostty` and
+    /// `WezTerm` among them — and places the rendition over the
+    /// cell art painted underneath.
+    Kitty,
+
+    /// No answer, or an answer that claims nothing.
+    ///
+    /// Cell art alone, unchanged. Every terminal behind tmux lands
+    /// here with its host — the APC escapes never pass through —
+    /// and so does any terminal that stayed silent past the
+    /// probe's windows.
+    None,
+}
+
+/// Ask the terminal whether it speaks the kitty graphics protocol.
+///
+/// Writes the protocol's own query — a one-pixel image probe whose
+/// answer names the protocol — and waits under the same short,
+/// one-shot windows the background query uses: input already
+/// waiting skips the ask (typed-ahead keys are the user's), silence
+/// settles the negative, and a keystroke landing inside the window
+/// is consumed rather than bridged, the house bargain. Inside tmux
+/// the query never reaches an outer terminal, so the honest outcome
+/// there is [`GraphicsSupport::None`] — the fallback, no graphics
+/// attempted.
+#[cfg(unix)]
+#[must_use = "the welcome's image layer keys on this verdict; dropping it leaves the cell art alone"]
+pub fn ask_graphics_support() -> GraphicsSupport {
+    use std::time::Duration;
+    use std::time::Instant;
+
+    // The window the probe's first byte must land inside — the same
+    // one-shot bargain the background query keeps. A terminal that
+    // speaks the protocol answers at once; silence past the bound is
+    // the negative, and inside tmux the query never reaches an outer
+    // terminal at all, so the wait must stay short enough that
+    // bring-up never hangs on an answer that will never come.
+    const QUERY_DEADLINE: Duration = Duration::from_millis(200);
+
+    // The most reply bytes the probe will take. The affirmative is a
+    // handful (`ESC _ G … ;OK ESC \`), but an error reply carries a
+    // human message (`EINVAL:Not enough image data: 0 < 4`) well past
+    // a handful — the cap must sit high enough that the read reaches
+    // the terminating `\` and drains the whole reply, because a tail
+    // left unread reaches the event reader as keystrokes typed into
+    // the composer. The deadline still bounds a terminal that answers
+    // endlessly.
+    const REPLY_CAP: usize = 4096;
+
+    if stdin_ready(Duration::ZERO) {
+        return GraphicsSupport::None;
+    }
+    let mut stdout = io::stdout();
+    if write!(stdout, "\x1b_Gi=1,a=q,s=1,v=1,f=24;AAAA\x1b\\").is_err() || stdout.flush().is_err() {
+        return GraphicsSupport::None;
+    }
+    let Some(first_deadline) = Instant::now().checked_add(QUERY_DEADLINE) else {
+        return GraphicsSupport::None;
+    };
+    if read_reply_byte(first_deadline) != Some(0x1b) {
+        return GraphicsSupport::None;
+    }
+    let rest_deadline = first_deadline;
+    let mut reply = vec![0x1b];
+    while reply.len() < REPLY_CAP {
+        let Some(byte) = read_reply_byte(rest_deadline) else {
+            break;
+        };
+        reply.push(byte);
+        if byte == b'\\' {
+            break;
+        }
+    }
+    if parse_graphics_reply(&reply) {
+        GraphicsSupport::Kitty
+    } else {
+        GraphicsSupport::None
+    }
+}
+
+/// Whether a reply is the kitty-graphics affirmative.
+///
+/// The terminal answers the query with an APC escape carrying
+/// `;OK` — the protocol's own handshake. Anything else, including
+/// an unfinished escape, is no support.
+#[cfg(unix)]
+fn parse_graphics_reply(reply: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(reply);
+    text.starts_with("\u{1b}_G") && text.contains(";OK")
+}
+
+/// The session's `splash_colors` choice, installed at app
+/// construction.
+///
+/// `Auto` leaves the decision to the tmux table below; the forced
+/// modes are the user's override — the session that knows its own
+/// terminal best — and skip both the ask and the notice.
+static SPLASH_COLORS: OnceLock<dch_config::SplashColors> = OnceLock::new();
+
+/// Record the configured splash color mode, before the first render.
+///
+/// Set once from [`crate::TuiApp`]'s constructor; a second call
+/// changes nothing, and the default — when no one calls — is `auto`.
+pub(crate) fn set_splash_colors(mode: dch_config::SplashColors) {
+    if SPLASH_COLORS.set(mode).is_err() {
+        // A second set: the first choice stands. Construction is the
+        // one writer, so this shape is a test harness re-arming, not a
+        // session changing its mind mid-flight.
+        tracing::debug!("splash_colors recorded twice; the first choice stands");
+    }
+}
+
+/// The configured splash-colors mode, `auto` when never set.
+///
+/// Read wherever a rendition is chosen — the scale picker, the
+/// truecolor warrant — and only ever read: the app's constructor is
+/// the one writer, through [`set_splash_colors`], so the process sees
+/// one mode from its first frame onward, and a process where no one
+/// wrote runs the default.
+fn splash_colors() -> dch_config::SplashColors {
+    SPLASH_COLORS.get().copied().unwrap_or_default()
+}
+
+/// Whether the session's truecolor escapes reach the terminal as
+/// themselves.
+///
+/// Outside tmux they always do — the process writes its colors to the
+/// terminal it stands on. Behind tmux, they reach the client when the
+/// client carries the RGB feature; without it, tmux re-encodes every
+/// direct color into the pane's palette, per color and with no eye for
+/// the pair a cell paints, which mangles a dithered two-color art.
+/// The session asks tmux itself — `display-message` against the pane,
+/// the same server the clipboard transport talks to — which features
+/// the attached client carries.
+///
+/// The polarity of ignorance is truecolor: a session that cannot get
+/// tmux's answer keeps emitting direct colors, exactly as sessions
+/// always have — a missing binary, a dead socket, or an empty answer
+/// (no client attached, a tmux too old to know the format) is no
+/// evidence of conversion, and downgrading a session whose colors were
+/// arriving fine is its own regression. Only an explicit feature list
+/// without the `RGB` token — tmux naming this client as one that
+/// cannot take direct colors — settles the downgrade to the palette
+/// rendition. Decided once per process, on the first reader.
+pub fn truecolor_warranted() -> bool {
+    static WARRANTED: OnceLock<bool> = OnceLock::new();
+    *WARRANTED.get_or_init(|| {
+        use dch_config::SplashColors;
+        let mode = splash_colors();
+        match mode {
+            SplashColors::Auto => {
+                let in_tmux = std::env::var_os("TMUX").is_some_and(|value| !value.is_empty());
+                splash_warrant(mode, in_tmux, tmux_client_report().as_ref())
+            }
+            SplashColors::Truecolor | SplashColors::Palette => splash_warrant(mode, false, None),
+        }
+    })
+}
+
+/// The tmux client's own report for this pane: its feature list and
+/// its terminal name, one query, cached for the process.
+///
+/// `None` when there is no pane id to target, no tmux to ask, or no
+/// success to read — each a shape where tmux has said nothing.
+fn tmux_client_report() -> Option<(String, String)> {
+    static REPORT: OnceLock<Option<(String, String)>> = OnceLock::new();
+    REPORT
+        .get_or_init(|| {
+            use std::process::Command;
+            let pane = std::env::var_os("TMUX_PANE")?;
+            let output = Command::new("tmux")
+                .args(["display-message", "-p", "-t"])
+                .arg(&pane)
+                .arg("#{client_termfeatures}|#{client_termname}")
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if echoed_format(&text) {
+                return None;
+            }
+            let (features, termname) = text.split_once('|')?;
+            Some((features.trim().to_string(), termname.trim().to_string()))
+        })
+        .clone()
+}
+
+/// Whether a tmux reply is the format string echoed back, not an
+/// answer.
+///
+/// tmux older than a format variable prints it literally
+/// (`#{client_termfeatures}`), which would otherwise parse as a
+/// feature list naming nothing — the exact shape that withdraws
+/// truecolor. The `#{` spelling never appears in a real answer.
+fn echoed_format(text: &str) -> bool {
+    text.contains("#{")
+}
+
+/// Whether a tmux client-features list carries the RGB feature.
+///
+/// The list is comma-separated (`focus,clipboard,RGB,title`); the
+/// token match keeps a hypothetical feature whose name merely contains
+/// the letters from vouching for truecolor.
+fn features_carry_rgb(features: &str) -> bool {
+    features.split(',').any(|token| token.trim() == "RGB")
+}
+
+/// The warrant from tmux's answer, purely.
+///
+/// The decision table behind [`truecolor_warranted`]: outside tmux is
+/// always warranted; inside, an absent or empty answer keeps
+/// truecolor, and only a feature list that says something and does
+/// not name RGB withdraws it.
+fn warrant_from(in_tmux: bool, report: Option<&(String, String)>) -> bool {
+    if !in_tmux {
+        return true;
+    }
+    match report {
+        None => true,
+        Some((features, _)) => features.trim().is_empty() || features_carry_rgb(features),
+    }
+}
+
+/// The truecolor verdict for one splash-colors mode, purely.
+///
+/// The decision table behind [`truecolor_warranted`]'s match: a
+/// forced mode answers outright — `truecolor` keeps the original
+/// art and `palette` the fixed vocabulary, whatever tmux's client
+/// would have answered — and only `auto` defers to the tmux table
+/// [`warrant_from`] holds. Separated from the process-wide caches
+/// so every arm pins without a terminal or a test-ordering.
+fn splash_warrant(
+    mode: dch_config::SplashColors,
+    in_tmux: bool,
+    report: Option<&(String, String)>,
+) -> bool {
+    use dch_config::SplashColors;
+    match mode {
+        SplashColors::Truecolor => true,
+        SplashColors::Palette => false,
+        SplashColors::Auto => warrant_from(in_tmux, report),
+    }
+}
+
+/// The one-row notice naming the setting that restores truecolor,
+/// when the palette rendition engaged.
+///
+/// `None` everywhere the rendition did not engage — outside tmux, or
+/// behind a client whose answer carries RGB, or where tmux said
+/// nothing at all. Where it engages, the notice names the
+/// `terminal-features` line for this pane's own client terminal, so
+/// the fix is one paste into `~/.tmux.conf` and one reattach away.
+#[must_use = "the notice exists to be shown; dropping it silences the one hint that truecolor is a config line away"]
+pub fn tmux_color_notice() -> Option<String> {
+    use dch_config::SplashColors;
+    let mode = splash_colors();
+    match mode {
+        SplashColors::Auto => {
+            let in_tmux = std::env::var_os("TMUX").is_some_and(|value| !value.is_empty());
+            splash_notice_from(mode, in_tmux, tmux_client_report().as_ref())
+        }
+        SplashColors::Truecolor | SplashColors::Palette => splash_notice_from(mode, false, None),
+    }
+}
+
+/// The palette-engagement notice for one splash-colors mode, purely.
+///
+/// The mode half of [`tmux_color_notice`]'s decision: a forced mode
+/// is the user's choice — no advice to give, whatever tmux answers —
+/// and only `auto` runs the engagement table [`color_notice_from`]
+/// holds. Separated from the process-wide caches so the forced skip
+/// pins without arming them.
+fn splash_notice_from(
+    mode: dch_config::SplashColors,
+    in_tmux: bool,
+    report: Option<&(String, String)>,
+) -> Option<String> {
+    use dch_config::SplashColors;
+    if !matches!(mode, SplashColors::Auto) {
+        return None;
+    }
+    color_notice_from(in_tmux, report)
+}
+
+/// The notice text from tmux's answer, purely.
+///
+/// The decision table behind [`tmux_color_notice`], separated so the
+/// polarity of ignorance pins without a terminal.
+fn color_notice_from(in_tmux: bool, report: Option<&(String, String)>) -> Option<String> {
+    let (features, termname) = report?;
+    if !in_tmux || features.trim().is_empty() || features_carry_rgb(features) {
+        return None;
+    }
+    let term = if termname.is_empty() {
+        "*"
+    } else {
+        termname.as_str()
+    };
+    Some(format!(
+        "tmux converts colors to 256 — `set -as terminal-features ',{term}:RGB'` restores truecolor"
+    ))
+}
+
+/// The terminal's cell size in pixels, as its bring-up answer taught.
+///
+/// The rendition the welcome's image layer builds sizes to the band's
+/// true pixel geometry when this is known, leaving the terminal no
+/// heavy scaling to improvise. `None` before the ask, and for every
+/// terminal that stayed silent.
+static CELL_PIXELS: std::sync::RwLock<Option<(u16, u16)>> = std::sync::RwLock::new(None);
+
+/// The cell size the asks have learned — width first, height second —
+/// if the terminal named one.
+#[must_use = "the rendition sizes to it; a dropped read is a guess nobody needed"]
+pub fn cell_pixels() -> Option<(u16, u16)> {
+    *CELL_PIXELS
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Ask the terminal for its cell size in pixels (CSI 16t).
+///
+/// Rides the same short, one-shot windows the bring-up probes use:
+/// input already waiting skips the ask — typed-ahead keys are the
+/// user's — silence settles the none, and a keystroke landing inside
+/// the window is consumed rather than bridged, the house bargain. The
+/// reply names the cell's height then its width (`ESC [ 6 ; h ; w t`)
+/// and is recorded for [`cell_pixels`]. Returns whether the recorded
+/// cell moved — a zoom changes it, a plain resize does not, and only
+/// a move owes the picture a rebuild.
+#[cfg(unix)]
+pub fn ask_cell_pixels() -> bool {
+    use std::time::Duration;
+    use std::time::Instant;
+
+    // The window the reply's first byte must land inside — the same
+    // one-shot bargain the bring-up probes keep. A terminal that
+    // answers at all answers at once; silence past the bound is the
+    // none, and the wait must stay short enough that the first
+    // frame never hangs on an answer that will never come.
+    const QUERY_DEADLINE: Duration = Duration::from_millis(200);
+
+    // The most reply bytes the read will take. The CSI 16t reply is a
+    // handful (`ESC [ 6 ; h ; w t`), but the cap must sit high enough
+    // that the read reaches the reply's trailing `t` and drains
+    // whatever the terminal sent in full — a tail left unread reaches
+    // the event reader as keystrokes typed into the composer. The
+    // deadline still bounds a terminal that answers endlessly.
+    const REPLY_CAP: usize = 512;
+
+    if stdin_ready(Duration::ZERO) {
+        return false;
+    }
+    let mut stdout = io::stdout();
+    if write!(stdout, "\x1b[16t").is_err() || stdout.flush().is_err() {
+        return false;
+    }
+    let Some(first_deadline) = Instant::now().checked_add(QUERY_DEADLINE) else {
+        return false;
+    };
+    if read_reply_byte(first_deadline) != Some(0x1b) {
+        return false;
+    }
+    let mut reply = vec![0x1b];
+    while reply.len() < REPLY_CAP {
+        let Some(byte) = read_reply_byte(first_deadline) else {
+            break;
+        };
+        reply.push(byte);
+        if byte == b't' {
+            break;
+        }
+    }
+    if let Some(cell) = parse_cell_reply(&reply) {
+        let moved = cell_pixels() != Some(cell);
+        *CELL_PIXELS
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cell);
+        moved
+    } else {
+        false
+    }
+}
+
+/// Parse a CSI 16t reply into `(width, height)`.
+///
+/// The reply names the cell's height first and its width second;
+/// anything else — an unfinished escape, a different report, garbage —
+/// is no answer at all.
+#[cfg(unix)]
+fn parse_cell_reply(reply: &[u8]) -> Option<(u16, u16)> {
+    let text = String::from_utf8_lossy(reply);
+    let body = text.strip_prefix('\u{1b}')?.strip_prefix('[')?;
+    let body = body.strip_suffix('t')?;
+    let mut parts = body.split(';');
+    if parts.next()? != "6" {
+        return None;
+    }
+    let height = parts.next()?.parse::<u16>().ok()?;
+    let width = parts.next()?.parse::<u16>().ok()?;
+    if parts.next().is_some() || width == 0 || height == 0 {
+        return None;
+    }
+    Some((width, height))
 }
 
 /// Read up to `buf.len()` raw bytes from the terminal's input.
@@ -1027,12 +1460,14 @@ enum DispositionAction {
     /// signal before arming, and handing the kernel's arguments back
     /// keeps cooperative cancellation working.
     Chain,
+
     /// Honor an inherited `SIG_IGN`: return without acting.
     ///
     /// The process inherited silence for this signal, so the handler
     /// adds none — the case of a launch that ignored the signal and a
     /// bridge whose listener never registered.
     HonorIgnore,
+
     /// Restore the terminal and exit 130, as the deaf phase does.
     ///
     /// The displaced default meant "terminate the process", so
@@ -1054,8 +1489,6 @@ fn disposition_action(sa_sigaction: usize) -> DispositionAction {
         0 => DispositionAction::RestoreAndExit,
         1 => DispositionAction::HonorIgnore,
         address => {
-            // Real handler addresses sit far above both sentinels; the
-            // binding exists only to name that any other value is one.
             let _ = address;
             DispositionAction::Chain
         }
@@ -1398,6 +1831,201 @@ impl Drop for TerminalGuard {
 )]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_graphics_affirmative_names_the_protocol() {
+        assert!(parse_graphics_reply(b"\x1b_Gi=1;OK\x1b\\"));
+    }
+
+    #[test]
+    fn the_rgb_feature_is_a_token_not_a_substring() {
+        // The features list tmux answers with is comma-separated; only
+        // the whole token vouches for truecolor, so a name carrying
+        // the letters inside it does not.
+        assert!(features_carry_rgb("RGB"));
+        assert!(features_carry_rgb("focus,clipboard,RGB,title"));
+        assert!(features_carry_rgb(" 256, RGB ,overline "));
+        assert!(!features_carry_rgb("focus,title"));
+        assert!(!features_carry_rgb(""));
+        assert!(!features_carry_rgb("RGBHALVES"));
+        assert!(!features_carry_rgb("truecolor"));
+    }
+
+    #[test]
+    fn an_echoed_format_is_no_answer() {
+        // A tmux too old to know the format variables prints them
+        // literally; that echo must read as silence — truecolor — not
+        // as a client with no features.
+        assert!(echoed_format("#{client_termfeatures}|#{client_termname}"));
+        assert!(!echoed_format("focus,title|xterm-256color"));
+        assert!(!echoed_format(""));
+    }
+
+    #[test]
+    fn the_polarity_of_ignorance_is_truecolor() {
+        // The decision table: outside tmux always warrants; inside, a
+        // missing or empty answer keeps truecolor — the long-standing
+        // behavior — and only tmux naming features without RGB
+        // withdraws it.
+        assert!(warrant_from(false, None), "outside tmux, no ask needed");
+        assert!(
+            warrant_from(true, None),
+            "no answer from tmux keeps truecolor"
+        );
+        assert!(
+            warrant_from(true, Some(&(String::new(), "xterm-256color".into()))),
+            "an empty feature list is no evidence of conversion"
+        );
+        assert!(
+            warrant_from(true, Some(&("focus,RGB,title".into(), "alacritty".into()))),
+            "the RGB token warrants"
+        );
+        assert!(
+            !warrant_from(true, Some(&("focus,title".into(), "xterm-256color".into()))),
+            "features named without RGB withdraws"
+        );
+    }
+
+    #[test]
+    fn the_notice_names_the_fix_only_where_the_downgrade_engaged() {
+        assert_eq!(
+            color_notice_from(false, Some(&("focus".into(), "alacritty".into()))),
+            None,
+            "outside tmux there is nothing to restore"
+        );
+        assert_eq!(
+            color_notice_from(true, None),
+            None,
+            "no answer engaged no downgrade"
+        );
+        assert_eq!(
+            color_notice_from(true, Some(&("focus,RGB".into(), "alacritty".into()))),
+            None,
+            "an RGB client needs no advice"
+        );
+        let notice =
+            color_notice_from(true, Some(&("focus,title".into(), "xterm-256color".into())))
+                .unwrap_or_default();
+        assert!(
+            notice.contains("set -as terminal-features ',xterm-256color:RGB'"),
+            "the notice names this client's own line: {notice}"
+        );
+        let unnamed =
+            color_notice_from(true, Some(&("focus".into(), String::new()))).unwrap_or_default();
+        assert!(
+            unnamed.contains("',*:RGB'"),
+            "a nameless client gets the every-terminal spelling: {unnamed}"
+        );
+    }
+
+    #[test]
+    fn the_forced_splash_color_modes_decide_without_asking_tmux() {
+        // The mode table's three arms, over the one answer that would
+        // downgrade an auto session: a forced mode answers outright —
+        // the user's override, not a detection — so even a client
+        // naming features without RGB keeps truecolor art under
+        // `truecolor` and takes the palette rendition under `palette`,
+        // while `auto` alone consults the tmux table.
+        let no_rgb = Some(&("focus,title".to_string(), "xterm-256color".to_string()));
+        assert!(
+            splash_warrant(dch_config::SplashColors::Truecolor, true, no_rgb),
+            "a forced truecolor session paints the original art whatever tmux said"
+        );
+        assert!(
+            !splash_warrant(dch_config::SplashColors::Palette, false, None),
+            "a forced palette session takes the fixed vocabulary even outside tmux"
+        );
+        assert!(
+            !splash_warrant(dch_config::SplashColors::Auto, true, no_rgb),
+            "auto alone downgrades on tmux's explicit no"
+        );
+        assert!(
+            splash_warrant(dch_config::SplashColors::Auto, false, no_rgb),
+            "auto outside tmux stays truecolor"
+        );
+    }
+
+    #[test]
+    fn a_forced_splash_color_mode_offers_no_notice() {
+        // The advice names the config line that restores truecolor —
+        // counsel for a downgrade the session chose for itself. A
+        // forced mode is the user's choice, so no answer tmux gives
+        // turns into advice; only `auto` naming its own downgrade
+        // earns the notice.
+        let no_rgb = Some(&("focus,title".to_string(), "xterm-256color".to_string()));
+        assert!(
+            splash_notice_from(dch_config::SplashColors::Truecolor, true, no_rgb).is_none(),
+            "a forced truecolor session gets no advice"
+        );
+        assert!(
+            splash_notice_from(dch_config::SplashColors::Palette, true, no_rgb).is_none(),
+            "a forced palette session gets no advice — it asked for the palette"
+        );
+        assert!(
+            splash_notice_from(dch_config::SplashColors::Auto, true, no_rgb).is_some(),
+            "an auto session that downgraded still hears the fix"
+        );
+    }
+
+    #[test]
+    fn the_first_splash_colors_choice_stands() {
+        // The set-once contract: construction is the one writer, and a
+        // second call changes nothing. Armed at `auto` — the default —
+        // so this pin leaves the process observing what it would have
+        // observed anyway; the different second call must not move it.
+        set_splash_colors(dch_config::SplashColors::Auto);
+        set_splash_colors(dch_config::SplashColors::Truecolor);
+        assert_eq!(
+            splash_colors(),
+            dch_config::SplashColors::Auto,
+            "the first choice stands; a second call changes nothing"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cell_report_names_height_then_width() {
+        // The reply's own order is height first, width second; the
+        // reader hands back width first, the shape everything else in
+        // the house speaks.
+        assert_eq!(parse_cell_reply(b"\x1b[6;32;16t"), Some((16, 32)));
+        assert_eq!(parse_cell_reply(b"\x1b[6;21;10t"), Some((10, 21)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn anything_else_is_no_cell_report() {
+        assert!(parse_cell_reply(b"\x1b[6;t").is_none(), "no numbers");
+        assert!(
+            parse_cell_reply(b"\x1b[6;0;10t").is_none(),
+            "a zero cell is no cell"
+        );
+        assert!(
+            parse_cell_reply(b"\x1b[6;32;16;9t").is_none(),
+            "a fourth field is a different report"
+        );
+        assert!(
+            parse_cell_reply(b"\x1b_Gi=1;OK\x1b\\").is_none(),
+            "the graphics probe is not a cell report"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn anything_else_is_no_graphics_support() {
+        assert!(!parse_graphics_reply(b"\x1b_Gi=1;ERR\x1b\\"));
+        assert!(!parse_graphics_reply(b"\x1b[6;21;10t"));
+        // The reply kitty sends a payload-less query: an error APC
+        // whose human message outgrew the probe's old reply cap — the
+        // leaked tail typed itself into the composer.
+        assert!(!parse_graphics_reply(
+            b"\x1b_Gi=1;EINVAL:Not enough image data: 0 < 4\x1b\\"
+        ));
+        // An affirmative without its terminator still names the
+        // protocol; the handshake check accepts it deliberately —
+        // the query is ours, the reply ours to recognize loosely.
+    }
 
     /// Reads one signal's current disposition record.
     #[cfg(unix)]
