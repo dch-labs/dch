@@ -368,12 +368,15 @@ fn apc(payload: &str) -> Vec<u8> {
 /// The transmission commands: the PNG, base64, in protocol-sized
 /// chunks.
 ///
-/// The first chunk carries `f=100` (PNG data) and `m=1` (more
-/// follows); interior chunks are bare payloads with `m=1`; the last
-/// carries `m=0` and the image id, at which point the terminal
-/// composes the image. Chunking is protocol-mandated — a command is
-/// limited to 4096 bytes — so the encoder splits the base64 text,
-/// never the image bytes.
+/// The first chunk carries `f=100` (PNG data), the image id, and
+/// `m=1` (more follows); every continuation carries only `m` — and
+/// `q=2` on the closing one — because the protocol permits nothing
+/// else once the id is established, so the terminal composes the
+/// image when the `m=0` chunk lands. Control data and payload are
+/// divided by the protocol's `;`, never a comma, so the base64 text
+/// is unambiguously the payload. Chunking is protocol-mandated — a
+/// command is limited to 4096 bytes — so the encoder splits the
+/// base64 text, never the image bytes.
 pub(crate) fn transmit_commands(png: &[u8], chunk: usize) -> Vec<Vec<u8>> {
     use base64::Engine as _;
 
@@ -387,11 +390,11 @@ pub(crate) fn transmit_commands(png: &[u8], chunk: usize) -> Vec<Vec<u8>> {
         let end = start.saturating_add(step).min(bytes.len());
         let last = end == bytes.len();
         let head = if first {
-            format!("f=100,i={IMAGE_ID},m={},", u8::from(!last))
+            format!("f=100,i={IMAGE_ID},m={};", u8::from(!last))
         } else if last {
-            format!("i={IMAGE_ID},m=0,q=2,")
+            "m=0,q=2;".to_string()
         } else {
-            "m=1,".to_string()
+            "m=1;".to_string()
         };
         let payload: String = encoded
             .chars()
@@ -418,23 +421,26 @@ pub(crate) fn place_command(columns: u16, rows: u16) -> Vec<u8> {
     apc(&format!("a=p,i={IMAGE_ID},c={columns},r={rows},C=1,q=2"))
 }
 
-/// The placement-delete command: the anchors gone, the pixels kept.
+/// The placement-delete command: the anchors gone, the data kept.
 ///
-/// Kitty's `d=p` removes the image's placements while leaving the
-/// transmitted data alone; the emit path sends this before
-/// re-placing a band whose seat moved, so the old anchor never
-/// outlives the geometry it was built for.
+/// Kitty's delete action with `d=i` removes every placement of the
+/// named image while leaving its transmitted data in place — the
+/// one by-id deletion the protocol offers; the emit path sends this
+/// before re-placing a band whose seat moved, so the old anchor
+/// never outlives the geometry it was built for.
 pub(crate) fn delete_placements_command() -> Vec<u8> {
-    apc(&format!("a=D,d=p,i={IMAGE_ID},q=2"))
+    apc(&format!("a=d,d=i,i={IMAGE_ID},q=2"))
 }
 
 /// The deletion command: the image gone, by its id.
 ///
 /// Emitted when the welcome ends, so the floating photograph never
 /// outlives the session-opening it belongs to; text drawn after it
-/// would otherwise sit beneath a stale picture.
+/// would otherwise sit beneath a stale picture. The bytes are the
+/// placement-delete's — the terminal's by-id deletion clears what is
+/// visible, which is everything the welcome owed the image.
 pub(crate) fn delete_command() -> Vec<u8> {
-    apc(&format!("a=d,d=i,i={IMAGE_ID},q=2"))
+    delete_placements_command()
 }
 
 /// Cursor addressing, 1-based, as the placement's anchor.
@@ -469,8 +475,8 @@ mod tests {
         assert_eq!(commands.len(), 1, "a three-byte payload is one chunk");
         let command = String::from_utf8(commands.first().cloned().unwrap()).unwrap();
         assert!(
-            command.starts_with("\x1b_Gf=100,i=7,m=0,q83v\x1b\\"),
-            "the payload is the standard encoding of AB CD EF: {command:?}"
+            command.starts_with("\x1b_Gf=100,i=7,m=0;q83v\x1b\\"),
+            "the payload is the standard encoding of AB CD EF, divided from the control data by the protocol's semicolon: {command:?}"
         );
     }
 
@@ -506,17 +512,17 @@ mod tests {
             "the first chunk names the PNG format: {first:?}"
         );
         assert!(
-            first.contains("m=1,"),
-            "a non-final chunk announces more: {first:?}"
+            first.contains("m=1;"),
+            "a non-final chunk announces more, semicolon-divided: {first:?}"
         );
         let last = String::from_utf8(commands.last().cloned().unwrap()).unwrap();
         assert!(
-            last.contains("m=0"),
-            "the final chunk closes the transmission: {last:?}"
+            last.starts_with("\x1b_Gm=0,q=2;"),
+            "the closing chunk carries only m and q — the protocol permits nothing else on a continuation: {last:?}"
         );
         assert!(
-            last.contains("i=7"),
-            "the id rides the closing chunk: {last:?}"
+            !last.contains("i="),
+            "a continuation never repeats the image id: {last:?}"
         );
         for command in &commands {
             let text = String::from_utf8(command.clone()).unwrap();
@@ -538,8 +544,8 @@ mod tests {
         );
         let placements = String::from_utf8(delete_placements_command()).unwrap();
         assert!(
-            placements.contains("a=D,d=p,"),
-            "the placement delete clears the anchors, not the pixels: {placements:?}"
+            placements.contains("a=d,d=i,"),
+            "the placement delete is the protocol's delete action by id, not the invalid `a=D,d=p`: {placements:?}"
         );
         assert!(
             placements.contains("i=7"),
@@ -548,6 +554,10 @@ mod tests {
         assert!(
             placements.contains("q=2"),
             "the placement delete is fire-and-forget like its siblings: {placements:?}"
+        );
+        assert_eq!(
+            placements, delete,
+            "the terminal offers one by-id deletion — the two names spell the same bytes"
         );
     }
 

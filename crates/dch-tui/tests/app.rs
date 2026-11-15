@@ -13770,11 +13770,346 @@ fn arrows_and_tab_interoperate_in_both_directions() {
         "Tab continues from the arrow-landed position"
     );
 
-    // The popup stands throughout
+    // The popup stands throughout — and since the window now sizes
+    // itself to the rows the side offers, the row it must keep is the
+    // highlighted one, not the list's head.
     let drawn = render_to_buffer(&mut app, 80, 24);
     let rows = row_texts(&drawn);
+    let highlighted = cands.get(5).cloned().unwrap_or_default();
     assert!(
-        rows.iter().any(|r| r.trim_start().starts_with("default")),
-        "the popup stands on the whole theme list"
+        rows.iter().any(|r| r.contains(&highlighted)),
+        "the popup stands with its highlighted row on screen: {rows:?}"
+    );
+}
+
+#[test]
+fn an_unset_of_permission_mode_moves_the_gate_back_with_the_display() {
+    // The undo's whole live path: `/unset permission_mode` restores
+    // the earlier value into the panel's config *and* moves the gate —
+    // the shared cell flips back and the driver hears the Mode
+    // command — so the loop never keeps enforcing a mode the panel no
+    // longer shows. Before the shared live path, the undo reached the
+    // display alone and the gate kept the removed mode.
+    use dch_tui::commands::Command;
+    let (mut app, _kept) = app_with_state();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    app.set_submit_tx(tx);
+    let cell = std::sync::Arc::new(std::sync::Mutex::new(dch_config::PermissionMode::default()));
+    app.set_permission_mode_cell(Some(std::sync::Arc::clone(&cell)));
+    app.run_command(Command::Mode {
+        name: Some("read_only".to_string()),
+    });
+    assert_eq!(
+        *cell.lock().unwrap(),
+        dch_config::PermissionMode::ReadOnly,
+        "/mode flips the gate's cell on the spot"
+    );
+    app.run_command(Command::Unset {
+        key: "permission_mode".to_string(),
+    });
+    assert_eq!(
+        *cell.lock().unwrap(),
+        dch_config::PermissionMode::default(),
+        "the undo flips the cell back — the gate reads the restored mode"
+    );
+    let mut modes = Vec::new();
+    while let Ok(submission) = rx.try_recv() {
+        if let dch_tui::Submission::Command { command } = submission
+            && let dch_tui::SessionCommand::Mode { mode } = command
+        {
+            modes.push(mode);
+        }
+    }
+    assert_eq!(
+        modes,
+        vec![
+            dch_config::PermissionMode::ReadOnly,
+            dch_config::PermissionMode::default(),
+        ],
+        "the set and the undo both told the driver to rebuild under their mode"
+    );
+}
+
+#[test]
+fn a_forget_press_numbers_the_listing_it_read_not_the_config_at_press_time() {
+    // A `/preset` between the listing and the press changes the
+    // configured set; the number the user names must still address
+    // the row they read. The press's boundary between configured and
+    // remembered rules is the listing's own count, snapshotted with
+    // the rendered rules — re-deriving it at press time shifted every
+    // numbered row under the user's number, handing `forget` a
+    // stranger to remove.
+    use dch_tui::commands::Command;
+    let allow_rule = |matcher: &str| dch_config::PermissionRuleConfig {
+        id: None,
+        outcome: dch_config::PermissionRuleOutcome::Allow,
+        tool: None,
+        shell_prefix: Some(matcher.to_string()),
+        path_glob: None,
+    };
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    let mut config = config_with_theme("dracula");
+    config.permissions.preset = Some("dev".to_string());
+    config.permissions.presets.insert(
+        "dev".to_string(),
+        dch_permissions::Preset {
+            rules: vec![allow_rule("cargo fmt")],
+        },
+    );
+    config.permissions.presets.insert(
+        "empty".to_string(),
+        dch_permissions::Preset { rules: Vec::new() },
+    );
+    let mut app = TuiApp::from_observer_state(config, kept);
+    let memory = dch_tui::queue::PermissionMemory::default();
+    memory.adopt(
+        vec![
+            dch_tui::queue::PermissionRule::ShellPrefix {
+                prefix: "cargo test".to_string(),
+            },
+            dch_tui::queue::PermissionRule::ShellPrefix {
+                prefix: "cargo build".to_string(),
+            },
+        ],
+        vec![],
+    );
+    app.set_permission_memory(memory);
+    // The listing numbers one configured row (the selected preset's
+    // rule), so rows 2 and 3 are the remembered rules in order.
+    app.run_command(Command::Permissions { forget: None });
+    // Between the listing and the press, the preset swap shrinks the
+    // configured set to nothing — a count re-derived now would say
+    // zero, shifting the remembered rows up under the user's number.
+    app.run_command(Command::Preset {
+        name: Some("empty".to_string()),
+    });
+    app.run_command(Command::Permissions {
+        forget: Some("forget 2".to_string()),
+    });
+    let forgot = app
+        .conversation()
+        .iter()
+        .filter_map(|message| match message {
+            dch_tui::TuiMessage::System { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .find(|text| text.starts_with("Forgot remembered permission"))
+        .expect("the forget lands its receipt");
+    assert!(
+        forgot.contains("cargo test"),
+        "row 2 is the first remembered rule as the listing numbered it: {forgot}"
+    );
+    assert!(
+        !forgot.contains("cargo build"),
+        "the re-derived boundary must not shift the press onto a stranger: {forgot}"
+    );
+}
+
+#[test]
+fn a_stand_in_save_keeps_the_pair_the_session_started_under() {
+    // The stand-in a config save writes without a wired file restores
+    // the session-scoped pair to what the session started under — the
+    // flag- or file-stated mode and preset — never compiled defaults:
+    // an unrelated `/theme` save once rewrote an initial
+    // `--permission-mode interactive` and `--permissions-preset`
+    // out of the file it wrote.
+    use dch_tui::commands::Command;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    let mut config = config_with_theme("dracula");
+    config.runner.permission_mode = dch_config::PermissionMode::Interactive;
+    config.permissions.preset = Some("rust-dev".to_string());
+    config.permissions.presets.insert(
+        "rust-dev".to_string(),
+        dch_permissions::Preset { rules: Vec::new() },
+    );
+    let mut app = TuiApp::from_observer_state(config, kept);
+    app.set_config_persist_dir(Some(dir.path().to_path_buf()));
+    app.run_command(Command::Theme {
+        name: Some("nord".to_string()),
+    });
+    let saved = std::fs::read_to_string(dir.path().join("config.toml")).expect("the save landed");
+    assert!(
+        saved.contains("interactive"),
+        "the stand-in keeps the mode the session started under: {saved}"
+    );
+    assert!(
+        saved.contains("rust-dev"),
+        "the stand-in keeps the preset the session started under: {saved}"
+    );
+    assert!(
+        saved.contains("\"nord\""),
+        "the unrelated theme change did land: {saved}"
+    );
+}
+
+#[test]
+fn an_expanded_permission_sheet_shows_the_command_s_tail() {
+    // The approval press must be able to see the whole command: the
+    // collapsed sheet shows its first rows, and a destructive suffix
+    // can hide past them. `e` expands the sheet onto the command's
+    // *tail* — the half a head-only preview cuts — and the hints name
+    // the press both ways. The toggle resets with the ask it read, so
+    // the next ask starts collapsed again.
+    let mut app = app();
+    let (requests_tx, requests_rx) = tokio::sync::mpsc::unbounded_channel();
+    let send_ask = |tx: &tokio::sync::mpsc::UnboundedSender<dch_tui::PermissionRequest>| {
+        let (reply, _reply_rx) = tokio::sync::oneshot::channel();
+        let command = format!("{}&& rm -rf /important", "filler-word ".repeat(40));
+        tx.send(dch_tui::PermissionRequest {
+            tool_name: "Bash".to_string(),
+            prompt: "allow bash?".to_string(),
+            input: serde_json::json!({ "command": command }),
+            always: Vec::new(),
+            never: Vec::new(),
+            reply,
+        })
+        .expect("receiver alive");
+    };
+    send_ask(&requests_tx);
+    app.set_permission_requests(requests_rx);
+    app.poll_permission_requests();
+
+    let collapsed = row_texts(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        collapsed.iter().any(|row| row.contains("runs: ")),
+        "the command preview renders: {collapsed:?}"
+    );
+    assert!(
+        !collapsed
+            .iter()
+            .any(|row| row.contains("rm -rf /important")),
+        "the collapsed head cannot show the command's tail"
+    );
+    assert!(
+        collapsed.iter().any(|row| row.contains("expand")),
+        "the hints offer the expansion when the wrap truncates: {collapsed:?}"
+    );
+
+    assert!(app.handle_event(&plain(KeyCode::Char('e'))));
+    let expanded = row_texts(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        expanded.iter().any(|row| row.contains("rm -rf /important")),
+        "the expanded sheet keeps the wrap's tail — the suffix is visible before the press: {expanded:?}"
+    );
+    assert!(
+        expanded.iter().any(|row| row.contains("collapse")),
+        "the hints offer the collapse: {expanded:?}"
+    );
+
+    // The toggle is the ask's own: resolving it and landing the next
+    // ask starts collapsed again.
+    assert!(app.handle_event(&plain(KeyCode::Char('n'))));
+    let (again_tx, again_rx) = tokio::sync::mpsc::unbounded_channel();
+    send_ask(&again_tx);
+    app.set_permission_requests(again_rx);
+    app.poll_permission_requests();
+    let recollapsed = row_texts(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        !recollapsed
+            .iter()
+            .any(|row| row.contains("rm -rf /important")),
+        "the next ask starts collapsed — the toggle reset with the one it read"
+    );
+    assert!(
+        recollapsed.iter().any(|row| row.contains("expand")),
+        "the next ask offers the expansion afresh: {recollapsed:?}"
+    );
+}
+
+#[test]
+fn a_short_terminal_sheds_session_picker_rows_not_the_cursor() {
+    // The picker's window sizes itself to the rows its side of the
+    // composer offers: a fixed eight-row window on a short terminal
+    // would walk the cursor past the last visible row, and Enter
+    // would resume a session the user cannot see. The cursor's own
+    // row always renders.
+    let mut app = app();
+    app.push_message(TuiMessage::User {
+        text: "hello".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
+    let rows: Vec<dch_tui::queue::SessionPick> = (1..=10)
+        .map(|n| dch_tui::queue::SessionPick {
+            id: format!("{n:08}-0000-0000-0000-000000000000"),
+            model: "m".to_string(),
+            saved_at: chrono::Utc::now(),
+            prompts: n,
+            title: Some(format!("session-{n}")),
+            workdir: Some("/home/user/alpha".to_string()),
+        })
+        .collect();
+    app.apply_session_update(dch_tui::queue::SessionUpdate::SessionCatalog { rows });
+    for _ in 0..9 {
+        app.handle_event(&plain(KeyCode::Down));
+    }
+    let drawn = row_texts(&render_to_buffer(&mut app, 80, 10));
+    assert!(
+        drawn.iter().any(|row| row.contains("sessions —")),
+        "the picker draws even on a short terminal: {drawn:?}"
+    );
+    assert!(
+        drawn.iter().any(|row| row.contains("session-10")),
+        "the cursor's own row renders — the window sheds list rows, never the cursor: {drawn:?}"
+    );
+}
+
+#[test]
+fn a_short_terminal_sheds_model_picker_rows_not_the_cursor() {
+    // The model picker's window takes the same bound-derived capacity:
+    // walking the cursor to the last model on a short terminal keeps
+    // the chosen row on screen, where Enter can act on what the user
+    // sees.
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    let mut config = config_with_theme("dracula");
+    config.models = (1..=10)
+        .map(|n| dch_config::ModelProfile {
+            model: format!("model-{n}"),
+            ..dch_config::ModelProfile::default()
+        })
+        .collect();
+    let mut app = TuiApp::from_observer_state(config, kept);
+    app.run_command(dch_tui::Command::Models);
+    for _ in 0..9 {
+        app.handle_event(&plain(KeyCode::Down));
+    }
+    let drawn = row_texts(&render_to_buffer(&mut app, 80, 10));
+    assert!(
+        drawn.iter().any(|row| row.contains("models —")),
+        "the picker draws even on a short terminal: {drawn:?}"
+    );
+    assert!(
+        drawn.iter().any(|row| row.contains("model-10")),
+        "the cursor's own row renders — the window sheds list rows, never the cursor: {drawn:?}"
+    );
+}
+
+#[test]
+fn a_short_terminal_sheds_completion_rows_not_the_highlight() {
+    // The completion popup's window takes its capacity from the side's
+    // bound too: cycling the highlight deep into the candidate list on
+    // a short terminal keeps the highlighted row on screen — the row
+    // Tab is about to accept is never the one the clamp cut.
+    let mut app = app();
+    app.handle_event(&plain(KeyCode::Char('/')));
+    // Each Tab accepts the next candidate into the composer, so the
+    // composer names the row the highlight stands on.
+    for _ in 0..8 {
+        app.handle_event(&plain(KeyCode::Tab));
+    }
+    let chosen = app.input().trim().trim_start_matches('/').to_string();
+    assert!(!chosen.is_empty(), "the cycle accepted a candidate");
+    let drawn = row_texts(&render_to_buffer(&mut app, 80, 10));
+    assert!(
+        drawn.iter().any(|row| row.contains(&chosen)),
+        "the highlighted candidate renders — the window sheds list rows, never the highlight: {drawn:?}"
     );
 }

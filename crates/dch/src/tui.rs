@@ -307,7 +307,16 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
         launch_identity(&mut app, control, &runner, args, flag_mode, model, &workdir);
     let (transcript_handle, transcript_worker) = TranscriptWorker::spawn(saver);
     let initial_transcript = transcript_handle.clone();
-    wire_permission_memory(&permission_memory, &initial_transcript);
+    let permission_restore = wire_permission_memory(&permission_memory, &initial_transcript);
+    if permission_restore.is_damaged() {
+        fail_permissions_restore_closed(&lanes.mode_cell);
+        app.post_notice(
+            "the saved permissions for this session are damaged — remembered \
+             always/deny rules are gone, and side effects ask until they are \
+             re-answered"
+                .to_string(),
+        );
+    }
     let exit_saver = Arc::clone(&initial_transcript.saver);
     install_turn_end_hook(&mut app, &state, transcript_handle);
 
@@ -1341,14 +1350,20 @@ impl dch_tui::Guidance for LoopGuidance {
 /// nothing to adopt), and every later remember writes through the
 /// live saver cell — a rotation — `/clear`, a live resume — swaps the
 /// target, and the hook reads the cell, so a choice always lands in
-/// the session file that is current when it is made.
-fn wire_permission_memory(memory: &PermissionMemory, transcript: &TranscriptHandle) {
+/// the session file that is current when it is made. The restore's
+/// verdict travels back to the caller: damage is the caller's to
+/// fail closed on, not this wiring's to bury.
+fn wire_permission_memory(
+    memory: &PermissionMemory,
+    transcript: &TranscriptHandle,
+) -> crate::session::PermissionsRestore {
     let launch_saver = transcript
         .saver
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
-    let (allow, deny) = launch_saver.load_permissions();
+    let restored = launch_saver.load_permissions();
+    let (allow, deny) = restored.clone().into_lists();
     memory.adopt(allow, deny);
     let persist_cell = Arc::clone(&transcript.saver);
     memory.persist_through(Arc::new(move |allow, deny| {
@@ -1360,6 +1375,29 @@ fn wire_permission_memory(memory: &PermissionMemory, transcript: &TranscriptHand
             tracing::warn!(error = %why, "remembered permissions could not be saved");
         }
     }));
+    restored
+}
+
+/// Fail a damaged permissions restore closed, on the mode cell.
+///
+/// The damage already emptied what the caller adopted — no list to
+/// restore — so the one lever left is the posture: where the session
+/// would run `auto`, the posture that never asks, the cell moves to
+/// `interactive`, and every side-effecting call prompts until the
+/// session's answers re-establish a memory (the explicit recovery).
+/// A stricter posture stays as it stands — read-only and interactive
+/// already gate everything the damage could have hidden — and the
+/// answer says whether the move happened, for the notice that names
+/// it.
+fn fail_permissions_restore_closed(cell: &dch_config::SharedPermissionMode) -> bool {
+    let mut guard = cell
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if *guard == dch_config::PermissionMode::Auto {
+        *guard = dch_config::PermissionMode::Interactive;
+        return true;
+    }
+    false
 }
 
 /// Post a fresh session's boot warning, when one was earned, as the
@@ -2369,6 +2407,7 @@ async fn apply_session_command(
                 &mut config,
                 context.overrides.reasoning_effort.as_deref(),
             );
+            carry_live_permission_mode(&mut config, &context.lanes.mode_cell);
             let history = runner.committed_history();
             let read_paths = crate::resume::resumed_read_paths_with_machine(&[], Some(&history));
             let observer = context.state.clone().into_observer().0;
@@ -2472,8 +2511,48 @@ async fn apply_session_command(
     }
 }
 
-/// Move the live loop's permission mode, from the next turn.
+/// Retarget the shared mode cell only while it still holds `was`.
 ///
+/// The panel flips the cell the moment `/mode` is keyed, so a
+/// rebuild finishing after a newer request landed must not stamp its
+/// own mode over the newer one — the write, the success confirmation
+/// and the failure rollback alike, goes through only while the cell
+/// still carries this command's mode. A cell that has moved on
+/// belongs to the newer request, whose own rebuild will settle it;
+/// writing over it would let a queued prompt dispatch under a mode
+/// the display no longer shows.
+fn settle_mode_cell_if_still(
+    cell: &dch_config::SharedPermissionMode,
+    was: dch_config::PermissionMode,
+    to: dch_config::PermissionMode,
+) {
+    let mut guard = cell
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if *guard == was {
+        *guard = to;
+    }
+}
+
+/// Carry the session's live permission mode into a rebuild's config.
+///
+/// A rebuild selects onto the user-stated base, whose mode is the
+/// boot default — but `/mode` moves the session's mode in the shared
+/// cell, not in the base. Without the carry, an accepted switch
+/// re-seats the loop's config on the base's stale spelling, and the
+/// next failed `/mode` rebuild would roll the cell back to it —
+/// enabling side effects under a mode the session had left. The cell
+/// is the one truth: whatever it holds when the rebuild is prepared
+/// is the mode the new loop's config names too.
+fn carry_live_permission_mode(
+    config: &mut dch_config::DchConfig,
+    cell: &dch_config::SharedPermissionMode,
+) {
+    config.runner.permission_mode = *cell
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+}
+
 /// `/mode`'s driver half: the running gate re-reads the shared mode
 /// cell on every dispatch, so the move updates that cell and rebuilds
 /// the runner on the new mode — the conversation and its recorded
@@ -2483,7 +2562,10 @@ async fn apply_session_command(
 /// so the failure direction is this function's to write: a rebuild
 /// that cannot stand restores the cell to the mode still in the
 /// loop's config, leaving the loop exactly as it was, mode included,
-/// and the notice says so.
+/// and the notice says so. Both cell writes — the confirmation and
+/// the rollback — go through only while the cell still holds this
+/// command's mode, so a newer `/mode` keyed during the rebuild is
+/// never dragged back by the older one.
 async fn move_mode(
     runner: &mut dch_loop::Runner,
     transcript: &TranscriptHandle,
@@ -2513,11 +2595,12 @@ async fn move_mode(
                 let _recorded = built.record_resumed_read(&path).await;
             }
             context.lanes.attach(&built);
-            *context
-                .lanes
-                .mode_cell
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = mode;
+            // The panel flipped the cell when the command was keyed, so
+            // the settle is a no-op unless a newer `/mode` has since
+            // moved the cell — and then this command's mode must not
+            // stamp over the newer one, whose own rebuild will settle
+            // it.
+            settle_mode_cell_if_still(&context.lanes.mode_cell, mode, mode);
             transcript.set_permission_mode(Some(mode));
             *runner = built;
             context.state.adopt_runner_handles(
@@ -2533,12 +2616,11 @@ async fn move_mode(
             );
         }
         Err(err) => {
-            *context
-                .lanes
-                .mode_cell
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                context.config.runner.permission_mode;
+            settle_mode_cell_if_still(
+                &context.lanes.mode_cell,
+                mode,
+                context.config.runner.permission_mode,
+            );
             if session_tx
                 .send(SessionUpdate::PermissionMode {
                     mode: context.config.runner.permission_mode,
@@ -2679,6 +2761,7 @@ async fn switch_provider(
         &mut config,
         context.overrides.reasoning_effort.as_deref(),
     );
+    carry_live_permission_mode(&mut config, &context.lanes.mode_cell);
     let history = runner.committed_history();
     let read_paths = crate::resume::resumed_read_paths_with_machine(&[], Some(&history));
     let observer = context.state.clone().into_observer().0;
@@ -2871,12 +2954,17 @@ async fn resume_into_session(
         outcome.title.clone(),
         recorded_mode,
     );
-    let (allow, deny) = transcript
-        .saver
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .load_permissions();
-    context.lanes.memory.adopt(allow, deny);
+    let (enforced_mode, permissions_damaged) =
+        adopt_resumed_permissions(transcript, context, standing_mode);
+    if permissions_damaged {
+        post_session_notice(
+            session_tx,
+            "the saved permissions for this session are damaged — remembered \
+             always/deny rules are gone, and side effects ask until they are \
+             re-answered"
+                .to_string(),
+        );
+    }
     transcript.send_machine(MachineSnapshot {
         messages: adopted,
         saved_at: chrono::Utc::now(),
@@ -2892,11 +2980,42 @@ async fn resume_into_session(
             last_input: outcome.tokens.last_input_tokens,
             context_tokens: outcome.tokens.context_tokens,
         },
-        permission_mode: standing_mode,
+        permission_mode: enforced_mode,
     };
     if session_tx.send(update).is_err() {
         tracing::warn!("session resumed but the display is gone");
     }
+}
+
+/// Adopt a resumed session's remembered permissions, failing damage
+/// closed.
+///
+/// The load's verdict drives everything here: a fresh or restored
+/// sibling adopts its lists wholesale, and a damaged one adopts
+/// nothing *and* — where the resumed session would run `auto`, the
+/// posture that never asks — moves the shared cell to the asking
+/// posture, because the standing refusals the damage hid cannot run
+/// unasked. Returns the mode the resumed display should publish
+/// beside the damage verdict, so the caller can say the damage aloud.
+fn adopt_resumed_permissions(
+    transcript: &TranscriptHandle,
+    context: &mut DriverContext,
+    standing_mode: dch_config::PermissionMode,
+) -> (dch_config::PermissionMode, bool) {
+    let restored = transcript
+        .saver
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .load_permissions();
+    let damaged = restored.is_damaged();
+    let (allow, deny) = restored.into_lists();
+    context.lanes.memory.adopt(allow, deny);
+    let enforced_mode = if damaged && fail_permissions_restore_closed(&context.lanes.mode_cell) {
+        dch_config::PermissionMode::Interactive
+    } else {
+        standing_mode
+    };
+    (enforced_mode, damaged)
 }
 
 /// Whether a `/clear` may rotate onto a fresh session, given the
@@ -5412,6 +5531,138 @@ mod tests {
         let _ = driver.await;
     }
 
+    #[test]
+    fn the_mode_cell_settle_writes_only_while_the_command_still_owns_it() {
+        // Both arms of the conditional in one pin: the settle lands
+        // while the cell holds the mode the command requested, and is
+        // a no-op the moment anything newer has moved the cell — the
+        // newer request's own rebuild is the one that settles it.
+        let cell: dch_config::SharedPermissionMode =
+            std::sync::Arc::new(std::sync::Mutex::new(dch_config::PermissionMode::Auto));
+        settle_mode_cell_if_still(
+            &cell,
+            dch_config::PermissionMode::Auto,
+            dch_config::PermissionMode::ReadOnly,
+        );
+        assert_eq!(
+            *cell
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            dch_config::PermissionMode::ReadOnly,
+            "a still-owned cell settles onto the target mode"
+        );
+        settle_mode_cell_if_still(
+            &cell,
+            dch_config::PermissionMode::Auto,
+            dch_config::PermissionMode::Interactive,
+        );
+        assert_eq!(
+            *cell
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            dch_config::PermissionMode::ReadOnly,
+            "a moved-on cell is left to its newer owner"
+        );
+    }
+
+    #[test]
+    fn a_rebuilds_config_carries_the_live_mode_not_the_bases() {
+        // The whole carry in one pin: the base names Auto, the
+        // session's cell holds the ReadOnly a `/mode` moved it to, and
+        // the config a rebuild prepares names ReadOnly — so the loop's
+        // own record, and any later failed `/mode` rollback, restore
+        // what the gate actually enforces, never the base's stale
+        // spelling.
+        let mut config = unreachable_config();
+        config.runner.permission_mode = dch_config::PermissionMode::Auto;
+        let cell: dch_config::SharedPermissionMode =
+            std::sync::Arc::new(std::sync::Mutex::new(dch_config::PermissionMode::ReadOnly));
+        carry_live_permission_mode(&mut config, &cell);
+        assert_eq!(
+            config.runner.permission_mode,
+            dch_config::PermissionMode::ReadOnly,
+            "the rebuild's config names the cell's live mode"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_older_failed_mode_rebuild_leaves_a_newer_flip_alone() {
+        // The race the conditional settle closes, in the interleaving
+        // that produced it: `/mode ReadOnly` is keyed and its rebuild
+        // starts, `/mode Interactive` is keyed while that rebuild
+        // still stands — the panel's second flip is the cell's newest
+        // word. The older rebuild's rollback must leave the newer flip
+        // where it is (the old unconditional write dragged the cell
+        // back mid-window, and a queued prompt could dispatch under
+        // the reverted mode); the newer command's own rebuild is the
+        // one that settles the cell.
+        let runner = unreachable_runner().await;
+        let (_, state) = TuiObserverState::new().into_observer();
+        let (submit_tx, submit_rx) = mpsc::unbounded_channel();
+        let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+        let mut context = unreachable_config();
+        context.api.fallback_model = Some(String::new());
+        let lanes = InteractiveLanes::detached();
+        let mode_cell = Arc::clone(&lanes.mode_cell);
+        // The panel keyed ReadOnly first, Interactive second: the cell
+        // holds the newest flip before the driver drains the first
+        // command.
+        *mode_cell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            dch_config::PermissionMode::Interactive;
+        submit_tx
+            .send(Submission::Command {
+                command: SessionCommand::Mode {
+                    mode: dch_config::PermissionMode::ReadOnly,
+                },
+            })
+            .expect("driver channel open");
+        drop(submit_tx);
+        let driver = tokio::spawn(Box::pin(run_driver_loop(
+            runner,
+            submit_rx,
+            DriverContext {
+                config_base: std::sync::Arc::new(context.clone()),
+                config: context,
+                workdir: std::path::PathBuf::from("."),
+                sessions_root: crate::session::sessions_dir(),
+                state,
+                shutting_down: shutdown_flag(false),
+                lanes,
+                overrides: RunOverrides::default(),
+            },
+            parked_transcript(),
+            session_tx,
+        )));
+        let mut notice = None;
+        for _ in 0..6 {
+            let update = tokio::time::timeout(std::time::Duration::from_secs(5), session_rx.recv())
+                .await
+                .expect("the driver answers the command")
+                .expect("the session channel is open when the command lands");
+            if let SessionUpdate::Notice { text } = update {
+                notice = Some(text);
+                break;
+            }
+        }
+        let notice =
+            notice.unwrap_or_else(|| panic!("a failed rebuild posts a notice, not a silent drop"));
+        assert!(
+            notice.contains("the loop kept its mode"),
+            "the failed rebuild names the mode it kept: {notice}"
+        );
+        assert_eq!(
+            *mode_cell
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            dch_config::PermissionMode::Interactive,
+            "the newer flip survives the older rebuild's rollback — \
+             the cell belongs to the newest request"
+        );
+        let _ = driver.await;
+    }
+
     #[tokio::test]
     async fn a_model_switch_selects_onto_the_base_not_the_accreted_live_config() {
         // The driver's half of the no-accretion rule, read off the
@@ -6839,6 +7090,149 @@ mod tests {
                 prefix: "cargo build".to_string(),
             }],
             "the resumed session's own pair replaces the previous session's wholesale"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_resume_of_a_damaged_permissions_sibling_fails_closed() {
+        // The reviewer's case on the live-resume path: session B saved a
+        // standing deny and ran auto, its permissions sibling is then
+        // damaged on disk, and the resume must not come back as a quiet
+        // empty memory under a mode that never asks. The verdict adopts
+        // nothing, the cell moves from the standing auto to the asking
+        // posture, the notice names the damage, and the Resumed update
+        // publishes the enforced mode — the display never shows a
+        // posture the gate does not run.
+        let dir = tempfile::tempdir().expect("sessions tempdir");
+        let root = dir.keep();
+        let b = uuid::Uuid::new_v4();
+        let saver =
+            crate::session::SessionSaver::with_base_dir(b, "test-model".to_string(), root.clone());
+        saver
+            .save_at(
+                &[dch_tui::TuiMessage::User {
+                    text: "the saved turn".to_string(),
+                    timestamp: chrono::Utc::now(),
+                    steered: false,
+                    unsent: false,
+                }],
+                crate::session::SessionTokens::default(),
+                chrono::Utc::now(),
+            )
+            .expect("the saved session lands");
+        saver
+            .save_permissions(
+                &[],
+                &[dch_tui::PermissionRule::ShellPrefix {
+                    prefix: "cargo publish".to_string(),
+                }],
+            )
+            .expect("the deny saves");
+        let path = root.join(b.to_string()).join("permissions.json");
+        let intact = std::fs::read_to_string(&path).expect("the sibling reads");
+        let cut = intact.len().saturating_sub(3);
+        std::fs::write(&path, intact.get(..cut).unwrap_or("")).expect("the damaged sibling writes");
+        let mut runner = unreachable_runner().await;
+        let (_, state) = TuiObserverState::new().into_observer();
+        let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+        let mut context = DriverContext {
+            config: unreachable_config(),
+            config_base: std::sync::Arc::new(unreachable_config()),
+            workdir: std::path::PathBuf::from("."),
+            sessions_root: root.clone(),
+            state,
+            shutting_down: shutdown_flag(false),
+            lanes: InteractiveLanes::detached(),
+            overrides: RunOverrides::default(),
+        };
+        let parked_saver = Arc::new(crate::session::SessionSaver::with_base_dir(
+            uuid::Uuid::new_v4(),
+            "m".to_string(),
+            root.clone(),
+        ));
+        let (transcript, _worker) = TranscriptWorker::spawn(parked_saver);
+        apply_session_command(
+            &mut runner,
+            &transcript,
+            &session_tx,
+            SessionCommand::Resume { id: b.to_string() },
+            &mut context,
+        )
+        .await;
+        assert!(
+            context.lanes.memory.allow_rules().is_empty()
+                && context.lanes.memory.deny_rules().is_empty(),
+            "a damaged sibling adopts nothing — the deny is not silently gone"
+        );
+        assert_eq!(
+            *context
+                .lanes
+                .mode_cell
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            dch_config::PermissionMode::Interactive,
+            "the auto the session stood on fails closed to the asking posture"
+        );
+        let mut damage_notice = None;
+        let mut resumed_mode = None;
+        for _ in 0..8 {
+            let Some(update) = session_rx.recv().await else {
+                break;
+            };
+            match update {
+                SessionUpdate::Notice { text } => damage_notice = Some(text),
+                SessionUpdate::Resumed {
+                    permission_mode, ..
+                } => resumed_mode = Some(permission_mode),
+                _ => {}
+            }
+            if damage_notice.is_some() && resumed_mode.is_some() {
+                break;
+            }
+        }
+        let notice = damage_notice.expect("the damage is said aloud on the notice lane");
+        assert!(
+            notice.contains("damaged"),
+            "the notice names the damage: {notice}"
+        );
+        assert_eq!(
+            resumed_mode,
+            Some(dch_config::PermissionMode::Interactive),
+            "the resumed display publishes the enforced posture, never the standing auto"
+        );
+    }
+
+    #[test]
+    fn a_damaged_restore_moves_only_an_auto_cell_to_asking() {
+        // The helper's whole contract: `auto` — the posture that never
+        // asks — moves to the asking posture and says so; a stricter
+        // posture already gates everything damage could have hidden and
+        // stays exactly where it stands.
+        let auto: dch_config::SharedPermissionMode =
+            std::sync::Arc::new(std::sync::Mutex::new(dch_config::PermissionMode::Auto));
+        assert!(
+            fail_permissions_restore_closed(&auto),
+            "the auto cell moves"
+        );
+        assert_eq!(
+            *auto
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            dch_config::PermissionMode::Interactive,
+            "the move lands on the asking posture"
+        );
+        let read_only: dch_config::SharedPermissionMode =
+            std::sync::Arc::new(std::sync::Mutex::new(dch_config::PermissionMode::ReadOnly));
+        assert!(
+            !fail_permissions_restore_closed(&read_only),
+            "a stricter cell does not move"
+        );
+        assert_eq!(
+            *read_only
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            dch_config::PermissionMode::ReadOnly,
+            "read-only stays read-only"
         );
     }
 

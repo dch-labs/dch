@@ -1027,6 +1027,37 @@ mod tests {
     }
 
     #[test]
+    fn a_denied_redirect_carrying_reader_verb_blocks_after_a_mode_move() {
+        // The deny mint and the engine, end to end: refusing
+        // `cat notes.txt > owned.txt` records the exact text (a reader
+        // verb carrying a redirect is a writer, so it mints), and the
+        // remembered deny blocks the identical rerun even after the
+        // session moves to auto — the refusal cannot be lost to a
+        // mode switch.
+        let input = serde_json::json!({ "command": "cat notes.txt > owned.txt" });
+        let minted = crate::shape::deny_rules("Bash", &input, std::path::Path::new("/work"));
+        let crate::rule::RememberRules::Segments { prefixes, texts } = &minted else {
+            panic!("a bash ask mints segments");
+        };
+        assert!(prefixes.is_empty(), "no verb prefix names a redirect");
+        assert_eq!(texts.as_slice(), ["cat notes.txt > owned.txt"]);
+        let mut view = MemoryView::empty();
+        view.denied.command_texts.extend(texts.iter().cloned());
+        let shape = CallShape {
+            segments: crate::shape::command_segments("cat notes.txt > owned.txt"),
+            ..CallShape::of("Bash", ShellExecute)
+        };
+        assert_eq!(
+            evaluate(Auto, &[], &view, &shape),
+            Decision {
+                outcome: Block,
+                rule_id: "remembered:deny".to_string(),
+            },
+            "the mode move does not lose the denial"
+        );
+    }
+
+    #[test]
     fn a_remembered_deny_is_any_match_across_the_axes() {
         // One banned target in a batch denies the batch; one banned verb
         // chained behind approved work denies the command; a banned tool

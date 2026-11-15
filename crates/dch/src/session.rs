@@ -638,31 +638,54 @@ impl SessionSaver {
 
     /// The remembered permission prompts this session last saved.
     ///
-    /// An absent sibling is a fresh session — nothing remembered yet,
-    /// not an error. An unreadable, unparseable, or unknown-format one
-    /// degrades to nothing with one warn, the same bargain the machine
-    /// sibling keeps: in an asking mode the worst case is asking again,
-    /// and under `auto` — where nothing asks — the denies the damaged
-    /// file drops were the session's only standing refusals, so the
-    /// work they banned runs again with the warn as its only trace.
+    /// An absent sibling is a fresh session —
+    /// [`PermissionsRestore::Fresh`], nothing remembered, not an
+    /// error. A sibling that parses under a known format tag restores
+    /// its lists ([`PermissionsRestore::Restored`]), the older
+    /// spellings loading as aliases. A sibling that exists but cannot
+    /// be trusted — unreadable, unparseable, or tagged with a format
+    /// this build does not know — fails the restore closed
+    /// ([`PermissionsRestore::Damaged`]): empty lists are not the
+    /// verdict, because empty lists under `auto` would run the work a
+    /// damaged file's denies had banned; the caller blocks
+    /// side-effecting calls until the session re-answers.
     #[must_use]
-    pub fn load_permissions(&self) -> (Vec<dch_tui::PermissionRule>, Vec<dch_tui::PermissionRule>) {
-        let nothing = || (Vec::new(), Vec::new());
+    pub fn load_permissions(&self) -> PermissionsRestore {
         let stored = match read_stored_file::<StoredPermissions>(&self.permissions_path()) {
             Ok(stored) => stored,
-            Err(fault) => return nothing_remembered(fault),
+            Err(StoredFileFault::Absent) => return PermissionsRestore::Fresh,
+            Err(StoredFileFault::Unreadable(err)) => {
+                tracing::warn!(
+                    error = %err,
+                    "remembered permissions unreadable; failing the restore closed"
+                );
+                return PermissionsRestore::Damaged;
+            }
+            Err(StoredFileFault::Unparseable(err)) => {
+                tracing::warn!(
+                    error = %err,
+                    "remembered permissions unparseable; failing the restore closed"
+                );
+                return PermissionsRestore::Damaged;
+            }
         };
         if stored.format == PERMISSIONS_FORMAT || stored.format == PERMISSIONS_FORMAT_V3 {
-            return (stored.allow, stored.deny);
+            return PermissionsRestore::Restored {
+                allow: stored.allow,
+                deny: stored.deny,
+            };
         }
         if stored.format == PERMISSIONS_FORMAT_V2 {
-            return (stored.allow, Vec::new());
+            return PermissionsRestore::Restored {
+                allow: stored.allow,
+                deny: Vec::new(),
+            };
         }
         tracing::warn!(
             format = %stored.format,
-            "unknown remembered-permissions format; asking again"
+            "unknown remembered-permissions format; failing the restore closed"
         );
-        nothing()
+        PermissionsRestore::Damaged
     }
 
     /// Serialize `messages` into the session file, atomically, stamped
@@ -896,7 +919,8 @@ struct StoredPermissions {
 /// The read-and-parse core [`read_stored_file`] returns this
 /// instead of applying policy, so every loader below meets the same
 /// three facts and answers them through one small policy function:
-/// [`nothing_remembered`] and [`no_machine_history`] warn and fall
+/// [`SessionSaver::load_permissions`] fails the damage closed through
+/// [`PermissionsRestore`], [`no_machine_history`] warns and falls
 /// back, [`session_error_from`] types each fault into a
 /// [`SessionError`], and [`skip_session_entry`] warns the listing's
 /// skip.
@@ -946,24 +970,78 @@ fn read_stored_file<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, St
     serde_json::from_str(&json).map_err(StoredFileFault::Unparseable)
 }
 
-/// The empty pair a refused permissions sibling degrades to.
+/// What a remembered-permissions sibling restored to.
 ///
-/// [`SessionSaver::load_permissions`]'s fault policy: `Absent` is a
-/// fresh session and stays silent; an unreadable or unparseable file
-/// warns once — asking again is the only cost an asking mode pays.
-fn nothing_remembered(
-    fault: StoredFileFault,
-) -> (Vec<dch_tui::PermissionRule>, Vec<dch_tui::PermissionRule>) {
-    match fault {
-        StoredFileFault::Absent => {}
-        StoredFileFault::Unreadable(err) => {
-            tracing::warn!(error = %err, "remembered permissions unreadable; asking again");
-        }
-        StoredFileFault::Unparseable(err) => {
-            tracing::warn!(error = %err, "remembered permissions unparseable; asking again");
+/// The verdict a restore hands its caller, which acts on all three
+/// arms: a fresh session adopts nothing and says nothing, a restored
+/// one adopts its lists, and a damaged one adopts nothing *and* fails
+/// closed — the denies the damage hid were standing refusals, so the
+/// caller blocks side-effecting calls until the session re-answers
+/// them. Damage is never emptiness by another name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PermissionsRestore {
+    /// No sibling existed — a fresh session, nothing remembered.
+    ///
+    /// Not damage and not an error: the session simply never saved a
+    /// permissions file, so there is nothing to adopt and nothing to
+    /// warn about.
+    Fresh,
+
+    /// The sibling parsed and its format tag is known.
+    ///
+    /// The lists exactly as last saved — an older format may carry an
+    /// empty deny list (v2 predates denies), which is the format's
+    /// truth, not damage.
+    Restored {
+        /// The always-allow rules, as saved.
+        ///
+        /// Exactly the list the session's last save recorded, in
+        /// record order — empty when nothing was ever remembered on
+        /// the allow side.
+        allow: Vec<dch_tui::PermissionRule>,
+
+        /// The always-deny rules, as saved.
+        ///
+        /// The standing refusals the session recorded, in record
+        /// order — absent wholesale in a v2 file, which predates the
+        /// deny list entirely.
+        deny: Vec<dch_tui::PermissionRule>,
+    },
+
+    /// The sibling exists but cannot be trusted.
+    ///
+    /// Unreadable, unparseable, or tagged with a format this build
+    /// does not know; nothing is adopted, one warn names the fault,
+    /// and the caller must not let side-effecting calls run unasked —
+    /// the refusals this file carried are unreadable, not gone by
+    /// choice.
+    Damaged,
+}
+
+impl PermissionsRestore {
+    /// The lists to install, whatever the verdict.
+    ///
+    /// Empty on [`PermissionsRestore::Fresh`] and
+    /// [`PermissionsRestore::Damaged`] alike — the difference between
+    /// the two is not the lists but what the caller owes beside them:
+    /// damage blocks side-effecting calls until the memory is
+    /// re-established, a fresh session owes nothing.
+    #[must_use]
+    pub fn into_lists(self) -> (Vec<dch_tui::PermissionRule>, Vec<dch_tui::PermissionRule>) {
+        match self {
+            Self::Fresh | Self::Damaged => (Vec::new(), Vec::new()),
+            Self::Restored { allow, deny } => (allow, deny),
         }
     }
-    (Vec::new(), Vec::new())
+
+    /// Whether the sibling was damaged and the restore failed closed.
+    ///
+    /// The caller's one question: does this session owe the blocking
+    /// posture until its memory is re-answered?
+    #[must_use]
+    pub fn is_damaged(&self) -> bool {
+        matches!(self, Self::Damaged)
+    }
 }
 
 /// The derive-not-seed answer a refused machine sibling earns.
@@ -1206,8 +1284,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("session tempdir");
         let id = Uuid::new_v4();
         let session = saver(dir.path(), id);
-        assert!(
-            session.load_permissions().0.is_empty(),
+        assert_eq!(
+            session.load_permissions(),
+            PermissionsRestore::Fresh,
             "a fresh session has nothing remembered"
         );
         let rules = vec![
@@ -1222,7 +1301,7 @@ mod tests {
             .save_permissions(&rules, &[])
             .expect("the choices save");
         let reloaded = saver(dir.path(), id);
-        let (allow, deny) = reloaded.load_permissions();
+        let (allow, deny) = reloaded.load_permissions().into_lists();
         assert_eq!(allow, rules, "the allow choices round-trip");
         assert!(deny.is_empty(), "no deny rules were recorded");
         // A deny rule takes the other slot of the pair and round-trips
@@ -1233,7 +1312,7 @@ mod tests {
         session
             .save_permissions(&rules, &deny_rules)
             .expect("the pair saves");
-        let (allow, deny) = saver(dir.path(), id).load_permissions();
+        let (allow, deny) = saver(dir.path(), id).load_permissions().into_lists();
         assert_eq!(allow, rules);
         assert_eq!(deny, deny_rules);
         // The file is v1, and the two pre-release spellings load as
@@ -1247,7 +1326,7 @@ mod tests {
             "deny": [{ "rule": "tool", "tool": "WebFetch" }],
         });
         std::fs::write(&path, v3.to_string()).expect("the v3 sibling writes");
-        let (allow, deny) = saver(dir.path(), id).load_permissions();
+        let (allow, deny) = saver(dir.path(), id).load_permissions().into_lists();
         assert_eq!(
             allow,
             vec![dch_tui::PermissionRule::ShellPrefix {
@@ -1266,7 +1345,7 @@ mod tests {
             "allow": [{ "rule": "path_glob", "pattern": "crates/**" }],
         });
         std::fs::write(&path, v2.to_string()).expect("the v2 sibling writes");
-        let (allow, deny) = saver(dir.path(), id).load_permissions();
+        let (allow, deny) = saver(dir.path(), id).load_permissions().into_lists();
         assert_eq!(
             allow,
             vec![dch_tui::PermissionRule::PathGlob {
@@ -1280,7 +1359,7 @@ mod tests {
             "prompts": ["cargo build --workspace"],
         });
         std::fs::write(&path, oldest.to_string()).expect("the oldest sibling writes");
-        let (allow, deny) = saver(dir.path(), id).load_permissions();
+        let (allow, deny) = saver(dir.path(), id).load_permissions().into_lists();
         assert!(
             allow.is_empty() && deny.is_empty(),
             "the prompt-string shape carries no rules — asking again"
@@ -1288,17 +1367,17 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_or_broken_permissions_file_degrades_to_nothing() {
+    fn an_unknown_or_broken_permissions_file_fails_the_restore_closed() {
         // The format tag's boundary: a file a future version wrote (a
         // tag this build never heard of) and a file that is not JSON at
-        // all both degrade to empty lists with a warn — in an asking
-        // mode the worst case is asking again, never a load error and
-        // never a misread rule, and under `auto`, where nothing asks,
-        // the denies this drops are gone with the warn as their only
-        // trace. The known spellings (v1, v2, v3, the oldest
-        // prompt-string shape) are pinned by the round-trip test
-        // beside this one; these are the two unknown cells that
-        // round-trip cannot reach.
+        // all are both damage, not emptiness — never a load error,
+        // never a misread rule, and never a quiet empty memory that
+        // would run, under `auto`, the work a damaged file's denies
+        // had banned. The verdict is `Damaged`; the lists are empty
+        // and the caller owes the blocking posture. The known
+        // spellings (v1, v2, v3, the oldest prompt-string shape) are
+        // pinned by the round-trip test beside this one; these are the
+        // two unknown cells that round-trip cannot reach.
         let dir = tempfile::tempdir().expect("session tempdir");
         let id = Uuid::new_v4();
         let path = dir.path().join(id.to_string()).join("permissions.json");
@@ -1311,28 +1390,31 @@ mod tests {
             "deny": [{ "rule": "tool", "tool": "WebFetch" }],
         });
         std::fs::write(&path, future.to_string()).expect("the future sibling writes");
-        let (allow, deny) = saver(dir.path(), id).load_permissions();
-        assert!(
-            allow.is_empty() && deny.is_empty(),
-            "an unknown format tag never loads as rules: {allow:?} {deny:?}"
+        let restored = saver(dir.path(), id).load_permissions();
+        assert_eq!(
+            restored,
+            PermissionsRestore::Damaged,
+            "an unknown format tag never loads as rules: {restored:?}"
         );
+        assert!(restored.into_lists().0.is_empty(), "damage adopts nothing");
 
         std::fs::write(&path, "not json at all").expect("the broken sibling writes");
-        let (allow, deny) = saver(dir.path(), id).load_permissions();
-        assert!(
-            allow.is_empty() && deny.is_empty(),
-            "an unparseable file degrades to nothing: {allow:?} {deny:?}"
+        assert_eq!(
+            saver(dir.path(), id).load_permissions(),
+            PermissionsRestore::Damaged,
+            "an unparseable file fails the restore closed"
         );
     }
 
     #[test]
-    fn a_damaged_sibling_drops_the_denies_an_auto_session_stood_on() {
-        // The degradation's cost, pinned: the deny list is as fragile
-        // as the allow list. A session that saved a deny — under
-        // `auto`, its only standing refusal — loses it to a damaged
-        // sibling: one warn, both lists empty, and the work the deny
-        // banned is ask-free again. The load keeps the session alive;
-        // what it never keeps is the memory.
+    fn a_damaged_sibling_fails_the_restore_closed_not_empty() {
+        // The reviewer's case, pinned at the loader: a session that
+        // saved a deny — under `auto`, its only standing refusal — and
+        // then truncated its sibling does not come back as a quiet
+        // empty memory the way it once did. The restore is `Damaged`:
+        // no lists, and the caller (pinned on the driver side) blocks
+        // side-effecting calls until the memory is re-answered. The
+        // intact sibling still carries the deny exactly as saved.
         let dir = tempfile::tempdir().expect("session tempdir");
         let id = Uuid::new_v4();
         let session = saver(dir.path(), id);
@@ -1342,20 +1424,23 @@ mod tests {
         session
             .save_permissions(&[], &deny)
             .expect("the deny saves");
-        let (allow, loaded) = session.load_permissions();
-        assert!(
-            allow.is_empty() && loaded == deny,
-            "the intact sibling carries the deny: {allow:?} {loaded:?}"
+        assert_eq!(
+            session.load_permissions(),
+            PermissionsRestore::Restored {
+                allow: Vec::new(),
+                deny,
+            },
+            "the intact sibling carries the deny"
         );
         let path = dir.path().join(id.to_string()).join("permissions.json");
         let intact = std::fs::read_to_string(&path).expect("the sibling reads");
         let cut = intact.len().saturating_sub(3);
         let truncated = intact.get(..cut).unwrap_or("");
         std::fs::write(&path, truncated).expect("the truncated sibling writes");
-        let (allow, deny) = session.load_permissions();
-        assert!(
-            allow.is_empty() && deny.is_empty(),
-            "a truncated sibling drops the deny with the rest: {allow:?} {deny:?}"
+        assert_eq!(
+            session.load_permissions(),
+            PermissionsRestore::Damaged,
+            "a truncated sibling fails the restore closed — the deny is not silently gone"
         );
     }
 

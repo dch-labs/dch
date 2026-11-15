@@ -272,6 +272,7 @@ While a permission prompt is on screen (see
 | `y` | Allow the pending tool call |
 | `Enter` | Swallowed — a queued submit press never lands as an approval |
 | `n` / `Esc` | Deny it |
+| `e` | Expand the command preview to its whole wrap (tail kept — the destructive suffix a three-row head can hide), and back; the hints name the press when the wrap truncates |
 | `Ctrl-C` | Serves the exit ladder as ever — a draft clears first; it cancels nothing, and the run's cancel is Esc's double press, which Esc here cannot serve (this sheet owns it) |
 
 ### Waiting prompts

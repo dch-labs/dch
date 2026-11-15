@@ -1284,6 +1284,13 @@ struct WelcomeState {
 /// Owns the event loop, the input buffer, and the shared state
 /// background producers write through. Construct with
 /// [`TuiApp::new`], which allocates the shared state fresh.
+// The boolean budget is spent: three run-loop lifecycle toggles
+// (render-pending, cancel-armed, plan-interrupted) under the
+// owner-reviewed exception recorded in AGENTS.md, plus the permission
+// sheet's command-preview toggle — a view-state bit that belongs to
+// the sheet the panel already owns, not to a sub-struct it would have
+// to reach through on every keystroke.
+#[allow(clippy::struct_excessive_bools)]
 pub struct TuiApp {
     /// The active palette and element styles.
     ///
@@ -2158,6 +2165,37 @@ pub struct TuiApp {
     /// stranger.
     rendered_permission_rules: Vec<(bool, crate::queue::PermissionRule)>,
 
+    /// The configured-rule count the last `/permissions` listing
+    /// numbered its remembered rules past.
+    ///
+    /// `forget <n>` keys to what the user read, so the boundary
+    /// between configured and remembered rules is the listing's own
+    /// count, snapshotted here — a `/preset` that changes the
+    /// configured set between the listing and the press must not
+    /// re-number the rows under the number the user is about to name,
+    /// which would hand the press a stranger to remove.
+    permission_listing_configured: usize,
+
+    /// The permission mode and preset selection this session started
+    /// under.
+    ///
+    /// The stand-in a config save writes without a wired file
+    /// restores these — the boot-time pair, flag- or file-stated — so
+    /// a `/mode` or `/preset` swap rides no save into a file it
+    /// promised never to touch, while an initial `--permission-mode`
+    /// or `--permissions-preset` also rides no save *out* of one.
+    permission_session_start: (dch_config::PermissionMode, Option<String>),
+
+    /// Whether the permission sheet shows the command preview
+    /// expanded.
+    ///
+    /// `e` on the sheet toggles it: the collapsed sheet shows the
+    /// command's first rows, the expanded sheet its last — together
+    /// the two windows cover the command, and the destructive suffix
+    /// a head-only preview could hide is always one press away. The
+    /// toggle resets with the ask it read.
+    permission_command_expanded: bool,
+
     /// The session's live permission mode, when the host wired one.
     ///
     /// The same cell the runner's gate re-reads on every dispatch;
@@ -2575,9 +2613,12 @@ impl TuiApp {
             queue_mode: QueueMode::Plain,
             pending_permissions: std::collections::VecDeque::new(),
             permission_reason: None,
+            permission_command_expanded: false,
             permission_rx: None,
             permission_memory: crate::queue::PermissionMemory::default(),
             rendered_permission_rules: Vec::new(),
+            permission_listing_configured: 0,
+            permission_session_start: boot_permission_pair(&config),
             permission_mode_cell: None,
             permission_config_rules_cell: None,
             pending_questions: std::collections::VecDeque::new(),
@@ -3113,18 +3154,7 @@ impl TuiApp {
             ));
         }
         if key == "permission_mode" {
-            // The flip buys the in-flight turn's next dispatch the new
-            // mode; a rebuild that fails is the driver's to undo — it
-            // restores this cell from the loop's own config.
-            if let Some(cell) = self.permission_mode_cell.as_ref() {
-                *cell
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    self.config.runner.permission_mode;
-            }
-            self.send_command(SessionCommand::Mode {
-                mode: self.config.runner.permission_mode,
-            });
+            self.move_permission_mode_live();
         }
         if !session_scoped {
             self.persist_config(key);
@@ -3158,18 +3188,13 @@ impl TuiApp {
             ));
             return;
         };
-        // The listing numbers rules from one: `0` is nobody's number,
-        // with or without configured rules, and must not fall through
-        // to the remembered index where it would land on rule 1's slot.
         if shown == 0 {
             self.post_notice(format!(
                 "no remembered rule {shown} — /permissions lists what is recorded"
             ));
             return;
         }
-        // The listing numbers the configured rules first; those live in
-        // the config file and cannot be forgotten from a session.
-        let configured = self.config.permissions.engine_rules().len();
+        let configured = self.permission_listing_configured;
         if shown <= configured {
             self.post_notice(format!(
                 "rule {shown} is configured — change it in the config file, not here"
@@ -3186,10 +3211,6 @@ impl TuiApp {
             ));
             return;
         };
-        // Identity, not position: the memory can move between the
-        // render and the press — a queued `/resume`'s adopt replaces
-        // the pair wholesale — so the press removes the rule the user
-        // read or nothing at all.
         let Some(removed) = self.permission_memory.forget_matching(was_allow, &rendered) else {
             self.post_notice(format!(
                 "rule {shown} is no longer remembered as rendered — the remembered \
@@ -3234,6 +3255,7 @@ impl TuiApp {
             .map(|rule| (true, rule))
             .chain(deny_snapshot.iter().cloned().map(|rule| (false, rule)))
             .collect();
+        self.permission_listing_configured = configured.len().saturating_add(preset_lines.len());
         let allowed: Vec<String> = allow_snapshot
             .iter()
             .map(PermissionRule::remember_phrase)
@@ -3399,6 +3421,28 @@ impl TuiApp {
         }
     }
 
+    /// Move the live permission mode: the shared cell and the
+    /// driver's rebuild, from the config the panel holds.
+    ///
+    /// `/mode` and `/unset permission_mode` share the whole live path:
+    /// the cell the gate re-reads per dispatch flips on the spot — the
+    /// flip buys the in-flight turn's next dispatch the new mode — and
+    /// the driver rebuilds the loop under the mode the config now
+    /// names, a rebuild whose failure is the driver's to undo, from
+    /// the loop's own config. Skipping any half of it leaves the
+    /// display naming one mode while the gate enforces another.
+    fn move_permission_mode_live(&mut self) {
+        if let Some(cell) = self.permission_mode_cell.as_ref() {
+            *cell
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                self.config.runner.permission_mode;
+        }
+        self.send_command(SessionCommand::Mode {
+            mode: self.config.runner.permission_mode,
+        });
+    }
+
     /// Install the session's remembered-permission memory.
     ///
     /// The host's wiring: the same object the permission resolver
@@ -3476,11 +3520,12 @@ impl TuiApp {
     /// value back.
     ///
     /// When no config file is wired — an embedder host — the save
-    /// serializes the live config through a stand-in that first resets
-    /// the session-scoped fields, the permission mode and the preset
-    /// selection, to their base (or default) values: a `/mode` or
-    /// `/preset` swap must not ride the save into a file it promised
-    /// never to touch.
+    /// serializes the live config through a stand-in that first
+    /// restores the session-scoped fields, the permission mode and
+    /// the preset selection, to the pair this session started under:
+    /// a `/mode` or `/preset` swap must not ride the save into a file
+    /// it promised never to touch, and an initial flag-stated pair
+    /// must not ride the save *out* of one either.
     fn persist_config(&mut self, key: &str) {
         let Some(dir) = self.config_persist_dir.clone() else {
             return;
@@ -3489,16 +3534,11 @@ impl TuiApp {
             file.clone()
         } else {
             let mut stand_in = self.config.clone();
-            if let Some(base) = self.config_base.as_ref() {
-                stand_in.runner.permission_mode = base.runner.permission_mode;
-                stand_in
-                    .permissions
-                    .preset
-                    .clone_from(&base.permissions.preset);
-            } else {
-                stand_in.runner.permission_mode = dch_config::PermissionMode::default();
-                stand_in.permissions.preset = None;
-            }
+            stand_in.runner.permission_mode = self.permission_session_start.0;
+            stand_in
+                .permissions
+                .preset
+                .clone_from(&self.permission_session_start.1);
             stand_in
         };
         if let Err(why) = to_save.save_to_dir(&dir) {
@@ -3554,6 +3594,9 @@ impl TuiApp {
                     let _mirror = config_fields::set(file, key, value);
                 }
             }
+        }
+        if key == "permission_mode" {
+            self.move_permission_mode_live();
         }
         self.apply_live_config(key);
         self.persist_config(key);
@@ -5250,16 +5293,16 @@ impl TuiApp {
     /// Answer the front permission request, if one is pending.
     ///
     /// Sends `resolution` on its reply channel and drops it from the
-    /// queue, clearing any half-typed reason beside it; a send that
-    /// finds no receiver (a resolver already cancelled away) is
-    /// silently fine — the gate denied that call on its own.
+    /// queue, clearing any half-typed reason and the command preview's
+    /// expansion beside it; a send that finds no receiver (a resolver
+    /// already cancelled away) is silently fine — the gate denied
+    /// that call on its own.
     fn resolve_pending_permission(&mut self, resolution: PermissionResolution) {
         self.permission_reason = None;
+        self.permission_command_expanded = false;
         if let Some(front) = self.pending_permissions.pop_front()
             && front.reply.send(resolution).is_err()
         {
-            // The resolver stopped waiting (a cancelled dispatch); the
-            // gate denied that call on its own.
             tracing::trace!("permission reply channel already closed");
         }
     }
@@ -5268,8 +5311,10 @@ impl TuiApp {
     ///
     /// `Some(redraw)` when a request is pending — the overlay owns the
     /// keyboard: plain `y` allows, plain `a` allows and remembers the
-    /// ask for the rest of the session, plain `n`/Esc deny, and every
-    /// other key is swallowed — Enter among them, since a press
+    /// ask for the rest of the session, plain `n`/Esc deny, `r` opens
+    /// a reason line, `e` expands the command preview to its whole
+    /// wrap (and back), and every other key is swallowed — Enter among
+    /// them, since a press
     /// queued to submit the draft must never land as an approval — so
     /// nothing reaches the composer, whose control chords would
     /// otherwise submit or edit the hidden draft (Ctrl-Enter and
@@ -5322,6 +5367,10 @@ impl TuiApp {
             }
             KeyCode::Char('r' | 'R') if bare || shift => {
                 self.permission_reason = Some(String::new());
+                Some(true)
+            }
+            KeyCode::Char('e' | 'E') if bare || shift => {
+                self.permission_command_expanded = !self.permission_command_expanded;
                 Some(true)
             }
             KeyCode::Esc if bare => {
@@ -9858,7 +9907,11 @@ impl TuiApp {
     /// `reason` is the live text when the sheet's `r` press opened the
     /// reason line, whose hints swap for the reason line's own.
     fn render_permission_overlay(&self, frame: &mut Frame, area: Rect, sheet: &PermissionSheet) {
-        let hints = if sheet.reason.is_some() {
+        let wrap_at = usize::from(area.width.saturating_sub(2));
+        let command_truncated = sheet.command.as_ref().is_some_and(|command| {
+            wrap_rows(&format!("runs: {command}"), wrap_at).len() > MAX_OVERLAY_ROWS
+        });
+        let mut hints = if sheet.reason.is_some() {
             "[enter] deny with this reason · [esc] back to the ask".to_string()
         } else if sheet.more == 0 {
             "[y] allow · [a] allow always · [d] deny always · [n] deny · [r] deny with a reason · ctrl+c cancels".to_string()
@@ -9868,16 +9921,26 @@ impl TuiApp {
                 more = sheet.more,
             )
         };
-        let wrap_at = usize::from(area.width.saturating_sub(2));
+        if command_truncated {
+            hints.push_str(if self.permission_command_expanded {
+                " · [e] collapse"
+            } else {
+                " · [e] expand"
+            });
+        }
         let mut lines: Vec<Line<'_>> = wrap_prompt_rows(&sheet.prompt, wrap_at, MAX_OVERLAY_ROWS)
             .into_iter()
             .map(|row| Line::styled(row, Style::default().fg(self.theme.ui.foreground)))
             .collect();
         if let Some(command) = &sheet.command {
             let runs = format!("runs: {command}");
-            lines.extend(
+            let rows = if self.permission_command_expanded {
+                wrap_prompt_rows_last(&runs, wrap_at, MAX_EXPANDED_OVERLAY_ROWS)
+            } else {
                 wrap_prompt_rows(&runs, wrap_at, MAX_OVERLAY_ROWS)
-                    .into_iter()
+            };
+            lines.extend(
+                rows.into_iter()
                     .map(|row| Line::styled(row, Style::default().fg(self.theme.ui.primary))),
             );
         }
@@ -11523,7 +11586,9 @@ impl TuiApp {
     /// under a palette that defers its colors, exactly the popup's
     /// rule — a dim header naming the keys, and a window that follows
     /// the cursor so a long catalog always keeps the chosen row on
-    /// screen. Each row spells the short id, the session's name, the
+    /// screen, its capacity sized to the rows the side actually
+    /// offers so a short terminal sheds list rows, never the cursor
+    /// itself. Each row spells the short id, the session's name, the
     /// model, when the session last saved, and its prompt count.
     fn render_session_picker(&mut self, frame: &mut Frame, input_area: Rect, above: bool) {
         const SHOWN: usize = 8;
@@ -11534,7 +11599,12 @@ impl TuiApp {
             return;
         }
         let surface = self.theme.ui.surface;
-        let (start, cursor_row) = popup_window(picker.cursor, picker.rows.len(), SHOWN);
+        let bound = popup_bound(frame, input_area, above);
+        if bound < 2 {
+            return;
+        }
+        let shown = SHOWN.min(usize::from(bound).saturating_sub(1));
+        let (start, cursor_row) = popup_window(picker.cursor, picker.rows.len(), shown);
         let lines: Vec<Line> = std::iter::once(Line::styled(
             " sessions — ↑↓ walk · ⏎ resume · esc close ",
             Style::default().fg(self.theme.ui.dim),
@@ -11544,7 +11614,7 @@ impl TuiApp {
                 .rows
                 .iter()
                 .skip(start)
-                .take(SHOWN)
+                .take(shown)
                 .enumerate()
                 .map(|(index, pick)| {
                     let highlighted = index == cursor_row;
@@ -11581,7 +11651,6 @@ impl TuiApp {
                 }),
         )
         .collect();
-        let bound = popup_bound(frame, input_area, above);
         let height = u16::try_from(lines.len()).unwrap_or(1).min(bound);
         if height == 0 {
             return;
@@ -11610,11 +11679,16 @@ impl TuiApp {
             return;
         }
         let surface = self.theme.ui.surface;
+        let bound = popup_bound(frame, input_area, above);
+        if bound < 2 {
+            return;
+        }
+        let shown = SHOWN.min(usize::from(bound).saturating_sub(1));
         let total = picker.rows.len();
-        let max_start = total.saturating_sub(SHOWN);
+        let max_start = total.saturating_sub(shown);
         let start = picker
             .cursor
-            .saturating_sub(SHOWN.saturating_sub(1))
+            .saturating_sub(shown.saturating_sub(1))
             .min(max_start);
         let running = &self.config.api.model;
         let lines: Vec<Line> = std::iter::once(Line::styled(
@@ -11626,7 +11700,7 @@ impl TuiApp {
                 .rows
                 .iter()
                 .skip(start)
-                .take(SHOWN)
+                .take(shown)
                 .enumerate()
                 .map(|(index, name)| {
                     let highlighted = index == picker.cursor.saturating_sub(start);
@@ -11644,7 +11718,6 @@ impl TuiApp {
                 }),
         )
         .collect();
-        let bound = popup_bound(frame, input_area, above);
         let height = u16::try_from(lines.len()).unwrap_or(1).min(bound);
         if height == 0 {
             return;
@@ -11674,6 +11747,8 @@ impl TuiApp {
     /// when the sole candidate is already fully spelled out in the composer.
     fn render_completion(&mut self, frame: &mut Frame, input_area: Rect, above: bool) {
         const SHOWN: usize = 6;
+        let bound = popup_bound(frame, input_area, above);
+        let shown = SHOWN.min(usize::from(bound));
         let Some((prefix, candidates)) = self.popup_candidates() else {
             self.completion = None;
             return;
@@ -11685,14 +11760,14 @@ impl TuiApp {
             .as_ref()
             .filter(|cycle| cycle.prefix == prefix);
         let start = active_cycle.map_or(0, |cycle| {
-            let max_start = total.saturating_sub(SHOWN);
+            let max_start = total.saturating_sub(shown);
             let start = cycle.window_start.min(max_start);
             let selected = cycle.index.min(total.saturating_sub(1));
             if selected < start {
                 selected
-            } else if selected >= start.saturating_add(SHOWN) {
+            } else if selected >= start.saturating_add(shown) {
                 selected
-                    .saturating_sub(SHOWN.saturating_sub(1))
+                    .saturating_sub(shown.saturating_sub(1))
                     .min(max_start)
             } else {
                 start
@@ -11704,13 +11779,13 @@ impl TuiApp {
                 .min(total.saturating_sub(1))
                 .saturating_sub(start)
         });
-        let shown: Vec<&String> = candidates.iter().skip(start).take(SHOWN).collect();
+        let window: Vec<&String> = candidates.iter().skip(start).take(shown).collect();
 
         let surface = self.theme.ui.surface;
         let completing_command = prefix == "/";
         let width = usize::from(input_area.width.max(1));
         let summary_column = if completing_command {
-            shown
+            window
                 .iter()
                 .map(|candidate| format!("   /{candidate}").width())
                 .max()
@@ -11719,7 +11794,7 @@ impl TuiApp {
         } else {
             0
         };
-        let lines: Vec<Line> = shown
+        let lines: Vec<Line> = window
             .iter()
             .enumerate()
             .map(|(index, candidate)| {
@@ -11760,15 +11835,7 @@ impl TuiApp {
             })
             .collect();
 
-        let height = if above {
-            u16::try_from(lines.len()).unwrap_or(1).min(input_area.y)
-        } else {
-            let space_below = frame
-                .area()
-                .height
-                .saturating_sub(input_area.y.saturating_add(input_area.height));
-            u16::try_from(lines.len()).unwrap_or(1).min(space_below)
-        };
+        let height = u16::try_from(lines.len()).unwrap_or(1).min(bound);
         if height == 0 {
             return;
         }
@@ -13783,6 +13850,31 @@ fn pane(chunks: &[Rect], index: usize, fallback: Rect) -> Rect {
 /// the hints are one line, not a document.
 const MAX_OVERLAY_ROWS: usize = 3;
 
+/// The most rows the expanded command preview keeps from its wrap's
+/// tail.
+///
+/// Expansion exists so the *end* of a command — where a destructive
+/// suffix hides — is never invisible at the approval press: the kept
+/// rows are the wrap's last, one leading ellipsis row naming the cut,
+/// and the cap keeps a pathological command from filling the whole
+/// sheet on a terminal that could not scroll it anyway. The collapsed
+/// head and the expanded tail together cover any command that fits.
+const MAX_EXPANDED_OVERLAY_ROWS: usize = 40;
+
+/// The boot-time permission pair a stand-in config save restores.
+///
+/// What the session started under — the mode and preset selection as
+/// the constructor's config stated them, flag- or file-named —
+/// captured once so no later `/mode` or `/preset` swap rides a
+/// stand-in save into a file it promised never to touch, and no
+/// initial flag-stated pair rides one out.
+fn boot_permission_pair(config: &DchConfig) -> (dch_config::PermissionMode, Option<String>) {
+    (
+        config.runner.permission_mode,
+        config.permissions.preset.clone(),
+    )
+}
+
 /// The permission overlay's render inputs, gathered in one pass.
 ///
 /// [`TuiApp::shown_permission`] builds it off the front pending
@@ -13831,12 +13923,12 @@ struct PermissionSheet {
 }
 
 /// Word-wrap `text` to `limit` display columns, hard-splitting any
-/// single word wider than `limit`, keeping at most `max_rows` rows
-/// (the last carries an ellipsis when truncation happens).
+/// single word wider than `limit`.
 ///
-/// Rows never exceed `limit`, so a paragraph rendering them inside a
-/// border `limit + 2` wide cannot re-flow them.
-fn wrap_prompt_rows(text: &str, limit: usize, max_rows: usize) -> Vec<String> {
+/// The uncapped core both capped twins build on: rows never exceed
+/// `limit`, so a paragraph rendering them inside a border `limit + 2`
+/// wide cannot re-flow them.
+fn wrap_rows(text: &str, limit: usize) -> Vec<String> {
     let limit = limit.max(1);
     let mut rows: Vec<String> = Vec::new();
     let mut current = String::new();
@@ -13879,6 +13971,16 @@ fn wrap_prompt_rows(text: &str, limit: usize, max_rows: usize) -> Vec<String> {
     if !current.is_empty() {
         rows.push(current);
     }
+    rows
+}
+
+/// [`wrap_rows`] keeping at most `max_rows` rows from the head.
+///
+/// The last kept row carries an ellipsis when truncation happens —
+/// the collapsed previews' shape: a short head of the text with the
+/// cut named where the reader's eye lands.
+fn wrap_prompt_rows(text: &str, limit: usize, max_rows: usize) -> Vec<String> {
+    let mut rows = wrap_rows(text, limit);
     if rows.len() > max_rows {
         rows.truncate(max_rows);
         if let Some(last) = rows.last_mut() {
@@ -13898,6 +14000,24 @@ fn wrap_prompt_rows(text: &str, limit: usize, max_rows: usize) -> Vec<String> {
         }
     }
     rows
+}
+
+/// [`wrap_rows`] keeping at most `max_rows` rows from the tail.
+///
+/// The expanded command preview's shape: the *end* of a command is
+/// the half a collapsed head hides — the destructive suffix — so the
+/// kept rows are the wrap's last, with one leading ellipsis row
+/// naming the cut. Together the collapsed head and the expanded tail
+/// cover the whole of any command that fits the cap.
+fn wrap_prompt_rows_last(text: &str, limit: usize, max_rows: usize) -> Vec<String> {
+    let rows = wrap_rows(text, limit);
+    if rows.len() <= max_rows {
+        return rows;
+    }
+    let skip = rows.len().saturating_sub(max_rows);
+    let mut kept: Vec<String> = rows.into_iter().skip(skip).collect();
+    kept.insert(0, "…".to_string());
+    kept
 }
 
 /// A full-width rectangle anchored at the bottom of `area`.

@@ -4,8 +4,8 @@
 //! rules, the session's remembered approvals — lives behind this trait,
 //! so the agent loop depends on an object it can swap rather than on a
 //! policy bolted into its pipeline. The default implementation is the
-//! curated layered policy ([`evaluate`](crate::engine::evaluate)); a
-//! host with different governance implements the trait and the loop
+//! curated layered policy ([`evaluate`]); a host with different
+//! governance implements the trait and the loop
 //! never knows.
 
 use std::sync::Arc;

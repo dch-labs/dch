@@ -243,14 +243,20 @@ pub fn shell_reads_only(command: &str) -> bool {
 /// [`deny_rules`] filters segments through this: a
 /// reader is never what was refused, so it mints no deny rule. The
 /// same judgment the reader gate consults —
-/// quoted spans masked first, arguments scrutinized (`find . -delete`
+/// quoted spans masked first, a live redirect or substitution
+/// anywhere in the segment disqualifying it exactly as the
+/// whole-command gate would, then arguments scrutinized (`find . -delete`
 /// is no reader; `find . -name x` is) — so there is one truth about
 /// reader-ness on both sides of the sheet, not two. Idempotent on
 /// already-masked text: the placeholder a quoted span collapses to
 /// carries no quotes itself.
 #[must_use]
 pub fn segment_reads_only(segment: &str) -> bool {
-    command_reads_only(&mask_quoted(segment))
+    let masked = mask_quoted(segment);
+    if masked.chars().any(|ch| "><$`()\\".contains(ch)) {
+        return false;
+    }
+    command_reads_only(&masked)
 }
 
 /// Whether one pipe segment — a bare command and its arguments — is a
@@ -367,8 +373,9 @@ fn command_reads_only(segment: &str) -> bool {
 /// `less -o`, `git log
 /// --output`, and `env` followed by anything at all; `rg --pre`
 /// runs a command per searched file, `git -c … --ext-diff` runs an
-/// external diff driver, and `systemctl -H` reaches a remote host.
-/// No argument to any reader may start `--output` — the one refusal
+/// external diff driver, and `systemctl -H` reaches a remote host;
+/// GNU `uniq`'s *second* positional names an output file, so one
+/// file argument is all it keeps. No argument to any reader may start `--output` — the one refusal
 /// the whole gate shares. Quoting narrows twice over: a wholly quoted
 /// argument refuses for the readers whose flags can execute or write
 /// (`env`, `sort`, `date`, `less`, `git`, `cargo`, `rg`) — the mask
@@ -438,6 +445,7 @@ fn reader_arguments_read_only(program: &str, args: &[&str]) -> bool {
                 || short_cluster(arg, 'o')
         }),
         "journalctl" => journalctl_arguments_read_only(args),
+        "uniq" => uniq_arguments_read_only(args),
         "systemctl" => {
             // -H/--host and -M/--machine leave this machine — the
             // command runs through ssh against a remote manager — so
@@ -647,6 +655,43 @@ fn journalctl_arguments_read_only(args: &[&str]) -> bool {
     true
 }
 
+/// The `uniq` policy: one file argument, because the second is an
+/// output.
+///
+/// GNU uniq's positional arguments are `[INPUT [OUTPUT]]` — the
+/// second names a file the command *writes* (`uniq in.txt out.txt`
+/// creates `out.txt`), so a command naming two positionals is a
+/// writer and refuses, exactly as a redirect would. The value-taking
+/// width flags (`-f`/`--skip-fields`, `-s`/`--skip-chars`,
+/// `-w`/`--check-chars`) consume their following word so a width
+/// never counts as a file; every other flag counts or compares and
+/// reads. A bare `-` is stdin's filename and counts as a file, so
+/// `uniq - out` still refuses — the second positional is real
+/// wherever the first came from.
+fn uniq_arguments_read_only(args: &[&str]) -> bool {
+    let mut takes_value = false;
+    let mut operands_only = false;
+    let mut files = 0_usize;
+    for arg in args {
+        if operands_only {
+            files = files.saturating_add(1);
+        } else if takes_value {
+            takes_value = false;
+        } else if *arg == "--" {
+            operands_only = true;
+        } else if matches!(
+            *arg,
+            "-f" | "-s" | "-w" | "--skip-fields" | "--skip-chars" | "--check-chars"
+        ) {
+            takes_value = true;
+        } else if arg.starts_with('-') && arg.len() > 1 {
+        } else {
+            files = files.saturating_add(1);
+        }
+    }
+    files <= 1
+}
+
 /// The `find` policy: no mutating primary, and a masked argument only
 /// where `find` expects a pattern to compare — never a bare primary.
 ///
@@ -712,7 +757,8 @@ pub struct CommandSegment {
     pub prefix: String,
 
     /// Whether the segment carries substitution, redirection, shell
-    /// control flow, or a quoted first word, and is therefore
+    /// control flow, or a quoted span in its verb — the first word or
+    /// any word inside the arity trim — and is therefore
     /// remembered as exact text only.
     pub complex: bool,
 }
@@ -729,11 +775,73 @@ const CONTROL_FLOW: &[&str] = &[
     "select", "function", "time", "[[",
 ];
 
-/// Collapse whitespace runs and trim — the normalization an exact
-/// command-text rule and the call's segments both apply, so matching
-/// is whitespace-insensitive and consistent on both sides.
+/// Collapse whitespace runs and trim outside quotes; inside quotes,
+/// whitespace is data and stays byte-for-byte.
+///
+/// The normalization an exact command-text rule and the call's
+/// segments both apply, so matching is whitespace-insensitive on the
+/// words and consistent on both sides — while a quoted payload keeps
+/// its own spelling exactly: a newline inside quotes is a different
+/// command from a space inside quotes (a `bash -c` payload embedding
+/// a newline runs a second line; a space does not), and the exact
+/// text an approval remembered for one must never match the other.
+/// The quote walk mirrors [`split_commands`]: single-quoted bytes
+/// literal, double-quoted escapes consumed in pairs, and a backslash
+/// outside quotes gluing its escaped character into the word.
 fn normalize_ws(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+    let mut out = String::with_capacity(text.len());
+    let mut pending_space = false;
+    let mut quote: Option<char> = None;
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        match quote {
+            Some('\'') => {
+                out.push(ch);
+                if ch == '\'' {
+                    quote = None;
+                }
+            }
+            Some(_) => {
+                out.push(ch);
+                if ch == '\\' {
+                    if let Some(escaped) = chars.next() {
+                        out.push(escaped);
+                    }
+                } else if ch == '"' {
+                    quote = None;
+                }
+            }
+            None => match ch {
+                '\'' | '"' => {
+                    if pending_space && !out.is_empty() {
+                        out.push(' ');
+                    }
+                    pending_space = false;
+                    quote = Some(ch);
+                    out.push(ch);
+                }
+                '\\' => {
+                    if pending_space && !out.is_empty() {
+                        out.push(' ');
+                    }
+                    pending_space = false;
+                    out.push(ch);
+                    if let Some(escaped) = chars.next() {
+                        out.push(escaped);
+                    }
+                }
+                c if c.is_whitespace() => pending_space = true,
+                c => {
+                    if pending_space && !out.is_empty() {
+                        out.push(' ');
+                    }
+                    pending_space = false;
+                    out.push(c);
+                }
+            },
+        }
+    }
+    out
 }
 
 /// Split a scrubbed command into command texts at top-level
@@ -832,6 +940,11 @@ fn quoted_verb(masked: &str) -> bool {
 /// across newlines and control operators, with its verb prefix and
 /// complexity verdict. Readers are segments like any other — they
 /// are remembered with the rest of the chain they were approved in.
+/// A quoted span inside the trimmed verb masks to the placeholder,
+/// which discriminates nothing (`cargo 'test'` and `cargo 'publish'`
+/// trim to the same masked verb), so such a segment is complex and
+/// remembered as its exact text — the quoted spelling is the only
+/// name that tells the two apart.
 #[must_use]
 pub fn command_segments(command: &str) -> Vec<CommandSegment> {
     let mut out = Vec::new();
@@ -841,15 +954,12 @@ pub fn command_segments(command: &str) -> Vec<CommandSegment> {
             continue;
         }
         let masked = mask_quoted(&text);
-        let complex = segment_complex(&masked) || quoted_verb(&masked);
-        let prefix = if complex {
-            String::new()
-        } else {
-            segment_prefix(&masked)
-        };
+        let prefix = segment_prefix(&masked);
+        let complex =
+            segment_complex(&masked) || quoted_verb(&masked) || prefix.contains(QUOTED_ARG);
         out.push(CommandSegment {
             text,
-            prefix,
+            prefix: if complex { String::new() } else { prefix },
             complex,
         });
     }
@@ -1057,21 +1167,18 @@ pub fn remember_rules(tool_name: &str, input: &Value, cwd: &Path) -> RememberRul
 /// segments mint their exact text (the shipped
 /// [`RememberRules::Segments`] text arm — the redirect or
 /// substitution the refusal named, and nothing wider); clean
-/// non-reader segments mint the verb prefix. Reader-ness is judged on
-/// each segment's whole text by [`segment_reads_only`] — arguments
-/// can disqualify a reader verb — and the reader check runs first, so
-/// a complex reader mints nothing too. Write-family asks remember the
-/// scopes their targets live under and every other tool remembers
-/// itself — the same shapes the allow side mints, unchanged. A
-/// derivation with nothing to mint (an all-reader chain, which the
-/// reader gate never lets reach an ask) records nothing: the refusal
-/// answered once, honestly, and minted nothing by association.
+/// non-reader segments mint the verb prefix. Reader-ness is judged
+/// on each segment's whole text by [`segment_reads_only`] — a
+/// redirect, substitution, or any live control anywhere in the
+/// segment disqualifies it exactly as the whole-command gate would,
+/// so a reader verb carrying `>` is a writer here too — and the
+/// reader check runs first, so a genuine reader mints nothing. Only
+/// a segment the reader gate itself would wave through goes
+/// unremembered: the refusal answered once, honestly, and minted
+/// nothing by association.
 #[must_use]
 pub fn deny_rules(tool_name: &str, input: &Value, cwd: &Path) -> RememberRules {
     if tool_name != "Bash" {
-        // Write-family and whole-tool asks mint what an approval would
-        // have: the scopes or the tool, unchanged — the refusal that
-        // reached them named exactly what they record.
         return remember_rules(tool_name, input, cwd);
     }
     let segments = input
@@ -1414,9 +1521,12 @@ mod tests {
         // A redirect to a real file makes the segment complex: the
         // refusal mints that exact line and nothing wider — a verb
         // prefix minted from a payload-carrying segment could outrun
-        // what the user saw. A complex reader (`grep` with a
-        // substitution) mints nothing: the reader check runs first,
-        // and a reader is never what was refused.
+        // what the user saw. A reader verb carrying the redirect is a
+        // writer the same way (`cat notes.txt > owned.txt`), and a
+        // substitution disqualifies its segment exactly as the
+        // whole-command gate would — both mint their exact text, so
+        // the denial stands against the identical rerun after a mode
+        // move.
         let deny = |command: &str| {
             deny_rules(
                 "Bash",
@@ -1432,11 +1542,168 @@ mod tests {
             }
         );
         assert_eq!(
+            deny("cat notes.txt > owned.txt"),
+            RememberRules::Segments {
+                prefixes: Vec::new(),
+                texts: vec!["cat notes.txt > owned.txt".to_string()],
+            }
+        );
+        assert_eq!(
             deny("grep \"$(cat patterns)\" notes.md | sort | head -5"),
             RememberRules::Segments {
                 prefixes: Vec::new(),
+                texts: vec!["grep \"$(cat patterns)\" notes.md".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn a_uniq_second_positional_names_an_output_file() {
+        // GNU uniq writes its second positional: one file argument
+        // keeps it a look (an input, or stdin to stdout), two make it
+        // a writer the reader gate refuses — counting flags and their
+        // attached values out, and a consumed width value out too.
+        assert!(
+            shell_reads_only("uniq"),
+            "bare uniq reads stdin and writes stdout"
+        );
+        assert!(
+            shell_reads_only("uniq -c input.txt"),
+            "one positional is an input — still a look"
+        );
+        assert!(
+            shell_reads_only("uniq -f 2 -s 1 input.txt"),
+            "width values are consumed, not files"
+        );
+        assert!(
+            !shell_reads_only("uniq input.txt output.txt"),
+            "the second positional is an output file — a writer"
+        );
+        assert!(
+            !shell_reads_only("uniq -c input.txt output.txt"),
+            "flags do not hide the second positional"
+        );
+        assert!(
+            !shell_reads_only("uniq -f 2 input.txt output.txt"),
+            "a consumed width value does not hide it either"
+        );
+        assert!(
+            !shell_reads_only("uniq - out.txt"),
+            "a bare dash is stdin's name — out.txt is still second"
+        );
+        assert!(
+            !shell_reads_only("uniq -- -f out.txt"),
+            "past `--` a flag spelling is an operand: -f is the input, out.txt \
+             the output GNU uniq writes — a writer, not a look"
+        );
+        assert!(
+            !shell_reads_only("uniq -- -f2 out.txt"),
+            "the attached-value spelling is an operand past `--` too — the \
+             second word still names the output"
+        );
+        assert!(
+            shell_reads_only("uniq -- input.txt"),
+            "a lone operand past `--` is an input like any other — a look"
+        );
+    }
+
+    #[test]
+    fn quoted_payload_whitespace_is_data_not_a_separator() {
+        // A newline inside quotes and a space inside quotes are
+        // different commands — the newline executes a second line
+        // under `bash -c`, the space does not — so the exact text an
+        // approval remembers keeps quoted whitespace byte-for-byte
+        // and the two never cross-match, in either direction.
+        let newline = "'bash' -c 'echo safe\nrm victim'";
+        let spaces = "'bash' -c 'echo safe rm victim'";
+        let newline_segments = command_segments(newline);
+        assert_eq!(
+            newline_segments.len(),
+            1,
+            "a quoted newline does not split the segment"
+        );
+        assert_eq!(
+            newline_segments.first().map(|s| s.text.as_str()),
+            Some(newline),
+            "the quoted newline survives normalization as data"
+        );
+        assert_ne!(
+            newline_segments.first().map(|s| s.text.as_str()),
+            command_segments(spaces).first().map(|s| s.text.as_str()),
+            "the newline twin and the space twin are different commands"
+        );
+        let shape_for = |cmd: &str| crate::engine::CallShape {
+            segments: command_segments(cmd),
+            ..crate::engine::CallShape::of("Bash", ToolCategory::ShellExecute)
+        };
+        let remembered = crate::engine::RememberedRules {
+            command_texts: vec![newline.to_string()],
+            ..crate::engine::RememberedRules::empty()
+        };
+        assert!(
+            remembered.covers(&shape_for(newline)),
+            "the identical rerun runs free through its exact text"
+        );
+        assert!(
+            !remembered.covers(&shape_for(spaces)),
+            "the space twin re-asks — quoted whitespace is data"
+        );
+    }
+
+    #[test]
+    fn a_quoted_word_inside_the_trimmed_verb_mints_no_prefix() {
+        // `cargo 'test'` and `cargo 'publish'` mask to the same
+        // trimmed verb — `cargo` plus the placeholder — so a prefix
+        // minted from either would cover both. The segment goes
+        // complex instead: remembered as its exact text, the quoted
+        // spelling being the one name that tells them apart.
+        let segments = command_segments("cargo 'test'");
+        let first = segments.first().unwrap();
+        assert!(
+            first.complex,
+            "a quoted word in the verb names nothing wider"
+        );
+        assert_eq!(first.prefix, "", "a complex segment carries no prefix");
+        assert_eq!(first.text, "cargo 'test'");
+        assert_eq!(
+            remember_rules(
+                "Bash",
+                &serde_json::json!({ "command": "cargo 'test'" }),
+                Path::new("/work")
+            ),
+            RememberRules::Segments {
+                prefixes: Vec::new(),
+                texts: vec!["cargo 'test'".to_string()],
+            }
+        );
+        // A quoted argument beyond the trimmed verb is payload, not
+        // name: the prefix stays `cargo test` and covers its flags.
+        assert_eq!(
+            remember_rules(
+                "Bash",
+                &serde_json::json!({ "command": "cargo test 'foo'" }),
+                Path::new("/work")
+            ),
+            RememberRules::Segments {
+                prefixes: vec!["cargo test".to_string()],
                 texts: Vec::new(),
             }
+        );
+        let shape_for = |cmd: &str| crate::engine::CallShape {
+            segments: command_segments(cmd),
+            ..crate::engine::CallShape::of("Bash", ToolCategory::ShellExecute)
+        };
+        let remembered = crate::engine::RememberedRules {
+            command_texts: vec!["cargo 'test'".to_string()],
+            ..crate::engine::RememberedRules::empty()
+        };
+        assert!(
+            !remembered.covers(&shape_for("cargo 'publish'")),
+            "one quoted verb word cannot cover another — the placeholder discriminates nothing"
+        );
+        assert!(
+            remembered.covers(&shape_for("cargo 'test'")),
+            "the identical rerun runs free through its exact text"
         );
     }
 
@@ -1735,6 +2002,7 @@ mod tests {
             "git log | wc -l",
             "git grep -n TODO",
             "cat notes.txt | sort | uniq -c",
+            "uniq -c input.txt",
             "jq .name package.json",
             "find . -name '*.rs' -print",
             "sort -n list.txt",
@@ -1829,6 +2097,8 @@ mod tests {
             "gh pr list",
             "gh run view 123",
             "sort -ro owned.txt list.txt",
+            "uniq input.txt output.txt",
+            "uniq -f 2 input.txt output.txt",
             "date -s '12:00'",
             "env rm -rf /tmp/x",
             "echo hi > owned.txt",
