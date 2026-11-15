@@ -3107,7 +3107,11 @@ impl TuiApp {
             ));
             return;
         }
-        let persisted = self.config_file.as_ref().unwrap_or(&self.config);
+        let persisted = if key == "permission_mode" {
+            &self.config
+        } else {
+            self.config_file.as_ref().unwrap_or(&self.config)
+        };
         if !self.config_overrides.contains_key(key) {
             let original = if config_fields::is_absent(persisted, key) {
                 None

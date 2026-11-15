@@ -344,7 +344,12 @@ fn scan_command(command: &str) -> Scan {
                         scan.heredoc = HeredocPhase::Body { delimiter, dash };
                     }
                 }
-                '\'' | '"' => scan.quoted = Quote::from_char(current),
+                '\'' | '"' => {
+                    if matches!(scan.heredoc, HeredocPhase::AwaitingDelimiter { .. }) {
+                        scan.heredoc_delimiter_quoted = true;
+                    }
+                    scan.quoted = Quote::from_char(current);
+                }
                 '\\' => {
                     if let Some(escaped) = chars.next() {
                         if escaped == '\n' {
@@ -504,6 +509,15 @@ struct Scan {
     /// the body skip takes over at the line's newline, ending at the
     /// complete line that equals the delimiter.
     heredoc: HeredocPhase,
+
+    /// Whether the pending or open heredoc's delimiter was quoted.
+    ///
+    /// bash reads a quoted delimiter's body literally — backslash and
+    /// all — while an unquoted one's body joins backslash-newline
+    /// pairs before any line is tested as a terminator. The flag is
+    /// set when a quote opens while the delimiter word is pending,
+    /// and reset when the next `<<` starts awaiting a fresh word.
+    heredoc_delimiter_quoted: bool,
 }
 
 impl Scan {
@@ -515,10 +529,17 @@ impl Scan {
     /// so the one boundary it recognizes is a complete line, and a
     /// word-at-a-space test would end the body early, handing the
     /// rest of the line to the command scan where what bash reads as
-    /// verbatim body could arm or hide a redirect. Operators and
-    /// quote marks are literal here — nothing arms inside a body.
+    /// verbatim body could arm or hide a redirect. One bash exception
+    /// for an unquoted delimiter: a backslash-newline pair joins —
+    /// `E\` over `OF` is the line `EOF` — so the pair is removed and
+    /// no terminator test runs at the join. Operators and quote
+    /// marks are literal here — nothing arms inside a body.
     fn heredoc_body(&mut self, current: char) {
         if current == '\n' {
+            if !self.heredoc_delimiter_quoted && self.word.ends_with('\\') {
+                self.word.pop();
+                return;
+            }
             self.close_heredoc_line();
         } else {
             self.word.push(current);
@@ -652,6 +673,7 @@ impl Scan {
                             chars.next();
                         }
                         self.heredoc = HeredocPhase::AwaitingDelimiter { dash };
+                        self.heredoc_delimiter_quoted = false;
                     }
                 }
                 _ => {}
@@ -1295,6 +1317,33 @@ mod tests {
             redirect_targets("cat <<-EOF\n\tEOF extra\n\tEOF\nmv a > b"),
             vec!["b".to_string()],
             "a tab-stripped line with trailing text is body; the bare line ends it"
+        );
+    }
+
+    #[test]
+    fn an_unquoted_delimiter_joins_backslash_newline_before_the_terminator_test() {
+        // bash removes a backslash-newline pair from an unquoted
+        // heredoc's body before any line is tested as a terminator, so
+        // `E\` over `OF` is the terminator line `EOF`: the body ends
+        // there, and the redirect after it is a real command target a
+        // guard must see. A quoted delimiter reads its body literally
+        // — single or double quotes alike — so the same two lines are
+        // body text and the redirect never runs.
+        assert_eq!(
+            redirect_targets("cat <<EOF\nbody\nE\\\nOF\nprintf x > env.conf"),
+            vec!["env.conf".to_string()],
+            "the joined line terminates the body; the redirect after it is real"
+        );
+        assert_eq!(
+            redirect_targets("cat <<'EOF'\nbody\nE\\\nOF\nprintf x > env.conf\nEOF"),
+            Vec::<String>::new(),
+            "a single-quoted delimiter's body is literal — no join, no redirect"
+        );
+        assert_eq!(
+            redirect_targets("cat <<\"EOF\"\nbody\nE\\\nOF\nprintf x > env.conf\nEOF"),
+            Vec::<String>::new(),
+            "a double-quoted delimiter's body is literal too — quoting any
+             part of the word makes the body verbatim"
         );
     }
 

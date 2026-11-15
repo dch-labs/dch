@@ -272,7 +272,7 @@ fn main() -> std::process::ExitCode {
                 let code = headless::run_headless(&args, startup_bridge, control).await;
                 std::process::ExitCode::from(code)
             } else {
-                std::process::ExitCode::from(tui::run_tui(&args, control).await)
+                std::process::ExitCode::from(Box::pin(tui::run_tui(&args, control)).await)
             }
         }
     })

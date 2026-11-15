@@ -13772,13 +13772,15 @@ fn arrows_and_tab_interoperate_in_both_directions() {
 
     // The popup stands throughout — and since the window now sizes
     // itself to the rows the side offers, the row it must keep is the
-    // highlighted one, not the list's head.
+    // highlighted one, not the list's head. The row is matched as a
+    // whole trimmed line, so the composer's own copy of the candidate
+    // cannot satisfy the check on its own.
     let drawn = render_to_buffer(&mut app, 80, 24);
     let rows = row_texts(&drawn);
     let highlighted = cands.get(5).cloned().unwrap_or_default();
     assert!(
-        rows.iter().any(|r| r.contains(&highlighted)),
-        "the popup stands with its highlighted row on screen: {rows:?}"
+        rows.iter().any(|r| r.trim() == highlighted),
+        "the popup stands with its highlighted row as a row of its own: {rows:?}"
     );
 }
 
@@ -13827,6 +13829,57 @@ fn an_unset_of_permission_mode_moves_the_gate_back_with_the_display() {
             dch_config::PermissionMode::default(),
         ],
         "the set and the undo both told the driver to rebuild under their mode"
+    );
+}
+
+#[test]
+fn an_unset_of_permission_mode_restores_the_live_session_mode_not_the_file_s() {
+    // The override ledger captures `permission_mode`'s original from
+    // the live config — a resumed session's own re-seated mode — never
+    // from the file: the file never hears of a session mode, and
+    // capturing its Auto would have `/unset` restore Auto over a
+    // session that ran read-only, with the live path publishing
+    // writes the session never approved.
+    use dch_tui::commands::Command;
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    // The session itself runs read-only — the mode a resume re-seats
+    // into the live config — while the file says auto.
+    let mut config = config_with_theme("dracula");
+    config.runner.permission_mode = dch_config::PermissionMode::ReadOnly;
+    let mut app = TuiApp::from_observer_state(config, kept);
+    app.set_config_file(config_with_theme("dracula"));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    app.set_submit_tx(tx);
+    let cell = std::sync::Arc::new(std::sync::Mutex::new(dch_config::PermissionMode::ReadOnly));
+    app.set_permission_mode_cell(Some(std::sync::Arc::clone(&cell)));
+    app.run_command(Command::Mode {
+        name: Some("interactive".to_string()),
+    });
+    app.run_command(Command::Unset {
+        key: "permission_mode".to_string(),
+    });
+    assert_eq!(
+        *cell.lock().unwrap(),
+        dch_config::PermissionMode::ReadOnly,
+        "the undo restores the session's own mode, never the file's auto"
+    );
+    let mut modes = Vec::new();
+    while let Ok(submission) = rx.try_recv() {
+        if let dch_tui::Submission::Command { command } = submission
+            && let dch_tui::SessionCommand::Mode { mode } = command
+        {
+            modes.push(mode);
+        }
+    }
+    assert_eq!(
+        modes,
+        vec![
+            dch_config::PermissionMode::Interactive,
+            dch_config::PermissionMode::ReadOnly,
+        ],
+        "the set and the undo each told the driver the mode the session runs"
     );
 }
 
@@ -14097,19 +14150,30 @@ fn a_short_terminal_sheds_completion_rows_not_the_highlight() {
     // The completion popup's window takes its capacity from the side's
     // bound too: cycling the highlight deep into the candidate list on
     // a short terminal keeps the highlighted row on screen — the row
-    // Tab is about to accept is never the one the clamp cut.
+    // Tab is about to accept is never the one the clamp cut. The
+    // candidates are theme values, whose popup rows are bare names, so
+    // the row match is a whole trimmed line and the composer's own
+    // copy cannot satisfy it alone.
     let mut app = app();
-    app.handle_event(&plain(KeyCode::Char('/')));
+    for c in "/theme ".chars() {
+        app.handle_event(&plain(KeyCode::Char(c)));
+    }
     // Each Tab accepts the next candidate into the composer, so the
     // composer names the row the highlight stands on.
     for _ in 0..8 {
         app.handle_event(&plain(KeyCode::Tab));
     }
-    let chosen = app.input().trim().trim_start_matches('/').to_string();
+    let chosen = app
+        .input()
+        .strip_prefix("/theme ")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
     assert!(!chosen.is_empty(), "the cycle accepted a candidate");
     let drawn = row_texts(&render_to_buffer(&mut app, 80, 10));
     assert!(
-        drawn.iter().any(|row| row.contains(&chosen)),
-        "the highlighted candidate renders — the window sheds list rows, never the highlight: {drawn:?}"
+        drawn.iter().any(|row| row.trim() == chosen),
+        "the highlighted candidate stands as its own popup row — the composer's \
+         copy alone must not satisfy the check: {drawn:?}"
     );
 }

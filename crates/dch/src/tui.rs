@@ -283,7 +283,7 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
     let (submit_tx, submit_rx) = mpsc::unbounded_channel();
     let (session_tx, session_rx) = mpsc::unbounded_channel();
     let model = config.api.model.clone();
-    let driver_config = config.clone();
+    let mut driver_config = config.clone();
     let driver_base = Arc::new(config_base.clone());
     let mut app = TuiApp::from_observer_state(config, state.clone());
     app.set_config_base(config_base);
@@ -309,12 +309,11 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
     let initial_transcript = transcript_handle.clone();
     let permission_restore = wire_permission_memory(&permission_memory, &initial_transcript);
     if permission_restore.is_damaged() {
-        fail_permissions_restore_closed(&lanes.mode_cell);
-        app.post_notice(
-            "the saved permissions for this session are damaged — remembered \
-             always/deny rules are gone, and side effects ask until they are \
-             re-answered"
-                .to_string(),
+        fail_permission_restore_closed_at_startup(
+            &mut app,
+            &mut driver_config,
+            &lanes,
+            &session_tx,
         );
     }
     let exit_saver = Arc::clone(&initial_transcript.saver);
@@ -1388,7 +1387,10 @@ fn wire_permission_memory(
 /// A stricter posture stays as it stands — read-only and interactive
 /// already gate everything the damage could have hidden — and the
 /// answer says whether the move happened, for the notice that names
-/// it.
+/// it. The move alone is half the fallback: the caller must also
+/// project the config rules ([`tighten_config_rules_cell`]) and name
+/// the enforced mode in the retained config, or a configured `allow`
+/// would cover the ask and a failed rebuild would restore auto.
 fn fail_permissions_restore_closed(cell: &dch_config::SharedPermissionMode) -> bool {
     let mut guard = cell
         .lock()
@@ -1398,6 +1400,68 @@ fn fail_permissions_restore_closed(cell: &dch_config::SharedPermissionMode) -> b
         return true;
     }
     false
+}
+
+/// Project the config-rules cell onto its tightening half.
+///
+/// The damaged-restore fallback's companion to the mode move: the
+/// engine consults the config layer ahead of the mode matrix, and a
+/// configured `allow` would cover the asking posture the cell moved
+/// to — a damaged session under a config that allows a verb would
+/// run that verb unasked, with the remembered refusals that might
+/// have balanced it gone. The projection drops the `allow` rules
+/// (the loosening half) and keeps `deny` and `ask` (the tightening
+/// half, which never made anything run), so every side-effecting
+/// call asks until the session re-answers or a `/preset` re-seeds
+/// the config layer. The cell is the live view the policy re-reads
+/// per evaluation, so the projection reaches the very next dispatch
+/// and survives every runner rebuild.
+fn tighten_config_rules_cell(cell: &std::sync::Arc<std::sync::Mutex<Vec<dch_permissions::Rule>>>) {
+    cell.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|rule| rule.outcome != dch_permissions::PermissionOutcome::Allow);
+}
+
+/// Fail a damaged permissions restore closed at startup, on every
+/// lever the session owns.
+///
+/// The whole of the fallback, in the order the guarantee needs: the
+/// mode cell moves off the never-asking posture
+/// ([`fail_permissions_restore_closed`]), the retained driver config
+/// names the enforced mode — a later failed `/mode` rebuild rolls
+/// back to this value, never to the standing auto — the config-rules
+/// cell is projected onto its tightening half so no configured allow
+/// covers the ask, the display is told the enforced mode, and the
+/// notice names the recovery. Each lever matters alone: the move
+/// without the projection would let a config allow run what the
+/// notice says asks, and the move without the retained config would
+/// let one failed rebuild restore auto.
+fn fail_permission_restore_closed_at_startup(
+    app: &mut dch_tui::TuiApp,
+    driver_config: &mut dch_config::DchConfig,
+    lanes: &InteractiveLanes,
+    session_tx: &mpsc::UnboundedSender<SessionUpdate>,
+) {
+    if fail_permissions_restore_closed(&lanes.mode_cell) {
+        driver_config.runner.permission_mode = dch_config::PermissionMode::Interactive;
+    }
+    tighten_config_rules_cell(&lanes.config_rules_cell);
+    let enforced = *lanes
+        .mode_cell
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if session_tx
+        .send(SessionUpdate::PermissionMode { mode: enforced })
+        .is_err()
+    {
+        tracing::warn!("damage posture published but the display is gone");
+    }
+    app.post_notice(
+        "the saved permissions for this session are damaged — remembered \
+         always/deny rules are gone, and side effects ask until they are \
+         re-answered"
+            .to_string(),
+    );
 }
 
 /// Post a fresh session's boot warning, when one was earned, as the
@@ -2957,6 +3021,7 @@ async fn resume_into_session(
     let (enforced_mode, permissions_damaged) =
         adopt_resumed_permissions(transcript, context, standing_mode);
     if permissions_damaged {
+        context.config.runner.permission_mode = enforced_mode;
         post_session_notice(
             session_tx,
             "the saved permissions for this session are damaged — remembered \
@@ -2992,11 +3057,12 @@ async fn resume_into_session(
 ///
 /// The load's verdict drives everything here: a fresh or restored
 /// sibling adopts its lists wholesale, and a damaged one adopts
-/// nothing *and* — where the resumed session would run `auto`, the
-/// posture that never asks — moves the shared cell to the asking
-/// posture, because the standing refusals the damage hid cannot run
-/// unasked. Returns the mode the resumed display should publish
-/// beside the damage verdict, so the caller can say the damage aloud.
+/// nothing *and* moves both levers of the fallback — the shared cell
+/// to the asking posture where the session would run `auto`, and the
+/// config-rules cell onto its tightening half, because a configured
+/// allow would otherwise cover the ask. Returns the mode the resumed
+/// display should publish beside the damage verdict, so the caller
+/// can retain the enforced mode and say the damage aloud.
 fn adopt_resumed_permissions(
     transcript: &TranscriptHandle,
     context: &mut DriverContext,
@@ -3015,6 +3081,12 @@ fn adopt_resumed_permissions(
     } else {
         standing_mode
     };
+    if damaged {
+        // The fallback's other half: the engine consults the config
+        // layer ahead of the matrix, so a configured allow would
+        // cover the asking posture the cell just moved to.
+        tighten_config_rules_cell(&context.lanes.config_rules_cell);
+    }
     (enforced_mode, damaged)
 }
 
@@ -7145,6 +7217,24 @@ mod tests {
             lanes: InteractiveLanes::detached(),
             overrides: RunOverrides::default(),
         };
+        // A configured allow would cover the asking posture the
+        // fallback moves the cell to; a deny must survive it.
+        *context
+            .lanes
+            .config_rules_cell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = vec![
+            dch_permissions::Rule {
+                id: "allow-bash".to_string(),
+                outcome: dch_permissions::PermissionOutcome::Allow,
+                matcher: dch_permissions::Matcher::Tool("Bash".to_string()),
+            },
+            dch_permissions::Rule {
+                id: "deny-env".to_string(),
+                outcome: dch_permissions::PermissionOutcome::Block,
+                matcher: dch_permissions::Matcher::Tool("Write".to_string()),
+            },
+        ];
         let parked_saver = Arc::new(crate::session::SessionSaver::with_base_dir(
             uuid::Uuid::new_v4(),
             "m".to_string(),
@@ -7199,6 +7289,135 @@ mod tests {
             resumed_mode,
             Some(dch_config::PermissionMode::Interactive),
             "the resumed display publishes the enforced posture, never the standing auto"
+        );
+        assert_eq!(
+            context.config.runner.permission_mode,
+            dch_config::PermissionMode::Interactive,
+            "the retained config names the enforced mode — a later failed /mode \
+             rebuild rolls back to it, never to the standing auto"
+        );
+        let remaining = context
+            .lanes
+            .config_rules_cell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(
+            remaining
+                .iter()
+                .all(|rule| rule.outcome != dch_permissions::PermissionOutcome::Allow),
+            "a damaged restore drops the configured allows — they would cover the ask: {remaining:?}"
+        );
+        assert!(
+            remaining
+                .iter()
+                .any(|rule| rule.outcome == dch_permissions::PermissionOutcome::Block),
+            "the configured tightening half stays"
+        );
+    }
+
+    #[test]
+    fn the_damage_projection_keeps_only_tightening_rules() {
+        // The projection half of the damaged fallback: allow rules go
+        // — they would cover the ask the mode move promises — and deny
+        // and ask stay, because they never made anything run and
+        // losing a deny would loosen.
+        let cell = std::sync::Arc::new(std::sync::Mutex::new(vec![
+            dch_permissions::Rule {
+                id: "allow-bash".to_string(),
+                outcome: dch_permissions::PermissionOutcome::Allow,
+                matcher: dch_permissions::Matcher::Tool("Bash".to_string()),
+            },
+            dch_permissions::Rule {
+                id: "ask-fetch".to_string(),
+                outcome: dch_permissions::PermissionOutcome::Ask,
+                matcher: dch_permissions::Matcher::Tool("WebFetch".to_string()),
+            },
+            dch_permissions::Rule {
+                id: "deny-env".to_string(),
+                outcome: dch_permissions::PermissionOutcome::Block,
+                matcher: dch_permissions::Matcher::Tool("Write".to_string()),
+            },
+        ]));
+        tighten_config_rules_cell(&cell);
+        let remaining = cell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            remaining
+                .iter()
+                .map(|rule| rule.id.clone())
+                .collect::<Vec<_>>(),
+            vec!["ask-fetch".to_string(), "deny-env".to_string()],
+            "the loosening half goes; the tightening half stays"
+        );
+    }
+
+    #[test]
+    fn the_startup_damage_fallback_moves_every_lever() {
+        // The startup fallback, each lever pinned alone: the cell moves
+        // off auto, the retained driver config names the enforced mode
+        // (a later failed rebuild rolls back to it, never auto), the
+        // config-rules cell loses its allows, and the display is told
+        // the enforced mode over the session lane.
+        let (observer, kept) = TuiObserverState::new().into_observer();
+        drop(observer);
+        let mut app = TuiApp::from_observer_state(unreachable_config(), kept);
+        let mut driver_config = unreachable_config();
+        let lanes = InteractiveLanes::detached();
+        let mode_cell = Arc::clone(&lanes.mode_cell);
+        *lanes
+            .config_rules_cell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = vec![
+            dch_permissions::Rule {
+                id: "allow-bash".to_string(),
+                outcome: dch_permissions::PermissionOutcome::Allow,
+                matcher: dch_permissions::Matcher::Tool("Bash".to_string()),
+            },
+            dch_permissions::Rule {
+                id: "deny-env".to_string(),
+                outcome: dch_permissions::PermissionOutcome::Block,
+                matcher: dch_permissions::Matcher::Tool("Write".to_string()),
+            },
+        ];
+        let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+        fail_permission_restore_closed_at_startup(
+            &mut app,
+            &mut driver_config,
+            &lanes,
+            &session_tx,
+        );
+        assert_eq!(
+            *mode_cell
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            dch_config::PermissionMode::Interactive,
+            "the cell leaves the never-asking posture"
+        );
+        assert_eq!(
+            driver_config.runner.permission_mode,
+            dch_config::PermissionMode::Interactive,
+            "the retained config names the enforced mode — a failed rebuild \
+             cannot roll back to auto"
+        );
+        let remaining = lanes
+            .config_rules_cell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(
+            remaining
+                .iter()
+                .all(|rule| rule.outcome != dch_permissions::PermissionOutcome::Allow),
+            "no configured allow survives to cover the ask: {remaining:?}"
+        );
+        assert_eq!(
+            session_rx.try_recv(),
+            Ok(SessionUpdate::PermissionMode {
+                mode: dch_config::PermissionMode::Interactive
+            }),
+            "the display is told the enforced mode"
         );
     }
 
