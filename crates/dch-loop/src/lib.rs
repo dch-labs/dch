@@ -24,6 +24,7 @@ pub use error::RunnerError;
 pub use permission::MemorySnapshot;
 pub use permission::RememberRules;
 pub use permission::config_rules;
+pub use permission::config_rules_at;
 pub use permission::permission_layer;
 pub use permission::permission_layer_live;
 pub use project::MessageAnalysis;

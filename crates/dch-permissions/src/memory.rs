@@ -317,37 +317,41 @@ impl PermissionMemory {
 
     /// Adopt a rule pair wholesale — a session's own choices at
     /// open, a resumed session's at adoption, a cleared session's
-    /// empty none.
+    /// empty none — under the damage verdict it was adopted with.
     ///
     /// Replacement, not merge: the pair handed over is the memory's
     /// whole truth from the call on, so a resume restores exactly
-    /// what its file records and can never accumulate a phantom.
-    /// The damage verdict dies with the pair it belonged to — a
-    /// healthy adoption is a healthy session, and a damaged one
-    /// re-marks itself right after, from its own verdict. No
+    /// what its file records and can never accumulate a phantom. The
+    /// verdict is part of the same observation, not a follow-up mark:
+    /// both lists and the flag store under one lock-hold, so a
+    /// write-through a concurrent choice fires — a remember or a
+    /// forget racing the resume — can never catch the memory between
+    /// a healthy pair and its verdict and persist the marker away. No
     /// write-through fires — adoption is not a new choice, and
     /// the file the pair came from is already its record.
-    pub fn adopt(&self, allow: Vec<PermissionRule>, deny: Vec<PermissionRule>) {
-        *self
+    pub fn adopt(&self, allow: Vec<PermissionRule>, deny: Vec<PermissionRule>, damaged: bool) {
+        let mut allow_guard = self
             .allow_rules
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = allow;
-        *self
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut deny_guard = self
             .deny_rules
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = deny;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *allow_guard = allow;
+        *deny_guard = deny;
         self.damage
-            .store(false, std::sync::atomic::Ordering::SeqCst);
+            .store(damaged, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Mark the session's permissions restore as damaged, still
     /// standing.
     ///
-    /// The host's half of the fail-closed bargain: called right
-    /// after a damaged verdict adopts its (empty or partial) lists,
-    /// so every later save carries the verdict and every later
-    /// launch re-arms it. Nothing in the memory clears the flag —
-    /// not the remembers, not the forgets — only a fresh adoption or
+    /// An adoption that fails closed passes its verdict through
+    /// [`adopt`](Self::adopt) in the same motion — the composition
+    /// production wires — so this verb arms a verdict no adoption
+    /// carried. Nothing in the memory clears the flag — not the
+    /// remembers, not the forgets — only a fresh adoption or
     /// [`clear_damage`](Self::clear_damage).
     pub fn mark_damaged(&self) {
         self.damage.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -620,7 +624,7 @@ mod tests {
                 && verdicts.lock().unwrap().iter().all(|damaged| *damaged),
             "every write-through carries the verdict — the file cannot launder it"
         );
-        memory.adopt(Vec::new(), Vec::new());
+        memory.adopt(Vec::new(), Vec::new(), false);
         assert!(
             !memory.damage_standing(),
             "a fresh adoption is a fresh verdict — healthy in, healthy out"
@@ -636,6 +640,79 @@ mod tests {
             Some(false),
             "the repair is itself a save — the write-through fires with the verdict \
              cleared, so the recovery reaches the file at once"
+        );
+    }
+
+    #[test]
+    fn an_adoption_carries_its_verdict_in_one_observation() {
+        // The verdict is part of the pair it was adopted under, not a
+        // follow-up mark: one call stores the lists and arms (or
+        // clears) the marker, so no observer — a write-through racing
+        // the resume included — can catch the memory between a
+        // healthy pair and its verdict.
+        let memory = PermissionMemory::default();
+        memory.adopt(
+            vec![prefix("cargo test")],
+            vec![prefix("cargo publish")],
+            true,
+        );
+        assert_eq!(
+            memory.allow_rules(),
+            vec![prefix("cargo test")],
+            "the adopted pair is the memory's whole truth"
+        );
+        assert_eq!(
+            memory.deny_rules(),
+            vec![prefix("cargo publish")],
+            "both halves of the adoption landed"
+        );
+        assert!(
+            memory.damage_standing(),
+            "the verdict armed with the pair — no second call, no window"
+        );
+        memory.adopt(Vec::new(), Vec::new(), false);
+        assert!(
+            !memory.damage_standing(),
+            "the healthy adoption cleared it in the same motion"
+        );
+    }
+
+    #[test]
+    fn a_damaged_adoption_races_no_write_through_to_a_laundered_verdict() {
+        // The window the two-step adoption left open: the lists
+        // replaced first, the verdict re-marked after, and a choice
+        // firing its write-through in between persisted the new pair
+        // with the marker gone — the file said healthy until a later
+        // save repaired it. The verdict now stores under the same
+        // lock-hold the lists replace under, so every write-through a
+        // racing choice fires during a damaged adoption sees a
+        // verdict that stands.
+        let memory = PermissionMemory::default();
+        memory.adopt(Vec::new(), Vec::new(), true);
+        let verdicts = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&verdicts);
+        memory.persist_through(Arc::new(
+            move |_allow: &[PermissionRule], _deny: &[PermissionRule], damaged: bool| {
+                sink.lock().unwrap().push(damaged);
+            },
+        ));
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for _ in 0..200 {
+                    memory.adopt(vec![prefix("cargo test")], Vec::new(), true);
+                }
+            });
+            scope.spawn(|| {
+                for _ in 0..200 {
+                    memory.forget_all();
+                }
+            });
+        });
+        assert!(
+            !verdicts.lock().unwrap().is_empty()
+                && verdicts.lock().unwrap().iter().all(|damaged| *damaged),
+            "every write-through carries a standing verdict — the file \
+             cannot launder the damage away mid-adoption"
         );
     }
 

@@ -295,6 +295,7 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
     app.set_permission_memory(permission_memory.clone());
     app.set_permission_mode_cell(Some(Arc::clone(&lanes.mode_cell)));
     app.set_permission_config_rules_cell(Some(Arc::clone(&lanes.config_rules_cell)));
+    app.set_permission_preset_cell(Some(Arc::clone(&lanes.preset_cell)));
     app.set_question_requests(prompt_rx);
     app.set_session_requests(session_rx);
     app.set_working_dir(&workdir);
@@ -309,7 +310,6 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
     let initial_transcript = transcript_handle.clone();
     let permission_restore = wire_permission_memory(&permission_memory, &initial_transcript);
     if permission_restore.damage_stands() {
-        permission_memory.mark_damaged();
         fail_permission_restore_closed_at_startup(
             &mut app,
             &mut driver_config,
@@ -1363,8 +1363,9 @@ fn wire_permission_memory(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
     let restored = launch_saver.load_permissions();
+    let damaged = restored.damage_stands();
     let (allow, deny) = restored.clone().into_lists();
-    memory.adopt(allow, deny);
+    memory.adopt(allow, deny, damaged);
     let persist_cell = Arc::clone(&transcript.saver);
     memory.persist_through(Arc::new(move |allow, deny, damaged| {
         let saver = persist_cell
@@ -1425,24 +1426,28 @@ fn tighten_config_rules_cell(cell: &std::sync::Arc<std::sync::Mutex<Vec<dch_perm
         .retain(|rule| rule.outcome != dch_permissions::PermissionOutcome::Allow);
 }
 
-/// Re-seed the config-rules cell from the configuration's own join.
+/// Re-seed the config-rules cell from the configuration's own join at
+/// the selection in effect.
 ///
 /// The recovery half of the damage posture and the exact call
 /// `/permissions repair` makes: the cell returns to the rules the
-/// configuration compiles today — the same join that seeded it at
-/// startup. Every fresh adoption clears the damage verdict
-/// [`tighten_config_rules_cell`] was keyed to, so each re-seeds the
-/// cell beside the adoption: the earned-fresh arm of a `/clear` and
-/// the healthy arm of a resume both leave a posture that belongs to
-/// no standing session, the configuration in force exactly as
-/// written.
+/// configuration compiles today at the live preset selection — the
+/// same join that seeded it at startup, carried on the lanes so a
+/// mid-session `/preset` survives the re-seed instead of regressing
+/// to the boot selection. Every fresh adoption clears the damage
+/// verdict [`tighten_config_rules_cell`] was keyed to, so each
+/// re-seeds the cell beside the adoption: the earned-fresh arm of a
+/// `/clear` and the healthy arm of a resume both leave a posture that
+/// belongs to no standing session, the configuration in force
+/// exactly as written and as selected.
 fn reseed_config_rules_cell(
     cell: &std::sync::Arc<std::sync::Mutex<Vec<dch_permissions::Rule>>>,
     config: &dch_config::DchConfig,
+    preset: Option<&str>,
 ) {
     cell.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone_from(&dch_loop::config_rules(config));
+        .clone_from(&dch_loop::config_rules_at(config, preset));
 }
 
 /// Fail a damaged permissions restore closed at startup, on every
@@ -1677,6 +1682,16 @@ struct InteractiveLanes {
     /// The session's live config-rules cell: `/preset` swaps the
     /// contents, and the gate's snapshot re-reads per dispatch.
     config_rules_cell: std::sync::Arc<std::sync::Mutex<Vec<dch_permissions::Rule>>>,
+
+    /// The session's live preset selection: `/preset` records it, and
+    /// the fresh adoptions re-seed the config-rules cell from it.
+    ///
+    /// Held on the lanes because the selection is process state the
+    /// app owns and the driver reads back: a `/clear` rotation and a
+    /// healthy resume both re-seed the cell from the configuration
+    /// compiled at this selection, so a mid-session swap cannot be
+    /// reverted by an adoption that only knows the boot config's.
+    preset_cell: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl InteractiveLanes {
@@ -1698,6 +1713,8 @@ impl InteractiveLanes {
         let memory = PermissionMemory::default();
         let config_rules_cell =
             std::sync::Arc::new(std::sync::Mutex::new(dch_loop::config_rules(config)));
+        let preset_cell =
+            std::sync::Arc::new(std::sync::Mutex::new(config.permissions.preset.clone()));
         let (permission, permission_rx) = permission_bridge();
         let (prompt_tx, prompt_rx) = mpsc::unbounded_channel();
         (
@@ -1710,6 +1727,7 @@ impl InteractiveLanes {
                 )),
                 memory: memory.clone(),
                 config_rules_cell,
+                preset_cell,
             },
             permission_rx,
             prompt_rx,
@@ -1799,6 +1817,7 @@ impl InteractiveLanes {
             config_rules_cell: std::sync::Arc::new(std::sync::Mutex::new(dch_loop::config_rules(
                 &dch_config::DchConfig::default(),
             ))),
+            preset_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 }
@@ -3107,10 +3126,7 @@ fn adopt_resumed_permissions(
         .load_permissions();
     let damage_stands = restored.damage_stands();
     let (allow, deny) = restored.into_lists();
-    context.lanes.memory.adopt(allow, deny);
-    if damage_stands {
-        context.lanes.memory.mark_damaged();
-    }
+    context.lanes.memory.adopt(allow, deny, damage_stands);
     let enforced_mode =
         if damage_stands && fail_permissions_restore_closed(&context.lanes.mode_cell) {
             dch_config::PermissionMode::Interactive
@@ -3120,7 +3136,17 @@ fn adopt_resumed_permissions(
     if damage_stands {
         tighten_config_rules_cell(&context.lanes.config_rules_cell);
     } else {
-        reseed_config_rules_cell(&context.lanes.config_rules_cell, &context.config);
+        let selection = context
+            .lanes
+            .preset_cell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        reseed_config_rules_cell(
+            &context.lanes.config_rules_cell,
+            &context.config,
+            selection.as_deref(),
+        );
     }
     (enforced_mode, damage_stands)
 }
@@ -3167,8 +3193,18 @@ fn land_session_clear<E: std::fmt::Display>(
             .mode_cell
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = default;
-        context.lanes.memory.adopt(Vec::new(), Vec::new());
-        reseed_config_rules_cell(&context.lanes.config_rules_cell, &context.config);
+        context.lanes.memory.adopt(Vec::new(), Vec::new(), false);
+        let selection = context
+            .lanes
+            .preset_cell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        reseed_config_rules_cell(
+            &context.lanes.config_rules_cell,
+            &context.config,
+            selection.as_deref(),
+        );
         if session_tx.send(SessionUpdate::SessionId { id }).is_err() {
             tracing::warn!("session cleared but the display is gone");
         }
@@ -6461,6 +6497,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_preset_selection_survives_the_clear_s_fresh_adoption() {
+        // The round-4 preset-regression case on the clear lane: the
+        // boot config selected p1, a mid-session `/preset p2` recorded
+        // the swap on the lanes, and the `/clear` rotation re-seeds
+        // from the selection in effect — p2's join — so the live deny
+        // cannot silently leave the gate while the boot preset's
+        // allow returns unasked.
+        let dir = tempfile::tempdir().expect("sessions tempdir");
+        let id = uuid::Uuid::new_v4();
+        let saver = Arc::new(crate::session::SessionSaver::with_base_dir(
+            id,
+            "m".to_string(),
+            dir.path().to_path_buf(),
+        ));
+        let (handle, worker) = TranscriptWorker::spawn(Arc::clone(&saver));
+        let (session_tx, _session_rx) = mpsc::unbounded_channel();
+        let mut config = dch_config::DchConfig::default();
+        config.permissions.preset = Some("p1".to_string());
+        config.permissions.presets.insert(
+            "p1".to_string(),
+            dch_permissions::Preset {
+                rules: vec![dch_config::PermissionRuleConfig {
+                    id: None,
+                    outcome: dch_config::PermissionRuleOutcome::Allow,
+                    tool: Some("Bash".to_string()),
+                    shell_prefix: None,
+                    path_glob: None,
+                }],
+            },
+        );
+        config.permissions.presets.insert(
+            "p2".to_string(),
+            dch_permissions::Preset {
+                rules: vec![dch_config::PermissionRuleConfig {
+                    id: Some("no-push".to_string()),
+                    outcome: dch_config::PermissionRuleOutcome::Deny,
+                    tool: None,
+                    shell_prefix: Some("git push".to_string()),
+                    path_glob: None,
+                }],
+            },
+        );
+        let mut context = DriverContext {
+            config: config.clone(),
+            config_base: Arc::new(dch_config::DchConfig::default()),
+            workdir: std::path::PathBuf::from("."),
+            sessions_root: dir.path().to_path_buf(),
+            state: TuiObserverState::new().into_observer().1,
+            shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            lanes: InteractiveLanes::detached(),
+            overrides: RunOverrides::default(),
+        };
+        *context
+            .lanes
+            .config_rules_cell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = dch_loop::config_rules(&config);
+        *context
+            .lanes
+            .preset_cell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some("p2".to_string());
+
+        land_session_clear::<loopctl::error::LoopError>(
+            Ok(2_usize),
+            &handle,
+            &session_tx,
+            &mut context,
+        );
+
+        assert_eq!(
+            context
+                .lanes
+                .config_rules_cell
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+            dch_loop::config_rules_at(&config, Some("p2")),
+            "the fresh session runs the live selection's join — the boot \
+             preset does not come back with the rotation"
+        );
+        worker.join();
+    }
+
+    #[tokio::test]
     async fn a_cleared_session_starts_with_no_remembered_rules() {
         // The memory is session state: the ended session answered
         // "allow always" on `cargo test` and "always deny" on a
@@ -6486,6 +6607,7 @@ mod tests {
             vec![dch_tui::PermissionRule::Tool {
                 tool: "WebFetch".to_string(),
             }],
+            false,
         );
         let mut context = DriverContext {
             config: dch_config::DchConfig::default(),
@@ -6633,6 +6755,7 @@ mod tests {
             )),
             memory: PermissionMemory::default(),
             config_rules_cell: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            preset_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),
         };
         let rebuilt = unreachable_runner().await;
         lanes.attach(&rebuilt);
@@ -7263,6 +7386,7 @@ mod tests {
                 prefix: "cargo test".to_string(),
             }],
             vec![],
+            false,
         );
         // One root, the production shape: the save cell the resume
         // retargets reads the same base the load read, so the
@@ -7582,6 +7706,116 @@ mod tests {
             dch_loop::config_rules(&config),
             "the healthy resume returns the cell to the configuration's own join — \
              the earlier damage cannot withdraw the config layer from this session"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_preset_selection_survives_a_healthy_live_resume() {
+        // The round-4 regression on the resume lane: the boot config
+        // selected p1, a mid-session `/preset p2` recorded the swap
+        // on the lanes, and a healthy live resume adopts its fresh
+        // memory — the re-seed must compile the config layer at the
+        // selection in effect, or the live preset's deny silently
+        // leaves the gate while the boot preset's allow returns.
+        let dir = tempfile::tempdir().expect("sessions tempdir");
+        let root = dir.keep();
+        let c = uuid::Uuid::new_v4();
+        let saver =
+            crate::session::SessionSaver::with_base_dir(c, "test-model".to_string(), root.clone());
+        saver
+            .save_at(
+                &[dch_tui::TuiMessage::User {
+                    text: "the healthy session's turn".to_string(),
+                    timestamp: chrono::Utc::now(),
+                    steered: false,
+                    unsent: false,
+                }],
+                crate::session::SessionTokens::default(),
+                chrono::Utc::now(),
+            )
+            .expect("the healthy session lands");
+        saver
+            .save_permissions(
+                &[dch_tui::PermissionRule::ShellPrefix {
+                    prefix: "cargo build".to_string(),
+                }],
+                &[],
+                false,
+            )
+            .expect("the healthy sibling saves");
+        let mut runner = unreachable_runner().await;
+        let (_, state) = TuiObserverState::new().into_observer();
+        let (session_tx, _session_rx) = mpsc::unbounded_channel();
+        let mut config = unreachable_config();
+        config.permissions.preset = Some("p1".to_string());
+        config.permissions.presets.insert(
+            "p1".to_string(),
+            dch_permissions::Preset {
+                rules: vec![dch_config::PermissionRuleConfig {
+                    id: None,
+                    outcome: dch_config::PermissionRuleOutcome::Allow,
+                    tool: Some("Bash".to_string()),
+                    shell_prefix: None,
+                    path_glob: None,
+                }],
+            },
+        );
+        config.permissions.presets.insert(
+            "p2".to_string(),
+            dch_permissions::Preset {
+                rules: vec![dch_config::PermissionRuleConfig {
+                    id: Some("no-push".to_string()),
+                    outcome: dch_config::PermissionRuleOutcome::Deny,
+                    tool: None,
+                    shell_prefix: Some("git push".to_string()),
+                    path_glob: None,
+                }],
+            },
+        );
+        let mut context = DriverContext {
+            config: config.clone(),
+            config_base: std::sync::Arc::new(unreachable_config()),
+            workdir: std::path::PathBuf::from("."),
+            sessions_root: root.clone(),
+            state,
+            shutting_down: shutdown_flag(false),
+            lanes: InteractiveLanes::detached(),
+            overrides: RunOverrides::default(),
+        };
+        *context
+            .lanes
+            .config_rules_cell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = dch_loop::config_rules(&config);
+        *context
+            .lanes
+            .preset_cell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some("p2".to_string());
+        let parked_saver = Arc::new(crate::session::SessionSaver::with_base_dir(
+            uuid::Uuid::new_v4(),
+            "m".to_string(),
+            root.clone(),
+        ));
+        let (transcript, _worker) = TranscriptWorker::spawn(parked_saver);
+        apply_session_command(
+            &mut runner,
+            &transcript,
+            &session_tx,
+            SessionCommand::Resume { id: c.to_string() },
+            &mut context,
+        )
+        .await;
+        assert_eq!(
+            context
+                .lanes
+                .config_rules_cell
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+            dch_loop::config_rules_at(&config, Some("p2")),
+            "the healthy resume compiles the config layer at the live \
+             selection — the boot preset does not come back with the adoption"
         );
     }
 

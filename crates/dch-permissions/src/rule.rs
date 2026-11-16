@@ -394,8 +394,25 @@ impl PermissionsConfig {
     /// with a warning rather than silently protecting nothing.
     #[must_use]
     pub fn engine_rules(&self) -> Vec<Rule> {
+        self.engine_rules_at(self.preset.as_deref())
+    }
+
+    /// Compile the configured rules under a live preset selection that
+    /// overrides the file's own.
+    ///
+    /// The same projection [`engine_rules`](Self::engine_rules) makes,
+    /// with the selection passed in rather than read: `/preset` moves
+    /// a process-live selection the configuration file never carries,
+    /// and the gate's re-seeds — the swap itself, a `/clear` rotation,
+    /// a healthy resume — all join from the selection in effect, so
+    /// the rules cell and the listing it mirrors cannot drift apart.
+    /// `None` selects nothing, whatever the file says; a name the
+    /// presets do not carry joins nothing, exactly as a dangling
+    /// selection in the file does.
+    #[must_use]
+    pub fn engine_rules_at(&self, preset: Option<&str>) -> Vec<Rule> {
         let mut rules = self.engine_rules_with_prefix("");
-        if let Some(name) = &self.preset
+        if let Some(name) = preset
             && let Some(preset) = self.presets.get(name)
         {
             rules.extend(preset.engine_rules(name));

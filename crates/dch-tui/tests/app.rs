@@ -14309,6 +14309,7 @@ fn a_forget_press_numbers_the_listing_it_read_not_the_config_at_press_time() {
             },
         ],
         vec![],
+        false,
     );
     app.set_permission_memory(memory);
     // The listing numbers one configured row (the selected preset's

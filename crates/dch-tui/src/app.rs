@@ -2214,6 +2214,16 @@ pub struct TuiApp {
     permission_config_rules_cell:
         Option<std::sync::Arc<std::sync::Mutex<Vec<dch_permissions::Rule>>>>,
 
+    /// The live preset-selection cell the driver's fresh adoptions
+    /// re-seed from, mirroring [`Self::permission_config_rules_cell`].
+    ///
+    /// `/preset` records the selection here beside swapping the rules
+    /// cell, so a `/clear` rotation or a healthy resume compiles the
+    /// config layer at the selection in effect rather than the boot
+    /// config's own. A host without a lane leaves it `None` and the
+    /// selection rides the session config alone.
+    permission_preset_cell: Option<std::sync::Arc<std::sync::Mutex<Option<String>>>>,
+
     /// Questions from the asking tool waiting for the user's answer,
     /// oldest first.
     ///
@@ -2621,6 +2631,7 @@ impl TuiApp {
             permission_session_start: boot_permission_pair(&config),
             permission_mode_cell: None,
             permission_config_rules_cell: None,
+            permission_preset_cell: None,
             pending_questions: std::collections::VecDeque::new(),
             graphics: crate::terminal::GraphicsSupport::None,
             welcome: WelcomeState {
@@ -3447,7 +3458,12 @@ impl TuiApp {
     /// shared rules cell — the loop's policy re-reads the preset join
     /// per evaluation — and never reaches the configuration file, so a
     /// restart or a launch `--resume` starts under the configuration's
-    /// own selection.
+    /// own selection. The selection also rides the shared preset
+    /// cell, so the driver's fresh adoptions — a `/clear`, a healthy
+    /// resume — re-seed at the selection in effect, never the boot
+    /// one. While a damage verdict stands the swap records the
+    /// selection and holds: the config layer stays tightened until
+    /// `/permissions repair` re-seeds it as chosen.
     fn preset_command(&mut self, name: Option<&str>) {
         let Some(selected) = name else {
             let names: Vec<&str> = self
@@ -3489,6 +3505,17 @@ impl TuiApp {
             return;
         }
         self.config.permissions.preset = Some(selected.to_string());
+        if let Some(cell) = &self.permission_preset_cell {
+            *cell
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(selected.to_string());
+        }
+        if self.permission_memory.damage_standing() {
+            self.post_notice(format!(
+                "preset {selected:?} selected — its rules wait for /permissions repair"
+            ));
+            return;
+        }
         let rules = self.config.permissions.engine_rules();
         if let Some(cell) = &self.permission_config_rules_cell {
             cell.lock()
@@ -3573,6 +3600,20 @@ impl TuiApp {
         cell: Option<std::sync::Arc<std::sync::Mutex<Vec<dch_permissions::Rule>>>>,
     ) {
         self.permission_config_rules_cell = cell;
+    }
+
+    /// Install the live preset-selection cell the driver's fresh
+    /// adoptions re-seed from.
+    ///
+    /// The host's wiring: `/preset` records the selection, and the
+    /// next `/clear` or healthy resume compiles the config layer at
+    /// it — a live swap cannot be reverted by an adoption that only
+    /// knows the boot config.
+    pub fn set_permission_preset_cell(
+        &mut self,
+        cell: Option<std::sync::Arc<std::sync::Mutex<Option<String>>>>,
+    ) {
+        self.permission_preset_cell = cell;
     }
 
     /// Point live config changes at a directory to persist into.
@@ -4369,10 +4410,7 @@ impl TuiApp {
             );
             return;
         }
-        self.permission_memory.adopt(Vec::new(), Vec::new());
-        // The fresh session owes nothing to the one it replaces: a
-        // mode override recorded against the ended conversation must
-        // not reach into the fresh one's `/unset`.
+        self.permission_memory.adopt(Vec::new(), Vec::new(), false);
         self.config_overrides.remove("permission_mode");
         self.compaction_summary_owed.clear();
         self.latest_todos.clear();
@@ -20454,6 +20492,7 @@ mod tests {
                 prefix: "cargo test".to_string(),
             }],
             vec![],
+            false,
         );
         let out = command_output(&mut app, "/permissions");
         assert!(
@@ -20467,6 +20506,7 @@ mod tests {
                 prefix: "cargo build".to_string(),
             }],
             vec![],
+            false,
         );
         let out = command_output(&mut app, "/permissions forget 1");
         assert!(
@@ -20567,7 +20607,7 @@ mod tests {
         );
         // The clear path's motion on the shared memory: the fresh
         // adoption clears the verdict.
-        app.permission_memory.adopt(Vec::new(), Vec::new());
+        app.permission_memory.adopt(Vec::new(), Vec::new(), false);
 
         app.permissions_command(Some("repair"));
 
@@ -20578,6 +20618,105 @@ mod tests {
         assert!(
             notice.contains("nothing to repair"),
             "the door answers for the verdict that stands — none: {notice}"
+        );
+    }
+
+    #[test]
+    fn a_preset_selection_waits_for_repair_and_takes_effect_at_it() {
+        // The round-4 damage interaction, end to end: a healthy swap
+        // joins the new preset's rules at once; under a standing
+        // damage verdict the swap records the selection and holds —
+        // the config layer stays tightened, so the new preset's rules
+        // cannot release anything ahead of the repair — and the
+        // repair re-seeds at the selection the session actually
+        // chose.
+        let mut config = dch_config::DchConfig::default();
+        config.permissions.preset = Some("p1".to_string());
+        config.permissions.presets.insert(
+            "p1".to_string(),
+            dch_permissions::Preset {
+                rules: vec![dch_config::PermissionRuleConfig {
+                    id: None,
+                    outcome: dch_config::PermissionRuleOutcome::Allow,
+                    tool: Some("Bash".to_string()),
+                    shell_prefix: None,
+                    path_glob: None,
+                }],
+            },
+        );
+        config.permissions.presets.insert(
+            "p2".to_string(),
+            dch_permissions::Preset {
+                rules: vec![dch_config::PermissionRuleConfig {
+                    id: Some("no-push".to_string()),
+                    outcome: dch_config::PermissionRuleOutcome::Deny,
+                    tool: None,
+                    shell_prefix: Some("git push".to_string()),
+                    path_glob: None,
+                }],
+            },
+        );
+        let mut app = TuiApp::new(config.clone());
+        let rules_cell =
+            std::sync::Arc::new(std::sync::Mutex::new(config.permissions.engine_rules()));
+        let preset_cell =
+            std::sync::Arc::new(std::sync::Mutex::new(config.permissions.preset.clone()));
+        app.set_permission_config_rules_cell(Some(std::sync::Arc::clone(&rules_cell)));
+        app.set_permission_preset_cell(Some(std::sync::Arc::clone(&preset_cell)));
+
+        app.preset_command(Some("p2"));
+
+        let held_join = config.permissions.engine_rules_at(Some("p2"));
+        assert_eq!(
+            *rules_cell
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            held_join,
+            "a healthy swap joins the new preset's rules at once"
+        );
+        assert_eq!(
+            *preset_cell
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            Some("p2".to_string()),
+            "the swap records the selection the driver re-seeds from"
+        );
+        app.permission_memory.adopt(Vec::new(), Vec::new(), true);
+
+        app.preset_command(Some("p1"));
+
+        assert_eq!(
+            *rules_cell
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            held_join,
+            "the held swap leaves the tightened cell exactly as it stood"
+        );
+        assert_eq!(
+            *preset_cell
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            Some("p1".to_string()),
+            "the selection is recorded even while its rules wait"
+        );
+        let (notice, _) = app
+            .transient_notice
+            .as_ref()
+            .expect("the held swap answers with a notice");
+        assert!(
+            notice.contains("wait for /permissions repair"),
+            "the notice names the door the rules wait at: {notice}"
+        );
+
+        app.permissions_command(Some("repair"));
+
+        assert_eq!(
+            *rules_cell
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            config.permissions.engine_rules_at(Some("p1")),
+            "the repair re-seeds at the selection in effect — the swap the \
+             damage held takes effect with it"
         );
     }
 

@@ -199,6 +199,19 @@ pub fn config_rules(config: &dch_config::DchConfig) -> Vec<EngineRule> {
     config.permissions.engine_rules()
 }
 
+/// The config's `[permissions]` rules under a live preset selection,
+/// compiled into engine rules.
+///
+/// The selection-aware pass-through beside [`config_rules`]: a
+/// `/preset` swap lives on the process's shared cells, so every
+/// re-seed that must not regress the selection — the swap itself, a
+/// `/clear` rotation, a healthy resume — joins through here with the
+/// selection in effect.
+#[must_use]
+pub fn config_rules_at(config: &dch_config::DchConfig, preset: Option<&str>) -> Vec<EngineRule> {
+    config.permissions.engine_rules_at(preset)
+}
+
 /// The `Ask` verdict, surfaced with its display prompt.
 ///
 /// The prompt names the tool, its category, and the active mode — pure

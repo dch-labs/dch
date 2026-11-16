@@ -215,15 +215,18 @@ fn scrub_and_mask(command: &str) -> String {
 
 /// Whether a masked span carries a substitution that can *execute*.
 ///
-/// bash draws the line the gate must draw with it: a `$` naming a
-/// variable or a parameter — `$?`, `$NAME`, `$1` — only expands, so
-/// `echo "exit: $?"` prints and touches nothing, while `$(` opens a
-/// command substitution, `${` opens a parameter expansion that can
-/// embed one (`${x:-$(rm)}`), and a backtick substitutes wherever it
-/// sits. The `$` is disqualified only in its two execution-capable
-/// spellings; the bare naming forms stay as ordinary, prefixable
-/// text — the echo that reports an exit code is a looker like any
-/// other, not a new exact-text rule per wording.
+/// bash draws the line the *remembering* judgment must draw: a `$`
+/// naming a variable or a parameter — `$?`, `$NAME`, `$1` — only
+/// expands, so the segment keeps its verb prefix (`echo $?` is the
+/// `echo` verb, remembered and covered like any echo), while `$(`
+/// opens a command substitution, `${` opens a parameter expansion
+/// that can embed one (`${x:-$(rm)}`), and a backtick substitutes
+/// wherever it sits — those spellings make the segment exact-text
+/// only, because no prefix can name what they will run. The reader
+/// gate draws the stricter line — every unquoted `$` disqualifies
+/// there, because the expansion word-splits into new words and flags
+/// — so this judgment is the complexity side alone; see
+/// [`shell_reads_only`].
 fn substitution_executes(span: &str) -> bool {
     span.contains('`') || span.contains("$(") || span.contains("${")
 }
@@ -231,23 +234,27 @@ fn substitution_executes(span: &str) -> bool {
 /// Whether a shell command only looks, never touches.
 ///
 /// Conservative by construction: a single line, and no character that
-/// could redirect or execute a substitution — `>`, `<`, parens,
-/// backslash, backtick, or a `$` in its two executing spellings `$(`
-/// and `${` (a bare `$NAME` or `$?` only expands) — anywhere outside
-/// quotes; those disqualify the whole
-/// command. Two spans cannot disqualify: the inert redirects
-/// (`2>/dev/null`, `>/dev/null`, `2>&1`, `1>&2`) are scrubbed first —
-/// each spelling only where it stands as its own token, never glued
-/// into a word, where its `>` opens a real file — because discarding
-/// or rerouting diagnostics touches no file, and
+/// could redirect, substitute, or split — `>`, `<`, parens,
+/// backslash, backtick, or any `$` — anywhere outside quotes; those
+/// disqualify the whole command. Every `$` is refused, not only the
+/// executing spellings, because bash word-splits the expansion's
+/// result: a bare `$NAME` becomes new words and flags — `find
+/// ./sandbox $ACTION` is whatever `ACTION` holds, `-delete` included
+/// — so no unquoted expansion reads. Two spans cannot disqualify: the
+/// inert redirects (`2>/dev/null`, `>/dev/null`, `2>&1`, `1>&2`) are
+/// scrubbed first — each spelling only where it stands as its own
+/// token, never glued into a word, where its `>` opens a real file —
+/// because discarding or rerouting diagnostics touches no file, and
 /// quoted text is masked (a single- or double-quoted span collapses to
-/// one opaque token), because literal characters
-/// cannot redirect, substitute, or separate — a grep pattern's `\+`
-/// stays a pattern. A real `> real-file` keeps its `>` and still
-/// disqualifies. The chaining characters (`;`, `|`, `&`) split the
-/// masked line into segments — empty segments, the artifacts of `&&`,
-/// are dropped — and **every** segment must be a command from the
-/// known-reading list: a pipeline of readers reads (`rg -n foo |
+/// one opaque token), because literal characters cannot redirect,
+/// substitute, separate, or re-split — a grep pattern's `\+` stays a
+/// pattern, and a quoted `$?` stays what the shell hands the echo
+/// whole (`echo "exit: $?"` reads). A real `> real-file` keeps its
+/// `>` and still disqualifies. The chaining characters (`;`, `|`,
+/// `&`) split the masked line into segments — empty segments, the
+/// artifacts of `&&`, are dropped — and **every** segment must be a
+/// command from the known-reading list: a pipeline of readers reads
+/// (`rg -n foo |
 /// wc -l`), a chain with one writer anywhere does not (`cargo build |
 /// wc -l`).
 #[must_use]
@@ -256,7 +263,7 @@ pub fn shell_reads_only(command: &str) -> bool {
         return false;
     }
     let masked = scrub_and_mask(command);
-    if masked.chars().any(|ch| "><`()\\".contains(ch)) || substitution_executes(&masked) {
+    if masked.chars().any(|ch| "><`()\\$".contains(ch)) {
         return false;
     }
     masked
@@ -281,7 +288,7 @@ pub fn shell_reads_only(command: &str) -> bool {
 #[must_use]
 pub fn segment_reads_only(segment: &str) -> bool {
     let masked = mask_quoted(segment);
-    if masked.chars().any(|ch| "><`()\\".contains(ch)) || substitution_executes(&masked) {
+    if masked.chars().any(|ch| "><`()\\$".contains(ch)) {
         return false;
     }
     command_reads_only(&masked)
@@ -403,7 +410,8 @@ fn command_reads_only(segment: &str) -> bool {
 /// runs a command per searched file, `git -c … --ext-diff` runs an
 /// external diff driver, and `systemctl -H` reaches a remote host;
 /// GNU `uniq`'s *second* positional names an output file, so one
-/// file argument is all it keeps. No argument to any reader may start `--output` — the one refusal
+/// file argument is all it keeps, and `xxd`'s second names the hex
+/// dump's own output — the same shape. No argument to any reader may start `--output` — the one refusal
 /// the whole gate shares. Quoting narrows twice over: a wholly quoted
 /// argument refuses for the readers whose flags can execute or write
 /// (`env`, `sort`, `date`, `less`, `git`, `cargo`, `rg`) — the mask
@@ -475,6 +483,7 @@ fn reader_arguments_read_only(program: &str, args: &[&str]) -> bool {
         }),
         "journalctl" => journalctl_arguments_read_only(args),
         "uniq" => uniq_arguments_read_only(args),
+        "xxd" => xxd_arguments_read_only(args),
         "systemctl" => {
             // -H/--host and -M/--machine leave this machine — the
             // command runs through ssh against a remote manager — so
@@ -711,6 +720,50 @@ fn uniq_arguments_read_only(args: &[&str]) -> bool {
         } else if matches!(
             *arg,
             "-f" | "-s" | "-w" | "--skip-fields" | "--skip-chars" | "--check-chars"
+        ) {
+            takes_value = true;
+        } else if arg.starts_with('-') && arg.len() > 1 {
+        } else {
+            files = files.saturating_add(1);
+        }
+    }
+    files <= 1
+}
+
+/// The `xxd` policy: one file argument, because the second is an
+/// output.
+///
+/// xxd's positional arguments are `[INFILE [OUTFILE]]` — the second
+/// names a file the command *writes* (`xxd in.bin out.hex` creates
+/// `out.hex`, over whatever stood there), so a command naming two
+/// positionals is a writer and refuses, exactly as `uniq`'s output
+/// operand does. The value-taking flags (`-c`/`--cols`,
+/// `-g`/`--groupsize`, `-l`/`--len`, `-s`/`--seek`, `-n`/`--name`,
+/// `-R`) consume their following word so a bound never counts as a
+/// file; every other flag formats or transforms and reads.
+fn xxd_arguments_read_only(args: &[&str]) -> bool {
+    let mut takes_value = false;
+    let mut operands_only = false;
+    let mut files = 0_usize;
+    for arg in args {
+        if operands_only {
+            files = files.saturating_add(1);
+        } else if takes_value {
+            takes_value = false;
+        } else if *arg == "--" {
+            operands_only = true;
+        } else if matches!(
+            *arg,
+            "-c" | "--cols"
+                | "-g"
+                | "--groupsize"
+                | "-l"
+                | "--len"
+                | "-s"
+                | "--seek"
+                | "-n"
+                | "--name"
+                | "-R"
         ) {
             takes_value = true;
         } else if arg.starts_with('-') && arg.len() > 1 {
@@ -2020,6 +2073,12 @@ mod tests {
             !remembered.covers(&shape_for("cargo build && echo \"exit: $?\"")),
             "a new writer re-asks — the reader beside it changes nothing"
         );
+        assert!(
+            !remembered.covers(&shape_for("cargo fmt && xxd input.bin victim.hex")),
+            "a reader-named writer — xxd's second operand is its output — \
+             re-asks: the carve-out never carried it, on the remembered \
+             side or the config's"
+        );
     }
 
     #[test]
@@ -2110,7 +2169,7 @@ mod tests {
             "git diff HEAD -- crates/dch-loop/src/permission.rs | grep -E '^@@|^\\+pub|^\\+fn' | head -40",
             "echo 'a > b'",
             "echo \"done: $?\"",
-            "echo $HOME $USER",
+            "xxd Cargo.lock",
             "grep 'x|y' notes.txt",
             "head -6 \"README.md\"",
             "git -C /home/dch/repos/dch log --oneline -15",
@@ -2162,6 +2221,15 @@ mod tests {
             // the glued spellings ride no cluster past the arm.
             "less -O owned.txt notes.txt",
             "cat x | less -O /tmp/leak",
+            // An unquoted `$` word-splits into whatever it holds — new
+            // words and flags alike — so no unquoted expansion reads,
+            // while the quoted exit-code echo above still does.
+            "echo $HOME $USER",
+            "find ./sandbox $ACTION",
+            // xxd's second positional is its own output operand — the
+            // hex dump's file — so one file argument is all it keeps.
+            "xxd input.bin victim.hex",
+            "cargo fmt && xxd input.bin victim.hex",
             "cat x | less -O/tmp/leak",
             "cat x | less -XO /tmp/leak",
             "cat x | less -NSO /tmp/leak notes.txt",
