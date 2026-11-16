@@ -273,7 +273,7 @@ While a permission prompt is on screen (see
 | `Enter` | Swallowed — a queued submit press never lands as an approval |
 | `n` / `Esc` | Deny it |
 | `e` | Expand the command preview to its whole wrap (tail kept — the destructive suffix a three-row head can hide), and back; the hints name the press when the wrap truncates |
-| `Ctrl-C` | Serves the exit ladder as ever — a draft clears first; it cancels nothing, and the run's cancel is Esc's double press, which Esc here cannot serve (this sheet owns it) |
+| `Ctrl-C` | Denies the pending ask, exactly as `Esc` — the hint's "esc or ctrl+c cancels" is this press, not the exit ladder, which stands down while the sheet owns the keyboard; the run's own cancel chord (Esc, Esc) cannot be served here either, for the same reason |
 
 ### Waiting prompts
 
@@ -475,7 +475,16 @@ Remembered rules persist to the session's `permissions.json` and ride a
 resume; `/permissions` lists configured rules, the allow list, and the
 deny list, and `/permissions forget <n>` takes a remembered rule out of
 the memory and the file in one motion, so that work asks again the next
-time.
+time; `/permissions forget all` is the same motion over every
+remembered rule at once. `/permissions repair` clears a standing damage
+verdict: when a
+session's permissions file was unreadable, the session runs failed
+closed — side effects ask, and configured `allow` rules stay
+suspended — until this command names the recovery, or the session
+itself ends: a `/clear` rotation and a resume into a healthy session
+adopt a fresh memory and put the config layer back as written (the
+re-answers made along the way are kept; they never clear the posture
+themselves).
 
 Named presets make the session's choices reusable:
 

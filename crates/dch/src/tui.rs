@@ -308,7 +308,8 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
     let (transcript_handle, transcript_worker) = TranscriptWorker::spawn(saver);
     let initial_transcript = transcript_handle.clone();
     let permission_restore = wire_permission_memory(&permission_memory, &initial_transcript);
-    if permission_restore.is_damaged() {
+    if permission_restore.damage_stands() {
+        permission_memory.mark_damaged();
         fail_permission_restore_closed_at_startup(
             &mut app,
             &mut driver_config,
@@ -1365,12 +1366,12 @@ fn wire_permission_memory(
     let (allow, deny) = restored.clone().into_lists();
     memory.adopt(allow, deny);
     let persist_cell = Arc::clone(&transcript.saver);
-    memory.persist_through(Arc::new(move |allow, deny| {
+    memory.persist_through(Arc::new(move |allow, deny, damaged| {
         let saver = persist_cell
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        if let Err(why) = saver.save_permissions(allow, deny) {
+        if let Err(why) = saver.save_permissions(allow, deny, damaged) {
             tracing::warn!(error = %why, "remembered permissions could not be saved");
         }
     }));
@@ -1412,14 +1413,36 @@ fn fail_permissions_restore_closed(cell: &dch_config::SharedPermissionMode) -> b
 /// have balanced it gone. The projection drops the `allow` rules
 /// (the loosening half) and keeps `deny` and `ask` (the tightening
 /// half, which never made anything run), so every side-effecting
-/// call asks until the session re-answers or a `/preset` re-seeds
-/// the config layer. The cell is the live view the policy re-reads
-/// per evaluation, so the projection reaches the very next dispatch
-/// and survives every runner rebuild.
+/// call asks until the verdict the projection was keyed to clears:
+/// `/permissions repair` naming the recovery, a `/preset` re-seeding
+/// the config layer, or a fresh adoption undoing the projection
+/// ([`reseed_config_rules_cell`]). The cell is the live view the
+/// policy re-reads per evaluation, so the projection reaches the very
+/// next dispatch and survives every runner rebuild.
 fn tighten_config_rules_cell(cell: &std::sync::Arc<std::sync::Mutex<Vec<dch_permissions::Rule>>>) {
     cell.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .retain(|rule| rule.outcome != dch_permissions::PermissionOutcome::Allow);
+}
+
+/// Re-seed the config-rules cell from the configuration's own join.
+///
+/// The recovery half of the damage posture and the exact call
+/// `/permissions repair` makes: the cell returns to the rules the
+/// configuration compiles today — the same join that seeded it at
+/// startup. Every fresh adoption clears the damage verdict
+/// [`tighten_config_rules_cell`] was keyed to, so each re-seeds the
+/// cell beside the adoption: the earned-fresh arm of a `/clear` and
+/// the healthy arm of a resume both leave a posture that belongs to
+/// no standing session, the configuration in force exactly as
+/// written.
+fn reseed_config_rules_cell(
+    cell: &std::sync::Arc<std::sync::Mutex<Vec<dch_permissions::Rule>>>,
+    config: &dch_config::DchConfig,
+) {
+    cell.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone_from(&dch_loop::config_rules(config));
 }
 
 /// Fail a damaged permissions restore closed at startup, on every
@@ -1432,10 +1455,13 @@ fn tighten_config_rules_cell(cell: &std::sync::Arc<std::sync::Mutex<Vec<dch_perm
 /// back to this value, never to the standing auto — the config-rules
 /// cell is projected onto its tightening half so no configured allow
 /// covers the ask, the display is told the enforced mode, and the
-/// notice names the recovery. Each lever matters alone: the move
-/// without the projection would let a config allow run what the
-/// notice says asks, and the move without the retained config would
-/// let one failed rebuild restore auto.
+/// damage is said as a transient notice: the announcement is a
+/// status, not conversation history — the durable record is the
+/// marker inside the permissions file, and `/permissions` restates
+/// the posture on demand. Each lever matters alone: the move without
+/// the projection would let a config allow run what the notice says
+/// asks, and the move without the retained config would let one
+/// failed rebuild restore auto.
 fn fail_permission_restore_closed_at_startup(
     app: &mut dch_tui::TuiApp,
     driver_config: &mut dch_config::DchConfig,
@@ -1457,9 +1483,10 @@ fn fail_permission_restore_closed_at_startup(
         tracing::warn!("damage posture published but the display is gone");
     }
     app.post_notice(
-        "the saved permissions for this session are damaged — remembered \
-         always/deny rules are gone, and side effects ask until they are \
-         re-answered"
+        "the saved permissions are damaged — remembered rules were dropped; \
+         side effects ask, and the configured rules stay tightened, until \
+         /permissions repair (the damage marker rides inside the permissions \
+         file — hand-fixing the file leaves it standing)"
             .to_string(),
     );
 }
@@ -3024,9 +3051,10 @@ async fn resume_into_session(
         context.config.runner.permission_mode = enforced_mode;
         post_session_notice(
             session_tx,
-            "the saved permissions for this session are damaged — remembered \
-             always/deny rules are gone, and side effects ask until they are \
-             re-answered"
+            "the saved permissions are damaged — remembered rules were dropped; \
+             side effects ask, and the configured rules stay tightened, until \
+             /permissions repair (the damage marker rides inside the permissions \
+             file — hand-fixing the file leaves it standing)"
                 .to_string(),
         );
     }
@@ -3060,9 +3088,13 @@ async fn resume_into_session(
 /// nothing *and* moves both levers of the fallback — the shared cell
 /// to the asking posture where the session would run `auto`, and the
 /// config-rules cell onto its tightening half, because a configured
-/// allow would otherwise cover the ask. Returns the mode the resumed
-/// display should publish beside the damage verdict, so the caller
-/// can retain the enforced mode and say the damage aloud.
+/// allow would otherwise cover the ask. A healthy verdict moves the
+/// same cell the other way: the adoption replaces the memory
+/// wholesale — verdict included — so the cell re-seeds from the
+/// configuration's own join, and a damage posture an earlier resume
+/// armed cannot outlive the verdict that keyed it. Returns the mode
+/// the resumed display should publish beside the damage verdict, so
+/// the caller can retain the enforced mode and say the damage aloud.
 fn adopt_resumed_permissions(
     transcript: &TranscriptHandle,
     context: &mut DriverContext,
@@ -3073,21 +3105,24 @@ fn adopt_resumed_permissions(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .load_permissions();
-    let damaged = restored.is_damaged();
+    let damage_stands = restored.damage_stands();
     let (allow, deny) = restored.into_lists();
     context.lanes.memory.adopt(allow, deny);
-    let enforced_mode = if damaged && fail_permissions_restore_closed(&context.lanes.mode_cell) {
-        dch_config::PermissionMode::Interactive
-    } else {
-        standing_mode
-    };
-    if damaged {
-        // The fallback's other half: the engine consults the config
-        // layer ahead of the matrix, so a configured allow would
-        // cover the asking posture the cell just moved to.
-        tighten_config_rules_cell(&context.lanes.config_rules_cell);
+    if damage_stands {
+        context.lanes.memory.mark_damaged();
     }
-    (enforced_mode, damaged)
+    let enforced_mode =
+        if damage_stands && fail_permissions_restore_closed(&context.lanes.mode_cell) {
+            dch_config::PermissionMode::Interactive
+        } else {
+            standing_mode
+        };
+    if damage_stands {
+        tighten_config_rules_cell(&context.lanes.config_rules_cell);
+    } else {
+        reseed_config_rules_cell(&context.lanes.config_rules_cell, &context.config);
+    }
+    (enforced_mode, damage_stands)
 }
 
 /// Whether a `/clear` may rotate onto a fresh session, given the
@@ -3111,7 +3146,12 @@ fn rewind_earned_fresh_session<E>(rewind: &Result<usize, E>) -> bool {
 /// a refused rewind rotates nothing, publishes nothing, and names the
 /// failure on the notice lane so the ended session — same id, same
 /// file — visibly stands. A rewind that merely had nothing to remove
-/// still emptied the history and still earns the rotation.
+/// still emptied the history and still earns the rotation. The
+/// rotation is also the damage posture's end: the fresh adoption
+/// clears the verdict, and the config-rules cell re-seeds from the
+/// configuration's own join beside it, so the ended session's
+/// fail-closed posture cannot withdraw the config's allows from the
+/// fresh one.
 fn land_session_clear<E: std::fmt::Display>(
     rewind: Result<usize, E>,
     transcript: &TranscriptHandle,
@@ -3128,6 +3168,7 @@ fn land_session_clear<E: std::fmt::Display>(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = default;
         context.lanes.memory.adopt(Vec::new(), Vec::new());
+        reseed_config_rules_cell(&context.lanes.config_rules_cell, &context.config);
         if session_tx.send(SessionUpdate::SessionId { id }).is_err() {
             tracing::warn!("session cleared but the display is gone");
         }
@@ -3751,15 +3792,11 @@ mod tests {
         let request = requests_rx.recv().await.expect("the live-case ask crosses");
         assert_eq!(
             request.always,
-            vec![
-                PermissionRule::ShellPrefix {
-                    prefix: "cargo build".to_string()
-                },
-                PermissionRule::ShellPrefix {
-                    prefix: "tail".to_string()
-                },
-            ],
-            "the allow derivation mints every segment"
+            vec![PermissionRule::ShellPrefix {
+                prefix: "cargo build".to_string()
+            },],
+            "the allow derivation mints every *writer* segment — the reader \
+             tail is part of no answer, on either side of the sheet"
         );
         assert_eq!(
             request.never,
@@ -6337,6 +6374,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_clear_after_damage_reseeds_the_config_rules_with_the_verdict() {
+        // The round-4 lifecycle case: a damaged restore tightened the
+        // config-rules cell, and `/clear` adopts a fresh memory —
+        // clearing the verdict the tightening was keyed to. The
+        // rotation re-seeds the cell from the configuration's own
+        // join, so the fresh session runs the config's allows as
+        // written instead of inheriting a withdrawn layer whose one
+        // door — `/permissions repair` — now answers "nothing to
+        // repair" against the cleared verdict.
+        let dir = tempfile::tempdir().expect("sessions tempdir");
+        let id = uuid::Uuid::new_v4();
+        let saver = Arc::new(crate::session::SessionSaver::with_base_dir(
+            id,
+            "m".to_string(),
+            dir.path().to_path_buf(),
+        ));
+        let (handle, worker) = TranscriptWorker::spawn(Arc::clone(&saver));
+        let (session_tx, _session_rx) = mpsc::unbounded_channel();
+        let mut config = dch_config::DchConfig::default();
+        config.permissions.rules = vec![dch_config::PermissionRuleConfig {
+            id: Some("allow-bash".to_string()),
+            outcome: dch_config::PermissionRuleOutcome::Allow,
+            tool: Some("Bash".to_string()),
+            shell_prefix: None,
+            path_glob: None,
+        }];
+        let mut context = DriverContext {
+            config: config.clone(),
+            config_base: Arc::new(dch_config::DchConfig::default()),
+            workdir: std::path::PathBuf::from("."),
+            sessions_root: dir.path().to_path_buf(),
+            state: TuiObserverState::new().into_observer().1,
+            shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            lanes: InteractiveLanes::detached(),
+            overrides: RunOverrides::default(),
+        };
+        // The startup join seeds the cell; a damaged restore projects
+        // it onto its tightening half — the posture the rotation must
+        // not leave behind.
+        *context
+            .lanes
+            .config_rules_cell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = dch_loop::config_rules(&config);
+        context.lanes.memory.mark_damaged();
+        tighten_config_rules_cell(&context.lanes.config_rules_cell);
+        assert!(
+            context.lanes.memory.damage_standing(),
+            "the damage verdict stands before the clear"
+        );
+        assert!(
+            context
+                .lanes
+                .config_rules_cell
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .all(|rule| rule.outcome != dch_permissions::PermissionOutcome::Allow),
+            "the damage posture withdraws the configured allow"
+        );
+
+        land_session_clear::<loopctl::error::LoopError>(
+            Ok(2_usize),
+            &handle,
+            &session_tx,
+            &mut context,
+        );
+
+        assert!(
+            !context.lanes.memory.damage_standing(),
+            "the fresh adoption clears the verdict the repair door reads"
+        );
+        assert_eq!(
+            context
+                .lanes
+                .config_rules_cell
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+            dch_loop::config_rules(&config),
+            "the cell returns to the configuration's own join — the tightening \
+             died with the verdict, not with a repair that can no longer fire"
+        );
+        worker.join();
+    }
+
+    #[tokio::test]
     async fn a_cleared_session_starts_with_no_remembered_rules() {
         // The memory is session state: the ended session answered
         // "allow always" on `cargo test` and "always deny" on a
@@ -7115,6 +7239,7 @@ mod tests {
                         prefix: prefix.to_string(),
                     }],
                     &[],
+                    false,
                 )
                 .expect("the remembered pair saves");
         }
@@ -7198,6 +7323,7 @@ mod tests {
                 &[dch_tui::PermissionRule::ShellPrefix {
                     prefix: "cargo publish".to_string(),
                 }],
+                false,
             )
             .expect("the deny saves");
         let path = root.join(b.to_string()).join("permissions.json");
@@ -7316,6 +7442,299 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_healthy_resume_after_damage_returns_the_config_rules_with_the_verdict() {
+        // The round-4 lifecycle case on the resume lane: the damaged
+        // session's restore tightened the config-rules cell, and the
+        // healthy session adopted after it replaces the memory —
+        // verdict included. The healthy adoption re-seeds the cell
+        // from the configuration's own join, so the damage posture
+        // cannot outlive the verdict that keyed it: the config's
+        // allows are in force for the healthy session, and the
+        // repair door the posture left standing now answers
+        // "nothing to repair".
+        let dir = tempfile::tempdir().expect("sessions tempdir");
+        let root = dir.keep();
+        let b = uuid::Uuid::new_v4();
+        let damaged_saver =
+            crate::session::SessionSaver::with_base_dir(b, "test-model".to_string(), root.clone());
+        damaged_saver
+            .save_at(
+                &[dch_tui::TuiMessage::User {
+                    text: "the damaged session's turn".to_string(),
+                    timestamp: chrono::Utc::now(),
+                    steered: false,
+                    unsent: false,
+                }],
+                crate::session::SessionTokens::default(),
+                chrono::Utc::now(),
+            )
+            .expect("the damaged session lands");
+        damaged_saver
+            .save_permissions(&[], &[], false)
+            .expect("the intact sibling saves");
+        let damaged_path = root.join(b.to_string()).join("permissions.json");
+        let intact = std::fs::read_to_string(&damaged_path).expect("the sibling reads");
+        let cut = intact.len().saturating_sub(3);
+        std::fs::write(&damaged_path, intact.get(..cut).unwrap_or(""))
+            .expect("the damaged sibling writes");
+        let c = uuid::Uuid::new_v4();
+        let healthy_saver =
+            crate::session::SessionSaver::with_base_dir(c, "test-model".to_string(), root.clone());
+        healthy_saver
+            .save_at(
+                &[dch_tui::TuiMessage::User {
+                    text: "the healthy session's turn".to_string(),
+                    timestamp: chrono::Utc::now(),
+                    steered: false,
+                    unsent: false,
+                }],
+                crate::session::SessionTokens::default(),
+                chrono::Utc::now(),
+            )
+            .expect("the healthy session lands");
+        healthy_saver
+            .save_permissions(
+                &[dch_tui::PermissionRule::ShellPrefix {
+                    prefix: "cargo build".to_string(),
+                }],
+                &[],
+                false,
+            )
+            .expect("the healthy sibling saves");
+        let mut runner = unreachable_runner().await;
+        let (_, state) = TuiObserverState::new().into_observer();
+        let (session_tx, _session_rx) = mpsc::unbounded_channel();
+        let mut config = unreachable_config();
+        config.permissions.rules = vec![dch_config::PermissionRuleConfig {
+            id: Some("allow-bash".to_string()),
+            outcome: dch_config::PermissionRuleOutcome::Allow,
+            tool: Some("Bash".to_string()),
+            shell_prefix: None,
+            path_glob: None,
+        }];
+        let mut context = DriverContext {
+            config: config.clone(),
+            config_base: std::sync::Arc::new(unreachable_config()),
+            workdir: std::path::PathBuf::from("."),
+            sessions_root: root.clone(),
+            state,
+            shutting_down: shutdown_flag(false),
+            lanes: InteractiveLanes::detached(),
+            overrides: RunOverrides::default(),
+        };
+        // The startup join seeds the cell before the damaged resume
+        // projects it onto its tightening half.
+        *context
+            .lanes
+            .config_rules_cell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = dch_loop::config_rules(&config);
+        let parked_saver = Arc::new(crate::session::SessionSaver::with_base_dir(
+            uuid::Uuid::new_v4(),
+            "m".to_string(),
+            root.clone(),
+        ));
+        let (transcript, _worker) = TranscriptWorker::spawn(parked_saver);
+        apply_session_command(
+            &mut runner,
+            &transcript,
+            &session_tx,
+            SessionCommand::Resume { id: b.to_string() },
+            &mut context,
+        )
+        .await;
+        assert!(
+            context.lanes.memory.damage_standing(),
+            "the damaged resume arms the posture"
+        );
+        assert!(
+            context
+                .lanes
+                .config_rules_cell
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .all(|rule| rule.outcome != dch_permissions::PermissionOutcome::Allow),
+            "the damaged restore withdraws the configured allow"
+        );
+
+        apply_session_command(
+            &mut runner,
+            &transcript,
+            &session_tx,
+            SessionCommand::Resume { id: c.to_string() },
+            &mut context,
+        )
+        .await;
+
+        assert!(
+            !context.lanes.memory.damage_standing(),
+            "the healthy adoption replaces the verdict wholesale"
+        );
+        assert_eq!(
+            context
+                .lanes
+                .config_rules_cell
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+            dch_loop::config_rules(&config),
+            "the healthy resume returns the cell to the configuration's own join — \
+             the earlier damage cannot withdraw the config layer from this session"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_standing_damage_marker_re_arms_the_resume_and_rides_the_saves() {
+        // The relaunch laundering hole, closed end to end: the saved
+        // file carries the marker beside its re-answers, the resume
+        // restores the re-answers *and* re-arms the posture — the mode
+        // cell off auto, the configured allows tightened, the retained
+        // config named, the marker standing on the memory — and the
+        // very next remembered answer saves a file that still says
+        // damaged. The restriction cannot evaporate across a
+        // save/relaunch; only `/permissions repair` clears it.
+        let dir = tempfile::tempdir().expect("sessions tempdir");
+        let root = dir.keep();
+        let b = uuid::Uuid::new_v4();
+        let saver =
+            crate::session::SessionSaver::with_base_dir(b, "test-model".to_string(), root.clone());
+        saver
+            .save_at(
+                &[dch_tui::TuiMessage::User {
+                    text: "the saved turn".to_string(),
+                    timestamp: chrono::Utc::now(),
+                    steered: false,
+                    unsent: false,
+                }],
+                crate::session::SessionTokens::default(),
+                chrono::Utc::now(),
+            )
+            .expect("the saved session lands");
+        // The file a damaged-then-reanswered session writes: real
+        // re-answers, marker standing.
+        saver
+            .save_permissions(
+                &[dch_tui::PermissionRule::ShellPrefix {
+                    prefix: "cargo test".to_string(),
+                }],
+                &[],
+                true,
+            )
+            .expect("the marked pair saves");
+        let mut runner = unreachable_runner().await;
+        let (_, state) = TuiObserverState::new().into_observer();
+        let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+        let mut context = DriverContext {
+            config: unreachable_config(),
+            config_base: std::sync::Arc::new(unreachable_config()),
+            workdir: std::path::PathBuf::from("."),
+            sessions_root: root.clone(),
+            state,
+            shutting_down: shutdown_flag(false),
+            lanes: InteractiveLanes::detached(),
+            overrides: RunOverrides::default(),
+        };
+        *context
+            .lanes
+            .config_rules_cell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = vec![
+            dch_permissions::Rule {
+                id: "allow-bash".to_string(),
+                outcome: dch_permissions::PermissionOutcome::Allow,
+                matcher: dch_permissions::Matcher::Tool("Bash".to_string()),
+            },
+            dch_permissions::Rule {
+                id: "deny-env".to_string(),
+                outcome: dch_permissions::PermissionOutcome::Block,
+                matcher: dch_permissions::Matcher::Tool("Write".to_string()),
+            },
+        ];
+        // The write-through a real session's wiring installs, so the
+        // anti-laundering half runs against the file on disk.
+        let hook_saver =
+            crate::session::SessionSaver::with_base_dir(b, "test-model".to_string(), root.clone());
+        context.lanes.memory.persist_through(Arc::new(
+            move |allow: &[dch_tui::PermissionRule],
+                  deny: &[dch_tui::PermissionRule],
+                  damaged: bool| {
+                let _ = hook_saver.save_permissions(allow, deny, damaged);
+            },
+        ));
+        let parked_saver = Arc::new(crate::session::SessionSaver::with_base_dir(
+            uuid::Uuid::new_v4(),
+            "m".to_string(),
+            root.clone(),
+        ));
+        let (transcript, _worker) = TranscriptWorker::spawn(parked_saver);
+        apply_session_command(
+            &mut runner,
+            &transcript,
+            &session_tx,
+            SessionCommand::Resume { id: b.to_string() },
+            &mut context,
+        )
+        .await;
+        assert_eq!(
+            context.lanes.memory.allow_rules(),
+            vec![dch_tui::PermissionRule::ShellPrefix {
+                prefix: "cargo test".to_string()
+            }],
+            "the re-answers restore — they are real choices the session keeps"
+        );
+        assert!(
+            context.lanes.memory.damage_standing(),
+            "the marker re-arms with the resume"
+        );
+        assert_eq!(
+            *context
+                .lanes
+                .mode_cell
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            dch_config::PermissionMode::Interactive,
+            "the standing auto still fails closed to the asking posture"
+        );
+        assert_eq!(
+            context.config.runner.permission_mode,
+            dch_config::PermissionMode::Interactive,
+            "the retained config names the enforced mode"
+        );
+        let remaining = context
+            .lanes
+            .config_rules_cell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(
+            remaining
+                .iter()
+                .all(|rule| rule.outcome != dch_permissions::PermissionOutcome::Allow),
+            "the configured allows stay tightened under the standing marker: {remaining:?}"
+        );
+        // The laundering attempt itself: the next remembered answer
+        // saves, and the file it writes still says damaged.
+        context
+            .lanes
+            .memory
+            .remember_rules(&[dch_tui::PermissionRule::ShellPrefix {
+                prefix: "cargo fmt".to_string(),
+            }]);
+        let raw = std::fs::read_to_string(root.join(b.to_string()).join("permissions.json"))
+            .expect("the write-through fired");
+        assert!(
+            raw.contains("\"damaged\":true"),
+            "the save cannot launder the marker away: {raw}"
+        );
+        assert!(
+            raw.contains("cargo fmt"),
+            "the re-answer itself did land: {raw}"
+        );
+        let _ = session_rx.recv().await;
+    }
+
     #[test]
     fn the_damage_projection_keeps_only_tightening_rules() {
         // The projection half of the damaged fallback: allow rules go
@@ -7418,6 +7837,13 @@ mod tests {
                 mode: dch_config::PermissionMode::Interactive
             }),
             "the display is told the enforced mode"
+        );
+        assert!(
+            app.conversation()
+                .iter()
+                .all(|message| !matches!(message, dch_tui::TuiMessage::System { text, .. } if text.contains("damaged"))),
+            "the announcement is a transient notice, not a transcript row — nothing \
+             accumulates across reopens; the durable record is the file's marker"
         );
     }
 

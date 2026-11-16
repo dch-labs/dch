@@ -354,8 +354,16 @@ fn scan_command(command: &str) -> Scan {
                     if let Some(escaped) = chars.next() {
                         if escaped == '\n' {
                             // bash removes the pair: the word continues
-                            // across the break, whole and unwrapped
+                            // across the break, whole and unwrapped — a
+                            // continuation, never quoting
                             continue;
+                        }
+                        if matches!(scan.heredoc, HeredocPhase::AwaitingDelimiter { .. }) {
+                            // A backslash quoting a delimiter character
+                            // makes the body literal exactly as an explicit
+                            // quote does; only the pair with a newline is
+                            // a continuation, never quoting.
+                            scan.heredoc_delimiter_quoted = true;
                         }
                         scan.word.push(escaped);
                     }
@@ -536,7 +544,7 @@ impl Scan {
     /// marks are literal here — nothing arms inside a body.
     fn heredoc_body(&mut self, current: char) {
         if current == '\n' {
-            if !self.heredoc_delimiter_quoted && self.word.ends_with('\\') {
+            if !self.heredoc_delimiter_quoted && trailing_backslash_run_is_odd(&self.word) {
                 self.word.pop();
                 return;
             }
@@ -680,6 +688,18 @@ impl Scan {
             },
         }
     }
+}
+
+/// Whether an unquoted heredoc body line's trailing backslash run
+/// has odd length.
+///
+/// bash pairs backslashes inside an unquoted heredoc body: a lone
+/// trailing backslash — an unpaired one, the odd run — continues the
+/// line onto the next, while a pair leaves a literal backslash at
+/// the line's end and the newline stands as the line's own. Only the
+/// odd run is the continuation; the even run is text.
+fn trailing_backslash_run_is_odd(line: &str) -> bool {
+    line.chars().rev().take_while(|ch| *ch == '\\').count() & 1 == 1
 }
 
 /// The quote state a shell word scan carries.
@@ -1344,6 +1364,24 @@ mod tests {
             Vec::<String>::new(),
             "a double-quoted delimiter's body is literal too — quoting any
              part of the word makes the body verbatim"
+        );
+        // A backslash quoting a delimiter character is the same
+        // literalism by another spelling: `<<\EOF` reads its body as
+        // verbatim as `<<'EOF'`, so the `EOF\` line is body text and
+        // the bare `EOF` after it terminates — the redirect beyond is
+        // a real target.
+        assert_eq!(
+            redirect_targets("cat <<\\EOF\nbody\nEOF\\\nEOF\nprintf x > env.conf"),
+            vec!["env.conf".to_string()],
+            "a backslash-quoted delimiter's body is literal — no join, the bare line ends it"
+        );
+        // Backslash runs pair up: a trailing pair is a literal
+        // backslash at the line's end, the newline stands, and only an
+        // odd (unpaired) run continues the line.
+        assert_eq!(
+            redirect_targets("cat <<EOF\nbody\n\\\\\nEOF\nprintf x > env.conf"),
+            vec!["env.conf".to_string()],
+            "a paired trailing backslash is text — the newline stands, the bare EOF terminates"
         );
     }
 

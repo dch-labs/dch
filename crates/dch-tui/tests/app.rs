@@ -13884,6 +13884,388 @@ fn an_unset_of_permission_mode_restores_the_live_session_mode_not_the_file_s() {
 }
 
 #[test]
+fn a_permissions_listing_names_the_standing_damage() {
+    // The listing is the damage posture's durable surface: while the
+    // verdict stands, every `/permissions` leads with the damage row
+    // — and the all-empty case shows the damage instead of reading
+    // as a healthy blank, because the damage is why nothing is
+    // remembered.
+    use dch_tui::commands::Command;
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    let memory = dch_tui::queue::PermissionMemory::default();
+    memory.mark_damaged();
+    app.set_permission_memory(memory);
+    app.run_command(Command::Permissions { forget: None });
+    let rows: Vec<String> = app
+        .conversation()
+        .iter()
+        .filter_map(|message| match message {
+            dch_tui::TuiMessage::System { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        rows.iter().any(|text| text.contains("damaged")),
+        "the damaged empty listing leads with the damage row: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|text| text.contains("/permissions repair")),
+        "the row names the one command that clears it: {rows:?}"
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|text| text.contains("no permission rules in force")),
+        "an empty listing under damage is not a healthy blank: {rows:?}"
+    );
+}
+
+#[test]
+fn a_resumed_session_under_damage_writes_no_damage_row() {
+    // The adoption half: the driver marks the shared memory before
+    // publishing the resume, and the announcement arrives as the
+    // driver's transient notice — the adoption itself writes no
+    // transcript row, so repeated reopens cannot accumulate damage
+    // rows in the conversation; `/permissions` is the on-demand
+    // restatement, and the file's marker is the one durable record.
+    let (mut app, _kept) = app_with_state();
+    let memory = dch_tui::queue::PermissionMemory::default();
+    memory.mark_damaged();
+    app.set_permission_memory(memory);
+    app.apply_session_update(dch_tui::queue::SessionUpdate::Resumed {
+        id: "22222222-2222-2222-2222-222222222222".to_string(),
+        transcript: Vec::new(),
+        tokens: dch_tui::queue::ResumedTokens {
+            cumulative_input: 0,
+            cumulative_output: 0,
+            last_input: 0,
+            context_tokens: 0,
+        },
+        permission_mode: dch_config::PermissionMode::Interactive,
+    });
+    assert!(
+        app.conversation()
+            .iter()
+            .all(|message| !matches!(message, dch_tui::TuiMessage::System { text, .. } if text.contains("damaged"))),
+        "the adoption writes no damage row — the notice is transient, nothing accumulates"
+    );
+}
+
+#[test]
+fn the_permission_hint_names_esc_as_a_cancel_and_esc_denies() {
+    // The hint's claim, made honest both ways: the sheet says "esc or
+    // ctrl+c cancels", and Esc really does resolve the ask as a
+    // refusal — the same DenyOnce as n and ctrl+c, so the key the
+    // hint names is the key that works.
+    let (mut app, _kept) = app_with_state();
+    let (requests_tx, requests_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (reply, mut reply_rx) = tokio::sync::oneshot::channel();
+    requests_tx
+        .send(dch_tui::PermissionRequest {
+            tool_name: "Bash".to_string(),
+            prompt: "allow bash?".to_string(),
+            input: serde_json::Value::Null,
+            always: Vec::new(),
+            never: Vec::new(),
+            reply,
+        })
+        .expect("receiver alive");
+    app.set_permission_requests(requests_rx);
+    app.poll_permission_requests();
+
+    let sheet = row_texts(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        sheet
+            .iter()
+            .any(|row| row.contains("esc or ctrl+c cancels")),
+        "the hint names esc beside ctrl+c: {sheet:?}"
+    );
+    assert!(
+        app.handle_event(&plain(KeyCode::Esc)),
+        "Esc answers the ask"
+    );
+    assert_eq!(
+        reply_rx.try_recv(),
+        Ok(loopctl::middleware::PermissionResolution::DenyOnce),
+        "Esc denies — the ask is cancelled, exactly as the hint promises"
+    );
+}
+
+#[test]
+fn a_forget_all_sweeps_every_remembered_rule() {
+    // The sweep, end to end: the receipt names the count, the memory
+    // holds nothing remembered afterwards, the write-through fires
+    // with the emptiness, and an empty memory's sweep says so instead
+    // of pretending a removal happened.
+    use dch_tui::commands::Command;
+    let (mut app, _kept) = app_with_state();
+    let memory = dch_tui::queue::PermissionMemory::default();
+    let writes: std::sync::Arc<std::sync::Mutex<Vec<(usize, usize)>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    memory.remember_rules(&[
+        dch_tui::queue::PermissionRule::ShellPrefix {
+            prefix: "cargo test".to_string(),
+        },
+        dch_tui::queue::PermissionRule::ShellPrefix {
+            prefix: "cargo build".to_string(),
+        },
+    ]);
+    memory.remember_deny(&[dch_tui::queue::PermissionRule::ShellPrefix {
+        prefix: "cargo publish".to_string(),
+    }]);
+    // The sink installs after the seeding remembers, so only the
+    // sweep's own write-through is what it counts.
+    let sink = std::sync::Arc::clone(&writes);
+    memory.persist_through(std::sync::Arc::new(
+        move |allow: &[dch_tui::queue::PermissionRule],
+              deny: &[dch_tui::queue::PermissionRule],
+              _damaged: bool| {
+            sink.lock().unwrap().push((allow.len(), deny.len()));
+        },
+    ));
+    app.set_permission_memory(memory);
+    app.run_command(Command::Permissions {
+        forget: Some("forget all".to_string()),
+    });
+    let rows: Vec<String> = app
+        .conversation()
+        .iter()
+        .filter_map(|message| match message {
+            dch_tui::TuiMessage::System { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        rows.iter()
+            .any(|text| text.starts_with("Forgot all 3 remembered rules")),
+        "the receipt names the swept count: {rows:?}"
+    );
+    assert_eq!(
+        writes.lock().unwrap().as_slice(),
+        &[(0, 0)],
+        "the write-through fired once with the emptiness"
+    );
+    app.run_command(Command::Permissions { forget: None });
+    let after: Vec<String> = app
+        .conversation()
+        .iter()
+        .filter_map(|message| match message {
+            dch_tui::TuiMessage::System { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !after
+            .iter()
+            .any(|text| text.contains("every future") || text.contains("the exact command")),
+        "the post-sweep listing remembers nothing: {after:?}"
+    );
+    // The empty memory's sweep says so rather than recording a
+    // no-op removal.
+    app.run_command(Command::Permissions {
+        forget: Some("forget all".to_string()),
+    });
+    let notice_rows = row_texts(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        notice_rows
+            .iter()
+            .any(|row| row.contains("nothing remembered to forget")),
+        "the empty sweep is refused with a reason: {notice_rows:?}"
+    );
+}
+
+#[test]
+fn a_mode_override_dies_with_the_session_it_was_recorded_in() {
+    // The override ledger is session state: an override recorded in
+    // session A must not reach into a session B adopted over it, nor
+    // into the fresh session a `/clear` opens — B's `/unset
+    // permission_mode` has nothing to undo, and A's original must not
+    // become B's mode. Both session switches sweep the entry.
+    use dch_tui::commands::Command;
+    let (mut app, _kept) = app_with_state();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    app.set_submit_tx(tx);
+    let cell = std::sync::Arc::new(std::sync::Mutex::new(dch_config::PermissionMode::Auto));
+    app.set_permission_mode_cell(Some(std::sync::Arc::clone(&cell)));
+
+    // Session A overrides its mode; the ledger records A's original.
+    app.run_command(Command::Mode {
+        name: Some("read_only".to_string()),
+    });
+    while rx.try_recv().is_ok() {
+        // A's own live move rides the channel; nothing after it may.
+    }
+    // Session B is adopted live, running Interactive — the driver has
+    // already moved the cell when the Resumed update publishes it.
+    app.apply_session_update(dch_tui::queue::SessionUpdate::Resumed {
+        id: "22222222-2222-2222-2222-222222222222".to_string(),
+        transcript: Vec::new(),
+        tokens: dch_tui::queue::ResumedTokens {
+            cumulative_input: 0,
+            cumulative_output: 0,
+            last_input: 0,
+            context_tokens: 0,
+        },
+        permission_mode: dch_config::PermissionMode::Interactive,
+    });
+    *cell.lock().unwrap() = dch_config::PermissionMode::Interactive;
+    app.run_command(Command::Unset {
+        key: "permission_mode".to_string(),
+    });
+    assert_eq!(
+        *cell.lock().unwrap(),
+        dch_config::PermissionMode::Interactive,
+        "B's unset finds no override — B keeps its own mode, never A's original"
+    );
+    while let Ok(submission) = rx.try_recv() {
+        if let dch_tui::Submission::Command { command } = submission {
+            panic!("no live mode move belongs to an unset with no override: {command:?}");
+        }
+    }
+    let rows = row_texts(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        rows.iter().any(|row| row.contains("no session override")),
+        "the unset says there is nothing to undo — the override died with session A"
+    );
+
+    // The fresh session a `/clear` opens sweeps the entry the same way.
+    app.run_command(Command::Mode {
+        name: Some("read_only".to_string()),
+    });
+    app.run_command(Command::Clear);
+    app.run_command(Command::Unset {
+        key: "permission_mode".to_string(),
+    });
+    let cleared_rows = row_texts(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        cleared_rows
+            .iter()
+            .any(|row| row.contains("no session override")),
+        "the cleared session's unset also finds nothing — the override died with the cleared one"
+    );
+}
+
+#[test]
+fn an_unset_of_permission_mode_never_touches_the_config_file() {
+    // The session-scoped key's unset restores the live value alone: the
+    // file mirrors and the save stay untouched, or the session's mode
+    // would overwrite the file's configured one for every later launch.
+    // Here the file says Interactive and the session runs Auto — the
+    // whole /mode…/unset cycle must leave no trace on disk at all.
+    use dch_tui::commands::Command;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    let mut file = config_with_theme("dracula");
+    file.runner.permission_mode = dch_config::PermissionMode::Interactive;
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    app.set_config_file(file);
+    app.set_config_persist_dir(Some(dir.path().to_path_buf()));
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    app.set_submit_tx(tx);
+    let cell = std::sync::Arc::new(std::sync::Mutex::new(dch_config::PermissionMode::Auto));
+    app.set_permission_mode_cell(Some(std::sync::Arc::clone(&cell)));
+    app.run_command(Command::Mode {
+        name: Some("read_only".to_string()),
+    });
+    app.run_command(Command::Unset {
+        key: "permission_mode".to_string(),
+    });
+    assert_eq!(
+        *cell.lock().unwrap(),
+        dch_config::PermissionMode::Auto,
+        "the session's own value is restored live"
+    );
+    assert!(
+        !dir.path().join("config.toml").exists(),
+        "the session-scoped key never reaches the file — not the mirrors, not the save"
+    );
+}
+
+#[test]
+fn a_permissions_repair_clears_the_marker_and_reseeds_the_config_rules() {
+    // The damage verdict's one door out: `/permissions repair` clears
+    // the standing marker and re-seeds the config-rules cell from the
+    // configuration's own join, so the configured allows return
+    // exactly as written — while a healthy session is told there is
+    // nothing to repair rather than pretending a sweep happened.
+    use dch_tui::commands::Command;
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    let mut config = config_with_theme("dracula");
+    config
+        .permissions
+        .rules
+        .push(dch_config::PermissionRuleConfig {
+            id: None,
+            outcome: dch_config::PermissionRuleOutcome::Allow,
+            tool: Some("WebFetch".to_string()),
+            shell_prefix: None,
+            path_glob: None,
+        });
+    let mut app = TuiApp::from_observer_state(config, kept);
+    let memory = dch_tui::queue::PermissionMemory::default();
+    memory.mark_damaged();
+    let memory_handle = memory.clone();
+    // The repair must reach the file: the sink counts the saves the
+    // press itself fires, verdict and all.
+    let saves: std::sync::Arc<std::sync::Mutex<Vec<(usize, usize, bool)>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = std::sync::Arc::clone(&saves);
+    memory.persist_through(std::sync::Arc::new(
+        move |allow: &[dch_tui::queue::PermissionRule],
+              deny: &[dch_tui::queue::PermissionRule],
+              damaged: bool| {
+            sink.lock()
+                .unwrap()
+                .push((allow.len(), deny.len(), damaged));
+        },
+    ));
+    app.set_permission_memory(memory);
+    let cell = std::sync::Arc::new(std::sync::Mutex::new(Vec::<dch_permissions::Rule>::new()));
+    app.set_permission_config_rules_cell(Some(std::sync::Arc::clone(&cell)));
+    app.run_command(Command::Permissions {
+        forget: Some("repair".to_string()),
+    });
+    assert!(
+        !memory_handle.damage_standing(),
+        "the repair clears the standing marker"
+    );
+    assert_eq!(
+        saves.lock().unwrap().as_slice(),
+        &[(0, 0, false)],
+        "the repair is itself a save — the file is fixed at the press, not on the \
+         next remember: empty lists, verdict cleared"
+    );
+    let rules = cell.lock().unwrap().clone();
+    assert!(
+        rules
+            .iter()
+            .any(|rule| rule.outcome == dch_permissions::PermissionOutcome::Allow),
+        "the config-rules cell re-seeds from the configuration's join — allows return: {rules:?}"
+    );
+    let rows = row_texts(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        rows.iter().any(|row| row.contains("repaired")),
+        "the repair is said aloud: {rows:?}"
+    );
+    // The healthy twin: nothing stands, nothing is swept.
+    app.run_command(Command::Permissions {
+        forget: Some("repair".to_string()),
+    });
+    let again = row_texts(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        again.iter().any(|row| row.contains("nothing to repair")),
+        "a healthy session is told there is nothing to repair: {again:?}"
+    );
+}
+
+#[test]
 fn a_forget_press_numbers_the_listing_it_read_not_the_config_at_press_time() {
     // A `/preset` between the listing and the press changes the
     // configured set; the number the user names must still address

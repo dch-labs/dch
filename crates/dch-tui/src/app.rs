@@ -2821,13 +2821,18 @@ impl TuiApp {
     /// just ended), releases the summary debts the replaced conversation
     /// still owed (their indexes name rows the replacement removes), and
     /// restores the session's token accounting so the counters continue
-    /// the saved session's story instead of restarting at zero.
+    /// the saved session's story instead of restarting at zero. The
+    /// session-scoped mode override dies with the conversation it was
+    /// recorded against: the adopted session's own mode stands, and
+    /// `/unset permission_mode` in it must not resurrect the previous
+    /// session's original.
     fn adopt_resumed_session(
         &mut self,
         id: String,
         transcript: Vec<TuiMessage>,
         tokens: ResumedTokens,
     ) {
+        self.config_overrides.remove("permission_mode");
         self.compaction_summary_owed.clear();
         self.conversation.clear();
         self.seed_messages(transcript);
@@ -3165,27 +3170,58 @@ impl TuiApp {
         }
     }
 
-    /// `/permissions` — the rules in force, and the way to drop one.
+    /// `/permissions` — the rules in force, the way to drop one or
+    /// all, and the damage marker's one door out.
     ///
     /// Bare lists configured and remembered rules, the gate's precedence
     /// order in the listing's own order. `forget <n>` takes the numbered
     /// remembered rule out of the memory and out of the session's
     /// permissions file in one motion, so that work asks again the next
-    /// time; a configured rule is the config file's own text and says so
-    /// instead of pretending it can be dropped here.
+    /// time; `forget all` is the same motion over every remembered rule
+    /// at once. A configured rule is the config file's own text and says
+    /// so instead of pretending it can be dropped here. `repair` clears
+    /// a standing damage verdict — the fail-closed posture a damaged
+    /// restore armed — and re-seeds the config rules as configured.
     fn permissions_command(&mut self, forget: Option<&str>) {
         let Some(requested) = forget else {
             self.post_permissions_listing();
             return;
         };
+        if requested.trim() == "repair" {
+            self.repair_permission_damage();
+            return;
+        }
         let Some(number) = requested.trim().strip_prefix("forget ") else {
             self.post_notice(
-                "usage: /permissions [forget <n>] — n is a remembered rule's number \
-                 from the listing"
+                "usage: /permissions [forget <n> | forget all | repair] — n is a remembered \
+                 rule's number from the listing"
                     .to_string(),
             );
             return;
         };
+        if number.trim() == "all" {
+            let remembered = self
+                .permission_memory
+                .allow_rules()
+                .len()
+                .saturating_add(self.permission_memory.deny_rules().len());
+            if remembered == 0 {
+                self.post_notice(
+                    "nothing remembered to forget — /permissions lists what is recorded"
+                        .to_string(),
+                );
+                return;
+            }
+            self.permission_memory.forget_all();
+            self.push_message(TuiMessage::System {
+                text: format!(
+                    "Forgot all {remembered} remembered rules — that work asks again \
+                     the next time."
+                ),
+                timestamp: chrono::Utc::now(),
+            });
+            return;
+        }
         let Ok(shown) = number.trim().parse::<usize>() else {
             self.post_notice(format!(
                 "{number:?} is not a rule number — /permissions lists what is recorded"
@@ -3231,6 +3267,61 @@ impl TuiApp {
         });
     }
 
+    /// The damage row a `/permissions` listing leads with while the
+    /// verdict stands.
+    ///
+    /// The listing's own restatement of the posture — inspection
+    /// output, shown on demand and never pushed by the session's own
+    /// motion: the launch and adoption announcements are transient
+    /// notices (a status, not conversation history), the durable
+    /// record is the marker inside the permissions file, and this row
+    /// names both the posture and the one command that clears it.
+    fn push_permission_damage_row(&mut self, now: chrono::DateTime<chrono::Utc>) {
+        self.push_message(TuiMessage::System {
+            text: "the saved permissions are damaged — remembered rules were dropped; \
+                   side effects ask, and the configured rules stay tightened, until \
+                   /permissions repair (the damage marker rides inside the permissions \
+                   file — hand-fixing the file leaves it standing)"
+                .to_string(),
+            timestamp: now,
+        });
+    }
+
+    /// `/permissions repair` — the standing damage verdict's one
+    /// door out of the session that earned it.
+    ///
+    /// A damaged restore arms a posture — the asking mode, the
+    /// tightened config rules, the marker that re-arms both on every
+    /// launch and rides every save — and nothing the run does clears
+    /// it: not the re-answers, which record real choices without
+    /// resurrecting the refusals the damage lost. Only the wholesale
+    /// endings do — a `/clear` rotation and a resume into a healthy
+    /// session adopt a fresh memory, and the driver re-seeds the
+    /// config-rules cell beside each, because a posture belongs to
+    /// the session that earned it. Within the damaged session, the
+    /// repair is the explicit recovery the notices name: the marker
+    /// clears, and the config-rules cell re-seeds from the
+    /// configuration's own join, so the configured allows return
+    /// exactly as written. The mode stays where it stands — the
+    /// user's to move with `/mode` as ever, because a posture is not
+    /// a config value.
+    fn repair_permission_damage(&mut self) {
+        if !self.permission_memory.damage_standing() {
+            self.post_notice("nothing to repair — the saved permissions read whole".to_string());
+            return;
+        }
+        self.permission_memory.clear_damage();
+        let rules = self.config.permissions.engine_rules();
+        if let Some(cell) = &self.permission_config_rules_cell {
+            cell.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone_from(&rules);
+        }
+        self.post_notice(
+            "repaired — the configured permission rules are in force again".to_string(),
+        );
+    }
+
     /// Post the `/permissions` listing: configured rules, then the
     /// session's remembered ones, numbered for `forget`.
     fn post_permissions_listing(&mut self) {
@@ -3273,13 +3364,20 @@ impl TuiApp {
             && allowed.is_empty()
             && denied.is_empty()
         {
-            self.push_message(TuiMessage::System {
-                text: "no permission rules in force — an allow-always or deny-always \
-                       answer records one, and [permissions] in the config pre-seeds more"
-                    .to_string(),
-                timestamp: now,
-            });
+            if self.permission_memory.damage_standing() {
+                self.push_permission_damage_row(now);
+            } else {
+                self.push_message(TuiMessage::System {
+                    text: "no permission rules in force — an allow-always or deny-always \
+                           answer records one, and [permissions] in the config pre-seeds more"
+                        .to_string(),
+                    timestamp: now,
+                });
+            }
             return;
+        }
+        if self.permission_memory.damage_standing() {
+            self.push_permission_damage_row(now);
         }
         let configured_lines: Vec<String> = configured
             .iter()
@@ -3565,6 +3663,11 @@ impl TuiApp {
     /// session and in the file alike: the restore writes through, or a
     /// restart would resurrect the override the user just removed. A key
     /// that was never overridden says so rather than quietly rewriting it.
+    /// `permission_mode` is the exception, exactly as on the set side: the
+    /// key is session-scoped, so its unset restores the live value alone —
+    /// the base and file mirrors and the save stay untouched, or the
+    /// session's mode would overwrite the file's configured one for every
+    /// later launch.
     fn unset_config_command(&mut self, key: &str) {
         let Some(original) = self.config_overrides.remove(key) else {
             self.post_notice(format!("{key} has no session override to undo"));
@@ -3579,23 +3682,26 @@ impl TuiApp {
             self.post_notice(format!("could not restore {key}: {why}"));
             return;
         }
-        if let Some(base) = self.config_base.as_mut() {
-            match original.as_deref() {
-                None => {
-                    let _mirror = config_fields::clear(base, key);
-                }
-                Some(value) => {
-                    let _mirror = config_fields::set(base, key, value);
+        let session_scoped = key == "permission_mode";
+        if !session_scoped {
+            if let Some(base) = self.config_base.as_mut() {
+                match original.as_deref() {
+                    None => {
+                        let _mirror = config_fields::clear(base, key);
+                    }
+                    Some(value) => {
+                        let _mirror = config_fields::set(base, key, value);
+                    }
                 }
             }
-        }
-        if let Some(file) = self.config_file.as_mut() {
-            match original.as_deref() {
-                None => {
-                    let _mirror = config_fields::clear(file, key);
-                }
-                Some(value) => {
-                    let _mirror = config_fields::set(file, key, value);
+            if let Some(file) = self.config_file.as_mut() {
+                match original.as_deref() {
+                    None => {
+                        let _mirror = config_fields::clear(file, key);
+                    }
+                    Some(value) => {
+                        let _mirror = config_fields::set(file, key, value);
+                    }
                 }
             }
         }
@@ -3603,7 +3709,9 @@ impl TuiApp {
             self.move_permission_mode_live();
         }
         self.apply_live_config(key);
-        self.persist_config(key);
+        if !session_scoped {
+            self.persist_config(key);
+        }
         let shown = if original.is_none() {
             "unset — an environment credential takes over again".to_string()
         } else if config_fields::is_secret(key) {
@@ -4262,6 +4370,10 @@ impl TuiApp {
             return;
         }
         self.permission_memory.adopt(Vec::new(), Vec::new());
+        // The fresh session owes nothing to the one it replaces: a
+        // mode override recorded against the ended conversation must
+        // not reach into the fresh one's `/unset`.
+        self.config_overrides.remove("permission_mode");
         self.compaction_summary_owed.clear();
         self.latest_todos.clear();
         self.conversation.clear();
@@ -9918,10 +10030,10 @@ impl TuiApp {
         let mut hints = if sheet.reason.is_some() {
             "[enter] deny with this reason · [esc] back to the ask".to_string()
         } else if sheet.more == 0 {
-            "[y] allow · [a] allow always · [d] deny always · [n] deny · [r] deny with a reason · ctrl+c cancels".to_string()
+            "[y] allow · [a] allow always · [d] deny always · [n] deny · [r] deny with a reason · esc or ctrl+c cancels".to_string()
         } else {
             format!(
-                "[y] allow · [a] allow always · [d] deny always · [n] deny · [r] deny with a reason · ctrl+c cancels · {more} more waiting",
+                "[y] allow · [a] allow always · [d] deny always · [n] deny · [r] deny with a reason · esc or ctrl+c cancels · {more} more waiting",
                 more = sheet.more,
             )
         };
@@ -20275,7 +20387,7 @@ mod tests {
         let written: std::sync::Arc<std::sync::Mutex<Ledger>> =
             std::sync::Arc::new(std::sync::Mutex::new(None));
         let ledger = std::sync::Arc::clone(&written);
-        memory.persist_through(std::sync::Arc::new(move |allow, deny| {
+        memory.persist_through(std::sync::Arc::new(move |allow, deny, _damaged: bool| {
             *ledger
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) =
@@ -20433,6 +20545,39 @@ mod tests {
             memory.allow_rules(),
             app.permission_memory.allow_rules(),
             "the app's memory and the seeded copy still agree"
+        );
+    }
+
+    #[test]
+    fn a_repair_after_the_verdict_cleared_says_nothing_to_repair() {
+        // The round-4 lifecycle case's door half: the verdict repair
+        // is keyed to can clear without the command — a `/clear`
+        // rotation and a resume into a healthy session both adopt a
+        // fresh memory. Against a cleared verdict the door must
+        // answer "nothing to repair", because the driver re-seeded
+        // the config layer beside the adoption and no posture
+        // stands.
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        let memory = crate::queue::PermissionMemory::default();
+        memory.mark_damaged();
+        app.set_permission_memory(memory);
+        assert!(
+            app.permission_memory.damage_standing(),
+            "the damage verdict stands before the wholesale adoption"
+        );
+        // The clear path's motion on the shared memory: the fresh
+        // adoption clears the verdict.
+        app.permission_memory.adopt(Vec::new(), Vec::new());
+
+        app.permissions_command(Some("repair"));
+
+        let (notice, _) = app
+            .transient_notice
+            .as_ref()
+            .expect("the repair answers with a notice");
+        assert!(
+            notice.contains("nothing to repair"),
+            "the door answers for the verdict that stands — none: {notice}"
         );
     }
 

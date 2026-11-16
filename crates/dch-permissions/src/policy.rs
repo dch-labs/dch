@@ -124,6 +124,9 @@ impl PermissionPolicy for RulesPolicy {
             let mut prefixes = Vec::new();
             let mut texts = Vec::new();
             for segment in &call.segments {
+                if crate::shape::segment_reads_only(&segment.text) {
+                    continue;
+                }
                 if segment.complex {
                     texts.push(segment.text.clone());
                 } else {

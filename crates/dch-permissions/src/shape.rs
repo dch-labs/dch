@@ -54,18 +54,25 @@ const VERB_ARITY: &[(&str, usize)] = &[
 /// A single-quoted span is wholly literal: it becomes one
 /// [`QUOTED_ARG`] token, delimiters gone — a quoted `|` is not a
 /// separator, a quoted `>` is not a redirect, a quoted `\` is text. A
-/// double-quoted span is literal except that `$` and backtick still
-/// substitute inside it; those survive masking so the metacharacter
-/// gate disqualifies the command, and only a span holding none
-/// becomes [`QUOTED_ARG`]. Escapes inside double quotes are consumed
-/// in pairs, as the shell reads them. Outside quotes a backslash
-/// escapes the next character: the pair becomes that character
-/// plainly, or a space when the character is one the gate treats as
-/// control — so `find`'s `\( … \)` grouping reads as text, and `\;`
-/// cannot smuggle a separator.
+/// double-quoted span is literal except that substitution reaches
+/// inside it, and only the execution-capable forms matter to the
+/// mask: a `$(` or `${` inside the span — or a backtick, which
+/// executes wherever it sits — pushes the opener pair itself, the
+/// marker every later judgment reads as execution, because the span
+/// walls hide the characters that would otherwise betray it. A span
+/// whose only expansion is a bare `$NAME` or `$?` prints a variable
+/// and touches nothing, so it masks as the plain placeholder like
+/// any other quoted argument — `echo "exit: $?"` reads as
+/// `echo <arg>`, prefixable and coverable, while `echo "$(rm)"`
+/// keeps its execution visible. Escapes inside double quotes are
+/// consumed in pairs, as the shell reads them. Outside quotes a
+/// backslash escapes the next character: the pair becomes that
+/// character plainly, or a space when the character is one the gate
+/// treats as control — so `find`'s `\( … \)` grouping reads as
+/// text, and `\;` cannot smuggle a separator.
 fn mask_quoted(command: &str) -> String {
     let mut masked = String::with_capacity(command.len());
-    let mut chars = command.chars();
+    let mut chars = command.chars().peekable();
     while let Some(ch) = chars.next() {
         match ch {
             '\'' => {
@@ -77,21 +84,25 @@ fn mask_quoted(command: &str) -> String {
                 masked.push_str(QUOTED_ARG);
             }
             '"' => {
-                let mut substituted = false;
+                let mut executes = false;
                 while let Some(inner) = chars.next() {
                     match inner {
                         '"' => break,
                         '\\' => {
                             chars.next();
                         }
-                        '$' | '`' => {
-                            substituted = true;
-                            masked.push(inner);
+                        '`' => executes = true,
+                        '$' => {
+                            if matches!(chars.peek(), Some('(' | '{')) {
+                                executes = true;
+                            }
                         }
                         _ => {}
                     }
                 }
-                if !substituted {
+                if executes {
+                    masked.push_str("$(");
+                } else {
                     masked.push_str(QUOTED_ARG);
                 }
             }
@@ -202,11 +213,28 @@ fn scrub_and_mask(command: &str) -> String {
     mask_quoted(&scrub(command))
 }
 
+/// Whether a masked span carries a substitution that can *execute*.
+///
+/// bash draws the line the gate must draw with it: a `$` naming a
+/// variable or a parameter — `$?`, `$NAME`, `$1` — only expands, so
+/// `echo "exit: $?"` prints and touches nothing, while `$(` opens a
+/// command substitution, `${` opens a parameter expansion that can
+/// embed one (`${x:-$(rm)}`), and a backtick substitutes wherever it
+/// sits. The `$` is disqualified only in its two execution-capable
+/// spellings; the bare naming forms stay as ordinary, prefixable
+/// text — the echo that reports an exit code is a looker like any
+/// other, not a new exact-text rule per wording.
+fn substitution_executes(span: &str) -> bool {
+    span.contains('`') || span.contains("$(") || span.contains("${")
+}
+
 /// Whether a shell command only looks, never touches.
 ///
 /// Conservative by construction: a single line, and no character that
-/// could redirect or substitute (`>`, `<`, `$`, backtick, parens,
-/// backslash) anywhere outside quotes — those disqualify the whole
+/// could redirect or execute a substitution — `>`, `<`, parens,
+/// backslash, backtick, or a `$` in its two executing spellings `$(`
+/// and `${` (a bare `$NAME` or `$?` only expands) — anywhere outside
+/// quotes; those disqualify the whole
 /// command. Two spans cannot disqualify: the inert redirects
 /// (`2>/dev/null`, `>/dev/null`, `2>&1`, `1>&2`) are scrubbed first —
 /// each spelling only where it stands as its own token, never glued
@@ -228,7 +256,7 @@ pub fn shell_reads_only(command: &str) -> bool {
         return false;
     }
     let masked = scrub_and_mask(command);
-    if masked.chars().any(|ch| "><$`()\\".contains(ch)) {
+    if masked.chars().any(|ch| "><`()\\".contains(ch)) || substitution_executes(&masked) {
         return false;
     }
     masked
@@ -253,7 +281,7 @@ pub fn shell_reads_only(command: &str) -> bool {
 #[must_use]
 pub fn segment_reads_only(segment: &str) -> bool {
     let masked = mask_quoted(segment);
-    if masked.chars().any(|ch| "><$`()\\".contains(ch)) {
+    if masked.chars().any(|ch| "><`()\\".contains(ch)) || substitution_executes(&masked) {
         return false;
     }
     command_reads_only(&masked)
@@ -370,7 +398,7 @@ fn command_reads_only(segment: &str) -> bool {
 /// A bare program name is not a verdict: several readers carry
 /// arguments that write files, set state, or run other programs —
 /// `find -delete`, `sort -o`, `sort --compress-program`, `date -s`,
-/// `less -o`, `git log
+/// `less -o` and its uppercase twin `-O`, `git log
 /// --output`, and `env` followed by anything at all; `rg --pre`
 /// runs a command per searched file, `git -c … --ext-diff` runs an
 /// external diff driver, and `systemctl -H` reaches a remote host;
@@ -439,10 +467,11 @@ fn reader_arguments_read_only(program: &str, args: &[&str]) -> bool {
             arg.starts_with("--log-file")
                 || arg.starts_with("--LOG-FILE")
                 // `-O` is the family's overwrite spelling — the
-                // uppercase twin of the `-o` the cluster check
-                // refuses, and case-sensitively beyond its reach.
-                || arg.starts_with("-O")
+                // uppercase twin of the `-o` beside it — and the
+                // cluster scan refuses either case, so no spelling
+                // of the log-file flag rides a cluster past the arm.
                 || short_cluster(arg, 'o')
+                || short_cluster(arg, 'O')
         }),
         "journalctl" => journalctl_arguments_read_only(args),
         "uniq" => uniq_arguments_read_only(args),
@@ -914,7 +943,7 @@ fn split_commands(command: &str) -> Vec<String> {
 /// control-flow keyword is the construct itself. All are remembered
 /// as exact text, never as a prefix.
 fn segment_complex(masked: &str) -> bool {
-    if masked.chars().any(|ch| "><$`()\\".contains(ch)) {
+    if masked.chars().any(|ch| "><`()\\".contains(ch)) || substitution_executes(masked) {
         return true;
     }
     let first = masked.split_whitespace().next().unwrap_or("");
@@ -1127,11 +1156,16 @@ fn edit_target(edit: &Value, batch_default: Option<&str>) -> Option<String> {
 /// The remember-rules for one dispatch: what an "allow always"
 /// answer on this ask would record.
 ///
-/// A Bash ask remembers one rule per command segment — verb prefixes
-/// for clean segments, exact text for complex ones
-/// ([`RememberRules::Segments`]); a write-family ask remembers the
-/// scopes its targets live under ([`RememberRules::PathGlobs`]); every
-/// other tool remembers itself ([`RememberRules::Tool`]).
+/// A Bash ask remembers one rule per *writer* segment — verb
+/// prefixes for clean segments, exact text for complex ones
+/// ([`RememberRules::Segments`]) — and nothing for a reader segment:
+/// the carve-out would run a reader free on its own, in every mode,
+/// so a rule for it records nothing the gate was asked about, and a
+/// chain's differently-worded `echo` tail could otherwise re-ask a
+/// chain whose every writer is remembered. A write-family ask
+/// remembers the scopes its targets live under
+/// ([`RememberRules::PathGlobs`]); every other tool remembers itself
+/// ([`RememberRules::Tool`]).
 #[must_use]
 pub fn remember_rules(tool_name: &str, input: &Value, cwd: &Path) -> RememberRules {
     if tool_name == "Bash" {
@@ -1142,6 +1176,9 @@ pub fn remember_rules(tool_name: &str, input: &Value, cwd: &Path) -> RememberRul
         let mut prefixes = Vec::new();
         let mut texts = Vec::new();
         for segment in segments {
+            if segment_reads_only(&segment.text) {
+                continue;
+            }
             if segment.complex {
                 texts.push(segment.text);
             } else {
@@ -1326,11 +1363,14 @@ mod tests {
     use crate::vocabulary::ToolCategory;
 
     #[test]
-    fn remember_rules_records_every_segment_of_the_chain() {
-        // One arity-trimmed verb prefix per command segment — readers
-        // included, they are part of the chain the user approved. The
-        // inert `2>&1` is scrubbed before splitting, so it never
-        // becomes a segment of its own.
+    fn remember_rules_records_every_writer_segment_of_the_chain() {
+        // One arity-trimmed verb prefix per *writer* segment — readers
+        // mint nothing, on either side of the sheet: the carve-out
+        // would run them free on their own, so a rule for them records
+        // nothing the approval was about, and a differently-worded
+        // `echo` tail must never re-ask a chain whose writers are all
+        // remembered. The inert `2>&1` is scrubbed before splitting, so
+        // it never becomes a segment of its own.
         let rules = |command: &str| {
             remember_rules(
                 "Bash",
@@ -1341,18 +1381,14 @@ mod tests {
         assert_eq!(
             rules("cargo build --workspace 2>&1 | tail -15"),
             RememberRules::Segments {
-                prefixes: vec!["cargo build".to_string(), "tail".to_string()],
+                prefixes: vec!["cargo build".to_string()],
                 texts: Vec::new(),
             }
         );
         assert_eq!(
             rules("cargo test -p dch-tui --all-features | grep -E 'x|y' | head -3"),
             RememberRules::Segments {
-                prefixes: vec![
-                    "cargo test".to_string(),
-                    "grep".to_string(),
-                    "head".to_string()
-                ],
+                prefixes: vec!["cargo test".to_string()],
                 texts: Vec::new(),
             }
         );
@@ -1492,18 +1528,19 @@ mod tests {
     }
 
     #[test]
-    fn the_allow_side_still_mints_readers_the_deny_side_drops_them() {
-        // The asymmetry holds on the allow side and only there: the same
-        // chain's approval remembers every segment (readers included —
-        // they are part of the chain the user approved), its refusal
-        // remembers the writers alone.
+    fn both_remember_sides_drop_readers_and_keep_writers() {
+        // The symmetry both sides now keep: the same chain's approval
+        // and its refusal remember the writers alone — a reader is
+        // never what the answer was about, so it mints nothing on
+        // either side, and the file never grows an `echo`/`head`/
+        // `tail` row per wording.
         let input = serde_json::json!({
             "command": "cargo build --workspace --quiet 2>&1 | tail -30"
         });
         assert_eq!(
             remember_rules("Bash", &input, Path::new("/work")),
             RememberRules::Segments {
-                prefixes: vec!["cargo build".to_string(), "tail".to_string()],
+                prefixes: vec!["cargo build".to_string()],
                 texts: Vec::new(),
             }
         );
@@ -1774,14 +1811,16 @@ mod tests {
     }
 
     #[test]
-    fn complex_segments_are_remembered_as_exact_text() {
-        // A segment carrying a live substitution — `$?` inside double
-        // quotes — is remembered as its exact normalized text, never as
-        // a verb prefix: a prefix minted from it could not be trusted to
-        // summarize the payload. The substitution-carrying trailer
-        // remembers itself alone, and the clean cargo segment beside it
-        // still mints its verb — one segment's complexity never
-        // contaminates the chain's other segments.
+    fn complex_writers_are_exact_text_and_variable_readers_mint_nothing() {
+        // The two halves of the substitution split. A *bare* variable
+        // — `$?` inside double quotes — only expands: the echo that
+        // reports an exit code is a looker, minting nothing, so no
+        // per-wording row ever lands in the file. An *executing*
+        // substitution — `$(…)` inside the quotes — keeps the segment
+        // complex and remembers its exact normalized text, never a
+        // verb prefix that could ride a payload; the clean cargo
+        // segment beside it still mints its verb, and one segment's
+        // complexity never contaminates the chain's other segments.
         let rules = |command: &str| {
             remember_rules(
                 "Bash",
@@ -1792,11 +1831,20 @@ mod tests {
         assert_eq!(
             rules("cargo check --workspace --quiet 2>&1 | tail -30; echo \"EXIT: $?\""),
             RememberRules::Segments {
-                prefixes: vec!["cargo check".to_string(), "tail".to_string()],
-                texts: vec!["echo \"EXIT: $?\"".to_string()],
+                prefixes: vec!["cargo check".to_string()],
+                texts: Vec::new(),
             },
-            "the substitution-carrying echo is remembered as exact text, \
-             never as an `echo` verb prefix that could ride a payload"
+            "the variable-carrying echo is a reader: it mints nothing, and no \
+             differently-worded twin of it will ever re-ask the chain"
+        );
+        assert_eq!(
+            rules("cargo check 2>&1; echo \"wrote: $(git rev-parse HEAD)\""),
+            RememberRules::Segments {
+                prefixes: vec!["cargo check".to_string()],
+                texts: vec!["echo \"wrote: $(git rev-parse HEAD)\"".to_string()],
+            },
+            "an executing substitution inside the quotes stays exact text, \
+             never an `echo` verb prefix that could ride a payload"
         );
         assert_eq!(
             rules("cargo build > owned.txt"),
@@ -1857,11 +1905,12 @@ mod tests {
     fn an_inert_set_preamble_is_remembered_with_the_chain_it_rode_in_on() {
         // The option setter reads like a look, so a chain carrying an
         // inert `set -o pipefail` preamble passes the reader gate
-        // whole. On the remember side the preamble is a segment like
-        // any other — its verb is remembered with the chain it rode in
-        // on, and coverage demands it: a chain that grows a preamble
-        // re-asks once, and the answer then covers the whole command.
-        // The pin drives both halves, prefix set and coverage.
+        // whole — and reads like a look to the remember side too: the
+        // preamble mints nothing and demands no coverage, because the
+        // chain's one writer is the runner. A remembered writer covers
+        // the chain whole; a chain whose writer is not remembered
+        // re-asks whatever readers ride beside it. The pin drives both
+        // halves, prefix set and coverage.
         let command =
             "set -o pipefail; cargo test --workspace 2>&1 | grep -E 'Running|Doc-tests' | tail -40";
         let segments = command_segments(command);
@@ -1883,13 +1932,23 @@ mod tests {
             segments: command_segments(cmd),
             ..crate::engine::CallShape::of("Bash", ToolCategory::ShellExecute)
         };
-        let without_preamble = crate::engine::RememberedRules {
-            shell_prefixes: vec!["cargo test".to_string(), "tail".to_string()],
+        let wrong_writer = crate::engine::RememberedRules {
+            shell_prefixes: vec!["cargo build".to_string()],
             ..crate::engine::RememberedRules::empty()
         };
         assert!(
-            !without_preamble.covers(&shape_for(command)),
-            "a remembered verb alone does not cover the grown chain — it re-asks once"
+            !wrong_writer.covers(&shape_for(command)),
+            "a chain whose writer is not remembered re-asks — whatever readers \
+             ride beside it"
+        );
+        let the_writer_alone = crate::engine::RememberedRules {
+            shell_prefixes: vec!["cargo test".to_string()],
+            ..crate::engine::RememberedRules::empty()
+        };
+        assert!(
+            the_writer_alone.covers(&shape_for(command)),
+            "the remembered writer covers the chain whole — the preamble and \
+             the reader tail demand nothing"
         );
         assert_eq!(
             remember_rules(
@@ -1898,28 +1957,15 @@ mod tests {
                 Path::new("/work")
             ),
             RememberRules::Segments {
-                prefixes: vec![
-                    "set".to_string(),
-                    "cargo test".to_string(),
-                    "grep".to_string(),
-                    "tail".to_string()
-                ],
+                prefixes: vec!["cargo test".to_string()],
                 texts: Vec::new(),
             },
-            "the press remembers the preamble with the chain"
+            "the press remembers the runner — the chain's one writer — and \
+             nothing for the preamble or the reader tail"
         );
-        let remembered = crate::engine::RememberedRules {
-            shell_prefixes: vec![
-                "set".to_string(),
-                "cargo test".to_string(),
-                "grep".to_string(),
-                "tail".to_string(),
-            ],
-            ..crate::engine::RememberedRules::empty()
-        };
         assert!(
-            remembered.covers(&shape_for(command)),
-            "the answer that remembered the whole chain covers it from then on"
+            the_writer_alone.covers(&shape_for(command)),
+            "the answer that remembered the chain's writer covers it from then on"
         );
         // Anything `set` can do beyond the known failure-behavior options
         // keeps its own verb — remembered separately when approved.
@@ -1929,6 +1975,51 @@ mod tests {
             .map(|segment| segment.prefix.clone())
             .collect();
         assert_eq!(prefixes, vec!["set".to_string(), "cargo test".to_string()],);
+    }
+
+    #[test]
+    fn a_remembered_writer_covers_a_chain_with_differently_worded_readers() {
+        // The report that motivated the split, pinned end to end:
+        // approving `cargo fmt` with an exit-code echo beside it mints
+        // the writer alone, and the same chain with a differently-
+        // worded echo — or a different reader entirely — runs free: no
+        // second ask, no second row in the permissions file. A new
+        // writer still re-asks.
+        let rules = |command: &str| {
+            remember_rules(
+                "Bash",
+                &serde_json::json!({ "command": command }),
+                Path::new("/work"),
+            )
+        };
+        assert_eq!(
+            rules("cargo fmt && echo \"exit: $?\""),
+            RememberRules::Segments {
+                prefixes: vec!["cargo fmt".to_string()],
+                texts: Vec::new(),
+            },
+            "the approval mints the writer alone — the echo is a reader"
+        );
+        let shape_for = |cmd: &str| crate::engine::CallShape {
+            segments: command_segments(cmd),
+            ..crate::engine::CallShape::of("Bash", ToolCategory::ShellExecute)
+        };
+        let remembered = crate::engine::RememberedRules {
+            shell_prefixes: vec!["cargo fmt".to_string()],
+            ..crate::engine::RememberedRules::empty()
+        };
+        assert!(
+            remembered.covers(&shape_for("cargo fmt && echo \"fmt-all exit: $?\"")),
+            "a differently-worded echo never re-asks the chain"
+        );
+        assert!(
+            remembered.covers(&shape_for("cargo fmt | tail -3")),
+            "a different reader beside the writer never re-asks either"
+        );
+        assert!(
+            !remembered.covers(&shape_for("cargo build && echo \"exit: $?\"")),
+            "a new writer re-asks — the reader beside it changes nothing"
+        );
     }
 
     #[test]
@@ -2018,6 +2109,8 @@ mod tests {
             "set",
             "git diff HEAD -- crates/dch-loop/src/permission.rs | grep -E '^@@|^\\+pub|^\\+fn' | head -40",
             "echo 'a > b'",
+            "echo \"done: $?\"",
+            "echo $HOME $USER",
             "grep 'x|y' notes.txt",
             "head -6 \"README.md\"",
             "git -C /home/dch/repos/dch log --oneline -15",
@@ -2065,10 +2158,13 @@ mod tests {
             "less '-o'=logfile notes.txt",
             // `-O` is the log-file family's uppercase spelling — the
             // unconditional-overwrite one, strictly worse than the
-            // `-o` the cluster check refuses.
+            // `-o` — and either case refuses inside a cluster, so
+            // the glued spellings ride no cluster past the arm.
             "less -O owned.txt notes.txt",
             "cat x | less -O /tmp/leak",
             "cat x | less -O/tmp/leak",
+            "cat x | less -XO /tmp/leak",
+            "cat x | less -NSO /tmp/leak notes.txt",
             "date '--set'=12:00",
             "git log --'output'=owned.txt",
             "git -c core.pager=cat status",
@@ -2087,6 +2183,8 @@ mod tests {
             "cargo build | wc -l",
             "ls > owned.txt",
             "echo $(rm -rf /)",
+            "echo \"x$(rm)y\"",
+            "echo \"${IFS}x\"",
             "find . -exec rm {} \\;",
             "find . -delete",
             "find . -execdir rm {} +",

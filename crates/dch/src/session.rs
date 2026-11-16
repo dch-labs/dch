@@ -606,7 +606,10 @@ impl SessionSaver {
     /// The "allow always" choices ride their own sibling beside the
     /// display and machine files — rewritten on every remember, since
     /// the list is tiny and the atomic discipline costs nothing at
-    /// this size.
+    /// this size. The damage verdict rides beside the pair, so a
+    /// save from a session whose restore failed closed writes a file
+    /// that still says so — the next launch re-arms the restriction
+    /// instead of reading the replaced lists as a recovery.
     ///
     /// # Errors
     ///
@@ -616,6 +619,7 @@ impl SessionSaver {
         &self,
         allow: &[dch_tui::PermissionRule],
         deny: &[dch_tui::PermissionRule],
+        damaged: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let path = self.permissions_path();
         let dir = path.parent().unwrap_or(Path::new("."));
@@ -624,6 +628,7 @@ impl SessionSaver {
             format: PERMISSIONS_FORMAT.to_string(),
             allow: allow.to_vec(),
             deny: deny.to_vec(),
+            damaged,
         };
         let json = serde_json::to_string(&stored)?;
         let mut temp = tempfile::NamedTempFile::new_in(dir)?;
@@ -642,12 +647,15 @@ impl SessionSaver {
     /// [`PermissionsRestore::Fresh`], nothing remembered, not an
     /// error. A sibling that parses under a known format tag restores
     /// its lists ([`PermissionsRestore::Restored`]), the older
-    /// spellings loading as aliases. A sibling that exists but cannot
-    /// be trusted — unreadable, unparseable, or tagged with a format
-    /// this build does not know — fails the restore closed
-    /// ([`PermissionsRestore::Damaged`]): empty lists are not the
-    /// verdict, because empty lists under `auto` would run the work a
-    /// damaged file's denies had banned; the caller blocks
+    /// spellings loading as aliases; a sibling carrying the standing
+    /// damage marker restores its lists with the marker beside them,
+    /// because the lists it holds are the re-answers made *after* the
+    /// damage — real choices, never a recovery. A sibling that exists
+    /// but cannot be trusted — unreadable, unparseable, or tagged
+    /// with a format this build does not know — fails the restore
+    /// closed ([`PermissionsRestore::Damaged`]): empty lists are not
+    /// the verdict, because empty lists under `auto` would run the
+    /// work a damaged file's denies had banned; the caller blocks
     /// side-effecting calls until the session re-answers.
     #[must_use]
     pub fn load_permissions(&self) -> PermissionsRestore {
@@ -673,12 +681,14 @@ impl SessionSaver {
             return PermissionsRestore::Restored {
                 allow: stored.allow,
                 deny: stored.deny,
+                damage_standing: stored.damaged,
             };
         }
         if stored.format == PERMISSIONS_FORMAT_V2 {
             return PermissionsRestore::Restored {
                 allow: stored.allow,
                 deny: Vec::new(),
+                damage_standing: false,
             };
         }
         tracing::warn!(
@@ -912,6 +922,15 @@ struct StoredPermissions {
     /// matched deny blocks the call silently in every mode.
     #[serde(default)]
     pub(crate) deny: Vec<dch_tui::PermissionRule>,
+
+    /// Whether the session that wrote this file was failing closed.
+    ///
+    /// Absent in every file a pre-marker build wrote, which reads as
+    /// false — those sessions were never damaged. The marker rides
+    /// every save a damaged session makes, so the lists it re-answers
+    /// with can never masquerade as a recovery.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) damaged: bool,
 }
 
 /// Why a stored-JSON sibling refused to hand back its struct.
@@ -991,7 +1010,11 @@ pub enum PermissionsRestore {
     ///
     /// The lists exactly as last saved — an older format may carry an
     /// empty deny list (v2 predates denies), which is the format's
-    /// truth, not damage.
+    /// truth, not damage. `damage_standing` carries the marker a
+    /// damaged-then-reanswered session wrote: the lists are the
+    /// re-answers made after the damage, real choices the session
+    /// keeps, while the marker keeps the fail-closed posture armed
+    /// until an explicit repair clears it.
     Restored {
         /// The always-allow rules, as saved.
         ///
@@ -1006,6 +1029,16 @@ pub enum PermissionsRestore {
         /// order — absent wholesale in a v2 file, which predates the
         /// deny list entirely.
         deny: Vec<dch_tui::PermissionRule>,
+
+        /// Whether the damage marker the last save carried still
+        /// stands.
+        ///
+        /// True when the session that wrote this file was failing
+        /// closed: the launch re-arms the asking posture and the
+        /// tightened config rules instead of reading the re-answered
+        /// lists as a recovery, and only `/permissions repair` clears
+        /// the marker.
+        damage_standing: bool,
     },
 
     /// The sibling exists but cannot be trusted.
@@ -1030,17 +1063,30 @@ impl PermissionsRestore {
     pub fn into_lists(self) -> (Vec<dch_tui::PermissionRule>, Vec<dch_tui::PermissionRule>) {
         match self {
             Self::Fresh | Self::Damaged => (Vec::new(), Vec::new()),
-            Self::Restored { allow, deny } => (allow, deny),
+            Self::Restored {
+                allow,
+                deny,
+                damage_standing: _,
+            } => (allow, deny),
         }
     }
 
-    /// Whether the sibling was damaged and the restore failed closed.
+    /// Whether damage stands in any form — a refused sibling or a
+    /// marker the last save carried.
     ///
-    /// The caller's one question: does this session owe the blocking
-    /// posture until its memory is re-answered?
+    /// The hosts' one question when wiring a launch: does this
+    /// session owe the fail-closed posture — the asking mode, the
+    /// tightened config rules, the marker that keeps both armed
+    /// across saves and launches until `/permissions repair`?
     #[must_use]
-    pub fn is_damaged(&self) -> bool {
-        matches!(self, Self::Damaged)
+    pub fn damage_stands(&self) -> bool {
+        match self {
+            Self::Damaged => true,
+            Self::Restored {
+                damage_standing, ..
+            } => *damage_standing,
+            Self::Fresh => false,
+        }
     }
 }
 
@@ -1298,7 +1344,7 @@ mod tests {
             },
         ];
         session
-            .save_permissions(&rules, &[])
+            .save_permissions(&rules, &[], false)
             .expect("the choices save");
         let reloaded = saver(dir.path(), id);
         let (allow, deny) = reloaded.load_permissions().into_lists();
@@ -1310,7 +1356,7 @@ mod tests {
             tool: "WebFetch".to_string(),
         }];
         session
-            .save_permissions(&rules, &deny_rules)
+            .save_permissions(&rules, &deny_rules, false)
             .expect("the pair saves");
         let (allow, deny) = saver(dir.path(), id).load_permissions().into_lists();
         assert_eq!(allow, rules);
@@ -1422,13 +1468,14 @@ mod tests {
             prefix: "cargo publish".to_string(),
         }];
         session
-            .save_permissions(&[], &deny)
+            .save_permissions(&[], &deny, false)
             .expect("the deny saves");
         assert_eq!(
             session.load_permissions(),
             PermissionsRestore::Restored {
                 allow: Vec::new(),
                 deny,
+                damage_standing: false,
             },
             "the intact sibling carries the deny"
         );
@@ -1441,6 +1488,73 @@ mod tests {
             session.load_permissions(),
             PermissionsRestore::Damaged,
             "a truncated sibling fails the restore closed — the deny is not silently gone"
+        );
+    }
+
+    #[test]
+    fn a_standing_damage_marker_round_trips_and_re_arms_the_verdict() {
+        // The marker's whole journey: a session whose restore failed
+        // closed re-answers questions and saves — the file carries its
+        // re-answers *and* the marker — and the next load restores the
+        // lists with the marker standing, so the launch re-arms the
+        // fail-closed instead of reading the replaced lists as a
+        // recovery. A pre-marker file (no field at all) reads healthy,
+        // as the sessions that wrote it were.
+        let dir = tempfile::tempdir().expect("session tempdir");
+        let id = Uuid::new_v4();
+        let session = saver(dir.path(), id);
+        let reanswers = vec![dch_tui::PermissionRule::Tool {
+            tool: "Read".to_string(),
+        }];
+        session
+            .save_permissions(&reanswers, &[], true)
+            .expect("the damaged session's save lands");
+        assert_eq!(
+            session.load_permissions(),
+            PermissionsRestore::Restored {
+                allow: reanswers.clone(),
+                deny: Vec::new(),
+                damage_standing: true,
+            },
+            "the re-answers restore, and the marker stands beside them"
+        );
+        assert!(
+            session.load_permissions().damage_stands(),
+            "the hosts' one question answers yes — the fail-closed re-arms"
+        );
+        let raw = std::fs::read_to_string(dir.path().join(id.to_string()).join("permissions.json"))
+            .expect("the sibling reads");
+        assert!(
+            raw.contains("\"damaged\":true"),
+            "the marker is on disk in its own spelling: {raw}"
+        );
+        // The repair's save writes a healthy file.
+        session
+            .save_permissions(&reanswers, &[], false)
+            .expect("the repaired session's save lands");
+        assert_eq!(
+            session.load_permissions(),
+            PermissionsRestore::Restored {
+                allow: reanswers,
+                deny: Vec::new(),
+                damage_standing: false,
+            },
+            "after the repair the same lists read healthy"
+        );
+        // A pre-marker file — no field at all — is a healthy session.
+        let legacy = serde_json::json!({
+            "format": "dch.permissions.v1",
+            "allow": [],
+            "deny": [],
+        });
+        std::fs::write(
+            dir.path().join(id.to_string()).join("permissions.json"),
+            legacy.to_string(),
+        )
+        .expect("the legacy sibling writes");
+        assert!(
+            !session.load_permissions().damage_stands(),
+            "a file a pre-marker build wrote reads healthy, as it was"
         );
     }
 

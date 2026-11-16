@@ -31,14 +31,18 @@ pub fn empty_view() -> crate::engine::MemoryView {
     crate::engine::MemoryView::empty()
 }
 
-/// The hook's shape: handed the whole rule list on every change.
+/// The hook's shape: handed the whole rule list and the standing
+/// damage verdict on every change.
 ///
 /// The whole list, never a delta — the host's storage is rewritten
 /// in kind at each fire, so the hook stays dumb: replace, not
-/// merge. The call runs synchronously inside the remember, so a
+/// merge. The damage verdict rides beside the pair so a save can
+/// never launder it away: a damaged session's file must keep saying
+/// it is damaged, whatever re-answers have landed since. The call
+/// runs synchronously inside the remember, so a
 /// slow write-through is a slow answer, the cost paid where the
 /// choice was made.
-pub type PersistHook = Arc<dyn Fn(&[PermissionRule], &[PermissionRule]) + Send + Sync>;
+pub type PersistHook = Arc<dyn Fn(&[PermissionRule], &[PermissionRule], bool) + Send + Sync>;
 
 /// The session's remembered permission rules.
 ///
@@ -68,6 +72,17 @@ pub struct PermissionMemory {
     /// A matched deny blocks the call silently, in every mode — the
     /// user's "never" asked once and does not ask again.
     deny_rules: Arc<Mutex<Vec<PermissionRule>>>,
+
+    /// Whether a damaged permissions restore still stands.
+    ///
+    /// Set when a restore fails closed and cleared only by adoption
+    /// of a healthy pair or an explicit repair — never by the
+    /// remembers, which re-answer questions without resurrecting the
+    /// refusals the damage lost. The flag rides the write-through so
+    /// the file cannot launder it: a save from a damaged session
+    /// writes a damaged file, and the next launch re-arms the
+    /// restriction the same hour it re-reads the rules.
+    damage: Arc<std::sync::atomic::AtomicBool>,
 
     /// The host's write-through, when one is installed.
     ///
@@ -274,6 +289,32 @@ impl PermissionMemory {
         Some(removed)
     }
 
+    /// Clear both rule lists wholesale, write-through and all.
+    ///
+    /// The `/permissions forget all` sweep: every remembered rule —
+    /// allow and deny alike — leaves the memory and the session's
+    /// permissions file in one motion, so all of that work asks
+    /// again. Deliberately not [`adopt`](Self::adopt): a sweep is a
+    /// removal, not a fresh session, so the write-through fires (the
+    /// file must record the emptiness) and the standing damage
+    /// verdict survives it — forgetting what was re-answered after
+    /// the damage is not a recovery from the damage.
+    pub fn forget_all(&self) {
+        let mut allow = self
+            .allow_rules
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut deny = self
+            .deny_rules
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        allow.clear();
+        deny.clear();
+        drop(allow);
+        drop(deny);
+        self.fire_persist();
+    }
+
     /// Adopt a rule pair wholesale — a session's own choices at
     /// open, a resumed session's at adoption, a cleared session's
     /// empty none.
@@ -281,7 +322,10 @@ impl PermissionMemory {
     /// Replacement, not merge: the pair handed over is the memory's
     /// whole truth from the call on, so a resume restores exactly
     /// what its file records and can never accumulate a phantom.
-    /// No write-through fires — adoption is not a new choice, and
+    /// The damage verdict dies with the pair it belonged to — a
+    /// healthy adoption is a healthy session, and a damaged one
+    /// re-marks itself right after, from its own verdict. No
+    /// write-through fires — adoption is not a new choice, and
     /// the file the pair came from is already its record.
     pub fn adopt(&self, allow: Vec<PermissionRule>, deny: Vec<PermissionRule>) {
         *self
@@ -292,6 +336,46 @@ impl PermissionMemory {
             .deny_rules
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = deny;
+        self.damage
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Mark the session's permissions restore as damaged, still
+    /// standing.
+    ///
+    /// The host's half of the fail-closed bargain: called right
+    /// after a damaged verdict adopts its (empty or partial) lists,
+    /// so every later save carries the verdict and every later
+    /// launch re-arms it. Nothing in the memory clears the flag —
+    /// not the remembers, not the forgets — only a fresh adoption or
+    /// [`clear_damage`](Self::clear_damage).
+    pub fn mark_damaged(&self) {
+        self.damage.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether the damaged-restore verdict still stands.
+    ///
+    /// The host's one question when wiring a launch or an adoption:
+    /// does this session owe the fail-closed posture?
+    #[must_use]
+    pub fn damage_standing(&self) -> bool {
+        self.damage.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Clear the standing damage verdict — the explicit repair.
+    ///
+    /// The one door out, and the host's `/permissions repair` holds
+    /// it: the user names the recovery, the memory forgets the
+    /// damage, and — because the verdict is persisted state, carried
+    /// by every save — the clearing is itself a save: the
+    /// write-through fires with the verdict false, so the repaired
+    /// file is written now and the recovery outlives the session that
+    /// named it. A host with no write-through installed keeps the
+    /// in-memory clearing alone, which is all it ever had.
+    pub fn clear_damage(&self) {
+        self.damage
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.fire_persist();
     }
 
     /// The always-allow rules, in remember order.
@@ -333,11 +417,12 @@ impl PermissionMemory {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(persist);
     }
 
-    /// Fire the write-through with both lists, if one is installed.
+    /// Fire the write-through with both lists and the damage verdict,
+    /// if a hook is installed.
     ///
     /// Every mutation funnels here after unlocking, so the hook's
-    /// contract — whole pair, replace-not-merge — is stated once and
-    /// the remember and the forget both inherit it.
+    /// contract — whole pair and verdict, replace-not-merge — is
+    /// stated once and the remember and the forget both inherit it.
     fn fire_persist(&self) {
         if let Some(persist) = self
             .persist
@@ -345,7 +430,11 @@ impl PermissionMemory {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
         {
-            persist(&self.allow_rules(), &self.deny_rules());
+            persist(
+                &self.allow_rules(),
+                &self.deny_rules(),
+                self.damage_standing(),
+            );
         }
     }
 
@@ -482,7 +571,7 @@ mod tests {
         let writes = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&writes);
         memory.persist_through(Arc::new(
-            move |allow: &[PermissionRule], deny: &[PermissionRule]| {
+            move |allow: &[PermissionRule], deny: &[PermissionRule], _damaged: bool| {
                 sink.lock().unwrap().push((allow.to_vec(), deny.to_vec()));
             },
         ));
@@ -493,6 +582,97 @@ mod tests {
         );
         memory.remember_deny(&[prefix("rm")]);
         assert_eq!(writes.lock().unwrap().len(), 1, "a real growth fires once");
+    }
+
+    #[test]
+    fn a_standing_damage_verdict_survives_answers_and_launders_into_no_save() {
+        // The verdict's whole lifecycle, pinned: a damaged mark stands
+        // through the remembers and the forgets (a re-answer is not a
+        // recovery), rides every write-through (a save from a damaged
+        // session writes a damaged file, so the next launch re-arms
+        // the restriction), dies only with a fresh adoption or the
+        // explicit repair.
+        let memory = PermissionMemory::default();
+        memory.mark_damaged();
+        let verdicts = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&verdicts);
+        memory.persist_through(Arc::new(
+            move |_allow: &[PermissionRule], _deny: &[PermissionRule], damaged: bool| {
+                sink.lock().unwrap().push(damaged);
+            },
+        ));
+        assert!(
+            memory.damage_standing(),
+            "the mark stands the moment it is set"
+        );
+        memory.remember_rules(&[prefix("cargo test")]);
+        assert!(
+            memory.damage_standing(),
+            "an allow-always re-answer does not clear the verdict"
+        );
+        memory.remember_deny(&[prefix("rm")]);
+        assert!(
+            memory.damage_standing(),
+            "a deny-always re-answer does not clear it either"
+        );
+        assert!(
+            !verdicts.lock().unwrap().is_empty()
+                && verdicts.lock().unwrap().iter().all(|damaged| *damaged),
+            "every write-through carries the verdict — the file cannot launder it"
+        );
+        memory.adopt(Vec::new(), Vec::new());
+        assert!(
+            !memory.damage_standing(),
+            "a fresh adoption is a fresh verdict — healthy in, healthy out"
+        );
+        memory.mark_damaged();
+        memory.clear_damage();
+        assert!(
+            !memory.damage_standing(),
+            "the explicit repair is the other door out"
+        );
+        assert_eq!(
+            verdicts.lock().unwrap().last().copied(),
+            Some(false),
+            "the repair is itself a save — the write-through fires with the verdict \
+             cleared, so the recovery reaches the file at once"
+        );
+    }
+
+    #[test]
+    fn a_forget_all_sweep_clears_both_lists_and_keeps_the_damage_verdict() {
+        // The sweep's whole contract: both lists empty in one motion,
+        // the write-through firing once with the emptiness — and the
+        // standing damage verdict riding that save untouched, because
+        // forgetting what was re-answered after the damage is not a
+        // recovery from the damage.
+        let memory = PermissionMemory::default();
+        memory.mark_damaged();
+        memory.remember_rules(&[prefix("cargo test")]);
+        memory.remember_deny(&[prefix("cargo publish")]);
+        let writes: Arc<Mutex<Vec<(usize, usize, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&writes);
+        memory.persist_through(Arc::new(
+            move |allow: &[PermissionRule], deny: &[PermissionRule], damaged: bool| {
+                sink.lock()
+                    .unwrap()
+                    .push((allow.len(), deny.len(), damaged));
+            },
+        ));
+        memory.forget_all();
+        assert!(
+            memory.allow_rules().is_empty() && memory.deny_rules().is_empty(),
+            "both lists empty after the sweep"
+        );
+        assert_eq!(
+            writes.lock().unwrap().as_slice(),
+            &[(0, 0, true)],
+            "one write-through, empty lists, the verdict standing"
+        );
+        assert!(
+            memory.damage_standing(),
+            "the sweep is a removal, never a recovery — the verdict stands"
+        );
     }
 
     #[test]

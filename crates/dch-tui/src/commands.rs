@@ -292,15 +292,20 @@ const REGISTRY: &[Spec] = &[
         aliases: &[],
         category: Category::Config,
         arg: ArgShape::Optional,
-        usage: "/permissions [forget <n>]",
-        summary: "Show the permission rules in force, or forget one.",
+        usage: "/permissions [forget <n> | forget all | repair]",
+        summary: "Show the permission rules in force, forget one or all, or repair damage.",
         detail: "Bare lists the rules the gate evaluates — the config's \
                  [permissions] rules, then the session's remembered \
                  allow-always answers, numbered. `forget <n>` takes \
                  remembered rule n out of the memory and out of the \
                  session's permissions file in the same motion, so that \
-                 work asks again the next time. A configured rule is the \
-                 config file's own text; it changes there, not here.",
+                 work asks again the next time; `forget all` is the same \
+                 motion over every remembered rule at once. `repair` \
+                 clears a standing damage verdict — when the session's \
+                 permissions file was unreadable, the session runs failed \
+                 closed until this names the recovery. A configured rule \
+                 is the config file's own text; it changes there, not \
+                 here.",
     },
     Spec {
         name: "preset",
@@ -1004,7 +1009,11 @@ fn argument_candidates(name: &str, argument: &str, sources: CompletionSources<'_
             .collect();
     }
     if name == "permissions" {
-        let mut ranked: Vec<(MatchRank, &str)> = ["forget"]
+        let mut pool: Vec<&str> = vec!["forget", "repair"];
+        if argument.split_whitespace().next() == Some("forget") {
+            pool.push("forget all");
+        }
+        let mut ranked: Vec<(MatchRank, &str)> = pool
             .iter()
             .filter(|candidate| **candidate != argument)
             .filter_map(|candidate| match_rank(candidate, argument).map(|rank| (rank, *candidate)))
@@ -1317,6 +1326,33 @@ mod tests {
             themes,
             keys,
         }
+    }
+
+    #[test]
+    fn permissions_argument_completion_offers_both_verbs() {
+        // `/permissions ` completes its own vocabulary — the forget
+        // door and the repair door alike, so the recovery command a
+        // damage notice names is also the one Tab can finish.
+        let candidates = complete("/permissions ", sources());
+        assert!(
+            candidates.iter().any(|candidate| candidate == "forget"),
+            "forget completes: {candidates:?}"
+        );
+        assert!(
+            candidates.iter().any(|candidate| candidate == "repair"),
+            "repair completes — the recovery is discoverable: {candidates:?}"
+        );
+        assert_eq!(
+            complete("/permissions rep", sources()),
+            vec!["repair".to_string()],
+            "a typed fragment narrows to the repair alone"
+        );
+        assert_eq!(
+            complete("/permissions forget", sources()),
+            vec!["forget all".to_string()],
+            "once the verb is typed, the sweep completes — the bare verb is
+             the typed argument, so it filters itself out"
+        );
     }
 
     #[test]

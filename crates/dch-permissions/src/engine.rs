@@ -143,21 +143,29 @@ impl RememberedRules {
     /// remembered.
     ///
     /// Coverage is all-or-nothing per call, exactly as an "allow always"
-    /// answer meant it: a shell call runs free only when **every**
-    /// segment is remembered — each clean segment by its verb prefix or
-    /// its exact text, each complex segment by its exact text alone —
-    /// or a whole-tool remember covers the call outright, the same
-    /// precedence the config layer gives a tool allow; a write
-    /// call runs free only when **every** target is remembered, whether
-    /// by glob or by a whole-tool rule that predates path scoping; every
-    /// other tool runs free on its own name. A call with nothing
-    /// remembered on its active axis is not covered — the caller asks.
+    /// answer meant it: a shell call runs free only when **every
+    /// writer segment** is remembered — each clean segment by its verb
+    /// prefix or its exact text, each complex segment by its exact
+    /// text alone — or a whole-tool remember covers the call outright, the
+    /// same precedence the config layer gives a tool allow. Reader
+    /// segments demand nothing: the carve-out runs them free on their
+    /// own, so a remembered writer covers its chain whatever
+    /// differently-worded readers ride beside it. A write call runs
+    /// free only when **every** target is remembered, whether by glob
+    /// or by a whole-tool rule that predates path scoping; every other
+    /// tool runs free on its own name. A call with nothing remembered
+    /// on its active axis is not covered — the caller asks.
     #[must_use]
     pub fn covers(&self, shape: &CallShape) -> bool {
         let tool_covered = self.tools.contains(&shape.tool);
-        if !shape.segments.is_empty() {
+        let writers: Vec<&CommandSegment> = shape
+            .segments
+            .iter()
+            .filter(|segment| !crate::shape::segment_reads_only(&segment.text))
+            .collect();
+        if !writers.is_empty() {
             return tool_covered
-                || shape.segments.iter().all(|segment| {
+                || writers.iter().all(|segment| {
                     if segment.complex {
                         self.command_texts.iter().any(|text| text == &segment.text)
                     } else {
@@ -376,12 +384,14 @@ fn matcher_applies(rule: &Rule, shape: &CallShape) -> bool {
 ///
 /// The same all-or-nothing coverage a remember means, applied to the
 /// config's allow rules: a whole-tool allow covers the call outright
-/// (the broad lever, named by the user), and otherwise **every**
-/// command segment must be covered by a prefix rule — a complex
-/// segment is never covered, because no prefix matcher can name what
-/// it will run, so a covered prefix cannot carry a complex payload:
-/// the call falls through to the ask layer, the same exact-text
-/// discipline the remembered layer enforces. Every write target must
+/// (the broad lever, named by the user), and otherwise **every writer
+/// segment** must be covered by a prefix rule — a complex segment is
+/// never covered, because no prefix matcher can name what it will
+/// run, so a covered prefix cannot carry a complex payload: the call
+/// falls through to the ask layer, the same exact-text discipline the
+/// remembered layer enforces. Reader segments demand nothing — the
+/// carve-out runs them free on their own — so a configured `cargo
+/// fmt` covers `cargo fmt && echo anything`. Every write target must
 /// likewise be matched by an allow glob. A call with no shell or
 /// write detail is covered only by its tool's own allow rule.
 fn config_allows(config_rules: &[Rule], shape: &CallShape) -> bool {
@@ -389,9 +399,14 @@ fn config_allows(config_rules: &[Rule], shape: &CallShape) -> bool {
     let tool_covered = config_rules.iter().any(|rule| {
         allows(rule) && matches!(&rule.matcher, Matcher::Tool(name) if *name == shape.tool)
     });
-    if !shape.segments.is_empty() {
+    let writers: Vec<&CommandSegment> = shape
+        .segments
+        .iter()
+        .filter(|segment| !crate::shape::segment_reads_only(&segment.text))
+        .collect();
+    if !writers.is_empty() {
         return tool_covered
-            || shape.segments.iter().all(|segment| {
+            || writers.iter().all(|segment| {
                 config_rules.iter().any(|rule| {
                     allows(rule)
                         && matches!(
