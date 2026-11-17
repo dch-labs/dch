@@ -711,7 +711,7 @@ fn ctrl_w_with_nothing_waiting_is_the_composer_s_word_delete() {
         "one ",
         "the chord deletes a word when no queue waits"
     );
-    assert!(waiting(&kept).is_empty());
+    assert_eq!(waiting(&kept), Vec::new(), "nothing waits");
 }
 
 #[test]
@@ -1503,6 +1503,9 @@ fn a_permission_prompt_outranks_the_queue_chords() {
         .send(dch_tui::PermissionRequest {
             tool_name: "Bash".to_string(),
             prompt: "allow bash?".to_string(),
+            input: serde_json::Value::Null,
+            always: Vec::new(),
+            never: Vec::new(),
             reply: reply_tx,
         })
         .expect("receiver alive");
@@ -1657,8 +1660,7 @@ fn a_narrow_terminal_keeps_the_hint_beside_the_badge_off_the_text() {
     let marked = marker_rows(&narrow);
     let body = narrow
         .get(marked[0]..marked[0] + 2)
-        .map(<[String]>::to_vec)
-        .unwrap_or_default()
+        .map_or_default(<[String]>::to_vec)
         .join(" ");
 
     assert!(

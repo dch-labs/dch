@@ -303,8 +303,16 @@ fn table_cells_pad_to_their_column_width() {
 #[test]
 fn one_blank_line_between_blocks_and_none_at_the_edges() {
     let lines = render("para one\n\npara two", 80);
-    assert!(!joined(lines.first().unwrap()).trim().is_empty());
-    assert!(!joined(lines.last().unwrap()).trim().is_empty());
+    assert_ne!(
+        joined(lines.first().unwrap()).trim(),
+        "",
+        "the first line carries text"
+    );
+    assert_ne!(
+        joined(lines.last().unwrap()).trim(),
+        "",
+        "the last line carries text"
+    );
     let blanks = lines.iter().filter(|l| joined(l).trim().is_empty()).count();
     assert_eq!(blanks, 1, "exactly one blank between, got {blanks}");
 }
@@ -329,7 +337,7 @@ fn clip_width_bounds_every_line() {
         BASE,
         Some(20),
     );
-    assert!(!lines.is_empty());
+    assert_ne!(lines, Vec::new(), "the render produced lines");
     for line in &lines {
         assert!(
             line_width(line) <= 20,
@@ -361,7 +369,7 @@ fn clip_width_respects_wide_glyphs() {
 #[test]
 fn empty_input_renders_no_lines() {
     let lines = render("", 80);
-    assert!(lines.is_empty());
+    assert_eq!(lines, Vec::new(), "the render produced no lines");
 }
 
 #[test]
@@ -431,7 +439,7 @@ fn truncated_wide_cells_keep_their_column_alignment() {
 fn a_list_item_hard_splits_a_word_wider_than_the_width() {
     let path = "/very/long/path/to/some/deeply/nested/directory/structure/file_name.rs";
     let lines = render(&format!("- see {path} for details"), 30);
-    assert!(!lines.is_empty());
+    assert_ne!(lines, Vec::new(), "the render produced lines");
     for line in &lines {
         assert!(
             line_width(line) <= 30,

@@ -12,6 +12,12 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Completion status written to the `--done-file` path on exit.
+///
+/// The marker a polling orchestrator reads instead of parsing
+/// stdout: one JSON object naming the outcome, the run's totals, and
+/// the session the transcript saved under. Built by the three
+/// outcome builders and stamped with the session id at the write
+/// call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DoneStatus {
     /// Whether the run completed successfully.
@@ -38,6 +44,19 @@ pub struct DoneStatus {
     ///
     /// `None` under the same conditions as [`turns`](Self::turns).
     pub tools_used: Option<usize>,
+
+    /// The session the run's transcript saves under, once resolved.
+    ///
+    /// `Some` on every marker written after the run's session id is
+    /// known — the resolved-outcome write and the force-cancel hook's
+    /// — so a consumer reading the marker can correlate it with the
+    /// sessions directory and resume by id without guessing which
+    /// save the run produced. `None` on markers written before a
+    /// session existed (bootstrap, startup-cancel, and construction
+    /// failures) and on markers from older versions, which predate
+    /// the field.
+    #[serde(default)]
+    pub session_id: Option<Uuid>,
 }
 
 impl DoneStatus {
@@ -52,6 +71,7 @@ impl DoneStatus {
             message: Some(message.into()),
             turns: Some(turns),
             tools_used: Some(tools_used),
+            session_id: None,
         }
     }
 
@@ -66,6 +86,7 @@ impl DoneStatus {
             message: Some(message.into()),
             turns: None,
             tools_used: None,
+            session_id: None,
         }
     }
 
@@ -84,7 +105,21 @@ impl DoneStatus {
             message: Some(message.into()),
             turns: Some(turns),
             tools_used: Some(tools_used),
+            session_id: None,
         }
+    }
+
+    /// Stamp the session the run is bound to onto the status.
+    ///
+    /// The marker writers know where the run's session id lives —
+    /// resolved after construction, or absent on the paths that end
+    /// before one exists — so every builder leaves the field `None`
+    /// and each writer stamps what it holds. Returns the status for
+    /// use at the write call.
+    #[must_use]
+    pub fn with_session_id(mut self, session_id: Option<Uuid>) -> Self {
+        self.session_id = session_id;
+        self
     }
 }
 
@@ -245,6 +280,36 @@ mod tests {
         assert!(restored.success);
         assert_eq!(restored.turns, Some(3));
         assert_eq!(restored.tools_used, Some(5));
+        assert_eq!(
+            restored.session_id, None,
+            "builders leave the field unstamped"
+        );
+    }
+
+    #[test]
+    fn a_marker_from_an_older_version_parses_without_the_session_field() {
+        // A pre-field marker carries four keys; adding the key must
+        // not break a reader pointed at an old done-file.
+        let legacy = "{\n  \"success\": true,\n  \"message\": \"ok\",\n  \"turns\": 2,\n  \"tools_used\": 4\n}";
+        let restored: DoneStatus = serde_json::from_str(legacy).unwrap();
+        assert!(restored.success);
+        assert_eq!(
+            restored.session_id, None,
+            "a missing key reads as unstamped"
+        );
+    }
+
+    #[test]
+    fn a_stamped_session_id_round_trips() {
+        let id = Uuid::new_v4();
+        let status = DoneStatus::success("ok", 1, 1).with_session_id(Some(id));
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(
+            json.contains(&format!("\"session_id\":\"{id}\"")),
+            "the uuid serializes in the --resume spelling: {json}"
+        );
+        let restored: DoneStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.session_id, Some(id));
     }
 
     #[test]

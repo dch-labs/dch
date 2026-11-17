@@ -4,9 +4,13 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+readme.workspace = true
+authors.workspace = true
 description = "Ratatui terminal UI for dch: themes, markdown rendering, streaming, TuiObserver"
 
 [dependencies]
+dch-permissions = { workspace = true }
 stacker = "0.1"
 loopctl                = { workspace = true, features = ["redaction"] }
 dch-config             = { workspace = true }
@@ -24,7 +28,7 @@ pest                   = "2.8"
 pest_derive            = "2.8"
 unicode-width          = "0.1"
 unicode-segmentation   = "1.10"
-base64                 = "0.22"
+base64                 = { workspace = true }
 textwrap               = "0.16.4"
 tree-sitter            = { version = "0.26", optional = true }
 tree-sitter-highlight  = { version = "0.26", optional = true }

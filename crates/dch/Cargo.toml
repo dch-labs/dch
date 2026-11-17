@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+readme.workspace = true
+authors.workspace = true
 description = "A terminal-based agentic coding assistant built on loopctl"
 autotests = false
 
@@ -22,6 +25,9 @@ name = "resume_exactness"
 
 [[test]]
 name = "smoke"
+
+[[test]]
+name = "stdin_task_combine"
 
 [[test]]
 name = "tui_signal_restore"
@@ -51,6 +57,7 @@ name = "resume_stale_real"
 name = "tui_final_settle"
 
 [dependencies]
+dch-permissions = { workspace = true }
 dch-loop = { workspace = true }
 dch-tui = { workspace = true }
 dch-config = { workspace = true }

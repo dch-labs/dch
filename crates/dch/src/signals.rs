@@ -6,7 +6,12 @@
 //! repeat window runs the force hook and exits immediately — unless the
 //! host has begun finalizing the resolved run, in which case the exit is
 //! recorded as pending for the host to honor once its durable writes
-//! land (see [`CancelBridge::begin_finalization`]).
+//! land (see [`CancelBridge::begin_finalization`]). That deferral
+//! covers exactly one repeat: recording it ends the bridge task. The
+//! platform handler stays installed for the runtime's lifetime, so a
+//! further interrupt during the rest of finalization is captured and
+//! discarded — SIGKILL is the reliable force if the wait must be cut
+//! short.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -175,6 +180,11 @@ impl InterruptListeners {
     }
 
     /// Windows waits on the persistently registered Ctrl-C stream.
+    ///
+    /// The platform registers one handler for the process's life, so
+    /// this arm simply awaits the shared stream — nothing is armed
+    /// or disarmed here; the registration the runtime made is the
+    /// whole of the platform wiring.
     #[cfg(windows)]
     async fn wait(&mut self) {
         match self.interrupt.as_mut() {
@@ -611,7 +621,13 @@ impl CancelBridge {
     /// the headless path. A repeat interrupt after this call runs the
     /// force hook and records a pending exit instead of terminating the
     /// process, so the host's remaining writes cannot be voided; the
-    /// host honors the pending exit when they have landed.
+    /// host honors the pending exit when they have landed. The armed
+    /// state survives exactly one repeat: recording the deferred force
+    /// ends the bridge task and with it the bridge's own listeners,
+    /// while the platform handler remains installed — a third
+    /// interrupt is captured and discarded rather than terminating
+    /// the process, and SIGKILL is the reliable force if finalization
+    /// hangs.
     pub fn begin_finalization(&self) {
         self.finalizing.store(true, Ordering::SeqCst);
     }

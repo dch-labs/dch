@@ -261,11 +261,66 @@ const REGISTRY: &[Spec] = &[
         summary: "Override a configuration value for this session.",
         detail: "Changes a value the running panel applies now — the theme and \
                  verbosity (`/set verbosity verbose`). `/set model X` switches \
-                 the live model (it is `/model X` in disguise). A value read at \
+                 the live model (it is `/model X` in disguise), and \
+                 `/set permission_mode` moves the running loop's mode for \
+                 the next turn (it is `/mode` in short). A value read at \
                  startup cannot be changed for a session already running; /set \
                  says so rather than pretend. A change that lands is saved to \
-                 the config file, so the next session opens with it. \
+                 the config file, so the next session opens with it — \
+                 `permission_mode` excepted: it is session state and never \
+                 reaches the file (see `/mode`). \
                  `/config` lists every value and its value in effect.",
+    },
+    Spec {
+        name: "mode",
+        aliases: &[],
+        category: Category::Config,
+        arg: ArgShape::Optional,
+        usage: "/mode [auto|read_only|interactive]",
+        summary: "Show or set the permission mode.",
+        detail: "Bare names the mode in effect and the spellings it takes. \
+                 A value is `/set permission_mode` in short — validated and \
+                 applied the same way — and it moves the running loop on the \
+                 spot: even mid-run, the very next tool call runs under it. \
+                 It is not saved the way a `/set` value is: the mode is \
+                 session state, it rides the session file, so a resume keeps \
+                 it, and the configuration's global default and the config \
+                 file never hear of it.",
+    },
+    Spec {
+        name: "permissions",
+        aliases: &[],
+        category: Category::Config,
+        arg: ArgShape::Optional,
+        usage: "/permissions [forget <n> | forget all | repair]",
+        summary: "Show the permission rules in force, forget one or all, or repair damage.",
+        detail: "Bare lists the rules the gate evaluates — the config's \
+                 [permissions] rules, then the session's remembered \
+                 allow-always answers, numbered. `forget <n>` takes \
+                 remembered rule n out of the memory and out of the \
+                 session's permissions file in the same motion, so that \
+                 work asks again the next time; `forget all` is the same \
+                 motion over every remembered rule at once. `repair` \
+                 clears a standing damage verdict — when the session's \
+                 permissions file was unreadable, the session runs failed \
+                 closed until this names the recovery. A configured rule \
+                 is the config file's own text; it changes there, not \
+                 here.",
+    },
+    Spec {
+        name: "preset",
+        aliases: &[],
+        category: Category::Config,
+        arg: ArgShape::Optional,
+        usage: "/preset [name]",
+        summary: "Select a [permissions.presets.<name>] bundle for this session.",
+        detail: "Bare lists the configured presets and marks the live one. \
+                 A name selects that bundle: its rules join the config layer \
+                 ahead of remembered approvals, so every covered call resolves \
+                 without prompting. The selection is process state — unlike \
+                 /mode it survives neither a restart nor a launch `--resume`; \
+                 start under one with `--permissions-preset`. The \
+                 configuration's own selection governs fresh sessions.",
     },
     Spec {
         name: "unset",
@@ -393,7 +448,9 @@ pub enum Command {
     /// End the session and start a fresh one (`/clear`, `/new`).
     ///
     /// Refused while a run holds the agent; at rest it rotates the
-    /// session identity and empties the transcript and queue.
+    /// session identity and empties the transcript and queue. The
+    /// session's permission-mode override ends with it — the fresh
+    /// session runs the configured default, live and on the record.
     Clear,
 
     /// Resume the saved session `target` names, or ask for an id.
@@ -439,6 +496,52 @@ pub enum Command {
         ///
         /// An unknown name is refused with the current palette kept.
         name: Option<String>,
+    },
+
+    /// Show the permission mode (`None`) or set it to `Some(spelling)`.
+    ///
+    /// The short door over `/set permission_mode`: the same machinery
+    /// validates, mirrors, and persists the value, so the two doors
+    /// cannot disagree; an unknown spelling is refused with the mode
+    /// kept.
+    Mode {
+        /// The mode to set, in a configuration spelling (`auto`,
+        /// `read_only`, `interactive` — the retired `plan`/
+        /// `accept_edits` spellings still load, migrated), or `None`
+        /// for the query half — bare
+        /// `/mode` names the mode in effect and the spellings it
+        /// takes, and changes nothing.
+        name: Option<String>,
+    },
+
+    /// Select a permission preset, or list the configured ones.
+    ///
+    /// Bare lists the configured presets and marks the live selection; a
+    /// name selects that bundle for this process, joining its rules into
+    /// the config layer ahead of remembered approvals. The selection is
+    /// process state — it never reaches the configuration file.
+    Preset {
+        /// The preset name to select, or `None` for the listing.
+        ///
+        /// `None` lists the configured presets and the live selection,
+        /// changing nothing; a name that matches no configured preset
+        /// is refused with the names available, and the selection
+        /// stands as it was.
+        name: Option<String>,
+    },
+
+    /// Show the permission rules in force, or forget one remembered rule.
+    ///
+    /// Bare lists the rules the gate evaluates — configured first, then
+    /// the session's remembered approvals, numbered. `forget <n>` takes
+    /// the remembered rule the listing numbers out of the memory and out
+    /// of the session's permissions file in one motion.
+    Permissions {
+        /// A `forget <n>` request as typed, or `None` for the listing.
+        ///
+        /// Kept as text so a mistyped request can be answered with the
+        /// spelling it wanted rather than a parse guess.
+        forget: Option<String>,
     },
 
     /// Show the configuration values in effect.
@@ -889,6 +992,38 @@ fn argument_candidates(name: &str, argument: &str, sources: CompletionSources<'_
             .map(|(_, level)| level.to_string())
             .collect();
     }
+    if name == "mode" {
+        let exact = argument.to_lowercase();
+        let Some(pool) = crate::config_fields::value_candidates("permission_mode") else {
+            return Vec::new();
+        };
+        let mut ranked: Vec<(MatchRank, &str)> = pool
+            .iter()
+            .filter(|mode| mode.to_lowercase() != exact)
+            .filter_map(|mode| match_rank(mode, argument).map(|rank| (rank, *mode)))
+            .collect();
+        ranked.sort_by_key(|&(rank, _)| rank);
+        return ranked
+            .into_iter()
+            .map(|(_, mode)| mode.to_string())
+            .collect();
+    }
+    if name == "permissions" {
+        let mut pool: Vec<&str> = vec!["forget", "repair"];
+        if argument.split_whitespace().next() == Some("forget") {
+            pool.push("forget all");
+        }
+        let mut ranked: Vec<(MatchRank, &str)> = pool
+            .iter()
+            .filter(|candidate| **candidate != argument)
+            .filter_map(|candidate| match_rank(candidate, argument).map(|rank| (rank, *candidate)))
+            .collect();
+        ranked.sort_by_key(|&(rank, _)| rank);
+        return ranked
+            .into_iter()
+            .map(|(_, candidate)| candidate.to_string())
+            .collect();
+    }
     let pool: &[String] = match name {
         "model" => sources.models,
         "theme" => sources.themes,
@@ -1041,6 +1176,15 @@ fn build_command(spec: &Spec, argument: &str) -> Parsed {
         "theme" => Command::Theme {
             name: non_empty(argument),
         },
+        "mode" => Command::Mode {
+            name: non_empty(argument),
+        },
+        "permissions" => Command::Permissions {
+            forget: non_empty(argument),
+        },
+        "preset" => Command::Preset {
+            name: non_empty(argument),
+        },
         "config" => Command::Config,
         "set" => match argument.split_once(char::is_whitespace) {
             Some((key, value)) => Command::Set {
@@ -1185,6 +1329,33 @@ mod tests {
     }
 
     #[test]
+    fn permissions_argument_completion_offers_both_verbs() {
+        // `/permissions ` completes its own vocabulary — the forget
+        // door and the repair door alike, so the recovery command a
+        // damage notice names is also the one Tab can finish.
+        let candidates = complete("/permissions ", sources());
+        assert!(
+            candidates.iter().any(|candidate| candidate == "forget"),
+            "forget completes: {candidates:?}"
+        );
+        assert!(
+            candidates.iter().any(|candidate| candidate == "repair"),
+            "repair completes — the recovery is discoverable: {candidates:?}"
+        );
+        assert_eq!(
+            complete("/permissions rep", sources()),
+            vec!["repair".to_string()],
+            "a typed fragment narrows to the repair alone"
+        );
+        assert_eq!(
+            complete("/permissions forget", sources()),
+            vec!["forget all".to_string()],
+            "once the verb is typed, the sweep completes — the bare verb is
+             the typed argument, so it filters itself out"
+        );
+    }
+
+    #[test]
     fn plain_text_without_a_leading_slash_is_not_a_command() {
         assert_eq!(parse("hello"), Parsed::NotACommand);
         assert_eq!(parse("type /clear in the docs"), Parsed::NotACommand);
@@ -1198,6 +1369,27 @@ mod tests {
             Parsed::Command(Command::Help { topic: None })
         );
         assert_eq!(parse("/clear"), Parsed::Command(Command::Clear));
+        assert_eq!(
+            parse("/mode"),
+            Parsed::Command(Command::Mode { name: None })
+        );
+        assert_eq!(
+            parse("/preset"),
+            Parsed::Command(Command::Preset { name: None }),
+            "bare /preset parses — the listing the detail promises"
+        );
+        assert_eq!(
+            parse("/preset rust-dev"),
+            Parsed::Command(Command::Preset {
+                name: Some("rust-dev".to_string()),
+            })
+        );
+        assert_eq!(
+            parse("/mode plan"),
+            Parsed::Command(Command::Mode {
+                name: Some("plan".to_string()),
+            })
+        );
         assert_eq!(parse("/models"), Parsed::Command(Command::Models));
         assert_eq!(parse("/config"), Parsed::Command(Command::Config));
         assert_eq!(parse("/compact"), Parsed::Command(Command::Compact));
@@ -1577,8 +1769,7 @@ mod tests {
             complete("/set permission_mode a", none),
             vec![
                 "auto".to_string(),
-                "accept_edits".to_string(),
-                "plan".to_string(),
+                "read_only".to_string(),
                 "interactive".to_string()
             ],
             "prefix matches lead, contains matches follow in pool order"

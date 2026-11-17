@@ -389,7 +389,7 @@ fn an_empty_thinking_delta_marks_the_stream_redacted() {
     observer.on_thinking_delta(&thinking(0, ""));
     let stream = kept.thinking.lock().expect("the thinking lock");
     assert!(stream.redacted, "an empty delta signals withheld reasoning");
-    assert!(stream.text.is_empty());
+    assert_eq!(stream.text, String::new(), "the stream carries no text");
 }
 
 #[test]
@@ -545,8 +545,7 @@ fn a_turn_end_queues_its_history_for_the_host() {
                 publication
                     .history
                     .first()
-                    .map(loopctl::message::Message::text_content)
-                    .unwrap_or_default(),
+                    .map_or_default(loopctl::message::Message::text_content),
             )
         })
         .collect();

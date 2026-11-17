@@ -43,11 +43,15 @@ use crate::observer::{
 };
 use crate::permission::PermissionRequest;
 use crate::question::QuestionPrompt;
-use crate::queue::{ResumedTokens, SessionCommand, SessionPick, SessionUpdate, Submission};
+use crate::queue::{
+    PermissionRule, ResumedTokens, SessionCommand, SessionPick, SessionUpdate, Submission,
+};
+use crate::splash;
 use crate::theme::Theme;
 use crate::todo_view;
 use crate::tool_render::SPINNER_FRAMES;
 use dch_config::Verbosity;
+use loopctl::middleware::PermissionResolution;
 
 /// The in-progress `Tab` completion cycle for a `/`-command line.
 ///
@@ -85,6 +89,15 @@ struct CompletionCycle {
     /// highlight follows the same index.
     index: usize,
 
+    /// Whether the cycle opened on the bare prefix — no fragment —
+    /// so its candidate list is the unfiltered whole.
+    ///
+    /// A cycle opened on a fragment (`/theme ligh`) freezes that
+    /// fragment's filtered list; returning to the bare prefix must
+    /// re-derive, not keep cycling the stale filter. Only a cycle that
+    /// opened bare holds the bare prefix.
+    bare: bool,
+
     /// The popup window's start row, scrolled only at the edges.
     ///
     /// The selection moves through a still list: the window shifts
@@ -111,14 +124,40 @@ fn popup_window(selected: usize, total: usize, shown_cap: usize) -> (usize, usiz
     (start, selected.saturating_sub(start))
 }
 
-/// The popup's rectangle: the composer's full width, floated directly
-/// above it as high as the content needs.
-fn popup_rect(input_area: Rect, height: u16) -> Rect {
+/// The popup's rectangle: the composer's full width, floated beside it
+/// as high or as low as the content needs.
+///
+/// `above` places the popup's bottom against the anchor's top — the
+/// docked composer's popup floats into the conversation above it —
+/// while `!above` places its top against the anchor's bottom, the
+/// welcome's choice: there the field sits under the art, and a popup
+/// above would cover the image the session opens on.
+fn popup_rect(input_area: Rect, height: u16, above: bool) -> Rect {
     Rect {
         x: input_area.x,
-        y: input_area.y.saturating_sub(height),
+        y: if above {
+            input_area.y.saturating_sub(height)
+        } else {
+            input_area.y.saturating_add(input_area.height)
+        },
         width: input_area.width.max(1),
         height,
+    }
+}
+
+/// The rows a popup may take on its chosen side of the anchor.
+///
+/// Above-placement clamps to the frame's top, below to its bottom,
+/// so a field near either edge sheds popup rows rather than painting
+/// past the buffer.
+fn popup_bound(frame: &Frame, input_area: Rect, above: bool) -> u16 {
+    if above {
+        input_area.y
+    } else {
+        frame
+            .area()
+            .height
+            .saturating_sub(input_area.y.saturating_add(input_area.height))
     }
 }
 
@@ -1196,11 +1235,36 @@ impl Sections {
     }
 }
 
+/// The welcome screen's lifecycle state, grouped off the app proper.
+///
+/// The fresh-session welcome — the fjord art over the composer — keeps
+/// the one bit of bookkeeping its lifetime needs: whether the
+/// conversation has ever held rows, retiring the screen for good.
+#[derive(Default)]
+struct WelcomeState {
+    /// Whether the conversation has ever held rows, retiring the
+    /// welcome.
+    ///
+    /// The splash belongs to the process's first breath: the latch
+    /// arms when the conversation first holds rows and never opens
+    /// again. `/clear` empties the pane but does not forget a session
+    /// happened — a cleared session meets the plain docked pane
+    /// instead of the fjord's return.
+    welcome_retired: bool,
+}
+
 /// The main TUI application.
 ///
 /// Owns the event loop, the input buffer, and the shared state
 /// background producers write through. Construct with
 /// [`TuiApp::new`], which allocates the shared state fresh.
+// The boolean budget is spent: three run-loop lifecycle toggles
+// (render-pending, cancel-armed, plan-interrupted) under the
+// owner-reviewed exception recorded in AGENTS.md, plus the permission
+// sheet's command-preview toggle — a view-state bit that belongs to
+// the sheet the panel already owns, not to a sub-struct it would have
+// to reach through on every keystroke.
+#[allow(clippy::struct_excessive_bools)]
 pub struct TuiApp {
     /// The active palette and element styles.
     ///
@@ -2034,6 +2098,17 @@ pub struct TuiApp {
     /// against the cancel signal.
     pending_permissions: std::collections::VecDeque<PermissionRequest>,
 
+    /// The reason being typed for the front permission ask, when the
+    /// sheet's `r` press opened the reason line.
+    ///
+    /// `None` is the sheet's ordinary posture — `y`/`a`/`d`/`n` answer
+    /// directly. `Some(buffer)` is the reason-entry mode: the sheet
+    /// owns every keystroke, Enter resolves the ask with
+    /// [`DenyWithFeedback`](loopctl::middleware::PermissionResolution::DenyWithFeedback)
+    /// (a trimmed-empty buffer plain-denies), and Esc returns to the
+    /// ordinary sheet with nothing resolved.
+    permission_reason: Option<String>,
+
     /// The channel permission requests arrive on, until `run` claims
     /// it.
     ///
@@ -2041,6 +2116,98 @@ pub struct TuiApp {
     /// select arm moves requests into the queue, so between runs the
     /// slot simply holds the receiver.
     permission_rx: Option<tokio::sync::mpsc::UnboundedReceiver<PermissionRequest>>,
+
+    /// The session's remembered permission prompts.
+    ///
+    /// The shared "allow always" memory: the same object the
+    /// permission resolver consults, so an answer the panel records
+    /// is honored by the very next ask. `Default` until the host
+    /// installs the session's own — asking still works, remembering
+    /// just goes nowhere the resolver can see.
+    permission_memory: crate::queue::PermissionMemory,
+
+    /// The remembered rules as the last `/permissions` listing
+    /// rendered them, in listing order — allow rules first, deny
+    /// after.
+    ///
+    /// `forget <n>` is keyed to what the user read, not to whatever
+    /// occupies the numbered position when the press lands: the
+    /// memory can move under a rendered listing — a queued
+    /// `/resume`'s adopt replaces the pair wholesale — so the press
+    /// matches the rendered rule's identity and, when nothing
+    /// matches, says the listing moved instead of removing a
+    /// stranger.
+    rendered_permission_rules: Vec<(bool, crate::queue::PermissionRule)>,
+
+    /// The configured-rule count the last `/permissions` listing
+    /// numbered its remembered rules past.
+    ///
+    /// `forget <n>` keys to what the user read, so the boundary
+    /// between configured and remembered rules is the listing's own
+    /// count, snapshotted here — a `/preset` that changes the
+    /// configured set between the listing and the press must not
+    /// re-number the rows under the number the user is about to name,
+    /// which would hand the press a stranger to remove.
+    permission_listing_configured: usize,
+
+    /// The permission mode and preset selection this session started
+    /// under.
+    ///
+    /// The stand-in a config save writes without a wired file
+    /// restores these — the boot-time pair, flag- or file-stated — so
+    /// a `/mode` or `/preset` swap rides no save into a file it
+    /// promised never to touch, while an initial `--permission-mode`
+    /// or `--permissions-preset` also rides no save *out* of one.
+    permission_session_start: (dch_config::PermissionMode, Option<String>),
+
+    /// Whether the permission sheet shows the command preview
+    /// expanded.
+    ///
+    /// `e` on the sheet toggles it: the collapsed sheet shows the
+    /// command's first rows, the expanded sheet its last — together
+    /// the two windows cover the command, and the destructive suffix
+    /// a head-only preview could hide is always one press away. The
+    /// toggle resets with the ask it read.
+    permission_command_expanded: bool,
+
+    /// The session's live permission mode, when the host wired one.
+    ///
+    /// The same cell the runner's gate re-reads on every dispatch;
+    /// `/mode` flips it in place, so a run in flight picks the new
+    /// mode up on its very next tool call. `None` in tests and
+    /// headless constructors — the loop command still carries the
+    /// move between turns.
+    permission_mode_cell: Option<dch_config::SharedPermissionMode>,
+
+    /// The live config-rules cell the loop's policy re-reads per
+    /// dispatch, mirroring [`Self::permission_mode_cell`].
+    ///
+    /// `/preset` swaps the contents on the spot; a host without a
+    /// lane (headless constructors) leaves it `None` and the loop
+    /// command still carries the selection between turns.
+    permission_config_rules_cell:
+        Option<std::sync::Arc<std::sync::Mutex<Vec<dch_permissions::Rule>>>>,
+
+    /// The live preset-selection cell the driver's fresh adoptions
+    /// re-seed from, mirroring [`Self::permission_config_rules_cell`].
+    ///
+    /// `/preset` records the selection here beside swapping the rules
+    /// cell, so a `/clear` rotation or a healthy resume compiles the
+    /// config layer at the selection in effect rather than the boot
+    /// config's own. A host without a lane leaves it `None` and the
+    /// selection rides the session config alone.
+    permission_preset_cell: Option<std::sync::Arc<std::sync::Mutex<Option<String>>>>,
+
+    /// The adoption guard the driver holds across its whole permission
+    /// adoptions, mirroring [`Self::permission_preset_cell`].
+    ///
+    /// `/preset` takes the same lock across its damage check and
+    /// rules write, so a live adoption — a resume landing damaged, a
+    /// `/clear` rotation — can never interleave with the swap: the
+    /// tightening an adoption installs cannot be overwritten by a
+    /// swap whose healthy check ran before it. A host without a lane
+    /// leaves it `None` and the swap stands alone, as it always did.
+    permission_adoption_guard: Option<std::sync::Arc<std::sync::Mutex<()>>>,
 
     /// Questions from the asking tool waiting for the user's answer,
     /// oldest first.
@@ -2058,6 +2225,20 @@ pub struct TuiApp {
     /// which question is shown — nothing already marked or typed is
     /// left behind on the way.
     pending_questions: std::collections::VecDeque<PendingQuestion>,
+
+    /// The welcome screen's lifecycle state — the retiring latch.
+    ///
+    /// Grouped as [`WelcomeState`] so the welcome layer's bookkeeping
+    /// reads as one thing; see the group's own docs for what the
+    /// latch does.
+    welcome: WelcomeState,
+
+    /// The band rect the last welcome frame painted, if it did.
+    ///
+    /// The art band's own geometry, recorded after each welcome frame:
+    /// the dissolve pins and the welcome's own tests read exactly
+    /// where the art stood, straight from the frame that painted it.
+    welcome_band: Option<ratatui::layout::Rect>,
 
     /// The saved-session picker `/sessions` opened, when it stands.
     ///
@@ -2310,6 +2491,7 @@ impl TuiApp {
             Theme::default()
         };
         let copy_command = config.display.copy_command.clone();
+        crate::terminal::set_splash_colors(config.display.splash_colors);
         let copy_outcomes: CopyOutcomes = Arc::new(std::sync::Mutex::new(Vec::new()));
         let copier_outcomes = Arc::clone(&copy_outcomes);
         let copy_attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -2416,8 +2598,20 @@ impl TuiApp {
             queue_posture: QueuePosture::Standing,
             queue_mode: QueueMode::Plain,
             pending_permissions: std::collections::VecDeque::new(),
+            permission_reason: None,
+            permission_command_expanded: false,
             permission_rx: None,
+            permission_memory: crate::queue::PermissionMemory::default(),
+            rendered_permission_rules: Vec::new(),
+            permission_listing_configured: 0,
+            permission_session_start: boot_permission_pair(&config),
+            permission_mode_cell: None,
+            permission_config_rules_cell: None,
+            permission_preset_cell: None,
+            permission_adoption_guard: None,
             pending_questions: std::collections::VecDeque::new(),
+            welcome: WelcomeState::default(),
+            welcome_band: None,
             session_picker: None,
             model_picker: None,
             question_view: 0,
@@ -2531,7 +2725,14 @@ impl TuiApp {
                 id,
                 transcript,
                 tokens,
-            } => self.adopt_resumed_session(id, transcript, tokens),
+                permission_mode,
+            } => {
+                self.config.runner.permission_mode = permission_mode;
+                self.adopt_resumed_session(id, transcript, tokens);
+            }
+            SessionUpdate::PermissionMode { mode } => {
+                self.config.runner.permission_mode = mode;
+            }
             SessionUpdate::Notice { text } => self.post_notice(text),
             SessionUpdate::SessionCatalog { rows } => self.open_session_picker(rows),
         }
@@ -2603,13 +2804,18 @@ impl TuiApp {
     /// just ended), releases the summary debts the replaced conversation
     /// still owed (their indexes name rows the replacement removes), and
     /// restores the session's token accounting so the counters continue
-    /// the saved session's story instead of restarting at zero.
+    /// the saved session's story instead of restarting at zero. The
+    /// session-scoped mode override dies with the conversation it was
+    /// recorded against: the adopted session's own mode stands, and
+    /// `/unset permission_mode` in it must not resurrect the previous
+    /// session's original.
     fn adopt_resumed_session(
         &mut self,
         id: String,
         transcript: Vec<TuiMessage>,
         tokens: ResumedTokens,
     ) {
+        self.config_overrides.remove("permission_mode");
         self.compaction_summary_owed.clear();
         self.conversation.clear();
         self.seed_messages(transcript);
@@ -2679,6 +2885,9 @@ impl TuiApp {
             Command::Models => self.list_models_command(),
             Command::Config => self.show_config_command(),
             Command::Set { key, value } => self.set_config_command(&key, &value),
+            Command::Mode { name } => self.mode_command(name.as_deref()),
+            Command::Permissions { forget } => self.permissions_command(forget.as_deref()),
+            Command::Preset { name } => self.preset_command(name.as_deref()),
             Command::Unset { key } => self.unset_config_command(&key),
             Command::Compact => self.compact_command(),
             Command::Exit => self.exit_command(),
@@ -2842,7 +3051,8 @@ impl TuiApp {
         self.push_message(TuiMessage::System {
             text:
                 "The theme, verbosity, caret_display, diff_layout, diff_palette, strip_position, \
-                   strip_style, path_style, and copy_command rows change live; the rest \
+                   strip_style, path_style, and copy_command rows change live, and permission_mode \
+                   moves live too — the session remembers it; the rest \
                    are read at startup. /set <key> <value> · /unset <key> · /config shows the \
                    value in effect."
                     .to_string(),
@@ -2865,10 +3075,13 @@ impl TuiApp {
     /// when dch starts" — rather than implying a liveness nothing
     /// delivers. `/config` shows the value actually in effect.
     ///
-    /// The model is the exception worth naming: the live conversation's model
+    /// The model is one exception worth naming: the live conversation's model
     /// *can* be moved between turns, but through `/model`, which drives the
     /// running client — so `/set model X` is sugar for `/model X` rather than a
-    /// silent config edit that would not reach the loop.
+    /// silent config edit that would not reach the loop. `permission_mode` is
+    /// the other: it lands in the session's own config only — the base and
+    /// the file never hear of it — because the session file carries the mode
+    /// a resume re-seats.
     fn set_config_command(&mut self, key: &str, value: &str) {
         if key == "model" {
             self.switch_model_command(value);
@@ -2882,7 +3095,11 @@ impl TuiApp {
             ));
             return;
         }
-        let persisted = self.config_file.as_ref().unwrap_or(&self.config);
+        let persisted = if key == "permission_mode" {
+            &self.config
+        } else {
+            self.config_file.as_ref().unwrap_or(&self.config)
+        };
         if !self.config_overrides.contains_key(key) {
             let original = if config_fields::is_absent(persisted, key) {
                 None
@@ -2896,11 +3113,14 @@ impl TuiApp {
             self.post_notice(format!("could not set {key}: {why}"));
             return;
         }
-        if let Some(base) = self.config_base.as_mut() {
-            let _mirror = config_fields::set(base, key, value);
-        }
-        if let Some(file) = self.config_file.as_mut() {
-            let _mirror = config_fields::set(file, key, value);
+        let session_scoped = key == "permission_mode";
+        if !session_scoped {
+            if let Some(base) = self.config_base.as_mut() {
+                let _mirror = config_fields::set(base, key, value);
+            }
+            if let Some(file) = self.config_file.as_mut() {
+                let _mirror = config_fields::set(file, key, value);
+            }
         }
         self.apply_live_config(key);
         let shown = if config_fields::is_secret(key) && !value.is_empty() && value != "unset" {
@@ -2910,12 +3130,501 @@ impl TuiApp {
         };
         if matches!(config_fields::live(key), Some(config_fields::Live::Display)) {
             self.post_notice(format!("{key} = {shown} — applied now"));
+        } else if key == "permission_mode" {
+            // The echo names the canonical spelling in force: a
+            // retired alias (`plan`) lands as its replacement
+            // (`read-only`), and the notice must not teach the alias
+            // as if it stuck.
+            self.post_notice(format!(
+                "{key} = {} — applies live, the next tool call runs under it; \
+                 this session remembers it",
+                self.config.runner.permission_mode.as_str()
+            ));
         } else {
             self.post_notice(format!(
                 "{key} = {shown} — saved; read when dch starts, so it applies next session"
             ));
         }
-        self.persist_config(key);
+        if key == "permission_mode" {
+            self.move_permission_mode_live();
+        }
+        if !session_scoped {
+            self.persist_config(key);
+        }
+    }
+
+    /// `/permissions` — the rules in force, the way to drop one or
+    /// all, and the damage marker's one door out.
+    ///
+    /// Bare lists configured and remembered rules, the gate's precedence
+    /// order in the listing's own order. `forget <n>` takes the numbered
+    /// remembered rule out of the memory and out of the session's
+    /// permissions file in one motion, so that work asks again the next
+    /// time; `forget all` is the same motion over every remembered rule
+    /// at once. A configured rule is the config file's own text and says
+    /// so instead of pretending it can be dropped here. `repair` clears
+    /// a standing damage verdict — the fail-closed posture a damaged
+    /// restore armed — and re-seeds the config rules as configured.
+    fn permissions_command(&mut self, forget: Option<&str>) {
+        let Some(requested) = forget else {
+            self.post_permissions_listing();
+            return;
+        };
+        if requested.trim() == "repair" {
+            self.repair_permission_damage();
+            return;
+        }
+        let Some(number) = requested.trim().strip_prefix("forget ") else {
+            self.post_notice(
+                "usage: /permissions [forget <n> | forget all | repair] — n is a remembered \
+                 rule's number from the listing"
+                    .to_string(),
+            );
+            return;
+        };
+        if number.trim() == "all" {
+            let remembered = self
+                .permission_memory
+                .allow_rules()
+                .len()
+                .saturating_add(self.permission_memory.deny_rules().len());
+            if remembered == 0 {
+                self.post_notice(
+                    "nothing remembered to forget — /permissions lists what is recorded"
+                        .to_string(),
+                );
+                return;
+            }
+            self.permission_memory.forget_all();
+            self.push_message(TuiMessage::System {
+                text: format!(
+                    "Forgot all {remembered} remembered rules — that work asks again \
+                     the next time."
+                ),
+                timestamp: chrono::Utc::now(),
+            });
+            return;
+        }
+        let Ok(shown) = number.trim().parse::<usize>() else {
+            self.post_notice(format!(
+                "{number:?} is not a rule number — /permissions lists what is recorded"
+            ));
+            return;
+        };
+        if shown == 0 {
+            self.post_notice(format!(
+                "no remembered rule {shown} — /permissions lists what is recorded"
+            ));
+            return;
+        }
+        let configured = self.permission_listing_configured;
+        if shown <= configured {
+            self.post_notice(format!(
+                "rule {shown} is configured — change it in the config file, not here"
+            ));
+            return;
+        }
+        let Some((was_allow, rendered)) = self
+            .rendered_permission_rules
+            .get(shown.saturating_sub(configured.saturating_add(1)))
+            .cloned()
+        else {
+            self.post_notice(format!(
+                "no remembered rule {shown} — /permissions lists what is recorded"
+            ));
+            return;
+        };
+        let Some(removed) = self.permission_memory.forget_matching(was_allow, &rendered) else {
+            self.post_notice(format!(
+                "rule {shown} is no longer remembered as rendered — the remembered \
+                 list moved; run /permissions to list what is recorded now"
+            ));
+            return;
+        };
+        self.push_message(TuiMessage::System {
+            text: format!(
+                "Forgot remembered permission — {} asks again the next time.",
+                removed.remember_phrase()
+            ),
+            timestamp: chrono::Utc::now(),
+        });
+    }
+
+    /// The damage row a `/permissions` listing leads with while the
+    /// verdict stands.
+    ///
+    /// The listing's own restatement of the posture — inspection
+    /// output, shown on demand and never pushed by the session's own
+    /// motion: the launch and adoption announcements are transient
+    /// notices (a status, not conversation history), the durable
+    /// record is the marker inside the permissions file, and this row
+    /// names both the posture and the one command that clears it.
+    fn push_permission_damage_row(&mut self, now: chrono::DateTime<chrono::Utc>) {
+        self.push_message(TuiMessage::System {
+            text: "the saved permissions are damaged — remembered rules were dropped; \
+                   side effects ask, and the configured rules stay tightened, until \
+                   /permissions repair (the damage marker rides inside the permissions \
+                   file — hand-fixing the file leaves it standing)"
+                .to_string(),
+            timestamp: now,
+        });
+    }
+
+    /// `/permissions repair` — the standing damage verdict's one
+    /// door out of the session that earned it.
+    ///
+    /// A damaged restore arms a posture — the asking mode, the
+    /// tightened config rules, the marker that re-arms both on every
+    /// launch and rides every save — and nothing the run does clears
+    /// it: not the re-answers, which record real choices without
+    /// resurrecting the refusals the damage lost. Only the wholesale
+    /// endings do — a `/clear` rotation and a resume into a healthy
+    /// session adopt a fresh memory, and the driver re-seeds the
+    /// config-rules cell beside each, because a posture belongs to
+    /// the session that earned it. Within the damaged session, the
+    /// repair is the explicit recovery the notices name: the marker
+    /// clears, and the config-rules cell re-seeds from the
+    /// configuration's own join, so the configured allows return
+    /// exactly as written. The mode stays where it stands — the
+    /// user's to move with `/mode` as ever, because a posture is not
+    /// a config value. The whole repair runs under the driver's
+    /// adoption guard — the same lock a live resume or `/clear`
+    /// adoption holds across its whole motion — so a concurrent
+    /// adoption cannot land between the verdict's clearing and the
+    /// cell's re-seed and leave the fresh posture tightened under
+    /// rules this repair never meant to loosen.
+    fn repair_permission_damage(&mut self) {
+        if !self.permission_memory.damage_standing() {
+            self.post_notice("nothing to repair — the saved permissions read whole".to_string());
+            return;
+        }
+        let adoption = self.permission_adoption_guard.clone();
+        let _held = adoption.as_ref().map(|guard| {
+            guard
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
+        self.permission_memory.clear_damage();
+        let rules = self.config.permissions.engine_rules();
+        if let Some(cell) = &self.permission_config_rules_cell {
+            cell.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone_from(&rules);
+        }
+        self.post_notice(
+            "repaired — the configured permission rules are in force again".to_string(),
+        );
+    }
+
+    /// Post the `/permissions` listing: configured rules, then the
+    /// session's remembered ones, numbered for `forget`.
+    fn post_permissions_listing(&mut self) {
+        let now = chrono::Utc::now();
+        let configured: Vec<String> = self
+            .config
+            .permissions
+            .rules
+            .iter()
+            .map(dch_config::PermissionRuleConfig::summary_line)
+            .collect();
+        let selected_preset = self.config.permissions.preset.clone();
+        let mut preset_lines: Vec<String> = Vec::new();
+        if let Some(name) = &selected_preset
+            && let Some(preset) = self.config.permissions.presets.get(name)
+        {
+            for rule in &preset.rules {
+                preset_lines.push(format!("{} — from preset {name}", rule.summary_line()));
+            }
+        }
+        let allow_snapshot = self.permission_memory.allow_rules();
+        let deny_snapshot = self.permission_memory.deny_rules();
+        self.rendered_permission_rules = allow_snapshot
+            .iter()
+            .cloned()
+            .map(|rule| (true, rule))
+            .chain(deny_snapshot.iter().cloned().map(|rule| (false, rule)))
+            .collect();
+        self.permission_listing_configured = configured.len().saturating_add(preset_lines.len());
+        let allowed: Vec<String> = allow_snapshot
+            .iter()
+            .map(PermissionRule::remember_phrase)
+            .collect();
+        let denied: Vec<String> = deny_snapshot
+            .iter()
+            .map(PermissionRule::remember_phrase)
+            .collect();
+        if configured.is_empty()
+            && preset_lines.is_empty()
+            && allowed.is_empty()
+            && denied.is_empty()
+        {
+            if self.permission_memory.damage_standing() {
+                self.push_permission_damage_row(now);
+            } else {
+                self.push_message(TuiMessage::System {
+                    text: "no permission rules in force — an allow-always or deny-always \
+                           answer records one, and [permissions] in the config pre-seeds more"
+                        .to_string(),
+                    timestamp: now,
+                });
+            }
+            return;
+        }
+        if self.permission_memory.damage_standing() {
+            self.push_permission_damage_row(now);
+        }
+        let configured_lines: Vec<String> = configured
+            .iter()
+            .cloned()
+            .chain(preset_lines.iter().cloned())
+            .collect();
+        if !configured_lines.is_empty() {
+            let header = match &selected_preset {
+                Some(name) => format!(
+                    "Permission rules configured (the config file's rules and the \
+                     selected preset \"{name}\" — change them there):"
+                ),
+                None => "Permission rules configured (in the config file — change them \
+                       there):"
+                    .to_string(),
+            };
+            self.push_message(TuiMessage::System {
+                text: header,
+                timestamp: now,
+            });
+            for (position, line) in (1..=configured_lines.len()).zip(&configured_lines) {
+                self.push_message(TuiMessage::System {
+                    text: format!("  {position}. {line}"),
+                    timestamp: now,
+                });
+            }
+        }
+        let allow_base = configured_lines.len();
+        let list_section = |app: &mut Self, header: &str, items: &[String], offset: usize| {
+            if items.is_empty() {
+                return;
+            }
+            app.push_message(TuiMessage::System {
+                text: header.to_string(),
+                timestamp: now,
+            });
+            for (position, phrase) in (offset.checked_add(1).unwrap_or(0)
+                ..=offset.checked_add(items.len()).unwrap_or(0))
+                .zip(items)
+            {
+                app.push_message(TuiMessage::System {
+                    text: format!("  {position}. {phrase}"),
+                    timestamp: now,
+                });
+            }
+        };
+        list_section(
+            self,
+            "Always allowed this session — /permissions forget <n> drops one:",
+            &allowed,
+            allow_base,
+        );
+        let deny_base = allow_base.checked_add(allowed.len()).unwrap_or(0);
+        list_section(
+            self,
+            "Always denied this session — /permissions forget <n> drops one:",
+            &denied,
+            deny_base,
+        );
+    }
+
+    /// `/preset` — the permission presets' own door.
+    ///
+    /// Bare lists the configured presets and marks the live selection; a
+    /// name swaps the session's selection. The swap is process state,
+    /// unlike `/mode`: it lives in the session's own config and the
+    /// shared rules cell — the loop's policy re-reads the preset join
+    /// per evaluation — and never reaches the configuration file, so a
+    /// restart or a launch `--resume` starts under the configuration's
+    /// own selection. The selection also rides the shared preset
+    /// cell, so the driver's fresh adoptions — a `/clear`, a healthy
+    /// resume — re-seed at the selection in effect, never the boot
+    /// one. While a damage verdict stands the swap records the
+    /// selection and holds: the config layer stays tightened until
+    /// `/permissions repair` re-seeds it as chosen. The swap runs
+    /// under the driver's adoption guard — the same lock a live
+    /// adoption holds across its whole motion — so the two can never
+    /// interleave: a damaged adoption cannot land between the swap's
+    /// damage check and its rules write.
+    fn preset_command(&mut self, name: Option<&str>) {
+        let Some(selected) = name else {
+            let names: Vec<&str> = self
+                .config
+                .permissions
+                .presets
+                .keys()
+                .map(String::as_str)
+                .collect();
+            if names.is_empty() {
+                self.post_notice(
+                    "no [permissions.presets] configured — add one to the config file".to_string(),
+                );
+            } else {
+                let live = self
+                    .config
+                    .permissions
+                    .preset
+                    .as_deref()
+                    .unwrap_or("(none)");
+                self.post_notice(format!("presets: {} — selected: {live}", names.join(", ")));
+            }
+            return;
+        };
+        if !self.config.permissions.presets.contains_key(selected) {
+            let names: Vec<&str> = self
+                .config
+                .permissions
+                .presets
+                .keys()
+                .map(String::as_str)
+                .collect();
+            let available = if names.is_empty() {
+                "(none configured)".to_string()
+            } else {
+                names.join(", ")
+            };
+            self.post_notice(format!("no preset {selected:?} — configured: {available}"));
+            return;
+        }
+        self.config.permissions.preset = Some(selected.to_string());
+        let adoption = self.permission_adoption_guard.clone();
+        let _held = adoption.as_ref().map(|guard| {
+            guard
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
+        if let Some(cell) = &self.permission_preset_cell {
+            *cell
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(selected.to_string());
+        }
+        if self.permission_memory.damage_standing() {
+            self.post_notice(format!(
+                "preset {selected:?} selected — its rules wait for /permissions repair"
+            ));
+            return;
+        }
+        let rules = self.config.permissions.engine_rules();
+        if let Some(cell) = &self.permission_config_rules_cell {
+            cell.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone_from(&rules);
+        } else {
+            self.post_notice("the loop adopts the selection on its next rebuild".to_string());
+        }
+        self.post_notice(format!(
+            "preset {selected:?} selected — its rules join the config layer"
+        ));
+    }
+
+    /// `/mode` — the permission mode's own short door.
+    ///
+    /// Bare names the mode in effect and the spellings it takes; a
+    /// value rides [`Self::set_config_command`] — validation and the
+    /// override ledger — and then moves live: the shared cell the gate
+    /// re-reads per dispatch flips on the spot, so even mid-run the
+    /// next tool call runs under the new mode. The file mirror and the
+    /// persist are skipped for this key — the session file carries the
+    /// mode, and the config file never hears of it. A rebuild that
+    /// cannot stand hands the old mode back to the cell — the driver
+    /// writes that direction — and the notice names the mode kept.
+    fn mode_command(&mut self, name: Option<&str>) {
+        match name {
+            Some(value) => self.set_config_command("permission_mode", value),
+            None => self.post_notice(format!(
+                "mode is {} — /mode <auto|read_only|interactive>",
+                self.config.runner.permission_mode.as_str()
+            )),
+        }
+    }
+
+    /// Move the live permission mode: the shared cell and the
+    /// driver's rebuild, from the config the panel holds.
+    ///
+    /// `/mode` and `/unset permission_mode` share the whole live path:
+    /// the cell the gate re-reads per dispatch flips on the spot — the
+    /// flip buys the in-flight turn's next dispatch the new mode — and
+    /// the driver rebuilds the loop under the mode the config now
+    /// names, a rebuild whose failure is the driver's to undo, from
+    /// the loop's own config. Skipping any half of it leaves the
+    /// display naming one mode while the gate enforces another.
+    fn move_permission_mode_live(&mut self) {
+        if let Some(cell) = self.permission_mode_cell.as_ref() {
+            *cell
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                self.config.runner.permission_mode;
+        }
+        self.send_command(SessionCommand::Mode {
+            mode: self.config.runner.permission_mode,
+        });
+    }
+
+    /// Install the session's remembered-permission memory.
+    ///
+    /// The host's wiring: the same object the permission resolver
+    /// consults, so an "allow always" answer the panel records is
+    /// honored by the very next ask — before any file round-trip.
+    pub fn set_permission_memory(&mut self, memory: crate::queue::PermissionMemory) {
+        self.permission_memory = memory;
+    }
+
+    /// Install the session's live permission-mode cell.
+    ///
+    /// The host's wiring: the same cell the runner's gate re-reads on
+    /// every dispatch, so `/mode` flips the mode the loop enforces on
+    /// the spot — mid-run included.
+    pub fn set_permission_mode_cell(&mut self, mode: Option<dch_config::SharedPermissionMode>) {
+        self.permission_mode_cell = mode;
+    }
+
+    /// Install the live config-rules cell the loop's policy re-reads
+    /// per dispatch.
+    ///
+    /// The host's wiring: `/preset` swaps the cell's contents, and the
+    /// gate evaluates the new join on the very next dispatch.
+    pub fn set_permission_config_rules_cell(
+        &mut self,
+        cell: Option<std::sync::Arc<std::sync::Mutex<Vec<dch_permissions::Rule>>>>,
+    ) {
+        self.permission_config_rules_cell = cell;
+    }
+
+    /// Install the live preset-selection cell the driver's fresh
+    /// adoptions re-seed from.
+    ///
+    /// The host's wiring: `/preset` records the selection, and the
+    /// next `/clear` or healthy resume compiles the config layer at
+    /// it — a live swap cannot be reverted by an adoption that only
+    /// knows the boot config.
+    pub fn set_permission_preset_cell(
+        &mut self,
+        cell: Option<std::sync::Arc<std::sync::Mutex<Option<String>>>>,
+    ) {
+        self.permission_preset_cell = cell;
+    }
+
+    /// Install the adoption guard the driver's permission adoptions
+    /// hold, so a `/preset` swap serializes against them.
+    ///
+    /// The host's wiring: the swap's damage check and rules write run
+    /// under the same lock a resume or `/clear` adoption holds across
+    /// its whole motion — verdict, mode, rules — closing the window
+    /// where a damaged adoption lands between the check and the write
+    /// and the swap's configured allows overwrite the tightening it
+    /// installed. The `/preset` swap takes the guard before the preset
+    /// and rules locks, matching the driver's order, so the two
+    /// cannot deadlock either.
+    pub fn set_permission_adoption_guard(
+        &mut self,
+        guard: Option<std::sync::Arc<std::sync::Mutex<()>>>,
+    ) {
+        self.permission_adoption_guard = guard;
     }
 
     /// Point live config changes at a directory to persist into.
@@ -2963,11 +3672,29 @@ impl TuiApp {
     /// value applied nothing this session and, unsaved, applies nothing
     /// next start either. The failure never rolls the session's own
     /// value back.
+    ///
+    /// When no config file is wired — an embedder host — the save
+    /// serializes the live config through a stand-in that first
+    /// restores the session-scoped fields, the permission mode and
+    /// the preset selection, to the pair this session started under:
+    /// a `/mode` or `/preset` swap must not ride the save into a file
+    /// it promised never to touch, and an initial flag-stated pair
+    /// must not ride the save *out* of one either.
     fn persist_config(&mut self, key: &str) {
         let Some(dir) = self.config_persist_dir.clone() else {
             return;
         };
-        let to_save = self.config_file.as_ref().unwrap_or(&self.config);
+        let to_save = if let Some(file) = self.config_file.as_ref() {
+            file.clone()
+        } else {
+            let mut stand_in = self.config.clone();
+            stand_in.runner.permission_mode = self.permission_session_start.0;
+            stand_in
+                .permissions
+                .preset
+                .clone_from(&self.permission_session_start.1);
+            stand_in
+        };
         if let Err(why) = to_save.save_to_dir(&dir) {
             match config_fields::live(key) {
                 Some(config_fields::Live::Display) => self.post_notice(format!(
@@ -2988,6 +3715,11 @@ impl TuiApp {
     /// session and in the file alike: the restore writes through, or a
     /// restart would resurrect the override the user just removed. A key
     /// that was never overridden says so rather than quietly rewriting it.
+    /// `permission_mode` is the exception, exactly as on the set side: the
+    /// key is session-scoped, so its unset restores the live value alone —
+    /// the base and file mirrors and the save stay untouched, or the
+    /// session's mode would overwrite the file's configured one for every
+    /// later launch.
     fn unset_config_command(&mut self, key: &str) {
         let Some(original) = self.config_overrides.remove(key) else {
             self.post_notice(format!("{key} has no session override to undo"));
@@ -3002,28 +3734,36 @@ impl TuiApp {
             self.post_notice(format!("could not restore {key}: {why}"));
             return;
         }
-        if let Some(base) = self.config_base.as_mut() {
-            match original.as_deref() {
-                None => {
-                    let _mirror = config_fields::clear(base, key);
+        let session_scoped = key == "permission_mode";
+        if !session_scoped {
+            if let Some(base) = self.config_base.as_mut() {
+                match original.as_deref() {
+                    None => {
+                        let _mirror = config_fields::clear(base, key);
+                    }
+                    Some(value) => {
+                        let _mirror = config_fields::set(base, key, value);
+                    }
                 }
-                Some(value) => {
-                    let _mirror = config_fields::set(base, key, value);
+            }
+            if let Some(file) = self.config_file.as_mut() {
+                match original.as_deref() {
+                    None => {
+                        let _mirror = config_fields::clear(file, key);
+                    }
+                    Some(value) => {
+                        let _mirror = config_fields::set(file, key, value);
+                    }
                 }
             }
         }
-        if let Some(file) = self.config_file.as_mut() {
-            match original.as_deref() {
-                None => {
-                    let _mirror = config_fields::clear(file, key);
-                }
-                Some(value) => {
-                    let _mirror = config_fields::set(file, key, value);
-                }
-            }
+        if key == "permission_mode" {
+            self.move_permission_mode_live();
         }
         self.apply_live_config(key);
-        self.persist_config(key);
+        if !session_scoped {
+            self.persist_config(key);
+        }
         let shown = if original.is_none() {
             "unset — an environment credential takes over again".to_string()
         } else if config_fields::is_secret(key) {
@@ -3193,13 +3933,13 @@ impl TuiApp {
 
     /// Open the saved-session picker on a catalog the driver listed.
     ///
-    /// The `/sessions` answer's display half: an empty catalog is
-    /// itself the answer — nothing saved yet — and is said aloud
-    /// rather than opening an empty sheet; anything else seats the
-    /// cursor on the newest conversation.
+    /// The `/sessions` answer's display half: an empty catalog opens
+    /// nothing and says nothing — the picker itself is the command's
+    /// whole answer, and a sheet with no rows to walk is no answer —
+    /// while anything else seats the cursor on the newest
+    /// conversation.
     fn open_session_picker(&mut self, rows: Vec<SessionPick>) {
         if rows.is_empty() {
-            self.post_notice("no saved sessions yet — a session saves as it runs".to_string());
             return;
         }
         self.session_picker = Some(SessionPicker { rows, cursor: 0 });
@@ -3210,8 +3950,9 @@ impl TuiApp {
     /// The display's `/sessions` half is the ask: the sessions root
     /// lives on the driver's side of the crate boundary, so the list
     /// travels as a command and the catalog comes back as an update
-    /// that opens the picker. Refused while a run holds the agent,
-    /// like every conversation-moving command.
+    /// that opens the picker. The ask itself posts nothing — the
+    /// picker's arrival is the answer. Refused while a run holds the
+    /// agent, like every conversation-moving command.
     fn sessions_command(&mut self) {
         if self.state.agent_running.load(Ordering::SeqCst) {
             self.post_notice(
@@ -3220,7 +3961,6 @@ impl TuiApp {
             return;
         }
         self.send_command(SessionCommand::ListSessions);
-        self.post_notice("reading the saved sessions…".to_string());
     }
 
     /// List every compiled-in theme, marking the live one.
@@ -3651,7 +4391,10 @@ impl TuiApp {
             );
             return;
         }
+        self.permission_memory.adopt(Vec::new(), Vec::new(), false);
+        self.config_overrides.remove("permission_mode");
         self.compaction_summary_owed.clear();
+        self.latest_todos.clear();
         self.conversation.clear();
         self.conversation_generation = self.conversation_generation.saturating_add(1);
         self.selection = None;
@@ -3753,19 +4496,19 @@ impl TuiApp {
     ///
     /// Both walkways (the arrows and Tab) apply the row they land on
     /// into the composer, so a cycle holds exactly while the composer
-    /// spells one of its own states: the prefix a browse opened on
-    /// (`/theme ` with nothing chosen) or the prefix plus one of its
-    /// candidates — and, either way, no whitespace past the prefix:
-    /// the caret is still inside the word the cycle completes. A
-    /// space retires the cycle — the command-word cycle that walked
-    /// `/` to `/theme` is one word past its own domain at `/theme `,
-    /// and the keys must re-derive against what the popup suggests
-    /// there, never keep cycling commands. Any other text — an edit,
+    /// spells one of its own states: the bare prefix, and only for a
+    /// cycle that opened bare (a cycle opened on a fragment carries
+    /// that fragment's filtered list, and the bare prefix owes a
+    /// re-derive), or the prefix plus one of its candidates — the
+    /// applied rows. Anything else — a hand-built fragment, an edit,
     /// a different word — retires the cycle and the popup re-derives
-    /// from the new line.
+    /// from the new line: typing `ligh` after a bare-prefix walk must
+    /// filter, never keep cycling the whole palette.
     fn cycle_holds_the_line(cycle: &CompletionCycle, line: &str) -> bool {
-        line.strip_prefix(&cycle.prefix)
-            .is_some_and(|rest| !rest.contains(char::is_whitespace))
+        line.strip_prefix(&cycle.prefix).is_some_and(|rest| {
+            rest.is_empty() && cycle.bare
+                || cycle.candidates.iter().any(|candidate| candidate == rest)
+        })
     }
 
     /// Tab on a command line, in either direction: `BackTab` and
@@ -3882,7 +4625,12 @@ impl TuiApp {
         let line = self.input.text().to_string();
         let len = candidates.len();
         let current = match &self.completion {
-            Some(cycle) if cycle.prefix == prefix && Self::cycle_holds_the_line(cycle, &line) => {
+            Some(cycle)
+                if cycle.prefix == prefix
+                    && line
+                        .strip_prefix(&cycle.prefix)
+                        .is_some_and(|rest| !rest.contains(char::is_whitespace)) =>
+            {
                 cycle.index
             }
             _ => 0,
@@ -3900,10 +4648,12 @@ impl TuiApp {
             return true;
         }
         let applied = candidates.get(index).map(|row| format!("{prefix}{row}"));
+        let bare = line.strip_prefix(&prefix).is_some_and(str::is_empty);
         self.completion = Some(CompletionCycle {
             prefix,
             candidates,
             index,
+            bare,
             window_start: self
                 .completion
                 .as_ref()
@@ -4020,6 +4770,7 @@ impl TuiApp {
         }
         let line = self.input.text().to_string();
         let mut carried_window = self.completion.as_ref().map_or(0, |c| c.window_start);
+        let mut carried_bare = false;
         let (mut prefix, mut candidates, mut index) = match self.completion.clone() {
             Some(cycle) => {
                 if Self::cycle_holds_the_line(&cycle, &line) {
@@ -4033,6 +4784,7 @@ impl TuiApp {
                             .and_then(|next| next.checked_rem(len))
                             .unwrap_or(0)
                     };
+                    carried_bare = cycle.bare;
                     (cycle.prefix, cycle.candidates, next)
                 } else {
                     self.fresh_completion(&line)
@@ -4055,6 +4807,7 @@ impl TuiApp {
                 candidates = arg_candidates;
                 index = arg_index;
                 carried_window = 0;
+                carried_bare = true;
             }
         }
         let Some(chosen) = candidates.get(index).cloned() else {
@@ -4070,11 +4823,13 @@ impl TuiApp {
         } else {
             carried_window.min(total.saturating_sub(POPUP_SHOWN))
         };
+        let bare = carried_bare || line.strip_prefix(&prefix).is_some_and(str::is_empty);
         self.input.set_text(prefix.clone() + &chosen);
         self.completion = Some(CompletionCycle {
             prefix,
             candidates,
             index,
+            bare,
             window_start,
         });
         self.preview_theme_from_completion();
@@ -4279,35 +5034,10 @@ impl TuiApp {
         if !self.cancel_run_in_flight() {
             return;
         }
-        // One frame the moment the fire lands: the screen shows the
-        // cancel's record at once — the manual sequence's own
-        // feedback, which is what makes its wait feel live — and the
-        // wait that follows reads as the exit doing its work rather
-        // than a freeze.
-        // The snapshot precedes even the feedback frame: the frame's
-        // own render drains, and a record that landed in that drain
-        // must count as landed — the check below scans from here.
         let before = self.conversation.len();
         drop(terminal.draw(|frame| self.render(frame)));
-        // The exit does not wait for the engine to unwind: the manual
-        // sequence's cancel unwinds in the background of a live UI,
-        // and the fire's exit owes the same immediacy. What the
-        // unwind would have landed, the exit lands itself — the lanes
-        // as they stood, the record row, the flush — and the
-        // teardown's bounded abort handles whatever the engine is
-        // still doing.
-        //
-        // The lanes first, exactly as they stood at the fire: the
-        // thinking on screen rides ahead of whatever lands next, so
-        // the transcript reads [prompt, the work so far, the record]
-        // in the order the run actually happened.
         self.capture_live_lanes_at_exit();
-        // One drain: whatever the cancel resolved before the exit got
-        // here — an instant settle's record row, a completed turn's
-        // graduation — lands now, behind the captured lanes.
         self.drain_shared_state();
-        // The record the manual sequence always has, deterministically:
-        // only when neither the drain nor anything else landed one.
         let record_landed = self.conversation.get(before..).is_some_and(|landed| {
             landed
                 .iter()
@@ -4697,15 +5427,17 @@ impl TuiApp {
 
     /// Answer the front permission request, if one is pending.
     ///
-    /// Sends `allow` on its reply channel and drops it from the queue;
-    /// a send that finds no receiver (a resolver already cancelled
-    /// away) is silently fine — the gate denied that call on its own.
-    fn resolve_pending_permission(&mut self, allow: bool) {
+    /// Sends `resolution` on its reply channel and drops it from the
+    /// queue, clearing any half-typed reason and the command preview's
+    /// expansion beside it; a send that finds no receiver (a resolver
+    /// already cancelled away) is silently fine — the gate denied
+    /// that call on its own.
+    fn resolve_pending_permission(&mut self, resolution: PermissionResolution) {
+        self.permission_reason = None;
+        self.permission_command_expanded = false;
         if let Some(front) = self.pending_permissions.pop_front()
-            && front.reply.send(allow).is_err()
+            && front.reply.send(resolution).is_err()
         {
-            // The resolver stopped waiting (a cancelled dispatch); the
-            // gate denied that call on its own.
             tracing::trace!("permission reply channel already closed");
         }
     }
@@ -4713,18 +5445,31 @@ impl TuiApp {
     /// Apply a key press to a pending permission ask.
     ///
     /// `Some(redraw)` when a request is pending — the overlay owns the
-    /// keyboard: plain `y` allows, plain `n`/Esc deny, and every
-    /// other key is swallowed — Enter among them, since a press
+    /// keyboard: plain `y` allows, plain `a` allows and remembers the
+    /// ask for the rest of the session, plain `n`/Esc deny, `r` opens
+    /// a reason line, `e` expands the command preview to its whole
+    /// wrap (and back), and every other key is swallowed — Enter among
+    /// them, since a press
     /// queued to submit the draft must never land as an approval — so
     /// nothing reaches the composer, whose control chords would
     /// otherwise submit or edit the hidden draft (Ctrl-Enter and
     /// Ctrl-M submit, Ctrl-W deletes a word).
-    /// `None` only for the two `c` chords the app machinery owns —
-    /// cancel/quit and copy — so those survive under a prompt.
+    /// `None` only for the keys that survive the sheet — Ctrl+Shift+C
+    /// (copy) among them. Plain `Ctrl+C` never survives: it is
+    /// intercepted below and answers the sheet, denying the ask (the
+    /// ask is cancelled, not the session), which the sheet's own pins
+    /// hold.
     /// Modifier-decorated answers (Alt+y, Alt+Enter) do not answer:
     /// the documented keys are the plain ones.
     fn permission_key(&mut self, key: KeyEvent) -> Option<bool> {
         self.pending_permissions.front()?;
+        if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
+            self.resolve_pending_permission(PermissionResolution::DenyOnce);
+            return Some(true);
+        }
+        if self.permission_reason.is_some() {
+            return Some(self.permission_reason_key(key));
+        }
         if key_survives_the_sheet(key) {
             return None;
         }
@@ -4732,18 +5477,99 @@ impl TuiApp {
         let shift = key.modifiers == KeyModifiers::SHIFT;
         match key.code {
             KeyCode::Char('y' | 'Y') if bare || shift => {
-                self.resolve_pending_permission(true);
+                self.resolve_pending_permission(PermissionResolution::AllowOnce);
+                Some(true)
+            }
+            KeyCode::Char('a' | 'A') if bare || shift => {
+                if let Some(front) = self.pending_permissions.front() {
+                    let always = front.always.clone();
+                    let adoption = self.permission_adoption_guard.clone();
+                    let _held = adoption.as_ref().map(|guard| {
+                        guard
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    });
+                    self.permission_memory.remember_rules(&always);
+                }
+                self.resolve_pending_permission(PermissionResolution::AllowOnce);
+                Some(true)
+            }
+            KeyCode::Char('d' | 'D') if bare || shift => {
+                if let Some(front) = self.pending_permissions.front() {
+                    let never = front.never.clone();
+                    let adoption = self.permission_adoption_guard.clone();
+                    let _held = adoption.as_ref().map(|guard| {
+                        guard
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    });
+                    self.permission_memory.remember_deny(&never);
+                }
+                self.resolve_pending_permission(PermissionResolution::DenyOnce);
                 Some(true)
             }
             KeyCode::Char('n' | 'N') if bare || shift => {
-                self.resolve_pending_permission(false);
+                self.resolve_pending_permission(PermissionResolution::DenyOnce);
+                Some(true)
+            }
+            KeyCode::Char('r' | 'R') if bare || shift => {
+                self.permission_reason = Some(String::new());
+                Some(true)
+            }
+            KeyCode::Char('e' | 'E') if bare || shift => {
+                self.permission_command_expanded = !self.permission_command_expanded;
                 Some(true)
             }
             KeyCode::Esc if bare => {
-                self.resolve_pending_permission(false);
+                self.resolve_pending_permission(PermissionResolution::DenyOnce);
                 Some(true)
             }
             _ => Some(false),
+        }
+    }
+
+    /// One key press in the reason-entry mode of the permission sheet.
+    ///
+    /// The buffer is the typed text; Enter resolves the ask — the
+    /// user's words ride back to the model as the denial reason (a
+    /// trimmed-empty buffer is a deliberate plain deny) — and Esc
+    /// returns to the ordinary sheet with the ask still pending. Every
+    /// other press types or is swallowed: the modal sheet owns the
+    /// keyboard, as it does outside the reason line. Every key here is
+    /// taken, so the redraw answer is unconditional.
+    fn permission_reason_key(&mut self, key: KeyEvent) -> bool {
+        let bare = key.modifiers == KeyModifiers::NONE;
+        match key.code {
+            KeyCode::Esc if bare => {
+                self.permission_reason = None;
+                true
+            }
+            KeyCode::Enter if bare => {
+                let reason = self
+                    .permission_reason
+                    .take()
+                    .map_or_default(|buffer| buffer.trim().to_string());
+                let resolution = if reason.is_empty() {
+                    PermissionResolution::DenyOnce
+                } else {
+                    PermissionResolution::DenyWithFeedback(reason)
+                };
+                self.resolve_pending_permission(resolution);
+                true
+            }
+            KeyCode::Backspace if bare => {
+                if let Some(reason) = self.permission_reason.as_mut() {
+                    reason.pop();
+                }
+                true
+            }
+            KeyCode::Char(ch) if bare || key.modifiers == KeyModifiers::SHIFT => {
+                if let Some(reason) = self.permission_reason.as_mut() {
+                    reason.push(ch);
+                }
+                true
+            }
+            _ => false,
         }
     }
 
@@ -4879,8 +5705,7 @@ impl TuiApp {
                 .find(|index| *index < free_row)
                 .and_then(|index| entry.prompt.options.get(index))
                 .or_else(|| entry.prompt.options.get(ui.cursor))
-                .map(|option| vec![option.label.clone()])
-                .unwrap_or_default()
+                .map_or_default(|option| vec![option.label.clone()])
         }
     }
 
@@ -5203,12 +6028,6 @@ impl TuiApp {
             let letter = bare || key.modifiers == KeyModifiers::SHIFT;
             match key.code {
                 KeyCode::Enter => {
-                    // The written reply is the answer, so it counts here
-                    // whether or not its row carries a mark. Whitespace
-                    // alone is not a reply and does not go, and the hint
-                    // row has already changed its wording to say what is
-                    // missing — a refusal the user reads, not a key
-                    // dropped without a word.
                     send = !ui.draft.trim().is_empty();
                 }
                 KeyCode::Esc => ui.composing = false,
@@ -5226,9 +6045,6 @@ impl TuiApp {
                 _ => {}
             }
         }
-        // The borrow above ends with the match; an answer leaves through
-        // the queue's own removal, which takes the drafted question — and
-        // its draft — out with it.
         if send {
             let answers = self.shown_answer(true);
             self.resolve_pending_question(answers);
@@ -5463,6 +6279,7 @@ impl TuiApp {
         terminal: &mut ratatui::Terminal<CrosstermBackend<std::io::Stdout>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.quit = QuitState::default();
+        self.full_repaint_due = Some(Instant::now());
         let mut events = TerminalEvents::spawn();
         self.input_quiesce = Some(events.quiesce_handle());
         let mut tick = tokio::time::interval(TICK_INTERVAL);
@@ -5887,6 +6704,17 @@ impl TuiApp {
         handled
     }
 
+    /// The key dispatch itself, the core [`Self::handle_key`] wraps.
+    ///
+    /// Order is the contract. The chord ladders are disarmed first —
+    /// any key but their own stands them down, so stale intent never
+    /// fires. Then the overlays get their look in turn
+    /// ([`Self::sheet_key`], then [`Self::completion_key`]): whoever
+    /// claims the key owns it, and nothing beneath runs. Only a key
+    /// no overlay wanted reaches the editor-and-chrome match below —
+    /// chords, scrolling, the transcript's fallbacks, selection
+    /// motion. Returns whether the key was consumed; the wrapper
+    /// runs its post-key retirement on every path this can take.
     fn handle_key_inner(&mut self, key: KeyEvent) -> bool {
         if !matches!(
             (key.code, key.modifiers),
@@ -7942,6 +8770,12 @@ impl TuiApp {
                 .load(std::sync::atomic::Ordering::SeqCst);
         if prompts_retired {
             self.pending_permissions.clear();
+            // The sheet's own entry state retires with it: a reason
+            // draft half-typed or a command preview left expanded
+            // would greet the next ask as if the retired sheet's keys
+            // had carried over.
+            self.permission_reason = None;
+            self.permission_command_expanded = false;
         }
         let questions_retired = !self.pending_questions.is_empty()
             && !self
@@ -8042,6 +8876,296 @@ impl TuiApp {
         (constraints, question_reserved)
     }
 
+    /// The welcome composer's widest block, in terminal cells.
+    ///
+    /// The artless fallback's cap — the block the box takes when no
+    /// scale fits the pane at all; wherever art stands, the box takes
+    /// the art's own width instead.
+    const WELCOME_BLOCK_MAX_WIDTH: u16 = 220;
+
+    /// The words an empty welcome composer murmurs.
+    ///
+    /// The name itself, in the night colors the picture wears,
+    /// riding the field's first text row until the first keystroke
+    /// stands it down.
+    const WELCOME_PLACEHOLDER: [&str; 3] = ["dream,", "create,", "harness"];
+
+    /// The night-sky color each word of the name wears.
+    ///
+    /// Starlight gold for the first word, moonlit blue for the
+    /// second, twilight lavender for the third — three registers
+    /// that read as light in the sky rather than ink on it, whatever
+    /// the theme.
+    const WELCOME_WORD_COLORS: [ratatui::style::Color; 3] = [
+        ratatui::style::Color::Rgb(232, 203, 122),
+        ratatui::style::Color::Rgb(150, 180, 222),
+        ratatui::style::Color::Rgb(180, 154, 216),
+    ];
+
+    /// The most rows the welcome's art band spends.
+    ///
+    /// The band is the welcome's backdrop, not its tenant: the pane's
+    /// own row floor keeps the frame the session's, and the cap only
+    /// names the tallest embedded rung so a future taller asset cannot
+    /// stretch the band past it. The picture is shown whole or not at
+    /// all — never windowed to its richest rows, which cut the water
+    /// from the fjord's foot.
+    const WELCOME_BAND_MAX_ROWS: u16 = 29;
+
+    /// The night-sky rows the band's fallback window would keep.
+    ///
+    /// Dormant while the picker honors height — no rung is ever
+    /// windowed — this names the sky floor the horizon window keeps
+    /// if an asset ever outgrows the band cap.
+    const WELCOME_MIN_SKY_ROWS: u16 = 6;
+
+    /// The give-way lane's ceiling: the w54 rung's band top.
+    ///
+    /// The largest rung a shrunken margin may seat: above it, the
+    /// fraction rules and the margins are a luxury of width again —
+    /// so a narrow pane spends its columns on the picture while a
+    /// roomy one keeps its proportions, and the seat never shrinks as
+    /// the pane widens.
+    const NARROW_LANE_MAX_WIDTH: u16 = 55;
+
+    /// The fresh session's welcome geometry, when this frame takes it.
+    ///
+    /// The welcome shape belongs to a conversation with nothing said
+    /// and nothing in flight — no queued prompts, no plan rows, no
+    /// pending ask, and no streamed or running bytes, for a run whose
+    /// first output has not landed yet still belongs to the docked
+    /// layout — and only before the conversation has ever held rows,
+    /// so `/clear` never brings the fjord back after a session
+    /// happened. When the frame qualifies, the geometry names one
+    /// compact group — the splash scale the block holds, the block's
+    /// width, and the rows the band above the art spends — with the
+    /// art shown whole, bounded by the pane's row floor so the welcome
+    /// never fills the screen; `None` leaves the frame to the docked
+    /// layout.
+    fn welcome_shape(&self, area: Rect) -> Option<WelcomeShape> {
+        let streaming_empty = self
+            .streaming_text()
+            .lock()
+            .is_ok_and(|text| text.is_empty());
+        let welcome = self.conversation.is_empty()
+            && !self.welcome.welcome_retired
+            && streaming_empty
+            && self.queued_display_len() == 0
+            && self.latest_todos.is_empty()
+            && !self.state.agent_running.load(Ordering::Relaxed)
+            && self.pending_permissions.is_empty()
+            && self.pending_questions.is_empty()
+            && self.frozen_lines.is_empty()
+            && self.live_lines.is_empty();
+        if !welcome {
+            return None;
+        }
+        let row_floor = area.height.saturating_sub(12);
+        let row_budget = row_floor.min(Self::WELCOME_BAND_MAX_ROWS);
+        let width_budget = area.width.saturating_sub(8).saturating_mul(3) / 4;
+        let narrow_budget = area
+            .width
+            .saturating_sub(4)
+            .min(Self::NARROW_LANE_MAX_WIDTH);
+        let width_budget = width_budget.max(narrow_budget);
+        let art = splash::rungs().iter().find(|entry| {
+            !entry.lines.is_empty() && entry.width <= width_budget && entry.height <= row_budget
+        });
+        let (art, rows_shown, row_skip) = match art {
+            Some(scale) => {
+                let rows = row_budget.min(scale.height);
+                let sky = leading_sky_rows(&scale.lines);
+                let skip = sky
+                    .saturating_sub(Self::WELCOME_MIN_SKY_ROWS)
+                    .min(scale.height.saturating_sub(rows));
+                (Some(scale), rows, skip)
+            }
+            None => (None, 0, 0),
+        };
+        let fallback_block = area
+            .width
+            .saturating_sub(8)
+            .min(Self::WELCOME_BLOCK_MAX_WIDTH);
+        let block_width = art.map_or(fallback_block, |scale| scale.width);
+        let band_height = art.map_or(0, |_| rows_shown);
+        Some(WelcomeShape {
+            art,
+            block_width,
+            band_height,
+            rows_shown,
+            row_skip,
+        })
+    }
+
+    /// Render the fresh session's welcome: splash, notice, open
+    /// composer, and the pinned status bar.
+    ///
+    /// One compact group — the splash band, the notice on its own
+    /// row, and the composer as an open, borderless field the width
+    /// of the art, murmuring the name in night colors until the
+    /// first keystroke — rides between two equal fillers, so the
+    /// group centers in the frame while the status bar keeps the
+    /// bottom edge. The docked composer's identity row and rules do
+    /// not follow it here, and the first traffic of any kind returns
+    /// the frame to the docked layout.
+    fn render_welcome(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        shape: &WelcomeShape,
+        rows: &[String],
+        caret: (u16, u16),
+        composer_height: u16,
+    ) {
+        let box_height = composer_height;
+        let rule_row = u16::from(self.theme.ui.composer_border.is_some());
+        let chunks = welcome_rows(area, shape.band_height, rule_row, box_height);
+        let origin = area
+            .x
+            .saturating_add(area.width.saturating_sub(shape.block_width) / 2);
+        if let Some(scale) = shape.art {
+            let band = pane(&chunks, 1, area);
+            let mut cropped: Vec<Line<'static>> = scale
+                .lines
+                .iter()
+                .skip(usize::from(shape.row_skip))
+                .take(usize::from(shape.rows_shown))
+                .cloned()
+                .collect();
+            crate::splash::dissolve_edges(&mut cropped, self.theme.ui.background);
+            let rect = Rect {
+                x: origin,
+                y: band.y,
+                width: scale.width,
+                height: shape.rows_shown,
+            };
+            frame.render_widget(Paragraph::new(cropped), rect);
+        }
+        let box_row = pane(&chunks, 4, area);
+        let inner = Rect {
+            x: origin,
+            y: box_row.y,
+            width: shape.block_width,
+            height: box_height,
+        };
+        if let Some(color) = self.theme.ui.composer_border {
+            let rule = Style::default()
+                .fg(color)
+                .add_modifier(ratatui::style::Modifier::UNDERLINED);
+            let spacer = pane(&chunks, 3, area);
+            if spacer.height > 0 {
+                let top = Rect {
+                    x: inner.x,
+                    y: spacer.y,
+                    width: inner.width,
+                    height: 1,
+                };
+                frame.buffer_mut().set_style(top, rule);
+            }
+            let bottom = Rect {
+                y: inner.bottom().saturating_sub(2),
+                height: 1,
+                ..inner
+            };
+            frame.buffer_mut().set_style(bottom, rule);
+        }
+        let band_row = pane(&chunks, 1, area);
+        self.welcome_band = shape.art.map(|scale| ratatui::layout::Rect {
+            x: origin,
+            y: band_row.y,
+            width: scale.width,
+            height: shape.band_height,
+        });
+        if self.input.is_empty() {
+            let spans: Vec<Span<'static>> = Self::WELCOME_PLACEHOLDER
+                .iter()
+                .zip(Self::WELCOME_WORD_COLORS.iter())
+                .enumerate()
+                .flat_map(|(index, (word, color))| {
+                    let space = (index > 0).then(|| Span::raw(" ")).into_iter();
+                    space.chain(std::iter::once(Span::styled(
+                        (*word).to_string(),
+                        Style::default().fg(*color),
+                    )))
+                })
+                .collect();
+            frame.render_widget(
+                Paragraph::new(Line::from(spans)),
+                Rect {
+                    x: inner.x.saturating_add(INPUT_SIDE_INSET),
+                    y: inner.y.saturating_add(INPUT_VERTICAL_PADDING),
+                    width: inner.width.saturating_sub(INPUT_SIDE_INSET),
+                    height: 1,
+                },
+            );
+        }
+        self.render_input(frame, inner, rows, caret);
+        let notice_row = pane(&chunks, 2, area);
+        let notice = self.notice_text();
+        let notice_len = notice
+            .as_ref()
+            .map_or(0u16, |text| u16::try_from(text.width()).unwrap_or(u16::MAX))
+            .saturating_add(1);
+        let standing = self.working_dir.clone().or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|dir| dir.display().to_string())
+        });
+        if let Some(dir) = standing {
+            let mut shown = dir;
+            if let Some(branch) = self.git_branch.clone() {
+                shown.push_str(" (");
+                shown.push_str(&branch);
+                shown.push(')');
+            }
+            let room = shape.block_width.saturating_sub(notice_len);
+            let count = shown.chars().count();
+            if count > usize::from(room) {
+                let keep = usize::from(room.saturating_sub(1));
+                let start = count.saturating_sub(keep);
+                shown = format!("…{}", shown.chars().skip(start).collect::<String>());
+            }
+            frame.render_widget(
+                Paragraph::new(Span::styled(shown, Style::default().fg(self.theme.ui.dim))),
+                Rect {
+                    x: origin,
+                    y: notice_row.y,
+                    width: room.max(1),
+                    height: 1,
+                },
+            );
+        }
+        if let Some(notice) = notice {
+            frame.render_widget(
+                Paragraph::new(notice)
+                    .style(Style::default().fg(self.theme.ui.input_border))
+                    .alignment(ratatui::layout::Alignment::Right),
+                Rect {
+                    x: origin.saturating_add(shape.block_width.saturating_sub(notice_len)),
+                    y: notice_row.y,
+                    width: notice_len.min(shape.block_width),
+                    height: 1,
+                },
+            );
+        }
+        self.render_completion(frame, inner, false);
+        self.render_session_picker(frame, inner, false);
+        self.render_model_picker(frame, inner, false);
+    }
+
+    /// Settle the run timer's anchor against the running flag.
+    ///
+    /// A running turn arms the anchor once — the first frame of the run
+    /// fixes its start — and a run at rest clears it, so the elapsed
+    /// the status bar shows never carries a stale anchor across runs.
+    fn settle_run_anchor(&mut self) {
+        if self.state.agent_running.load(Ordering::Relaxed) {
+            self.run_anchor.get_or_insert_with(Instant::now);
+        } else {
+            self.run_anchor = None;
+        }
+    }
+
     /// Render one frame of the layout.
     ///
     /// Conversation fills the space above a blank spacer row that
@@ -8058,6 +9182,24 @@ impl TuiApp {
         self.drain_shared_state();
         self.sync_queue_view();
         let area = frame.area();
+        if !self.welcome.welcome_retired && !self.conversation.is_empty() {
+            self.welcome.welcome_retired = true;
+            self.full_repaint_due = Some(Instant::now());
+        }
+        if let Some(shape) = self.welcome_shape(area) {
+            let wrap_width = shape.inner_width();
+            let (rows, caret) = self.composer_wrap(wrap_width);
+            let text_rows = u16::try_from(rows.len())
+                .unwrap_or(1)
+                .clamp(1, INPUT_TEXT_ROWS);
+            let composer_height = text_rows
+                .saturating_add(INPUT_VERTICAL_PADDING.saturating_mul(2))
+                .saturating_add(1);
+            self.input_wrap_width = wrap_width;
+            self.render_welcome(frame, area, &shape, &rows, caret, composer_height);
+            return;
+        }
+        self.welcome_band = None;
         let wrap_width = area
             .width
             .max(1)
@@ -8088,12 +9230,12 @@ impl TuiApp {
                 .add_queue(queue_shown)
                 .add_place(place_shown),
         });
+        let base = usize::from(strip_at_top);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints(constraints)
             .split(area);
 
-        let base = usize::from(strip_at_top);
         let todo_at = usize::from(todo_shown);
         let furniture = base
             .saturating_add(todo_at)
@@ -8122,15 +9264,7 @@ impl TuiApp {
         if notice_rows > 0 {
             self.render_notice(frame, pane(&chunks, furniture.saturating_add(1), fallback));
         }
-        if self
-            .state
-            .agent_running
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            self.run_anchor.get_or_insert_with(Instant::now);
-        } else {
-            self.run_anchor = None;
-        }
+        self.settle_run_anchor();
         let caption_above_rule = self.theme.ui.composer_border.is_some() && place_shown;
         let below_notice = furniture.saturating_add(1).saturating_add(notice_rows);
         let seat_rows = usize::from(place_shown);
@@ -8172,20 +9306,15 @@ impl TuiApp {
         let input_area = pane(&chunks, composer_at, fallback);
         self.input_wrap_width = wrap_width;
         self.render_input(frame, input_area, &rows, caret);
-        self.render_completion(frame, input_area);
-        self.render_session_picker(frame, input_area);
-        self.render_model_picker(frame, input_area);
+        self.render_completion(frame, input_area, true);
+        self.render_session_picker(frame, input_area, true);
+        self.render_model_picker(frame, input_area, true);
         self.render_status_bar(
             frame,
             pane(&chunks, composer_at.saturating_add(1), fallback),
         );
-        if let Some((prompt, more)) = self.pending_permissions.front().map(|request| {
-            (
-                request.prompt.clone(),
-                self.pending_permissions.len().saturating_sub(1),
-            )
-        }) {
-            self.render_permission_overlay(frame, area, &prompt, more);
+        if let Some(sheet) = self.shown_permission() {
+            self.render_permission_overlay(frame, area, &sheet);
             return;
         }
         if self.pending_permissions.is_empty() && !self.pending_questions.is_empty() {
@@ -8781,6 +9910,28 @@ impl TuiApp {
         }
     }
 
+    /// The pending permission ask, as the overlay renders it: the ask's
+    /// prompt, the phrases naming what each press would actually record
+    /// — post-skip, the same filter the record arms apply — the command
+    /// the ask would run (read from the raw input, never from the
+    /// prompt), any reason line being typed, and how many more asks
+    /// wait behind it.
+    fn shown_permission(&self) -> Option<PermissionSheet> {
+        self.pending_permissions.front().map(|request| {
+            let phrases = |rules: &[PermissionRule]| {
+                rules.iter().map(PermissionRule::remember_phrase).collect()
+            };
+            PermissionSheet {
+                prompt: request.prompt.clone(),
+                always: phrases(&self.permission_memory.would_record(&request.always, false)),
+                never: phrases(&self.permission_memory.would_record(&request.never, true)),
+                command: request.command_detail(),
+                reason: self.permission_reason.clone(),
+                more: self.pending_permissions.len().saturating_sub(1),
+            }
+        })
+    }
+
     /// Render the pending permission ask as a sheet over the prompt
     /// box.
     ///
@@ -8796,28 +9947,106 @@ impl TuiApp {
     /// line can re-flow inside the border and the hints always fit,
     /// whatever the tool name's length or the terminal's width; only
     /// a terminal shorter than the box clips, at the box's top. The
-    /// strings arrive cloned so this borrows nothing from the queue.
-    fn render_permission_overlay(&self, frame: &mut Frame, area: Rect, prompt: &str, more: usize) {
-        let hints = if more == 0 {
-            "[y] allow · [n] deny · ctrl+c cancels (a draft clears first)".to_string()
-        } else {
-            format!("[y] allow · [n] deny · ctrl+c cancels · {more} more waiting")
-        };
+    /// sheet is gathered already — this borrows nothing from the
+    /// queue.
+    ///
+    /// `always` carries what an "allow always" answer would record, in
+    /// the rules' own phrases; the line stands between the command and
+    /// the hints so the scope of the `a` press is read before the key
+    /// is pressed, not after. `command` is the call's raw command from
+    /// the input — exactly what will run — drawn as its own block, and
+    /// `reason` is the live text when the sheet's `r` press opened the
+    /// reason line, whose hints swap for the reason line's own.
+    fn render_permission_overlay(&self, frame: &mut Frame, area: Rect, sheet: &PermissionSheet) {
         let wrap_at = usize::from(area.width.saturating_sub(2));
-        let mut lines: Vec<Line<'_>> = wrap_prompt_rows(prompt, wrap_at, MAX_OVERLAY_ROWS)
+        let command_truncated = sheet.command.as_ref().is_some_and(|command| {
+            wrap_rows(&format!("runs: {command}"), wrap_at).len() > MAX_OVERLAY_ROWS
+        });
+        let mut hints = if sheet.reason.is_some() {
+            "[enter] deny with this reason · [esc] back to the ask".to_string()
+        } else if sheet.more == 0 {
+            "[y] allow · [a] allow always · [d] deny always · [n] deny · [r] deny with a reason · esc or ctrl+c cancels".to_string()
+        } else {
+            format!(
+                "[y] allow · [a] allow always · [d] deny always · [n] deny · [r] deny with a reason · esc or ctrl+c cancels · {more} more waiting",
+                more = sheet.more,
+            )
+        };
+        if command_truncated {
+            hints.push_str(if self.permission_command_expanded {
+                " · [e] collapse"
+            } else {
+                " · [e] expand"
+            });
+        }
+        let mut lines: Vec<Line<'_>> = wrap_prompt_rows(&sheet.prompt, wrap_at, MAX_OVERLAY_ROWS)
             .into_iter()
             .map(|row| Line::styled(row, Style::default().fg(self.theme.ui.foreground)))
             .collect();
+        let sheet_area = Rect {
+            height: area.height.saturating_sub(STATUS_BAR_ROWS - STATUS_BAR_AIR),
+            ..area
+        };
+        let scope_line = (!sheet.always.is_empty())
+            .then(|| format!("a remembers: {}", sheet.always.join(" · ")));
+        let deny_line =
+            (!sheet.never.is_empty()).then(|| format!("d remembers: {}", sheet.never.join(" · ")));
+        let reason_line = sheet
+            .reason
+            .as_ref()
+            .map(|reason| format!("reason: {reason}▏"));
+        if let Some(command) = &sheet.command {
+            let runs = format!("runs: {command}");
+            let rows = if self.permission_command_expanded {
+                let blocks = [
+                    scope_line.as_deref(),
+                    deny_line.as_deref(),
+                    reason_line.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<&str>>();
+                let budget = expanded_command_budget(
+                    sheet_area.height,
+                    lines.len(),
+                    expanded_fixed_rows(&blocks, &hints, wrap_at),
+                );
+                wrap_prompt_rows_last(&runs, wrap_at, budget)
+            } else {
+                wrap_prompt_rows(&runs, wrap_at, MAX_OVERLAY_ROWS)
+            };
+            lines.extend(
+                rows.into_iter()
+                    .map(|row| Line::styled(row, Style::default().fg(self.theme.ui.primary))),
+            );
+        }
+        if let Some(scope) = scope_line {
+            lines.extend(
+                wrap_prompt_rows(&scope, wrap_at, MAX_OVERLAY_ROWS)
+                    .into_iter()
+                    .map(|row| Line::styled(row, Style::default().fg(self.theme.ui.secondary))),
+            );
+        }
+        if let Some(scope) = deny_line {
+            lines.extend(
+                wrap_prompt_rows(&scope, wrap_at, MAX_OVERLAY_ROWS)
+                    .into_iter()
+                    .map(|row| Line::styled(row, Style::default().fg(self.theme.ui.secondary))),
+            );
+        }
+        if let Some(typed) = reason_line {
+            lines.extend(
+                wrap_prompt_rows(&typed, wrap_at, MAX_OVERLAY_ROWS)
+                    .into_iter()
+                    .map(|row| Line::styled(row, Style::default().fg(self.theme.ui.foreground))),
+            );
+        }
         lines.push(Line::default());
         lines.extend(
             wrap_prompt_rows(&hints, wrap_at, MAX_OVERLAY_ROWS)
                 .into_iter()
                 .map(|row| Line::styled(row, Style::default().fg(self.theme.ui.secondary))),
         );
-        let sheet_area = Rect {
-            height: area.height.saturating_sub(STATUS_BAR_ROWS - STATUS_BAR_AIR),
-            ..area
-        };
         let height = u16::try_from(lines.len())
             .unwrap_or(u16::MAX)
             .saturating_add(2)
@@ -9102,6 +10331,7 @@ impl TuiApp {
                 .saturating_sub(self.scroll_offset),
             conversation_height,
         );
+        frame.render_widget(ratatui::widgets::Clear, pane);
         self.paint_user_turn_chrome(
             frame,
             pane,
@@ -10184,9 +11414,6 @@ impl TuiApp {
             return 0;
         }
         if self.queue_posture == QueuePosture::Folded && self.queue_mode == QueueMode::Plain {
-            // Air above the badge row: whatever stands over the section
-            // — the plan, the transcript — keeps the row of separation
-            // the standing section's own standoff pays for.
             return 2;
         }
         let shown = self.queue_view.min(total.saturating_sub(1));
@@ -10421,16 +11648,18 @@ impl TuiApp {
         Some("ctrl+s to guide".to_string())
     }
 
-    /// Render the saved-session picker above the composer.
+    /// Render the saved-session picker on the composer's chosen side.
     ///
-    /// The same floating shape the completion popup takes: rows above
-    /// the composer, the cursor row highlighted — inverting under a
-    /// palette that defers its colors, exactly the popup's rule —
-    /// a dim header naming the keys, and a window that follows the
-    /// cursor so a long catalog always keeps the chosen row on
-    /// screen. Each row spells the short id, the session's name, the
+    /// The same floating shape the completion popup takes: rows
+    /// beside the composer, the cursor row highlighted — inverting
+    /// under a palette that defers its colors, exactly the popup's
+    /// rule — a dim header naming the keys, and a window that follows
+    /// the cursor so a long catalog always keeps the chosen row on
+    /// screen, its capacity sized to the rows the side actually
+    /// offers so a short terminal sheds list rows, never the cursor
+    /// itself. Each row spells the short id, the session's name, the
     /// model, when the session last saved, and its prompt count.
-    fn render_session_picker(&mut self, frame: &mut Frame, input_area: Rect) {
+    fn render_session_picker(&mut self, frame: &mut Frame, input_area: Rect, above: bool) {
         const SHOWN: usize = 8;
         let Some(picker) = self.session_picker.as_ref() else {
             return;
@@ -10439,7 +11668,12 @@ impl TuiApp {
             return;
         }
         let surface = self.theme.ui.surface;
-        let (start, cursor_row) = popup_window(picker.cursor, picker.rows.len(), SHOWN);
+        let bound = popup_bound(frame, input_area, above);
+        if bound < 2 {
+            return;
+        }
+        let shown = SHOWN.min(usize::from(bound).saturating_sub(1));
+        let (start, cursor_row) = popup_window(picker.cursor, picker.rows.len(), shown);
         let lines: Vec<Line> = std::iter::once(Line::styled(
             " sessions — ↑↓ walk · ⏎ resume · esc close ",
             Style::default().fg(self.theme.ui.dim),
@@ -10449,7 +11683,7 @@ impl TuiApp {
                 .rows
                 .iter()
                 .skip(start)
-                .take(SHOWN)
+                .take(shown)
                 .enumerate()
                 .map(|(index, pick)| {
                     let highlighted = index == cursor_row;
@@ -10486,11 +11720,11 @@ impl TuiApp {
                 }),
         )
         .collect();
-        let height = u16::try_from(lines.len()).unwrap_or(1).min(input_area.y);
+        let height = u16::try_from(lines.len()).unwrap_or(1).min(bound);
         if height == 0 {
             return;
         }
-        let popup = popup_rect(input_area, height);
+        let popup = popup_rect(input_area, height, above);
         frame.render_widget(Clear, popup);
         frame.render_widget(
             Paragraph::new(lines).style(Style::default().bg(surface)),
@@ -10498,14 +11732,14 @@ impl TuiApp {
         );
     }
 
-    /// Render the configured-models picker above the composer.
+    /// Render the configured-models picker on the composer's chosen side.
     ///
     /// The same floating shape the session picker takes: a dim header
     /// naming the keys, each row the model name with the running one
     /// marked `•`, the cursor row highlighted (inverting under a
     /// palette that defers its colors). The window follows the cursor
     /// at its edges, same scroll rule as the session picker.
-    fn render_model_picker(&mut self, frame: &mut Frame, input_area: Rect) {
+    fn render_model_picker(&mut self, frame: &mut Frame, input_area: Rect, above: bool) {
         const SHOWN: usize = 8;
         let Some(picker) = self.model_picker.as_ref() else {
             return;
@@ -10514,11 +11748,16 @@ impl TuiApp {
             return;
         }
         let surface = self.theme.ui.surface;
+        let bound = popup_bound(frame, input_area, above);
+        if bound < 2 {
+            return;
+        }
+        let shown = SHOWN.min(usize::from(bound).saturating_sub(1));
         let total = picker.rows.len();
-        let max_start = total.saturating_sub(SHOWN);
+        let max_start = total.saturating_sub(shown);
         let start = picker
             .cursor
-            .saturating_sub(SHOWN.saturating_sub(1))
+            .saturating_sub(shown.saturating_sub(1))
             .min(max_start);
         let running = &self.config.api.model;
         let lines: Vec<Line> = std::iter::once(Line::styled(
@@ -10530,7 +11769,7 @@ impl TuiApp {
                 .rows
                 .iter()
                 .skip(start)
-                .take(SHOWN)
+                .take(shown)
                 .enumerate()
                 .map(|(index, name)| {
                     let highlighted = index == picker.cursor.saturating_sub(start);
@@ -10548,11 +11787,11 @@ impl TuiApp {
                 }),
         )
         .collect();
-        let height = u16::try_from(lines.len()).unwrap_or(1).min(input_area.y);
+        let height = u16::try_from(lines.len()).unwrap_or(1).min(bound);
         if height == 0 {
             return;
         }
-        let popup = popup_rect(input_area, height);
+        let popup = popup_rect(input_area, height, above);
         frame.render_widget(Clear, popup);
         frame.render_widget(
             Paragraph::new(lines).style(Style::default().bg(surface)),
@@ -10575,8 +11814,10 @@ impl TuiApp {
     /// current text; Tab is what actually accepts or cycles a choice, so this
     /// never changes what is typed. It hides when there is nothing to offer, or
     /// when the sole candidate is already fully spelled out in the composer.
-    fn render_completion(&mut self, frame: &mut Frame, input_area: Rect) {
+    fn render_completion(&mut self, frame: &mut Frame, input_area: Rect, above: bool) {
         const SHOWN: usize = 6;
+        let bound = popup_bound(frame, input_area, above);
+        let shown = SHOWN.min(usize::from(bound));
         let Some((prefix, candidates)) = self.popup_candidates() else {
             self.completion = None;
             return;
@@ -10588,14 +11829,14 @@ impl TuiApp {
             .as_ref()
             .filter(|cycle| cycle.prefix == prefix);
         let start = active_cycle.map_or(0, |cycle| {
-            let max_start = total.saturating_sub(SHOWN);
+            let max_start = total.saturating_sub(shown);
             let start = cycle.window_start.min(max_start);
             let selected = cycle.index.min(total.saturating_sub(1));
             if selected < start {
                 selected
-            } else if selected >= start.saturating_add(SHOWN) {
+            } else if selected >= start.saturating_add(shown) {
                 selected
-                    .saturating_sub(SHOWN.saturating_sub(1))
+                    .saturating_sub(shown.saturating_sub(1))
                     .min(max_start)
             } else {
                 start
@@ -10607,13 +11848,13 @@ impl TuiApp {
                 .min(total.saturating_sub(1))
                 .saturating_sub(start)
         });
-        let shown: Vec<&String> = candidates.iter().skip(start).take(SHOWN).collect();
+        let window: Vec<&String> = candidates.iter().skip(start).take(shown).collect();
 
         let surface = self.theme.ui.surface;
         let completing_command = prefix == "/";
         let width = usize::from(input_area.width.max(1));
         let summary_column = if completing_command {
-            shown
+            window
                 .iter()
                 .map(|candidate| format!("   /{candidate}").width())
                 .max()
@@ -10622,7 +11863,7 @@ impl TuiApp {
         } else {
             0
         };
-        let lines: Vec<Line> = shown
+        let lines: Vec<Line> = window
             .iter()
             .enumerate()
             .map(|(index, candidate)| {
@@ -10663,11 +11904,11 @@ impl TuiApp {
             })
             .collect();
 
-        let height = u16::try_from(lines.len()).unwrap_or(1).min(input_area.y);
+        let height = u16::try_from(lines.len()).unwrap_or(1).min(bound);
         if height == 0 {
             return;
         }
-        let popup = popup_rect(input_area, height);
+        let popup = popup_rect(input_area, height, above);
         frame.render_widget(Clear, popup);
         frame.render_widget(
             Paragraph::new(lines).style(Style::default().bg(surface)),
@@ -11907,9 +13148,6 @@ fn copy_verdict_notice(verdict: CopyVerdict) -> &'static str {
     if verdict.verified {
         "selection copied"
     } else if verdict.escape_written {
-        // The escape's bytes left but nothing confirmed delivery —
-        // claiming either way would lie, and an empty wording posts
-        // no row at all, which is the honest silence.
         ""
     } else {
         "copy failed — set display.copy_command"
@@ -12473,16 +13711,15 @@ fn reverse_selection(lines: &mut [Line<'_>], skip: usize, selection: &CellSelect
 fn take_locked<T: Default>(mutex: &Mutex<T>) -> T {
     std::mem::take(&mut *mutex.lock().unwrap_or_else(PoisonError::into_inner))
 }
-
 /// Collect the viewport window across concatenated line segments.
 ///
-/// The settled conversation renders from a cache that must survive
-/// the frame, so instead of concatenating and cloning every segment
-/// this walks them with the skip offset and clones only the lines
-/// the viewport actually shows — per-frame cost tracks the pane
-/// height, not the session length. The segments' borrow and their
-/// content are decoupled lifetimes: the caller may assemble the
-/// window from transient borrows of lines it keeps beyond them.
+/// The settled conversation renders from a cache that must survive the
+/// frame, so instead of concatenating and cloning every segment this
+/// walks them with the skip offset and clones only the lines the
+/// viewport actually shows — per-frame cost tracks the pane height,
+/// not the session length. The segments' borrow and their content are
+/// decoupled lifetimes: the caller may assemble the window from
+/// transient borrows of lines it keeps beyond them.
 fn visible_window<'a>(segments: &[&'a [Line<'a>]], skip: usize, height: usize) -> Vec<Line<'a>> {
     let mut visible = Vec::with_capacity(height.min(64));
     let mut skip = skip;
@@ -12506,8 +13743,118 @@ fn visible_window<'a>(segments: &[&'a [Line<'a>]], skip: usize, height: usize) -
     visible
 }
 
-/// Fetch a layout pane by index with a whole-area fallback.
+/// The welcome group's six rows: a filler above and below, the band,
+/// the notice, the rule, the composer box.
 ///
+/// One split in one place — the arithmetic cannot drift between two
+/// copies of it.
+fn welcome_rows(area: Rect, band_height: u16, rule_row: u16, box_height: u16) -> Vec<Rect> {
+    let constraints = [
+        Constraint::Min(0),
+        Constraint::Length(band_height),
+        Constraint::Length(1),
+        Constraint::Length(rule_row),
+        Constraint::Length(box_height),
+        Constraint::Min(0),
+    ];
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(area)
+        .to_vec()
+}
+
+/// Count a band's leading star-sky rows.
+///
+/// The fjord paints its night sky as dark, blue-dominant grounds;
+/// the first row whose cells stray from that register carries the
+/// horizon's glow, and everything above it is open sky. The window
+/// that trims the band to its budget reads this so the stars keep
+/// their floor while the water keeps its foot.
+fn leading_sky_rows(lines: &[Line<'static>]) -> u16 {
+    let depth = lines
+        .iter()
+        .take_while(|line| {
+            line.spans.iter().all(|span| {
+                matches!(
+                    span.style.bg,
+                    Some(ratatui::style::Color::Rgb(red, green, blue))
+                        if blue > red
+                            && u16::from(red)
+                                .saturating_add(u16::from(green))
+                                .saturating_add(u16::from(blue))
+                                < 220
+                ) && matches!(
+                    span.style.fg,
+                    Some(ratatui::style::Color::Rgb(red, green, blue))
+                        if u32::from(red)
+                            .saturating_mul(299)
+                            .saturating_add(u32::from(green).saturating_mul(587))
+                            .saturating_add(u32::from(blue).saturating_mul(114))
+                            < 100_000
+                )
+            })
+        })
+        .count();
+    u16::try_from(depth).unwrap_or(u16::MAX)
+}
+
+/// The fresh session's welcome geometry.
+///
+/// What the frame's welcome path needs to seat the group: the splash
+/// scale the block holds, the block's width, and the rows the band
+/// above the art spends. Built once per frame by
+/// [`TuiApp::welcome_shape`](crate::app::TuiApp::welcome_shape)
+/// before the composer wraps, for the wrap width depends on the
+/// block, not the frame.
+struct WelcomeShape {
+    /// The largest splash scale the welcome block holds, if any.
+    ///
+    /// `None` when even the smallest scale exceeds the block — the
+    /// welcome still stands, its composer box alone.
+    art: Option<&'static splash::SplashArt>,
+
+    /// The welcome composer box's width, in terminal cells.
+    ///
+    /// The frame's width less its side margins, capped at the welcome
+    /// maximum so the block stays compact on wide terminals.
+    block_width: u16,
+
+    /// The rows the splash band spends, art height or zero.
+    ///
+    /// Zero when no scale fits; otherwise the rows the pane's height
+    /// allows of the chosen rung — the band's one row of spending,
+    /// trimmed never below the greeting's needs.
+    band_height: u16,
+
+    /// The rung rows the welcome shows, after the height trim.
+    ///
+    /// A short pane shows fewer of the rung's rows — a shorter slice
+    /// of the same-wide fjord — so the art's width never follows the
+    /// pane's height.
+    rows_shown: u16,
+
+    /// The rung rows cropped away above.
+    ///
+    /// Half the trim, so the slice is centered; the rows below spend
+    /// the rest.
+    row_skip: u16,
+}
+
+impl WelcomeShape {
+    /// The wrap width the boxed composer wraps its text to.
+    ///
+    /// The block's inner width — the border columns and the input's
+    /// own side insets spent — so the wrapped rows and the caret land
+    /// where the box will show them.
+    fn inner_width(&self) -> u16 {
+        self.block_width
+            .saturating_sub(2)
+            .saturating_sub(INPUT_SIDE_INSET.saturating_mul(2))
+            .max(1)
+    }
+}
+
 /// The three-pane layout always splits into three rects; the
 /// fallback keeps rendering total if a shorter split ever appears.
 fn pane(chunks: &[Rect], index: usize, fallback: Rect) -> Rect {
@@ -12522,13 +13869,133 @@ fn pane(chunks: &[Rect], index: usize, fallback: Rect) -> Rect {
 /// the hints are one line, not a document.
 const MAX_OVERLAY_ROWS: usize = 3;
 
-/// Word-wrap `text` to `limit` display columns, hard-splitting any
-/// single word wider than `limit`, keeping at most `max_rows` rows
-/// (the last carries an ellipsis when truncation happens).
+/// The most rows the expanded command preview keeps from its wrap's
+/// tail — the ceiling for panes tall enough to spend it.
 ///
-/// Rows never exceed `limit`, so a paragraph rendering them inside a
-/// border `limit + 2` wide cannot re-flow them.
-fn wrap_prompt_rows(text: &str, limit: usize, max_rows: usize) -> Vec<String> {
+/// Expansion exists so the *end* of a command — where a destructive
+/// suffix hides — is never invisible at the approval press: the kept
+/// rows are the wrap's last, one leading ellipsis row naming the cut,
+/// and the cap keeps a pathological command from filling the whole
+/// sheet on a terminal that could not scroll it anyway. The collapsed
+/// head and the expanded tail together cover any command that fits.
+/// The budget a sheet actually spends is derived from its own height
+/// ([`expanded_command_budget`]) and clamped to this ceiling; the
+/// collapsed path is unchanged.
+const MAX_EXPANDED_OVERLAY_ROWS: usize = 40;
+
+/// The sheet's inner height, minus the borders.
+///
+/// The block draws a rounded border on every side, so two of the
+/// sheet's rows are chrome; the content rows live between them.
+fn sheet_inner_height(sheet_height: u16) -> usize {
+    usize::from(sheet_height.saturating_sub(2))
+}
+
+/// The rows the sheet draws besides the prompt and the preview.
+///
+/// `blocks` are the conditional rows the sheet may draw below the
+/// preview — the always-remember scope, the deny-remember scope, the
+/// reason draft — handed in as the strings the renderer will wrap, so
+/// the budget measures the rows those strings actually occupy, never
+/// a one-row guess per block. Each block is counted as the renderer
+/// appends it, wrapped to the pane and capped at the overlay's row
+/// ceiling, because a long scope or reason on a narrow pane occupies
+/// up to three rows; the blank spacer ahead of the hints and the
+/// hints themselves are counted the same measured way rather than
+/// guessed, because a narrow pane wraps a long hint across several
+/// rows too.
+fn expanded_fixed_rows(blocks: &[&str], hints: &str, wrap_at: usize) -> usize {
+    let rows = blocks
+        .iter()
+        .map(|block| wrap_prompt_rows(block, wrap_at, MAX_OVERLAY_ROWS).len())
+        .fold(0usize, usize::saturating_add);
+    // The blank spacer ahead of the hints, then the hints themselves.
+    let hint_rows = wrap_prompt_rows(hints, wrap_at, MAX_OVERLAY_ROWS).len();
+    rows.saturating_add(1).saturating_add(hint_rows)
+}
+
+/// The row budget an expanded command preview may spend on this sheet.
+///
+/// The sheet's inner height, less the prompt rows already drawn and
+/// the fixed rows it must still draw, floored at one row so a cramped
+/// pane still shows the preview's first line — and capped at the
+/// standing ceiling so a tall pane does not hand an enormous command
+/// the whole sheet.
+fn expanded_command_budget(sheet_height: u16, prompt_rows: usize, fixed_rows: usize) -> usize {
+    let remaining = sheet_inner_height(sheet_height)
+        .saturating_sub(prompt_rows)
+        .saturating_sub(fixed_rows);
+    remaining.clamp(1, MAX_EXPANDED_OVERLAY_ROWS)
+}
+
+/// The boot-time permission pair a stand-in config save restores.
+///
+/// What the session started under — the mode and preset selection as
+/// the constructor's config stated them, flag- or file-named —
+/// captured once so no later `/mode` or `/preset` swap rides a
+/// stand-in save into a file it promised never to touch, and no
+/// initial flag-stated pair rides one out.
+fn boot_permission_pair(config: &DchConfig) -> (dch_config::PermissionMode, Option<String>) {
+    (
+        config.runner.permission_mode,
+        config.permissions.preset.clone(),
+    )
+}
+
+/// The permission overlay's render inputs, gathered in one pass.
+///
+/// [`TuiApp::shown_permission`] builds it off the front pending
+/// request; [`TuiApp::render_permission_overlay`] draws it.
+struct PermissionSheet {
+    /// The gate's question — the tool, its category, the mode.
+    ///
+    /// Display text built from the ask, never an identity: the typed
+    /// resolver receives the raw call beside it, so nothing here is
+    /// load-bearing for a later decision.
+    prompt: String,
+
+    /// What an "allow always" answer would actually record, in the
+    /// rules' own phrases — post-skip against the deny list.
+    ///
+    /// Rendered on the sheet so the user approves exactly the rules
+    /// the press writes, not a paraphrase of them.
+    always: Vec<String>,
+
+    /// What a "deny always" answer would actually record, in the
+    /// rules' own phrases — post-skip against the allow list.
+    ///
+    /// Same contract as [`Self::always`] for the deny direction: the
+    /// sheet shows the words, the press records the words.
+    never: Vec<String>,
+
+    /// The command the ask would run, read from the raw call input —
+    /// never from the prompt string.
+    ///
+    /// Some only for shell calls; the overlay shows it verbatim so
+    /// the approval names the exact command line.
+    command: Option<String>,
+
+    /// The reason being typed, when the sheet's `r` press opened the
+    /// reason line.
+    ///
+    /// Held here between keystrokes and carried into the denial the
+    /// model reads when the reason line submits.
+    reason: Option<String>,
+
+    /// How many more asks wait behind this one.
+    ///
+    /// Zero when this is the only pending request; the overlay shows
+    /// the count so a burst of asks reads as a queue, not a loop.
+    more: usize,
+}
+
+/// Word-wrap `text` to `limit` display columns, hard-splitting any
+/// single word wider than `limit`.
+///
+/// The uncapped core both capped twins build on: rows never exceed
+/// `limit`, so a paragraph rendering them inside a border `limit + 2`
+/// wide cannot re-flow them.
+fn wrap_rows(text: &str, limit: usize) -> Vec<String> {
     let limit = limit.max(1);
     let mut rows: Vec<String> = Vec::new();
     let mut current = String::new();
@@ -12571,6 +14038,16 @@ fn wrap_prompt_rows(text: &str, limit: usize, max_rows: usize) -> Vec<String> {
     if !current.is_empty() {
         rows.push(current);
     }
+    rows
+}
+
+/// [`wrap_rows`] keeping at most `max_rows` rows from the head.
+///
+/// The last kept row carries an ellipsis when truncation happens —
+/// the collapsed previews' shape: a short head of the text with the
+/// cut named where the reader's eye lands.
+fn wrap_prompt_rows(text: &str, limit: usize, max_rows: usize) -> Vec<String> {
+    let mut rows = wrap_rows(text, limit);
     if rows.len() > max_rows {
         rows.truncate(max_rows);
         if let Some(last) = rows.last_mut() {
@@ -12590,6 +14067,32 @@ fn wrap_prompt_rows(text: &str, limit: usize, max_rows: usize) -> Vec<String> {
         }
     }
     rows
+}
+
+/// [`wrap_rows`] keeping at most `max_rows` rows from the tail.
+///
+/// The expanded command preview's shape: the *end* of a command is
+/// the half a collapsed head hides — the destructive suffix — so the
+/// kept rows are the wrap's last, with one leading ellipsis row
+/// naming the cut. The ellipsis counts inside `max_rows` — the
+/// ceiling is the caller's row budget, and the return never exceeds
+/// it — so an overflowing text yields the ellipsis plus `max_rows - 1`
+/// tail rows, while a text that fits returns its own rows unchanged.
+/// Together the collapsed head and the expanded tail cover the whole
+/// of any command that fits the cap.
+fn wrap_prompt_rows_last(text: &str, limit: usize, max_rows: usize) -> Vec<String> {
+    let rows = wrap_rows(text, limit);
+    if rows.len() <= max_rows {
+        return rows;
+    }
+    let keep = max_rows.saturating_sub(1);
+    if keep == 0 {
+        return vec!["…".to_string()];
+    }
+    let skip = rows.len().saturating_sub(keep);
+    let mut kept: Vec<String> = rows.into_iter().skip(skip).collect();
+    kept.insert(0, "…".to_string());
+    kept
 }
 
 /// A full-width rectangle anchored at the bottom of `area`.
@@ -14406,6 +15909,18 @@ mod tests {
             rows.push(row.trim_end().to_string());
         }
         rows.join("\n")
+    }
+
+    /// Whether any cell in the row holds a symbol beyond a space.
+    ///
+    /// A row the leak would stain reads as text; a row the pane erase
+    /// cleaned reads as blank.
+    fn row_has_text(buffer: &ratatui::buffer::Buffer, y: u16) -> bool {
+        (buffer.area.x..buffer.area.right()).any(|x| {
+            buffer
+                .cell((x, y))
+                .is_some_and(|cell| cell.symbol() != " " && cell.symbol() != "")
+        })
     }
 
     #[test]
@@ -16298,6 +17813,14 @@ mod tests {
     #[test]
     fn the_status_bar_reads_the_live_window() {
         let mut app = app();
+        // The footer belongs to a conversation with turns — the
+        // welcome paints none — so the bar rides a landed prompt.
+        app.push_message(TuiMessage::User {
+            text: "hello".to_string(),
+            timestamp: chrono::Utc::now(),
+            steered: false,
+            unsent: false,
+        });
         app.config.api.context_window = Some(200_000);
         app.state
             .context_window
@@ -16369,6 +17892,14 @@ mod tests {
     #[test]
     fn the_status_bar_shows_the_context_bar_at_the_configured_fill() {
         let mut app = app();
+        // The footer belongs to a conversation with turns — the
+        // welcome paints none — so the bar rides a landed prompt.
+        app.push_message(TuiMessage::User {
+            text: "hello".to_string(),
+            timestamp: chrono::Utc::now(),
+            steered: false,
+            unsent: false,
+        });
         app.state
             .tokens
             .lock()
@@ -16963,6 +18494,7 @@ mod tests {
                 last_input: 5,
                 context_tokens: 3,
             },
+            permission_mode: dch_config::PermissionMode::Auto,
         });
         assert!(
             app.compaction_summary_owed.is_empty(),
@@ -17030,6 +18562,447 @@ mod tests {
             app.conversation().is_empty(),
             "a publication after the clear attaches nothing — no row \
              exists to take it"
+        );
+    }
+
+    #[test]
+    fn an_empty_conversation_paints_the_fjord_splash() {
+        // The empty pane's own shape: a fresh session shows the
+        // half-block fjord, centered, in the art's own colors.
+        let mut subject = app();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 30)).expect("terminal");
+        terminal
+            .draw(|frame| subject.render(frame))
+            .expect("first draw");
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(
+            text.contains('▀'),
+            "the empty conversation paints the half-block art: {text}"
+        );
+    }
+
+    #[test]
+    fn the_splash_margins_dissolve_into_the_theme_canvas() {
+        // The flat blue-black margins the art carries against the
+        // default theme's neutral canvas read as a mismatched
+        // background flanking the image — the outermost art column now
+        // goes unstyled, a cell the terminal paints as its own default
+        // (the canvas, in every color vocabulary), so the art's edge
+        // and the strips beside it are literally the same cell state.
+        // The picture's middle keeps its own colors.
+        let mut subject = app();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 30)).expect("terminal");
+        terminal
+            .draw(|frame| subject.render(frame))
+            .expect("first draw");
+        let buffer = terminal.backend().buffer();
+        let band = subject.welcome_band.expect("band");
+        let mid = band.y + band.height / 2;
+        let canvas = ratatui::style::Color::Reset;
+        for x in [band.x, band.right().saturating_sub(1)] {
+            let cell = buffer
+                .cell((x, mid))
+                .map(|cell| (cell.symbol(), cell.fg, cell.bg));
+            assert_eq!(
+                cell,
+                Some((" ", canvas, canvas)),
+                "the outermost art column is a blank default cell — no glyph dots in the foreground color"
+            );
+        }
+        let middle = buffer
+            .cell((band.x + band.width / 2, mid))
+            .map(|cell| cell.bg);
+        assert_ne!(
+            middle,
+            Some(canvas),
+            "the picture's middle keeps its own color"
+        );
+        let strip = buffer
+            .cell((band.x.saturating_sub(1), mid))
+            .map(|cell| (cell.fg, cell.bg));
+        assert_eq!(
+            strip,
+            Some((canvas, canvas)),
+            "the strips beyond the band are the same default cells as the art's edge"
+        );
+    }
+
+    #[test]
+    fn a_prompt_displaces_the_splash_and_a_clear_keeps_it_displaced() {
+        // Displacement retires the splash for the run: the first
+        // message bakes the cache and the splash stands down; /clear
+        // empties the conversation but the session happened — the
+        // fjord belongs to a process's first breath only and never
+        // returns after it.
+        let mut subject = app();
+        subject.push_message(TuiMessage::User {
+            text: "hello".to_string(),
+            timestamp: chrono::Utc::now(),
+            steered: false,
+            unsent: false,
+        });
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 30)).expect("terminal");
+        terminal
+            .draw(|frame| subject.render(frame))
+            .expect("first draw");
+        let busy = buffer_text(terminal.backend().buffer());
+        assert!(
+            !busy.contains('▀'),
+            "a conversation with traffic paints no splash: {busy}"
+        );
+        subject.clear_command();
+        terminal
+            .draw(|frame| subject.render(frame))
+            .expect("redraw after clear");
+        let cleared = buffer_text(terminal.backend().buffer());
+        assert!(
+            !cleared.contains('▀'),
+            "the cleared conversation keeps the splash retired: {cleared}"
+        );
+    }
+
+    #[test]
+    fn a_narrow_pane_seats_the_small_rung_on_give_way_margins() {
+        // Narrow panes spend their columns on the picture: the margins
+        // give way to two a side, the w34 rung stands where the old
+        // fractions left no room at all, and a pane too narrow even
+        // for that still declines rather than clips.
+        let mut subject = app();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 30)).expect("terminal");
+        terminal
+            .draw(|frame| subject.render(frame))
+            .expect("first draw");
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(
+            text.contains('▀'),
+            "the give-way margins seat the small rung: {text}"
+        );
+        let shape = subject
+            .welcome_shape(ratatui::layout::Rect::new(0, 0, 40, 30))
+            .expect("a shape");
+        let art = shape.art.expect("the narrow lane's rung");
+        assert_eq!(art.width, 34, "the narrow lane seats the w34 rung");
+        let declined = subject
+            .welcome_shape(ratatui::layout::Rect::new(0, 0, 30, 30))
+            .expect("a shape");
+        assert!(
+            declined.art.is_none(),
+            "too narrow for the smallest rung, the splash still declines"
+        );
+    }
+
+    #[test]
+    fn a_wide_tall_pane_shows_the_rung_whole_with_its_water() {
+        // The whole picture, not its richest rows: a pane that seats a
+        // tall rung's columns and rows shows every row of it — the
+        // water at the fjord's foot included, never windowed away. The
+        // three-quarter budget seats a rung below the widest one the
+        // pane could hold.
+        let subject = app();
+        let area = ratatui::layout::Rect::new(0, 0, 120, 44);
+        let shape = subject.welcome_shape(area).expect("a shape");
+        let art = shape.art.expect("the pane seats the 82x21 rung");
+        assert_eq!(art.width, 82, "the rung three-quarter budgets seat");
+        assert_eq!(art.height, 21, "the rung's own height");
+        assert_eq!(shape.rows_shown, art.height, "the rung shows whole");
+        assert_eq!(shape.row_skip, 0, "nothing is windowed away");
+    }
+
+    #[test]
+    fn a_wide_pane_seats_the_rung_its_width_deserves() {
+        // The width governs: a pane wide enough for the w75 rung seats
+        // it even when the pane is shorter than that, as long as the
+        // group still has its floor of room — the old proportional
+        // height budget used to shrink the picture on panes like this.
+        let subject = app();
+        let area = ratatui::layout::Rect::new(0, 0, 120, 32);
+        let shape = subject.welcome_shape(area).expect("a shape");
+        let art = shape.art.expect("the width seats the 75x20 rung");
+        assert_eq!(art.width, 75, "width governs the seat");
+        assert_eq!(art.height, 20, "the pane's floor still fits it");
+    }
+
+    #[test]
+    fn a_ruled_theme_underlines_the_welcome_field_too() {
+        // The open field is still a field: a theme that rules its
+        // docked composer rules the welcome's the same way — hairline
+        // underlines on the field's own top and bottom padding rows,
+        // drawn by the terminal, thin and solid — while the painted
+        // themes' welcome stays bare, and no rule crosses the murmur
+        // itself.
+        let mut subject = app();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 25)).expect("terminal");
+        terminal
+            .draw(|frame| subject.render(frame))
+            .expect("first draw");
+        {
+            let buffer = terminal.backend().buffer();
+            assert!(
+                (0..25u16).all(|y| {
+                    (0..80u16).all(|x| {
+                        !buffer[(x, y)]
+                            .style()
+                            .add_modifier
+                            .contains(ratatui::style::Modifier::UNDERLINED)
+                    })
+                }),
+                "a painted theme's welcome draws no rules — the field is open"
+            );
+        }
+        subject.theme.ui.composer_border = Some(ratatui::style::Color::Indexed(8));
+        terminal
+            .draw(|frame| subject.render(frame))
+            .expect("ruled draw");
+        let buffer = terminal.backend().buffer();
+        let row_text = |y: u16| -> String {
+            (0..80u16)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect()
+        };
+        let murmur = (0..25u16)
+            .find(|&y| row_text(y).contains("dream"))
+            .expect("the murmur row");
+        // The field's width at this pane: the three-quarter ladder
+        // seats the w48 rung, so each rule runs the field's 48 cells.
+        // The top rule rides the spacer two rows above the murmur —
+        // rule, a blank breath, the text — and the bottom rule the
+        // padding row just below it: the docked field's exact shape.
+        for row in [murmur.saturating_sub(2), murmur + 1] {
+            let ruled = (0..80u16)
+                .filter(|x| {
+                    buffer[(*x, row)]
+                        .style()
+                        .add_modifier
+                        .contains(ratatui::style::Modifier::UNDERLINED)
+                })
+                .count();
+            assert_eq!(ruled, 48, "row {row}: the rule runs the field's width");
+        }
+        assert!(
+            !buffer[(40, murmur)]
+                .style()
+                .add_modifier
+                .contains(ratatui::style::Modifier::UNDERLINED),
+            "the murmur rides clear of both rules"
+        );
+    }
+
+    #[test]
+    fn a_pane_too_short_for_the_art_paints_nothing() {
+        // The art is centered or absent, never clipped — vertically
+        // too: a pane whose row floor cannot seat the smallest rung
+        // shows no splash rather than a windowed fjord missing its
+        // water.
+        let subject = app();
+        let area = ratatui::layout::Rect::new(0, 0, 120, 20);
+        let shape = subject.welcome_shape(area).expect("a shape");
+        assert!(
+            shape.art.is_none(),
+            "a short pane clips nothing — the splash declines"
+        );
+    }
+
+    /// Whether a glyph belongs to the splash's art alphabet.
+    fn is_art_glyph(glyph: &str) -> bool {
+        "▀▄▌▐░▒▓█▘▝▖▗▚▞▙▛▜▟▏▎▍▋▊▉▁▂▃▅▆▇".contains(glyph)
+    }
+
+    /// The art-glyph cells one fresh-session render paints.
+    fn rendered_art(width: u16, height: u16) -> usize {
+        rendered_art_with(app(), width, height)
+    }
+
+    /// The art-glyph cells one given fresh app paints at a size.
+    fn rendered_art_with(mut subject: TuiApp, width: u16, height: u16) -> usize {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                .expect("terminal");
+        terminal.draw(|frame| subject.render(frame)).expect("draw");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .filter(|cell| is_art_glyph(cell.symbol()))
+            .count()
+    }
+
+    #[test]
+    fn a_clear_retires_the_plan_with_the_conversation() {
+        // The plan belongs to the conversation: /clear starts a fresh
+        // session, and the retired plan must not linger in the section
+        // the cleared transcript left behind.
+        let mut subject = app();
+        subject.latest_todos = vec![crate::todo_view::TodoRow {
+            id: "1".to_string(),
+            subject: "Ship the release".to_string(),
+            status: crate::todo_view::TodoStatus::Pending,
+        }];
+        assert!(
+            subject
+                .latest_todos
+                .iter()
+                .any(|row| row.subject.contains("Ship the release")),
+            "the plan stands before the clear"
+        );
+        subject.clear_command();
+        assert!(
+            subject.latest_todos.is_empty(),
+            "the cleared conversation retires its plan"
+        );
+    }
+
+    #[test]
+    fn the_welcome_name_murmurs_in_the_placeholder() {
+        // The empty composer carries the name in the picture's own
+        // night colors: dream in starlight gold, create in moonlit
+        // blue, harness in twilight lavender — one quiet row inside
+        // the open field, stood down at the first keystroke.
+        let mut subject = app();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 60)).expect("terminal");
+        terminal.draw(|frame| subject.render(frame)).expect("draw");
+        let buffer = terminal.backend().buffer();
+        let gold = ratatui::style::Color::Rgb(232, 203, 122);
+        let blue = ratatui::style::Color::Rgb(150, 180, 222);
+        let lavender = ratatui::style::Color::Rgb(180, 154, 216);
+        let word_row = |color: ratatui::style::Color| {
+            (0..buffer.area.height)
+                .find(|row| (0..buffer.area.width).any(|column| buffer[(column, *row)].fg == color))
+        };
+        let placeholder_row = word_row(gold).expect("the placeholder murmurs the name");
+        assert_eq!(
+            word_row(blue),
+            Some(placeholder_row),
+            "create shares the placeholder's row"
+        );
+        assert_eq!(
+            word_row(lavender),
+            Some(placeholder_row),
+            "harness shares the placeholder's row"
+        );
+    }
+
+    #[test]
+    fn the_arts_height_never_trims_the_picture() {
+        // The whole picture at every resolution: a pane that cannot
+        // seat a rung's rows declines to a smaller rung — height
+        // narrows the fjord, it never windows its water away.
+        let short = rendered_art_columns(120, 24);
+        let mid = rendered_art_columns(120, 50);
+        let tall = rendered_art_columns(120, 90);
+        assert_eq!(mid, tall, "past the fit, the width holds: {mid} vs {tall}");
+        assert!(
+            short < mid,
+            "a shorter pane narrows to a smaller whole rung: {short} vs {mid}"
+        );
+
+        let short_rows = rendered_art_rows(120, 24);
+        let tall_rows = rendered_art_rows(120, 90);
+        assert!(
+            short_rows < tall_rows,
+            "a taller pane shows a taller rung, whole: {short_rows} vs {tall_rows}"
+        );
+    }
+
+    #[test]
+    fn the_arts_width_follows_the_panes_width() {
+        // A wider pane earns a wider rung — the ladder's whole point —
+        // up to the ladder's ceiling, beyond which the width holds and
+        // only the height can add rows.
+        let snug = rendered_art_columns(80, 50);
+        let roomy = rendered_art_columns(100, 50);
+        let giant = rendered_art_columns(120, 50);
+        assert!(
+            snug < roomy && roomy < giant,
+            "width drives the rung: {snug} < {roomy} < {giant}"
+        );
+        let beyond = rendered_art_columns(220, 50);
+        let ceiling = rendered_art_columns(200, 50);
+        assert_eq!(
+            ceiling, beyond,
+            "past the ladder's ceiling the width holds: {ceiling} vs {beyond}"
+        );
+    }
+
+    /// The distinct columns one fresh render's art occupies.
+    fn rendered_art_columns(width: u16, height: u16) -> usize {
+        art_bounds(width, height).map_or(0, |(left, right)| {
+            usize::from(right.saturating_sub(left).saturating_add(1))
+        })
+    }
+
+    /// The rows one fresh render's art occupies.
+    fn rendered_art_rows(width: u16, height: u16) -> usize {
+        art_rows(width, height).map_or(0, |(top, bottom)| {
+            usize::from(bottom.saturating_sub(top).saturating_add(1))
+        })
+    }
+
+    /// The leftmost and rightmost art-glyph columns in one render.
+    fn art_bounds(width: u16, height: u16) -> Option<(u16, u16)> {
+        let mut subject = app();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                .expect("terminal");
+        terminal.draw(|frame| subject.render(frame)).expect("draw");
+        let buffer = terminal.backend().buffer();
+        let mut left = None;
+        let mut right = None;
+        for row in 0..buffer.area.height {
+            for column in 0..buffer.area.width {
+                if is_art_glyph(buffer[(column, row)].symbol()) {
+                    left = Some(left.map_or(column, |known: u16| known.min(column)));
+                    right = Some(right.map_or(column, |known: u16| known.max(column)));
+                }
+            }
+        }
+        Some((left?, right?))
+    }
+
+    /// The topmost and bottommost art-glyph rows in one render.
+    fn art_rows(width: u16, height: u16) -> Option<(u16, u16)> {
+        let mut subject = app();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                .expect("terminal");
+        terminal.draw(|frame| subject.render(frame)).expect("draw");
+        let buffer = terminal.backend().buffer();
+        let mut top = None;
+        let mut bottom = None;
+        for row in 0..buffer.area.height {
+            for column in 0..buffer.area.width {
+                if is_art_glyph(buffer[(column, row)].symbol()) {
+                    top.get_or_insert(row);
+                    bottom = Some(row);
+                }
+            }
+        }
+        Some((top?, bottom?))
+    }
+
+    #[test]
+    fn a_roomy_pane_paints_the_larger_scale() {
+        // Quality follows both axes under the cover-crop: width drives
+        // the rung up to the ladder's ceiling, and past it a taller
+        // pane adds rows of the same-wide art.
+        let snug = rendered_art(50, 40);
+        let roomy = rendered_art(140, 30);
+        let giant = rendered_art(220, 80);
+        assert!(snug < 1200, "the snug pane holds the smallest rung: {snug}");
+        assert!(
+            snug * 2 < roomy,
+            "the roomy pane holds a wider rung than snug: {snug} vs {roomy}"
+        );
+        assert!(
+            giant > roomy,
+            "the giant pane shows more rows of the same-wide art: \
+             {giant} vs {roomy}"
         );
     }
 
@@ -17915,11 +19888,1252 @@ mod tests {
     }
 
     #[test]
+    fn mode_names_sets_and_refuses() {
+        // The short door over `/set permission_mode`: bare names the
+        // mode in effect, a spelling lands through the setter's own
+        // machinery — its notice, its ledger, its persist — and an
+        // unknown spelling is refused with the mode kept.
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        // A driver channel from the start, so every landed move also
+        // crosses to the loop and the notices stay the setter's own.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.submit_tx = Some(tx);
+        let out = command_output(&mut app, "/mode");
+        assert!(
+            out.contains("mode is auto"),
+            "the bare form names the mode in effect: {out}"
+        );
+        let out = command_output(&mut app, "/mode plan");
+        assert!(
+            out.contains("permission_mode = read_only"),
+            "the notice names the canonical spelling in force — a retired \
+             alias lands as its replacement: {out}"
+        );
+        assert_eq!(
+            app.config.runner.permission_mode,
+            dch_config::PermissionMode::ReadOnly,
+            "the session config carries the mode"
+        );
+        let sent = rx.try_recv().expect("/mode hands the move to the driver");
+        let crate::queue::Submission::Command { command } = sent else {
+            panic!("the mode travels as a command, got {sent:?}")
+        };
+        let SessionCommand::Mode { mode } = command else {
+            panic!("the command is a mode move, got {command:?}")
+        };
+        assert_eq!(
+            mode,
+            dch_config::PermissionMode::ReadOnly,
+            "the loop is asked for the mode just saved"
+        );
+        let out = command_output(&mut app, "/mode bogus");
+        assert!(
+            out.contains("could not set permission_mode"),
+            "an unknown spelling is refused: {out}"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a refused spelling never reaches the loop"
+        );
+        let (_, candidates, _) = app.fresh_completion("/mode ");
+        assert!(
+            candidates.contains(&"auto".to_string())
+                && candidates.contains(&"read_only".to_string()),
+            "completion offers the mode's spellings: {candidates:?}"
+        );
+
+        // A second spelling lands and crosses the same way — and mid-run
+        // the mode moves live: the shared cell the gate re-reads flips
+        // on the spot, so the very next tool call runs under it.
+        let cell: dch_config::SharedPermissionMode =
+            std::sync::Arc::new(std::sync::Mutex::new(dch_config::PermissionMode::Auto));
+        app.set_permission_mode_cell(Some(std::sync::Arc::clone(&cell)));
+        app.state
+            .agent_running
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let out = command_output(&mut app, "/mode plan");
+        assert!(
+            out.contains("permission_mode = read_only"),
+            "a run in flight still moves the mode live — and the notice \
+             names the canonical spelling, not the alias: {out}"
+        );
+        assert_eq!(
+            *cell
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            dch_config::PermissionMode::ReadOnly,
+            "the gate's cell flips on the spot — the next dispatch reads it"
+        );
+        assert_eq!(
+            app.config.runner.permission_mode,
+            dch_config::PermissionMode::ReadOnly,
+            "the session config carries the live move"
+        );
+    }
+
+    #[test]
+    fn a_welcome_too_small_for_art_records_no_band() {
+        // The band exists to carry art: a pane too small for the
+        // smallest rung still shows the welcome — its composer box
+        // alone, as the shape's own doc says — and must record no
+        // band.
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).expect("terminal");
+        terminal.draw(|frame| app.render(frame)).expect("draw");
+        assert!(
+            app.welcome_band.is_none(),
+            "an artless welcome carries no band — the composer box alone"
+        );
+    }
+
+    #[test]
+    fn retiring_pending_permissions_clears_the_sheet_entry_state() {
+        // The sheet's own drafting state retires with the sheet: a
+        // half-typed reason or a left-expanded preview would greet the
+        // next ask as if the retired sheet's keys had carried over.
+        // The ask itself is dropped unanswered — the resolver reads a
+        // dropped reply as denial — so only the entry state needs
+        // proving here.
+        let mut subject = app();
+        let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
+        subject
+            .pending_permissions
+            .push_back(crate::permission::PermissionRequest {
+                tool_name: "Bash".to_string(),
+                prompt: "run it?".to_string(),
+                input: serde_json::json!({"command": "cargo test"}),
+                always: Vec::new(),
+                never: Vec::new(),
+                reply: reply_tx,
+            });
+        subject.permission_reason = Some("because".to_string());
+        subject.permission_command_expanded = true;
+
+        let _ = subject.tick_wake(std::time::Instant::now());
+
+        assert!(
+            subject.pending_permissions.is_empty(),
+            "the run at rest retires the pending ask"
+        );
+        assert!(
+            subject.permission_reason.is_none(),
+            "the reason draft retires with the sheet"
+        );
+        assert!(
+            !subject.permission_command_expanded,
+            "the preview's expansion retires with the sheet"
+        );
+    }
+
+    #[test]
+    fn an_expanded_preview_spends_only_the_rows_the_sheet_has() {
+        // The budget is the sheet's inner height minus the prompt rows
+        // drawn and the fixed rows owed (scopes, reason, spacer,
+        // hints — each block measured at its wrapped length), floored
+        // at one so a cramped pane still shows the preview's first
+        // line, and capped at the standing ceiling so a tall pane does
+        // not hand an enormous command the sheet.
+        let hints = "y allows · n or esc denies · e expands";
+        let blocks = [
+            "a remembers: cargo build",
+            "d remembers: rm",
+            "reason: ship it▏",
+        ];
+        let fixed = expanded_fixed_rows(&blocks, hints, 80);
+        // A tall sheet: everything fits, the ceiling binds.
+        assert_eq!(
+            expanded_command_budget(100, 3, fixed),
+            MAX_EXPANDED_OVERLAY_ROWS,
+            "a tall pane spends the standing ceiling, no more"
+        );
+        // A short sheet: inner height (less borders) minus prompt and
+        // fixed rows is exactly the preview's budget — nothing more.
+        let budget = expanded_command_budget(20, 3, fixed);
+        assert_eq!(
+            budget,
+            usize::from(20u16.saturating_sub(2))
+                .saturating_sub(3)
+                .saturating_sub(fixed),
+            "the short pane spends its remaining rows, no more"
+        );
+        assert_eq!(
+            3 + fixed + budget,
+            usize::from(20u16.saturating_sub(2)),
+            "prompt, fixed rows, and preview fill the sheet exactly"
+        );
+        // A pane with nothing to spare: the floor still shows one row.
+        assert_eq!(
+            expanded_command_budget(6, 3, fixed),
+            1,
+            "a cramped pane still shows the preview's first line"
+        );
+    }
+
+    #[test]
+    fn an_overflowing_preview_keeps_its_ellipsis_row_inside_the_budget() {
+        // The wrapper's row ceiling includes its own ellipsis row: a
+        // command whose wrap runs past the budget returns exactly the
+        // budget's rows — the ellipsis and the budget's remaining tail
+        // rows — so prompt, preview, and fixed rows fill the sheet
+        // exactly and the final hint row is never clipped. A wrap that
+        // fits the budget, exactly or with room, returns its own rows
+        // unchanged.
+        let wrap_at = 10;
+        let budget = 3;
+        let fits = "aa bb cc";
+        assert_eq!(
+            wrap_prompt_rows_last(fits, wrap_at, budget).len(),
+            1,
+            "a short command returns its own single row"
+        );
+        let exact = "aa bb cc dd ee ff gg hh ii";
+        assert_eq!(
+            wrap_prompt_rows_last(exact, wrap_at, budget).len(),
+            budget,
+            "a wrap that exactly spends the budget returns it whole"
+        );
+        let overflowing = "aa bb cc dd ee ff gg hh ii jj kk ll";
+        let rows = wrap_prompt_rows_last(overflowing, wrap_at, budget);
+        assert_eq!(
+            rows.len(),
+            budget,
+            "the ellipsis row is counted inside the budget, never added on top of it"
+        );
+        assert_eq!(
+            rows.first().map(String::as_str),
+            Some("…"),
+            "the cut is named where the reader's eye lands"
+        );
+        // The sheet-level composition the budget exists for: with the
+        // prompt drawn and the fixed rows owed, an overflowing command
+        // still leaves the sheet's total at or under its inner height.
+        let hints = "y allows · n or esc denies · e expands";
+        let blocks = ["a remembers: cargo build", "d remembers: rm"];
+        let fixed = expanded_fixed_rows(&blocks, hints, 80);
+        let sheet_prompt_rows = 3;
+        let budget = expanded_command_budget(20, sheet_prompt_rows, fixed);
+        let preview = wrap_prompt_rows_last(overflowing, 80, budget);
+        assert!(
+            sheet_prompt_rows + fixed + preview.len() <= usize::from(20u16.saturating_sub(2)),
+            "prompt, fixed rows, and an overflowing preview stay inside the sheet's inner height"
+        );
+    }
+
+    #[test]
+    fn multi_row_blocks_are_counted_at_their_wrapped_length() {
+        // The fixed-rows measurement must count what the renderer
+        // appends: a long scope on a narrow pane wraps to the overlay's
+        // row ceiling, and a one-row-per-block guess would hand the
+        // preview rows the sheet has already spent — pushing scope text
+        // and hints past the sheet's bottom edge.
+        let hints = "y allows · n or esc denies";
+        let narrow = 20;
+        let long_scope = "a remembers: cargo build --workspace --quiet · repeated again and again";
+        let blocks = [long_scope, "d remembers: rm"];
+        let wrapped_scope = wrap_prompt_rows(long_scope, narrow, MAX_OVERLAY_ROWS);
+        assert!(
+            wrapped_scope.len() > 1,
+            "the fixture genuinely wraps — a one-row block could never pin the undercount"
+        );
+        let measured = expanded_fixed_rows(&blocks, hints, narrow);
+        let by_hand = wrapped_scope.len()
+            + wrap_prompt_rows("d remembers: rm", narrow, MAX_OVERLAY_ROWS).len()
+            + 1
+            + wrap_prompt_rows(hints, narrow, MAX_OVERLAY_ROWS).len();
+        assert_eq!(
+            measured, by_hand,
+            "each block counts at the length its wrap will render at"
+        );
+    }
+
+    #[test]
+    fn the_welcome_to_docked_transition_requests_a_full_repaint() {
+        // The docked layout paints fewer rows than the splash band did;
+        // trusting the diff across that transition is the stale-splash
+        // symptom. The retirement arms the repaint the loop clears
+        // with.
+        let mut subject = app();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+        terminal
+            .draw(|frame| subject.render(frame))
+            .expect("welcome draw");
+        assert!(!subject.welcome.welcome_retired);
+        assert!(
+            subject.full_repaint_due.is_none(),
+            "the welcome itself repaints nothing"
+        );
+        subject.push_message(TuiMessage::User {
+            text: "first".to_string(),
+            timestamp: chrono::Utc::now(),
+            steered: false,
+            unsent: false,
+        });
+        terminal
+            .draw(|frame| subject.render(frame))
+            .expect("docked draw");
+        assert!(subject.welcome.welcome_retired);
+        assert!(
+            subject.full_repaint_due.is_some(),
+            "the transition arms the full repaint the loop clears with"
+        );
+    }
+
+    #[test]
+    fn the_docked_frame_leaves_no_splash_rows_behind() {
+        // The reported symptom, pinned at the buffer: the welcome
+        // paints a deep band, the first docked frame paints a short
+        // window — the rows the window cannot reach must hold nothing,
+        // because the pane erases whole before its widgets write.
+        let mut subject = app();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+        terminal
+            .draw(|frame| subject.render(frame))
+            .expect("welcome draw");
+        let welcome_buffer = terminal.backend().buffer().clone();
+        let deep_splash_row = (0..12)
+            .rev()
+            .find(|y| row_has_text(&welcome_buffer, *y))
+            .expect("the welcome paints a deep band");
+        subject.push_message(TuiMessage::User {
+            text: "first".to_string(),
+            timestamp: chrono::Utc::now(),
+            steered: false,
+            unsent: false,
+        });
+        terminal
+            .draw(|frame| subject.render(frame))
+            .expect("docked draw");
+        assert!(
+            !row_has_text(terminal.backend().buffer(), deep_splash_row),
+            "the splash row the docked window cannot reach must be erased"
+        );
+    }
+
+    #[test]
+    fn a_write_ask_shows_what_always_would_remember() {
+        // The `a` press's scope is read before it is pressed: the sheet
+        // carries a dim line naming the rules an allow-always would
+        // record — for a write ask, the directory scope — and a
+        // scopeless ask (nothing to record) shows no such line.
+        let mut subject = app();
+        subject
+            .pending_permissions
+            .push_back(crate::permission::PermissionRequest {
+                tool_name: "Write".to_string(),
+                prompt: "Allow 'Write' (FileWrite) in Interactive mode?".to_string(),
+                input: serde_json::json!({ "file_path": "crates/loop/src/lib.rs" }),
+                always: vec![PermissionRule::PathGlob {
+                    pattern: "crates/**".to_string(),
+                }],
+                never: vec![PermissionRule::PathGlob {
+                    pattern: "crates/**".to_string(),
+                }],
+                reply: tokio::sync::oneshot::channel().0,
+            });
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+        terminal.draw(|frame| subject.render(frame)).expect("draw");
+        let frame = buffer_text(terminal.backend().buffer());
+        assert!(
+            frame.contains("a remembers: writes under `crates/**`"),
+            "the sheet names the scope the a press records: {frame}"
+        );
+        let mut bare = app();
+        bare.pending_permissions
+            .push_back(crate::permission::PermissionRequest {
+                tool_name: "Bash".to_string(),
+                prompt: "Allow 'Bash' (ShellExecute) in Interactive mode?".to_string(),
+                input: serde_json::json!({ "command": "cargo build" }),
+                always: Vec::new(),
+                never: Vec::new(),
+                reply: tokio::sync::oneshot::channel().0,
+            });
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+        terminal.draw(|frame| bare.render(frame)).expect("draw");
+        let frame = buffer_text(terminal.backend().buffer());
+        assert!(
+            frame.contains("runs: cargo build"),
+            "the sheet renders the command from the raw input: {frame}"
+        );
+        assert!(
+            !frame.contains("a remembers"),
+            "nothing to record, no scope line: {frame}"
+        );
+    }
+
+    #[test]
+    fn deny_always_records_the_asks_rules_into_the_deny_list() {
+        // The `d` press is the refusal-side memory: the same typed rules
+        // the `a` press would record land in the deny list, the call is
+        // refused, and plain `n` still records nothing — one denial is
+        // one denial, not a standing "never".
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        let memory = crate::queue::PermissionMemory::default();
+        app.set_permission_memory(memory.clone());
+        app.pending_permissions
+            .push_back(crate::permission::PermissionRequest {
+                tool_name: "Bash".to_string(),
+                prompt: "Allow 'Bash' (ShellExecute) in Interactive mode?".to_string(),
+                input: serde_json::json!({ "command": "make ci" }),
+                always: vec![PermissionRule::ShellPrefix {
+                    prefix: "make ci".to_string(),
+                }],
+                never: vec![PermissionRule::ShellPrefix {
+                    prefix: "make ci".to_string(),
+                }],
+                reply: tokio::sync::oneshot::channel().0,
+            });
+        app.permission_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert_eq!(
+            memory.deny_rules(),
+            vec![PermissionRule::ShellPrefix {
+                prefix: "make ci".to_string()
+            }],
+            "the deny list carries the verb prefix"
+        );
+        assert!(
+            memory.allow_rules().is_empty(),
+            "a deny-always never leaks into the allow list"
+        );
+
+        // A plain `n` denies once and records nothing.
+        app.pending_permissions
+            .push_back(crate::permission::PermissionRequest {
+                tool_name: "Bash".to_string(),
+                prompt: "Allow 'Bash' (ShellExecute) in Interactive mode?".to_string(),
+                input: serde_json::json!({ "command": "make test" }),
+                always: vec![PermissionRule::ShellPrefix {
+                    prefix: "make test".to_string(),
+                }],
+                never: vec![PermissionRule::ShellPrefix {
+                    prefix: "make test".to_string(),
+                }],
+                reply: tokio::sync::oneshot::channel().0,
+            });
+        app.permission_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert!(
+            memory.deny_rules().len() == 1 && memory.allow_rules().is_empty(),
+            "a plain denial records nothing"
+        );
+    }
+
+    #[test]
+    fn the_live_case_denies_only_what_was_refused_and_blessings_survive() {
+        // The sheet-level pin on the narrow deny derivation: a session
+        // that blessed
+        // `cargo build` earlier, then pressed `d` on
+        // `cargo build … | tail -30`, records nothing — the narrow
+        // derivation mints only `cargo build`, and the memory skips
+        // what the allow list already carries. The blessing survives;
+        // no reader-deny rule is minted by association.
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        let memory = crate::queue::PermissionMemory::default();
+        memory.remember_rules(&[PermissionRule::ShellPrefix {
+            prefix: "cargo build".to_string(),
+        }]);
+        app.set_permission_memory(memory.clone());
+        app.pending_permissions
+            .push_back(crate::permission::PermissionRequest {
+                tool_name: "Bash".to_string(),
+                prompt: "Allow 'Bash' (ShellExecute) in Interactive mode?".to_string(),
+                input: serde_json::json!({
+                    "command": "cargo build --workspace --quiet 2>&1 | tail -30"
+                }),
+                always: vec![
+                    PermissionRule::ShellPrefix {
+                        prefix: "cargo build".to_string(),
+                    },
+                    PermissionRule::ShellPrefix {
+                        prefix: "tail".to_string(),
+                    },
+                ],
+                never: vec![PermissionRule::ShellPrefix {
+                    prefix: "cargo build".to_string(),
+                }],
+                reply: tokio::sync::oneshot::channel().0,
+            });
+        app.permission_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert!(
+            memory.deny_rules().is_empty(),
+            "the refusal minted nothing — the verb was already blessed"
+        );
+        assert_eq!(
+            memory.allow_rules(),
+            vec![PermissionRule::ShellPrefix {
+                prefix: "cargo build".to_string()
+            }],
+            "the blessing is sticky"
+        );
+    }
+
+    #[test]
+    fn the_sheet_renders_both_remember_lines_post_skip() {
+        // The sheet tells the truth before the press: both remember
+        // lines render the post-skip set — what the press will
+        // actually write — not the raw derivation.
+        let mut subject = app();
+        let memory = crate::queue::PermissionMemory::default();
+        memory.remember_rules(&[PermissionRule::ShellPrefix {
+            prefix: "tail".to_string(),
+        }]);
+        subject.set_permission_memory(memory);
+        subject
+            .pending_permissions
+            .push_back(crate::permission::PermissionRequest {
+                tool_name: "Bash".to_string(),
+                prompt: "Allow 'Bash' (ShellExecute) in Interactive mode?".to_string(),
+                input: serde_json::json!({
+                    "command": "cargo build --workspace 2>&1 | tail -30"
+                }),
+                always: vec![
+                    PermissionRule::ShellPrefix {
+                        prefix: "cargo build".to_string(),
+                    },
+                    PermissionRule::ShellPrefix {
+                        prefix: "tail".to_string(),
+                    },
+                ],
+                never: vec![
+                    PermissionRule::ShellPrefix {
+                        prefix: "tail".to_string(),
+                    },
+                    PermissionRule::ShellPrefix {
+                        prefix: "cargo build".to_string(),
+                    },
+                ],
+                reply: tokio::sync::oneshot::channel().0,
+            });
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+        terminal.draw(|frame| subject.render(frame)).expect("draw");
+        let frame = buffer_text(terminal.backend().buffer());
+        assert!(
+            frame.contains("a remembers: every future `cargo build` run"),
+            "the allow line previews both verbs — neither is denied: {frame}"
+        );
+        assert!(
+            frame.contains("d remembers: every future `cargo build` run"),
+            "the deny line skips the blessed tail — only the build previews: {frame}"
+        );
+        assert!(
+            !frame.contains("d remembers: every future `cargo build` run ·"),
+            "the blessed tail is gone from the deny preview: {frame}"
+        );
+    }
+
+    #[test]
+    fn bare_preset_lists_the_configured_presets() {
+        // The listing the spec promises: bare `/preset` reaches the
+        // listing branch now that the parser admits it (the arg shape
+        // matches `/mode`) — naming the configured presets and the
+        // live selection; with none configured it says so instead.
+        let mut app = TuiApp::new(
+            dch_config::DchConfig::from_toml_str(concat!(
+                "[permissions]\n",
+                "preset = \"rust-dev\"\n",
+                "\n",
+                "[permissions.presets.rust-dev]\n",
+                "rules = [{ outcome = \"allow\", shell_prefix = \"cargo test\" }]\n",
+            ))
+            .expect("the config parses"),
+        );
+        app.preset_command(None);
+        let (text, _) = app
+            .transient_notice
+            .as_ref()
+            .expect("the listing posts a notice")
+            .clone();
+        assert!(
+            text.contains("presets: rust-dev") && text.contains("selected: rust-dev"),
+            "the listing names the presets and the live selection: {text}"
+        );
+
+        let mut empty = TuiApp::new(dch_config::DchConfig::default());
+        empty.preset_command(None);
+        let (text, _) = empty
+            .transient_notice
+            .as_ref()
+            .expect("the empty listing posts a notice")
+            .clone();
+        assert!(
+            text.contains("no [permissions.presets] configured"),
+            "an empty preset table is named, not listed silently: {text}"
+        );
+    }
+
+    #[test]
+    fn permissions_lists_and_forgets_the_remembered_rules() {
+        type Ledger = Option<(
+            Vec<crate::queue::PermissionRule>,
+            Vec<crate::queue::PermissionRule>,
+        )>;
+
+        // The listing names the config's rules and the session's
+        // remembered ones, numbered; `forget <n>` drops the numbered
+        // remembered rule through the memory and its persist hook in one
+        // motion, so what the listing forgets the file forgets with it.
+        // A configured rule is listed read-only — its home is the file.
+        let mut app = TuiApp::new(
+            dch_config::DchConfig::from_toml_str(
+                "[[permissions.rules]]\nid = \"no-env-writes\"\noutcome = \"deny\"\npath_glob = \"**/.env\"\n",
+            )
+            .expect("the config parses"),
+        );
+        let memory = crate::queue::PermissionMemory::default();
+        let written: std::sync::Arc<std::sync::Mutex<Ledger>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let ledger = std::sync::Arc::clone(&written);
+        memory.persist_through(std::sync::Arc::new(move |allow, deny, _damaged: bool| {
+            *ledger
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some((allow.to_vec(), deny.to_vec()));
+        }));
+        app.set_permission_memory(memory.clone());
+        memory.remember_rules(&[
+            crate::queue::PermissionRule::Tool {
+                tool: "WebFetch".to_string(),
+            },
+            crate::queue::PermissionRule::PathGlob {
+                pattern: "crates/**".to_string(),
+            },
+        ]);
+        let out = command_output(&mut app, "/permissions");
+        assert!(
+            out.contains("deny path_glob **/.env"),
+            "the config rule lists with its verdict and matcher: {out}"
+        );
+        assert!(
+            out.contains("2. every future WebFetch call"),
+            "the allow rules number after the configured ones: {out}"
+        );
+        assert!(out.contains("3. writes under `crates/**`"), "{out}");
+        let out = command_output(&mut app, "/permissions forget 2");
+        assert!(
+            out.contains("Forgot remembered permission"),
+            "the forget says what lapsed: {out}"
+        );
+        assert_eq!(
+            memory.allow_rules().len(),
+            1,
+            "the tool rule stays in the allow list"
+        );
+        assert_eq!(
+            memory.deny_rules().len(),
+            0,
+            "the glob rule is out of the memory"
+        );
+        let persisted = written
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .expect("the forget fired the write-through");
+        assert_eq!(persisted.0.len(), 1, "the allow half mirrors the memory");
+        assert_eq!(persisted.1.len(), 0, "the deny half mirrors the memory");
+        let out = command_output(&mut app, "/permissions forget 9");
+        assert!(
+            out.contains("no remembered rule 9"),
+            "an out-of-range forget says so: {out}"
+        );
+    }
+
+    #[test]
+    fn a_forget_matches_the_rule_it_rendered_not_the_position_it_landed_on() {
+        // The listing's numbers are a snapshot: the memory can move
+        // between the render and the press — a queued `/resume`'s
+        // adopt replaces the pair wholesale — so the press removes
+        // the rule the user read or nothing, never whatever now
+        // occupies the position.
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        app.permission_memory.adopt(
+            vec![crate::queue::PermissionRule::ShellPrefix {
+                prefix: "cargo test".to_string(),
+            }],
+            vec![],
+            false,
+        );
+        let out = command_output(&mut app, "/permissions");
+        assert!(
+            out.contains("1. every future `cargo test` run"),
+            "the render numbers the rule the user read: {out}"
+        );
+        // The adopt the resume rides in: the rendered rule is gone, a
+        // different one holds the position.
+        app.permission_memory.adopt(
+            vec![crate::queue::PermissionRule::ShellPrefix {
+                prefix: "cargo build".to_string(),
+            }],
+            vec![],
+            false,
+        );
+        let out = command_output(&mut app, "/permissions forget 1");
+        assert!(
+            out.contains("no longer remembered as rendered"),
+            "the mismatch is named, not silently re-keyed: {out}"
+        );
+        assert_eq!(
+            app.permission_memory.allow_rules(),
+            vec![crate::queue::PermissionRule::ShellPrefix {
+                prefix: "cargo build".to_string(),
+            }],
+            "the rule holding the position survives the mismatched press"
+        );
+        // The happy twin: a fresh render re-keys the press, and the
+        // forget removes exactly the rule it now names.
+        let out = command_output(&mut app, "/permissions");
+        assert!(
+            out.contains("cargo build"),
+            "the fresh render lists what is live: {out}"
+        );
+        let out = command_output(&mut app, "/permissions forget 1");
+        assert!(
+            out.contains("Forgot remembered permission"),
+            "the re-keyed press removes what it rendered: {out}"
+        );
+        assert!(
+            app.permission_memory.allow_rules().is_empty(),
+            "the rendered rule is out of the memory"
+        );
+    }
+
+    #[test]
+    fn permissions_command_parses_bare_and_forget() {
+        assert_eq!(
+            commands::parse("/permissions"),
+            commands::Parsed::Command(commands::Command::Permissions { forget: None })
+        );
+        assert_eq!(
+            commands::parse("/permissions forget 2"),
+            commands::Parsed::Command(commands::Command::Permissions {
+                forget: Some("forget 2".to_string())
+            })
+        );
+    }
+
+    #[test]
+    fn forget_zero_answers_no_such_rule_and_spares_the_first_remembered() {
+        // Zero is nobody's number in a list numbered from one: with a
+        // remembered rule sitting at position 1, `forget 0` must answer
+        // the no-such-rule notice — never reach the remembered index,
+        // and never masquerade as a configured rule when none exist.
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        let memory = crate::queue::PermissionMemory::default();
+        memory.remember_rules(&[crate::queue::PermissionRule::ShellPrefix {
+            prefix: "cargo test".to_string(),
+        }]);
+        app.set_permission_memory(memory.clone());
+        assert_eq!(
+            app.config.permissions.rules,
+            Vec::new(),
+            "the fresh app carries no configured rules"
+        );
+
+        app.permissions_command(Some("forget 0"));
+
+        let (notice, _) = app
+            .transient_notice
+            .as_ref()
+            .expect("the zero ask answers with a notice");
+        assert!(
+            notice.contains("no remembered rule 0"),
+            "the notice says no such rule, not the configured-file wording: {notice}"
+        );
+        assert_eq!(
+            app.permission_memory.allow_rules().len(),
+            1,
+            "the remembered rule at position 1 is untouched"
+        );
+        assert_eq!(
+            memory.allow_rules(),
+            app.permission_memory.allow_rules(),
+            "the app's memory and the seeded copy still agree"
+        );
+    }
+
+    #[test]
+    fn a_repair_after_the_verdict_cleared_says_nothing_to_repair() {
+        // The round-4 lifecycle case's door half: the verdict repair
+        // is keyed to can clear without the command — a `/clear`
+        // rotation and a resume into a healthy session both adopt a
+        // fresh memory. Against a cleared verdict the door must
+        // answer "nothing to repair", because the driver re-seeded
+        // the config layer beside the adoption and no posture
+        // stands.
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        let memory = crate::queue::PermissionMemory::default();
+        memory.mark_damaged();
+        app.set_permission_memory(memory);
+        assert!(
+            app.permission_memory.damage_standing(),
+            "the damage verdict stands before the wholesale adoption"
+        );
+        // The clear path's motion on the shared memory: the fresh
+        // adoption clears the verdict.
+        app.permission_memory.adopt(Vec::new(), Vec::new(), false);
+
+        app.permissions_command(Some("repair"));
+
+        let (notice, _) = app
+            .transient_notice
+            .as_ref()
+            .expect("the repair answers with a notice");
+        assert!(
+            notice.contains("nothing to repair"),
+            "the door answers for the verdict that stands — none: {notice}"
+        );
+    }
+
+    #[test]
+    fn a_repair_under_standing_damage_reseeds_and_releases_the_adoption_guard() {
+        // The repair's serialization pin: with the driver's adoption
+        // guard installed the way production wires it, the recovery
+        // runs its two steps — the verdict's clearing, the cell's
+        // re-seed — under that guard and gives it back, so a
+        // concurrent resume adoption cannot interleave between them
+        // and a leaked guard cannot deadlock the next adoption.
+        let mut config = dch_config::DchConfig::default();
+        config.permissions.rules = vec![dch_config::PermissionRuleConfig {
+            id: None,
+            outcome: dch_config::PermissionRuleOutcome::Allow,
+            tool: Some("Bash".to_string()),
+            shell_prefix: None,
+            path_glob: None,
+        }];
+        let mut app = TuiApp::new(config.clone());
+        let memory = crate::queue::PermissionMemory::default();
+        memory.mark_damaged();
+        app.set_permission_memory(memory);
+        let rules_cell = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        app.set_permission_config_rules_cell(Some(std::sync::Arc::clone(&rules_cell)));
+        let adoption_guard = std::sync::Arc::new(std::sync::Mutex::new(()));
+        app.set_permission_adoption_guard(Some(std::sync::Arc::clone(&adoption_guard)));
+
+        app.permissions_command(Some("repair"));
+
+        let rules = rules_cell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            *rules,
+            config.permissions.engine_rules(),
+            "the repair re-seeds the config layer at the configuration's own join"
+        );
+        drop(rules);
+        assert!(
+            adoption_guard.try_lock().is_ok(),
+            "the repair releases the adoption guard — a leak would deadlock the next adoption"
+        );
+        assert!(
+            !app.permission_memory.damage_standing(),
+            "the verdict cleared"
+        );
+    }
+
+    #[test]
+    fn a_preset_selection_waits_for_repair_and_takes_effect_at_it() {
+        // The round-4 damage interaction, end to end: a healthy swap
+        // joins the new preset's rules at once; under a standing
+        // damage verdict the swap records the selection and holds —
+        // the config layer stays tightened, so the new preset's rules
+        // cannot release anything ahead of the repair — and the
+        // repair re-seeds at the selection the session actually
+        // chose.
+        let mut config = dch_config::DchConfig::default();
+        config.permissions.preset = Some("p1".to_string());
+        config.permissions.presets.insert(
+            "p1".to_string(),
+            dch_permissions::Preset {
+                rules: vec![dch_config::PermissionRuleConfig {
+                    id: None,
+                    outcome: dch_config::PermissionRuleOutcome::Allow,
+                    tool: Some("Bash".to_string()),
+                    shell_prefix: None,
+                    path_glob: None,
+                }],
+            },
+        );
+        config.permissions.presets.insert(
+            "p2".to_string(),
+            dch_permissions::Preset {
+                rules: vec![dch_config::PermissionRuleConfig {
+                    id: Some("no-push".to_string()),
+                    outcome: dch_config::PermissionRuleOutcome::Deny,
+                    tool: None,
+                    shell_prefix: Some("git push".to_string()),
+                    path_glob: None,
+                }],
+            },
+        );
+        let mut app = TuiApp::new(config.clone());
+        let rules_cell =
+            std::sync::Arc::new(std::sync::Mutex::new(config.permissions.engine_rules()));
+        let preset_cell =
+            std::sync::Arc::new(std::sync::Mutex::new(config.permissions.preset.clone()));
+        app.set_permission_config_rules_cell(Some(std::sync::Arc::clone(&rules_cell)));
+        app.set_permission_preset_cell(Some(std::sync::Arc::clone(&preset_cell)));
+        // The swap runs under the driver's adoption guard in production;
+        // hand the app the same lane so the paths below exercise it —
+        // and prove at the end that every swap gave it back.
+        let adoption_guard = std::sync::Arc::new(std::sync::Mutex::new(()));
+        app.set_permission_adoption_guard(Some(std::sync::Arc::clone(&adoption_guard)));
+
+        app.preset_command(Some("p2"));
+
+        let held_join = config.permissions.engine_rules_at(Some("p2"));
+        assert_eq!(
+            *rules_cell
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            held_join,
+            "a healthy swap joins the new preset's rules at once"
+        );
+        assert_eq!(
+            *preset_cell
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            Some("p2".to_string()),
+            "the swap records the selection the driver re-seeds from"
+        );
+        app.permission_memory.adopt(Vec::new(), Vec::new(), true);
+
+        app.preset_command(Some("p1"));
+
+        assert_eq!(
+            *rules_cell
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            held_join,
+            "the held swap leaves the tightened cell exactly as it stood"
+        );
+        assert_eq!(
+            *preset_cell
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            Some("p1".to_string()),
+            "the selection is recorded even while its rules wait"
+        );
+        let (notice, _) = app
+            .transient_notice
+            .as_ref()
+            .expect("the held swap answers with a notice");
+        assert!(
+            notice.contains("wait for /permissions repair"),
+            "the notice names the door the rules wait at: {notice}"
+        );
+
+        app.permissions_command(Some("repair"));
+
+        assert_eq!(
+            *rules_cell
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            config.permissions.engine_rules_at(Some("p1")),
+            "the repair re-seeds at the selection in effect — the swap the \
+             damage held takes effect with it"
+        );
+
+        assert!(
+            adoption_guard.try_lock().is_ok(),
+            "a finished swap always releases the adoption guard — a leak \
+             would deadlock the next adoption"
+        );
+    }
+
+    #[test]
+    fn the_listing_names_the_selected_preset_rules_and_numbers_them() {
+        // The gate evaluates the preset's rules beside the top-level
+        // ones, so the listing shows both: the preset's rows marked
+        // with their origin and numbered into the same sequence — and
+        // `forget` on a preset row answers the configured wording, the
+        // preset being config-side like the file's own rules.
+        let mut config = dch_config::DchConfig::default();
+        config.permissions.rules = vec![dch_config::PermissionRuleConfig {
+            id: Some("no-env-writes".to_string()),
+            outcome: dch_config::PermissionRuleOutcome::Deny,
+            tool: None,
+            shell_prefix: None,
+            path_glob: Some("**/.env".to_string()),
+        }];
+        config.permissions.preset = Some("rust-dev".to_string());
+        config.permissions.presets = std::collections::BTreeMap::from([(
+            "rust-dev".to_string(),
+            dch_permissions::Preset {
+                rules: vec![dch_config::PermissionRuleConfig {
+                    id: Some("deny-cargo-publish".to_string()),
+                    outcome: dch_config::PermissionRuleOutcome::Deny,
+                    tool: None,
+                    shell_prefix: Some("cargo publish".to_string()),
+                    path_glob: None,
+                }],
+            },
+        )]);
+        let mut app = TuiApp::new(config);
+
+        app.permissions_command(None);
+        let texts: Vec<String> = app
+            .conversation()
+            .iter()
+            .filter_map(|message| match message {
+                TuiMessage::System { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        let joined = texts.join("\n");
+        assert!(
+            joined.contains("from preset rust-dev"),
+            "the preset's rules are listed with their origin: {joined}"
+        );
+        assert!(
+            joined.contains("2. deny shell_prefix cargo publish"),
+            "the preset rule carries the number after the top-level rule: {joined}"
+        );
+
+        app.permissions_command(Some("forget 2"));
+        let (notice, _) = app
+            .transient_notice
+            .as_ref()
+            .expect("the preset-row ask answers with a notice");
+        assert!(
+            notice.contains("rule 2 is configured"),
+            "a preset rule is config-side — forget answers the configured wording: {notice}"
+        );
+    }
+
+    #[test]
+    fn allow_always_remembers_the_asks_rules_and_only_the_asks() {
+        // The overlay's third answer: `a` allows and records the ask's
+        // typed rules — for Bash, one verb prefix per non-reader
+        // segment, so every later variant of the same work runs free —
+        // while `y` allows without remembering and `n` denies without
+        // remembering. The memory is the same object the resolver
+        // consults, so the next ask the rules cover never prompts.
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        let memory = crate::queue::PermissionMemory::default();
+        app.set_permission_memory(memory.clone());
+        let asks = [
+            (
+                "Bash",
+                "Allow 'Bash' (ShellExecute) in Interactive mode?",
+                serde_json::json!({ "command": "cargo test -p dch-tui" }),
+                vec![crate::queue::PermissionRule::ShellPrefix {
+                    prefix: "cargo test".to_string(),
+                }],
+                vec![crate::queue::PermissionRule::ShellPrefix {
+                    prefix: "cargo test".to_string(),
+                }],
+            ),
+            (
+                "Bash",
+                "Allow 'Bash' (ShellExecute) in Interactive mode?",
+                serde_json::json!({ "command": "rm -rf /tmp/x" }),
+                vec![crate::queue::PermissionRule::ShellPrefix {
+                    prefix: "rm".to_string(),
+                }],
+                vec![crate::queue::PermissionRule::ShellPrefix {
+                    prefix: "rm".to_string(),
+                }],
+            ),
+            (
+                "Write",
+                "Allow 'Write' (FileWrite) in Interactive mode?",
+                serde_json::json!({ "file_path": "README.md" }),
+                vec![crate::queue::PermissionRule::Tool {
+                    tool: "Write".to_string(),
+                }],
+                vec![crate::queue::PermissionRule::Tool {
+                    tool: "Write".to_string(),
+                }],
+            ),
+        ];
+        let mut replies = Vec::new();
+        for (tool, prompt, input, always, never) in asks {
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            app.pending_permissions
+                .push_back(crate::permission::PermissionRequest {
+                    tool_name: tool.to_string(),
+                    prompt: prompt.to_string(),
+                    input,
+                    always,
+                    never,
+                    reply: reply_tx,
+                });
+            replies.push(reply_rx);
+        }
+        assert_eq!(
+            app.permission_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+            Some(true),
+            "`a` answers the ask"
+        );
+        assert_eq!(
+            replies.remove(0).try_recv(),
+            Ok(PermissionResolution::AllowOnce),
+            "`a` allows the call"
+        );
+        assert_eq!(
+            app.permission_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
+            Some(true)
+        );
+        assert_eq!(
+            replies.remove(0).try_recv(),
+            Ok(PermissionResolution::AllowOnce),
+            "`y` allows too"
+        );
+        assert_eq!(
+            app.permission_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
+            Some(true)
+        );
+        assert_eq!(
+            replies.remove(0).try_recv(),
+            Ok(PermissionResolution::DenyOnce),
+            "`n` denies"
+        );
+        let remembered = "cargo test";
+        assert_eq!(
+            memory.allow_rules(),
+            vec![crate::queue::PermissionRule::ShellPrefix {
+                prefix: remembered.to_string()
+            }],
+            "only the `a` answer is remembered — its verb prefix"
+        );
+        assert!(
+            memory.covers_prefixes(&["cargo test".to_string()]),
+            "the resolver answers every cargo-test variant on sight"
+        );
+        assert!(
+            !memory.covers_prefixes(&["cargo build".to_string()]),
+            "a different verb is a different ask"
+        );
+    }
+
+    #[test]
+    fn ctrl_c_cancels_the_ask_instead_of_quitting() {
+        // The hint's promise holds: under a pending ask, ctrl+c
+        // denies that ask — cancel, not quit — and the reply that
+        // crosses is a refusal.
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
+        app.pending_permissions
+            .push_back(crate::permission::PermissionRequest {
+                tool_name: "Bash".to_string(),
+                prompt: "Allow 'Bash' (ShellExecute) in Interactive mode?".to_string(),
+                input: serde_json::json!({ "command": "cargo test" }),
+                always: Vec::new(),
+                never: Vec::new(),
+                reply: reply_tx,
+            });
+        assert_eq!(
+            app.permission_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Some(true),
+            "ctrl+c answers the ask"
+        );
+        assert_eq!(
+            reply_rx.try_recv(),
+            Ok(PermissionResolution::DenyOnce),
+            "ctrl+c denies — the ask is cancelled, not the session"
+        );
+    }
+
+    #[test]
+    fn returning_to_the_bare_prefix_rederives_not_recycles() {
+        // A cycle opened on a fragment freezes that fragment's filtered
+        // list; deleting back to the bare prefix must re-derive the
+        // whole list, not keep stepping the stale filter. Only a cycle
+        // that opened bare holds the bare prefix.
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        app.handle_event(&crossterm::event::Event::Paste("/theme ligh".to_string()));
+        let tab = crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Tab,
+            KeyModifiers::NONE,
+        ));
+        assert!(app.handle_event(&tab), "Tab steps the filtered cycle");
+        let cycle = app.completion.as_ref().expect("the filtered cycle stands");
+        assert_eq!(cycle.candidates.len(), 3, "ligh* filters three themes");
+        assert!(!cycle.bare, "the cycle opened on a fragment");
+        while app.input.text() != "/theme " {
+            app.handle_event(&crossterm::event::Event::Key(
+                crossterm::event::KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+            ));
+        }
+        assert!(app.handle_event(&tab), "Tab at the bare prefix re-derives");
+        let cycle = app.completion.as_ref().expect("a fresh cycle stands");
+        assert!(
+            cycle.candidates.len() > 3,
+            "the bare prefix cycles the whole palette, not the stale filter"
+        );
+        assert!(cycle.bare, "the fresh cycle opened bare");
+    }
+
+    #[test]
+    fn a_typed_fragment_tab_walks_only_its_filter() {
+        // The user's exact flow, typed character by character: the
+        // fragment's filtered list is what Tab walks, press after
+        // press — never the whole palette. The stale-path guard: a
+        // bare-prefix walk first (the whole list), then typing `ligh`
+        // over it must retire that cycle and re-derive the filter.
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        for ch in "/theme ligh".chars() {
+            app.handle_event(&crossterm::event::Event::Key(
+                crossterm::event::KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            ));
+        }
+        let tab = crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Tab,
+            KeyModifiers::NONE,
+        ));
+        for _ in 0..5 {
+            assert!(app.handle_event(&tab), "Tab always answers");
+            let cycle = app.completion.as_ref().expect("a cycle stands");
+            assert_eq!(
+                cycle.candidates.len(),
+                3,
+                "the walk stays on the filtered list: {:?}",
+                cycle.candidates
+            );
+            assert!(!cycle.bare, "the walk never reopens bare");
+        }
+
+        // The stale path: walk the bare prefix's whole list, then
+        // build the fragment by hand over it — the bare cycle must
+        // retire the moment the composer spells something it never
+        // applied, and Tab walks the fragment's filter instead.
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        for ch in "/theme ".chars() {
+            app.handle_event(&crossterm::event::Event::Key(
+                crossterm::event::KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            ));
+        }
+        assert!(app.handle_event(&tab), "the bare walk opens");
+        while app.input.text() != "/theme " {
+            app.handle_event(&crossterm::event::Event::Key(
+                crossterm::event::KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+            ));
+        }
+        for ch in "ligh".chars() {
+            app.handle_event(&crossterm::event::Event::Key(
+                crossterm::event::KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+            ));
+        }
+        assert!(app.handle_event(&tab), "Tab answers the fragment");
+        let cycle = app.completion.as_ref().expect("a fresh cycle stands");
+        assert_eq!(
+            cycle.candidates.len(),
+            3,
+            "typing over a bare walk re-derives the filter: {:?}",
+            cycle.candidates
+        );
+    }
+
+    #[test]
     fn help_lists_the_palette_and_its_footer() {
         let mut app = TuiApp::new(dch_config::DchConfig::default());
         let out = command_output(&mut app, "/help");
         assert!(out.contains("In-session commands"), "got {out:?}");
         assert!(out.contains("/clear"), "the listing shows a known command");
+        assert!(out.contains("/mode"), "the short mode door is listed");
         assert!(
             out.contains("/help <command>"),
             "the footer points at per-command help, got {out:?}"
@@ -18082,9 +21296,7 @@ mod tests {
         );
         assert_eq!(
             app.theme.name,
-            Theme::by_name(&first)
-                .map(|theme| theme.name)
-                .unwrap_or_default(),
+            Theme::by_name(&first).map_or_default(|theme| theme.name),
             "the palette previews the row the first Tab applied"
         );
         assert!(
@@ -18153,9 +21365,7 @@ mod tests {
         );
         assert_eq!(
             app.theme.name,
-            Theme::by_name(&second)
-                .map(|theme| theme.name)
-                .unwrap_or_default(),
+            Theme::by_name(&second).map_or_default(|theme| theme.name),
             "the palette previews the landed row"
         );
         assert!(
@@ -18182,9 +21392,7 @@ mod tests {
         );
         assert_eq!(
             app.theme.name,
-            Theme::by_name(&first)
-                .map(|theme| theme.name)
-                .unwrap_or_default(),
+            Theme::by_name(&first).map_or_default(|theme| theme.name),
             "the palette previews the row the composer names"
         );
     }
@@ -18317,9 +21525,7 @@ mod tests {
         assert!(app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
         assert_eq!(
             app.theme.name,
-            Theme::by_name(&third)
-                .map(|theme| theme.name)
-                .unwrap_or_default(),
+            Theme::by_name(&third).map_or_default(|theme| theme.name),
             "the arrows previewed the third theme"
         );
         // Backspace out of the applied row and past the space: the
@@ -18393,9 +21599,7 @@ mod tests {
         );
         assert_eq!(
             app.theme.name,
-            Theme::by_name(&second)
-                .map(|theme| theme.name)
-                .unwrap_or_default(),
+            Theme::by_name(&second).map_or_default(|theme| theme.name),
             "the palette previews the highlighted row, not the theme the browse started from"
         );
         assert!(
@@ -18430,9 +21634,7 @@ mod tests {
         );
         assert_eq!(
             app.theme.name,
-            Theme::by_name(&third)
-                .map(|theme| theme.name)
-                .unwrap_or_default(),
+            Theme::by_name(&third).map_or_default(|theme| theme.name),
             "the preview follows the arrow-landed row"
         );
         // Tab continues from the arrow's position — the shared cycle —
@@ -18457,9 +21659,7 @@ mod tests {
         assert!(app.handle_key(up));
         assert_eq!(
             app.theme.name,
-            Theme::by_name(&last)
-                .map(|theme| theme.name)
-                .unwrap_or_default(),
+            Theme::by_name(&last).map_or_default(|theme| theme.name),
             "Up from the fresh highlight wraps to the last row"
         );
         assert_eq!(
@@ -18471,9 +21671,7 @@ mod tests {
         assert!(app.handle_key(down));
         assert_eq!(
             app.theme.name,
-            Theme::by_name(&last)
-                .map(|theme| theme.name)
-                .unwrap_or_default(),
+            Theme::by_name(&last).map_or_default(|theme| theme.name),
             "Up then Down returns to the last row (Up wrapped, Down stepped back)"
         );
         assert!(
@@ -18497,9 +21695,7 @@ mod tests {
         assert!(app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
         assert_eq!(
             app.theme.name,
-            Theme::by_name(&second)
-                .map(|theme| theme.name)
-                .unwrap_or_default(),
+            Theme::by_name(&second).map_or_default(|theme| theme.name),
             "the arrow lands on the second row — the preview proves the position"
         );
         assert!(app.complete_command_line(false));
@@ -18549,9 +21745,7 @@ mod tests {
         assert!(app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
         assert_eq!(
             app.theme.name,
-            Theme::by_name(&third)
-                .map(|theme| theme.name)
-                .unwrap_or_default(),
+            Theme::by_name(&third).map_or_default(|theme| theme.name),
             "the step continues from the cycle's position in the fresh list"
         );
     }
@@ -18588,7 +21782,7 @@ mod tests {
             width: 40,
             height: 3,
         };
-        let popup = popup_rect(area, 4);
+        let popup = popup_rect(area, 4, true);
         assert_eq!(popup.width, 40, "the popup is as wide as the composer");
         assert_eq!(popup.x, 2, "it shares the composer's left edge");
         assert_eq!(popup.y, 6, "it floats immediately above the composer");
@@ -18616,6 +21810,15 @@ mod tests {
     #[test]
     fn the_popup_command_rows_carry_the_help_summary() {
         let mut subject = TuiApp::new(dch_config::DchConfig::default());
+        // The popup's full summary belongs to the docked composer's
+        // width — the welcome's four-fifths field truncates it — so
+        // the rows ride a landed prompt.
+        subject.push_message(TuiMessage::User {
+            text: "hello".to_string(),
+            timestamp: chrono::Utc::now(),
+            steered: false,
+            unsent: false,
+        });
         subject.input.set_text("/".to_string());
         let rows = screen_rows(&mut subject);
         let (_, candidates, _) = subject.fresh_completion("/");
@@ -18669,8 +21872,7 @@ mod tests {
         let notice = app
             .transient_notice
             .as_ref()
-            .map(|(text, _)| text.clone())
-            .unwrap_or_default();
+            .map_or_default(|(text, _)| text.clone());
         assert!(
             !notice.is_empty() && !notice.contains("more") && !notice.contains(','),
             "the notice is the chosen value alone, no list, no tally: {notice}"
@@ -18684,8 +21886,7 @@ mod tests {
         let silent = theme_app
             .transient_notice
             .as_ref()
-            .map(|(text, _)| text.clone())
-            .unwrap_or_default();
+            .map_or_default(|(text, _)| text.clone());
         assert!(
             silent.is_empty(),
             "a theme completion posts no notice — the preview is the feedback: {silent}"
@@ -19056,6 +22257,9 @@ mod tests {
             .push_back(crate::permission::PermissionRequest {
                 tool_name: "Bash".to_string(),
                 prompt: "run it?".to_string(),
+                input: serde_json::Value::Null,
+                always: Vec::new(),
+                never: Vec::new(),
                 reply: reply_tx,
             });
         let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
@@ -19063,7 +22267,10 @@ mod tests {
         // The ask's Esc: denies it, does NOT arm the cancel.
         assert!(app.handle_key(esc), "the sheet's Esc is taken");
         assert!(
-            !reply_rx.blocking_recv().unwrap_or(true),
+            !matches!(
+                reply_rx.blocking_recv(),
+                Ok(PermissionResolution::AllowOnce)
+            ),
             "the standing ask still reads the Esc as its deny"
         );
         assert_eq!(
@@ -19173,8 +22380,7 @@ mod tests {
         let notice = app
             .transient_notice
             .as_ref()
-            .map(|(text, _)| text.clone())
-            .unwrap_or_default();
+            .map_or_default(|(text, _)| text.clone());
         assert!(
             notice.contains("multi-byte"),
             "the loss is named honestly: {notice:?}"
@@ -19192,8 +22398,7 @@ mod tests {
         let notice = app
             .transient_notice
             .as_ref()
-            .map(|(text, _)| text.clone())
-            .unwrap_or_default();
+            .map_or_default(|(text, _)| text.clone());
         assert!(
             notice.contains("was consumed") && !notice.contains("multi-byte"),
             "a control byte is named as itself: {notice:?}"
@@ -19391,6 +22596,58 @@ mod tests {
     }
 
     #[test]
+    fn a_mode_move_never_reaches_the_persisted_config() {
+        // The mode is session state: `/set permission_mode` moves the
+        // live config and the session file remembers it — the user's
+        // config file never hears of it, so what one session chose
+        // cannot govern the next. A later non-mode `/set` persists the
+        // whole file copy, and that copy still carries no mode.
+        let dir = tempfile::tempdir().expect("persist tempdir");
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        app.set_config_persist_dir(Some(dir.path().to_path_buf()));
+        app.set_config_command("permission_mode", "interactive");
+        assert_eq!(
+            app.config.runner.permission_mode,
+            dch_config::PermissionMode::Interactive,
+            "the mode moves for this session"
+        );
+        assert!(
+            std::fs::read_dir(dir.path())
+                .expect("the persist dir")
+                .next()
+                .is_none(),
+            "a mode move writes nothing to the config directory"
+        );
+
+        app.set_config_command("verbosity", "quiet");
+        let written: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("the persist dir")
+            .filter_map(|entry| std::fs::read_to_string(entry.expect("an entry").path()).ok())
+            .collect();
+        assert!(!written.is_empty(), "a non-mode /set persists the config");
+        assert!(
+            written.iter().all(|text| !text.contains("\"interactive\"")),
+            "the persisted config carries no session's choice: {written:?}"
+        );
+    }
+
+    #[test]
+    fn a_boundary_mode_update_moves_the_display_without_the_file() {
+        // A `/clear`'s fresh session falls back to the configured
+        // default, and the display hears it over the update lane: the
+        // live config moves, the file copy never does.
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        app.apply_session_update(crate::queue::SessionUpdate::PermissionMode {
+            mode: dch_config::PermissionMode::ReadOnly,
+        });
+        assert_eq!(
+            app.config.runner.permission_mode,
+            dch_config::PermissionMode::ReadOnly,
+            "the display answers /mode for the mode actually in force"
+        );
+    }
+
+    #[test]
     fn a_resumed_session_re_seeds_the_transcript_and_empties_the_queue() {
         // The display half of the live swap: what arrives over the session
         // channel replaces the conversation wholesale, drops the prompts
@@ -19418,6 +22675,7 @@ mod tests {
                 last_input: 5,
                 context_tokens: 3,
             },
+            permission_mode: dch_config::PermissionMode::Auto,
         });
         let texts: Vec<String> = app
             .conversation
@@ -19606,6 +22864,91 @@ mod tests {
         assert!(
             !saved.contains("unsafe_paths = true"),
             "the run-scoped flag never lands: {saved}"
+        );
+    }
+
+    #[test]
+    fn a_preset_selection_is_session_state_and_never_reaches_the_config_file() {
+        // The `/preset` spec calls the selection process state — neither
+        // a restart nor a launch `--resume` carries it — and the
+        // command's own doc says it never reaches the configuration
+        // file; the two claims this pins the behavior half of. The
+        // selection takes in the session, the next persisting change
+        // still lands (the theme proves the save went through), and
+        // the file the save wrote carries no `preset` selection — so a
+        // restart and every fresh session resolve under the
+        // configuration's own selection, exactly what the spec's last
+        // sentence promises. A `preset` key here would mean the
+        // session-scoped choice leaked into the file.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let live = dch_config::DchConfig::from_toml_str(concat!(
+            "[permissions.presets.rust-dev]\n",
+            "rules = [{ outcome = \"allow\", shell_prefix = \"cargo test\" }]\n",
+        ))
+        .expect("a preset table parses");
+        let mut app = TuiApp::new(live);
+        app.set_config_file(dch_config::DchConfig::default());
+        app.set_config_persist_dir(Some(dir.path().to_path_buf()));
+        app.preset_command(Some("rust-dev"));
+        assert_eq!(
+            app.config.permissions.preset.as_deref(),
+            Some("rust-dev"),
+            "the selection takes in the session"
+        );
+        app.run_command(Command::Set {
+            key: "theme".to_string(),
+            value: "nord".to_string(),
+        });
+        let saved =
+            std::fs::read_to_string(dir.path().join("config.toml")).expect("the set landed");
+        assert!(
+            saved.contains("\"nord\""),
+            "the persisting change is written, so the save went through: {saved}"
+        );
+        let reloaded = dch_config::DchConfig::from_toml_str(&saved).expect("the file reloads");
+        assert!(
+            reloaded.permissions.preset.is_none(),
+            "the session-scoped selection never lands in the file: {saved}"
+        );
+    }
+
+    #[test]
+    fn a_stand_in_persist_resets_the_session_preset_selection() {
+        // The file-wired save cannot leak — it serializes the file's own
+        // copy. The stand-in save — a host that wired no config file —
+        // serializes the live config, which `/preset` mutated; without
+        // the reset the session-scoped selection would ride the save
+        // into a file the swap promised never to touch, and outlive the
+        // process the spec says it dies with.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let live = dch_config::DchConfig::from_toml_str(concat!(
+            "[permissions.presets.rust-dev]\n",
+            "rules = [{ outcome = \"allow\", shell_prefix = \"cargo test\" }]\n",
+        ))
+        .expect("a preset table parses");
+        let mut app = TuiApp::new(live);
+        // No `set_config_file` — persist_config takes the stand-in path.
+        app.set_config_persist_dir(Some(dir.path().to_path_buf()));
+        app.preset_command(Some("rust-dev"));
+        assert_eq!(
+            app.config.permissions.preset.as_deref(),
+            Some("rust-dev"),
+            "the selection takes in the session"
+        );
+        app.run_command(Command::Set {
+            key: "theme".to_string(),
+            value: "nord".to_string(),
+        });
+        let saved =
+            std::fs::read_to_string(dir.path().join("config.toml")).expect("the set landed");
+        assert!(
+            saved.contains("\"nord\""),
+            "the persisting change is written, so the save went through: {saved}"
+        );
+        let reloaded = dch_config::DchConfig::from_toml_str(&saved).expect("the file reloads");
+        assert!(
+            reloaded.permissions.preset.is_none(),
+            "the stand-in save carries no session-scoped selection: {saved}"
         );
     }
 

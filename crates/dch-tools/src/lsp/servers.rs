@@ -75,7 +75,11 @@ mod tests {
     fn rust_files_map_to_rust_analyzer() {
         let config = get_server_for_file(Path::new("src/lib.rs")).expect("rs configured");
         assert_eq!(config.command, "rust-analyzer");
-        assert!(config.args.is_empty());
+        assert_eq!(
+            config.args,
+            Vec::<String>::new(),
+            "rust-analyzer rides bare — stdio is its whole contract"
+        );
     }
 
     #[test]

@@ -205,7 +205,7 @@ impl ToolMiddleware for RedactionOverwriteGuard {
     ) -> Pin<Box<dyn Future<Output = ToolDispatchResult> + Send + 'a>> {
         Box::pin(async move {
             if ctx.tool_name == WRITE_TOOL
-                && let Some(file_path) = crate::write_target_gate::write_family_path(&ctx.input)
+                && let Some(file_path) = dch_permissions::write_family_path(&ctx.input)
                 && write_refused(
                     &write_target(file_path, Path::new(&ctx.tool_context.cwd)),
                     &self.patterns,
@@ -274,15 +274,18 @@ pub(crate) fn write_target(file_path: &str, cwd: &Path) -> PathBuf {
 ///
 /// A minimal shell lexing — words separated by whitespace and
 /// operators outside quotes, quote marks stripped from words, a
-/// backslash outside quotes escaping the next character — followed by
-/// a pairing of each write-redirect operator (`>`, `>>`, `<>`, `>|`,
-/// `&>`, `&>>`, and their fd-numbered spellings) with the word that
-/// follows it. `>&` joins that set in its two file spellings: with no
-/// descriptor number before it, or with `1`, the following word is a
-/// file the shell opens — `>& notes` and `1>& notes` both write it —
-/// while behind any other descriptor number bash refuses the command
-/// as an ambiguous redirect and opens nothing, so those spellings name
-/// no file. Targets that are not file words are skipped: a digit word
+/// backslash outside quotes escaping the next character (a
+/// backslash-newline pair removed whole, as bash removes a line
+/// continuation, so a word wrapped across lines is one word) —
+/// followed by a pairing of each write-redirect operator (`>`, `>>`,
+/// `<>`, `>|`, `&>`, `&>>`, and their fd-numbered spellings) with the
+/// word that follows it. `>&` joins that set in its two file
+/// spellings: with no descriptor number before it, or with `1`, the
+/// following word is a file the shell opens — `>& notes` and
+/// `1>& notes` both write it — while behind any other descriptor
+/// number bash refuses the command as an ambiguous redirect and
+/// opens nothing, so those spellings name no file. Targets that are
+/// not file words are skipped: a digit word
 /// or a bare `-` names a descriptor to duplicate or close (`2>&1`,
 /// `>&-`), a `&` word duplicates a descriptor, and a `(`-opening word
 /// is a process substitution (`>(cmd)`). Input redirections leave no
@@ -313,7 +316,11 @@ fn scan_command(command: &str) -> Scan {
                 '"' => scan.quoted = Quote::None,
                 '\\' => {
                     if let Some(&escaped) = chars.peek() {
-                        if matches!(escaped, '"' | '\\' | '$' | '`') {
+                        if escaped == '\n' {
+                            // bash removes the pair inside double quotes
+                            // too: the word continues, nothing pushed
+                            chars.next();
+                        } else if matches!(escaped, '"' | '\\' | '$' | '`') {
                             scan.word.push(escaped);
                             chars.next();
                         } else {
@@ -331,15 +338,33 @@ fn scan_command(command: &str) -> Scan {
             Quote::None => match current {
                 '\n' => {
                     scan.flush_word();
-                    if let HeredocPhase::Armed { delimiter } = std::mem::take(&mut scan.heredoc) {
-                        scan.heredoc = HeredocPhase::Body { delimiter };
+                    if let HeredocPhase::Armed { delimiter, dash } =
+                        std::mem::take(&mut scan.heredoc)
+                    {
+                        scan.heredoc = HeredocPhase::Body { delimiter, dash };
                     }
-                    scan.at_line_start = true;
                 }
-                '\'' | '"' => scan.quoted = Quote::from_char(current),
+                '\'' | '"' => {
+                    if matches!(scan.heredoc, HeredocPhase::AwaitingDelimiter { .. }) {
+                        scan.heredoc_delimiter_quoted = true;
+                    }
+                    scan.quoted = Quote::from_char(current);
+                }
                 '\\' => {
                     if let Some(escaped) = chars.next() {
-                        scan.open_word();
+                        if escaped == '\n' {
+                            // bash removes the pair: the word continues
+                            // across the break, whole and unwrapped — a
+                            // continuation, never quoting
+                            continue;
+                        }
+                        if matches!(scan.heredoc, HeredocPhase::AwaitingDelimiter { .. }) {
+                            // A backslash quoting a delimiter character
+                            // makes the body literal exactly as an explicit
+                            // quote does; only the pair with a newline is
+                            // a continuation, never quoting.
+                            scan.heredoc_delimiter_quoted = true;
+                        }
                         scan.word.push(escaped);
                     }
                 }
@@ -357,7 +382,6 @@ fn scan_command(command: &str) -> Scan {
                     scan.flush_word();
                 }
                 _ => {
-                    scan.open_word();
                     scan.word.push(current);
                 }
             },
@@ -380,10 +404,11 @@ pub fn redirect_targets(command: &str) -> Vec<String> {
 
 /// The lexing state one command's scan carries.
 ///
-/// Everything the target scan accumulates — the word in progress, the
-/// operator waiting for its target, the heredoc being skipped, and
-/// the line-start bookkeeping the heredoc terminator needs — lives
-/// here so the character loop stays a dispatch over one character.
+/// Everything the target scan accumulates — the word in progress,
+/// the operator waiting for its target, and the heredoc being skipped
+/// — lives here so the character loop stays a dispatch over one
+/// character.
+///
 /// Where a heredoc skip stands.
 ///
 /// One state value instead of paired flags, so the phase transitions
@@ -402,29 +427,50 @@ enum HeredocPhase {
     /// word, and the flush that lands the word converts it — into an
     /// armed body for a plain word, or into an unresolved heredoc for
     /// one the shell would compute.
-    AwaitingDelimiter,
+    AwaitingDelimiter {
+        /// Whether the operator spelled `<<-`.
+        ///
+        /// Carried from the operator into the armed and body phases
+        /// unchanged: the dash decides whether a terminator line's
+        /// leading tabs are stripped before the comparison.
+        dash: bool,
+    },
     /// The delimiter is consumed; its command line still scans.
     ///
     /// Words and operators on the delimiter's own line behave
     /// normally, because bash starts the body on the next line.
     Armed {
-        /// The word that ends the body when it reappears at a line start.
+        /// The line that ends the body when it reappears whole.
         ///
-        /// Compared against a flushed body word that began at a line
-        /// start, leading tabs trimmed for the `<<-` spelling; a
-        /// mid-line match is body text, not a terminator.
+        /// Compared against a complete body line at its newline,
+        /// leading tabs trimmed for the `<<-` spelling; a line that
+        /// merely begins with the delimiter is body text, not a
+        /// terminator.
         delimiter: String,
+        /// Whether the operator spelled `<<-`.
+        ///
+        /// Decides the terminator test's trim: with the dash, a line's
+        /// leading tabs are stripped before the comparison; without
+        /// it, the line must equal the delimiter exactly.
+        dash: bool,
     },
     /// The body is being skipped.
     ///
-    /// Body characters accumulate into words only so the terminator
-    /// can be recognized, and nothing inside arms or collects.
+    /// Body lines accumulate whole — spaces and word breaks included
+    /// — only so the terminator can be recognized, and nothing inside
+    /// arms or collects.
     Body {
-        /// The word that ends the body when it reappears at a line start.
+        /// The line that ends the body when it reappears whole.
         ///
-        /// Carried over from the armed phase unchanged; the same
-        /// line-start and tab-trim rules decide the match here.
+        /// Carried over from the armed phase unchanged; the whole-line
+        /// and tab-trim rules decide the match here.
         delimiter: String,
+        /// Whether the operator spelled `<<-`.
+        ///
+        /// The dash carried from the operator: with it, a body line's
+        /// leading tabs are stripped before the terminator comparison;
+        /// without it, the line must equal the delimiter exactly.
+        dash: bool,
     },
 }
 
@@ -433,8 +479,8 @@ struct Scan {
     /// The word in progress, quote marks already stripped.
     ///
     /// Grown character by character and emptied by every flush; a
-    /// heredoc body still grows it, but only so the terminator test
-    /// has a word to compare.
+    /// heredoc body grows it into the line in progress, whole, so the
+    /// terminator test has the complete line to compare.
     word: String,
 
     /// The write-redirect operator waiting for its target word.
@@ -468,63 +514,79 @@ struct Scan {
     /// The phases follow bash's own reading: the delimiter word is
     /// consumed when `<<` is seen, the rest of that command line —
     /// including a redirect like `<<EOF > out` — scans normally, and
-    /// the body skip takes over at the line's newline, ending when
-    /// the delimiter reappears at a line start.
+    /// the body skip takes over at the line's newline, ending at the
+    /// complete line that equals the delimiter.
     heredoc: HeredocPhase,
 
-    /// Whether the next character opens a line.
+    /// Whether the pending or open heredoc's delimiter was quoted.
     ///
-    /// True only immediately after a newline; the first character of
-    /// a word copies it into `word_line_start`, which is the fact the
-    /// heredoc terminator test reads.
-    at_line_start: bool,
-
-    /// Whether the word in progress began at a line start.
-    ///
-    /// Settled once, by the first character, and read at the flush —
-    /// a delimiter word that began mid-line is body text, not a
-    /// terminator.
-    word_line_start: bool,
+    /// bash reads a quoted delimiter's body literally — backslash and
+    /// all — while an unquoted one's body joins backslash-newline
+    /// pairs before any line is tested as a terminator. The flag is
+    /// set when a quote opens while the delimiter word is pending,
+    /// and reset when the next `<<` starts awaiting a fresh word.
+    heredoc_delimiter_quoted: bool,
 }
 
 impl Scan {
-    /// Begin a word, recording whether it opened at a line start.
-    ///
-    /// The first character of a word settles its line-start status,
-    /// which is the fact the heredoc terminator test needs; every
-    /// later character only clears the line-start flag.
-    fn open_word(&mut self) {
-        if self.word.is_empty() {
-            self.word_line_start = self.at_line_start;
-        }
-        self.at_line_start = false;
-    }
-
     /// Consume one character of a heredoc body.
     ///
-    /// Words accumulate only to be tested against the delimiter;
-    /// line breaks and whitespace flush them, and the flush that
-    /// matches the delimiter at a line start ends the body. Operators
-    /// and quote marks are literal here — bash reads the body
-    /// verbatim — so nothing arms inside it.
+    /// The line accumulates whole — spaces, tabs, and word breaks
+    /// included — and only its newline tests the terminator
+    /// ([`Self::close_heredoc_line`]): bash reads the body verbatim,
+    /// so the one boundary it recognizes is a complete line, and a
+    /// word-at-a-space test would end the body early, handing the
+    /// rest of the line to the command scan where what bash reads as
+    /// verbatim body could arm or hide a redirect. One bash exception
+    /// for an unquoted delimiter: a backslash-newline pair joins —
+    /// `E\` over `OF` is the line `EOF` — so the pair is removed and
+    /// no terminator test runs at the join. Operators and quote
+    /// marks are literal here — nothing arms inside a body.
     fn heredoc_body(&mut self, current: char) {
         if current == '\n' {
-            self.flush_word();
-            self.at_line_start = true;
-        } else if current.is_whitespace() {
-            self.flush_word();
+            if !self.heredoc_delimiter_quoted && trailing_backslash_run_is_odd(&self.word) {
+                self.word.pop();
+                return;
+            }
+            self.close_heredoc_line();
         } else {
-            self.open_word();
             self.word.push(current);
+        }
+    }
+
+    /// Test one whole heredoc body line against its delimiter.
+    ///
+    /// bash ends a heredoc only at a line that *is* the delimiter and
+    /// nothing else — leading tabs stripped for the `<<-` spelling
+    /// alone, trailing whitespace refused like any other text — so
+    /// the comparison runs on the complete accumulated line, never
+    /// on a word a space cut short: a body line `EOF ignored <<HIDE`
+    /// is body text, and ending the body at its first word would hand
+    /// the rest of the line to the command scan. The command's final
+    /// flush reaches here with the last, newline-less body line and
+    /// runs the same test, because bash ends the body at a delimiter
+    /// line even when the input ends on it.
+    fn close_heredoc_line(&mut self) {
+        let terminated = match &self.heredoc {
+            HeredocPhase::Body { delimiter, dash } if *dash => {
+                self.word.trim_start_matches('\t') == delimiter.as_str()
+            }
+            HeredocPhase::Body { delimiter, .. } => self.word == *delimiter,
+            _ => false,
+        };
+        self.word.clear();
+        if terminated {
+            self.heredoc = HeredocPhase::None;
         }
     }
 
     /// Flush the word in progress, collecting or consuming it.
     ///
-    /// Inside a heredoc body the flush only tests the terminator: a
-    /// word equal to the delimiter that began at a line start ends
-    /// the body, and any other word is dropped. A pending `<<` takes
-    /// the word as its delimiter, unless that word carries an
+    /// Inside a heredoc body the flush is the end-of-command reach of
+    /// the terminator test: the last, newline-less body line gets the
+    /// same whole-line comparison a newline runs, and any other word
+    /// is dropped. A pending `<<`
+    /// takes the word as its delimiter, unless that word carries an
     /// expansion spelling — a delimiter the shell computes, which no
     /// later line can match — and then the heredoc is recorded as
     /// unresolved instead. Otherwise an empty flush is a
@@ -538,34 +600,36 @@ impl Scan {
         if self.word.is_empty() {
             return;
         }
-        if let HeredocPhase::Body { delimiter } = &self.heredoc {
-            let terminated =
-                self.word_line_start && self.word.trim_start_matches('\t') == *delimiter;
-            self.word.clear();
-            self.word_line_start = false;
-            if terminated {
-                self.heredoc = HeredocPhase::None;
-            }
+        if self.heredoc_body_open() {
+            self.close_heredoc_line();
             return;
         }
-        if matches!(self.heredoc, HeredocPhase::AwaitingDelimiter) {
+        if let HeredocPhase::AwaitingDelimiter { dash } = self.heredoc {
             if expansion_spelling(&self.word) {
                 self.unresolved.push(std::mem::take(&mut self.word));
                 self.heredoc = HeredocPhase::None;
             } else {
                 self.heredoc = HeredocPhase::Armed {
                     delimiter: std::mem::take(&mut self.word),
+                    dash,
                 };
             }
-            self.word_line_start = false;
             return;
         }
         if self.arm.names_file(&self.word) {
             self.targets.push(std::mem::take(&mut self.word));
         }
         self.word.clear();
-        self.word_line_start = false;
         self.arm = Arm::None;
+    }
+
+    /// Whether a heredoc body is open and owns the word in progress.
+    ///
+    /// The one fact the end-of-command flush needs: inside a body the
+    /// accumulated text is a body line, not a command word, so the
+    /// flush runs the terminator test instead of the arm.
+    fn heredoc_body_open(&self) -> bool {
+        matches!(self.heredoc, HeredocPhase::Body { .. })
     }
 
     /// Scan the remainder of a redirection operator whose lead
@@ -610,21 +674,32 @@ impl Scan {
                 Some('<') => {
                     chars.next();
                     if chars.peek() == Some(&'<') {
-                        // A here-string (`<<< word`): the word is a
-                        // literal operand, not a delimiter — no body
-                        // follows it.
                         chars.next();
                     } else {
-                        if chars.peek() == Some(&'-') {
+                        let dash = chars.peek() == Some(&'-');
+                        if dash {
                             chars.next();
                         }
-                        self.heredoc = HeredocPhase::AwaitingDelimiter;
+                        self.heredoc = HeredocPhase::AwaitingDelimiter { dash };
+                        self.heredoc_delimiter_quoted = false;
                     }
                 }
                 _ => {}
             },
         }
     }
+}
+
+/// Whether an unquoted heredoc body line's trailing backslash run
+/// has odd length.
+///
+/// bash pairs backslashes inside an unquoted heredoc body: a lone
+/// trailing backslash — an unpaired one, the odd run — continues the
+/// line onto the next, while a pair leaves a literal backslash at
+/// the line's end and the newline stands as the line's own. Only the
+/// odd run is the continuation; the even run is text.
+fn trailing_backslash_run_is_odd(line: &str) -> bool {
+    line.chars().rev().take_while(|ch| *ch == '\\').count() & 1 == 1
 }
 
 /// The quote state a shell word scan carries.
@@ -684,11 +759,13 @@ enum Arm {
     /// nothing, so the scanner only accumulates it.
     #[default]
     None,
+
     /// A whole-file write operator awaits the file it opens.
     ///
     /// Set by the plain `>` family — the next word is unambiguously
     /// the file bash will create or truncate, whatever it spells.
     File,
+
     /// The stdout redirection `>&`, spelled with no descriptor number or
     /// with `1`.
     ///
@@ -1154,6 +1231,157 @@ mod tests {
             redirect_targets("cat <<-EOF\n\tbody > b\n\tEOF\necho y > real.log"),
             vec!["real.log".to_string()],
             "a tab-indented terminator closes a << heredoc and later redirects arm"
+        );
+    }
+
+    #[test]
+    fn a_backslash_newline_wrap_names_the_unwrapped_target() {
+        // Bash removes a backslash-newline pair before words are split,
+        // so a target wrapped across lines is one word naming one file.
+        // The scan must resolve the file the shell opens, never the
+        // spelling with the pair left inside it — all three quote
+        // states wrap, and a pair before the operator stays inert.
+        assert_eq!(
+            redirect_targets("printf x > \\\nenv.conf"),
+            vec!["env.conf".to_string()],
+            "an unquoted continuation wraps to the same word"
+        );
+        assert_eq!(
+            redirect_targets("printf x > \"env\\\n.conf\""),
+            vec!["env.conf".to_string()],
+            "a continuation inside double quotes joins the word"
+        );
+        assert_eq!(
+            redirect_targets("printf x > 'env'\\\n.conf"),
+            vec!["env.conf".to_string()],
+            "a continuation after a closed quote continues the word"
+        );
+        assert_eq!(
+            redirect_targets("printf x \\\n>> env.conf"),
+            vec!["env.conf".to_string()],
+            "a continuation before the operator changes nothing"
+        );
+    }
+
+    #[test]
+    fn a_wrapped_heredoc_delimiter_arms_the_unwrapped_terminator() {
+        // A delimiter wrapped across lines arms the same terminator
+        // bash reads: the body ends where it ends, and the redirect
+        // after it is collected like any other.
+        assert_eq!(
+            redirect_targets("cat <<E\\\nOF\nbody\nEOF\necho x >> ./credentials"),
+            vec!["./credentials".to_string()],
+            "the wrapped delimiter terminates the body; later redirects arm"
+        );
+    }
+
+    #[test]
+    fn a_delimiter_carrying_its_own_tab_terminates_at_the_exact_line() {
+        // Bash trims leading tabs from a terminator line only for the
+        // `<<-` spelling; a delimiter that itself carries a tab ends
+        // the body at the line that equals it exactly. The trim must
+        // follow the spelling, or the body never ends and the redirect
+        // after bash's real terminator is invisible.
+        assert_eq!(
+            redirect_targets("cat <<\\\tEOF\nbody\n\tEOF\necho x >> ./credentials"),
+            vec!["./credentials".to_string()],
+            "an escaped tab in the delimiter keeps the line's tab in the match"
+        );
+        assert_eq!(
+            redirect_targets("cat <<'\tEOF'\nbody\n\tEOF\necho x >> ./credentials"),
+            vec!["./credentials".to_string()],
+            "a quoted tab in the delimiter keeps the line's tab in the match"
+        );
+    }
+
+    #[test]
+    fn a_tab_indented_line_is_body_text_for_a_plain_heredoc() {
+        // The mirror half of the same rule: without the dash, bash
+        // reads a tab-indented line as body text, not a terminator —
+        // the redirect on it never runs, so the scan collects nothing
+        // from past it.
+        assert_eq!(
+            redirect_targets("cat <<EOF\nbody\n\tEOF\necho x >> ./credentials"),
+            Vec::<String>::new(),
+            "a tab-indented interior line does not end a plain << heredoc"
+        );
+    }
+
+    #[test]
+    fn a_terminator_line_is_the_whole_line_not_its_first_word() {
+        // The terminator is a complete line, not a word a space cut
+        // short. A body line whose first word is the delimiter is body
+        // text: the old word-at-a-space test ended the body there,
+        // handing the rest of the line to the command scan — `<<HIDE`
+        // armed a second heredoc whose early close let later lines arm
+        // redirects bash never runs, and hid the real terminator a
+        // scan should have found.
+        assert_eq!(
+            redirect_targets(
+                "cat <<EOF\nEOF ignored <<HIDE\nsecret\nHIDE\necho done > env.conf\nEOF"
+            ),
+            Vec::<String>::new(),
+            "everything through the real terminator is body — no redirect runs"
+        );
+        assert_eq!(
+            redirect_targets("cat <<EOF\nEOF ignored\n> hidden.txt\nEOF\n> real.txt"),
+            vec!["real.txt".to_string()],
+            "only the redirect after the real terminator is a target"
+        );
+        assert_eq!(
+            redirect_targets("cat <<EOF\nEOF \n> sneaky.conf\nEOF"),
+            Vec::<String>::new(),
+            "trailing whitespace keeps a delimiter line body text"
+        );
+        assert_eq!(
+            redirect_targets("cat <<-EOF\n\tEOF extra\n\tEOF\nmv a > b"),
+            vec!["b".to_string()],
+            "a tab-stripped line with trailing text is body; the bare line ends it"
+        );
+    }
+
+    #[test]
+    fn an_unquoted_delimiter_joins_backslash_newline_before_the_terminator_test() {
+        // bash removes a backslash-newline pair from an unquoted
+        // heredoc's body before any line is tested as a terminator, so
+        // `E\` over `OF` is the terminator line `EOF`: the body ends
+        // there, and the redirect after it is a real command target a
+        // guard must see. A quoted delimiter reads its body literally
+        // — single or double quotes alike — so the same two lines are
+        // body text and the redirect never runs.
+        assert_eq!(
+            redirect_targets("cat <<EOF\nbody\nE\\\nOF\nprintf x > env.conf"),
+            vec!["env.conf".to_string()],
+            "the joined line terminates the body; the redirect after it is real"
+        );
+        assert_eq!(
+            redirect_targets("cat <<'EOF'\nbody\nE\\\nOF\nprintf x > env.conf\nEOF"),
+            Vec::<String>::new(),
+            "a single-quoted delimiter's body is literal — no join, no redirect"
+        );
+        assert_eq!(
+            redirect_targets("cat <<\"EOF\"\nbody\nE\\\nOF\nprintf x > env.conf\nEOF"),
+            Vec::<String>::new(),
+            "a double-quoted delimiter's body is literal too — quoting any
+             part of the word makes the body verbatim"
+        );
+        // A backslash quoting a delimiter character is the same
+        // literalism by another spelling: `<<\EOF` reads its body as
+        // verbatim as `<<'EOF'`, so the `EOF\` line is body text and
+        // the bare `EOF` after it terminates — the redirect beyond is
+        // a real target.
+        assert_eq!(
+            redirect_targets("cat <<\\EOF\nbody\nEOF\\\nEOF\nprintf x > env.conf"),
+            vec!["env.conf".to_string()],
+            "a backslash-quoted delimiter's body is literal — no join, the bare line ends it"
+        );
+        // Backslash runs pair up: a trailing pair is a literal
+        // backslash at the line's end, the newline stands, and only an
+        // odd (unpaired) run continues the line.
+        assert_eq!(
+            redirect_targets("cat <<EOF\nbody\n\\\\\nEOF\nprintf x > env.conf"),
+            vec!["env.conf".to_string()],
+            "a paired trailing backslash is text — the newline stands, the bare EOF terminates"
         );
     }
 

@@ -16,6 +16,7 @@ pub mod observer;
 pub mod permission;
 pub mod question;
 pub mod queue;
+pub mod splash;
 pub mod terminal;
 pub mod theme;
 pub mod todo_view;
@@ -35,7 +36,8 @@ pub use observer::{
 pub use permission::PermissionRequest;
 pub use question::{QuestionChoice, QuestionPrompt};
 pub use queue::{
-    PromptQueue, QueuedPrompt, ResumedTokens, SessionCommand, SessionUpdate, Submission,
+    PermissionMemory, PermissionRule, PromptQueue, QueuedPrompt, ResumedTokens, SessionCommand,
+    SessionUpdate, Submission,
 };
 pub use terminal::{
     TerminalGuard, arm_fatal_signal_restore, enter_signal_deaf_window, exit_signal_deaf_window,

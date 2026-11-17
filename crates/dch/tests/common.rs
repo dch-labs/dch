@@ -1253,7 +1253,7 @@ fn model_names(listing: &serde_json::Value, array_key: &str, id_key: &str) -> Ve
     listing
         .get(array_key)
         .and_then(|entries| entries.as_array())
-        .map(|entries| {
+        .map_or_default(|entries| {
             entries
                 .iter()
                 .filter_map(|entry| entry.get(id_key))
@@ -1261,7 +1261,6 @@ fn model_names(listing: &serde_json::Value, array_key: &str, id_key: &str) -> Ve
                 .map(String::from)
                 .collect()
         })
-        .unwrap_or_default()
 }
 
 /// Ask a provider endpoint which models it offers, preferring a coder build.

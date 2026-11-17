@@ -930,7 +930,11 @@ mod tests {
             .model_changed("switched", "big-model", "small-model");
         h.observer
             .model_changed("fallback", "big-model", "fallback-model");
-        assert!(h.stderr().is_empty());
+        assert_eq!(
+            h.stderr(),
+            String::new(),
+            "a clean run stays silent on stderr"
+        );
     }
 
     #[test]

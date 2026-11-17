@@ -8,40 +8,8 @@
 //! [`Ask`](PermissionOutcome::Ask) into a prompt for the user — or a denial
 //! when no one is there to ask.
 
+use crate::mode::PermissionMode;
 use tracing::warn;
-
-/// The runner's autonomy level, mirrored for mode-aware logic in dch-tools.
-///
-/// dch-config owns the serde-bearing canonical definition (selected by the
-/// `[runner] permission_mode` config key); this copy exists so dch-tools can
-/// express mode-aware classification without depending on dch-config.
-/// Whatever consumes this mirror converts the config-side mode into it at
-/// dispatch time — one conversion point — and the variants stay ordered and
-/// named identically, keeping that conversion a pure relabeling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PermissionMode {
-    /// Never prompts.
-    ///
-    /// Lets every side-effecting action run without confirmation. The most
-    /// autonomous mode.
-    Auto,
-
-    /// Proposes but never executes.
-    ///
-    /// Produces a plan of intended actions without performing any of them.
-    Plan,
-
-    /// Auto-applies file edits; prompts for everything else.
-    ///
-    /// A middle ground that trusts edits but still asks before other
-    /// side-effecting work.
-    AcceptEdits,
-
-    /// Prompts before every side-effecting action.
-    ///
-    /// The most conservative mode, confirming each action individually.
-    Interactive,
-}
 
 /// Coarse classification of a tool, used by the permission system to decide
 /// whether to prompt.
@@ -69,9 +37,10 @@ pub enum ToolCategory {
 
     /// Executes shell commands, which can touch anything the shell can.
     ///
-    /// Bash is the whole category: its reach is unbounded, so it never
-    /// auto-runs outside Auto mode regardless of what the command claims
-    /// to do.
+    /// Bash is the whole category: its reach is unbounded, so outside
+    /// Auto mode a call runs only through the reader gate's judgment
+    /// of what the command claims or a covering rule — the matrix
+    /// itself asks or blocks.
     ShellExecute,
 
     /// Performs network egress.
@@ -107,9 +76,10 @@ impl ToolCategory {
     /// deliberately excluded even though they never touch the filesystem:
     /// they carry real session-level side-effects — submitting a task
     /// produces a patch and may run tests, `TodoWrite` mutates the shared
-    /// todo list, a question tool blocks for user input — and treating them
-    /// as read-only would let Plan mode execute them, defeating the point
-    /// of Plan.
+    /// todo list, a question tool blocks for user input — and treating the
+    /// category as read-only would let read-only mode run `Submit` and `Jobs`,
+    /// the tools that reach the session's outsides, defeating the point
+    /// of the mode.
     #[must_use]
     pub fn is_read_only(self) -> bool {
         matches!(self, ToolCategory::FileRead)
@@ -174,26 +144,33 @@ pub enum PermissionOutcome {
 ///
 /// The matrix is the behavioral contract of the whole permission system:
 ///
-/// | Mode ＼ Category   | `FileRead` | `FileWrite` | `ShellExecute` | `Network` | `Meta` | `Unclassified` |
-/// |-------------------|------------|-------------|----------------|-----------|--------|----------------|
-/// | `Auto`            | allow      | allow       | allow          | allow     | allow  | allow          |
-/// | `Plan`            | allow      | block       | block          | block     | block  | block          |
-/// | `AcceptEdits`     | allow      | allow       | ask            | ask       | ask    | ask            |
-/// | `Interactive`     | ask        | ask         | ask            | ask       | ask    | ask            |
+/// | Mode ＼ Category    | `FileRead` | `FileWrite` | `ShellExecute` | `Network` | `Meta` | `Unclassified` |
+/// |--------------------|------------|-------------|----------------|-----------|--------|----------------|
+/// | `Auto`             | allow      | allow       | allow          | allow     | allow  | allow          |
+/// | `ReadOnly`         | allow      | block       | block          | block     | block  | block          |
+/// | `Interactive`      | allow      | ask         | ask            | ask       | ask    | ask            |
+///
+/// `ReadOnly`'s line is absolute — nothing loosens it, though remembered
+/// deny rules still tighten (a user's "never" outranks even a read).
+/// `Interactive`'s asks resolve through the memory first: a rule covering
+/// the call answers it without prompting. Two carve-outs run ahead of
+/// this matrix: the session's furniture (todo, question, jobs reads) is
+/// free in all three modes, and a shell command the reader gate judges
+/// to only look is allowed — the gate sits in the engine's evaluation,
+/// before this table is consulted.
 ///
 /// [`PermissionOutcome::Allow`] runs the tool; [`PermissionOutcome::Block`]
 /// refuses it; [`PermissionOutcome::Ask`] prompts the user (or blocks, in a
 /// host that cannot ask).
 #[must_use]
 pub fn decide(mode: PermissionMode, category: ToolCategory) -> PermissionOutcome {
-    use PermissionMode::{AcceptEdits, Auto, Interactive, Plan};
+    use PermissionMode::{Auto, Interactive, ReadOnly};
     use PermissionOutcome::{Allow, Ask, Block};
     use ToolCategory::{FileRead, FileWrite, Meta, Network, ShellExecute, Unclassified};
     match (mode, category) {
-        (Auto, _) | (Plan, FileRead) | (AcceptEdits, FileRead | FileWrite) => Allow,
-        (Plan, FileWrite | ShellExecute | Network | Meta | Unclassified) => Block,
-        (Interactive, FileRead | FileWrite)
-        | (AcceptEdits | Interactive, ShellExecute | Network | Meta | Unclassified) => Ask,
+        (Auto, _) | (ReadOnly | Interactive, FileRead) => Allow,
+        (ReadOnly, FileWrite | ShellExecute | Network | Meta | Unclassified) => Block,
+        (Interactive, FileWrite | ShellExecute | Network | Meta | Unclassified) => Ask,
     }
 }
 
@@ -206,7 +183,6 @@ pub fn decide(mode: PermissionMode, category: ToolCategory) -> PermissionOutcome
 )]
 mod tests {
     use super::*;
-    use crate::registry::builtin_registry;
 
     /// Every v1 tool with the category this table prescribes.
     ///
@@ -245,31 +221,6 @@ mod tests {
     }
 
     #[test]
-    fn every_registered_tool_has_a_category_row() {
-        // The registry and the category table are linked only by convention;
-        // this pins that a registered tool never silently falls to the
-        // unknown-name default.
-        let registry = builtin_registry(
-            &loopctl::tool::builtin::fs::FileSession::new(std::path::PathBuf::from(".")),
-            crate::registry::ReadWindows::default(),
-        );
-        let registered: Vec<String> = registry
-            .all_tools()
-            .into_iter()
-            .map(|tool| tool.name().to_owned())
-            .collect();
-        assert!(!registered.is_empty(), "the registry must not be empty");
-        for name in registered {
-            assert!(
-                TOOL_TABLE
-                    .iter()
-                    .any(|(row_name, _)| *row_name == name.as_str()),
-                "{name} is registered but has no category row"
-            );
-        }
-    }
-
-    #[test]
     fn is_read_only_is_true_for_file_read_only() {
         // The regression guard: Meta tools carry session-level side-effects
         // (submission produces a patch, TodoWrite mutates state, questions
@@ -296,11 +247,7 @@ mod tests {
     #[test]
     fn unclassified_never_allows_outside_auto() {
         // The fail-closed guarantee: only Auto runs an unclassified tool.
-        for mode in [
-            PermissionMode::Plan,
-            PermissionMode::AcceptEdits,
-            PermissionMode::Interactive,
-        ] {
+        for mode in [PermissionMode::ReadOnly, PermissionMode::Interactive] {
             assert_ne!(
                 decide(mode, ToolCategory::Unclassified),
                 PermissionOutcome::Allow,
@@ -317,7 +264,7 @@ mod tests {
     fn the_mode_category_matrix_resolves_every_cell() {
         // The behavioral contract, one row per cell: any single-cell
         // regression names its (mode, category) pair in the failure.
-        use PermissionMode::{AcceptEdits, Auto, Interactive, Plan};
+        use PermissionMode::{Auto, Interactive, ReadOnly};
         use PermissionOutcome::{Allow, Ask, Block};
         use ToolCategory::{FileRead, FileWrite, Meta, Network, ShellExecute, Unclassified};
 
@@ -327,22 +274,14 @@ mod tests {
             ("auto × shell_execute", Auto, ShellExecute, Allow),
             ("auto × network", Auto, Network, Allow),
             ("auto × meta", Auto, Meta, Allow),
-            ("plan × file_read", Plan, FileRead, Allow),
-            ("plan × file_write", Plan, FileWrite, Block),
-            ("plan × shell_execute", Plan, ShellExecute, Block),
-            ("plan × network", Plan, Network, Block),
-            ("plan × meta", Plan, Meta, Block),
-            ("accept_edits × file_read", AcceptEdits, FileRead, Allow),
-            ("accept_edits × file_write", AcceptEdits, FileWrite, Allow),
-            (
-                "accept_edits × shell_execute",
-                AcceptEdits,
-                ShellExecute,
-                Ask,
-            ),
-            ("accept_edits × network", AcceptEdits, Network, Ask),
-            ("accept_edits × meta", AcceptEdits, Meta, Ask),
-            ("interactive × file_read", Interactive, FileRead, Ask),
+            ("auto × unclassified", Auto, Unclassified, Allow),
+            ("read_only × file_read", ReadOnly, FileRead, Allow),
+            ("read_only × file_write", ReadOnly, FileWrite, Block),
+            ("read_only × shell_execute", ReadOnly, ShellExecute, Block),
+            ("read_only × network", ReadOnly, Network, Block),
+            ("read_only × meta", ReadOnly, Meta, Block),
+            ("read_only × unclassified", ReadOnly, Unclassified, Block),
+            ("interactive × file_read", Interactive, FileRead, Allow),
             ("interactive × file_write", Interactive, FileWrite, Ask),
             (
                 "interactive × shell_execute",
@@ -352,24 +291,16 @@ mod tests {
             ),
             ("interactive × network", Interactive, Network, Ask),
             ("interactive × meta", Interactive, Meta, Ask),
-            ("auto × unclassified", Auto, Unclassified, Allow),
-            ("plan × unclassified", Plan, Unclassified, Block),
-            (
-                "accept_edits × unclassified",
-                AcceptEdits,
-                Unclassified,
-                Ask,
-            ),
             ("interactive × unclassified", Interactive, Unclassified, Ask),
         ];
-        assert_eq!(MATRIX.len(), 24, "the matrix is 4 modes × 6 categories");
+        assert_eq!(MATRIX.len(), 18, "the matrix is 3 modes × 6 categories");
         for (cell, mode, category, expected) in MATRIX {
             assert_eq!(decide(*mode, *category), *expected, "{cell}");
         }
     }
 
     #[test]
-    fn plan_mode_allow_exactly_matches_is_read_only() {
+    fn read_only_mode_allow_exactly_matches_is_read_only() {
         // The predicate and the matrix agree by construction; this pins the
         // agreement at the matrix level, so a repeat of the old bug is caught
         // even if the predicate itself drifted.
@@ -382,7 +313,7 @@ mod tests {
             ToolCategory::Unclassified,
         ] {
             assert_eq!(
-                decide(PermissionMode::Plan, category) == PermissionOutcome::Allow,
+                decide(PermissionMode::ReadOnly, category) == PermissionOutcome::Allow,
                 category.is_read_only()
             );
         }

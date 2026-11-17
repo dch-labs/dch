@@ -1175,7 +1175,7 @@ mod tests {
             .await
             .unwrap()
             .expect("an empty array is a present, empty list");
-        assert!(found.is_empty());
+        assert_eq!(found, Vec::new(), "an empty array is a present, empty list");
     }
 
     #[tokio::test]

@@ -1302,15 +1302,13 @@ impl TuiObserver {
             tools
                 .iter()
                 .position(|tool| tool.call_id == call_id)
-                .map(|position| tools.remove(position).input_summary)
-                .unwrap_or_default()
+                .map_or_default(|position| tools.remove(position).input_summary)
         };
         let (full_input, full_output) = {
             let mut captures = recover(&self.state.tool_captures);
             captures
                 .remove(call_id)
-                .map(|capture| (capture.input_json, capture.output))
-                .unwrap_or_default()
+                .map_or_default(|capture| (capture.input_json, capture.output))
         };
         if name == "TodoWrite" && !is_error {
             self.state.note_todo_plan_graduated();

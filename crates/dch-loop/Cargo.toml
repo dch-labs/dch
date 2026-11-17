@@ -4,9 +4,13 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+readme.workspace = true
+authors.workspace = true
 description = "Composition layer for dch: loop, provider factory, system prompt, observers"
 
 [dependencies]
+dch-permissions = { workspace = true }
 loopctl = { workspace = true, features = ["ollama", "openai", "anthropic", "gemini", "redaction", "bedrock", "mcp", "self_hosted"] }
 dch-tools = { workspace = true }
 dch-config = { workspace = true }

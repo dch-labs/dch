@@ -204,8 +204,7 @@ fn get_job(id: u64) -> Option<BackgroundJob> {
 fn list_jobs() -> Vec<BackgroundJob> {
     JOB_TABLE
         .lock()
-        .map(|t| t.values().cloned().collect())
-        .unwrap_or_default()
+        .map_or_default(|t| t.values().cloned().collect())
 }
 
 /// Remove terminal jobs (completed or failed) from the table.
@@ -836,6 +835,64 @@ mod tests {
             "the table must cap terminal retention, retained {retained}"
         );
         assert!(retained > 0, "recent terminal jobs stay queryable");
+    }
+
+    #[tokio::test]
+    async fn a_job_status_poll_after_prune_reports_not_found() {
+        // The eviction interleaving: a job completes; the retention cap's
+        // prune evicts its entry; a poll that resolves afterwards reads
+        // "not found" for a job that did run and complete. The contract
+        // lives in `get_job`; this pins the observable wording so a
+        // poller cannot mistake an evicted entry for a still-running
+        // job.
+        let _guard = JOB_TEST_GUARD.lock().await;
+        reset_job_table();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cwd = tmp.path().to_str().unwrap();
+        let ctx = ctx_in(cwd);
+
+        // The job whose eviction the poll will meet — the oldest
+        // terminal entry, first out when the cap prunes.
+        let spawn_out = BashTool
+            .call(
+                json!({ "command": "echo evicted-target", "background": true }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let evicted_id = parse_spawned_id(&spawn_out.text_content());
+
+        for _ in 0..(MAX_TERMINAL_JOBS + 5) {
+            BashTool
+                .call(json!({ "command": "true", "background": true }), &ctx)
+                .await
+                .unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while list_jobs()
+            .iter()
+            .any(|job| job.status == JobStatus::Running)
+            && Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let out = JobsTool
+            .call(
+                json!({ "operation": "job_status", "job_id": evicted_id }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let text = out.text_content();
+        assert!(
+            text.contains("not found"),
+            "an evicted entry polls as not found: {text}"
+        );
+        assert!(
+            !text.contains("evicted-target"),
+            "the evicted payload is gone with the entry: {text}"
+        );
     }
 
     #[tokio::test]

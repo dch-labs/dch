@@ -113,9 +113,11 @@ pub fn is_secret(key: &str) -> bool {
 /// or a spawned process), so `/set` writes it — the session's config and the
 /// file — and it reaches the running loop the next time dch starts; the
 /// notice names which of the two landed rather than implying a live change
-/// it cannot make. (The model is the one loop value a user can move now,
-/// but through `/model`, which drives the loop directly — not through this
-/// table.)
+/// it cannot make. (Two loop values move live — the model through
+/// `/model`, the permission mode through `/mode` — but both drive the
+/// loop directly, not through this table. The permission mode is
+/// session state: `/set permission_mode` never reaches the config
+/// file; the session file remembers it instead.)
 #[must_use]
 pub fn live(key: &str) -> Option<Live> {
     match key {
@@ -166,7 +168,7 @@ pub fn value_candidates(key: &str) -> Option<&'static [&'static str]> {
         "diff_layout" => &["side-by-side", "inline"],
         "diff_palette" => &["classic", "soft", "blue-orange"],
         "compactor" => &["truncating", "qa", "structured", "rolling"],
-        "permission_mode" => &["auto", "plan", "accept_edits", "interactive"],
+        "permission_mode" => &["auto", "read_only", "interactive"],
         "no_color" | "mouse_capture" | "auto_compact" => &["true", "false"],
         _ => return None,
     })
@@ -469,11 +471,10 @@ where
 {
     serde_json::to_value(value)
         .ok()
-        .map(|value| match value.as_str() {
+        .map_or_default(|value| match value.as_str() {
             Some(text) => text.to_string(),
             None => value.to_string(),
         })
-        .unwrap_or_default()
 }
 
 /// Render an optional scalar: its value or `unset` when absent.
@@ -486,13 +487,14 @@ where
     T: serde::Serialize,
 {
     match value {
-        Some(value) => serde_json::to_value(value)
-            .ok()
-            .map(|value| match value.as_str() {
-                Some(text) => text.to_string(),
-                None => value.to_string(),
-            })
-            .unwrap_or_default(),
+        Some(value) => {
+            serde_json::to_value(value)
+                .ok()
+                .map_or_default(|value| match value.as_str() {
+                    Some(text) => text.to_string(),
+                    None => value.to_string(),
+                })
+        }
         None => "unset".to_string(),
     }
 }

@@ -1360,8 +1360,7 @@ mod tests {
 
     #[test]
     fn a_long_subject_is_truncated_and_the_cut_is_named() {
-        // The field evidence: the model cannot count characters, and
-        // the median overshoot was a couple dozen — a refusal bought a
+        // The model cannot count characters, so a length refusal buys a
         // wasted round trip over wording whose exact length the model
         // never chose. The tool now cuts at the boundary and names the
         // cut, the same soft-accept pattern the reword notes use, so

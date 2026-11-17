@@ -19,10 +19,11 @@ use std::io::IsTerminal as _;
 
 /// Whether this invocation selects the single-run headless mode.
 ///
-/// A task argument always does; with none, a stdin that is not a
-/// terminal (a pipe or a redirect) does too — so `dch "task"` and
-/// `echo "task" | dch` both run headlessly, and only a bare
-/// invocation on a terminal launches the TUI.
+/// A task argument selects the mode and consumes a piped stdin as
+/// context, so `ip a | dch "what is my ip"` delivers both; with no
+/// task, a stdin that is not a terminal (a pipe or a redirect) does
+/// too — so `dch "task"` and `echo "task" | dch` both run headlessly,
+/// and only a bare invocation on a terminal launches the TUI.
 fn wants_headless(args: &args::Args) -> bool {
     selects_single_run(args.task.as_deref(), std::io::stdin().is_terminal())
 }
@@ -260,20 +261,19 @@ fn main() -> std::process::ExitCode {
         });
     runtime.block_on(async move {
         if let Some(limit) = args.list_sessions {
-            resume::run_list_sessions(limit)
+            resume::run_list_sessions(limit);
+        }
+        let control = resume::resolve_resume(&args);
+        if wants_headless(&args) {
+            let startup_args = args.clone();
+            let startup_mode = headless::capture_marker_mode(args.done_file.as_ref());
+            let startup_bridge = signals::install_construction_handler(move || {
+                headless::write_startup_done_file(&startup_args, startup_mode.as_ref());
+            });
+            let code = headless::run_headless(&args, startup_bridge, control).await;
+            std::process::ExitCode::from(code)
         } else {
-            let control = resume::resolve_resume(&args);
-            if wants_headless(&args) {
-                let startup_args = args.clone();
-                let startup_mode = headless::capture_marker_mode(args.done_file.as_ref());
-                let startup_bridge = signals::install_construction_handler(move || {
-                    headless::write_startup_done_file(&startup_args, startup_mode.as_ref());
-                });
-                let code = headless::run_headless(&args, startup_bridge, control).await;
-                std::process::ExitCode::from(code)
-            } else {
-                std::process::ExitCode::from(tui::run_tui(&args, control).await)
-            }
+            std::process::ExitCode::from(Box::pin(tui::run_tui(&args, control)).await)
         }
     })
 }

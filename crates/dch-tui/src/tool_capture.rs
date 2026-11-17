@@ -694,7 +694,11 @@ mod tests {
             .expect("the input was recorded before the tool ran");
         assert!(!mid_call.done, "the mid-call record is the running one");
         assert!(mid_call.input_json.contains("\"shade\": \"red\""));
-        assert!(mid_call.output.is_empty());
+        assert_eq!(
+            mid_call.output,
+            String::new(),
+            "the running call has produced no output yet"
+        );
 
         let capture = sink
             .lock()

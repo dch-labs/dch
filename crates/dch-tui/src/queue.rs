@@ -270,14 +270,17 @@ pub enum Submission {
         text: String,
     },
 
-    /// Carry out `command` against the loop the driver owns, at rest.
+    /// Carry out `command` against the loop the driver owns.
     ///
     /// The session lane of the composer's command language: the acts that
-    /// reach the loop (`/clear`, `/model`) ride this rather than a second
-    /// channel, because the driver is the only holder of the runner. A
-    /// command is a between-turns act, so the display raises it only when
-    /// no run is in flight; the running check there and the take-up here
-    /// mean the two halves cannot disagree mid-run.
+    /// reach the loop (`/clear`, `/model`, `/mode`) ride this rather than a
+    /// second channel, because the driver is the only holder of the
+    /// runner. Most commands are between-turns acts — the display raises
+    /// them only when no run is in flight, and the running check there and
+    /// the take-up here mean the two halves cannot disagree mid-run.
+    /// `/mode` is the standing exception: it raises mid-run by design, the
+    /// shared mode cell moves on the spot, and the driver's rebuild puts
+    /// the loop itself on the new mode at the next boundary.
     Command {
         /// The session command to carry out on the driver's loop.
         ///
@@ -326,6 +329,24 @@ pub enum SessionCommand {
         /// The configured entry's own spelling; the loop's rebuild is
         /// built around it and the verdict publishes it back.
         name: String,
+    },
+
+    /// Move the live loop's permission mode, from the next turn.
+    ///
+    /// The gate re-reads the shared mode cell on every dispatch, so
+    /// the display flips that cell before the command dispatches —
+    /// the in-flight turn's next dispatch already runs under the new
+    /// matrix — and the driver rebuilds the runner on the mode this
+    /// carries, the conversation carried whole, everything else as it
+    /// stood. A rebuild that fails is the driver's to undo: its `Err`
+    /// arm restores the cell to the mode the loop still runs under,
+    /// and the notice says the loop kept its mode.
+    Mode {
+        /// The mode the loop moves to.
+        ///
+        /// The config's own spelling, already validated: the display
+        /// sends only a value the file would accept.
+        mode: dch_config::PermissionMode,
     },
 
     /// Rebuild the runner on a different provider, carrying the
@@ -402,6 +423,8 @@ pub enum SessionCommand {
     /// the listing reads — for the picker sheet to walk.
     ListSessions,
 }
+
+pub use dch_permissions::{PermissionMemory, PermissionRule};
 
 /// One saved session as a picker row sees it.
 ///
@@ -555,6 +578,30 @@ pub enum SessionUpdate {
         /// Restored into the running counters so the resumed session
         /// continues the saved one's story.
         tokens: ResumedTokens,
+
+        /// The permission mode the adopted session runs under.
+        ///
+        /// The session's own override resolved — the launch flag's
+        /// choice when it named one, otherwise the file's record, else
+        /// the configuration's default — so the display's `/mode`
+        /// answers for the session actually running, not the config
+        /// file's stale guess.
+        permission_mode: dch_config::PermissionMode,
+    },
+
+    /// The permission mode now in force, moved without a `/mode` of
+    /// the user's own.
+    ///
+    /// Posted when a session boundary moves the mode by itself — a
+    /// `/clear`'s fresh session carries no override, so the loop and
+    /// the display fall back to the configuration's default together.
+    PermissionMode {
+        /// The mode now enforced on the loop's dispatches.
+        ///
+        /// The same mode the loop's gate reads from the shared cell:
+        /// the display re-seats its `/mode` row on this, so the bar
+        /// never names a mode the loop has left.
+        mode: dch_config::PermissionMode,
     },
 
     /// A line the driver could not keep to itself: a refusal, a failure, or

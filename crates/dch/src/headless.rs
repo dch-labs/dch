@@ -1,7 +1,8 @@
 //! Headless runner: load config, build the agent, run one session, exit.
 //!
 //! This is the dispatch target for task-mode invocations — a task
-//! argument or a piped stdin. It owns no agent-loop
+//! argument, a piped stdin, or both (the pipe as context, the task as
+//! instruction). It owns no agent-loop
 //! logic — everything turn/stream/dispatch lives in loopctl via the runner —
 //! and prints nothing of its own beyond the answer the task asked for:
 //! the run is quiet by default — stdout carries only the final answer,
@@ -9,7 +10,9 @@
 //! trouble — a session
 //! that could not be built, a resume that had to degrade, a run that
 //! ends with todos still open, a `--done-file` that refused to be
-//! written (each reported panic-proof, as every stderr word here is).
+//! written (each reported panic-proof, as every stderr word here is)
+//! — beside one closing line, printed once the transcript has saved,
+//! naming the session id it saved under.
 //! `--verbose` hands the narration to the [`ConsoleObserver`]: one
 //! flag streams the model's reply to stdout as it forms with
 //! tool-call lines on stderr; a second adds durations, token counts,
@@ -276,9 +279,15 @@ pub(crate) fn capture_marker_mode(
 /// and the done-file written before the naming task is waited on, and
 /// the transcript save waits only [`NAMING_SETTLE_BUDGET`] for a title
 /// still pending. `saver_root` overrides
-/// where the session transcript is written; `None` uses the user's
-/// sessions directory. `control` carries the resume resolution — a
+/// where the session transcript is written and where a resumed
+/// session's remembered permissions restore from; `None` uses the
+/// user's sessions directory for both. `control` carries the resume
+/// resolution — a
 /// degradation warning prints to stderr before anything else runs.
+/// The session id resolves before the run bridge is armed so every
+/// marker written from that point — the run's own and the force
+/// hook's — carries it; the stderr line naming it for the operator
+/// prints at the end, once the transcript it names has saved.
 ///
 /// # Errors
 ///
@@ -314,7 +323,14 @@ async fn run_headless_inner(
             }
         }
     }
-    let built = match construct_run(args, inherited_mode.as_ref(), &control).await {
+    let built = match construct_run(
+        args,
+        inherited_mode.as_ref(),
+        &control,
+        saver_root.as_deref(),
+    )
+    .await
+    {
         Ok(built) => built,
         Err(outcome) => {
             startup_bridge.stop().await;
@@ -332,60 +348,49 @@ async fn run_headless_inner(
         compaction_counter,
     } = built;
 
+    let session_id = resolve_session_id(&control, &runner);
     let force_args = args.clone();
     let hook_mode = inherited_mode.clone();
     let outcome_recorded = Arc::new(AtomicBool::new(false));
     let hook_recorded = Arc::clone(&outcome_recorded);
     let bridge = crate::signals::install_cancel_handler(runner.cancel_signal(), move || {
-        write_force_marker_unless_recorded(&force_args, &hook_recorded, hook_mode.as_ref());
+        write_force_marker_unless_recorded(
+            &force_args,
+            session_id,
+            &hook_recorded,
+            hook_mode.as_ref(),
+        );
     });
     startup_bridge.stop().await;
-
-    let session_id = match &control {
-        crate::resume::ResumeControl::Resumed(outcome) => outcome.session_id,
-        crate::resume::ResumeControl::Fresh {
-            session_id: Some(id),
-            ..
-        } => *id,
-        crate::resume::ResumeControl::Fresh {
-            session_id: None, ..
-        } => runner.session_id(),
-    };
     let resumed_title = match &control {
         crate::resume::ResumeControl::Resumed(outcome) => outcome.title.clone(),
         crate::resume::ResumeControl::Fresh { .. } => None,
+    };
+    let permission_override = if let Some(mode) = args.permission_mode {
+        Some(mode.into())
+    } else {
+        match &control {
+            crate::resume::ResumeControl::Resumed(outcome) => outcome.permission_mode,
+            crate::resume::ResumeControl::Fresh { .. } => None,
+        }
     };
     let saver = match saver_root {
         Some(root) => crate::session::SessionSaver::with_base_dir(session_id, model, root),
         None => crate::session::SessionSaver::with_model(session_id, model),
     }
     .with_workdir(&workdir)
-    .with_title(resumed_title);
+    .with_title(resumed_title)
+    .with_permission_mode(permission_override);
     let mut transcript = match &control {
         crate::resume::ResumeControl::Resumed(outcome) => outcome.messages.clone(),
         crate::resume::ResumeControl::Fresh { .. } => Vec::new(),
     };
-    let naming = if saver.title().is_none() {
-        let naming_api = api.clone();
-        let first_prompt = prompt.clone();
-        Some(tokio::spawn(async move {
-            tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                dch_loop::session_title(&naming_api, &first_prompt),
-            )
-            .await
-            .unwrap_or_default()
-        }))
-    } else {
-        None
-    };
+    let naming = saver
+        .title()
+        .is_none()
+        .then(|| arm_naming_task(&api, &runner.committed_history(), &prompt));
     let result = runner.run(&prompt).await;
     let turn_outputs = runner.session_turn_outputs();
-    // The outcome outranks the name: the answer reaches stdout and the
-    // done-file its orchestrator polls land before the naming task is
-    // waited on, and the save waits only the settle budget for a title
-    // still pending — a stalled naming call once held all four for its
-    // whole request timeout, and a cancelled run waited too.
     let outcome = match &result {
         Ok(run) => {
             let delivery = if !streams_answer && let Some(answer) = &run.output {
@@ -397,7 +402,7 @@ async fn run_headless_inner(
         }
         Err(err) => HeadlessOutcome::from_loop_error(err),
     };
-    write_done_file_if_requested(args, &outcome, inherited_mode.as_ref());
+    write_done_file_if_requested(args, Some(session_id), &outcome, inherited_mode.as_ref());
     outcome_recorded.store(true, Ordering::SeqCst);
     bridge.begin_finalization();
     let saver = match naming {
@@ -431,6 +436,7 @@ async fn run_headless_inner(
             save_transcript(&saver, &runner, &transcript, compactions);
         }
     }
+    crate::signals::report(&session_notice(session_id));
     let pending_force = bridge.pending_force();
     bridge.stop().await;
     if pending_force {
@@ -450,6 +456,31 @@ async fn run_headless_inner(
 /// timeout.
 const NAMING_SETTLE_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Arm the session's one-shot naming side call.
+///
+/// Fires beside the run — the session's own provider, its thinking
+/// budget stripped, no tools — so the title can land while the run
+/// works, bounded by the spawn's own request timeout;
+/// [`settle_naming`] decides how long the outcome waits on it. The
+/// subject coins from the conversation's first user prompt, the arming
+/// prompt standing in for the fresh session that has no history yet.
+fn arm_naming_task(
+    api: &dch_config::ApiConfig,
+    history: &[loopctl::message::Message],
+    prompt: &str,
+) -> tokio::task::JoinHandle<Option<String>> {
+    let naming_api = api.clone();
+    let naming_prompt = crate::messages::naming_subject(history, prompt);
+    tokio::spawn(async move {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            dch_loop::session_title(&naming_api, &naming_prompt),
+        )
+        .await
+        .unwrap_or_default()
+    })
+}
+
 /// Resolve the naming task into a title under `budget`.
 ///
 /// A task that has already answered — the common case, the run having
@@ -466,6 +497,41 @@ async fn settle_naming(
         Ok(joined) => joined.unwrap_or(None),
         Err(_) => None,
     }
+}
+
+/// The session id this run saves its transcript under.
+///
+/// A resumed run keeps the loaded session's identity — the notice
+/// line and every marker name the file the follow-up continues —
+/// and a fresh run takes the id the runner minted at construction.
+/// Resolved before the run bridge is armed so the notice, the
+/// markers, and the saver all share one id.
+fn resolve_session_id(
+    control: &crate::resume::ResumeControl,
+    runner: &dch_loop::Runner,
+) -> uuid::Uuid {
+    match control {
+        crate::resume::ResumeControl::Resumed(outcome) => outcome.session_id,
+        crate::resume::ResumeControl::Fresh {
+            session_id: Some(id),
+            ..
+        } => *id,
+        crate::resume::ResumeControl::Fresh {
+            session_id: None, ..
+        } => runner.session_id(),
+    }
+}
+
+/// The stderr line naming the session a headless run saved under.
+///
+/// Printed once at the end of the run — after the transcript has
+/// saved, success and failure alike — so the id closes the run as
+/// its last word: the uuid is the exact spelling `--resume` takes
+/// and the sessions directory names, and the markers already carry
+/// it for the machines. stdout stays answer-only; this line is the
+/// whole announcement.
+fn session_notice(session_id: uuid::Uuid) -> String {
+    format!("dch: session {session_id}")
 }
 
 /// Persist the run's transcript, the engine's committed history,
@@ -508,9 +574,12 @@ fn save_transcript(
 /// interrupt during the write fails closed; after that write completes,
 /// the recorded outcome is authoritative — a repeat interrupt still
 /// exits 130 through the force path, but no longer replaces the
-/// done-file's real outcome with the fixed cancel message.
+/// done-file's real outcome with the fixed cancel message. The
+/// marker carries the session id the run was bound to — the hook is
+/// armed only after the id resolves.
 fn write_force_marker_unless_recorded(
     args: &Args,
+    session_id: uuid::Uuid,
     recorded: &AtomicBool,
     inherited_mode: Option<&std::fs::Permissions>,
 ) {
@@ -519,6 +588,7 @@ fn write_force_marker_unless_recorded(
     }
     write_done_file_if_requested(
         args,
+        Some(session_id),
         &HeadlessOutcome::failure(130, FORCE_CANCEL_MESSAGE),
         inherited_mode,
     );
@@ -593,16 +663,24 @@ struct ConstructedRun {
 /// the outcome leaves this function. A resumed `control` shapes the
 /// construction: the agent's history starts from the restored
 /// conversation, on the current configuration's model and provider —
-/// the saved model is provenance for the listing.
+/// the saved model is provenance for the listing — and its remembered
+/// permissions restore from the same sessions root the transcript
+/// saves into (`saver_root` when the host injected one, the user's
+/// default otherwise). A restore that failed closed refuses the run
+/// outright: a headless continuation has no one to ask, and the
+/// refusals a damaged file hid cannot be trusted to run unattended —
+/// the TUI keeps its `/permissions repair` door.
 ///
 /// # Errors
 ///
 /// Returns the construction-phase failure outcome when the prompt,
-/// config, working directory, or agent construction fails.
+/// config, working directory, or agent construction fails — and when a
+/// resumed session's permissions restore stands damaged.
 async fn construct_run(
     args: &Args,
     inherited_mode: Option<&std::fs::Permissions>,
     control: &crate::resume::ResumeControl,
+    saver_root: Option<&std::path::Path>,
 ) -> Result<ConstructedRun, HeadlessOutcome> {
     let prompt = resolve_prompt_nonblocking(args)
         .await
@@ -629,19 +707,43 @@ async fn construct_run(
     let mut builder = dch_loop::Runner::builder(&config, &workdir)
         .with_observer(Arc::clone(&observer) as Arc<dyn loopctl::observer::LoopObserver>)
         .with_todo_nudge(|_reminder| {}, || true)
+        .with_permission_config_rules(std::sync::Arc::new({
+            let permissions = config.permissions.clone();
+            move || permissions.engine_rules()
+        }))
         .without_interactive_tools();
     if let crate::resume::ResumeControl::Resumed(outcome) = control {
         builder = builder.with_history(crate::resume::history_for_resume(
             outcome,
             config.security.redact_secrets,
         ));
+        let saver = match saver_root {
+            Some(root) => crate::session::SessionSaver::with_base_dir(
+                outcome.session_id,
+                config.api.model.clone(),
+                root.to_path_buf(),
+            ),
+            None => crate::session::SessionSaver::with_model(
+                outcome.session_id,
+                config.api.model.clone(),
+            ),
+        };
+        let memory = resumed_permission_memory(&saver);
+        if memory.damage_standing() {
+            let message = format!(
+                "resumed session {} carries a damaged permissions file — its remembered \
+                 refusals cannot be trusted to run unattended; resume it in the TUI and \
+                 run /permissions repair",
+                outcome.session_id
+            );
+            return Err(construction_failure(args, message, inherited_mode));
+        }
+        let snapshot: dch_loop::MemorySnapshot = std::sync::Arc::new(move || memory.snapshot());
+        builder = builder.with_permission_memory(snapshot);
     }
     let runner = builder.build().await.map_err(|err| {
         construction_failure(args, format!("agent construction: {err}"), inherited_mode)
     })?;
-    // Rebuild the read-before-write guard's baselines for the files
-    // the restored transcript shows being read: without this, a
-    // resumed Write treats every previously-read file as never-read.
     if let crate::resume::ResumeControl::Resumed(outcome) = control {
         for path in crate::resume::resumed_read_paths_with_machine(
             &outcome.messages,
@@ -674,6 +776,7 @@ async fn construct_run(
 pub(crate) fn write_startup_done_file(args: &Args, inherited_mode: Option<&std::fs::Permissions>) {
     write_done_file_if_requested(
         args,
+        None,
         &HeadlessOutcome::failure(130, STARTUP_CANCEL_MESSAGE),
         inherited_mode,
     );
@@ -690,38 +793,36 @@ fn construction_failure(
     inherited_mode: Option<&std::fs::Permissions>,
 ) -> HeadlessOutcome {
     let outcome = HeadlessOutcome::failure(1, message);
-    write_done_file_if_requested(args, &outcome, inherited_mode);
+    write_done_file_if_requested(args, None, &outcome, inherited_mode);
     outcome
 }
 
 /// Resolve the prompt from the parsed arguments without blocking the
 /// runtime thread.
 ///
-/// The fast paths — explicit text, terminal-stdin usage errors — resolve
-/// synchronously; a piped-stdin read, potentially unbounded, runs on the
-/// blocking pool so the startup interrupt bridge stays live while it
+/// A terminal stdin resolves synchronously — the task argument alone
+/// or the usage error, nothing to read. A piped stdin is read to EOF
+/// on the blocking pool — potentially unbounded, task argument present
+/// or not, so the pipe is drained rather than left to burst on its
+/// producer — keeping the startup interrupt bridge live while it
 /// waits. See [`resolve_prompt_with`] for the full rules.
 ///
 /// # Errors
 ///
 /// Returns an error message when no usable prompt exists.
 async fn resolve_prompt_nonblocking(args: &Args) -> Result<String, String> {
-    if has_explicit_prompt(args) || std::io::stdin().is_terminal() {
-        return resolve_prompt(args);
+    if std::io::stdin().is_terminal() {
+        return resolve_prompt_with(
+            args.task.as_deref(),
+            || Err("a terminal stdin is never read".to_string()),
+            || true,
+        );
     }
     let read = tokio::task::spawn_blocking(read_stdin_prompt);
     let piped = read
         .await
         .unwrap_or_else(|err| Err(format!("stdin read task failed: {err}")));
     resolve_prompt_with(args.task.as_deref(), move || piped, || false)
-}
-
-/// Whether the task argument carries a usable task text.
-///
-/// Shared by the fast paths so the definition of "explicit prompt" cannot
-/// drift between them.
-fn has_explicit_prompt(args: &Args) -> bool {
-    args.task.as_deref().is_some_and(presentable)
 }
 
 /// Whether a prompt candidate can be used verbatim.
@@ -732,28 +833,29 @@ fn presentable(text: &str) -> bool {
     !text.trim().is_empty()
 }
 
-/// Resolve the prompt from the parsed arguments.
-///
-/// A non-empty task argument wins and stdin is never touched; an empty
-/// or whitespace-only value falls through to stdin, as does an omitted
-/// argument. See [`resolve_prompt_with`] for the full rules.
-///
-/// # Errors
-///
-/// Returns an error message when no usable prompt exists.
-fn resolve_prompt(args: &Args) -> Result<String, String> {
-    resolve_prompt_with(args.task.as_deref(), read_stdin_prompt, || {
-        std::io::stdin().is_terminal()
-    })
-}
-
 /// The prompt-resolution rules, with the stdin side injected.
 ///
-/// Precedence: a non-empty task argument is used verbatim and the stdin
-/// closures are never called; otherwise stdin is probed and, when it is not
-/// a terminal, read to end as one prompt with trailing line breaks trimmed.
-/// A terminal stdin can never deliver a task, so that is a usage error, as
-/// is an empty stream.
+/// Piped stdin is the **context** and the task argument the
+/// **instruction** — both are delivered, stdin first, task last, in a
+/// labeled scaffold that keeps arbitrary piped text from reading like
+/// an instruction:
+///
+/// ```text
+/// --- piped stdin ---
+/// <stdin body, trailing line breaks trimmed>
+///
+/// --- task ---
+/// <task text>
+/// ```
+///
+/// The full table: a presentable task with a terminal stdin is the
+/// task alone (no read); with a non-empty pipe it combines as above;
+/// with an empty pipe it is the task alone, no error. Without a
+/// usable task, a non-empty pipe is the prompt verbatim (trailing
+/// line breaks trimmed), an empty pipe is an error, and a terminal
+/// stdin is a usage error — the task argument cannot arrive over a
+/// terminal. A stdin read failure surfaces whatever the read named,
+/// with or without a task.
 ///
 /// # Errors
 ///
@@ -763,24 +865,28 @@ fn resolve_prompt_with(
     read_stdin: impl FnOnce() -> Result<String, String>,
     stdin_is_terminal: impl FnOnce() -> bool,
 ) -> Result<String, String> {
-    if let Some(text) = explicit.filter(|text| presentable(text)) {
-        return Ok(text.to_string());
-    }
+    let task = explicit.filter(|text| presentable(text));
     if stdin_is_terminal() {
-        return Err(if explicit.is_some() {
-            "stdin is a terminal and no task was given: pass a task \
-             argument or pipe one on stdin"
-                .into()
-        } else {
-            "no prompt: pass a task argument or pipe one on stdin".into()
-        });
+        return match task {
+            Some(task) => Ok(task.to_string()),
+            None => Err(if explicit.is_some() {
+                "stdin is a terminal and no task was given: pass a task \
+                 argument or pipe one on stdin"
+                    .into()
+            } else {
+                "no prompt: pass a task argument or pipe one on stdin".into()
+            }),
+        };
     }
     let raw = read_stdin()?;
-    let prompt = raw.trim_end_matches(['\n', '\r']);
-    if prompt.is_empty() {
-        Err("empty prompt on stdin".into())
-    } else {
-        Ok(prompt.to_string())
+    let piped = raw.trim_end_matches(['\n', '\r']);
+    match (task, piped.is_empty()) {
+        (Some(task), false) => Ok(format!(
+            "--- piped stdin ---\n{piped}\n\n--- task ---\n{task}"
+        )),
+        (Some(task), true) => Ok(task.to_string()),
+        (None, false) => Ok(piped.to_string()),
+        (None, true) => Err("empty prompt on stdin".into()),
     }
 }
 
@@ -854,12 +960,15 @@ pub(crate) fn load_config(path: Option<&Path>) -> Result<dch_config::DchConfig, 
 /// # Errors
 ///
 /// Returns the user-facing message for a `--model` name that matches no
-/// configured entry — the text names the entries that do exist.
+/// configured entry — the text names the entries that do exist — and
+/// the same message for a `--permissions-preset` selection that names
+/// no configured preset.
 pub(crate) fn apply_cli_overrides(
     config: &mut dch_config::DchConfig,
     args: &Args,
 ) -> Result<(), String> {
     apply_non_model_overrides(config, args);
+    config.permissions.validate()?;
     config
         .select_model(args.model.as_deref())
         .map_err(|err| err.to_string())
@@ -897,6 +1006,9 @@ pub(crate) fn apply_non_model_overrides(config: &mut dch_config::DchConfig, args
     if let Some(mode) = args.permission_mode {
         config.runner.permission_mode = mode.into();
     }
+    if let Some(preset) = &args.permissions_preset {
+        config.permissions.preset = Some(preset.clone());
+    }
     if args.config.no_redact {
         config.security.redact_secrets = false;
     }
@@ -916,11 +1028,14 @@ pub(crate) fn apply_non_model_overrides(config: &mut dch_config::DchConfig, args
 /// selection so far. A resumed session adopts the saved conversation's
 /// own model into the live half — over the base, replacing the boot
 /// selection wholesale — unless the CLI named a model outright, in
-/// which case the flag's selection stands as the overrides left it.
+/// which case the flag's selection stands as the overrides left it. It
+/// adopts the saved conversation's permission mode the same way — the
+/// session's own override outranks the configuration's global default
+/// — unless the CLI named a mode outright.
 ///
 /// The steps run in one fixed order — non-model overrides onto the
 /// base, the full overrides onto the live config, the boot selection,
-/// the resume adoption, then [`reapply_displaced_flag_overrides`] — so
+/// the resume adoptions, then [`reapply_displaced_flag_overrides`] — so
 /// a per-run flag never loses to a value no word of the user's named.
 ///
 /// # Errors
@@ -944,6 +1059,11 @@ pub(crate) fn resolve_session_config_pair(
     apply_non_model_overrides(&mut base, args);
     apply_cli_overrides(&mut config, args)?;
     crate::resume::adopt_resumed_model(&mut config, &base, control, args.model.as_deref());
+    crate::resume::adopt_resumed_permission_mode(
+        &mut config,
+        control,
+        args.permission_mode.is_some(),
+    );
     reapply_displaced_flag_overrides(&mut config, args);
     Ok((config, base, file))
 }
@@ -1068,15 +1188,38 @@ fn outcome_after_delivery(run: &Run, delivery: std::io::Result<()>) -> HeadlessO
     }
 }
 
+/// The resumed session's remembered permissions, as the headless host
+/// installs them on the runner.
+///
+/// The TUI resume path's equal: without them a headless continuation
+/// would start from an empty memory and re-run exactly the work the
+/// session's own "never" answers had banned. A damaged restore adopts
+/// nothing and stands damaged — the verdict lives on the memory, and
+/// the caller refuses the run on it, because the snapshot the runner
+/// carries exports only the rule lists and a headless run has no one
+/// to ask.
+fn resumed_permission_memory(saver: &crate::session::SessionSaver) -> dch_tui::PermissionMemory {
+    let restored = saver.load_permissions();
+    let damage_stands = restored.damage_stands();
+    let (allow, deny) = restored.into_lists();
+    let memory = dch_tui::PermissionMemory::default();
+    memory.adopt(allow, deny, damage_stands);
+    memory
+}
+
 /// Write the done-file when `--done-file` is supplied.
 ///
 /// Called on every terminal path. Successful runs and answerless runs carry
 /// their turn/tool counts; other failures carry the message alone. The
-/// inherited mode — captured before the stale marker was cleared — is
-/// applied to the replacement atomically, before the rename. Write
-/// failures are logged to stderr but do not change the exit code.
+/// status is stamped with `session_id` — the session the run is bound
+/// to where the writer knows it, `None` on the paths that end before
+/// one resolves. The inherited mode — captured before the stale marker
+/// was cleared — is applied to the replacement atomically, before the
+/// rename. Write failures are logged to stderr but do not change the
+/// exit code.
 fn write_done_file_if_requested(
     args: &Args,
+    session_id: Option<uuid::Uuid>,
     outcome: &HeadlessOutcome,
     inherited_mode: Option<&std::fs::Permissions>,
 ) {
@@ -1093,7 +1236,8 @@ fn write_done_file_if_requested(
         DoneStatus::failure_with_counts(outcome.message.clone(), turns, tools_used)
     } else {
         DoneStatus::failure(outcome.message.clone())
-    };
+    }
+    .with_session_id(session_id);
     if let Err(err) = write_done_file(path, &status, inherited_mode) {
         crate::signals::report(&format!(
             "warning: failed to write done-file {}: {err}",
@@ -1116,6 +1260,69 @@ mod tests {
     use clap::Parser as _;
     use loopctl::engine::RunConfig;
     use tokio::io::AsyncWriteExt as _;
+
+    /// Point the process's real stderr at `/dev/null` for a scope.
+    ///
+    /// The failure-path pins below exercise the product's own stderr
+    /// reporting — a refused delivery, an unwritable done-file — and
+    /// their assertions pin the outcome, not the emission; without the
+    /// hush the suite's own report lines leak into `make test`'s
+    /// output and read as trouble they are not. The guard holds a
+    /// dedicated lock for its whole lifetime — create to restore — so
+    /// two overlapping guards cannot capture each other's redirect
+    /// and restore `/dev/null` over the real stderr; the signal-test
+    /// lock is deliberately not relied on, because callers acquire it
+    /// only after the guard already stands.
+    #[cfg(unix)]
+    struct HushedStderr {
+        _serializes: std::sync::MutexGuard<'static, ()>,
+        saved: i32,
+    }
+
+    #[cfg(unix)]
+    impl Drop for HushedStderr {
+        fn drop(&mut self) {
+            // SAFETY: dup2 on the process's own stderr descriptor is the
+            // documented restore path; a failure leaves the sink in place,
+            // which costs test-output tidiness, never correctness.
+            unsafe {
+                if libc::dup2(self.saved, libc::STDERR_FILENO) == -1 {
+                    std::fs::write("/dev/null", []).ok();
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn hush_stderr() -> HushedStderr {
+        use std::os::fd::AsRawFd as _;
+        static STDERR_HUSH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        // The guard is stored under its underscore-free name inside
+        // the struct; the shorthand-field syntax would bind it under
+        // an underscore-prefixed name here, which the used-underscore
+        // lint refuses.
+        let serializes = STDERR_HUSH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let sink = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .expect("/dev/null opens");
+        // SAFETY: dup/dup2 on this process's own descriptors; both fds are
+        // valid for the whole call and the save happens before the redirect,
+        // under the lock every other guard also takes.
+        let (saved, redirected) = unsafe {
+            (libc::dup(libc::STDERR_FILENO), {
+                libc::dup2(sink.as_raw_fd(), libc::STDERR_FILENO)
+            })
+        };
+        assert!(saved != -1, "stderr duplicates for the restore");
+        assert!(redirected != -1, "stderr redirects to the sink");
+        HushedStderr {
+            _serializes: serializes,
+            saved,
+        }
+    }
 
     /// Parse a flag list into [`Args`], prefixing the program name.
     ///
@@ -1233,13 +1440,42 @@ mod tests {
     }
 
     #[test]
-    fn explicit_prompt_wins_and_stdin_is_never_touched() {
+    fn explicit_task_with_terminal_stdin_is_used_alone() {
+        // The one shape that never reads: a task argument on a
+        // terminal stdin — the interactive launch's sibling, resolved
+        // synchronously with the pipe side untouched.
         let prompt = resolve_prompt_with(
             Some("do the thing"),
-            || panic!("stdin must not be read when text is given"),
-            || panic!("stdin must not be probed when text is given"),
+            || panic!("a terminal stdin is never read"),
+            || true,
         );
         assert_eq!(prompt.unwrap(), "do the thing");
+    }
+
+    #[test]
+    fn explicit_task_and_piped_stdin_combine_stdin_first() {
+        // The pipe is context, the task the instruction: both are
+        // delivered, stdin first in a labeled scaffold, the task last
+        // in the recency position — exactly the combined string, not
+        // a paraphrase of it.
+        let prompt = resolve_prompt_with(
+            Some("what is my ip"),
+            || Ok("1: lo: 127.0.0.1\n2: eth0: 192.168.1.7\n".into()),
+            || false,
+        );
+        assert_eq!(
+            prompt.unwrap(),
+            "--- piped stdin ---\n1: lo: 127.0.0.1\n2: eth0: 192.168.1.7\n\n--- task ---\nwhat is my ip"
+        );
+    }
+
+    #[test]
+    fn empty_piped_stdin_with_a_task_uses_the_task_alone() {
+        // `dch "task" < /dev/null` — the wrapper's stdin is a pipe
+        // that delivers nothing: the task stands alone, no error, the
+        // same outcome the old argument-wins semantics gave.
+        let prompt = resolve_prompt_with(Some("the task"), || Ok(String::new()), || false);
+        assert_eq!(prompt.unwrap(), "the task");
     }
 
     #[test]
@@ -1292,6 +1528,21 @@ mod tests {
     }
 
     #[test]
+    fn a_stdin_read_failure_surfaces_with_a_task_too() {
+        // A task argument no longer suppresses the read, so it no
+        // longer suppresses the read's failure either: the error
+        // names the pipe, not a silent task-only run that leaves the
+        // producer to die of EPIPE.
+        let err = resolve_prompt_with(
+            Some("do the thing"),
+            || Err("failed to read stdin: broken".into()),
+            || false,
+        )
+        .unwrap_err();
+        assert!(err.contains("broken"), "{err}");
+    }
+
+    #[test]
     fn a_run_with_output_maps_to_success() {
         let mut run = Run::new("task", &RunConfig::default());
         run.output = Some("the answer".into());
@@ -1324,7 +1575,187 @@ mod tests {
     }
 
     #[test]
+    fn a_resumed_session_installs_its_remembered_permissions_on_the_runner() {
+        // The headless resume's equal of the TUI adoption: the saved
+        // pair loads from the session's own sibling file, the verdict
+        // rides with it, and the memory the runner carries denies
+        // exactly what the session denied — a damaged sibling adopts
+        // no lists and keeps the verdict, so the fail-closed posture
+        // stands on the continuation too.
+        let root = tempfile::tempdir().unwrap();
+        let id = uuid::Uuid::new_v4();
+        let saver = crate::session::SessionSaver::with_base_dir(
+            id,
+            "test-model".to_string(),
+            root.path().to_path_buf(),
+        );
+        let allow = vec![dch_tui::PermissionRule::ShellPrefix {
+            prefix: "cargo test".to_string(),
+        }];
+        let deny = vec![dch_tui::PermissionRule::Tool {
+            tool: "WebFetch".to_string(),
+        }];
+        saver
+            .save_permissions(&allow, &deny, false)
+            .expect("the pair saves");
+
+        let memory = resumed_permission_memory(&saver);
+
+        assert_eq!(memory.allow_rules(), allow, "the blessings ride along");
+        assert_eq!(memory.deny_rules(), deny, "the bans ride along");
+        assert!(
+            !memory.damage_standing(),
+            "a healthy restore stands healthy"
+        );
+
+        let damaged_id = uuid::Uuid::new_v4();
+        let damaged = crate::session::SessionSaver::with_base_dir(
+            damaged_id,
+            "test-model".to_string(),
+            root.path().to_path_buf(),
+        );
+        damaged
+            .save_permissions(&[], &[], true)
+            .expect("the damaged marker saves");
+        let memory = resumed_permission_memory(&damaged);
+        assert!(
+            memory.damage_standing(),
+            "the damage verdict rides the headless adoption"
+        );
+        assert!(
+            memory.allow_rules().is_empty() && memory.deny_rules().is_empty(),
+            "the damaged restore adopts no lists"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_damaged_permissions_restore_refuses_the_headless_run() {
+        // The fail-open this round closed, pinned end to end: the
+        // snapshot the runner carries exports only the rule lists, so
+        // the damage verdict must be read where it lives — at
+        // construction, against the sessions root the run actually
+        // saves into. The damaged marker sits only in the injected
+        // root, so the refusal also proves that root is the one
+        // consulted; the done-file carries the failure an orchestrator
+        // polls for instead of a run whose remembered refusals
+        // quietly vanished under the auto mode's allows.
+        let _signal_lock = SIGNAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "[api]\nmodel = \"test-model\"\n").unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let done = dir.path().join("done.json");
+        let id = uuid::Uuid::new_v4();
+        crate::session::SessionSaver::with_base_dir(
+            id,
+            "test-model".to_string(),
+            sessions.path().to_path_buf(),
+        )
+        .save_permissions(&[], &[], true)
+        .expect("the damaged marker saves");
+        let args = parse(&[
+            "continue the work",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--done-file",
+            done.to_str().unwrap(),
+        ]);
+        let control = crate::resume::ResumeControl::Resumed(crate::resume::ResumeOutcome {
+            session_id: id,
+            model: "test-model".to_string(),
+            permission_mode: None,
+            messages: Vec::new(),
+            tokens: crate::session::SessionTokens::default(),
+            machine: None,
+            machine_compactions: 0,
+            title: None,
+        });
+        let code = run_headless_rooted(
+            &args,
+            crate::signals::install_construction_handler(|| {}),
+            sessions.path().to_path_buf(),
+            control,
+        )
+        .await;
+        assert_eq!(
+            code, 1,
+            "a damaged restore refuses the headless run before any work runs"
+        );
+        let status: DoneStatus =
+            serde_json::from_str(&std::fs::read_to_string(&done).unwrap()).unwrap();
+        assert!(!status.success, "the refusal is the recorded outcome");
+        assert!(
+            status
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("damaged")),
+            "the refusal names the damage: {:?}",
+            status.message
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_healthy_permissions_restore_rides_the_injected_root() {
+        // The root threading's healthy side: a sibling carrying a real
+        // remembered pair under the injected root loads without a
+        // refusal and the continuation completes — the door the damaged
+        // test proves closed opens on nothing else.
+        let _signal_lock = SIGNAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let server = TurnServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, server.config_toml()).unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let id = uuid::Uuid::new_v4();
+        crate::session::SessionSaver::with_base_dir(
+            id,
+            "test-model".to_string(),
+            sessions.path().to_path_buf(),
+        )
+        .save_permissions(
+            &[dch_tui::PermissionRule::ShellPrefix {
+                prefix: "cargo test".to_string(),
+            }],
+            &[dch_tui::PermissionRule::Tool {
+                tool: "WebFetch".to_string(),
+            }],
+            false,
+        )
+        .expect("the healthy pair saves");
+        let args = parse(&["continue", "--config", config_path.to_str().unwrap()]);
+        let control = crate::resume::ResumeControl::Resumed(crate::resume::ResumeOutcome {
+            session_id: id,
+            model: "test-model".to_string(),
+            permission_mode: None,
+            messages: Vec::new(),
+            tokens: crate::session::SessionTokens::default(),
+            machine: None,
+            machine_compactions: 0,
+            title: None,
+        });
+        let code = run_headless_rooted(
+            &args,
+            crate::signals::install_construction_handler(|| {}),
+            sessions.path().to_path_buf(),
+            control,
+        )
+        .await;
+        assert_eq!(
+            code, 0,
+            "a healthy restore from the injected root runs the continuation"
+        );
+    }
+
+    #[test]
     fn a_refused_delivery_fails_the_run_with_its_real_counts() {
+        #[cfg(unix)]
+        let _hush = hush_stderr();
         // The shell's verdict and the done-file's status both turn on the
         // delivery: exit 2, a failure status, the run's turn and tool
         // totals kept, and the message naming the write's own error —
@@ -1359,8 +1790,10 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("done.json");
         let args = parse(&["x", "--done-file", path.to_str().unwrap()]);
+        let id = uuid::Uuid::new_v4();
         write_done_file_if_requested(
             &args,
+            Some(id),
             &HeadlessOutcome::failure(130, FORCE_CANCEL_MESSAGE),
             None,
         );
@@ -1368,6 +1801,11 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(written.message.as_deref(), Some(FORCE_CANCEL_MESSAGE));
         assert_eq!(written.turns, None);
+        assert_eq!(
+            written.session_id,
+            Some(id),
+            "the marker names the session the run was bound to"
+        );
     }
 
     #[test]
@@ -1377,18 +1815,19 @@ mod tests {
         let args = parse(&["x", "--done-file", path.to_str().unwrap()]);
 
         let recorded = AtomicBool::new(false);
-        write_force_marker_unless_recorded(&args, &recorded, None);
+        write_force_marker_unless_recorded(&args, uuid::Uuid::nil(), &recorded, None);
         let first: DoneStatus =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(first.message.as_deref(), Some(FORCE_CANCEL_MESSAGE));
 
         write_done_file_if_requested(
             &args,
+            None,
             &HeadlessOutcome::failure(2, "engine error text"),
             None,
         );
         recorded.store(true, Ordering::SeqCst);
-        write_force_marker_unless_recorded(&args, &recorded, None);
+        write_force_marker_unless_recorded(&args, uuid::Uuid::nil(), &recorded, None);
         let final_status: DoneStatus =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(
@@ -1407,6 +1846,7 @@ mod tests {
         let args = parse(&["x", "--done-file", path.to_str().unwrap()]);
         write_done_file_if_requested(
             &args,
+            None,
             &HeadlessOutcome::failure(130, STARTUP_CANCEL_MESSAGE),
             None,
         );
@@ -1414,6 +1854,18 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(written.message.as_deref(), Some(STARTUP_CANCEL_MESSAGE));
         assert_eq!(written.turns, None);
+        assert_eq!(
+            written.session_id, None,
+            "no session exists before the runner does"
+        );
+    }
+
+    #[test]
+    fn the_notice_line_names_the_session_in_the_resume_spelling() {
+        let id = uuid::Uuid::new_v4();
+        let line = session_notice(id);
+        assert!(line.contains("dch: session"), "{line}");
+        assert!(line.contains(&id.to_string()), "{line}");
     }
 
     #[test]
@@ -1443,6 +1895,10 @@ mod tests {
         assert_eq!(written.turns, None);
         assert_eq!(written.tools_used, None);
         assert_eq!(written.message.as_deref(), Some("config unreadable"));
+        assert_eq!(
+            written.session_id, None,
+            "a construction failure ends before any session resolves"
+        );
     }
 
     #[test]
@@ -1452,7 +1908,7 @@ mod tests {
         let args = parse(&["x", "--done-file", path.to_str().unwrap()]);
         let mut run = Run::new("task", &RunConfig::default());
         run.output = Some("done".into());
-        write_done_file_if_requested(&args, &HeadlessOutcome::from_run(&run), None);
+        write_done_file_if_requested(&args, None, &HeadlessOutcome::from_run(&run), None);
         let written: DoneStatus =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert!(written.success);
@@ -1466,7 +1922,7 @@ mod tests {
         let path = tmp.path().join("done.json");
         let args = parse(&["x", "--done-file", path.to_str().unwrap()]);
         let run = Run::new("task", &RunConfig::default());
-        write_done_file_if_requested(&args, &HeadlessOutcome::from_run(&run), None);
+        write_done_file_if_requested(&args, None, &HeadlessOutcome::from_run(&run), None);
         let written: DoneStatus =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert!(!written.success);
@@ -1478,7 +1934,7 @@ mod tests {
     fn no_done_file_flag_writes_nothing() {
         let tmp = tempfile::TempDir::new().unwrap();
         let args = parse(&["x"]);
-        write_done_file_if_requested(&args, &HeadlessOutcome::failure(1, "boom"), None);
+        write_done_file_if_requested(&args, None, &HeadlessOutcome::failure(1, "boom"), None);
         assert_eq!(
             std::fs::read_dir(tmp.path()).unwrap().count(),
             0,
@@ -1490,6 +1946,8 @@ mod tests {
     #[cfg(unix)]
     fn an_unwritable_done_file_path_does_not_panic_or_mask_the_outcome() {
         use std::os::unix::fs::PermissionsExt;
+
+        let _hush = hush_stderr();
 
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = tmp.path().join("locked");
@@ -1508,6 +1966,7 @@ mod tests {
         let args = parse(&["x", "--done-file", path.to_str().unwrap()]);
         write_done_file_if_requested(
             &args,
+            None,
             &HeadlessOutcome::from_loop_error(&LoopError::Cancelled),
             None,
         );
@@ -1673,16 +2132,16 @@ mod tests {
         apply_cli_overrides(&mut config, &parse(&["--permission-mode", "plan"])).unwrap();
         assert_eq!(
             config.runner.permission_mode,
-            dch_config::PermissionMode::Plan,
+            dch_config::PermissionMode::ReadOnly,
             "the flag beats the configured mode"
         );
 
         let mut config = dch_config::DchConfig::default();
-        config.runner.permission_mode = dch_config::PermissionMode::AcceptEdits;
+        config.runner.permission_mode = dch_config::PermissionMode::Interactive;
         apply_cli_overrides(&mut config, &parse(&[])).unwrap();
         assert_eq!(
             config.runner.permission_mode,
-            dch_config::PermissionMode::AcceptEdits,
+            dch_config::PermissionMode::Interactive,
             "with no flag the configured mode stands"
         );
     }
@@ -1754,6 +2213,42 @@ mod tests {
     }
 
     #[test]
+    fn a_cli_preset_typo_is_a_startup_error_not_a_silent_noop() {
+        // The CLI preset override lands after the file's load-time
+        // validation, so the selection is re-validated here: a typo'd
+        // selection used to proceed with zero preset rules and no
+        // message — the refusal now names the configured selection. A
+        // typo'd field inside the preset table is refused earlier
+        // still, at the parse: an unknown key cannot silently produce
+        // an empty preset. The correctly-spelled selection applies as
+        // before.
+        let typo = dch_config::DchConfig::from_toml_str(concat!(
+            "[permissions.presets.rust-dev]\n",
+            "outcome = \"allow\"\n",
+            "shell_prefix = \"cargo test\"\n",
+        ));
+        let parse_err = typo.unwrap_err();
+        assert!(
+            format!("{parse_err:?}").contains("unknown field"),
+            "the parse names the unknown field: {parse_err:?}"
+        );
+        let mut config = dch_config::DchConfig::from_toml_str(concat!(
+            "[permissions.presets.rust-dev]\n",
+            "rules = [{ outcome = \"allow\", shell_prefix = \"cargo test\" }]\n",
+        ))
+        .unwrap();
+        let args = parse(&["--permissions-preset", "rust-ev"]);
+        let err = apply_cli_overrides(&mut config, &args).unwrap_err();
+        assert!(
+            err.contains("rust-dev"),
+            "the error names the preset that does exist: {err}"
+        );
+        let args = parse(&["--permissions-preset", "rust-dev"]);
+        apply_cli_overrides(&mut config, &args).unwrap();
+        assert_eq!(config.permissions.preset.as_deref(), Some("rust-dev"));
+    }
+
+    #[test]
     fn the_unstreamed_answer_prints_as_one_line_with_a_newline() {
         let mut sink: Vec<u8> = Vec::new();
         write_final_answer(&mut sink, "the answer").expect("a Vec sink takes the line");
@@ -1787,6 +2282,52 @@ mod tests {
     }
 
     #[test]
+    fn a_resumed_sessions_mode_adopts_and_the_flag_outranks_it() {
+        // The session file's own permission mode is what a resume runs
+        // under — the configuration's global default yields to it — and
+        // an explicit --permission-mode outranks the file, becoming the
+        // session's standing override from that run forward.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[api]\nmodel = \"qwen\"\n").unwrap();
+        let config_path = path.display().to_string();
+
+        let resumed = crate::resume::ResumeControl::Resumed(crate::resume::ResumeOutcome {
+            session_id: uuid::Uuid::nil(),
+            model: "qwen".to_string(),
+            permission_mode: Some(dch_config::PermissionMode::Interactive),
+            messages: Vec::new(),
+            tokens: crate::session::SessionTokens::default(),
+            machine: None,
+            machine_compactions: 0,
+            title: None,
+        });
+        let bare = parse(&["--config", &config_path]);
+        let (config, _base, _file) = resolve_session_config_pair(&bare, &resumed).unwrap();
+        assert_eq!(
+            config.runner.permission_mode,
+            dch_config::PermissionMode::Interactive,
+            "the session's own override outranks the configured default"
+        );
+
+        let flagged = parse(&["--config", &config_path, "--permission-mode", "plan"]);
+        let (flagged_config, _base, _file) =
+            resolve_session_config_pair(&flagged, &resumed).unwrap();
+        assert_eq!(
+            flagged_config.runner.permission_mode,
+            dch_config::PermissionMode::ReadOnly,
+            "the CLI flag outranks the session file's own record"
+        );
+
+        let (fresh, _base, _file) = resolve_session_config_pair(&bare, &fresh_control()).unwrap();
+        assert_eq!(
+            fresh.runner.permission_mode,
+            dch_config::PermissionMode::Auto,
+            "a fresh run without the flag stays on the configured default"
+        );
+    }
+
+    #[test]
     fn the_reasoning_effort_flag_wins_over_an_entrys_own_dial() {
         // The entry states its own dial; the flag is a per-run statement
         // and outranks it on every path — the boot selection layering
@@ -1814,6 +2355,7 @@ mod tests {
         let resumed = crate::resume::ResumeControl::Resumed(crate::resume::ResumeOutcome {
             session_id: uuid::Uuid::nil(),
             model: "glm".to_string(),
+            permission_mode: None,
             messages: Vec::new(),
             tokens: crate::session::SessionTokens::default(),
             machine: None,
@@ -2081,6 +2623,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     async fn an_unclearable_stale_done_file_fails_the_run() {
         use std::os::unix::fs::PermissionsExt as _;
+        let _hush = hush_stderr();
         let _signal_lock = SIGNAL_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2183,6 +2726,20 @@ mod tests {
         /// successive runs at the one server needs no name
         /// resolution or a fixed port.
         port: u16,
+
+        /// Every naming request's raw bytes, oldest first.
+        ///
+        /// The title side-call's wire truth, kept apart from the
+        /// conversation turns: a pin reads exactly what the ask
+        /// carried.
+        naming_bodies: Arc<std::sync::Mutex<Vec<String>>>,
+
+        /// Every conversation request's raw bytes, oldest first.
+        ///
+        /// The turns' wire truth — the same split the naming capture
+        /// makes, so a pin can prove a prompt rode the run and not
+        /// the naming call.
+        bodies: Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     impl TurnServer {
@@ -2217,6 +2774,12 @@ mod tests {
                 .await
                 .expect("ephemeral bind");
             let port = listener.local_addr().expect("bound address").port();
+            let naming_bodies: Arc<std::sync::Mutex<Vec<String>>> =
+                Arc::new(std::sync::Mutex::new(Vec::new()));
+            let task_naming = Arc::clone(&naming_bodies);
+            let bodies: Arc<std::sync::Mutex<Vec<String>>> =
+                Arc::new(std::sync::Mutex::new(Vec::new()));
+            let task_bodies = Arc::clone(&bodies);
             tokio::spawn(async move {
                 while let Ok((mut stream, _)) = listener.accept().await {
                     let mut seen = Vec::new();
@@ -2247,7 +2810,11 @@ mod tests {
                             break;
                         }
                     }
-                    if String::from_utf8_lossy(&seen).contains(dch_loop::NAME_SYSTEM_PROMPT) {
+                    let request = String::from_utf8_lossy(&seen).into_owned();
+                    if request.contains(dch_loop::NAME_SYSTEM_PROMPT) {
+                        if let Ok(mut recorded) = task_naming.lock() {
+                            recorded.push(request);
+                        }
                         if stall_title {
                             tokio::spawn(async move {
                                 let _held = stream;
@@ -2272,6 +2839,9 @@ mod tests {
                         let _written = stream.write_all(answer.as_bytes()).await;
                         continue;
                     }
+                    if let Ok(mut recorded) = task_bodies.lock() {
+                        recorded.push(request);
+                    }
                     let body = [
                         serde_json::json!({
                             "id": "c1", "model": "test-model",
@@ -2291,7 +2861,28 @@ mod tests {
                     let _written = stream.write_all(response.as_bytes()).await;
                 }
             });
-            Self { port }
+            Self {
+                port,
+                naming_bodies,
+                bodies,
+            }
+        }
+
+        /// The body of every naming request received, oldest first.
+        ///
+        /// The naming side-call's wire truth: what prompt the title
+        /// ask actually carried, whatever the run that armed it
+        /// claimed.
+        fn naming_bodies(&self) -> Vec<String> {
+            self.naming_bodies
+                .lock()
+                .map_or_default(|reqs| reqs.clone())
+        }
+
+        /// The body of every conversation request received, oldest
+        /// first.
+        fn bodies(&self) -> Vec<String> {
+            self.bodies.lock().map_or_default(|reqs| reqs.clone())
         }
 
         /// A config pointing the agent at this server.
@@ -2539,6 +3130,8 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn a_stalled_naming_call_never_delays_the_headless_outcome() {
+        #[cfg(unix)]
+        let _hush = hush_stderr();
         let _signal_lock = SIGNAL_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2594,12 +3187,115 @@ mod tests {
         );
         let saved = session_ids(sessions.path());
         assert_eq!(saved.len(), 1, "the session saved untitled, not unsaved");
+        let status: DoneStatus = serde_json::from_str(&done_text).unwrap();
+        assert_eq!(
+            status.session_id,
+            saved.first().copied(),
+            "the marker names the session the transcript saved under"
+        );
         let meta =
             crate::session::load_with_meta_in(*saved.first().unwrap(), sessions.path()).unwrap();
         assert_eq!(
             meta.title, None,
             "a title that never answered saves as untitled — the run \
              does not wait for it"
+        );
+    }
+
+    /// A resumed untitled session's naming retry coins from the
+    /// conversation's opening ask.
+    ///
+    /// The title is coined from the session's first prompt; a session
+    /// whose naming never answered gets its retry armed by a follow-up
+    /// run, and the side-call must carry the restored history's first
+    /// user message — not the follow-up — while the run itself rides
+    /// the follow-up.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_resumed_untitled_session_names_from_the_restored_first_prompt() {
+        #[cfg(unix)]
+        let _hush = hush_stderr();
+        let _signal_lock = SIGNAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let server = TurnServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, server.config_toml()).unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let done = dir.path().join("done.json");
+        let outcome = crate::resume::ResumeOutcome {
+            session_id: uuid::Uuid::new_v4(),
+            model: "test-model".to_string(),
+            messages: vec![
+                dch_tui::TuiMessage::User {
+                    text: "map the coastline roads".to_string(),
+                    timestamp: chrono::Utc::now(),
+                    steered: false,
+                    unsent: false,
+                },
+                dch_tui::TuiMessage::Assistant {
+                    blocks: vec![dch_tui::ContentBlock::Text {
+                        text: "the coast is mapped".to_string(),
+                    }],
+                    timestamp: chrono::Utc::now(),
+                    duration_ms: None,
+                },
+            ],
+            machine: Some(vec![
+                loopctl::message::Message::user("map the coastline roads"),
+                loopctl::message::Message::assistant("the coast is mapped"),
+            ]),
+            tokens: crate::session::SessionTokens::default(),
+            machine_compactions: 0,
+            title: None,
+            permission_mode: None,
+        };
+        let args = parse(&[
+            "now chart the tides",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--done-file",
+            done.to_str().unwrap(),
+        ]);
+        let code = run_headless_rooted(
+            &args,
+            crate::signals::install_construction_handler(|| {}),
+            sessions.path().to_path_buf(),
+            crate::resume::ResumeControl::Resumed(outcome),
+        )
+        .await;
+        assert_eq!(code, 0, "the resumed run itself succeeds");
+        let naming = server.naming_bodies();
+        assert_eq!(
+            naming.len(),
+            1,
+            "the untitled resume fires exactly one naming call"
+        );
+        let naming_body = naming.first().unwrap();
+        assert!(
+            naming_body.contains("map the coastline roads"),
+            "the naming call coins from the restored first prompt: {naming_body}"
+        );
+        assert!(
+            !naming_body.contains("now chart the tides"),
+            "the arming follow-up never rides the naming call: {naming_body}"
+        );
+        assert!(
+            server
+                .bodies()
+                .iter()
+                .any(|body| body.contains("now chart the tides")),
+            "the run itself rode the claimed prompt"
+        );
+        let saved = session_ids(sessions.path());
+        assert_eq!(saved.len(), 1, "the resumed save lands on one session");
+        let meta =
+            crate::session::load_with_meta_in(*saved.first().unwrap(), sessions.path()).unwrap();
+        assert_eq!(
+            meta.title,
+            Some("Canned Session Title".to_string()),
+            "the retry's answer titles the session"
         );
     }
 

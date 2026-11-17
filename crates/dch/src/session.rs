@@ -34,6 +34,27 @@ const FORMAT: &str = "dch.v1";
 /// a future shape is refused rather than misread.
 const MACHINE_FORMAT: &str = "dch.machine.v1";
 
+/// The format tag of the remembered-permissions sibling file.
+///
+/// Pre-release there is no version history to carry: the file is v1
+/// now and stays v1 — the rule shapes (tool names, shell verb
+/// prefixes, exact command texts, write-path globs) are the format.
+/// The two earlier pre-release spellings are read as aliases of the
+/// same format, so a session saved before the rename keeps its
+/// choices: a `v3` tag carried both lists, and a `v2` tag — allow
+/// rules only, the deny list did not exist yet — loads wholesale into
+/// the allow list. The oldest files (whole prompt strings, tagged v1
+/// before the rename) carry no rule data and lapse into asking once
+/// more rather than misread.
+const PERMISSIONS_FORMAT: &str = "dch.permissions.v1";
+
+/// The two pre-release aliases, still readable: a `v3` file carried
+/// both lists under the same shapes this version writes, and a `v2`
+/// file carried only allow rules (the deny list did not exist yet),
+/// loading wholesale into the allow list.
+const PERMISSIONS_FORMAT_V3: &str = "dch.permissions.v3";
+const PERMISSIONS_FORMAT_V2: &str = "dch.permissions.v2";
+
 /// Persists and restores conversation sessions under
 /// `~/.dch/sessions/<uuid>/session.json`.
 ///
@@ -83,6 +104,16 @@ pub struct SessionSaver {
     /// renders the absence as a dash. The title rides the envelope
     /// so a resume carries the name forward under the same id.
     title: Option<String>,
+
+    /// The session's permission-mode override, when it carries one.
+    ///
+    /// Set at launch from `--permission-mode` or the resumed file's
+    /// own record, and updated when a `/mode` move lands; written
+    /// into every envelope the saver produces so a resume re-seats
+    /// the session's own mode instead of the configuration's global
+    /// default. `None` — the configuration governs — on a fresh
+    /// start without the flag.
+    pub(crate) permission_mode: Option<dch_config::PermissionMode>,
 
     /// The root sessions directory, injectable for tests.
     ///
@@ -317,6 +348,18 @@ struct StoredSession {
     /// absence as a dash.
     #[serde(default)]
     title: Option<String>,
+
+    /// The permission mode this session runs under, when one was
+    /// chosen for it.
+    ///
+    /// Written when the session carries its own override — a
+    /// `--permission-mode` flag at launch or a `/mode` move — and
+    /// adopted by a resume, so the session keeps its own mode whatever
+    /// the configuration's global default says. Absent on sessions
+    /// without an override and on files saved before the field
+    /// existed; those read as none and the configuration governs.
+    #[serde(default)]
+    permission_mode: Option<dch_config::PermissionMode>,
 }
 
 /// A session's cumulative token accounting.
@@ -375,6 +418,7 @@ impl SessionSaver {
             model,
             workdir: None,
             title: None,
+            permission_mode: None,
             base_dir: sessions_dir(),
         }
     }
@@ -390,6 +434,7 @@ impl SessionSaver {
             model,
             workdir: None,
             title: None,
+            permission_mode: None,
             base_dir,
         }
     }
@@ -427,6 +472,7 @@ impl SessionSaver {
             model,
             workdir: self.workdir.clone(),
             title: self.title.clone(),
+            permission_mode: self.permission_mode,
             base_dir: self.base_dir.clone(),
         }
     }
@@ -441,6 +487,23 @@ impl SessionSaver {
     #[must_use]
     pub fn with_title(mut self, title: Option<String>) -> Self {
         self.title = title;
+        self
+    }
+
+    /// Record the permission mode this session runs under.
+    ///
+    /// The session-level override: set at launch from
+    /// `--permission-mode` or the resumed file's own record, and
+    /// updated when a `/mode` move lands. `None` — a session with no
+    /// override of its own, the configuration's global default
+    /// governing — is what a fresh start without the flag carries and
+    /// what a `/clear`'s fresh identity drops back to.
+    #[must_use]
+    pub fn with_permission_mode(
+        mut self,
+        permission_mode: Option<dch_config::PermissionMode>,
+    ) -> Self {
+        self.permission_mode = permission_mode;
         self
     }
 
@@ -486,6 +549,18 @@ impl SessionSaver {
             .join("machine.json")
     }
 
+    /// The remembered-permissions sibling:
+    /// `<base>/<uuid>/permissions.json`.
+    ///
+    /// Sits beside the display and machine files so the choices
+    /// travel with a copied session directory; its absence is a
+    /// fresh session's honest state — nothing remembered yet.
+    fn permissions_path(&self) -> PathBuf {
+        self.base_dir
+            .join(self.session_id.to_string())
+            .join("permissions.json")
+    }
+
     /// Serialize the engine's working set into the machine-history
     /// file, atomically.
     ///
@@ -524,6 +599,114 @@ impl SessionSaver {
                 .map_err(|err| SessionError::Io(err.error))?,
         );
         Ok(())
+    }
+
+    /// Persist the remembered permission prompts, atomically.
+    ///
+    /// The "allow always" choices ride their own sibling beside the
+    /// display and machine files — rewritten on every remember, since
+    /// the list is tiny and the atomic discipline costs nothing at
+    /// this size. The damage verdict rides beside the pair, so a
+    /// save from a session whose restore failed closed writes a file
+    /// that still says so — the next launch re-arms the restriction
+    /// instead of reading the replaced lists as a recovery.
+    ///
+    /// # Errors
+    ///
+    /// Same conditions as [`SessionSaver::save_at`], against the
+    /// sibling path.
+    pub fn save_permissions(
+        &self,
+        allow: &[dch_tui::PermissionRule],
+        deny: &[dch_tui::PermissionRule],
+        damaged: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let path = self.permissions_path();
+        let dir = path.parent().unwrap_or(Path::new("."));
+        std::fs::create_dir_all(dir)?;
+        let stored = StoredPermissions {
+            format: PERMISSIONS_FORMAT.to_string(),
+            allow: allow.to_vec(),
+            deny: deny.to_vec(),
+            damaged,
+        };
+        let json = serde_json::to_string(&stored)?;
+        let mut temp = tempfile::NamedTempFile::new_in(dir)?;
+        std::io::Write::write_all(&mut temp, json.as_bytes())?;
+        std::fs::File::sync_all(temp.as_file())?;
+        drop(
+            temp.persist(&path)
+                .map_err(|err| SessionError::Io(err.error))?,
+        );
+        Ok(())
+    }
+
+    /// The remembered permission prompts this session last saved.
+    ///
+    /// An absent sibling is a fresh session —
+    /// [`PermissionsRestore::Fresh`], nothing remembered, not an
+    /// error. A sibling that parses under a known format tag restores
+    /// its lists ([`PermissionsRestore::Restored`]), the older
+    /// spellings loading as aliases; a sibling carrying the standing
+    /// damage marker restores its lists with the marker beside them,
+    /// because the lists it holds are the re-answers made *after* the
+    /// damage — real choices, never a recovery. A sibling that exists
+    /// but cannot be trusted — unreadable, unparseable, or tagged
+    /// with a format this build does not know — fails the restore
+    /// closed ([`PermissionsRestore::Damaged`]): empty lists are not
+    /// the verdict, because empty lists under `auto` would run the
+    /// work a damaged file's denies had banned; the caller blocks
+    /// side-effecting calls until the session re-answers.
+    #[must_use]
+    pub fn load_permissions(&self) -> PermissionsRestore {
+        let stored = match read_stored_file::<StoredPermissions>(&self.permissions_path()) {
+            Ok(stored) => stored,
+            Err(StoredFileFault::Absent) => return PermissionsRestore::Fresh,
+            Err(StoredFileFault::Unreadable(err)) => {
+                tracing::warn!(
+                    error = %err,
+                    "remembered permissions unreadable; failing the restore closed"
+                );
+                return PermissionsRestore::Damaged;
+            }
+            Err(StoredFileFault::Unparseable(err)) => {
+                tracing::warn!(
+                    error = %err,
+                    "remembered permissions unparseable; failing the restore closed"
+                );
+                return PermissionsRestore::Damaged;
+            }
+        };
+        if stored.format == PERMISSIONS_FORMAT || stored.format == PERMISSIONS_FORMAT_V3 {
+            if stored.deny.iter().any(|rule| match rule {
+                dch_tui::PermissionRule::PathGlob { pattern } => {
+                    dch_permissions::rule::PathGlob::new(pattern.clone()).is_err()
+                }
+                _ => false,
+            }) {
+                tracing::warn!(
+                    "a remembered deny glob no longer compiles; failing the restore closed"
+                );
+                return PermissionsRestore::Damaged;
+            }
+            return PermissionsRestore::Restored {
+                allow: stored.allow,
+                deny: stored.deny,
+                damage_standing: stored.damaged,
+            };
+        }
+        if stored.format == PERMISSIONS_FORMAT_V2 {
+            return PermissionsRestore::Restored {
+                allow: stored.allow,
+                deny: Vec::new(),
+                damage_standing: false,
+            };
+        }
+        tracing::warn!(
+            format = %stored.format,
+            "unknown remembered-permissions format; failing the restore closed"
+        );
+        PermissionsRestore::Damaged
     }
 
     /// Serialize `messages` into the session file, atomically, stamped
@@ -595,6 +778,7 @@ impl SessionSaver {
             tokens,
             workdir: self.workdir.clone(),
             title: self.title.clone(),
+            permission_mode: self.permission_mode,
         };
         let json = serde_json::to_string_pretty(&stored)?;
         let mut temp = tempfile::NamedTempFile::new_in(dir)?;
@@ -680,6 +864,15 @@ pub(crate) struct LoadedSession {
     /// existed; the adopting host carries it into its own saver so
     /// a resume never renames.
     pub(crate) title: Option<String>,
+
+    /// The session's permission-mode override, when it has one.
+    ///
+    /// What a resumed host seeds its gate with instead of the
+    /// configuration's global default — the session keeps the mode it
+    /// was moved to, whatever the configuration now says. `None` when
+    /// the session never carried an override and on files saved
+    /// before the field existed.
+    pub(crate) permission_mode: Option<dch_config::PermissionMode>,
 }
 
 /// Load a session's messages together with the facts its envelope
@@ -702,7 +895,277 @@ pub(crate) fn load_with_meta_in(id: Uuid, base: &Path) -> Result<LoadedSession, 
         tokens: stored.tokens,
         saved_at: stored.saved_at,
         title: stored.title,
+        permission_mode: stored.permission_mode,
     })
+}
+
+/// The remembered-permissions sibling's on-disk shape; private like
+/// [`StoredSession`].
+///
+/// The "allow always" choices as typed rules under their own format
+/// tag: one verb prefix per clean shell segment plus the exact text of
+/// each complex one, or the tool itself, or a write-path scope. No
+/// stamp: the list is advisory memory, not half of a freshness pair.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct StoredPermissions {
+    /// The format tag; [`PERMISSIONS_FORMAT`] for everything this
+    /// version writes.
+    ///
+    /// Refused on read when unknown, exactly as the display file's
+    /// tag is.
+    format: String,
+
+    /// The always-allow rules, in the order they were remembered.
+    ///
+    /// Typed data, never the whole-prompt strings the oldest files
+    /// carried: a tool rule remembers the tool by name, a shell-prefix rule
+    /// one arity-trimmed verb prefix — `cargo test`, not
+    /// `cargo test -p dch-tui` — a command-text rule one exact complex
+    /// segment, and a path-glob rule one directory
+    /// scope — `crates/dch-loop/**` — so every later variant of the
+    /// same work runs without asking again.
+    #[serde(default)]
+    pub(crate) allow: Vec<dch_tui::PermissionRule>,
+
+    /// The always-deny rules, same shapes, the other answer.
+    ///
+    /// Absent in a v2 file (the deny list did not exist yet); a
+    /// matched deny blocks the call silently in every mode.
+    #[serde(default)]
+    pub(crate) deny: Vec<dch_tui::PermissionRule>,
+
+    /// Whether the session that wrote this file was failing closed.
+    ///
+    /// Absent in every file a pre-marker build wrote, which reads as
+    /// false — those sessions were never damaged. The marker rides
+    /// every save a damaged session makes, so the lists it re-answers
+    /// with can never masquerade as a recovery.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) damaged: bool,
+}
+
+/// Why a stored-JSON sibling refused to hand back its struct.
+///
+/// The read-and-parse core [`read_stored_file`] returns this
+/// instead of applying policy, so every loader below meets the same
+/// three facts and answers them through one small policy function:
+/// [`SessionSaver::load_permissions`] fails the damage closed through
+/// [`PermissionsRestore`], [`no_machine_history`] warns and falls
+/// back, [`session_error_from`] types each fault into a
+/// [`SessionError`], and [`skip_session_entry`] warns the listing's
+/// skip.
+enum StoredFileFault {
+    /// No file exists at the path.
+    ///
+    /// A fresh state rather than damage — most callers treat it
+    /// silently, and only the strict loader reports it.
+    Absent,
+
+    /// The filesystem refused the read, the io error attached.
+    ///
+    /// Carried untyped so the callers that discriminate kinds — the
+    /// `ENOTDIR` stray-file check in [`session_error_from`] — still
+    /// can.
+    Unreadable(std::io::Error),
+
+    /// The bytes are not the struct's JSON.
+    ///
+    /// The file exists and reads; only the parse failed.
+    Unparseable(serde_json::Error),
+}
+
+/// Read one stored-JSON sibling file and parse it into `T`.
+///
+/// The shared read-and-parse core of every loader in this module —
+/// remembered permissions, machine history, transcripts both single
+/// and listed — so the `NotFound` discrimination and the parse error
+/// are derived once instead of re-spelled at each site. Format tags
+/// and failure policy stay with the caller, each as one small
+/// function over [`StoredFileFault`] that decides what degrades,
+/// what errors, and what skips.
+///
+/// # Errors
+///
+/// Exactly one of the [`StoredFileFault`] variants and nothing else —
+/// absent, unreadable, or unparseable — and never a format-tag
+/// verdict, which is the caller's to make on the parsed struct.
+fn read_stored_file<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, StoredFileFault> {
+    let json = match std::fs::read_to_string(path) {
+        Ok(json) => json,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(StoredFileFault::Absent);
+        }
+        Err(err) => return Err(StoredFileFault::Unreadable(err)),
+    };
+    serde_json::from_str(&json).map_err(StoredFileFault::Unparseable)
+}
+
+/// What a remembered-permissions sibling restored to.
+///
+/// The verdict a restore hands its caller, which acts on all three
+/// arms: a fresh session adopts nothing and says nothing, a restored
+/// one adopts its lists, and a damaged one adopts nothing *and* fails
+/// closed — the denies the damage hid were standing refusals, so the
+/// caller blocks side-effecting calls until the session re-answers
+/// them. Damage is never emptiness by another name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PermissionsRestore {
+    /// No sibling existed — a fresh session, nothing remembered.
+    ///
+    /// Not damage and not an error: the session simply never saved a
+    /// permissions file, so there is nothing to adopt and nothing to
+    /// warn about.
+    Fresh,
+
+    /// The sibling parsed and its format tag is known.
+    ///
+    /// The lists exactly as last saved — an older format may carry an
+    /// empty deny list (v2 predates denies), which is the format's
+    /// truth, not damage. `damage_standing` carries the marker a
+    /// damaged-then-reanswered session wrote: the lists are the
+    /// re-answers made after the damage, real choices the session
+    /// keeps, while the marker keeps the fail-closed posture armed
+    /// until an explicit repair clears it.
+    Restored {
+        /// The always-allow rules, as saved.
+        ///
+        /// Exactly the list the session's last save recorded, in
+        /// record order — empty when nothing was ever remembered on
+        /// the allow side.
+        allow: Vec<dch_tui::PermissionRule>,
+
+        /// The always-deny rules, as saved.
+        ///
+        /// The standing refusals the session recorded, in record
+        /// order — absent wholesale in a v2 file, which predates the
+        /// deny list entirely.
+        deny: Vec<dch_tui::PermissionRule>,
+
+        /// Whether the damage marker the last save carried still
+        /// stands.
+        ///
+        /// True when the session that wrote this file was failing
+        /// closed: the launch re-arms the asking posture and the
+        /// tightened config rules instead of reading the re-answered
+        /// lists as a recovery, and only `/permissions repair` clears
+        /// the marker.
+        damage_standing: bool,
+    },
+
+    /// The sibling exists but cannot be trusted.
+    ///
+    /// Unreadable, unparseable, or tagged with a format this build
+    /// does not know; nothing is adopted, one warn names the fault,
+    /// and the caller must not let side-effecting calls run unasked —
+    /// the refusals this file carried are unreadable, not gone by
+    /// choice.
+    Damaged,
+}
+
+impl PermissionsRestore {
+    /// The lists to install, whatever the verdict.
+    ///
+    /// Empty on [`PermissionsRestore::Fresh`] and
+    /// [`PermissionsRestore::Damaged`] alike — the difference between
+    /// the two is not the lists but what the caller owes beside them:
+    /// damage blocks side-effecting calls until the memory is
+    /// re-established, a fresh session owes nothing.
+    #[must_use]
+    pub fn into_lists(self) -> (Vec<dch_tui::PermissionRule>, Vec<dch_tui::PermissionRule>) {
+        match self {
+            Self::Fresh | Self::Damaged => (Vec::new(), Vec::new()),
+            Self::Restored {
+                allow,
+                deny,
+                damage_standing: _,
+            } => (allow, deny),
+        }
+    }
+
+    /// Whether damage stands in any form — a refused sibling or a
+    /// marker the last save carried.
+    ///
+    /// The hosts' one question when wiring a launch: does this
+    /// session owe the fail-closed posture — the asking mode, the
+    /// tightened config rules, the marker that keeps both armed
+    /// across saves and launches until `/permissions repair`?
+    #[must_use]
+    pub fn damage_stands(&self) -> bool {
+        match self {
+            Self::Damaged => true,
+            Self::Restored {
+                damage_standing, ..
+            } => *damage_standing,
+            Self::Fresh => false,
+        }
+    }
+}
+
+/// The derive-not-seed answer a refused machine sibling earns.
+///
+/// [`load_machine_in`]'s fault policy: every fault ends in `None` —
+/// the caller derives the resume from the display transcript — with
+/// one warn for the two damaged kinds and silence for a fresh pair.
+fn no_machine_history(fault: StoredFileFault) -> Option<(Vec<loopctl::message::Message>, u32)> {
+    match fault {
+        StoredFileFault::Absent => {}
+        StoredFileFault::Unreadable(err) => {
+            tracing::warn!(
+                error = %err,
+                "machine history unreadable; deriving resume from the display transcript"
+            );
+        }
+        StoredFileFault::Unparseable(err) => {
+            tracing::warn!(
+                error = %err,
+                "machine history unparseable; deriving resume from the display transcript"
+            );
+        }
+    }
+    None
+}
+
+/// The typed error a refused transcript read becomes.
+///
+/// [`load_envelope`]'s fault policy, the strict one: `Absent` and the
+/// stray-file `ENOTDIR` spelling — when the sessions root itself is
+/// a real directory — both say "nothing resumable under this id" and
+/// map to [`SessionError::NotFound`]; an `ENOTDIR` whose broken
+/// component is the root is layout damage worth stopping for and
+/// maps to [`SessionError::Io`], as every other refused read does; a
+/// parse failure is [`SessionError::Corrupt`].
+fn session_error_from(fault: StoredFileFault, session_id: Uuid, base: &Path) -> SessionError {
+    match fault {
+        StoredFileFault::Absent => SessionError::NotFound(session_id),
+        StoredFileFault::Unreadable(err) if err.kind() == std::io::ErrorKind::NotADirectory => {
+            if base.is_dir() {
+                SessionError::NotFound(session_id)
+            } else {
+                SessionError::Io(err)
+            }
+        }
+        StoredFileFault::Unreadable(err) => SessionError::Io(err),
+        StoredFileFault::Unparseable(err) => SessionError::Corrupt(err.to_string()),
+    }
+}
+
+/// The one-warn skip a listed entry's refused read earns.
+///
+/// [`list_sessions_in`]'s fault policy: each refusal warns once, in
+/// the entry's own words, and the table simply lacks the row — one
+/// bad file never blanks the listing.
+fn skip_session_entry(fault: StoredFileFault, id: Uuid) {
+    match fault {
+        StoredFileFault::Absent => {
+            tracing::warn!(session = %id, "skipping absent session file");
+        }
+        StoredFileFault::Unreadable(err) => {
+            tracing::warn!(session = %id, error = %err, "skipping unreadable session file");
+        }
+        StoredFileFault::Unparseable(err) => {
+            tracing::warn!(session = %id, error = %err, "skipping corrupt session file");
+        }
+    }
 }
 
 /// Load a session's machine-history snapshot when the pair is fresh.
@@ -723,26 +1186,9 @@ pub(crate) fn load_machine_in(
     session_saved_at: chrono::DateTime<chrono::Utc>,
 ) -> Option<(Vec<loopctl::message::Message>, u32)> {
     let path = base.join(id.to_string()).join("machine.json");
-    let json = match std::fs::read_to_string(&path) {
-        Ok(json) => json,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
-        Err(err) => {
-            tracing::warn!(
-                error = %err,
-                "machine history unreadable; deriving resume from the display transcript"
-            );
-            return None;
-        }
-    };
-    let stored: StoredMachine = match serde_json::from_str(&json) {
+    let stored: StoredMachine = match read_stored_file(&path) {
         Ok(stored) => stored,
-        Err(err) => {
-            tracing::warn!(
-                error = %err,
-                "machine history unparseable; deriving resume from the display transcript"
-            );
-            return None;
-        }
+        Err(fault) => return no_machine_history(fault),
     };
     if stored.format != MACHINE_FORMAT {
         tracing::warn!(
@@ -783,21 +1229,8 @@ fn load_envelope(
     session_id: Uuid,
     base: &Path,
 ) -> Result<StoredSession, SessionError> {
-    let json = match std::fs::read_to_string(path) {
-        Ok(json) => json,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Err(SessionError::NotFound(session_id));
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotADirectory => {
-            if base.is_dir() {
-                return Err(SessionError::NotFound(session_id));
-            }
-            return Err(SessionError::Io(err));
-        }
-        Err(err) => return Err(SessionError::Io(err)),
-    };
     let stored: StoredSession =
-        serde_json::from_str(&json).map_err(|err| SessionError::Corrupt(err.to_string()))?;
+        read_stored_file(path).map_err(|fault| session_error_from(fault, session_id, base))?;
     if stored.format != FORMAT {
         return Err(SessionError::Corrupt(format!(
             "unknown format tag {:?}",
@@ -839,27 +1272,15 @@ pub(crate) fn list_sessions_in(base: &Path) -> Result<Vec<SessionSummary>, Sessi
         let Ok(id) = Uuid::parse_str(name) else {
             continue;
         };
-        // The address resume builds is the id's canonical spelling,
-        // so a directory named in any other form — braced, urn, or
-        // case-variant — cannot be reached through the id this
-        // listing would report. Skipping it keeps the table and the
-        // load path agreeing on what an id addresses.
         if id.to_string() != name {
             tracing::warn!(session = %id, directory = %name, "skipping a non-canonical session directory name");
             continue;
         }
         let file = path.join("session.json");
-        let json = match std::fs::read_to_string(&file) {
-            Ok(json) => json,
-            Err(err) => {
-                tracing::warn!(session = %id, error = %err, "skipping unreadable session file");
-                continue;
-            }
-        };
-        let stored: StoredSession = match serde_json::from_str(&json) {
+        let stored: StoredSession = match read_stored_file(&file) {
             Ok(stored) => stored,
-            Err(err) => {
-                tracing::warn!(session = %id, error = %err, "skipping corrupt session file");
+            Err(fault) => {
+                skip_session_entry(fault, id);
                 continue;
             }
         };
@@ -867,10 +1288,6 @@ pub(crate) fn list_sessions_in(base: &Path) -> Result<Vec<SessionSummary>, Sessi
             tracing::warn!(session = %id, format = %stored.format, "skipping unknown session format");
             continue;
         }
-        // The directory is the addressable identity — resume reaches a
-        // transcript by it — so the summary reports it even when the
-        // envelope inside was written under a different id (a copied
-        // or hand-moved file).
         sessions.push(SessionSummary {
             id,
             model: stored.model,
@@ -913,6 +1330,269 @@ mod tests {
 
     fn saver(dir: &std::path::Path, id: Uuid) -> SessionSaver {
         SessionSaver::with_base_dir(id, "test-model".to_string(), dir.to_path_buf())
+    }
+
+    #[test]
+    fn remembered_permissions_round_trip_their_own_sibling() {
+        // The "allow always" choices ride permissions.json beside the
+        // display and machine files: saved atomically, loaded back
+        // exactly, and an absent sibling is a fresh session's empty
+        // list, not an error.
+        let dir = tempfile::tempdir().expect("session tempdir");
+        let id = Uuid::new_v4();
+        let session = saver(dir.path(), id);
+        assert_eq!(
+            session.load_permissions(),
+            PermissionsRestore::Fresh,
+            "a fresh session has nothing remembered"
+        );
+        let rules = vec![
+            dch_tui::PermissionRule::ShellPrefix {
+                prefix: "cargo test".to_string(),
+            },
+            dch_tui::PermissionRule::Tool {
+                tool: "Write".to_string(),
+            },
+        ];
+        session
+            .save_permissions(&rules, &[], false)
+            .expect("the choices save");
+        let reloaded = saver(dir.path(), id);
+        let (allow, deny) = reloaded.load_permissions().into_lists();
+        assert_eq!(allow, rules, "the allow choices round-trip");
+        assert!(deny.is_empty(), "no deny rules were recorded");
+        // A deny rule takes the other slot of the pair and round-trips
+        // the same way.
+        let deny_rules = vec![dch_tui::PermissionRule::Tool {
+            tool: "WebFetch".to_string(),
+        }];
+        session
+            .save_permissions(&rules, &deny_rules, false)
+            .expect("the pair saves");
+        let (allow, deny) = saver(dir.path(), id).load_permissions().into_lists();
+        assert_eq!(allow, rules);
+        assert_eq!(deny, deny_rules);
+        // A deny glob the compiler cannot rebuild is a "never" the
+        // restore must not silently drop: the whole restore stands
+        // damaged, and the damaged posture asks instead of assuming
+        // the dropped refusal never existed.
+        let deny_glob = vec![dch_tui::PermissionRule::PathGlob {
+            pattern: "[unclosed".to_string(),
+        }];
+        session
+            .save_permissions(&rules, &deny_glob, false)
+            .expect("the corrupt-deny pair saves");
+        let reloaded = saver(dir.path(), id);
+        assert!(
+            reloaded.load_permissions().damage_stands(),
+            "an uncompilable deny glob fails the restore closed"
+        );
+        // A corrupt *allow* glob keeps its lenient arm: the blessing
+        // stops covering, the rest of the pair restores untouched.
+        let allow_glob = vec![dch_tui::PermissionRule::PathGlob {
+            pattern: "[unclosed".to_string(),
+        }];
+        session
+            .save_permissions(&allow_glob, &deny_rules, false)
+            .expect("the corrupt-allow pair saves");
+        let (allow, deny) = saver(dir.path(), id).load_permissions().into_lists();
+        assert_eq!(allow, allow_glob);
+        assert_eq!(deny, deny_rules);
+        // The file is v1, and the two pre-release spellings load as
+        // aliases: a v3 file carries both lists, a v2 file loads
+        // wholesale into the allow list, and the oldest prompt-string
+        // shape carries no rules — it degrades to asking again.
+        let path = dir.path().join(id.to_string()).join("permissions.json");
+        let v3 = serde_json::json!({
+            "format": "dch.permissions.v3",
+            "allow": [{ "rule": "shell_prefix", "prefix": "git diff" }],
+            "deny": [{ "rule": "tool", "tool": "WebFetch" }],
+        });
+        std::fs::write(&path, v3.to_string()).expect("the v3 sibling writes");
+        let (allow, deny) = saver(dir.path(), id).load_permissions().into_lists();
+        assert_eq!(
+            allow,
+            vec![dch_tui::PermissionRule::ShellPrefix {
+                prefix: "git diff".to_string()
+            }],
+            "a v3 file loads both lists"
+        );
+        assert_eq!(
+            deny,
+            vec![dch_tui::PermissionRule::Tool {
+                tool: "WebFetch".to_string()
+            }]
+        );
+        let v2 = serde_json::json!({
+            "format": "dch.permissions.v2",
+            "allow": [{ "rule": "path_glob", "pattern": "crates/**" }],
+        });
+        std::fs::write(&path, v2.to_string()).expect("the v2 sibling writes");
+        let (allow, deny) = saver(dir.path(), id).load_permissions().into_lists();
+        assert_eq!(
+            allow,
+            vec![dch_tui::PermissionRule::PathGlob {
+                pattern: "crates/**".to_string()
+            }],
+            "a v2 file loads wholesale into the allow list"
+        );
+        assert!(deny.is_empty(), "a v2 file has no deny list");
+        let oldest = serde_json::json!({
+            "format": "dch.permissions.v1",
+            "prompts": ["cargo build --workspace"],
+        });
+        std::fs::write(&path, oldest.to_string()).expect("the oldest sibling writes");
+        let (allow, deny) = saver(dir.path(), id).load_permissions().into_lists();
+        assert!(
+            allow.is_empty() && deny.is_empty(),
+            "the prompt-string shape carries no rules — asking again"
+        );
+    }
+
+    #[test]
+    fn an_unknown_or_broken_permissions_file_fails_the_restore_closed() {
+        // The format tag's boundary: a file a future version wrote (a
+        // tag this build never heard of) and a file that is not JSON at
+        // all are both damage, not emptiness — never a load error,
+        // never a misread rule, and never a quiet empty memory that
+        // would run, under `auto`, the work a damaged file's denies
+        // had banned. The verdict is `Damaged`; the lists are empty
+        // and the caller owes the blocking posture. The known
+        // spellings (v1, v2, v3, the oldest prompt-string shape) are
+        // pinned by the round-trip test beside this one; these are the
+        // two unknown cells that round-trip cannot reach.
+        let dir = tempfile::tempdir().expect("session tempdir");
+        let id = Uuid::new_v4();
+        let path = dir.path().join(id.to_string()).join("permissions.json");
+        std::fs::create_dir_all(path.parent().expect("the parent exists"))
+            .expect("the session dir creates");
+
+        let future = serde_json::json!({
+            "format": "dch.permissions.v9",
+            "allow": [{ "rule": "tool", "tool": "Write" }],
+            "deny": [{ "rule": "tool", "tool": "WebFetch" }],
+        });
+        std::fs::write(&path, future.to_string()).expect("the future sibling writes");
+        let restored = saver(dir.path(), id).load_permissions();
+        assert_eq!(
+            restored,
+            PermissionsRestore::Damaged,
+            "an unknown format tag never loads as rules: {restored:?}"
+        );
+        assert!(restored.into_lists().0.is_empty(), "damage adopts nothing");
+
+        std::fs::write(&path, "not json at all").expect("the broken sibling writes");
+        assert_eq!(
+            saver(dir.path(), id).load_permissions(),
+            PermissionsRestore::Damaged,
+            "an unparseable file fails the restore closed"
+        );
+    }
+
+    #[test]
+    fn a_damaged_sibling_fails_the_restore_closed_not_empty() {
+        // The reviewer's case, pinned at the loader: a session that
+        // saved a deny — under `auto`, its only standing refusal — and
+        // then truncated its sibling does not come back as a quiet
+        // empty memory the way it once did. The restore is `Damaged`:
+        // no lists, and the caller (pinned on the driver side) blocks
+        // side-effecting calls until the memory is re-answered. The
+        // intact sibling still carries the deny exactly as saved.
+        let dir = tempfile::tempdir().expect("session tempdir");
+        let id = Uuid::new_v4();
+        let session = saver(dir.path(), id);
+        let deny = vec![dch_tui::PermissionRule::ShellPrefix {
+            prefix: "cargo publish".to_string(),
+        }];
+        session
+            .save_permissions(&[], &deny, false)
+            .expect("the deny saves");
+        assert_eq!(
+            session.load_permissions(),
+            PermissionsRestore::Restored {
+                allow: Vec::new(),
+                deny,
+                damage_standing: false,
+            },
+            "the intact sibling carries the deny"
+        );
+        let path = dir.path().join(id.to_string()).join("permissions.json");
+        let intact = std::fs::read_to_string(&path).expect("the sibling reads");
+        let cut = intact.len().saturating_sub(3);
+        let truncated = intact.get(..cut).unwrap_or("");
+        std::fs::write(&path, truncated).expect("the truncated sibling writes");
+        assert_eq!(
+            session.load_permissions(),
+            PermissionsRestore::Damaged,
+            "a truncated sibling fails the restore closed — the deny is not silently gone"
+        );
+    }
+
+    #[test]
+    fn a_standing_damage_marker_round_trips_and_re_arms_the_verdict() {
+        // The marker's whole journey: a session whose restore failed
+        // closed re-answers questions and saves — the file carries its
+        // re-answers *and* the marker — and the next load restores the
+        // lists with the marker standing, so the launch re-arms the
+        // fail-closed instead of reading the replaced lists as a
+        // recovery. A pre-marker file (no field at all) reads healthy,
+        // as the sessions that wrote it were.
+        let dir = tempfile::tempdir().expect("session tempdir");
+        let id = Uuid::new_v4();
+        let session = saver(dir.path(), id);
+        let reanswers = vec![dch_tui::PermissionRule::Tool {
+            tool: "Read".to_string(),
+        }];
+        session
+            .save_permissions(&reanswers, &[], true)
+            .expect("the damaged session's save lands");
+        assert_eq!(
+            session.load_permissions(),
+            PermissionsRestore::Restored {
+                allow: reanswers.clone(),
+                deny: Vec::new(),
+                damage_standing: true,
+            },
+            "the re-answers restore, and the marker stands beside them"
+        );
+        assert!(
+            session.load_permissions().damage_stands(),
+            "the hosts' one question answers yes — the fail-closed re-arms"
+        );
+        let raw = std::fs::read_to_string(dir.path().join(id.to_string()).join("permissions.json"))
+            .expect("the sibling reads");
+        assert!(
+            raw.contains("\"damaged\":true"),
+            "the marker is on disk in its own spelling: {raw}"
+        );
+        // The repair's save writes a healthy file.
+        session
+            .save_permissions(&reanswers, &[], false)
+            .expect("the repaired session's save lands");
+        assert_eq!(
+            session.load_permissions(),
+            PermissionsRestore::Restored {
+                allow: reanswers,
+                deny: Vec::new(),
+                damage_standing: false,
+            },
+            "after the repair the same lists read healthy"
+        );
+        // A pre-marker file — no field at all — is a healthy session.
+        let legacy = serde_json::json!({
+            "format": "dch.permissions.v1",
+            "allow": [],
+            "deny": [],
+        });
+        std::fs::write(
+            dir.path().join(id.to_string()).join("permissions.json"),
+            legacy.to_string(),
+        )
+        .expect("the legacy sibling writes");
+        assert!(
+            !session.load_permissions().damage_stands(),
+            "a file a pre-marker build wrote reads healthy, as it was"
+        );
     }
 
     #[test]
@@ -1012,6 +1692,7 @@ mod tests {
             tokens: SessionTokens::default(),
             workdir: None,
             title: None,
+            permission_mode: None,
         };
         let path = dir.join(id.to_string()).join("session.json");
         std::fs::create_dir_all(path.parent().expect("the session dir")).expect("mkdir");

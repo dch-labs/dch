@@ -5,10 +5,9 @@ members = ["crates/*", "xtask"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.98"
+rust-version = "1.100"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/dch-labs/dch"
-homepage = "https://github.com/dch-labs/dch"
 readme = "README.md"
 authors = ["dch"]
 
@@ -41,14 +40,15 @@ tempfile   = "3"
 base64     = "0.22"
 ignore     = "0.4"
 regex      = "1"
+globset    = "0.4"
 lru        = "0.18.2"
 portable-pty = "0.9"
 
-dch        = { path = "crates/dch" }
 dch-loop    = { path = "crates/dch-loop" }
 dch-tools  = { path = "crates/dch-tools" }
 dch-tui    = { path = "crates/dch-tui" }
 dch-config = { path = "crates/dch-config" }
+dch-permissions = { path = "crates/dch-permissions" }
 
 [workspace.lints.clippy]
 pedantic            = { level = "warn", priority = -1 }

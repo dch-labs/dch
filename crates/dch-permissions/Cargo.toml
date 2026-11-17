@@ -1,0 +1,20 @@
+[package]
+name = "dch-permissions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+authors.workspace = true
+description = "The permission domain for dch: modes, the rule engine, remembered decisions, and the pluggable policy seam"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+globset = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

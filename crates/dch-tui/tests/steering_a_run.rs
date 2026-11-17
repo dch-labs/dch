@@ -424,8 +424,8 @@ fn an_empty_composer_sends_nothing() {
     assert!(app.handle_event(&ctrl(KeyCode::Char('s'))));
 
     assert!(guidance.offered.lock().unwrap().is_empty());
-    assert!(waiting(&kept).is_empty());
-    assert!(user_rows(&app).is_empty());
+    assert_eq!(waiting(&kept), Vec::<String>::new(), "nothing waits");
+    assert_eq!(user_rows(&app), Vec::<String>::new(), "no user rows stand");
 }
 
 #[test]
@@ -705,7 +705,7 @@ fn a_multi_line_draft_is_steered_whole() {
         ["stop before the deploy\nit restarts the service I am logged into"],
         "the whole draft goes, newlines and all, exactly as Enter would send it"
     );
-    assert!(waiting(&kept).is_empty());
+    assert_eq!(waiting(&kept), Vec::<String>::new(), "nothing waits");
 }
 
 #[test]

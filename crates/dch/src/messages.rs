@@ -10,6 +10,7 @@
 
 use dch_tui::{ContentBlock, TuiMessage};
 use loopctl::error::LoopError;
+use loopctl::message::{Message, MessagePart, Role};
 
 /// Build the transcript of one headless run.
 ///
@@ -50,6 +51,35 @@ pub(crate) fn transcript_from(
         });
     }
     messages
+}
+
+/// The prompt a session's naming call coins from.
+///
+/// The conversation's first user prompt: the first user message in the
+/// agent's history whose text parts carry words — for a resumed
+/// session, the prompt that opened its conversation — falling back to
+/// the prompt that armed the call when the history holds none, the
+/// fresh session's shape. A session whose naming call never answered
+/// thereby retries against its conversation's own opening ask rather
+/// than against whatever follow-up happened to arm the retry. The
+/// chosen message's text parts join with newlines, in order.
+pub(crate) fn naming_subject(messages: &[Message], claimed: &str) -> String {
+    messages
+        .iter()
+        .filter(|message| matches!(message.role, Role::User))
+        .find_map(|message| {
+            let text = message
+                .parts
+                .iter()
+                .filter_map(|part| match part {
+                    MessagePart::Text { text } if !text.trim().is_empty() => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!text.is_empty()).then_some(text)
+        })
+        .unwrap_or_else(|| claimed.to_string())
 }
 
 #[cfg(test)]
@@ -122,5 +152,57 @@ mod tests {
             &transcript[1],
             TuiMessage::Error { text, .. } if text.contains("provider refused")
         ));
+    }
+
+    #[test]
+    fn a_fresh_history_names_from_the_claimed_prompt() {
+        let subject = naming_subject(&[], "do it now");
+        assert_eq!(
+            subject, "do it now",
+            "no history — the arming prompt is the subject"
+        );
+    }
+
+    #[test]
+    fn a_restored_history_names_from_its_first_user_prompt() {
+        let history = vec![
+            Message::user("map the coastline roads"),
+            Message::assistant("the coast is mapped"),
+            Message::user("now chart the tides"),
+        ];
+        let subject = naming_subject(&history, "now chart the tides");
+        assert_eq!(
+            subject, "map the coastline roads",
+            "the opening ask is the subject, not the arming follow-up"
+        );
+    }
+
+    #[test]
+    fn a_user_message_without_words_is_skipped_for_one_that_has_them() {
+        let history = vec![
+            Message::user("   "),
+            Message::assistant("quiet"),
+            Message::user("the real opening ask"),
+        ];
+        let subject = naming_subject(&history, "the arming prompt");
+        assert_eq!(subject, "the real opening ask");
+    }
+
+    #[test]
+    fn a_multi_part_user_prompt_joins_its_text_parts() {
+        let opening = Message::new(
+            Role::User,
+            vec![
+                MessagePart::Text {
+                    text: "map the coastline roads".to_string(),
+                },
+                MessagePart::Text {
+                    text: "(start at the harbour)".to_string(),
+                },
+            ],
+        );
+        let history = vec![opening, Message::assistant("done")];
+        let subject = naming_subject(&history, "the arming prompt");
+        assert_eq!(subject, "map the coastline roads\n(start at the harbour)");
     }
 }

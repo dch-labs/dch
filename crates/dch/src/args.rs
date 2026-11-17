@@ -56,18 +56,23 @@ fn parse_list_count(value: &str) -> Result<ListCount, String> {
 )]
 /// dch — a terminal-based agentic coding assistant built on loopctl.
 ///
-/// A task argument (`dch "fix the bug"`) or a piped stdin
-/// (`echo "fix the bug" | dch`) selects the single-run non-interactive
-/// mode; with neither, launches the interactive TUI. `--resume`/
+/// A task argument (`dch "fix the bug"`), a piped stdin
+/// (`echo "fix the bug" | dch`), or both selects the single-run
+/// non-interactive mode — with both, the pipe is the context and the
+/// task the instruction, delivered as one labeled prompt; with
+/// neither, launches the interactive TUI. `--resume`/
 /// `--list-sessions` manage sessions. Run-mode selection happens in
 /// `main`, not here; this struct is only the parsed input.
 pub struct Args {
     /// The task for a single non-interactive run.
     ///
-    /// A non-empty value is the task verbatim; an empty one defers to
-    /// stdin, exactly like omitting the argument with stdin piped.
-    /// Composes with `--resume` — a task plus a session id continues
-    /// that session headless.
+    /// A non-empty value is the instruction the run answers; when
+    /// stdin is piped, its output is delivered with it as context —
+    /// piped body first, task last — so `ip a | dch "what is my ip"`
+    /// reaches the agent whole. An empty value defers to stdin alone,
+    /// exactly like omitting the argument with stdin piped. Composes
+    /// with `--resume` — a task plus a session id continues that
+    /// session headless.
     #[arg(
         value_name = "TASK",
         conflicts_with_all = ["list_sessions"],
@@ -79,8 +84,9 @@ pub struct Args {
     ///
     /// The id is validated here — a malformed value is a parse error rather
     /// than a later load failure. Long-only: a 36-character id has no useful
-    /// short form. Combines with a task argument or a piped stdin to resume
-    /// headless, and with neither to resume in the TUI.
+    /// short form. Combines with a task argument, a piped stdin, or both
+    /// (context and instruction) to resume headless, and with neither to
+    /// resume in the TUI.
     #[arg(
         long,
         value_name = "SESSION_ID",
@@ -110,8 +116,8 @@ pub struct Args {
     ///
     /// Resolves to whatever session was saved last, sparing the
     /// `--list-sessions` and `--resume <id>` round trip. Composes
-    /// like `--resume`: with a task argument or piped stdin it
-    /// continues headless, with neither in the TUI. No saved
+    /// like `--resume`: with a task argument, a piped stdin, or both
+    /// it continues headless, with neither in the TUI. No saved
     /// session exists means a fresh start with a note.
     #[arg(
         long = "continue",
@@ -182,23 +188,74 @@ pub struct Args {
     /// Override the configured permission mode for this run.
     ///
     /// Sets how the permission gate treats side-effecting tools:
-    /// `auto` runs everything, `plan` allows read-only tools and blocks
-    /// the rest, `accept-edits` additionally auto-applies file edits,
-    /// and `interactive` asks before every action, reads included. The
-    /// TUI asks through an approval overlay; a headless run denies
-    /// whatever it cannot ask about. Overrides
+    /// `auto` runs everything without confirmation, `read-only` allows
+    /// read-only tools and blocks the rest, and `interactive` asks
+    /// before each uncovered side-effecting call. The TUI asks through
+    /// an approval overlay; a headless run denies whatever it cannot
+    /// ask about. The retired `plan` and `accept-edits` spellings still
+    /// parse, migrated with a warning (`plan` becomes `read-only`,
+    /// `accept-edits` becomes `interactive`). Overrides
     /// `[runner] permission_mode`; without the flag the configured
     /// value (default `auto`) stands.
-    #[arg(long, value_name = "MODE", value_enum, help_heading = "Mode")]
+    #[arg(
+        long,
+        value_name = "MODE",
+        value_parser = parse_permission_mode,
+        help_heading = "Mode"
+    )]
     pub permission_mode: Option<CliPermissionMode>,
+
+    /// Select a `[permissions.presets.<name>]` bundle for this run.
+    ///
+    /// Overrides the config's own selection. The preset's rules join the
+    /// config layer, evaluated ahead of remembered approvals.
+    #[arg(long, value_name = "NAME")]
+    pub permissions_preset: Option<String>,
+}
+
+/// Parse one `--permission-mode` spelling onto [`CliPermissionMode`],
+/// migrating the retired ones.
+///
+/// The current spellings are `auto`, `read-only`, and `interactive`.
+/// The retired spellings still parse — `plan` maps to `read-only`
+/// (same behavior, new name) and `accept-edits` maps to
+/// `interactive` (edits now prompt unless a rule allows them) — each
+/// with a warning naming the migration, so a stale script announces
+/// its update instead of silently changing meaning.
+///
+/// # Errors
+///
+/// Returns the clap-shaped message naming the valid spellings for a
+/// value none of them matches.
+fn parse_permission_mode(spelling: &str) -> Result<CliPermissionMode, String> {
+    let (mode, migrated) = match spelling {
+        "auto" => (CliPermissionMode::Auto, false),
+        "read-only" | "read_only" => (CliPermissionMode::ReadOnly, false),
+        "interactive" => (CliPermissionMode::Interactive, false),
+        "plan" => (CliPermissionMode::ReadOnly, true),
+        "accept-edits" | "accept_edits" => (CliPermissionMode::Interactive, true),
+        other => {
+            return Err(format!(
+                "invalid value '{other}' for '--permission-mode <MODE>'\n  \
+                 [possible values: auto, read-only, interactive]"
+            ));
+        }
+    };
+    if migrated {
+        crate::signals::report(&format!(
+            "dch: --permission-mode = {spelling:?} is retired and was applied as \
+             {mode:?} — update the spelling"
+        ));
+    }
+    Ok(mode)
 }
 
 /// The `--permission-mode` value set, mapped onto the config mode.
 ///
-/// A CLI-side enum so clap stays out of dch-config; the names are the
-/// kebab-case spellings of the config's `snake_case` values, and the
-/// mapping to [`dch_config::PermissionMode`] is variant-for-variant.
-#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+/// A CLI-side enum so clap stays out of `dch-config`; the [`From`]
+/// impl below maps each variant onto the matching
+/// [`dch_config::PermissionMode`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CliPermissionMode {
     /// Run every side-effecting action without confirmation.
     ///
@@ -211,20 +268,13 @@ pub enum CliPermissionMode {
     /// The explore-only mode — writes, shell, network, meta, and
     /// unknown tools come back to the model as denials naming this
     /// mode, so it plans instead of acting.
-    Plan,
+    ReadOnly,
 
-    /// Allow file edits too; ask before the rest.
+    /// Ask before every uncovered side-effecting call.
     ///
-    /// Reads and edits run without interruption; shell, network,
-    /// meta, and unknown tools prompt, and each answer allows or
-    /// denies that one call.
-    AcceptEdits,
-
-    /// Ask before every action, reads included.
-    ///
-    /// The most conservative mode: every tool call waits on its own
-    /// approval, so nothing runs the user has not personally
-    /// released.
+    /// Reads run free; the user's answers record into the two
+    /// remembered lists (always allow, always deny), so each kind of
+    /// work is decided once.
     Interactive,
 }
 
@@ -232,8 +282,7 @@ impl From<CliPermissionMode> for dch_config::PermissionMode {
     fn from(mode: CliPermissionMode) -> Self {
         match mode {
             CliPermissionMode::Auto => Self::Auto,
-            CliPermissionMode::Plan => Self::Plan,
-            CliPermissionMode::AcceptEdits => Self::AcceptEdits,
+            CliPermissionMode::ReadOnly => Self::ReadOnly,
             CliPermissionMode::Interactive => Self::Interactive,
         }
     }
@@ -587,6 +636,43 @@ mod tests {
     }
 
     #[test]
+    fn help_teaches_the_live_mode_spellings_not_the_retired_postures() {
+        let err = parse(&["--help"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DisplayHelp);
+        // clap wraps at its own width, so the assertions run against a
+        // whitespace-flattened rendering — a phrase split across lines
+        // still matches, a phrase that is gone cannot.
+        let help = err
+            .render()
+            .to_string()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for spelling in ["auto", "read-only", "interactive"] {
+            assert!(
+                help.contains(spelling),
+                "help must teach the live spelling {spelling}:\n{help}"
+            );
+        }
+        assert!(
+            help.contains("still parse, migrated with a warning"),
+            "the retired spellings are taught as a migration aside:\n{help}"
+        );
+        assert!(
+            !help.contains("`plan` allows"),
+            "the retired plan posture must not be taught as current:\n{help}"
+        );
+        assert!(
+            !help.contains("additionally auto-applies file edits"),
+            "the retired accept-edits posture must not be taught as current:\n{help}"
+        );
+        assert!(
+            !help.contains("every action, reads included"),
+            "interactive no longer asks before reads:\n{help}"
+        );
+    }
+
+    #[test]
     fn version_prints_the_crate_version() {
         let err = parse(&["--version"]).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::DisplayVersion);
@@ -597,7 +683,7 @@ mod tests {
     }
 
     #[test]
-    fn permission_mode_parses_all_four_values() {
+    fn permission_mode_parses_the_three_live_values_and_migrates_the_retired_pair() {
         assert_eq!(
             parse(&["--permission-mode", "auto"])
                 .unwrap()
@@ -605,16 +691,10 @@ mod tests {
             Some(CliPermissionMode::Auto)
         );
         assert_eq!(
-            parse(&["--permission-mode", "plan"])
+            parse(&["--permission-mode", "read-only"])
                 .unwrap()
                 .permission_mode,
-            Some(CliPermissionMode::Plan)
-        );
-        assert_eq!(
-            parse(&["--permission-mode", "accept-edits"])
-                .unwrap()
-                .permission_mode,
-            Some(CliPermissionMode::AcceptEdits)
+            Some(CliPermissionMode::ReadOnly)
         );
         assert_eq!(
             parse(&["--permission-mode", "interactive"])
@@ -622,15 +702,29 @@ mod tests {
                 .permission_mode,
             Some(CliPermissionMode::Interactive)
         );
+        // The retired spellings still parse, mapped to their replacements.
+        assert_eq!(
+            parse(&["--permission-mode", "plan"])
+                .unwrap()
+                .permission_mode,
+            Some(CliPermissionMode::ReadOnly),
+            "plan migrates to read-only"
+        );
+        assert_eq!(
+            parse(&["--permission-mode", "accept-edits"])
+                .unwrap()
+                .permission_mode,
+            Some(CliPermissionMode::Interactive),
+            "accept-edits migrates to interactive"
+        );
         assert_eq!(parse(&[]).unwrap().permission_mode, None);
     }
 
     #[test]
     fn permission_mode_rejects_unknown_values() {
         let err = parse(&["--permission-mode", "yolo"]).unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::InvalidValue);
         assert!(
-            err.render().to_string().contains("accept-edits"),
+            err.to_string().contains("read-only"),
             "the error must list the valid spellings: {err}"
         );
     }

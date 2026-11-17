@@ -232,6 +232,38 @@ pub enum PathStyle {
     Relative,
 }
 
+/// Which color vocabulary the welcome splash paints in.
+///
+/// Selects the splash's rendition. Consumed from
+/// [`DisplayConfig::splash_colors`] and (de)serialized as its
+/// lowercase name — `"auto"`, `"truecolor"`, or `"palette"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SplashColors {
+    /// Truecolor wherever it can reach the screen, the palette
+    /// rendition only where a tmux client would have it converted.
+    ///
+    /// The default: the session asks tmux, when it sits behind one,
+    /// whether the attached client carries the RGB feature, and
+    /// downgrades only on tmux's explicit no — an unanswered ask keeps
+    /// truecolor.
+    #[default]
+    Auto,
+
+    /// The original truecolor art, everywhere and unconditionally.
+    ///
+    /// For the session that knows its own terminal best: no detection,
+    /// no fallback.
+    Truecolor,
+
+    /// The fixed 256-color palette rendition, everywhere.
+    ///
+    /// The same photograph authored for the palette every 256-color
+    /// terminal paints identically — the setting for non-truecolor
+    /// environments.
+    Palette,
+}
+
 /// How the composer's caret presents itself.
 ///
 /// Selects the caret's beat. Consumed from
@@ -341,54 +373,11 @@ pub enum StripStyle {
     Glow,
 }
 
-/// When the runner prompts for permission before side-effecting actions.
-///
-/// Sets how aggressively the agent may act without an explicit user decision.
-/// It is consumed from [`RunnerConfig::permission_mode`] and (de)serialized as
-/// its `snake_case` name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PermissionMode {
-    /// Never prompts.
-    ///
-    /// Lets every side-effecting action run without confirmation. The most
-    /// autonomous mode.
-    #[default]
-    Auto,
-
-    /// Proposes but never executes.
-    ///
-    /// Produces a plan of intended actions without performing any of them.
-    Plan,
-
-    /// Auto-applies file edits; prompts for everything else.
-    ///
-    /// A middle ground that trusts edits but still asks before other
-    /// side-effecting work.
-    AcceptEdits,
-
-    /// Prompts before every side-effecting action.
-    ///
-    /// The most conservative mode, confirming each action individually.
-    Interactive,
-}
-
-impl PermissionMode {
-    /// The mode's config spelling.
-    ///
-    /// The `snake_case` name serde reads and writes — the same string
-    /// the TUI's status bar shows, so what the user configured and
-    /// what the display names never drift apart.
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Plan => "plan",
-            Self::AcceptEdits => "accept_edits",
-            Self::Interactive => "interactive",
-        }
-    }
-}
+// The mode vocabulary belongs to the permission domain; the config
+// re-exports it so every existing `dch_config::PermissionMode` path
+// keeps compiling and the serde spelling has one owner.
+pub use dch_permissions::PermissionMode;
+pub use dch_permissions::SharedPermissionMode;
 
 /// Which role the agent takes on — *who* it acts as for this session.
 ///
@@ -732,6 +721,14 @@ pub struct McpServerConfig {
     pub tools: Option<Vec<String>>,
 }
 
+// The permission schema types are the permission domain's; the config
+// re-exports them so the `[permissions]` section and every existing
+// `dch_config::Permission*` path keep compiling.
+pub use dch_permissions::MatcherParts;
+pub use dch_permissions::PermissionRuleConfig;
+pub use dch_permissions::PermissionRuleOutcome;
+pub use dch_permissions::PermissionsConfig;
+
 /// Top-level configuration loaded from `~/.dch/config.toml`.
 ///
 /// The root of the config TOML; every section maps onto one of its fields, each
@@ -798,6 +795,14 @@ pub struct DchConfig {
     /// Servers to spawn and adapt at startup. See [`McpConfig`].
     #[serde(default)]
     pub mcp: McpConfig,
+
+    /// Permission rules configured ahead of any session.
+    ///
+    /// The `[permissions]` section: user-authored allow/ask/deny rules that
+    /// outrank remembered approvals and the built-in matrix. See
+    /// [`PermissionsConfig`].
+    #[serde(default)]
+    pub permissions: PermissionsConfig,
 }
 
 /// Provider connection settings.
@@ -1095,6 +1100,15 @@ pub struct DisplayConfig {
     /// directory, falling back to the full path outside home. See
     /// [`PathStyle`].
     pub path_style: PathStyle,
+
+    /// Which color vocabulary the welcome splash paints in.
+    ///
+    /// `auto` (the default) shows the original truecolors everywhere
+    /// they can reach the screen and falls back to the fixed-palette
+    /// rendition only behind a tmux client tmux itself names as one it
+    /// would convert; `truecolor` and `palette` force one rendition
+    /// unconditionally. See [`SplashColors`].
+    pub splash_colors: SplashColors,
 
     /// Let the TUI capture the mouse.
     ///
@@ -1572,6 +1586,7 @@ impl Default for DisplayConfig {
             strip_position: StripPosition::default(),
             strip_style: StripStyle::default(),
             path_style: PathStyle::default(),
+            splash_colors: SplashColors::default(),
             diff_layout: DiffLayout::default(),
             diff_palette: DiffPalette::default(),
             mouse_capture: true,
@@ -2036,6 +2051,7 @@ impl DchConfig {
             )));
         }
         self.validate_models()?;
+        self.validate_permissions()?;
         Ok(())
     }
 
@@ -2094,6 +2110,25 @@ impl DchConfig {
             seen.push(named.to_string());
         }
         Ok(())
+    }
+
+    /// Reject `[permissions]` rules that could never do what they say.
+    ///
+    /// A rule naming no matcher key — or naming two — cannot be evaluated
+    /// against a call's shape, and a `path_glob` that fails to compile
+    /// would silently protect nothing; both refuse with the rule named,
+    /// the way the rest of validation turns a silently-rewritten value
+    /// into a message. The check itself lives with the rule schema in
+    /// the permission domain — one home for what a rule may say and
+    /// what it may match — so the message a user reads is the same one
+    /// every other consumer of the schema produces.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DchConfigError::Invalid`] for a rule with zero or two
+    /// matcher keys, or a `path_glob` the glob compiler rejects.
+    fn validate_permissions(&self) -> Result<(), DchConfigError> {
+        self.permissions.validate().map_err(DchConfigError::Invalid)
     }
 
     /// Map the session-scoped fields to a [`loopctl::config::SessionConfig`].
@@ -2254,6 +2289,36 @@ mod tests {
         assert!(
             display.mouse_capture,
             "the wheel scrolls the conversation by default"
+        );
+    }
+
+    #[test]
+    fn splash_colors_parse_and_default() {
+        // The knob speaks its three lowercase names and defaults to
+        // auto, where the session asks tmux and keeps truecolor on
+        // any unanswered ask. The knob rides the [display] table of
+        // the whole document, so the honest parse is the one the
+        // config loader performs.
+        let mode = |document: &str| -> SplashColors {
+            toml::from_str::<DchConfig>(document)
+                .expect("the document parses")
+                .display
+                .splash_colors
+        };
+        assert_eq!(
+            mode("[display]\n"),
+            SplashColors::Auto,
+            "an absent knob is the asking mode"
+        );
+        assert_eq!(
+            mode("[display]\nsplash_colors = \"truecolor\"\n"),
+            SplashColors::Truecolor,
+            "truecolor forces the original art everywhere"
+        );
+        assert_eq!(
+            mode("[display]\nsplash_colors = \"palette\"\n"),
+            SplashColors::Palette,
+            "palette forces the fixed-palette rendition everywhere"
         );
     }
 
@@ -2821,7 +2886,8 @@ redact_secrets = false
         assert_eq!(c.runner.turn_timeout_secs, 600);
         assert!(!c.runner.auto_compact);
         assert_eq!(c.runner.compact_threshold, 75);
-        assert_eq!(c.runner.permission_mode, PermissionMode::AcceptEdits);
+        // accept_edits migrated to interactive on load (with a warning)
+        assert_eq!(c.runner.permission_mode, PermissionMode::Interactive);
         assert_eq!(c.runner.role, Role::Coding);
         assert_eq!(
             c.runner.role_override(Role::Coding),
@@ -2919,7 +2985,11 @@ redact_secrets = false
     #[test]
     fn present_but_empty_mcp_section_parses_as_no_servers() {
         let c: DchConfig = toml::from_str("[mcp]\n").unwrap();
-        assert!(c.mcp.servers.is_empty());
+        assert_eq!(
+            c.mcp.servers,
+            Vec::new(),
+            "the section's presence alone configures no servers"
+        );
     }
 
     #[test]
@@ -3200,9 +3270,199 @@ redact_secrets = false
     #[test]
     fn permission_mode_names_match_the_config_spelling() {
         assert_eq!(PermissionMode::Auto.as_str(), "auto");
-        assert_eq!(PermissionMode::Plan.as_str(), "plan");
-        assert_eq!(PermissionMode::AcceptEdits.as_str(), "accept_edits");
+        assert_eq!(PermissionMode::ReadOnly.as_str(), "read_only");
         assert_eq!(PermissionMode::Interactive.as_str(), "interactive");
+        // The retired spellings load through the migration mapping.
+        assert_eq!(
+            DchConfig::from_toml_str("[runner]\npermission_mode = \"plan\"")
+                .expect("plan migrates")
+                .runner
+                .permission_mode,
+            PermissionMode::ReadOnly,
+            "plan was renamed read_only"
+        );
+        assert_eq!(
+            DchConfig::from_toml_str("[runner]\npermission_mode = \"accept_edits\"")
+                .expect("accept_edits migrates")
+                .runner
+                .permission_mode,
+            PermissionMode::Interactive,
+            "accept_edits dissolved into interactive"
+        );
+    }
+
+    #[test]
+    fn permissions_rules_parse_with_their_matchers_and_verdicts() {
+        let config = DchConfig::from_toml_str(
+            r#"
+[[permissions.rules]]
+id = "no-env-writes"
+outcome = "deny"
+path_glob = "**/.env"
+
+[[permissions.rules]]
+outcome = "allow"
+shell_prefix = "cargo test"
+
+[[permissions.rules]]
+id = "webfetch-asks"
+outcome = "ask"
+tool = "WebFetch"
+"#,
+        )
+        .expect("a well-formed [permissions] section parses");
+        let rules = &config.permissions.rules;
+        assert_eq!(rules.len(), 3, "every rule lands");
+        assert_eq!(rules[0].outcome, PermissionRuleOutcome::Deny);
+        assert_eq!(
+            rules[0].path_glob.as_deref(),
+            Some("**/.env"),
+            "the deny names its glob"
+        );
+        assert_eq!(rules[1].outcome, PermissionRuleOutcome::Allow);
+        assert!(rules[1].id.is_none(), "the id is optional");
+        assert_eq!(
+            rules[2].outcome,
+            PermissionRuleOutcome::Ask,
+            "an ask rule tightens the modes that would allow"
+        );
+        // The projection carries the authored and generated ids in order.
+        let compiled = config.permissions.compiled();
+        assert_eq!(compiled.len(), 3);
+        assert_eq!(compiled[0].0, "no-env-writes", "an authored id is kept");
+        assert_eq!(compiled[1].0, "rule-1", "a missing id takes the position");
+        assert_eq!(compiled[1].1, PermissionRuleOutcome::Allow);
+        assert_eq!(
+            compiled[1].2,
+            MatcherParts::ShellPrefix("cargo test".to_string()),
+        );
+        assert_eq!(compiled[2].2, MatcherParts::Tool("WebFetch".to_string()));
+    }
+
+    #[test]
+    fn a_config_without_a_permissions_section_has_no_rules() {
+        let config = DchConfig::from_toml_str("[api]\nmodel = \"m\"\nbase_url = \"http://h/v1\"\n")
+            .expect("a pre-permissions config parses");
+        assert!(
+            config.permissions.rules.is_empty(),
+            "the section is optional; its absence configures nothing"
+        );
+        assert_eq!(
+            config.permissions.compiled(),
+            Vec::new(),
+            "the section is optional; its absence configures nothing"
+        );
+    }
+
+    #[test]
+    fn a_rule_without_exactly_one_matcher_is_a_load_error() {
+        for toml in [
+            r#"
+[[permissions.rules]]
+outcome = "deny"
+"#,
+            r#"
+[[permissions.rules]]
+outcome = "deny"
+tool = "Write"
+shell_prefix = "cargo"
+"#,
+            r#"
+[[permissions.rules]]
+outcome = "deny"
+tool = "Write"
+path_glob = "**/.env"
+"#,
+        ] {
+            let why = DchConfig::from_toml_str(toml)
+                .expect_err("a rule without exactly one matcher cannot load");
+            assert!(
+                why.to_string().contains("exactly one of tool"),
+                "the error names the one-of contract: {why}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_rule_key_is_a_load_error() {
+        let why = DchConfig::from_toml_str(
+            r#"
+[[permissions.rules]]
+outcome = "deny"
+glob = "**/.env"
+"#,
+        )
+        .expect_err("a mistyped matcher key cannot load");
+        assert!(
+            why.to_string().contains("glob"),
+            "the error names the unknown key so the typo is one read away: {why}"
+        );
+    }
+
+    #[test]
+    fn a_selected_preset_must_exist_and_its_rules_validate() {
+        // [permissions] preset names one of [permissions.presets.<name>];
+        // naming nothing configured is a startup error listing the
+        // available names, and a preset's own rules go through the same
+        // shape checks as the top-level list.
+        let why = DchConfig::from_toml_str("[permissions]\npreset = \"nope\"\n")
+            .expect_err("a missing selected preset cannot load");
+        assert!(
+            why.to_string().contains("none is configured"),
+            "the empty list is named: {why}"
+        );
+
+        let why = DchConfig::from_toml_str(concat!(
+            "[permissions]\n",
+            "preset = \"nope\"\n",
+            "\n",
+            "[permissions.presets.rust-dev]\n",
+            "rules = [{ outcome = \"allow\", shell_prefix = \"cargo test\" }]\n",
+        ))
+        .expect_err("a missing named preset cannot load");
+        assert!(
+            why.to_string().contains("rust-dev"),
+            "the error lists the available names: {why}"
+        );
+
+        let why = DchConfig::from_toml_str(concat!(
+            "[permissions.presets.bad]\n",
+            "[[permissions.presets.bad.rules]]\n",
+            "outcome = \"deny\"\n",
+            "path_glob = \"x[\"\n",
+        ))
+        .expect_err("a preset with a bad glob cannot load");
+        assert!(
+            why.to_string().contains("[permissions] preset \"bad\""),
+            "the error scopes the preset by name: {why}"
+        );
+
+        let ok = DchConfig::from_toml_str(concat!(
+            "[permissions]\n",
+            "preset = \"rust-dev\"\n",
+            "[permissions.presets.rust-dev]\n",
+            "rules = [{ outcome = \"allow\", shell_prefix = \"cargo test\" }]\n",
+        ))
+        .expect("an inline-rules preset parses");
+        assert_eq!(ok.permissions.preset.as_deref(), Some("rust-dev"));
+        assert_eq!(ok.permissions.presets["rust-dev"].rules.len(), 1);
+    }
+
+    #[test]
+    fn a_malformed_path_glob_is_a_load_error() {
+        let why = DchConfig::from_toml_str(
+            r#"
+[[permissions.rules]]
+id = "broken"
+outcome = "deny"
+path_glob = "crates/**["
+"#,
+        )
+        .expect_err("an uncompilable glob cannot load");
+        assert!(
+            why.to_string().contains("crates/**["),
+            "the error names the offending pattern: {why}"
+        );
     }
 
     /// One local server plus one hosted provider, the shape `[[models]]`

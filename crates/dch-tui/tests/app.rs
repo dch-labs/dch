@@ -50,6 +50,17 @@ fn app() -> TuiApp {
     TuiApp::new(config_with_theme("dracula"))
 }
 
+fn docked_app() -> TuiApp {
+    let mut app = TuiApp::new(config_with_theme("dracula"));
+    app.push_message(TuiMessage::User {
+        text: "hello".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
+    app
+}
+
 /// An app over observer state the test keeps a handle to, plus that state.
 ///
 /// The shared queue is the seam between the two halves of a session, so a
@@ -149,8 +160,12 @@ fn painted_caret_col(
 fn new_constructs_with_empty_fresh_state() {
     let app = app();
 
-    assert!(app.conversation().is_empty());
-    assert!(app.input().is_empty());
+    assert_eq!(
+        app.conversation(),
+        Vec::new(),
+        "a fresh app holds no conversation rows"
+    );
+    assert_eq!(app.input(), "", "the composer holds nothing");
     assert_eq!(app.scroll_offset(), 0);
     assert!(!app.is_quitting());
 
@@ -217,7 +232,7 @@ fn a_known_theme_name_resolves() {
 
 #[test]
 fn typing_echoes_into_the_input() {
-    let mut app = app();
+    let mut app = docked_app();
     for c in ['h', 'e', 'l', 'l', 'o'] {
         assert!(app.handle_event(&plain(KeyCode::Char(c))));
     }
@@ -233,7 +248,7 @@ fn typing_echoes_into_the_input() {
 
 #[test]
 fn the_caret_follows_display_width_not_bytes() {
-    let mut app = app();
+    let mut app = docked_app();
     for c in ['h', 'é', 'x'] {
         app.handle_event(&plain(KeyCode::Char(c)));
     }
@@ -245,7 +260,7 @@ fn the_caret_follows_display_width_not_bytes() {
         "the padding columns plus three display columns of text"
     );
 
-    let mut wide_app = TuiApp::new(config_with_theme("dracula"));
+    let mut wide_app = docked_app();
     for c in ['h', '😀'] {
         wide_app.handle_event(&plain(KeyCode::Char(c)));
     }
@@ -292,7 +307,7 @@ fn enter_submits_appends_and_clears() {
     app.handle_event(&plain(KeyCode::PageUp));
     assert!(app.handle_event(&plain(KeyCode::Enter)));
 
-    assert!(app.input().is_empty());
+    assert_eq!(app.input(), "", "the composer holds nothing");
     assert_eq!(app.conversation().len(), 1);
     match app.conversation().first() {
         Some(TuiMessage::User { text, .. }) => assert_eq!(text, "hi"),
@@ -890,6 +905,14 @@ fn the_status_bar_shows_the_model_and_the_session_id() {
     let (observer, kept) = state.into_observer();
     drop(observer);
     let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    // The footer belongs to a conversation with turns — the welcome
+    // paints none — so the bar rides a landed prompt.
+    app.push_message(TuiMessage::User {
+        text: "hello".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
     app.set_session_id("f005d097-c4ce-477a-88c0-2fc2cec5a466".to_string());
     let bar = render_to_buffer(&mut app, 100, 24);
     let rows = row_texts(&bar);
@@ -908,7 +931,7 @@ fn the_notice_bar_carries_the_armed_quit_hint_above_the_composer() {
     // The hint lives on its own reserved row above the prompt box —
     // not the status bar — so the row can host glance-worthy
     // messages without shifting anything when one arrives.
-    let mut app = app();
+    let mut app = docked_app();
     let calm = render_to_buffer(&mut app, 80, 24);
     assert!(
         !view_text(&calm, 80, 24).contains("ctrl+c again"),
@@ -1035,7 +1058,7 @@ fn key_releases_are_ignored() {
         KeyEventKind::Release,
     ));
     assert!(!app.handle_event(&release));
-    assert!(app.input().is_empty());
+    assert_eq!(app.input(), "", "the composer holds nothing");
 
     let repeat = Event::Key(KeyEvent::new_with_kind(
         KeyCode::Char('a'),
@@ -1043,7 +1066,7 @@ fn key_releases_are_ignored() {
         KeyEventKind::Repeat,
     ));
     assert!(!app.handle_event(&repeat));
-    assert!(app.input().is_empty());
+    assert_eq!(app.input(), "", "the composer holds nothing");
 }
 
 #[test]
@@ -1053,16 +1076,21 @@ fn the_composer_info_row_names_the_current_permission_mode() {
     // shows is exactly what the user set.
     for (mode, segment) in [
         (dch_config::PermissionMode::Auto, "mode: auto"),
-        (dch_config::PermissionMode::Plan, "mode: plan"),
-        (
-            dch_config::PermissionMode::AcceptEdits,
-            "mode: accept_edits",
-        ),
+        (dch_config::PermissionMode::ReadOnly, "mode: read_only"),
         (dch_config::PermissionMode::Interactive, "mode: interactive"),
     ] {
         let mut config = config_with_theme("dracula");
         config.runner.permission_mode = mode;
         let mut app = TuiApp::new(config);
+        // The info row's full spelling belongs to the docked composer:
+        // the welcome box hugs the art's width and may cut the segment,
+        // so the mode rides a conversation with traffic.
+        app.push_message(TuiMessage::User {
+            text: "hello".to_string(),
+            timestamp: chrono::Utc::now(),
+            steered: false,
+            unsent: false,
+        });
         let rows = row_texts(&render_to_buffer(&mut app, 80, 30));
         let info = rows
             .iter()
@@ -1112,6 +1140,14 @@ fn clicking_the_session_id_segment_copies_it() {
     drop(observer);
     let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
     let id = "f005d097-c4ce-477a-88c0-2fc2cec5a466";
+    // The footer belongs to a conversation with turns — the welcome
+    // paints none — so the bar rides a landed prompt.
+    app.push_message(TuiMessage::User {
+        text: "hello".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
     app.set_session_id(id.to_string());
     let copied: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Arc::clone(&copied);
@@ -1214,7 +1250,7 @@ fn the_place_row_names_the_working_directory_above_the_composer() {
     // `path_style` — full by default, `~/`-relative on request — with
     // the git branch in parentheses when the host named one, and a
     // row the frame never spends until a directory is named.
-    let mut app = app();
+    let mut app = docked_app();
     let unset = render_to_buffer(&mut app, 100, 24);
     assert!(
         !row_texts(&unset).iter().any(|row| row.contains("repos")),
@@ -1272,6 +1308,12 @@ fn the_place_row_names_the_working_directory_above_the_composer() {
     let mut relative_config = config_with_theme("dracula");
     relative_config.display.path_style = dch_config::PathStyle::Relative;
     let mut relative = TuiApp::new(relative_config);
+    relative.push_message(TuiMessage::User {
+        text: "hello".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
     relative.set_working_dir(std::path::Path::new(&format!("{home}/repos/dch")));
     relative.set_git_branch(Some("master".to_string()));
     let spelled = row_texts(&render_to_buffer(&mut relative, 100, 24));
@@ -1284,6 +1326,12 @@ fn the_place_row_names_the_working_directory_above_the_composer() {
     let mut outside_config = config_with_theme("dracula");
     outside_config.display.path_style = dch_config::PathStyle::Relative;
     let mut outside = TuiApp::new(outside_config);
+    outside.push_message(TuiMessage::User {
+        text: "hello".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
     outside.set_working_dir(std::path::Path::new("/srv/work"));
     let spelled = row_texts(&render_to_buffer(&mut outside, 100, 24));
     assert!(
@@ -1294,7 +1342,7 @@ fn the_place_row_names_the_working_directory_above_the_composer() {
 
 #[test]
 fn layout_shows_three_panes() {
-    let mut app = app();
+    let mut app = docked_app();
     let terminal = render_to_buffer(&mut app, 80, 30);
     let buffer = terminal.backend().buffer();
 
@@ -1602,7 +1650,7 @@ fn growth_after_a_frozen_closer_renders_without_waiting_for_a_newline() {
 
 #[test]
 fn active_tools_render_as_running_lines() {
-    let mut app = app();
+    let mut app = docked_app();
     app.active_tools()
         .lock()
         .expect("the tools lock")
@@ -1630,6 +1678,15 @@ fn the_session_picker_names_each_row() {
     // display offset on both rows — the title column is a cell
     // budget every row fills exactly.
     let mut app = app();
+    // The full row — every column, the prompt count included — belongs
+    // to the docked composer's width; the welcome's picker is as wide
+    // as its own composer and sheds the trailing column.
+    app.push_message(TuiMessage::User {
+        text: "hello".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
     app.apply_session_update(dch_tui::queue::SessionUpdate::SessionCatalog {
         rows: vec![
             dch_tui::queue::SessionPick {
@@ -2333,13 +2390,124 @@ fn a_user_turn_opens_with_the_primary_chevron() {
 
     // The paintless chrome paints nothing: no surface block, the turn
     // keeps the terminal's own background beside its chevron glyph.
+    // The ruled app carries the same turn, for the assertion speaks
+    // about the user turn's surface — an empty conversation's splash
+    // is a different painter entirely.
     let mut ruled = TuiApp::new(config_with_theme("transparent"));
+    ruled.push_message(TuiMessage::User {
+        text: "first line of the question\nsecond line".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
     let frame = render_to_buffer(&mut ruled, 80, 24);
     let buffer = frame.backend().buffer();
     assert_eq!(
         buffer[(40, marked_row)].bg,
         ratatui::style::Color::Reset,
         "the paintless theme draws no user-turn surface"
+    );
+}
+
+/// A row inside `band` whose background is the theme's primary.
+///
+/// The composer's caret lane, scanned wherever the calling test knows
+/// the composer sits — mid-frame for the fresh session's centered
+/// shape, the bottom quarter for the docked one. Blank fillers, the
+/// splash's own colors, and the transcript never paint the primary as
+/// a background inside these bands.
+fn primary_row_in(
+    terminal: &Terminal<TestBackend>,
+    band: std::ops::Range<u16>,
+    primary: ratatui::style::Color,
+) -> Option<u16> {
+    let buffer = terminal.backend().buffer();
+    (band.start..band.end)
+        .find(|&row| (0..buffer.area.width).any(|column| buffer[(column, row)].bg == primary))
+}
+
+#[test]
+fn an_empty_session_centers_the_composer_under_the_splash() {
+    // The fresh session's welcome shape: with nothing said and nothing
+    // in flight, the composer takes the middle of the frame with the
+    // splash band above it; the first message docks the composer back
+    // to the bottom, and the two positions are far apart.
+    let mut fresh = app();
+    let terminal = render_to_buffer(&mut fresh, 80, 100);
+    let primary = fresh.theme.ui.primary;
+    let Some(centered_row) = primary_row_in(&terminal, 40..75, primary) else {
+        panic!("the centered composer paints its caret lane mid-frame");
+    };
+    let rows = row_texts(&terminal);
+    let splash_bottom = rows
+        .iter()
+        .rposition(|row| row.contains('▀'))
+        .expect("the splash band above the composer");
+    assert!(
+        u16::try_from(splash_bottom).unwrap_or(0) < centered_row,
+        "the composer sits below the splash: {centered_row}"
+    );
+
+    let mut busy = app();
+    busy.push_message(TuiMessage::User {
+        text: "first words".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
+    let docked = render_to_buffer(&mut busy, 80, 100);
+    let Some(docked_row) = primary_row_in(&docked, 85..100, busy.theme.ui.primary) else {
+        panic!("the docked composer paints its caret lane at the bottom");
+    };
+    assert!(
+        centered_row + 3 < docked_row,
+        "the fresh composer sits well above the docked one: \
+         centered {centered_row}, docked {docked_row}"
+    );
+    let docked_rows = row_texts(&docked);
+    assert!(
+        !docked_rows.iter().any(|row| row.contains('▀')),
+        "traffic displaces the splash and the centered shape with it"
+    );
+}
+
+#[test]
+fn the_welcome_composer_is_an_open_field_with_a_greeting() {
+    // The welcome composer is its own look, not the docked one: an
+    // open, borderless field the width of the art, carrying the name
+    // in night colors while the input stands empty — and the murmur
+    // stands down at the first keystroke.
+    let mut fresh = app();
+    let terminal = render_to_buffer(&mut fresh, 80, 24);
+    let rows = row_texts(&terminal);
+    assert!(
+        rows.iter()
+            .any(|row| row.contains("dream, create, harness")),
+        "the empty field carries the name"
+    );
+    assert!(
+        rows.iter().any(|row| row.contains("dch-tui")),
+        "the folder the session stands in rides above the composer"
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row.contains('╭') || row.contains('╰')),
+        "the welcome composer draws no border of its own"
+    );
+
+    fresh.handle_event(&plain(KeyCode::Char('h')));
+    let typed = render_to_buffer(&mut fresh, 80, 24);
+    let typed_rows = row_texts(&typed);
+    assert!(
+        !typed_rows
+            .iter()
+            .any(|row| row.contains("dream, create, harness")),
+        "the first keystroke stands the murmur down"
+    );
+    assert!(
+        typed_rows.iter().any(|row| row.contains('h')),
+        "the typed glyph renders in the field"
     );
 }
 
@@ -2388,6 +2556,12 @@ fn the_transparent_theme_underlines_its_composer() {
     // identity line, so the model and mode hang below the box rather
     // than sitting on their own border.
     let mut ruled = TuiApp::new(config_with_theme("transparent"));
+    ruled.push_message(TuiMessage::User {
+        text: "hello".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
     let frame = render_to_buffer(&mut ruled, 80, 25);
     let buffer = frame.backend().buffer();
     for x in [1u16, 40, 78] {
@@ -2431,7 +2605,7 @@ fn the_transparent_theme_underlines_its_composer() {
     assert_eq!(buffer[(1, 19)].symbol(), " ", "no border glyphs remain");
 
     // opaque themes keep their painted, borderless composer
-    let mut plain = app();
+    let mut plain = docked_app();
     let plain_frame = render_to_buffer(&mut plain, 80, 25);
     let buffer = plain_frame.backend().buffer();
     let style = buffer[(40, 20)].style();
@@ -2450,6 +2624,12 @@ fn the_transparent_theme_stands_its_captions_outside_the_rules() {
     // themes keep the caption tight against the composer's surface,
     // where nothing crosses anything.
     let mut ruled = TuiApp::new(config_with_theme("transparent"));
+    ruled.push_message(TuiMessage::User {
+        text: "hello".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
     ruled.set_working_dir(std::path::Path::new("/home/tester/repos/dch"));
     let rows = row_texts(&render_to_buffer(&mut ruled, 80, 25));
     let caption_row = rows
@@ -2493,7 +2673,7 @@ fn the_transparent_theme_stands_its_captions_outside_the_rules() {
 
     // Painted themes keep the caption against the composer's paint,
     // unchanged: the surface opens on the very row after the caption.
-    let mut painted = app();
+    let mut painted = docked_app();
     painted.set_working_dir(std::path::Path::new("/home/tester/repos/dch"));
     let frame = render_to_buffer(&mut painted, 80, 25);
     let buffer = frame.backend().buffer();
@@ -2515,7 +2695,7 @@ fn the_composer_carries_a_solid_primary_column_on_its_left_edge() {
     // 25 rows put the composer pane on rows 18..=21 with the text
     // window on row 19, starting two columns in — the edge column owns
     // column 0 alone, thick by construction (paint, not glyphs).
-    let mut plain = app();
+    let mut plain = docked_app();
     let frame = render_to_buffer(&mut plain, 80, 25);
     let buffer = frame.backend().buffer();
     for y in 18..=21u16 {
@@ -2577,7 +2757,7 @@ fn a_press_in_the_composer_places_the_caret_where_it_landed() {
     // composer's text puts the painted caret where it pointed, and a
     // press past the text's end clamps to the end — the caret never
     // leaves the typed run's own extent.
-    let mut app = TuiApp::new(config_with_theme("dracula"));
+    let mut app = docked_app();
     app.handle_event(&Event::Paste("hello world".to_string()));
     let composed = render_to_buffer(&mut app, 80, 24);
     let (end, row) = painted_caret_pos(&composed, app.theme.ui.primary)
@@ -3687,7 +3867,7 @@ fn a_press_below_a_running_tool_clamps_onto_the_tool_row() {
     // empty pane under it anchors on the block itself — the same
     // clamp an editor applies below a document's end — so a drag
     // back over the row selects the running tool's own text.
-    let mut app = app();
+    let mut app = docked_app();
     app.active_tools()
         .lock()
         .expect("the tools lock")
@@ -4331,7 +4511,7 @@ fn mouse_traffic_leaves_the_caret_blink_alone() {
     // one used to restart the blink phase — the caret sat solid
     // through a whole mouse-driven session. Only keyboard input
     // resolidifies the caret now.
-    let mut app = app();
+    let mut app = docked_app();
     let base = std::time::Instant::now();
     let _ = render_to_buffer(&mut app, 80, 24);
     // Advance the clock past the blink interval: the caret goes dark.
@@ -4378,7 +4558,7 @@ fn the_caret_blinks_on_the_tick_and_input_resolidifies_it() {
     // The app owns the blink: half a second visible, half a second
     // gone, beaten on the clock — and any keyboard input resolidifies
     // it and restarts the phase.
-    let mut app = app();
+    let mut app = docked_app();
     app.handle_event(&Event::Paste("hi".to_string()));
     let base = std::time::Instant::now();
     let _ = render_to_buffer(&mut app, 80, 24);
@@ -4462,6 +4642,12 @@ fn the_input_field_grows_with_its_buffer_up_to_the_cap() {
     let (observer, kept) = state.into_observer();
     drop(observer);
     let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    app.push_message(TuiMessage::User {
+        text: "hello".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
 
     // empty composer: one text row — the pane is four rows (a
     // padding row, the text row, another padding row, and the
@@ -4520,7 +4706,7 @@ fn the_input_field_grows_with_its_buffer_up_to_the_cap() {
 
 #[test]
 fn an_exactly_filled_line_stays_visible_with_its_caret_at_the_end() {
-    let mut app = TuiApp::new(config_with_theme("dracula"));
+    let mut app = docked_app();
     let width = 40usize;
     let mut text = String::new();
     for _ in 0..width.saturating_sub(4) {
@@ -4584,7 +4770,7 @@ fn the_caret_stays_inside_the_composer_in_undersized_terminals() {
     // entirely paints no caret at all, and containment holds by
     // absence there.
     for height in [2u16, 3, 4, 5, 6] {
-        let mut app = TuiApp::new(config_with_theme("dracula"));
+        let mut app = docked_app();
         app.handle_event(&plain(KeyCode::Char('x')));
         let typed = render_to_buffer(&mut app, 40, height);
         let buffer = typed.backend().buffer();
@@ -4620,7 +4806,7 @@ fn the_status_bar_paints_only_its_own_rows_in_undersized_terminals() {
     // block grows with the width's demand — air, the context bar, the
     // numbers, and wrapped status text above them on narrow frames.
     for height in [2u16, 3, 4, 5, 6] {
-        let mut app = app();
+        let mut app = docked_app();
         let terminal = render_to_buffer(&mut app, 40, height);
         let buffer = terminal.backend().buffer();
         let bar_rows: Vec<u16> = (0..height)
@@ -4647,16 +4833,16 @@ fn the_conversation_pane_renders_on_the_terminal_s_own_background() {
     // no per-cell paint can differ from the margin beside it. Only the
     // raised surfaces paint: the composer on `surface`, the bar on its
     // own row.
-    let mut app = app();
+    let mut app = docked_app();
     let terminal = render_to_buffer(&mut app, 40, 14);
     let buffer = terminal.backend().buffer();
+    let composer = composer_chunk(40, 14, 4);
     assert_eq!(
-        buffer[(5, 2)].bg,
+        buffer[(5, composer.y.saturating_sub(2))].bg,
         ratatui::style::Color::Reset,
         "the conversation pane leaves its cells to the terminal default — \
          painting them is what shows a seam against the margin"
     );
-    let composer = composer_chunk(40, 14, 4);
     assert_eq!(
         buffer[(1, composer.y)].bg,
         app.theme.ui.surface,
@@ -5108,7 +5294,7 @@ fn f2_cycles_verbosity_and_rerenders_completed_tools() {
 
 #[test]
 fn running_tools_render_their_humanized_summary() {
-    let mut app = app();
+    let mut app = docked_app();
     app.active_tools()
         .lock()
         .expect("the tools lock")
@@ -5327,6 +5513,12 @@ fn a_running_tool_row_expands_to_its_captured_input() {
         },
     );
     let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    app.push_message(TuiMessage::User {
+        text: "hello".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
     app.active_tools()
         .lock()
         .expect("the tools lock")
@@ -5391,6 +5583,12 @@ fn an_expansion_opened_while_running_survives_the_calls_completion() {
         },
     );
     let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    app.push_message(TuiMessage::User {
+        text: "hello".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
     app.active_tools()
         .lock()
         .expect("the tools lock")
@@ -6425,7 +6623,7 @@ fn permission_app(
 ) -> (
     TuiApp,
     tokio::sync::mpsc::UnboundedSender<dch_tui::PermissionRequest>,
-    Vec<tokio::sync::oneshot::Receiver<bool>>,
+    Vec<tokio::sync::oneshot::Receiver<loopctl::middleware::PermissionResolution>>,
 ) {
     let mut app = app();
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -6435,6 +6633,9 @@ fn permission_app(
         tx.send(dch_tui::PermissionRequest {
             tool_name: (*tool).to_string(),
             prompt: (*prompt).to_string(),
+            input: serde_json::Value::Null,
+            always: Vec::new(),
+            never: Vec::new(),
             reply,
         })
         .expect("receiver alive");
@@ -6638,7 +6839,7 @@ fn y_allows_the_pending_request_and_enter_is_swallowed() {
     assert!(app.handle_event(&plain(KeyCode::Char('y'))));
     assert_eq!(
         replies.pop().expect("one reply staged").blocking_recv(),
-        Ok(true),
+        Ok(loopctl::middleware::PermissionResolution::AllowOnce),
         "'y' must answer the ask with allow"
     );
 
@@ -6657,7 +6858,7 @@ fn y_allows_the_pending_request_and_enter_is_swallowed() {
     assert!(app.handle_event(&plain(KeyCode::Char('y'))));
     assert_eq!(
         reply.blocking_recv(),
-        Ok(true),
+        Ok(loopctl::middleware::PermissionResolution::AllowOnce),
         "a later 'y' still answers the ask Enter left pending"
     );
 }
@@ -6668,7 +6869,7 @@ fn n_and_esc_deny_the_pending_request() {
     assert!(app.handle_event(&plain(KeyCode::Char('n'))));
     assert_eq!(
         replies.pop().expect("one reply staged").blocking_recv(),
-        Ok(false),
+        Ok(loopctl::middleware::PermissionResolution::DenyOnce),
         "'n' must answer the ask with deny"
     );
 
@@ -6676,7 +6877,7 @@ fn n_and_esc_deny_the_pending_request() {
     assert!(app.handle_event(&plain(KeyCode::Esc)));
     assert_eq!(
         replies.pop().expect("one reply staged").blocking_recv(),
-        Ok(false),
+        Ok(loopctl::middleware::PermissionResolution::DenyOnce),
         "Esc must answer the ask with deny"
     );
 }
@@ -6697,6 +6898,9 @@ fn other_keys_are_inert_while_a_request_is_pending() {
         .send(dch_tui::PermissionRequest {
             tool_name: "Bash".to_string(),
             prompt: "allow bash?".to_string(),
+            input: serde_json::Value::Null,
+            always: Vec::new(),
+            never: Vec::new(),
             reply,
         })
         .expect("receiver alive");
@@ -6747,6 +6951,9 @@ fn a_burst_of_ready_requests_lands_together() {
             .send(dch_tui::PermissionRequest {
                 tool_name: tool.to_string(),
                 prompt: prompt.to_string(),
+                input: serde_json::Value::Null,
+                always: Vec::new(),
+                never: Vec::new(),
                 reply,
             })
             .expect("receiver alive");
@@ -6756,7 +6963,7 @@ fn a_burst_of_ready_requests_lands_together() {
     let terminal = render_to_buffer(&mut app, 80, 30);
     let screen = screen_text(&terminal);
     assert!(
-        screen.contains("first ask?") && screen.contains("1 more waiting"),
+        screen.contains("first ask?") && screen.contains("more waiting"),
         "the burst lands together and the count reports it: {screen}"
     );
 }
@@ -6774,14 +6981,14 @@ fn queued_requests_render_front_first() {
         "only the front of the queue renders: {screen}"
     );
     assert!(
-        screen.contains("1 more waiting"),
+        screen.contains("more waiting"),
         "the overlay must count what waits behind: {screen}"
     );
 
     assert!(app.handle_event(&plain(KeyCode::Char('y'))));
     assert_eq!(
         replies.remove(0).blocking_recv(),
-        Ok(true),
+        Ok(loopctl::middleware::PermissionResolution::AllowOnce),
         "the keypress answers the front request only"
     );
     let terminal = render_to_buffer(&mut app, 80, 30);
@@ -8337,6 +8544,9 @@ fn a_click_behind_a_pending_prompt_leaves_the_hidden_caret_alone() {
         .send(dch_tui::PermissionRequest {
             tool_name: "Bash".to_string(),
             prompt: "allow bash?".to_string(),
+            input: serde_json::Value::Null,
+            always: Vec::new(),
+            never: Vec::new(),
             reply,
         })
         .expect("receiver alive");
@@ -8352,7 +8562,7 @@ fn a_click_behind_a_pending_prompt_leaves_the_hidden_caret_alone() {
     assert!(app.handle_event(&plain(KeyCode::Char('y'))));
     assert_eq!(
         reply_rx.blocking_recv(),
-        Ok(true),
+        Ok(loopctl::middleware::PermissionResolution::AllowOnce),
         "the prompt still answers after the swallowed click"
     );
     let answered = render_to_buffer(&mut app, 80, 25);
@@ -8401,6 +8611,9 @@ fn a_parked_drag_does_not_scroll_behind_a_pending_prompt() {
         .send(dch_tui::PermissionRequest {
             tool_name: "Bash".to_string(),
             prompt: "allow bash?".to_string(),
+            input: serde_json::Value::Null,
+            always: Vec::new(),
+            never: Vec::new(),
             reply,
         })
         .expect("receiver alive");
@@ -8438,6 +8651,9 @@ fn control_chords_stay_inert_behind_a_pending_prompt() {
         .send(dch_tui::PermissionRequest {
             tool_name: "Bash".to_string(),
             prompt: "allow bash?".to_string(),
+            input: serde_json::Value::Null,
+            always: Vec::new(),
+            never: Vec::new(),
             reply,
         })
         .expect("receiver alive");
@@ -8463,7 +8679,7 @@ fn control_chords_stay_inert_behind_a_pending_prompt() {
     assert!(app.handle_event(&plain(KeyCode::Char('y'))));
     assert_eq!(
         reply_rx.blocking_recv(),
-        Ok(true),
+        Ok(loopctl::middleware::PermissionResolution::AllowOnce),
         "the prompt still answers after the chords"
     );
 }
@@ -8482,16 +8698,18 @@ fn modifier_decorated_keys_do_not_answer_the_prompt() {
     assert!(app.handle_event(&plain(KeyCode::Char('y'))));
     assert_eq!(
         reply.blocking_recv(),
-        Ok(true),
+        Ok(loopctl::middleware::PermissionResolution::AllowOnce),
         "the plain key still answers"
     );
 }
 
 #[test]
 fn ctrl_c_ctrl_c_under_a_pending_prompt_is_one_action_as_ever() {
-    // A permission ask passes the chord (it owns Esc, not Ctrl+C):
-    // the double action behaves exactly as it does without the
-    // sheet — arm, then the one fire that cancels and exits.
+    // The hint's promise: under a permission ask, Ctrl+C cancels the
+    // ask itself — a denial — before the chord ever reaches the app.
+    // The double-press quit returns the moment no ask stands: the
+    // first press after the sheet clears only arms, the second is the
+    // one fire that cancels and exits, exactly as without the sheet.
     let state = dch_tui::TuiObserverState::new();
     let (observer, kept) = state.into_observer();
     drop(observer);
@@ -8505,11 +8723,14 @@ fn ctrl_c_ctrl_c_under_a_pending_prompt_is_one_action_as_ever() {
     }));
 
     let (requests_tx, requests_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (reply, _reply_rx) = tokio::sync::oneshot::channel();
+    let (reply, mut reply_rx) = tokio::sync::oneshot::channel();
     requests_tx
         .send(dch_tui::PermissionRequest {
             tool_name: "Bash".to_string(),
             prompt: "allow bash?".to_string(),
+            input: serde_json::Value::Null,
+            always: Vec::new(),
+            never: Vec::new(),
             reply,
         })
         .expect("receiver alive");
@@ -8518,9 +8739,21 @@ fn ctrl_c_ctrl_c_under_a_pending_prompt_is_one_action_as_ever() {
 
     assert!(app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL)));
     assert_eq!(
+        reply_rx.try_recv(),
+        Ok(loopctl::middleware::PermissionResolution::DenyOnce),
+        "under the sheet, the first press cancels the ask — a denial"
+    );
+    assert_eq!(
         cancels.lock().expect("sink").len(),
         0,
-        "through the sheet the first press still only arms"
+        "the ask's cancel is not the run's cancel — nothing armed or fired"
+    );
+
+    assert!(app.handle_event(&key(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+    assert_eq!(
+        cancels.lock().expect("sink").len(),
+        0,
+        "with no ask standing, the first press still only arms"
     );
     assert!(!app.is_quitting(), "the arming press leaves nothing");
 
@@ -8528,7 +8761,7 @@ fn ctrl_c_ctrl_c_under_a_pending_prompt_is_one_action_as_ever() {
     assert_eq!(
         cancels.lock().expect("sink").len(),
         1,
-        "the fire cancels through the sheet as without it"
+        "the fire cancels as without the sheet"
     );
     assert!(app.is_quitting(), "and the same fire terminates");
 }
@@ -8783,6 +9016,12 @@ fn the_pulse_strip_sits_above_the_composer_in_the_border_color() {
 #[test]
 fn an_idle_frame_draws_no_pulse_strip() {
     let (_observer, mut app) = thinking_app();
+    app.push_message(TuiMessage::User {
+        text: "hello".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
     let terminal = render_to_buffer(&mut app, 80, 24);
     let theme = dch_tui::theme::Theme::by_name("dracula").expect("the theme exists");
     let buffer = terminal.backend().buffer();
@@ -8890,6 +9129,12 @@ fn a_stale_living_buffer_after_the_run_draws_nothing() {
         .agent_running
         .store(true, std::sync::atomic::Ordering::Relaxed);
     let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), state.clone());
+    app.push_message(TuiMessage::User {
+        text: "hello".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
     observer.on_thinking_delta(&thinking_delta(
         0,
         "orphaned by a cancel that fired no event",
@@ -9644,6 +9889,9 @@ fn page_keys_page_the_transcript_behind_a_permission_ask() {
         .send(dch_tui::PermissionRequest {
             tool_name: "Bash".to_string(),
             prompt: "allow bash?".to_string(),
+            input: serde_json::Value::Null,
+            always: Vec::new(),
+            never: Vec::new(),
             reply,
         })
         .expect("receiver alive");
@@ -9660,7 +9908,7 @@ fn page_keys_page_the_transcript_behind_a_permission_ask() {
     assert!(app.handle_event(&plain(KeyCode::Char('y'))));
     assert_eq!(
         reply_rx.try_recv(),
-        Ok(true),
+        Ok(loopctl::middleware::PermissionResolution::AllowOnce),
         "the ask still answers after the paging key"
     );
 }
@@ -9679,6 +9927,9 @@ fn a_click_behind_the_permission_sheet_moves_nothing() {
             .send(dch_tui::PermissionRequest {
                 tool_name: "Bash".to_string(),
                 prompt: "allow bash?".to_string(),
+                input: serde_json::Value::Null,
+                always: Vec::new(),
+                never: Vec::new(),
                 reply,
             })
             .expect("receiver alive");
@@ -9695,7 +9946,7 @@ fn a_click_behind_the_permission_sheet_moves_nothing() {
 
     // The map first: with nothing on the screen this press is a click on
     // the composer's text, and the caret goes where it was pointed.
-    let mut bare = app();
+    let mut bare = docked_app();
     bare.handle_event(&Event::Paste("hello world".to_string()));
     let _ = render_to_buffer(&mut bare, 80, 25);
     assert!(click_the_composer(&mut bare));
@@ -11427,7 +11678,7 @@ fn the_readout_leads_the_footer_and_the_session_id_centers_it() {
     // too narrow for the id to clear the bar forgoes it rather than
     // truncating it, and the directory the bar once carried rides
     // the place row above the composer instead.
-    let mut app = app();
+    let mut app = docked_app();
     app.set_working_dir(std::path::Path::new("/home/tester/repos/dch"));
     app.set_git_branch(Some("master".to_string()));
     app.set_session_id("f005d097-c4ce-477a-88c0-2fc2fc000000".to_string());
@@ -11507,6 +11758,14 @@ fn autumn_night_keeps_its_track_a_visible_step_off_the_bar() {
     // step — every channel at least sixteen off the bar's background —
     // and the empty track must actually paint on the bar's row.
     let mut app = TuiApp::new(config_with_theme("autumn_night"));
+    // The footer belongs to a conversation with turns — the welcome
+    // paints none — so the bar rides a landed prompt.
+    app.push_message(TuiMessage::User {
+        text: "hello".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
     let (track, bar_bg) = (app.theme.ui.scrollbar_track, app.theme.ui.status_bar_bg);
     let (track_rgb, bar_rgb) = (rgb_of(track), rgb_of(bar_bg));
     let delta = std::iter::zip(track_rgb, bar_rgb)
@@ -13093,6 +13352,12 @@ fn the_notice_rides_the_place_row_and_saves_its_own() {
     // keeps the row for the conversation, and the notice is exactly as
     // visible as it ever was.
     let (mut app, _kept) = app_with_state();
+    app.push_message(TuiMessage::User {
+        text: "hello".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
     app.set_working_dir(std::path::Path::new("/home/dch/repos/dch"));
     app.set_git_branch(Some("feat/x".to_string()));
     app.post_notice("THE NOTICE SPEAKS".to_string());
@@ -13122,6 +13387,12 @@ fn a_place_less_frame_keeps_the_reserved_notice_row() {
     // always had: reserved, blank when silent, right-aligned when it
     // speaks — nothing on screen shifts when a message arrives.
     let (mut app, _kept) = app_with_state();
+    app.push_message(TuiMessage::User {
+        text: "hello".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
     app.post_notice("THE NOTICE SPEAKS".to_string());
     let terminal = render_to_buffer(&mut app, 80, 26);
     let rows = row_texts(&terminal);
@@ -13145,6 +13416,12 @@ fn a_wide_glyph_notice_reserves_its_full_width() {
     // in cells, the place keeps the columns the notice needs and both
     // texts stand whole on the row.
     let (mut app, _kept) = app_with_state();
+    app.push_message(TuiMessage::User {
+        text: "hello".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
     app.set_working_dir(std::path::Path::new("/home/dch/repos/dch"));
     app.post_notice("ワイドゴ通知".to_string());
     let terminal = render_to_buffer(&mut app, 80, 26);
@@ -13356,6 +13633,12 @@ fn a_notice_that_fills_the_row_leaves_the_place_no_cell() {
     // notice stands whole, right-aligned, with the row's first cell
     // blank beside it.
     let (mut app, _kept) = app_with_state();
+    app.push_message(TuiMessage::User {
+        text: "hello".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
     app.set_working_dir(std::path::Path::new("/home/dch/repos/dch"));
     let notice = "THE NOTICE FILLS THE ROW IT SITS ON";
     assert_eq!(
@@ -13491,11 +13774,793 @@ fn arrows_and_tab_interoperate_in_both_directions() {
         "Tab continues from the arrow-landed position"
     );
 
-    // The popup stands throughout
+    // The popup stands throughout — and since the window now sizes
+    // itself to the rows the side offers, the row it must keep is the
+    // highlighted one, not the list's head. The row is matched as a
+    // whole trimmed line, so the composer's own copy of the candidate
+    // cannot satisfy the check on its own.
     let drawn = render_to_buffer(&mut app, 80, 24);
     let rows = row_texts(&drawn);
+    let highlighted = cands.get(5).cloned().unwrap_or_default();
     assert!(
-        rows.iter().any(|r| r.trim_start().starts_with("default")),
-        "the popup stands on the whole theme list"
+        rows.iter().any(|r| r.trim() == highlighted),
+        "the popup stands with its highlighted row as a row of its own: {rows:?}"
+    );
+}
+
+#[test]
+fn an_unset_of_permission_mode_moves_the_gate_back_with_the_display() {
+    // The undo's whole live path: `/unset permission_mode` restores
+    // the earlier value into the panel's config *and* moves the gate —
+    // the shared cell flips back and the driver hears the Mode
+    // command — so the loop never keeps enforcing a mode the panel no
+    // longer shows. Before the shared live path, the undo reached the
+    // display alone and the gate kept the removed mode.
+    use dch_tui::commands::Command;
+    let (mut app, _kept) = app_with_state();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    app.set_submit_tx(tx);
+    let cell = std::sync::Arc::new(std::sync::Mutex::new(dch_config::PermissionMode::default()));
+    app.set_permission_mode_cell(Some(std::sync::Arc::clone(&cell)));
+    app.run_command(Command::Mode {
+        name: Some("read_only".to_string()),
+    });
+    assert_eq!(
+        *cell.lock().unwrap(),
+        dch_config::PermissionMode::ReadOnly,
+        "/mode flips the gate's cell on the spot"
+    );
+    app.run_command(Command::Unset {
+        key: "permission_mode".to_string(),
+    });
+    assert_eq!(
+        *cell.lock().unwrap(),
+        dch_config::PermissionMode::default(),
+        "the undo flips the cell back — the gate reads the restored mode"
+    );
+    let mut modes = Vec::new();
+    while let Ok(submission) = rx.try_recv() {
+        if let dch_tui::Submission::Command { command } = submission
+            && let dch_tui::SessionCommand::Mode { mode } = command
+        {
+            modes.push(mode);
+        }
+    }
+    assert_eq!(
+        modes,
+        vec![
+            dch_config::PermissionMode::ReadOnly,
+            dch_config::PermissionMode::default(),
+        ],
+        "the set and the undo both told the driver to rebuild under their mode"
+    );
+}
+
+#[test]
+fn an_unset_of_permission_mode_restores_the_live_session_mode_not_the_file_s() {
+    // The override ledger captures `permission_mode`'s original from
+    // the live config — a resumed session's own re-seated mode — never
+    // from the file: the file never hears of a session mode, and
+    // capturing its Auto would have `/unset` restore Auto over a
+    // session that ran read-only, with the live path publishing
+    // writes the session never approved.
+    use dch_tui::commands::Command;
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    // The session itself runs read-only — the mode a resume re-seats
+    // into the live config — while the file says auto.
+    let mut config = config_with_theme("dracula");
+    config.runner.permission_mode = dch_config::PermissionMode::ReadOnly;
+    let mut app = TuiApp::from_observer_state(config, kept);
+    app.set_config_file(config_with_theme("dracula"));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    app.set_submit_tx(tx);
+    let cell = std::sync::Arc::new(std::sync::Mutex::new(dch_config::PermissionMode::ReadOnly));
+    app.set_permission_mode_cell(Some(std::sync::Arc::clone(&cell)));
+    app.run_command(Command::Mode {
+        name: Some("interactive".to_string()),
+    });
+    app.run_command(Command::Unset {
+        key: "permission_mode".to_string(),
+    });
+    assert_eq!(
+        *cell.lock().unwrap(),
+        dch_config::PermissionMode::ReadOnly,
+        "the undo restores the session's own mode, never the file's auto"
+    );
+    let mut modes = Vec::new();
+    while let Ok(submission) = rx.try_recv() {
+        if let dch_tui::Submission::Command { command } = submission
+            && let dch_tui::SessionCommand::Mode { mode } = command
+        {
+            modes.push(mode);
+        }
+    }
+    assert_eq!(
+        modes,
+        vec![
+            dch_config::PermissionMode::Interactive,
+            dch_config::PermissionMode::ReadOnly,
+        ],
+        "the set and the undo each told the driver the mode the session runs"
+    );
+}
+
+#[test]
+fn a_permissions_listing_names_the_standing_damage() {
+    // The listing is the damage posture's durable surface: while the
+    // verdict stands, every `/permissions` leads with the damage row
+    // — and the all-empty case shows the damage instead of reading
+    // as a healthy blank, because the damage is why nothing is
+    // remembered.
+    use dch_tui::commands::Command;
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    let memory = dch_tui::queue::PermissionMemory::default();
+    memory.mark_damaged();
+    app.set_permission_memory(memory);
+    app.run_command(Command::Permissions { forget: None });
+    let rows: Vec<String> = app
+        .conversation()
+        .iter()
+        .filter_map(|message| match message {
+            dch_tui::TuiMessage::System { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        rows.iter().any(|text| text.contains("damaged")),
+        "the damaged empty listing leads with the damage row: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|text| text.contains("/permissions repair")),
+        "the row names the one command that clears it: {rows:?}"
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|text| text.contains("no permission rules in force")),
+        "an empty listing under damage is not a healthy blank: {rows:?}"
+    );
+}
+
+#[test]
+fn a_resumed_session_under_damage_writes_no_damage_row() {
+    // The adoption half: the driver marks the shared memory before
+    // publishing the resume, and the announcement arrives as the
+    // driver's transient notice — the adoption itself writes no
+    // transcript row, so repeated reopens cannot accumulate damage
+    // rows in the conversation; `/permissions` is the on-demand
+    // restatement, and the file's marker is the one durable record.
+    let (mut app, _kept) = app_with_state();
+    let memory = dch_tui::queue::PermissionMemory::default();
+    memory.mark_damaged();
+    app.set_permission_memory(memory);
+    app.apply_session_update(dch_tui::queue::SessionUpdate::Resumed {
+        id: "22222222-2222-2222-2222-222222222222".to_string(),
+        transcript: Vec::new(),
+        tokens: dch_tui::queue::ResumedTokens {
+            cumulative_input: 0,
+            cumulative_output: 0,
+            last_input: 0,
+            context_tokens: 0,
+        },
+        permission_mode: dch_config::PermissionMode::Interactive,
+    });
+    assert!(
+        app.conversation()
+            .iter()
+            .all(|message| !matches!(message, dch_tui::TuiMessage::System { text, .. } if text.contains("damaged"))),
+        "the adoption writes no damage row — the notice is transient, nothing accumulates"
+    );
+}
+
+#[test]
+fn the_permission_hint_names_esc_as_a_cancel_and_esc_denies() {
+    // The hint's claim, made honest both ways: the sheet says "esc or
+    // ctrl+c cancels", and Esc really does resolve the ask as a
+    // refusal — the same DenyOnce as n and ctrl+c, so the key the
+    // hint names is the key that works.
+    let (mut app, _kept) = app_with_state();
+    let (requests_tx, requests_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (reply, mut reply_rx) = tokio::sync::oneshot::channel();
+    requests_tx
+        .send(dch_tui::PermissionRequest {
+            tool_name: "Bash".to_string(),
+            prompt: "allow bash?".to_string(),
+            input: serde_json::Value::Null,
+            always: Vec::new(),
+            never: Vec::new(),
+            reply,
+        })
+        .expect("receiver alive");
+    app.set_permission_requests(requests_rx);
+    app.poll_permission_requests();
+
+    let sheet = row_texts(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        sheet
+            .iter()
+            .any(|row| row.contains("esc or ctrl+c cancels")),
+        "the hint names esc beside ctrl+c: {sheet:?}"
+    );
+    assert!(
+        app.handle_event(&plain(KeyCode::Esc)),
+        "Esc answers the ask"
+    );
+    assert_eq!(
+        reply_rx.try_recv(),
+        Ok(loopctl::middleware::PermissionResolution::DenyOnce),
+        "Esc denies — the ask is cancelled, exactly as the hint promises"
+    );
+}
+
+#[test]
+fn a_forget_all_sweeps_every_remembered_rule() {
+    // The sweep, end to end: the receipt names the count, the memory
+    // holds nothing remembered afterwards, the write-through fires
+    // with the emptiness, and an empty memory's sweep says so instead
+    // of pretending a removal happened.
+    use dch_tui::commands::Command;
+    let (mut app, _kept) = app_with_state();
+    let memory = dch_tui::queue::PermissionMemory::default();
+    let writes: std::sync::Arc<std::sync::Mutex<Vec<(usize, usize)>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    memory.remember_rules(&[
+        dch_tui::queue::PermissionRule::ShellPrefix {
+            prefix: "cargo test".to_string(),
+        },
+        dch_tui::queue::PermissionRule::ShellPrefix {
+            prefix: "cargo build".to_string(),
+        },
+    ]);
+    memory.remember_deny(&[dch_tui::queue::PermissionRule::ShellPrefix {
+        prefix: "cargo publish".to_string(),
+    }]);
+    // The sink installs after the seeding remembers, so only the
+    // sweep's own write-through is what it counts.
+    let sink = std::sync::Arc::clone(&writes);
+    memory.persist_through(std::sync::Arc::new(
+        move |allow: &[dch_tui::queue::PermissionRule],
+              deny: &[dch_tui::queue::PermissionRule],
+              _damaged: bool| {
+            sink.lock().unwrap().push((allow.len(), deny.len()));
+        },
+    ));
+    app.set_permission_memory(memory);
+    app.run_command(Command::Permissions {
+        forget: Some("forget all".to_string()),
+    });
+    let rows: Vec<String> = app
+        .conversation()
+        .iter()
+        .filter_map(|message| match message {
+            dch_tui::TuiMessage::System { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        rows.iter()
+            .any(|text| text.starts_with("Forgot all 3 remembered rules")),
+        "the receipt names the swept count: {rows:?}"
+    );
+    assert_eq!(
+        writes.lock().unwrap().as_slice(),
+        &[(0, 0)],
+        "the write-through fired once with the emptiness"
+    );
+    app.run_command(Command::Permissions { forget: None });
+    let after: Vec<String> = app
+        .conversation()
+        .iter()
+        .filter_map(|message| match message {
+            dch_tui::TuiMessage::System { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !after
+            .iter()
+            .any(|text| text.contains("every future") || text.contains("the exact command")),
+        "the post-sweep listing remembers nothing: {after:?}"
+    );
+    // The empty memory's sweep says so rather than recording a
+    // no-op removal.
+    app.run_command(Command::Permissions {
+        forget: Some("forget all".to_string()),
+    });
+    let notice_rows = row_texts(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        notice_rows
+            .iter()
+            .any(|row| row.contains("nothing remembered to forget")),
+        "the empty sweep is refused with a reason: {notice_rows:?}"
+    );
+}
+
+#[test]
+fn a_mode_override_dies_with_the_session_it_was_recorded_in() {
+    // The override ledger is session state: an override recorded in
+    // session A must not reach into a session B adopted over it, nor
+    // into the fresh session a `/clear` opens — B's `/unset
+    // permission_mode` has nothing to undo, and A's original must not
+    // become B's mode. Both session switches sweep the entry.
+    use dch_tui::commands::Command;
+    let (mut app, _kept) = app_with_state();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    app.set_submit_tx(tx);
+    let cell = std::sync::Arc::new(std::sync::Mutex::new(dch_config::PermissionMode::Auto));
+    app.set_permission_mode_cell(Some(std::sync::Arc::clone(&cell)));
+
+    // Session A overrides its mode; the ledger records A's original.
+    app.run_command(Command::Mode {
+        name: Some("read_only".to_string()),
+    });
+    while rx.try_recv().is_ok() {
+        // A's own live move rides the channel; nothing after it may.
+    }
+    // Session B is adopted live, running Interactive — the driver has
+    // already moved the cell when the Resumed update publishes it.
+    app.apply_session_update(dch_tui::queue::SessionUpdate::Resumed {
+        id: "22222222-2222-2222-2222-222222222222".to_string(),
+        transcript: Vec::new(),
+        tokens: dch_tui::queue::ResumedTokens {
+            cumulative_input: 0,
+            cumulative_output: 0,
+            last_input: 0,
+            context_tokens: 0,
+        },
+        permission_mode: dch_config::PermissionMode::Interactive,
+    });
+    *cell.lock().unwrap() = dch_config::PermissionMode::Interactive;
+    app.run_command(Command::Unset {
+        key: "permission_mode".to_string(),
+    });
+    assert_eq!(
+        *cell.lock().unwrap(),
+        dch_config::PermissionMode::Interactive,
+        "B's unset finds no override — B keeps its own mode, never A's original"
+    );
+    while let Ok(submission) = rx.try_recv() {
+        if let dch_tui::Submission::Command { command } = submission {
+            panic!("no live mode move belongs to an unset with no override: {command:?}");
+        }
+    }
+    let rows = row_texts(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        rows.iter().any(|row| row.contains("no session override")),
+        "the unset says there is nothing to undo — the override died with session A"
+    );
+
+    // The fresh session a `/clear` opens sweeps the entry the same way.
+    app.run_command(Command::Mode {
+        name: Some("read_only".to_string()),
+    });
+    app.run_command(Command::Clear);
+    app.run_command(Command::Unset {
+        key: "permission_mode".to_string(),
+    });
+    let cleared_rows = row_texts(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        cleared_rows
+            .iter()
+            .any(|row| row.contains("no session override")),
+        "the cleared session's unset also finds nothing — the override died with the cleared one"
+    );
+}
+
+#[test]
+fn an_unset_of_permission_mode_never_touches_the_config_file() {
+    // The session-scoped key's unset restores the live value alone: the
+    // file mirrors and the save stay untouched, or the session's mode
+    // would overwrite the file's configured one for every later launch.
+    // Here the file says Interactive and the session runs Auto — the
+    // whole /mode…/unset cycle must leave no trace on disk at all.
+    use dch_tui::commands::Command;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    let mut file = config_with_theme("dracula");
+    file.runner.permission_mode = dch_config::PermissionMode::Interactive;
+    let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
+    app.set_config_file(file);
+    app.set_config_persist_dir(Some(dir.path().to_path_buf()));
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    app.set_submit_tx(tx);
+    let cell = std::sync::Arc::new(std::sync::Mutex::new(dch_config::PermissionMode::Auto));
+    app.set_permission_mode_cell(Some(std::sync::Arc::clone(&cell)));
+    app.run_command(Command::Mode {
+        name: Some("read_only".to_string()),
+    });
+    app.run_command(Command::Unset {
+        key: "permission_mode".to_string(),
+    });
+    assert_eq!(
+        *cell.lock().unwrap(),
+        dch_config::PermissionMode::Auto,
+        "the session's own value is restored live"
+    );
+    assert!(
+        !dir.path().join("config.toml").exists(),
+        "the session-scoped key never reaches the file — not the mirrors, not the save"
+    );
+}
+
+#[test]
+fn a_permissions_repair_clears_the_marker_and_reseeds_the_config_rules() {
+    // The damage verdict's one door out: `/permissions repair` clears
+    // the standing marker and re-seeds the config-rules cell from the
+    // configuration's own join, so the configured allows return
+    // exactly as written — while a healthy session is told there is
+    // nothing to repair rather than pretending a sweep happened.
+    use dch_tui::commands::Command;
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    let mut config = config_with_theme("dracula");
+    config
+        .permissions
+        .rules
+        .push(dch_config::PermissionRuleConfig {
+            id: None,
+            outcome: dch_config::PermissionRuleOutcome::Allow,
+            tool: Some("WebFetch".to_string()),
+            shell_prefix: None,
+            path_glob: None,
+        });
+    let mut app = TuiApp::from_observer_state(config, kept);
+    let memory = dch_tui::queue::PermissionMemory::default();
+    memory.mark_damaged();
+    let memory_handle = memory.clone();
+    // The repair must reach the file: the sink counts the saves the
+    // press itself fires, verdict and all.
+    let saves: std::sync::Arc<std::sync::Mutex<Vec<(usize, usize, bool)>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = std::sync::Arc::clone(&saves);
+    memory.persist_through(std::sync::Arc::new(
+        move |allow: &[dch_tui::queue::PermissionRule],
+              deny: &[dch_tui::queue::PermissionRule],
+              damaged: bool| {
+            sink.lock()
+                .unwrap()
+                .push((allow.len(), deny.len(), damaged));
+        },
+    ));
+    app.set_permission_memory(memory);
+    let cell = std::sync::Arc::new(std::sync::Mutex::new(Vec::<dch_permissions::Rule>::new()));
+    app.set_permission_config_rules_cell(Some(std::sync::Arc::clone(&cell)));
+    app.run_command(Command::Permissions {
+        forget: Some("repair".to_string()),
+    });
+    assert!(
+        !memory_handle.damage_standing(),
+        "the repair clears the standing marker"
+    );
+    assert_eq!(
+        saves.lock().unwrap().as_slice(),
+        &[(0, 0, false)],
+        "the repair is itself a save — the file is fixed at the press, not on the \
+         next remember: empty lists, verdict cleared"
+    );
+    let rules = cell.lock().unwrap().clone();
+    assert!(
+        rules
+            .iter()
+            .any(|rule| rule.outcome == dch_permissions::PermissionOutcome::Allow),
+        "the config-rules cell re-seeds from the configuration's join — allows return: {rules:?}"
+    );
+    let rows = row_texts(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        rows.iter().any(|row| row.contains("repaired")),
+        "the repair is said aloud: {rows:?}"
+    );
+    // The healthy twin: nothing stands, nothing is swept.
+    app.run_command(Command::Permissions {
+        forget: Some("repair".to_string()),
+    });
+    let again = row_texts(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        again.iter().any(|row| row.contains("nothing to repair")),
+        "a healthy session is told there is nothing to repair: {again:?}"
+    );
+}
+
+#[test]
+fn a_forget_press_numbers_the_listing_it_read_not_the_config_at_press_time() {
+    // A `/preset` between the listing and the press changes the
+    // configured set; the number the user names must still address
+    // the row they read. The press's boundary between configured and
+    // remembered rules is the listing's own count, snapshotted with
+    // the rendered rules — re-deriving it at press time shifted every
+    // numbered row under the user's number, handing `forget` a
+    // stranger to remove.
+    use dch_tui::commands::Command;
+    let allow_rule = |matcher: &str| dch_config::PermissionRuleConfig {
+        id: None,
+        outcome: dch_config::PermissionRuleOutcome::Allow,
+        tool: None,
+        shell_prefix: Some(matcher.to_string()),
+        path_glob: None,
+    };
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    let mut config = config_with_theme("dracula");
+    config.permissions.preset = Some("dev".to_string());
+    config.permissions.presets.insert(
+        "dev".to_string(),
+        dch_permissions::Preset {
+            rules: vec![allow_rule("cargo fmt")],
+        },
+    );
+    config.permissions.presets.insert(
+        "empty".to_string(),
+        dch_permissions::Preset { rules: Vec::new() },
+    );
+    let mut app = TuiApp::from_observer_state(config, kept);
+    let memory = dch_tui::queue::PermissionMemory::default();
+    memory.adopt(
+        vec![
+            dch_tui::queue::PermissionRule::ShellPrefix {
+                prefix: "cargo test".to_string(),
+            },
+            dch_tui::queue::PermissionRule::ShellPrefix {
+                prefix: "cargo build".to_string(),
+            },
+        ],
+        vec![],
+        false,
+    );
+    app.set_permission_memory(memory);
+    // The listing numbers one configured row (the selected preset's
+    // rule), so rows 2 and 3 are the remembered rules in order.
+    app.run_command(Command::Permissions { forget: None });
+    // Between the listing and the press, the preset swap shrinks the
+    // configured set to nothing — a count re-derived now would say
+    // zero, shifting the remembered rows up under the user's number.
+    app.run_command(Command::Preset {
+        name: Some("empty".to_string()),
+    });
+    app.run_command(Command::Permissions {
+        forget: Some("forget 2".to_string()),
+    });
+    let forgot = app
+        .conversation()
+        .iter()
+        .filter_map(|message| match message {
+            dch_tui::TuiMessage::System { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .find(|text| text.starts_with("Forgot remembered permission"))
+        .expect("the forget lands its receipt");
+    assert!(
+        forgot.contains("cargo test"),
+        "row 2 is the first remembered rule as the listing numbered it: {forgot}"
+    );
+    assert!(
+        !forgot.contains("cargo build"),
+        "the re-derived boundary must not shift the press onto a stranger: {forgot}"
+    );
+}
+
+#[test]
+fn a_stand_in_save_keeps_the_pair_the_session_started_under() {
+    // The stand-in a config save writes without a wired file restores
+    // the session-scoped pair to what the session started under — the
+    // flag- or file-stated mode and preset — never compiled defaults:
+    // an unrelated `/theme` save once rewrote an initial
+    // `--permission-mode interactive` and `--permissions-preset`
+    // out of the file it wrote.
+    use dch_tui::commands::Command;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    let mut config = config_with_theme("dracula");
+    config.runner.permission_mode = dch_config::PermissionMode::Interactive;
+    config.permissions.preset = Some("rust-dev".to_string());
+    config.permissions.presets.insert(
+        "rust-dev".to_string(),
+        dch_permissions::Preset { rules: Vec::new() },
+    );
+    let mut app = TuiApp::from_observer_state(config, kept);
+    app.set_config_persist_dir(Some(dir.path().to_path_buf()));
+    app.run_command(Command::Theme {
+        name: Some("nord".to_string()),
+    });
+    let saved = std::fs::read_to_string(dir.path().join("config.toml")).expect("the save landed");
+    assert!(
+        saved.contains("interactive"),
+        "the stand-in keeps the mode the session started under: {saved}"
+    );
+    assert!(
+        saved.contains("rust-dev"),
+        "the stand-in keeps the preset the session started under: {saved}"
+    );
+    assert!(
+        saved.contains("\"nord\""),
+        "the unrelated theme change did land: {saved}"
+    );
+}
+
+#[test]
+fn an_expanded_permission_sheet_shows_the_command_s_tail() {
+    // The approval press must be able to see the whole command: the
+    // collapsed sheet shows its first rows, and a destructive suffix
+    // can hide past them. `e` expands the sheet onto the command's
+    // *tail* — the half a head-only preview cuts — and the hints name
+    // the press both ways. The toggle resets with the ask it read, so
+    // the next ask starts collapsed again.
+    let mut app = app();
+    let (requests_tx, requests_rx) = tokio::sync::mpsc::unbounded_channel();
+    let send_ask = |tx: &tokio::sync::mpsc::UnboundedSender<dch_tui::PermissionRequest>| {
+        let (reply, _reply_rx) = tokio::sync::oneshot::channel();
+        let command = format!("{}&& rm -rf /important", "filler-word ".repeat(40));
+        tx.send(dch_tui::PermissionRequest {
+            tool_name: "Bash".to_string(),
+            prompt: "allow bash?".to_string(),
+            input: serde_json::json!({ "command": command }),
+            always: Vec::new(),
+            never: Vec::new(),
+            reply,
+        })
+        .expect("receiver alive");
+    };
+    send_ask(&requests_tx);
+    app.set_permission_requests(requests_rx);
+    app.poll_permission_requests();
+
+    let collapsed = row_texts(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        collapsed.iter().any(|row| row.contains("runs: ")),
+        "the command preview renders: {collapsed:?}"
+    );
+    assert!(
+        !collapsed
+            .iter()
+            .any(|row| row.contains("rm -rf /important")),
+        "the collapsed head cannot show the command's tail"
+    );
+    assert!(
+        collapsed.iter().any(|row| row.contains("expand")),
+        "the hints offer the expansion when the wrap truncates: {collapsed:?}"
+    );
+
+    assert!(app.handle_event(&plain(KeyCode::Char('e'))));
+    let expanded = row_texts(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        expanded.iter().any(|row| row.contains("rm -rf /important")),
+        "the expanded sheet keeps the wrap's tail — the suffix is visible before the press: {expanded:?}"
+    );
+    assert!(
+        expanded.iter().any(|row| row.contains("collapse")),
+        "the hints offer the collapse: {expanded:?}"
+    );
+
+    // The toggle is the ask's own: resolving it and landing the next
+    // ask starts collapsed again.
+    assert!(app.handle_event(&plain(KeyCode::Char('n'))));
+    let (again_tx, again_rx) = tokio::sync::mpsc::unbounded_channel();
+    send_ask(&again_tx);
+    app.set_permission_requests(again_rx);
+    app.poll_permission_requests();
+    let recollapsed = row_texts(&render_to_buffer(&mut app, 80, 24));
+    assert!(
+        !recollapsed
+            .iter()
+            .any(|row| row.contains("rm -rf /important")),
+        "the next ask starts collapsed — the toggle reset with the one it read"
+    );
+    assert!(
+        recollapsed.iter().any(|row| row.contains("expand")),
+        "the next ask offers the expansion afresh: {recollapsed:?}"
+    );
+}
+
+#[test]
+fn a_short_terminal_sheds_session_picker_rows_not_the_cursor() {
+    // The picker's window sizes itself to the rows its side of the
+    // composer offers: a fixed eight-row window on a short terminal
+    // would walk the cursor past the last visible row, and Enter
+    // would resume a session the user cannot see. The cursor's own
+    // row always renders.
+    let mut app = app();
+    app.push_message(TuiMessage::User {
+        text: "hello".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
+    let rows: Vec<dch_tui::queue::SessionPick> = (1..=10)
+        .map(|n| dch_tui::queue::SessionPick {
+            id: format!("{n:08}-0000-0000-0000-000000000000"),
+            model: "m".to_string(),
+            saved_at: chrono::Utc::now(),
+            prompts: n,
+            title: Some(format!("session-{n}")),
+            workdir: Some("/home/user/alpha".to_string()),
+        })
+        .collect();
+    app.apply_session_update(dch_tui::queue::SessionUpdate::SessionCatalog { rows });
+    for _ in 0..9 {
+        app.handle_event(&plain(KeyCode::Down));
+    }
+    let drawn = row_texts(&render_to_buffer(&mut app, 80, 10));
+    assert!(
+        drawn.iter().any(|row| row.contains("sessions —")),
+        "the picker draws even on a short terminal: {drawn:?}"
+    );
+    assert!(
+        drawn.iter().any(|row| row.contains("session-10")),
+        "the cursor's own row renders — the window sheds list rows, never the cursor: {drawn:?}"
+    );
+}
+
+#[test]
+fn a_short_terminal_sheds_model_picker_rows_not_the_cursor() {
+    // The model picker's window takes the same bound-derived capacity:
+    // walking the cursor to the last model on a short terminal keeps
+    // the chosen row on screen, where Enter can act on what the user
+    // sees.
+    let state = dch_tui::TuiObserverState::new();
+    let (observer, kept) = state.into_observer();
+    drop(observer);
+    let mut config = config_with_theme("dracula");
+    config.models = (1..=10)
+        .map(|n| dch_config::ModelProfile {
+            model: format!("model-{n}"),
+            ..dch_config::ModelProfile::default()
+        })
+        .collect();
+    let mut app = TuiApp::from_observer_state(config, kept);
+    app.run_command(dch_tui::Command::Models);
+    for _ in 0..9 {
+        app.handle_event(&plain(KeyCode::Down));
+    }
+    let drawn = row_texts(&render_to_buffer(&mut app, 80, 10));
+    assert!(
+        drawn.iter().any(|row| row.contains("models —")),
+        "the picker draws even on a short terminal: {drawn:?}"
+    );
+    assert!(
+        drawn.iter().any(|row| row.contains("model-10")),
+        "the cursor's own row renders — the window sheds list rows, never the cursor: {drawn:?}"
+    );
+}
+
+#[test]
+fn a_short_terminal_sheds_completion_rows_not_the_highlight() {
+    // The completion popup's window takes its capacity from the side's
+    // bound too: cycling the highlight deep into the candidate list on
+    // a short terminal keeps the highlighted row on screen — the row
+    // Tab is about to accept is never the one the clamp cut. The
+    // candidates are theme values, whose popup rows are bare names, so
+    // the row match is a whole trimmed line and the composer's own
+    // copy cannot satisfy it alone.
+    let mut app = app();
+    for c in "/theme ".chars() {
+        app.handle_event(&plain(KeyCode::Char(c)));
+    }
+    // Each Tab accepts the next candidate into the composer, so the
+    // composer names the row the highlight stands on.
+    for _ in 0..8 {
+        app.handle_event(&plain(KeyCode::Tab));
+    }
+    let chosen = app
+        .input()
+        .strip_prefix("/theme ")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    assert!(!chosen.is_empty(), "the cycle accepted a candidate");
+    let drawn = row_texts(&render_to_buffer(&mut app, 80, 10));
+    assert!(
+        drawn.iter().any(|row| row.trim() == chosen),
+        "the highlighted candidate stands as its own popup row — the composer's \
+         copy alone must not satisfy the check: {drawn:?}"
     );
 }

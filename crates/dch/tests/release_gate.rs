@@ -255,7 +255,7 @@ fn at11_headless_prints_stdout_and_writes_the_done_file() {
 }
 
 #[test]
-fn at12_plan_mode_blocks_the_write() {
+fn at12_read_only_mode_blocks_the_write() {
     let sb = Sandbox::sse(vec![
         sse_tool_call_turn(
             "Write",
@@ -267,13 +267,82 @@ fn at12_plan_mode_blocks_the_write() {
     assert_eq!(out.status.code(), Some(0), "stderr: {}", lossy(&out.stderr));
     assert!(
         !sb.workdir().join("test.txt").exists(),
-        "Plan mode never lets the write land"
+        "read-only mode never lets the write land"
     );
     let requests = sb.requests();
     let follow_up = requests.get(1).expect("the block came back to the model");
     assert!(
-        follow_up.contains("denied by Plan mode"),
+        follow_up.contains("denied by ReadOnly mode"),
         "the block reason reaches the model: {follow_up}"
+    );
+}
+
+#[test]
+fn at13_a_stale_write_refuses_and_demands_a_fresh_read() {
+    // The conflict cell end to end: one process, one file, three
+    // scripted turns — Read, a Bash turn that changes the file behind
+    // the session's back, then a Write of the bytes the read saw. The
+    // refusal must reach the model naming the file and the recovery
+    // path, and the on-disk file must still hold the bash turn's
+    // bytes. A binary whose Read and Write did not share one session
+    // state would let the write land and clobber — this scenario is
+    // the wiring proof the loop-level pins cannot make.
+    let sb = Sandbox::sse(vec![
+        sse_tool_call_turn("Read", &json!({"path": "note.txt"})),
+        sse_tool_call_turn("Bash", &json!({"command": "echo changed > note.txt"})),
+        sse_tool_call_turn(
+            "Write",
+            &json!({"file_path": "note.txt", "content": "garden wall\n"}),
+        ),
+        sse_text_turn("it changed; I will re-read"),
+    ]);
+    std::fs::write(sb.workdir().join("note.txt"), "garden wall\n").expect("note written");
+    let out = sb.dch(&["update the note"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", lossy(&out.stderr));
+    assert_eq!(
+        std::fs::read_to_string(sb.workdir().join("note.txt")).expect("note readable"),
+        "changed\n",
+        "the stale write never landed: the bash turn's bytes stand"
+    );
+    let requests = sb.requests();
+    let refusal = requests.get(3).expect("the refusal came back to the model");
+    assert!(
+        refusal.contains("changed on disk since it was read"),
+        "the refusal names the drift: {refusal}"
+    );
+    assert!(
+        refusal.contains("Re-read the file with Read"),
+        "the refusal names the recovery path: {refusal}"
+    );
+}
+
+#[test]
+fn at14_a_write_after_a_read_of_unchanged_bytes_lands() {
+    // The allow twin of at13: a baseline present, the bytes unchanged
+    // since the read, the write lands. Both directions of the
+    // baseline-present cell pinned at the binary level, so a guard
+    // that refuses everything after a read fails this side as loudly
+    // as one that refuses nothing fails at13's.
+    let sb = Sandbox::sse(vec![
+        sse_tool_call_turn("Read", &json!({"path": "note.txt"})),
+        sse_tool_call_turn(
+            "Write",
+            &json!({"file_path": "note.txt", "content": "rewritten\n"}),
+        ),
+        sse_text_turn("rewrote it"),
+    ]);
+    std::fs::write(sb.workdir().join("note.txt"), "garden wall\n").expect("note written");
+    let out = sb.dch(&["rewrite the note"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", lossy(&out.stderr));
+    assert_eq!(
+        std::fs::read_to_string(sb.workdir().join("note.txt")).expect("note readable"),
+        "rewritten\n",
+        "the write after an unchanged read lands"
+    );
+    let requests = sb.requests();
+    assert!(
+        !requests.iter().any(|body| body.contains("changed on disk")),
+        "no refusal rides any request: {requests:?}"
     );
 }
 
@@ -365,7 +434,7 @@ fn at21_lsp_resolves_a_definition() {
 }
 
 #[test]
-fn at22_accept_edits_headless_denies_shell() {
+fn at22_accept_edits_migrates_and_headless_denies_shell() {
     let sb = Sandbox::sse(vec![
         sse_tool_call_turn("Bash", &json!({"command": "touch pwned.txt"})),
         sse_text_turn("denied noted"),
@@ -379,8 +448,8 @@ fn at22_accept_edits_headless_denies_shell() {
     let requests = sb.requests();
     let follow_up = requests.get(1).expect("the denial came back to the model");
     assert!(
-        follow_up.contains("AcceptEdits") && follow_up.contains("Bash"),
-        "the unresolved ask reaches the model naming mode and tool: {follow_up}"
+        follow_up.contains("Interactive") && follow_up.contains("Bash"),
+        "the migrated mode names itself in the denial: {follow_up}"
     );
 }
 

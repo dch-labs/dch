@@ -285,8 +285,16 @@ mod tests {
         assert_eq!(common.base_path, ".");
         assert!(!common.case_insensitive);
         assert_eq!(common.max_results, DEFAULT_MAX_RESULTS);
-        assert!(common.include_patterns.is_empty());
-        assert!(common.exclude_patterns.is_empty());
+        assert_eq!(
+            common.include_patterns,
+            Vec::<String>::new(),
+            "Grep's filename filtering rides its own matcher, not the walk's"
+        );
+        assert_eq!(
+            common.exclude_patterns,
+            Vec::<String>::new(),
+            "the walk's exclusions are equally absent"
+        );
     }
 
     #[test]
