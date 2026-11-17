@@ -9987,28 +9987,29 @@ impl TuiApp {
             height: area.height.saturating_sub(STATUS_BAR_ROWS - STATUS_BAR_AIR),
             ..area
         };
+        let scope_line = (!sheet.always.is_empty())
+            .then(|| format!("a remembers: {}", sheet.always.join(" · ")));
+        let deny_line =
+            (!sheet.never.is_empty()).then(|| format!("d remembers: {}", sheet.never.join(" · ")));
+        let reason_line = sheet
+            .reason
+            .as_ref()
+            .map(|reason| format!("reason: {reason}▏"));
         if let Some(command) = &sheet.command {
             let runs = format!("runs: {command}");
             let rows = if self.permission_command_expanded {
-                let scope = if sheet.always.is_empty() {
-                    0
-                } else {
-                    FIXED_SCOPE_ROWS
-                };
-                let deny_scope = if sheet.never.is_empty() {
-                    0
-                } else {
-                    FIXED_DENY_ROWS
-                };
-                let reason = if sheet.reason.is_some() {
-                    FIXED_REASON_ROWS
-                } else {
-                    0
-                };
+                let blocks = [
+                    scope_line.as_deref(),
+                    deny_line.as_deref(),
+                    reason_line.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<&str>>();
                 let budget = expanded_command_budget(
                     sheet_area.height,
                     lines.len(),
-                    expanded_fixed_rows(scope | deny_scope | reason, &hints, wrap_at),
+                    expanded_fixed_rows(&blocks, &hints, wrap_at),
                 );
                 wrap_prompt_rows_last(&runs, wrap_at, budget)
             } else {
@@ -10019,24 +10020,21 @@ impl TuiApp {
                     .map(|row| Line::styled(row, Style::default().fg(self.theme.ui.primary))),
             );
         }
-        if !sheet.always.is_empty() {
-            let scope = format!("a remembers: {}", sheet.always.join(" · "));
+        if let Some(scope) = scope_line {
             lines.extend(
                 wrap_prompt_rows(&scope, wrap_at, MAX_OVERLAY_ROWS)
                     .into_iter()
                     .map(|row| Line::styled(row, Style::default().fg(self.theme.ui.secondary))),
             );
         }
-        if !sheet.never.is_empty() {
-            let scope = format!("d remembers: {}", sheet.never.join(" · "));
+        if let Some(scope) = deny_line {
             lines.extend(
                 wrap_prompt_rows(&scope, wrap_at, MAX_OVERLAY_ROWS)
                     .into_iter()
                     .map(|row| Line::styled(row, Style::default().fg(self.theme.ui.secondary))),
             );
         }
-        if let Some(reason) = &sheet.reason {
-            let typed = format!("reason: {reason}▏");
+        if let Some(typed) = reason_line {
             lines.extend(
                 wrap_prompt_rows(&typed, wrap_at, MAX_OVERLAY_ROWS)
                     .into_iter()
@@ -13893,23 +13891,24 @@ fn sheet_inner_height(sheet_height: u16) -> usize {
     usize::from(sheet_height.saturating_sub(2))
 }
 
-/// Which optional rows the sheet owes besides the prompt and preview.
-///
-/// A bit-set over the sheet's conditional rows, so the fixed-row
-/// count takes one argument instead of a bool per row — the pane's
-/// budget math reads as arithmetic, not flag soup.
-const FIXED_SCOPE_ROWS: usize = 1;
-const FIXED_DENY_ROWS: usize = 1 << 1;
-const FIXED_REASON_ROWS: usize = 1 << 2;
-
 /// The rows the sheet draws besides the prompt and the preview.
 ///
-/// The scopes, reason, blank spacer, and hint rows are counted here
-/// so the preview's budget spends only what remains; the hint wrap is
-/// measured rather than guessed, because a narrow pane wraps a long
-/// hint across several rows.
-fn expanded_fixed_rows(fixed: usize, hints: &str, wrap_at: usize) -> usize {
-    let rows = fixed.count_ones() as usize;
+/// `blocks` are the conditional rows the sheet may draw below the
+/// preview — the always-remember scope, the deny-remember scope, the
+/// reason draft — handed in as the strings the renderer will wrap, so
+/// the budget measures the rows those strings actually occupy, never
+/// a one-row guess per block. Each block is counted as the renderer
+/// appends it, wrapped to the pane and capped at the overlay's row
+/// ceiling, because a long scope or reason on a narrow pane occupies
+/// up to three rows; the blank spacer ahead of the hints and the
+/// hints themselves are counted the same measured way rather than
+/// guessed, because a narrow pane wraps a long hint across several
+/// rows too.
+fn expanded_fixed_rows(blocks: &[&str], hints: &str, wrap_at: usize) -> usize {
+    let rows = blocks
+        .iter()
+        .map(|block| wrap_prompt_rows(block, wrap_at, MAX_OVERLAY_ROWS).len())
+        .fold(0usize, usize::saturating_add);
     // The blank spacer ahead of the hints, then the hints themselves.
     let hint_rows = wrap_prompt_rows(hints, wrap_at, MAX_OVERLAY_ROWS).len();
     rows.saturating_add(1).saturating_add(hint_rows)
@@ -14075,14 +14074,22 @@ fn wrap_prompt_rows(text: &str, limit: usize, max_rows: usize) -> Vec<String> {
 /// The expanded command preview's shape: the *end* of a command is
 /// the half a collapsed head hides — the destructive suffix — so the
 /// kept rows are the wrap's last, with one leading ellipsis row
-/// naming the cut. Together the collapsed head and the expanded tail
-/// cover the whole of any command that fits the cap.
+/// naming the cut. The ellipsis counts inside `max_rows` — the
+/// ceiling is the caller's row budget, and the return never exceeds
+/// it — so an overflowing text yields the ellipsis plus `max_rows - 1`
+/// tail rows, while a text that fits returns its own rows unchanged.
+/// Together the collapsed head and the expanded tail cover the whole
+/// of any command that fits the cap.
 fn wrap_prompt_rows_last(text: &str, limit: usize, max_rows: usize) -> Vec<String> {
     let rows = wrap_rows(text, limit);
     if rows.len() <= max_rows {
         return rows;
     }
-    let skip = rows.len().saturating_sub(max_rows);
+    let keep = max_rows.saturating_sub(1);
+    if keep == 0 {
+        return vec!["…".to_string()];
+    }
+    let skip = rows.len().saturating_sub(keep);
     let mut kept: Vec<String> = rows.into_iter().skip(skip).collect();
     kept.insert(0, "…".to_string());
     kept
@@ -20023,15 +20030,17 @@ mod tests {
     fn an_expanded_preview_spends_only_the_rows_the_sheet_has() {
         // The budget is the sheet's inner height minus the prompt rows
         // drawn and the fixed rows owed (scopes, reason, spacer,
-        // hints), floored at one so a cramped pane still shows the
-        // preview's first line, and capped at the standing ceiling so
-        // a tall pane does not hand an enormous command the sheet.
+        // hints — each block measured at its wrapped length), floored
+        // at one so a cramped pane still shows the preview's first
+        // line, and capped at the standing ceiling so a tall pane does
+        // not hand an enormous command the sheet.
         let hints = "y allows · n or esc denies · e expands";
-        let fixed = expanded_fixed_rows(
-            FIXED_SCOPE_ROWS | FIXED_DENY_ROWS | FIXED_REASON_ROWS,
-            hints,
-            80,
-        );
+        let blocks = [
+            "a remembers: cargo build",
+            "d remembers: rm",
+            "reason: ship it▏",
+        ];
+        let fixed = expanded_fixed_rows(&blocks, hints, 80);
         // A tall sheet: everything fits, the ceiling binds.
         assert_eq!(
             expanded_command_budget(100, 3, fixed),
@@ -20058,6 +20067,83 @@ mod tests {
             expanded_command_budget(6, 3, fixed),
             1,
             "a cramped pane still shows the preview's first line"
+        );
+    }
+
+    #[test]
+    fn an_overflowing_preview_keeps_its_ellipsis_row_inside_the_budget() {
+        // The wrapper's row ceiling includes its own ellipsis row: a
+        // command whose wrap runs past the budget returns exactly the
+        // budget's rows — the ellipsis and the budget's remaining tail
+        // rows — so prompt, preview, and fixed rows fill the sheet
+        // exactly and the final hint row is never clipped. A wrap that
+        // fits the budget, exactly or with room, returns its own rows
+        // unchanged.
+        let wrap_at = 10;
+        let budget = 3;
+        let fits = "aa bb cc";
+        assert_eq!(
+            wrap_prompt_rows_last(fits, wrap_at, budget).len(),
+            1,
+            "a short command returns its own single row"
+        );
+        let exact = "aa bb cc dd ee ff gg hh ii";
+        assert_eq!(
+            wrap_prompt_rows_last(exact, wrap_at, budget).len(),
+            budget,
+            "a wrap that exactly spends the budget returns it whole"
+        );
+        let overflowing = "aa bb cc dd ee ff gg hh ii jj kk ll";
+        let rows = wrap_prompt_rows_last(overflowing, wrap_at, budget);
+        assert_eq!(
+            rows.len(),
+            budget,
+            "the ellipsis row is counted inside the budget, never added on top of it"
+        );
+        assert_eq!(
+            rows.first().map(String::as_str),
+            Some("…"),
+            "the cut is named where the reader's eye lands"
+        );
+        // The sheet-level composition the budget exists for: with the
+        // prompt drawn and the fixed rows owed, an overflowing command
+        // still leaves the sheet's total at or under its inner height.
+        let hints = "y allows · n or esc denies · e expands";
+        let blocks = ["a remembers: cargo build", "d remembers: rm"];
+        let fixed = expanded_fixed_rows(&blocks, hints, 80);
+        let sheet_prompt_rows = 3;
+        let budget = expanded_command_budget(20, sheet_prompt_rows, fixed);
+        let preview = wrap_prompt_rows_last(overflowing, 80, budget);
+        assert!(
+            sheet_prompt_rows + fixed + preview.len() <= usize::from(20u16.saturating_sub(2)),
+            "prompt, fixed rows, and an overflowing preview stay inside the sheet's inner height"
+        );
+    }
+
+    #[test]
+    fn multi_row_blocks_are_counted_at_their_wrapped_length() {
+        // The fixed-rows measurement must count what the renderer
+        // appends: a long scope on a narrow pane wraps to the overlay's
+        // row ceiling, and a one-row-per-block guess would hand the
+        // preview rows the sheet has already spent — pushing scope text
+        // and hints past the sheet's bottom edge.
+        let hints = "y allows · n or esc denies";
+        let narrow = 20;
+        let long_scope = "a remembers: cargo build --workspace --quiet · repeated again and again";
+        let blocks = [long_scope, "d remembers: rm"];
+        let wrapped_scope = wrap_prompt_rows(long_scope, narrow, MAX_OVERLAY_ROWS);
+        assert!(
+            wrapped_scope.len() > 1,
+            "the fixture genuinely wraps — a one-row block could never pin the undercount"
+        );
+        let measured = expanded_fixed_rows(&blocks, hints, narrow);
+        let by_hand = wrapped_scope.len()
+            + wrap_prompt_rows("d remembers: rm", narrow, MAX_OVERLAY_ROWS).len()
+            + 1
+            + wrap_prompt_rows(hints, narrow, MAX_OVERLAY_ROWS).len();
+        assert_eq!(
+            measured, by_hand,
+            "each block counts at the length its wrap will render at"
         );
     }
 

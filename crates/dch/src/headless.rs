@@ -279,8 +279,10 @@ pub(crate) fn capture_marker_mode(
 /// and the done-file written before the naming task is waited on, and
 /// the transcript save waits only [`NAMING_SETTLE_BUDGET`] for a title
 /// still pending. `saver_root` overrides
-/// where the session transcript is written; `None` uses the user's
-/// sessions directory. `control` carries the resume resolution — a
+/// where the session transcript is written and where a resumed
+/// session's remembered permissions restore from; `None` uses the
+/// user's sessions directory for both. `control` carries the resume
+/// resolution — a
 /// degradation warning prints to stderr before anything else runs.
 /// The session id resolves before the run bridge is armed so every
 /// marker written from that point — the run's own and the force
@@ -321,7 +323,14 @@ async fn run_headless_inner(
             }
         }
     }
-    let built = match construct_run(args, inherited_mode.as_ref(), &control).await {
+    let built = match construct_run(
+        args,
+        inherited_mode.as_ref(),
+        &control,
+        saver_root.as_deref(),
+    )
+    .await
+    {
         Ok(built) => built,
         Err(outcome) => {
             startup_bridge.stop().await;
@@ -376,20 +385,10 @@ async fn run_headless_inner(
         crate::resume::ResumeControl::Resumed(outcome) => outcome.messages.clone(),
         crate::resume::ResumeControl::Fresh { .. } => Vec::new(),
     };
-    let naming = if saver.title().is_none() {
-        let naming_api = api.clone();
-        let naming_prompt = crate::messages::naming_subject(&runner.committed_history(), &prompt);
-        Some(tokio::spawn(async move {
-            tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                dch_loop::session_title(&naming_api, &naming_prompt),
-            )
-            .await
-            .unwrap_or_default()
-        }))
-    } else {
-        None
-    };
+    let naming = saver
+        .title()
+        .is_none()
+        .then(|| arm_naming_task(&api, &runner.committed_history(), &prompt));
     let result = runner.run(&prompt).await;
     let turn_outputs = runner.session_turn_outputs();
     let outcome = match &result {
@@ -456,6 +455,31 @@ async fn run_headless_inner(
 /// save, and the exit for as long as its own 30-second request
 /// timeout.
 const NAMING_SETTLE_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Arm the session's one-shot naming side call.
+///
+/// Fires beside the run — the session's own provider, its thinking
+/// budget stripped, no tools — so the title can land while the run
+/// works, bounded by the spawn's own request timeout;
+/// [`settle_naming`] decides how long the outcome waits on it. The
+/// subject coins from the conversation's first user prompt, the arming
+/// prompt standing in for the fresh session that has no history yet.
+fn arm_naming_task(
+    api: &dch_config::ApiConfig,
+    history: &[loopctl::message::Message],
+    prompt: &str,
+) -> tokio::task::JoinHandle<Option<String>> {
+    let naming_api = api.clone();
+    let naming_prompt = crate::messages::naming_subject(history, prompt);
+    tokio::spawn(async move {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            dch_loop::session_title(&naming_api, &naming_prompt),
+        )
+        .await
+        .unwrap_or_default()
+    })
+}
 
 /// Resolve the naming task into a title under `budget`.
 ///
@@ -639,16 +663,24 @@ struct ConstructedRun {
 /// the outcome leaves this function. A resumed `control` shapes the
 /// construction: the agent's history starts from the restored
 /// conversation, on the current configuration's model and provider —
-/// the saved model is provenance for the listing.
+/// the saved model is provenance for the listing — and its remembered
+/// permissions restore from the same sessions root the transcript
+/// saves into (`saver_root` when the host injected one, the user's
+/// default otherwise). A restore that failed closed refuses the run
+/// outright: a headless continuation has no one to ask, and the
+/// refusals a damaged file hid cannot be trusted to run unattended —
+/// the TUI keeps its `/permissions repair` door.
 ///
 /// # Errors
 ///
 /// Returns the construction-phase failure outcome when the prompt,
-/// config, working directory, or agent construction fails.
+/// config, working directory, or agent construction fails — and when a
+/// resumed session's permissions restore stands damaged.
 async fn construct_run(
     args: &Args,
     inherited_mode: Option<&std::fs::Permissions>,
     control: &crate::resume::ResumeControl,
+    saver_root: Option<&std::path::Path>,
 ) -> Result<ConstructedRun, HeadlessOutcome> {
     let prompt = resolve_prompt_nonblocking(args)
         .await
@@ -685,9 +717,27 @@ async fn construct_run(
             outcome,
             config.security.redact_secrets,
         ));
-        let saver =
-            crate::session::SessionSaver::with_model(outcome.session_id, config.api.model.clone());
+        let saver = match saver_root {
+            Some(root) => crate::session::SessionSaver::with_base_dir(
+                outcome.session_id,
+                config.api.model.clone(),
+                root.to_path_buf(),
+            ),
+            None => crate::session::SessionSaver::with_model(
+                outcome.session_id,
+                config.api.model.clone(),
+            ),
+        };
         let memory = resumed_permission_memory(&saver);
+        if memory.damage_standing() {
+            let message = format!(
+                "resumed session {} carries a damaged permissions file — its remembered \
+                 refusals cannot be trusted to run unattended; resume it in the TUI and \
+                 run /permissions repair",
+                outcome.session_id
+            );
+            return Err(construction_failure(args, message, inherited_mode));
+        }
         let snapshot: dch_loop::MemorySnapshot = std::sync::Arc::new(move || memory.snapshot());
         builder = builder.with_permission_memory(snapshot);
     }
@@ -1144,9 +1194,10 @@ fn outcome_after_delivery(run: &Run, delivery: std::io::Result<()>) -> HeadlessO
 /// The TUI resume path's equal: without them a headless continuation
 /// would start from an empty memory and re-run exactly the work the
 /// session's own "never" answers had banned. A damaged restore adopts
-/// nothing and stands damaged — the headless posture already denies
-/// every uncovered side effect, so the fail-closed verdict changes no
-/// verdict it did not already carry.
+/// nothing and stands damaged — the verdict lives on the memory, and
+/// the caller refuses the run on it, because the snapshot the runner
+/// carries exports only the rule lists and a headless run has no one
+/// to ask.
 fn resumed_permission_memory(saver: &crate::session::SessionSaver) -> dch_tui::PermissionMemory {
     let restored = saver.load_permissions();
     let damage_stands = restored.damage_stands();
@@ -1574,6 +1625,130 @@ mod tests {
         assert!(
             memory.allow_rules().is_empty() && memory.deny_rules().is_empty(),
             "the damaged restore adopts no lists"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_damaged_permissions_restore_refuses_the_headless_run() {
+        // The fail-open this round closed, pinned end to end: the
+        // snapshot the runner carries exports only the rule lists, so
+        // the damage verdict must be read where it lives — at
+        // construction, against the sessions root the run actually
+        // saves into. The damaged marker sits only in the injected
+        // root, so the refusal also proves that root is the one
+        // consulted; the done-file carries the failure an orchestrator
+        // polls for instead of a run whose remembered refusals
+        // quietly vanished under the auto mode's allows.
+        let _signal_lock = SIGNAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "[api]\nmodel = \"test-model\"\n").unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let done = dir.path().join("done.json");
+        let id = uuid::Uuid::new_v4();
+        crate::session::SessionSaver::with_base_dir(
+            id,
+            "test-model".to_string(),
+            sessions.path().to_path_buf(),
+        )
+        .save_permissions(&[], &[], true)
+        .expect("the damaged marker saves");
+        let args = parse(&[
+            "continue the work",
+            "--config",
+            config_path.to_str().unwrap(),
+            "--done-file",
+            done.to_str().unwrap(),
+        ]);
+        let control = crate::resume::ResumeControl::Resumed(crate::resume::ResumeOutcome {
+            session_id: id,
+            model: "test-model".to_string(),
+            permission_mode: None,
+            messages: Vec::new(),
+            tokens: crate::session::SessionTokens::default(),
+            machine: None,
+            machine_compactions: 0,
+            title: None,
+        });
+        let code = run_headless_rooted(
+            &args,
+            crate::signals::install_construction_handler(|| {}),
+            sessions.path().to_path_buf(),
+            control,
+        )
+        .await;
+        assert_eq!(
+            code, 1,
+            "a damaged restore refuses the headless run before any work runs"
+        );
+        let status: DoneStatus =
+            serde_json::from_str(&std::fs::read_to_string(&done).unwrap()).unwrap();
+        assert!(!status.success, "the refusal is the recorded outcome");
+        assert!(
+            status
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("damaged")),
+            "the refusal names the damage: {:?}",
+            status.message
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_healthy_permissions_restore_rides_the_injected_root() {
+        // The root threading's healthy side: a sibling carrying a real
+        // remembered pair under the injected root loads without a
+        // refusal and the continuation completes — the door the damaged
+        // test proves closed opens on nothing else.
+        let _signal_lock = SIGNAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let server = TurnServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, server.config_toml()).unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let id = uuid::Uuid::new_v4();
+        crate::session::SessionSaver::with_base_dir(
+            id,
+            "test-model".to_string(),
+            sessions.path().to_path_buf(),
+        )
+        .save_permissions(
+            &[dch_tui::PermissionRule::ShellPrefix {
+                prefix: "cargo test".to_string(),
+            }],
+            &[dch_tui::PermissionRule::Tool {
+                tool: "WebFetch".to_string(),
+            }],
+            false,
+        )
+        .expect("the healthy pair saves");
+        let args = parse(&["continue", "--config", config_path.to_str().unwrap()]);
+        let control = crate::resume::ResumeControl::Resumed(crate::resume::ResumeOutcome {
+            session_id: id,
+            model: "test-model".to_string(),
+            permission_mode: None,
+            messages: Vec::new(),
+            tokens: crate::session::SessionTokens::default(),
+            machine: None,
+            machine_compactions: 0,
+            title: None,
+        });
+        let code = run_headless_rooted(
+            &args,
+            crate::signals::install_construction_handler(|| {}),
+            sessions.path().to_path_buf(),
+            control,
+        )
+        .await;
+        assert_eq!(
+            code, 0,
+            "a healthy restore from the injected root runs the continuation"
         );
     }
 
