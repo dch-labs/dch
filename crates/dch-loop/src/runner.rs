@@ -3522,7 +3522,7 @@ mod tests {
             .system_prompt
             .as_deref()
             .expect("system_prompt is composed");
-        assert!(!prompt.is_empty());
+        assert_ne!(prompt, "", "the composed system prompt carries a body");
         // Default role is General; its body must be present.
         assert!(
             prompt.contains("YOUR ROLE: GENERAL ASSISTANCE"),
@@ -4078,10 +4078,7 @@ mod tests {
         }
 
         fn snapshot(&self) -> Vec<&'static str> {
-            self.events
-                .lock()
-                .map(|events| events.clone())
-                .unwrap_or_default()
+            self.events.lock().map_or_default(|events| events.clone())
         }
     }
 
@@ -4141,11 +4138,7 @@ mod tests {
     }
 
     fn recorded_requests(server: &SseServer) -> Vec<String> {
-        server
-            .requests
-            .lock()
-            .map(|reqs| reqs.clone())
-            .unwrap_or_default()
+        server.requests.lock().map_or_default(|reqs| reqs.clone())
     }
 
     /// The roles of every message in a recorded request whose text
@@ -4160,7 +4153,7 @@ mod tests {
         parsed
             .get("messages")
             .and_then(serde_json::Value::as_array)
-            .map(|messages| {
+            .map_or_default(|messages| {
                 messages
                     .iter()
                     .filter(|message| {
@@ -4178,7 +4171,6 @@ mod tests {
                     })
                     .collect()
             })
-            .unwrap_or_default()
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -8047,11 +8039,10 @@ mod tests {
         let message_text = |message: &serde_json::Value| -> String {
             message
                 .get("content")
-                .map(|content| match content.as_str() {
+                .map_or_default(|content| match content.as_str() {
                     Some(text) => text.to_string(),
                     None => content.to_string(),
                 })
-                .unwrap_or_default()
         };
         let reminder_at_tail = second[first.len()..].iter().any(|message| {
             message.get("role").and_then(|role| role.as_str()) == Some("user")

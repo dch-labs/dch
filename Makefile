@@ -8,7 +8,7 @@ BUILD_DIR_MACOS := target/$(TARGET_MACOS)/release
 ZIG            ?= zig
 MACOS_SDK_PATH ?= /home/dch/MacOSX-SDKs/MacOSX14.5.sdk
 
-.PHONY: build check test clippy fmt run lint docs examples boundary nodefault release-check smoke ci help static macos strip macos-strip install check-zig check-target check-macos-target check-macos-sdk check-openssl
+.PHONY: build check test clippy fmt run lint docs boundary nodefault release-check smoke ci help static macos strip macos-strip install check-zig check-target check-macos-target check-macos-sdk check-openssl
 
 ## build: Build the whole workspace (debug, all features)
 build:
@@ -41,10 +41,6 @@ run:
 ## docs: Build rustdoc, treating warnings as errors (matches CI)
 docs:
 	RUSTDOCFLAGS="-D warnings" $(CARGO) doc --no-deps $(ALL_FEATURES)
-
-## examples: Build all examples
-examples:
-	$(CARGO) build --examples $(ALL_FEATURES)
 
 ## boundary: Enforce the crate-boundary rules
 boundary:
@@ -134,8 +130,8 @@ check-openssl:
 	fi
 	@echo "✅ no openssl-sys in the dependency graph"
 
-## ci: Run the full local CI gate (fmt, clippy, test, docs, examples, boundary, nodefault, openssl)
-ci: fmt clippy test docs examples boundary nodefault check-openssl
+## ci: Run the full local CI gate (fmt, clippy, test, docs, boundary, nodefault, openssl)
+ci: fmt clippy test docs boundary nodefault check-openssl
 	@echo "✅ CI passed locally"
 
 ## help: Show this help

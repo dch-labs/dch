@@ -646,17 +646,10 @@ mod tests {
         // without landing on it.
         let art = art(34, 9, include_str!("fjord_splash_w34.txt"), false);
         let canvas = Color::Rgb(14, 14, 14);
-        let before = art
-            .lines
-            .first()
-            .map(|line| line.spans.clone())
-            .unwrap_or_default();
+        let before = art.lines.first().map_or_default(|line| line.spans.clone());
         let mut faded = art.lines.clone();
         dissolve_edges(&mut faded, canvas);
-        let row = faded
-            .first()
-            .map(|line| line.spans.clone())
-            .unwrap_or_default();
+        let row = faded.first().map_or_default(|line| line.spans.clone());
         let outer = row
             .first()
             .map(|span| (span.content.as_ref(), span.style.fg, span.style.bg));

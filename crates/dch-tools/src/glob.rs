@@ -403,7 +403,11 @@ mod tests {
     fn collect_matches_empty_dir_returns_empty() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let ov = matcher("**/*.rs");
-        assert!(collect_matches(tmp.path(), &ov).is_empty());
+        assert_eq!(
+            collect_matches(tmp.path(), &ov),
+            Vec::<String>::new(),
+            "an empty tree matches nothing"
+        );
     }
 }
 

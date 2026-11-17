@@ -204,8 +204,7 @@ fn get_job(id: u64) -> Option<BackgroundJob> {
 fn list_jobs() -> Vec<BackgroundJob> {
     JOB_TABLE
         .lock()
-        .map(|t| t.values().cloned().collect())
-        .unwrap_or_default()
+        .map_or_default(|t| t.values().cloned().collect())
 }
 
 /// Remove terminal jobs (completed or failed) from the table.

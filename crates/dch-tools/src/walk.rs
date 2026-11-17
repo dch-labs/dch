@@ -29,7 +29,7 @@ use std::path::Path;
 ///
 /// Returns each matched file as an `ignore::DirEntry` (not directories, not
 /// symlinked-into files).
-#[must_use]
+#[must_use = "the walker is lazy — collect or iterate it to walk anything"]
 pub fn walk_files(
     base: &Path,
     include_patterns: &[String],
@@ -465,8 +465,7 @@ mod tests {
             .map(|e| {
                 e.path()
                     .strip_prefix(base)
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_default()
+                    .map_or_default(|p| p.to_string_lossy().into_owned())
             })
             .collect();
         out.sort();
@@ -599,8 +598,7 @@ mod tests {
                 let rel = e
                     .path
                     .strip_prefix(base)
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_default();
+                    .map_or_default(|p| p.to_string_lossy().into_owned());
                 (rel, e.is_dir)
             })
             .collect();

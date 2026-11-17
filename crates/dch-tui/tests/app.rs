@@ -160,8 +160,12 @@ fn painted_caret_col(
 fn new_constructs_with_empty_fresh_state() {
     let app = app();
 
-    assert!(app.conversation().is_empty());
-    assert!(app.input().is_empty());
+    assert_eq!(
+        app.conversation(),
+        Vec::new(),
+        "a fresh app holds no conversation rows"
+    );
+    assert_eq!(app.input(), "", "the composer holds nothing");
     assert_eq!(app.scroll_offset(), 0);
     assert!(!app.is_quitting());
 
@@ -303,7 +307,7 @@ fn enter_submits_appends_and_clears() {
     app.handle_event(&plain(KeyCode::PageUp));
     assert!(app.handle_event(&plain(KeyCode::Enter)));
 
-    assert!(app.input().is_empty());
+    assert_eq!(app.input(), "", "the composer holds nothing");
     assert_eq!(app.conversation().len(), 1);
     match app.conversation().first() {
         Some(TuiMessage::User { text, .. }) => assert_eq!(text, "hi"),
@@ -1054,7 +1058,7 @@ fn key_releases_are_ignored() {
         KeyEventKind::Release,
     ));
     assert!(!app.handle_event(&release));
-    assert!(app.input().is_empty());
+    assert_eq!(app.input(), "", "the composer holds nothing");
 
     let repeat = Event::Key(KeyEvent::new_with_kind(
         KeyCode::Char('a'),
@@ -1062,7 +1066,7 @@ fn key_releases_are_ignored() {
         KeyEventKind::Repeat,
     ));
     assert!(!app.handle_event(&repeat));
-    assert!(app.input().is_empty());
+    assert_eq!(app.input(), "", "the composer holds nothing");
 }
 
 #[test]

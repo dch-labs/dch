@@ -471,11 +471,10 @@ where
 {
     serde_json::to_value(value)
         .ok()
-        .map(|value| match value.as_str() {
+        .map_or_default(|value| match value.as_str() {
             Some(text) => text.to_string(),
             None => value.to_string(),
         })
-        .unwrap_or_default()
 }
 
 /// Render an optional scalar: its value or `unset` when absent.
@@ -488,13 +487,14 @@ where
     T: serde::Serialize,
 {
     match value {
-        Some(value) => serde_json::to_value(value)
-            .ok()
-            .map(|value| match value.as_str() {
-                Some(text) => text.to_string(),
-                None => value.to_string(),
-            })
-            .unwrap_or_default(),
+        Some(value) => {
+            serde_json::to_value(value)
+                .ok()
+                .map_or_default(|value| match value.as_str() {
+                    Some(text) => text.to_string(),
+                    None => value.to_string(),
+                })
+        }
         None => "unset".to_string(),
     }
 }

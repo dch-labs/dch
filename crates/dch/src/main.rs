@@ -261,20 +261,19 @@ fn main() -> std::process::ExitCode {
         });
     runtime.block_on(async move {
         if let Some(limit) = args.list_sessions {
-            resume::run_list_sessions(limit)
+            resume::run_list_sessions(limit);
+        }
+        let control = resume::resolve_resume(&args);
+        if wants_headless(&args) {
+            let startup_args = args.clone();
+            let startup_mode = headless::capture_marker_mode(args.done_file.as_ref());
+            let startup_bridge = signals::install_construction_handler(move || {
+                headless::write_startup_done_file(&startup_args, startup_mode.as_ref());
+            });
+            let code = headless::run_headless(&args, startup_bridge, control).await;
+            std::process::ExitCode::from(code)
         } else {
-            let control = resume::resolve_resume(&args);
-            if wants_headless(&args) {
-                let startup_args = args.clone();
-                let startup_mode = headless::capture_marker_mode(args.done_file.as_ref());
-                let startup_bridge = signals::install_construction_handler(move || {
-                    headless::write_startup_done_file(&startup_args, startup_mode.as_ref());
-                });
-                let code = headless::run_headless(&args, startup_bridge, control).await;
-                std::process::ExitCode::from(code)
-            } else {
-                std::process::ExitCode::from(Box::pin(tui::run_tui(&args, control)).await)
-            }
+            std::process::ExitCode::from(Box::pin(tui::run_tui(&args, control)).await)
         }
     })
 }

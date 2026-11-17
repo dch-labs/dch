@@ -294,7 +294,7 @@ mod tests {
         let got = ctx.get_extension::<RunnerContext>();
         assert!(got.is_some());
         assert_eq!(
-            got.map(|r| r.cwd.clone()).unwrap_or_default(),
+            got.map_or_default(|r| r.cwd.clone()),
             PathBuf::from("/tmp/workspace")
         );
     }

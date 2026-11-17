@@ -2985,7 +2985,11 @@ redact_secrets = false
     #[test]
     fn present_but_empty_mcp_section_parses_as_no_servers() {
         let c: DchConfig = toml::from_str("[mcp]\n").unwrap();
-        assert!(c.mcp.servers.is_empty());
+        assert_eq!(
+            c.mcp.servers,
+            Vec::new(),
+            "the section's presence alone configures no servers"
+        );
     }
 
     #[test]
@@ -3343,7 +3347,11 @@ tool = "WebFetch"
             config.permissions.rules.is_empty(),
             "the section is optional; its absence configures nothing"
         );
-        assert!(config.permissions.compiled().is_empty());
+        assert_eq!(
+            config.permissions.compiled(),
+            Vec::new(),
+            "the section is optional; its absence configures nothing"
+        );
     }
 
     #[test]

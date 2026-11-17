@@ -5284,10 +5284,7 @@ mod tests {
         /// bodies say what they carried, which is what a pin needs to
         /// show that a piece of text was *not* among them.
         fn bodies(&self) -> Vec<String> {
-            self.requests
-                .lock()
-                .map(|reqs| reqs.clone())
-                .unwrap_or_default()
+            self.requests.lock().map_or_default(|reqs| reqs.clone())
         }
 
         /// The body of every naming request received, oldest first.
@@ -5298,8 +5295,7 @@ mod tests {
         fn naming_bodies(&self) -> Vec<String> {
             self.naming_requests
                 .lock()
-                .map(|reqs| reqs.clone())
-                .unwrap_or_default()
+                .map_or_default(|reqs| reqs.clone())
         }
     }
 

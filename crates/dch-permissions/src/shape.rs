@@ -1144,13 +1144,12 @@ pub fn write_family_targets(tool_name: &str, input: &Value) -> Vec<String> {
             input
                 .get(EDITS_FIELD)
                 .and_then(|value| value.as_array())
-                .map(|edits| {
+                .map_or_default(|edits| {
                     edits
                         .iter()
                         .filter_map(|edit| edit_target(edit, batch_default.as_deref()))
                         .collect()
                 })
-                .unwrap_or_default()
         }
         _ => Vec::new(),
     }

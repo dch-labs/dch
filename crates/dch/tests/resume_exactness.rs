@@ -99,7 +99,7 @@ fn a_tool_marathon_session_resumes_through_compaction() {
 /// Compaction precedes the request, so the head of the recorded
 /// stream is the compacted follow-up the pin measures.
 fn first_request(requests: &[String]) -> &str {
-    requests.first().map(String::as_str).unwrap_or_default()
+    requests.first().map_or_default(String::as_str)
 }
 
 /// The one saved session id under the sandbox's isolated home.

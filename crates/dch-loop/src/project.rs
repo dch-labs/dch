@@ -446,8 +446,16 @@ mod tests {
     #[test]
     fn empty_root_yields_no_profiles() {
         let tmp = tempfile::TempDir::new().unwrap();
-        assert!(detect_tech_stack(tmp.path()).is_empty());
-        assert!(render_techs(&[], None).is_empty());
+        assert_eq!(
+            detect_tech_stack(tmp.path()),
+            Vec::<TechProfile>::new(),
+            "an empty root names no tech"
+        );
+        assert_eq!(
+            render_techs(&[], None),
+            String::new(),
+            "and renders as nothing at all"
+        );
     }
 
     #[test]
@@ -695,7 +703,11 @@ mod tests {
             suggested_role: Some(Role::General),
             languages: vec![],
         };
-        assert!(analysis.tech_profiles().is_empty());
+        assert_eq!(
+            analysis.tech_profiles(),
+            Vec::<TechProfile>::new(),
+            "a lint-only intent names no tech stack"
+        );
     }
 
     #[test]

@@ -448,7 +448,7 @@ fn message_roles(request: &str, needle: &str) -> Vec<String> {
     parsed
         .get("messages")
         .and_then(serde_json::Value::as_array)
-        .map(|messages| {
+        .map_or_default(|messages| {
             messages
                 .iter()
                 .filter(|message| {
@@ -466,5 +466,4 @@ fn message_roles(request: &str, needle: &str) -> Vec<String> {
                 })
                 .collect()
         })
-        .unwrap_or_default()
 }

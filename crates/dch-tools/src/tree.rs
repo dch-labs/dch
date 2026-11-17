@@ -181,7 +181,7 @@ fn filter_entries(
     include_files: bool,
     pattern: Option<&str>,
 ) -> Vec<WalkEntry> {
-    let pat_vec: Vec<String> = pattern.map(|p| vec![p.to_string()]).unwrap_or_default();
+    let pat_vec: Vec<String> = pattern.map_or_default(|p| vec![p.to_string()]);
     entries
         .into_iter()
         .filter(|e| {

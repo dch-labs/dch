@@ -5536,8 +5536,7 @@ impl TuiApp {
                 let reason = self
                     .permission_reason
                     .take()
-                    .map(|buffer| buffer.trim().to_string())
-                    .unwrap_or_default();
+                    .map_or_default(|buffer| buffer.trim().to_string());
                 let resolution = if reason.is_empty() {
                     PermissionResolution::DenyOnce
                 } else {
@@ -5694,8 +5693,7 @@ impl TuiApp {
                 .find(|index| *index < free_row)
                 .and_then(|index| entry.prompt.options.get(index))
                 .or_else(|| entry.prompt.options.get(ui.cursor))
-                .map(|option| vec![option.label.clone()])
-                .unwrap_or_default()
+                .map_or_default(|option| vec![option.label.clone()])
         }
     }
 
@@ -20376,7 +20374,11 @@ mod tests {
             prefix: "cargo test".to_string(),
         }]);
         app.set_permission_memory(memory.clone());
-        assert!(app.config.permissions.rules.is_empty());
+        assert_eq!(
+            app.config.permissions.rules,
+            Vec::new(),
+            "the fresh app carries no configured rules"
+        );
 
         app.permissions_command(Some("forget 0"));
 
@@ -21042,9 +21044,7 @@ mod tests {
         );
         assert_eq!(
             app.theme.name,
-            Theme::by_name(&first)
-                .map(|theme| theme.name)
-                .unwrap_or_default(),
+            Theme::by_name(&first).map_or_default(|theme| theme.name),
             "the palette previews the row the first Tab applied"
         );
         assert!(
@@ -21113,9 +21113,7 @@ mod tests {
         );
         assert_eq!(
             app.theme.name,
-            Theme::by_name(&second)
-                .map(|theme| theme.name)
-                .unwrap_or_default(),
+            Theme::by_name(&second).map_or_default(|theme| theme.name),
             "the palette previews the landed row"
         );
         assert!(
@@ -21142,9 +21140,7 @@ mod tests {
         );
         assert_eq!(
             app.theme.name,
-            Theme::by_name(&first)
-                .map(|theme| theme.name)
-                .unwrap_or_default(),
+            Theme::by_name(&first).map_or_default(|theme| theme.name),
             "the palette previews the row the composer names"
         );
     }
@@ -21277,9 +21273,7 @@ mod tests {
         assert!(app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
         assert_eq!(
             app.theme.name,
-            Theme::by_name(&third)
-                .map(|theme| theme.name)
-                .unwrap_or_default(),
+            Theme::by_name(&third).map_or_default(|theme| theme.name),
             "the arrows previewed the third theme"
         );
         // Backspace out of the applied row and past the space: the
@@ -21353,9 +21347,7 @@ mod tests {
         );
         assert_eq!(
             app.theme.name,
-            Theme::by_name(&second)
-                .map(|theme| theme.name)
-                .unwrap_or_default(),
+            Theme::by_name(&second).map_or_default(|theme| theme.name),
             "the palette previews the highlighted row, not the theme the browse started from"
         );
         assert!(
@@ -21390,9 +21382,7 @@ mod tests {
         );
         assert_eq!(
             app.theme.name,
-            Theme::by_name(&third)
-                .map(|theme| theme.name)
-                .unwrap_or_default(),
+            Theme::by_name(&third).map_or_default(|theme| theme.name),
             "the preview follows the arrow-landed row"
         );
         // Tab continues from the arrow's position — the shared cycle —
@@ -21417,9 +21407,7 @@ mod tests {
         assert!(app.handle_key(up));
         assert_eq!(
             app.theme.name,
-            Theme::by_name(&last)
-                .map(|theme| theme.name)
-                .unwrap_or_default(),
+            Theme::by_name(&last).map_or_default(|theme| theme.name),
             "Up from the fresh highlight wraps to the last row"
         );
         assert_eq!(
@@ -21431,9 +21419,7 @@ mod tests {
         assert!(app.handle_key(down));
         assert_eq!(
             app.theme.name,
-            Theme::by_name(&last)
-                .map(|theme| theme.name)
-                .unwrap_or_default(),
+            Theme::by_name(&last).map_or_default(|theme| theme.name),
             "Up then Down returns to the last row (Up wrapped, Down stepped back)"
         );
         assert!(
@@ -21457,9 +21443,7 @@ mod tests {
         assert!(app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
         assert_eq!(
             app.theme.name,
-            Theme::by_name(&second)
-                .map(|theme| theme.name)
-                .unwrap_or_default(),
+            Theme::by_name(&second).map_or_default(|theme| theme.name),
             "the arrow lands on the second row — the preview proves the position"
         );
         assert!(app.complete_command_line(false));
@@ -21509,9 +21493,7 @@ mod tests {
         assert!(app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
         assert_eq!(
             app.theme.name,
-            Theme::by_name(&third)
-                .map(|theme| theme.name)
-                .unwrap_or_default(),
+            Theme::by_name(&third).map_or_default(|theme| theme.name),
             "the step continues from the cycle's position in the fresh list"
         );
     }
@@ -21638,8 +21620,7 @@ mod tests {
         let notice = app
             .transient_notice
             .as_ref()
-            .map(|(text, _)| text.clone())
-            .unwrap_or_default();
+            .map_or_default(|(text, _)| text.clone());
         assert!(
             !notice.is_empty() && !notice.contains("more") && !notice.contains(','),
             "the notice is the chosen value alone, no list, no tally: {notice}"
@@ -21653,8 +21634,7 @@ mod tests {
         let silent = theme_app
             .transient_notice
             .as_ref()
-            .map(|(text, _)| text.clone())
-            .unwrap_or_default();
+            .map_or_default(|(text, _)| text.clone());
         assert!(
             silent.is_empty(),
             "a theme completion posts no notice — the preview is the feedback: {silent}"
@@ -22148,8 +22128,7 @@ mod tests {
         let notice = app
             .transient_notice
             .as_ref()
-            .map(|(text, _)| text.clone())
-            .unwrap_or_default();
+            .map_or_default(|(text, _)| text.clone());
         assert!(
             notice.contains("multi-byte"),
             "the loss is named honestly: {notice:?}"
@@ -22167,8 +22146,7 @@ mod tests {
         let notice = app
             .transient_notice
             .as_ref()
-            .map(|(text, _)| text.clone())
-            .unwrap_or_default();
+            .map_or_default(|(text, _)| text.clone());
         assert!(
             notice.contains("was consumed") && !notice.contains("multi-byte"),
             "a control byte is named as itself: {notice:?}"

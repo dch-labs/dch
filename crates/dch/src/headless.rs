@@ -1187,6 +1187,51 @@ mod tests {
     use loopctl::engine::RunConfig;
     use tokio::io::AsyncWriteExt as _;
 
+    /// Point the process's real stderr at `/dev/null` for a scope.
+    ///
+    /// The failure-path pins below exercise the product's own stderr
+    /// reporting — a refused delivery, an unwritable done-file — and
+    /// their assertions pin the outcome, not the emission; without the
+    /// hush the suite's own report lines leak into `make test`'s
+    /// output and read as trouble they are not.
+    #[cfg(unix)]
+    struct HushedStderr {
+        saved: i32,
+    }
+
+    #[cfg(unix)]
+    impl Drop for HushedStderr {
+        fn drop(&mut self) {
+            // SAFETY: dup2 on the process's own stderr descriptor is the
+            // documented restore path; a failure leaves the sink in place,
+            // which costs test-output tidiness, never correctness.
+            unsafe {
+                if libc::dup2(self.saved, libc::STDERR_FILENO) == -1 {
+                    std::fs::write("/dev/null", []).ok();
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn hush_stderr() -> HushedStderr {
+        use std::os::fd::AsRawFd as _;
+        let sink = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .expect("/dev/null opens");
+        // SAFETY: dup/dup2 on this process's own descriptors; both fds are
+        // valid for the whole call and the save happens before the redirect.
+        let (saved, redirected) = unsafe {
+            (libc::dup(libc::STDERR_FILENO), {
+                libc::dup2(sink.as_raw_fd(), libc::STDERR_FILENO)
+            })
+        };
+        assert!(saved != -1, "stderr duplicates for the restore");
+        assert!(redirected != -1, "stderr redirects to the sink");
+        HushedStderr { saved }
+    }
+
     /// Parse a flag list into [`Args`], prefixing the program name.
     ///
     /// Clap requires the program name as the first argument, so tests pass
@@ -1439,6 +1484,8 @@ mod tests {
 
     #[test]
     fn a_refused_delivery_fails_the_run_with_its_real_counts() {
+        #[cfg(unix)]
+        let _hush = hush_stderr();
         // The shell's verdict and the done-file's status both turn on the
         // delivery: exit 2, a failure status, the run's turn and tool
         // totals kept, and the message naming the write's own error —
@@ -1629,6 +1676,8 @@ mod tests {
     #[cfg(unix)]
     fn an_unwritable_done_file_path_does_not_panic_or_mask_the_outcome() {
         use std::os::unix::fs::PermissionsExt;
+
+        let _hush = hush_stderr();
 
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = tmp.path().join("locked");
@@ -2304,6 +2353,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     async fn an_unclearable_stale_done_file_fails_the_run() {
         use std::os::unix::fs::PermissionsExt as _;
+        let _hush = hush_stderr();
         let _signal_lock = SIGNAL_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2556,17 +2606,13 @@ mod tests {
         fn naming_bodies(&self) -> Vec<String> {
             self.naming_bodies
                 .lock()
-                .map(|reqs| reqs.clone())
-                .unwrap_or_default()
+                .map_or_default(|reqs| reqs.clone())
         }
 
         /// The body of every conversation request received, oldest
         /// first.
         fn bodies(&self) -> Vec<String> {
-            self.bodies
-                .lock()
-                .map(|reqs| reqs.clone())
-                .unwrap_or_default()
+            self.bodies.lock().map_or_default(|reqs| reqs.clone())
         }
 
         /// A config pointing the agent at this server.
@@ -2814,6 +2860,8 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn a_stalled_naming_call_never_delays_the_headless_outcome() {
+        #[cfg(unix)]
+        let _hush = hush_stderr();
         let _signal_lock = SIGNAL_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2895,6 +2943,8 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn a_resumed_untitled_session_names_from_the_restored_first_prompt() {
+        #[cfg(unix)]
+        let _hush = hush_stderr();
         let _signal_lock = SIGNAL_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);

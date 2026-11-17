@@ -68,7 +68,7 @@ The dependency graph is strictly layered and enforced in CI
 
 ## Installation
 
-Requires Rust **1.98** (edition 2024).
+Requires Rust **1.100** (edition 2024).
 
 ```bash
 git clone https://github.com/dch-labs/dch
