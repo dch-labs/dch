@@ -17,9 +17,11 @@ A terminal-based agentic coding assistant written in Rust, built on the
   rendition engages, dch says so on the welcome notice and names the
   one `tmux.conf` line — `set -as terminal-features ',<TERM>:RGB'` —
   that lets truecolor through again for terminals that can show it.
-  The choice is also a setting: `display.splash_colors` is `auto`
-  (the default), or `truecolor` / `palette` to force one rendition
-  everywhere.
+  The art's outer columns dissolve into the theme's canvas, so the
+  photograph's dark margins never read as a strip of mismatched
+  background beside it. The choice is also a setting:
+  `display.splash_colors` is `auto` (the default), or `truecolor` /
+  `palette` to force one rendition everywhere.
 - **Single-run mode** — run one task non-interactively (as an argument
   or piped on stdin), print only the final answer, exit with a
   meaningful shell status, and optionally write a JSON completion
@@ -105,10 +107,14 @@ offered no `AskUserQuestion` tool, and permission asks it cannot
 surface are denied rather than waited on.
 
 A `TASK` argument selects single-run mode; with no argument, a stdin
-that is not a terminal selects it too. A bare invocation on a
-terminal opens the fullscreen TUI. A `TASK` composes with `--resume`
-or `--continue` (continue a saved session headless); neither combines
-with `--list-sessions`.
+that is not a terminal selects it too. When both arrive —
+`ip a | dch "what is my ip"` — the piped output is delivered to the
+agent as context and the task as its instruction, in one labeled
+prompt (stdin first, task last); redirect `< /dev/null` to keep a
+wrapper's stray stdin out. A bare invocation on a terminal opens the
+fullscreen TUI. A `TASK` composes with `--resume` or `--continue`
+(continue a saved session headless); neither combines with
+`--list-sessions`.
 
 Resume a saved session — the restored conversation seeds the display
 and the agent's context (tool blocks carry their retained command
@@ -461,8 +467,9 @@ covers every axis of the call:
 
 An "allow always" (`a`) or "deny always" (`d`) answer records typed
 rules, never prose. For a shell ask it remembers one verb prefix per
-command segment — readers included (`cargo test`, not the whole
-command), so the same work with different flags runs free while a new
+*writer* command segment — reader segments mint nothing on either
+side of the sheet (the reader carve-out already runs them free), so
+the same work with different flags runs free while a new writer
 segment still asks. For
 a write ask it remembers the target's directory scope
 (`crates/dch-loop/**`) — a root-level file remembers itself exactly,

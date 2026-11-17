@@ -427,6 +427,15 @@ impl PermissionMemory {
     /// Every mutation funnels here after unlocking, so the hook's
     /// contract — whole pair and verdict, replace-not-merge — is
     /// stated once and the remember and the forget both inherit it.
+    /// The snapshot is one observation: both lists cloned and the
+    /// verdict read under a single hold of both locks — `adopt`'s own
+    /// hold, in its own allow-then-deny order — so an adoption racing
+    /// the write-through lands whole before the snapshot or waits
+    /// behind it, and no persisted file can pair one arm's list with
+    /// the other arm's verdict (a removed allowance laundered into a
+    /// save that says healthy). The guards drop before the hook runs:
+    /// the write is the host's business, and it never holds the
+    /// memory's locks.
     fn fire_persist(&self) {
         if let Some(persist) = self
             .persist
@@ -434,11 +443,20 @@ impl PermissionMemory {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
         {
-            persist(
-                &self.allow_rules(),
-                &self.deny_rules(),
-                self.damage_standing(),
-            );
+            let allow_guard = self
+                .allow_rules
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let deny_guard = self
+                .deny_rules
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let damaged = self.damage.load(std::sync::atomic::Ordering::SeqCst);
+            let allow = allow_guard.clone();
+            let deny = deny_guard.clone();
+            drop(allow_guard);
+            drop(deny_guard);
+            persist(&allow, &deny, damaged);
         }
     }
 
@@ -679,40 +697,60 @@ mod tests {
 
     #[test]
     fn a_damaged_adoption_races_no_write_through_to_a_laundered_verdict() {
-        // The window the two-step adoption left open: the lists
-        // replaced first, the verdict re-marked after, and a choice
-        // firing its write-through in between persisted the new pair
-        // with the marker gone — the file said healthy until a later
-        // save repaired it. The verdict now stores under the same
-        // lock-hold the lists replace under, so every write-through a
-        // racing choice fires during a damaged adoption sees a
-        // verdict that stands.
+        // The window the separate-read snapshot left open, now on
+        // both axes: the write-through once read the allow list, the
+        // deny list, and the verdict in three independent lock
+        // cycles, so a choice firing its save against a racing
+        // adoption could persist one arm's list beside the other
+        // arm's verdict — a removed allowance in a file that says
+        // healthy, laundered back on the next resume. The snapshot is
+        // one hold of both locks now, and the adoptions below
+        // alternate their verdict — a real true→false change, not the
+        // always-true walk that could never exercise the laundering
+        // direction — so every persisted triple must be a state the
+        // memory can stand in: either adopted pair under its own
+        // verdict, or the swept pair under whichever verdict stands
+        // (the sweep clears the lists, never the verdict).
         let memory = PermissionMemory::default();
-        memory.adopt(Vec::new(), Vec::new(), true);
-        let verdicts = Arc::new(Mutex::new(Vec::new()));
-        let sink = Arc::clone(&verdicts);
+        let writes: Arc<Mutex<Vec<(usize, usize, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&writes);
         memory.persist_through(Arc::new(
-            move |_allow: &[PermissionRule], _deny: &[PermissionRule], damaged: bool| {
-                sink.lock().unwrap().push(damaged);
+            move |allow: &[PermissionRule], deny: &[PermissionRule], damaged: bool| {
+                sink.lock()
+                    .unwrap()
+                    .push((allow.len(), deny.len(), damaged));
             },
         ));
+        // Two adoptions with nothing in common on any axis — a
+        // one-allow damaged pair, a two-deny healthy pair — so any
+        // cross-pair mix shows in the lengths before the verdict is
+        // even read.
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                for _ in 0..200 {
-                    memory.adopt(vec![prefix("cargo test")], Vec::new(), true);
+                for turn in 0..1000 {
+                    if turn % 2 == 0 {
+                        memory.adopt(vec![prefix("cargo test")], Vec::new(), true);
+                    } else {
+                        memory.adopt(
+                            Vec::new(),
+                            vec![prefix("rm"), prefix("cargo publish")],
+                            false,
+                        );
+                    }
                 }
             });
             scope.spawn(|| {
-                for _ in 0..200 {
+                for _ in 0..1000 {
                     memory.forget_all();
                 }
             });
         });
+        let reachable = [(1, 0, true), (0, 2, false), (0, 0, true), (0, 0, false)];
+        let observed = writes.lock().unwrap().clone();
         assert!(
-            !verdicts.lock().unwrap().is_empty()
-                && verdicts.lock().unwrap().iter().all(|damaged| *damaged),
-            "every write-through carries a standing verdict — the file \
-             cannot launder the damage away mid-adoption"
+            !observed.is_empty() && observed.iter().all(|triple| reachable.contains(triple)),
+            "every write-through persists a state the memory can stand in — anything \
+             else pairs one arm's list with the other arm's verdict: {observed:?}"
         );
     }
 

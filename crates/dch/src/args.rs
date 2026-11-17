@@ -56,18 +56,23 @@ fn parse_list_count(value: &str) -> Result<ListCount, String> {
 )]
 /// dch — a terminal-based agentic coding assistant built on loopctl.
 ///
-/// A task argument (`dch "fix the bug"`) or a piped stdin
-/// (`echo "fix the bug" | dch`) selects the single-run non-interactive
-/// mode; with neither, launches the interactive TUI. `--resume`/
+/// A task argument (`dch "fix the bug"`), a piped stdin
+/// (`echo "fix the bug" | dch`), or both selects the single-run
+/// non-interactive mode — with both, the pipe is the context and the
+/// task the instruction, delivered as one labeled prompt; with
+/// neither, launches the interactive TUI. `--resume`/
 /// `--list-sessions` manage sessions. Run-mode selection happens in
 /// `main`, not here; this struct is only the parsed input.
 pub struct Args {
     /// The task for a single non-interactive run.
     ///
-    /// A non-empty value is the task verbatim; an empty one defers to
-    /// stdin, exactly like omitting the argument with stdin piped.
-    /// Composes with `--resume` — a task plus a session id continues
-    /// that session headless.
+    /// A non-empty value is the instruction the run answers; when
+    /// stdin is piped, its output is delivered with it as context —
+    /// piped body first, task last — so `ip a | dch "what is my ip"`
+    /// reaches the agent whole. An empty value defers to stdin alone,
+    /// exactly like omitting the argument with stdin piped. Composes
+    /// with `--resume` — a task plus a session id continues that
+    /// session headless.
     #[arg(
         value_name = "TASK",
         conflicts_with_all = ["list_sessions"],
@@ -79,8 +84,9 @@ pub struct Args {
     ///
     /// The id is validated here — a malformed value is a parse error rather
     /// than a later load failure. Long-only: a 36-character id has no useful
-    /// short form. Combines with a task argument or a piped stdin to resume
-    /// headless, and with neither to resume in the TUI.
+    /// short form. Combines with a task argument, a piped stdin, or both
+    /// (context and instruction) to resume headless, and with neither to
+    /// resume in the TUI.
     #[arg(
         long,
         value_name = "SESSION_ID",
@@ -110,8 +116,8 @@ pub struct Args {
     ///
     /// Resolves to whatever session was saved last, sparing the
     /// `--list-sessions` and `--resume <id>` round trip. Composes
-    /// like `--resume`: with a task argument or piped stdin it
-    /// continues headless, with neither in the TUI. No saved
+    /// like `--resume`: with a task argument, a piped stdin, or both
+    /// it continues headless, with neither in the TUI. No saved
     /// session exists means a fresh start with a note.
     #[arg(
         long = "continue",

@@ -557,9 +557,10 @@ fn quote_splices_flag_name(arg: &str) -> bool {
 /// The policy matters beyond its own command because the reader gate
 /// judges whole chains: a preamble that read as a writer would drag
 /// the real work behind it out of the reader carve-out. On the
-/// remember side the preamble is a segment like any other — remembered
-/// with the chain it rode in on, so a chain that grows one re-asks
-/// once and then covers.
+/// remember side the preamble mints nothing — it is a reader, and
+/// readers mint nothing on either side of the sheet — so a chain
+/// that grows one re-asks for its writers alone, and the preamble
+/// rides free regardless.
 fn set_arguments_read_only(args: &[&str]) -> bool {
     if args.is_empty() {
         return true;
@@ -740,7 +741,12 @@ fn uniq_arguments_read_only(args: &[&str]) -> bool {
 /// operand does. The value-taking flags (`-c`/`--cols`,
 /// `-g`/`--groupsize`, `-l`/`--len`, `-s`/`--seek`, `-n`/`--name`,
 /// `-R`) consume their following word so a bound never counts as a
-/// file; every other flag formats or transforms and reads.
+/// file; every other flag formats or transforms and reads. Option
+/// parsing stops at the first operand, as xxd's own argv walk does:
+/// a dash-word after the first file is not a flag but the *output*
+/// operand (`xxd in.bin -c` opens `-c` for writing and truncates an
+/// existing file of that name), so once one file has landed every
+/// remaining argument counts as one — the same law `--` always set.
 fn xxd_arguments_read_only(args: &[&str]) -> bool {
     let mut takes_value = false;
     let mut operands_only = false;
@@ -769,6 +775,9 @@ fn xxd_arguments_read_only(args: &[&str]) -> bool {
         } else if arg.starts_with('-') && arg.len() > 1 {
         } else {
             files = files.saturating_add(1);
+            if files == 1 {
+                operands_only = true;
+            }
         }
     }
     files <= 1
@@ -1020,13 +1029,14 @@ fn quoted_verb(masked: &str) -> bool {
 
 /// Reduce a Bash command to its command segments: every command text
 /// across newlines and control operators, with its verb prefix and
-/// complexity verdict. Readers are segments like any other — they
-/// are remembered with the rest of the chain they were approved in.
-/// A quoted span inside the trimmed verb masks to the placeholder,
-/// which discriminates nothing (`cargo 'test'` and `cargo 'publish'`
-/// trim to the same masked verb), so such a segment is complex and
-/// remembered as its exact text — the quoted spelling is the only
-/// name that tells the two apart.
+/// complexity verdict. Readers are segments like any other — they ride
+/// the split and the shape like every writer — but the remember mint
+/// drops them on both sides of the sheet; the carve-out runs them free
+/// on their own. A quoted span inside the trimmed verb masks to the
+/// placeholder, which discriminates nothing (`cargo 'test'` and
+/// `cargo 'publish'` trim to the same masked verb), so such a segment
+/// is complex and remembered as its exact text — the quoted spelling
+/// is the only name that tells the two apart.
 #[must_use]
 pub fn command_segments(command: &str) -> Vec<CommandSegment> {
     let mut out = Vec::new();
@@ -1955,7 +1965,7 @@ mod tests {
     }
 
     #[test]
-    fn an_inert_set_preamble_is_remembered_with_the_chain_it_rode_in_on() {
+    fn an_inert_set_preamble_mints_nothing_and_demands_no_coverage() {
         // The option setter reads like a look, so a chain carrying an
         // inert `set -o pipefail` preamble passes the reader gate
         // whole — and reads like a look to the remember side too: the
@@ -2300,6 +2310,34 @@ mod tests {
             assert!(
                 !shell_reads_only(command),
                 "{command} is a shell command like any other"
+            );
+        }
+    }
+
+    #[test]
+    fn xxd_reads_flags_before_the_first_operand_and_writes_after_it() {
+        // O1's law pinned on its own: option parsing stops at the first
+        // file operand, exactly as xxd's own argv walk does. Ahead of
+        // it, flags and their values read like the one-file form; after
+        // it, a dash-word is not a flag but the *output* operand — real
+        // xxd opens it for writing and truncates whatever stood there
+        // (`xxd input.bin -c` destroys a file named `-c`) — and the
+        // two-positional form stays a writer, `--` or not.
+        for command in [
+            "xxd Cargo.lock",
+            "xxd -c 16 Cargo.lock",
+            "xxd -l 64 -g 2 Cargo.lock",
+        ] {
+            assert!(shell_reads_only(command), "{command} only looks");
+        }
+        for command in [
+            "xxd input.bin victim.hex",
+            "xxd input.bin -c",
+            "xxd input.bin -c 16",
+        ] {
+            assert!(
+                !shell_reads_only(command),
+                "{command} writes an output operand after the first file"
             );
         }
     }

@@ -25,7 +25,6 @@ pest                   = "2.8"
 pest_derive            = "2.8"
 unicode-width          = "0.1"
 unicode-segmentation   = "1.10"
-image                  = { version = "0.25", default-features = false, features = ["png"] }
 base64                 = { workspace = true }
 textwrap               = "0.16.4"
 tree-sitter            = { version = "0.26", optional = true }

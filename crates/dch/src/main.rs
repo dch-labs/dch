@@ -19,10 +19,11 @@ use std::io::IsTerminal as _;
 
 /// Whether this invocation selects the single-run headless mode.
 ///
-/// A task argument always does; with none, a stdin that is not a
-/// terminal (a pipe or a redirect) does too — so `dch "task"` and
-/// `echo "task" | dch` both run headlessly, and only a bare
-/// invocation on a terminal launches the TUI.
+/// A task argument selects the mode and consumes a piped stdin as
+/// context, so `ip a | dch "what is my ip"` delivers both; with no
+/// task, a stdin that is not a terminal (a pipe or a redirect) does
+/// too — so `dch "task"` and `echo "task" | dch` both run headlessly,
+/// and only a bare invocation on a terminal launches the TUI.
 fn wants_headless(args: &args::Args) -> bool {
     selects_single_run(args.task.as_deref(), std::io::stdin().is_terminal())
 }

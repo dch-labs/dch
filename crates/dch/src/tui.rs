@@ -49,7 +49,7 @@ use crate::resume::ResumeControl;
 /// Returns the exit code for any failure: 1 for construction or
 /// session-level failures, 0 for a clean quit.
 pub async fn run_tui(args: &Args, control: ResumeControl) -> u8 {
-    match run_tui_session(args, control).await {
+    match Box::pin(run_tui_session(args, control)).await {
         Ok(()) => 0,
         Err(message) => {
             crate::signals::report(&format!("dch: {message}"));
@@ -296,6 +296,7 @@ async fn run_tui_session(args: &Args, control: ResumeControl) -> Result<(), Stri
     app.set_permission_mode_cell(Some(Arc::clone(&lanes.mode_cell)));
     app.set_permission_config_rules_cell(Some(Arc::clone(&lanes.config_rules_cell)));
     app.set_permission_preset_cell(Some(Arc::clone(&lanes.preset_cell)));
+    app.set_permission_adoption_guard(Some(Arc::clone(&lanes.adoption_guard)));
     app.set_question_requests(prompt_rx);
     app.set_session_requests(session_rx);
     app.set_working_dir(&workdir);
@@ -1415,8 +1416,10 @@ fn fail_permissions_restore_closed(cell: &dch_config::SharedPermissionMode) -> b
 /// (the loosening half) and keeps `deny` and `ask` (the tightening
 /// half, which never made anything run), so every side-effecting
 /// call asks until the verdict the projection was keyed to clears:
-/// `/permissions repair` naming the recovery, a `/preset` re-seeding
-/// the config layer, or a fresh adoption undoing the projection
+/// `/permissions repair` naming the recovery — a `/preset` keyed
+/// while the verdict stands having recorded its selection without
+/// joining, so the repair seeds the layer at the preset the session
+/// chose — or a fresh adoption undoing the projection
 /// ([`reseed_config_rules_cell`]). The cell is the live view the
 /// policy re-reads per evaluation, so the projection reaches the very
 /// next dispatch and survives every runner rebuild.
@@ -1542,10 +1545,11 @@ fn permission_bridge() -> (
 /// [`dch_permissions::deny_rules`] are pure and deterministic, so
 /// these derivations are exactly the ones the gate's evaluation would
 /// have computed — grounded on the ask's own working directory, the
-/// base the gate spelled the call's write targets on. The allow side
-/// mints every segment (readers included); the deny side is the
-/// narrow derivation — readers mint nothing, so a refusal bans
-/// the work, not the pipe beside it.
+/// base the gate spelled the call's write targets on. Both sides mint
+/// every *writer* segment — readers mint nothing on either side of
+/// the sheet, the carve-out runs them free on their own — and the
+/// deny side is the narrow derivation, so a refusal bans the work,
+/// not the pipe beside it.
 struct PanelBridge {
     /// The channel the panel's requests travel on.
     ///
@@ -1692,6 +1696,19 @@ struct InteractiveLanes {
     /// compiled at this selection, so a mid-session swap cannot be
     /// reverted by an adoption that only knows the boot config's.
     preset_cell: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+
+    /// The adoption guard: one lock the driver's permission adoptions
+    /// and the panel's `/preset` swap both hold across their whole
+    /// motions, so the two can never interleave.
+    ///
+    /// The race it closes: the swap's damage check and rules write
+    /// shared no lock with a live adoption, so a damaged resume
+    /// landing between them installed its tightened rules after the
+    /// swap's healthy check — and the swap's configured allows then
+    /// overwrote the tightening while the verdict stood. Every path
+    /// that carries the guard takes it before the preset and rules
+    /// locks, so it cannot deadlock against them.
+    adoption_guard: std::sync::Arc<std::sync::Mutex<()>>,
 }
 
 impl InteractiveLanes {
@@ -1728,6 +1745,7 @@ impl InteractiveLanes {
                 memory: memory.clone(),
                 config_rules_cell,
                 preset_cell,
+                adoption_guard: std::sync::Arc::new(std::sync::Mutex::new(())),
             },
             permission_rx,
             prompt_rx,
@@ -1818,6 +1836,7 @@ impl InteractiveLanes {
                 &dch_config::DchConfig::default(),
             ))),
             preset_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            adoption_guard: std::sync::Arc::new(std::sync::Mutex::new(())),
         }
     }
 }
@@ -3126,6 +3145,11 @@ fn adopt_resumed_permissions(
         .load_permissions();
     let damage_stands = restored.damage_stands();
     let (allow, deny) = restored.into_lists();
+    let _adoption = context
+        .lanes
+        .adoption_guard
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     context.lanes.memory.adopt(allow, deny, damage_stands);
     let enforced_mode =
         if damage_stands && fail_permissions_restore_closed(&context.lanes.mode_cell) {
@@ -3140,8 +3164,7 @@ fn adopt_resumed_permissions(
             .lanes
             .preset_cell
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         reseed_config_rules_cell(
             &context.lanes.config_rules_cell,
             &context.config,
@@ -3185,6 +3208,11 @@ fn land_session_clear<E: std::fmt::Display>(
     context: &mut DriverContext,
 ) {
     if rewind_earned_fresh_session(&rewind) {
+        let _adoption = context
+            .lanes
+            .adoption_guard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let id = transcript.rotate(&context.config.api.model);
         let default = context.overrides.permission_default;
         context.config.runner.permission_mode = default;
@@ -3198,8 +3226,7 @@ fn land_session_clear<E: std::fmt::Display>(
             .lanes
             .preset_cell
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         reseed_config_rules_cell(
             &context.lanes.config_rules_cell,
             &context.config,
@@ -3807,11 +3834,11 @@ mod tests {
     #[tokio::test]
     async fn the_deny_derivation_is_narrow_at_the_seam() {
         // The narrow-deny pin on the bridge — a chain mixing reader
-        // and writer segments: the same ask ships both verb prefixes as
-        // what an `a` press
-        // records (readers included, the approval's chain) and only
-        // the writer verb as what a `d` press records. `tail` is never
-        // banned by association; the redirect rides the scrub like any
+        // and writer segments: the same ask ships the writer verb as
+        // what an `a` press records — readers mint nothing, on either
+        // side of the sheet — and only the writer verb as what a `d`
+        // press records. `tail` is never banned by association; the
+        // redirect rides the scrub like any
         // allow derivation sees it.
         let (resolver, mut requests_rx) = permission_bridge();
         let ask = loopctl::middleware::PermissionAsk::new(
@@ -6756,6 +6783,7 @@ mod tests {
             memory: PermissionMemory::default(),
             config_rules_cell: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             preset_cell: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            adoption_guard: std::sync::Arc::new(std::sync::Mutex::new(())),
         };
         let rebuilt = unreachable_runner().await;
         lanes.attach(&rebuilt);

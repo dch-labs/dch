@@ -1,7 +1,8 @@
 //! Headless runner: load config, build the agent, run one session, exit.
 //!
 //! This is the dispatch target for task-mode invocations — a task
-//! argument or a piped stdin. It owns no agent-loop
+//! argument, a piped stdin, or both (the pipe as context, the task as
+//! instruction). It owns no agent-loop
 //! logic — everything turn/stream/dispatch lives in loopctl via the runner —
 //! and prints nothing of its own beyond the answer the task asked for:
 //! the run is quiet by default — stdout carries only the final answer,
@@ -744,31 +745,29 @@ fn construction_failure(
 /// Resolve the prompt from the parsed arguments without blocking the
 /// runtime thread.
 ///
-/// The fast paths — explicit text, terminal-stdin usage errors — resolve
-/// synchronously; a piped-stdin read, potentially unbounded, runs on the
-/// blocking pool so the startup interrupt bridge stays live while it
+/// A terminal stdin resolves synchronously — the task argument alone
+/// or the usage error, nothing to read. A piped stdin is read to EOF
+/// on the blocking pool — potentially unbounded, task argument present
+/// or not, so the pipe is drained rather than left to burst on its
+/// producer — keeping the startup interrupt bridge live while it
 /// waits. See [`resolve_prompt_with`] for the full rules.
 ///
 /// # Errors
 ///
 /// Returns an error message when no usable prompt exists.
 async fn resolve_prompt_nonblocking(args: &Args) -> Result<String, String> {
-    if has_explicit_prompt(args) || std::io::stdin().is_terminal() {
-        return resolve_prompt(args);
+    if std::io::stdin().is_terminal() {
+        return resolve_prompt_with(
+            args.task.as_deref(),
+            || Err("a terminal stdin is never read".to_string()),
+            || true,
+        );
     }
     let read = tokio::task::spawn_blocking(read_stdin_prompt);
     let piped = read
         .await
         .unwrap_or_else(|err| Err(format!("stdin read task failed: {err}")));
     resolve_prompt_with(args.task.as_deref(), move || piped, || false)
-}
-
-/// Whether the task argument carries a usable task text.
-///
-/// Shared by the fast paths so the definition of "explicit prompt" cannot
-/// drift between them.
-fn has_explicit_prompt(args: &Args) -> bool {
-    args.task.as_deref().is_some_and(presentable)
 }
 
 /// Whether a prompt candidate can be used verbatim.
@@ -779,28 +778,29 @@ fn presentable(text: &str) -> bool {
     !text.trim().is_empty()
 }
 
-/// Resolve the prompt from the parsed arguments.
-///
-/// A non-empty task argument wins and stdin is never touched; an empty
-/// or whitespace-only value falls through to stdin, as does an omitted
-/// argument. See [`resolve_prompt_with`] for the full rules.
-///
-/// # Errors
-///
-/// Returns an error message when no usable prompt exists.
-fn resolve_prompt(args: &Args) -> Result<String, String> {
-    resolve_prompt_with(args.task.as_deref(), read_stdin_prompt, || {
-        std::io::stdin().is_terminal()
-    })
-}
-
 /// The prompt-resolution rules, with the stdin side injected.
 ///
-/// Precedence: a non-empty task argument is used verbatim and the stdin
-/// closures are never called; otherwise stdin is probed and, when it is not
-/// a terminal, read to end as one prompt with trailing line breaks trimmed.
-/// A terminal stdin can never deliver a task, so that is a usage error, as
-/// is an empty stream.
+/// Piped stdin is the **context** and the task argument the
+/// **instruction** — both are delivered, stdin first, task last, in a
+/// labeled scaffold that keeps arbitrary piped text from reading like
+/// an instruction:
+///
+/// ```text
+/// --- piped stdin ---
+/// <stdin body, trailing line breaks trimmed>
+///
+/// --- task ---
+/// <task text>
+/// ```
+///
+/// The full table: a presentable task with a terminal stdin is the
+/// task alone (no read); with a non-empty pipe it combines as above;
+/// with an empty pipe it is the task alone, no error. Without a
+/// usable task, a non-empty pipe is the prompt verbatim (trailing
+/// line breaks trimmed), an empty pipe is an error, and a terminal
+/// stdin is a usage error — the task argument cannot arrive over a
+/// terminal. A stdin read failure surfaces whatever the read named,
+/// with or without a task.
 ///
 /// # Errors
 ///
@@ -810,24 +810,28 @@ fn resolve_prompt_with(
     read_stdin: impl FnOnce() -> Result<String, String>,
     stdin_is_terminal: impl FnOnce() -> bool,
 ) -> Result<String, String> {
-    if let Some(text) = explicit.filter(|text| presentable(text)) {
-        return Ok(text.to_string());
-    }
+    let task = explicit.filter(|text| presentable(text));
     if stdin_is_terminal() {
-        return Err(if explicit.is_some() {
-            "stdin is a terminal and no task was given: pass a task \
-             argument or pipe one on stdin"
-                .into()
-        } else {
-            "no prompt: pass a task argument or pipe one on stdin".into()
-        });
+        return match task {
+            Some(task) => Ok(task.to_string()),
+            None => Err(if explicit.is_some() {
+                "stdin is a terminal and no task was given: pass a task \
+                 argument or pipe one on stdin"
+                    .into()
+            } else {
+                "no prompt: pass a task argument or pipe one on stdin".into()
+            }),
+        };
     }
     let raw = read_stdin()?;
-    let prompt = raw.trim_end_matches(['\n', '\r']);
-    if prompt.is_empty() {
-        Err("empty prompt on stdin".into())
-    } else {
-        Ok(prompt.to_string())
+    let piped = raw.trim_end_matches(['\n', '\r']);
+    match (task, piped.is_empty()) {
+        (Some(task), false) => Ok(format!(
+            "--- piped stdin ---\n{piped}\n\n--- task ---\n{task}"
+        )),
+        (Some(task), true) => Ok(task.to_string()),
+        (None, false) => Ok(piped.to_string()),
+        (None, true) => Err("empty prompt on stdin".into()),
     }
 }
 
@@ -1299,13 +1303,42 @@ mod tests {
     }
 
     #[test]
-    fn explicit_prompt_wins_and_stdin_is_never_touched() {
+    fn explicit_task_with_terminal_stdin_is_used_alone() {
+        // The one shape that never reads: a task argument on a
+        // terminal stdin — the interactive launch's sibling, resolved
+        // synchronously with the pipe side untouched.
         let prompt = resolve_prompt_with(
             Some("do the thing"),
-            || panic!("stdin must not be read when text is given"),
-            || panic!("stdin must not be probed when text is given"),
+            || panic!("a terminal stdin is never read"),
+            || true,
         );
         assert_eq!(prompt.unwrap(), "do the thing");
+    }
+
+    #[test]
+    fn explicit_task_and_piped_stdin_combine_stdin_first() {
+        // The pipe is context, the task the instruction: both are
+        // delivered, stdin first in a labeled scaffold, the task last
+        // in the recency position — exactly the combined string, not
+        // a paraphrase of it.
+        let prompt = resolve_prompt_with(
+            Some("what is my ip"),
+            || Ok("1: lo: 127.0.0.1\n2: eth0: 192.168.1.7\n".into()),
+            || false,
+        );
+        assert_eq!(
+            prompt.unwrap(),
+            "--- piped stdin ---\n1: lo: 127.0.0.1\n2: eth0: 192.168.1.7\n\n--- task ---\nwhat is my ip"
+        );
+    }
+
+    #[test]
+    fn empty_piped_stdin_with_a_task_uses_the_task_alone() {
+        // `dch "task" < /dev/null` — the wrapper's stdin is a pipe
+        // that delivers nothing: the task stands alone, no error, the
+        // same outcome the old argument-wins semantics gave.
+        let prompt = resolve_prompt_with(Some("the task"), || Ok(String::new()), || false);
+        assert_eq!(prompt.unwrap(), "the task");
     }
 
     #[test]
@@ -1350,6 +1383,21 @@ mod tests {
     fn a_stdin_read_failure_surfaces() {
         let err = resolve_prompt_with(
             None,
+            || Err("failed to read stdin: broken".into()),
+            || false,
+        )
+        .unwrap_err();
+        assert!(err.contains("broken"), "{err}");
+    }
+
+    #[test]
+    fn a_stdin_read_failure_surfaces_with_a_task_too() {
+        // A task argument no longer suppresses the read, so it no
+        // longer suppresses the read's failure either: the error
+        // names the pipe, not a silent task-only run that leaves the
+        // producer to die of EPIPE.
+        let err = resolve_prompt_with(
+            Some("do the thing"),
             || Err("failed to read stdin: broken".into()),
             || false,
         )

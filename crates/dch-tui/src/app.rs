@@ -1237,37 +1237,11 @@ impl Sections {
 
 /// The welcome screen's lifecycle state, grouped off the app proper.
 ///
-/// The fresh-session welcome — the fjord and its floating photograph —
-/// carries three pieces of bookkeeping the run loop reads beside the
-/// band it paints: whether the photograph has reached the terminal,
-/// the seat it was rendered for, and whether the conversation has
-/// retired the screen for good. They move as one group so the app's
-/// own flag count stays inside the lint policy's budget.
+/// The fresh-session welcome — the fjord art over the composer — keeps
+/// the one bit of bookkeeping its lifetime needs: whether the
+/// conversation has ever held rows, retiring the screen for good.
+#[derive(Default)]
 struct WelcomeState {
-    /// Whether the photograph has been transmitted to the terminal.
-    ///
-    /// The one transmission is chunked, and the frame seam reports
-    /// `first` until it lands. A later geometry change never sends a
-    /// second rendition: the placement re-anchors to the new seat and
-    /// the terminal scales the bytes already aboard. The seam reports
-    /// `Delete` when the welcome ends so the loop retires the floating
-    /// image.
-    image_transmitted: bool,
-
-    /// The band seat the transmitted rendition was placed for.
-    ///
-    /// Origin and geometry together — x, y, columns, rows — because
-    /// the placement anchors at the origin: a band that moved without
-    /// resizing is a new seat, and the old placement is deleted before
-    /// the new one lands, so placements never stack or strand behind a
-    /// move. The photograph itself goes out once, as a rendition
-    /// resampled for the band's size at transmit time; a later
-    /// geometry change re-places that rendition under the same id and
-    /// the terminal scales it to the new cells — the exact-resample
-    /// pipeline runs at transmission, and a resize trades it for the
-    /// terminal's own scaling.
-    image_seat: Option<(u16, u16, u16, u16)>,
-
     /// Whether the conversation has ever held rows, retiring the
     /// welcome.
     ///
@@ -2224,6 +2198,17 @@ pub struct TuiApp {
     /// selection rides the session config alone.
     permission_preset_cell: Option<std::sync::Arc<std::sync::Mutex<Option<String>>>>,
 
+    /// The adoption guard the driver holds across its whole permission
+    /// adoptions, mirroring [`Self::permission_preset_cell`].
+    ///
+    /// `/preset` takes the same lock across its damage check and
+    /// rules write, so a live adoption — a resume landing damaged, a
+    /// `/clear` rotation — can never interleave with the swap: the
+    /// tightening an adoption installs cannot be overwritten by a
+    /// swap whose healthy check ran before it. A host without a lane
+    /// leaves it `None` and the swap stands alone, as it always did.
+    permission_adoption_guard: Option<std::sync::Arc<std::sync::Mutex<()>>>,
+
     /// Questions from the asking tool waiting for the user's answer,
     /// oldest first.
     ///
@@ -2241,27 +2226,18 @@ pub struct TuiApp {
     /// left behind on the way.
     pending_questions: std::collections::VecDeque<PendingQuestion>,
 
-    /// The bring-up graphics ask's verdict, for the welcome's image.
-    ///
-    /// `Kitty` when the terminal answered the graphics query — the
-    /// welcome floats the real photograph over its band; `None`
-    /// everywhere else, the cell art alone.
-    graphics: crate::terminal::GraphicsSupport,
-
-    /// The welcome screen's lifecycle state — the photograph's
-    /// transmission, its seat, and the retiring latch.
+    /// The welcome screen's lifecycle state — the retiring latch.
     ///
     /// Grouped as [`WelcomeState`] so the welcome layer's bookkeeping
-    /// reads as one thing; see the group's own docs for what each
-    /// half does.
+    /// reads as one thing; see the group's own docs for what the
+    /// latch does.
     welcome: WelcomeState,
 
     /// The band rect the last welcome frame painted, if it did.
     ///
-    /// The graphics layer's lifecycle bookkeeping: set after each
-    /// welcome frame (so the run loop can place the photograph over
-    /// the same cells) and read when a frame draws no welcome (so
-    /// the loop deletes the floating image exactly once).
+    /// The art band's own geometry, recorded after each welcome frame:
+    /// the dissolve pins and the welcome's own tests read exactly
+    /// where the art stood, straight from the frame that painted it.
     welcome_band: Option<ratatui::layout::Rect>,
 
     /// The saved-session picker `/sessions` opened, when it stands.
@@ -2632,13 +2608,9 @@ impl TuiApp {
             permission_mode_cell: None,
             permission_config_rules_cell: None,
             permission_preset_cell: None,
+            permission_adoption_guard: None,
             pending_questions: std::collections::VecDeque::new(),
-            graphics: crate::terminal::GraphicsSupport::None,
-            welcome: WelcomeState {
-                image_transmitted: false,
-                image_seat: None,
-                welcome_retired: false,
-            },
+            welcome: WelcomeState::default(),
             welcome_band: None,
             session_picker: None,
             model_picker: None,
@@ -3315,12 +3287,23 @@ impl TuiApp {
     /// configuration's own join, so the configured allows return
     /// exactly as written. The mode stays where it stands — the
     /// user's to move with `/mode` as ever, because a posture is not
-    /// a config value.
+    /// a config value. The whole repair runs under the driver's
+    /// adoption guard — the same lock a live resume or `/clear`
+    /// adoption holds across its whole motion — so a concurrent
+    /// adoption cannot land between the verdict's clearing and the
+    /// cell's re-seed and leave the fresh posture tightened under
+    /// rules this repair never meant to loosen.
     fn repair_permission_damage(&mut self) {
         if !self.permission_memory.damage_standing() {
             self.post_notice("nothing to repair — the saved permissions read whole".to_string());
             return;
         }
+        let adoption = self.permission_adoption_guard.clone();
+        let _held = adoption.as_ref().map(|guard| {
+            guard
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
         self.permission_memory.clear_damage();
         let rules = self.config.permissions.engine_rules();
         if let Some(cell) = &self.permission_config_rules_cell {
@@ -3463,7 +3446,11 @@ impl TuiApp {
     /// resume — re-seed at the selection in effect, never the boot
     /// one. While a damage verdict stands the swap records the
     /// selection and holds: the config layer stays tightened until
-    /// `/permissions repair` re-seeds it as chosen.
+    /// `/permissions repair` re-seeds it as chosen. The swap runs
+    /// under the driver's adoption guard — the same lock a live
+    /// adoption holds across its whole motion — so the two can never
+    /// interleave: a damaged adoption cannot land between the swap's
+    /// damage check and its rules write.
     fn preset_command(&mut self, name: Option<&str>) {
         let Some(selected) = name else {
             let names: Vec<&str> = self
@@ -3505,6 +3492,12 @@ impl TuiApp {
             return;
         }
         self.config.permissions.preset = Some(selected.to_string());
+        let adoption = self.permission_adoption_guard.clone();
+        let _held = adoption.as_ref().map(|guard| {
+            guard
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
         if let Some(cell) = &self.permission_preset_cell {
             *cell
                 .lock()
@@ -3614,6 +3607,24 @@ impl TuiApp {
         cell: Option<std::sync::Arc<std::sync::Mutex<Option<String>>>>,
     ) {
         self.permission_preset_cell = cell;
+    }
+
+    /// Install the adoption guard the driver's permission adoptions
+    /// hold, so a `/preset` swap serializes against them.
+    ///
+    /// The host's wiring: the swap's damage check and rules write run
+    /// under the same lock a resume or `/clear` adoption holds across
+    /// its whole motion — verdict, mode, rules — closing the window
+    /// where a damaged adoption lands between the check and the write
+    /// and the swap's configured allows overwrite the tightening it
+    /// installed. The `/preset` swap takes the guard before the preset
+    /// and rules locks, matching the driver's order, so the two
+    /// cannot deadlock either.
+    pub fn set_permission_adoption_guard(
+        &mut self,
+        guard: Option<std::sync::Arc<std::sync::Mutex<()>>>,
+    ) {
+        self.permission_adoption_guard = guard;
     }
 
     /// Point live config changes at a directory to persist into.
@@ -4170,36 +4181,6 @@ impl TuiApp {
             self.return_stolen_byte(byte);
         }
         outcome.installed
-    }
-
-    /// Re-ask the terminal's cell size after a resize, for the picture.
-    ///
-    /// A zoom is a resize whose cell pixels changed while the welcome
-    /// stands: the rendition in flight was built for the old geometry,
-    /// and the terminal would rescale it its own way — worse in both
-    /// directions of the zoom. Park the reader on the same lane the
-    /// background ask uses, ask again, and drop the image's seat when
-    /// the answer moved: the next frame re-places the rendition
-    /// already aboard under the same id, and the terminal scales its
-    /// bytes to the new cells — no second transmission is owed. A
-    /// plain resize — pixels unmoved, only counts — keeps its seat;
-    /// the band's own change drives any rebuild.
-    fn refresh_welcome_cell_pixels(&mut self) {
-        if self.graphics == crate::terminal::GraphicsSupport::None || self.welcome_band.is_none() {
-            return;
-        }
-        let Some(quiesce) = self.input_quiesce.clone() else {
-            return;
-        };
-        quiesce.request();
-        let mut moved = false;
-        if quiesce.wait_paused(Self::QUIESCE_ACK) {
-            moved = crate::terminal::ask_cell_pixels();
-        }
-        quiesce.release();
-        if moved {
-            self.welcome.image_seat = None;
-        }
     }
 
     /// Hand back a keystroke the terminal query consumed.
@@ -6288,12 +6269,6 @@ impl TuiApp {
         terminal: &mut ratatui::Terminal<CrosstermBackend<std::io::Stdout>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.quit = QuitState::default();
-        #[cfg(unix)]
-        self.set_graphics_support(crate::terminal::ask_graphics_support());
-        #[cfg(unix)]
-        if self.graphics != crate::terminal::GraphicsSupport::None {
-            crate::terminal::ask_cell_pixels();
-        }
         self.full_repaint_due = Some(Instant::now());
         let mut events = TerminalEvents::spawn();
         self.input_quiesce = Some(events.quiesce_handle());
@@ -6416,7 +6391,6 @@ impl TuiApp {
                 }
                 let started = Instant::now();
                 terminal.draw(|frame| self.render(frame))?;
-                self.emit_welcome_graphics();
                 let took = started.elapsed();
                 if let Some((background, primary)) = theme_burst {
                     crate::terminal::finish_theme_burst(background, primary);
@@ -6628,10 +6602,7 @@ impl TuiApp {
                 self.input.insert_str(&normalize_pasted_newlines(text));
                 true
             }
-            Event::Resize(_, _) => {
-                self.refresh_welcome_cell_pixels();
-                true
-            }
+            Event::Resize(_, _) => true,
             Event::FocusGained => {
                 self.full_repaint_due = Some(Instant::now());
                 true
@@ -9032,30 +9003,20 @@ impl TuiApp {
     ) {
         let box_height = composer_height;
         let rule_row = u16::from(self.theme.ui.composer_border.is_some());
-        let constraints = [
-            Constraint::Min(0),
-            Constraint::Length(shape.band_height),
-            Constraint::Length(1),
-            Constraint::Length(rule_row),
-            Constraint::Length(box_height),
-            Constraint::Min(0),
-        ];
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints(constraints)
-            .split(area);
+        let chunks = welcome_rows(area, shape.band_height, rule_row, box_height);
         let origin = area
             .x
             .saturating_add(area.width.saturating_sub(shape.block_width) / 2);
         if let Some(scale) = shape.art {
             let band = pane(&chunks, 1, area);
-            let cropped: Vec<Line<'static>> = scale
+            let mut cropped: Vec<Line<'static>> = scale
                 .lines
                 .iter()
                 .skip(usize::from(shape.row_skip))
                 .take(usize::from(shape.rows_shown))
                 .cloned()
                 .collect();
+            crate::splash::dissolve_edges(&mut cropped, self.theme.ui.background);
             let rect = Rect {
                 x: origin,
                 y: band.y,
@@ -9174,86 +9135,6 @@ impl TuiApp {
         self.render_completion(frame, inner, false);
         self.render_session_picker(frame, inner, false);
         self.render_model_picker(frame, inner, false);
-    }
-
-    /// The welcome's graphics frame, if this frame wants one.
-    ///
-    /// `Place(band, first)` while the welcome stands — the band the
-    /// photograph floats over, `first` when the image is not yet
-    /// transmitted (the loop transmits, then places); `Delete` once
-    /// when the welcome ends with an image floating; `Inert`
-    /// otherwise.
-    pub fn welcome_graphics_frame(&mut self) -> WelcomeGraphicsFrame {
-        if self.graphics == crate::terminal::GraphicsSupport::None {
-            return WelcomeGraphicsFrame::Inert;
-        }
-        match self.welcome_band {
-            Some(band) => WelcomeGraphicsFrame::Place(band, !self.welcome.image_transmitted),
-            None if self.welcome.image_transmitted => {
-                self.welcome.image_transmitted = false;
-                self.welcome.image_seat = None;
-                WelcomeGraphicsFrame::Delete
-            }
-            None => WelcomeGraphicsFrame::Inert,
-        }
-    }
-
-    /// Record the bring-up graphics ask's verdict.
-    ///
-    /// Called once before the run loop starts; the welcome's image
-    /// layer is inert without it.
-    pub fn set_graphics_support(&mut self, support: crate::terminal::GraphicsSupport) {
-        self.graphics = support;
-    }
-
-    /// Write this frame's welcome-graphics commands, if any.
-    ///
-    /// The single write point for the image layer: transmit once,
-    /// place when the band's seat differs from the seated one — the
-    /// origin rides the seat, so a moved band deletes its stale
-    /// placement before the new one lands and placements never stack
-    /// across frames — or delete when the welcome has ended.
-    /// Fire-and-forget by design (`q=2` throughout): the cell art
-    /// beneath is the standing fallback, and a failed write is named
-    /// in the log rather than dropped on the floor.
-    fn emit_welcome_graphics(&mut self) {
-        match self.welcome_graphics_frame() {
-            WelcomeGraphicsFrame::Place(band, first) => {
-                let seat = (band.x, band.y, band.width, band.height);
-                if placement_due(self.welcome.image_seat, seat) {
-                    let mut out = std::io::stdout();
-                    if self.welcome.image_seat.is_some() {
-                        write_graphics(
-                            &mut out,
-                            &crate::welcome_image::delete_placements_command(),
-                        );
-                    }
-                    if first {
-                        let bytes = match crate::welcome_image::rendition(band.width, band.height) {
-                            Some(bytes) => bytes,
-                            None => crate::welcome_image::PHOTO.to_vec(),
-                        };
-                        for command in crate::welcome_image::transmit_commands(&bytes, 4096) {
-                            write_graphics(&mut out, &command);
-                        }
-                        self.welcome.image_transmitted = true;
-                    }
-                    write_graphics(&mut out, &crate::welcome_image::cursor_to(band.x, band.y));
-                    write_graphics(
-                        &mut out,
-                        &crate::welcome_image::place_command(band.width, band.height),
-                    );
-                    flush_graphics(&mut out);
-                    self.welcome.image_seat = Some(seat);
-                }
-            }
-            WelcomeGraphicsFrame::Delete => {
-                let mut out = std::io::stdout();
-                write_graphics(&mut out, &crate::welcome_image::delete_command());
-                flush_graphics(&mut out);
-            }
-            WelcomeGraphicsFrame::Inert => {}
-        }
     }
 
     /// Settle the run timer's anchor against the running flag.
@@ -13796,51 +13677,15 @@ fn reverse_selection(lines: &mut [Line<'_>], skip: usize, selection: &CellSelect
 fn take_locked<T: Default>(mutex: &Mutex<T>) -> T {
     std::mem::take(&mut *mutex.lock().unwrap_or_else(PoisonError::into_inner))
 }
-
-/// Write one welcome-graphics command, naming a failure in the log.
-///
-/// The writes are fire-and-forget for the terminal's sake (`q=2`
-/// throughout, no reply requested), but a failed write is still worth
-/// a warning line: a silently dropped error is how a stranded
-/// placement or a lost delete goes unnoticed.
-fn write_graphics(out: &mut std::io::Stdout, command: &[u8]) {
-    use std::io::Write as _;
-    if let Err(err) = out.write_all(command) {
-        tracing::warn!("welcome graphics write failed: {err}");
-    }
-}
-
-/// Flush the graphics write side, naming a failure in the log.
-///
-/// Without the flush the commands can sit in the stdout buffer past
-/// the frame, so the placement lands a frame late or never.
-fn flush_graphics(out: &mut std::io::Stdout) {
-    use std::io::Write as _;
-    if let Err(err) = out.flush() {
-        tracing::warn!("welcome graphics flush failed: {err}");
-    }
-}
-
-/// Whether the image layer must place for this frame's band seat.
-///
-/// First contact seats `None`, so it places; afterwards only a seat
-/// that differs — the origin rides the seat beside the geometry —
-/// places again, and the emit path deletes the stale placement
-/// first. A stable band places once, so placements never stack
-/// behind unchanged frames.
-fn placement_due(seated: Option<(u16, u16, u16, u16)>, band: (u16, u16, u16, u16)) -> bool {
-    seated != Some(band)
-}
-
 /// Collect the viewport window across concatenated line segments.
 ///
-/// The settled conversation renders from a cache that must survive
-/// the frame, so instead of concatenating and cloning every segment
-/// this walks them with the skip offset and clones only the lines
-/// the viewport actually shows — per-frame cost tracks the pane
-/// height, not the session length. The segments' borrow and their
-/// content are decoupled lifetimes: the caller may assemble the
-/// window from transient borrows of lines it keeps beyond them.
+/// The settled conversation renders from a cache that must survive the
+/// frame, so instead of concatenating and cloning every segment this
+/// walks them with the skip offset and clones only the lines the
+/// viewport actually shows — per-frame cost tracks the pane height,
+/// not the session length. The segments' borrow and their content are
+/// decoupled lifetimes: the caller may assemble the window from
+/// transient borrows of lines it keeps beyond them.
 fn visible_window<'a>(segments: &[&'a [Line<'a>]], skip: usize, height: usize) -> Vec<Line<'a>> {
     let mut visible = Vec::with_capacity(height.min(64));
     let mut skip = skip;
@@ -13862,6 +13707,27 @@ fn visible_window<'a>(segments: &[&'a [Line<'a>]], skip: usize, height: usize) -
         }
     }
     visible
+}
+
+/// The welcome group's six rows: a filler above and below, the band,
+/// the notice, the rule, the composer box.
+///
+/// One split in one place — the arithmetic cannot drift between two
+/// copies of it.
+fn welcome_rows(area: Rect, band_height: u16, rule_row: u16, box_height: u16) -> Vec<Rect> {
+    let constraints = [
+        Constraint::Min(0),
+        Constraint::Length(band_height),
+        Constraint::Length(1),
+        Constraint::Length(rule_row),
+        Constraint::Length(box_height),
+        Constraint::Min(0),
+    ];
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(area)
+        .to_vec()
 }
 
 /// Count a band's leading star-sky rows.
@@ -13897,41 +13763,6 @@ fn leading_sky_rows(lines: &[Line<'static>]) -> u16 {
         })
         .count();
     u16::try_from(depth).unwrap_or(u16::MAX)
-}
-
-/// What the run loop owes the welcome's graphics layer this frame.
-///
-/// The loop owns the terminal's single write point, so the app hands
-/// it the lifecycle in data: place (transmit first when the second
-/// field is `true`), delete once when the welcome ends, or nothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WelcomeGraphicsFrame {
-    /// Float the photograph over the rect, sized to cells.
-    ///
-    /// The flag is the transmit half of the lifecycle: `true` when
-    /// the image bytes must ride ahead of the placement — the
-    /// terminal renders nothing it has not received — and `false`
-    /// when the image is already aboard and only the placement is
-    /// new.
-    Place(ratatui::layout::Rect, bool),
-
-    /// The welcome ended with an image still floating: delete it.
-    ///
-    /// The photograph must not outlive the session-opening it
-    /// belongs to — text drawn after a stale picture would sit
-    /// beneath it — so the loop sends this once when the welcome
-    /// leaves.
-    Delete,
-
-    /// No graphics business this frame.
-    ///
-    /// Either the terminal never spoke the protocol — the layer
-    /// stays inert for the run's whole life — or this frame shows
-    /// no welcome band and no image is afloat to clean up. The loop
-    /// writes nothing: no cursor move, no transmit, no placement.
-    /// The explicit verdict is the point — every frame hands the
-    /// layer one, so the single write point never has to guess.
-    Inert,
 }
 
 /// The fresh session's welcome geometry.
@@ -18662,6 +18493,53 @@ mod tests {
     }
 
     #[test]
+    fn the_splash_margins_dissolve_into_the_theme_canvas() {
+        // The flat blue-black margins the art carries against the
+        // default theme's neutral canvas read as a mismatched
+        // background flanking the image — the outermost art column now
+        // goes unstyled, a cell the terminal paints as its own default
+        // (the canvas, in every color vocabulary), so the art's edge
+        // and the strips beside it are literally the same cell state.
+        // The picture's middle keeps its own colors.
+        let mut subject = app();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 30)).expect("terminal");
+        terminal
+            .draw(|frame| subject.render(frame))
+            .expect("first draw");
+        let buffer = terminal.backend().buffer();
+        let band = subject.welcome_band.expect("band");
+        let mid = band.y + band.height / 2;
+        let canvas = ratatui::style::Color::Reset;
+        for x in [band.x, band.right().saturating_sub(1)] {
+            let cell = buffer
+                .cell((x, mid))
+                .map(|cell| (cell.symbol(), cell.fg, cell.bg));
+            assert_eq!(
+                cell,
+                Some((" ", canvas, canvas)),
+                "the outermost art column is a blank default cell — no glyph dots in the foreground color"
+            );
+        }
+        let middle = buffer
+            .cell((band.x + band.width / 2, mid))
+            .map(|cell| cell.bg);
+        assert_ne!(
+            middle,
+            Some(canvas),
+            "the picture's middle keeps its own color"
+        );
+        let strip = buffer
+            .cell((band.x.saturating_sub(1), mid))
+            .map(|cell| (cell.fg, cell.bg));
+        assert_eq!(
+            strip,
+            Some((canvas, canvas)),
+            "the strips beyond the band are the same default cells as the art's edge"
+        );
+    }
+
+    #[test]
     fn a_prompt_displaces_the_splash_and_a_clear_keeps_it_displaced() {
         // Displacement retires the splash for the run: the first
         // message bakes the cache and the splash stands down; /clear
@@ -20008,80 +19886,14 @@ mod tests {
         // The band exists to carry art: a pane too small for the
         // smallest rung still shows the welcome — its composer box
         // alone, as the shape's own doc says — and must record no
-        // band, or the image layer would transmit the photograph and
-        // place it at natural size over that composer (a zero-row
-        // placement is natural size, not no rows).
+        // band.
         let mut app = TuiApp::new(dch_config::DchConfig::default());
-        app.graphics = crate::terminal::GraphicsSupport::Kitty;
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).expect("terminal");
         terminal.draw(|frame| app.render(frame)).expect("draw");
         assert!(
             app.welcome_band.is_none(),
             "an artless welcome carries no band — the composer box alone"
-        );
-        assert_eq!(
-            app.welcome_graphics_frame(),
-            WelcomeGraphicsFrame::Inert,
-            "with no band, the graphics layer transmits and places nothing"
-        );
-    }
-
-    #[test]
-    fn a_resize_without_a_parked_reader_keeps_the_seated_rendition() {
-        // The zoom lane's guards: graphics absent, welcome gone, or no
-        // reader to park — each leaves the seated rendition exactly as
-        // it stood, nothing asked, nothing cleared. The rebuild is
-        // owed only to a proven move, on the parked lane.
-        let mut app = TuiApp::new(dch_config::DchConfig::default());
-        app.graphics = crate::terminal::GraphicsSupport::Kitty;
-        app.welcome_band = Some(ratatui::layout::Rect::new(20, 4, 41, 11));
-        app.welcome.image_seat = Some((20, 4, 41, 11));
-        app.handle_event(&Event::Resize(80, 25));
-        assert_eq!(
-            app.welcome.image_seat,
-            Some((20, 4, 41, 11)),
-            "without a parked reader the seat stands — no rebuild is owed"
-        );
-    }
-
-    #[test]
-    fn a_moved_band_is_a_new_seat_even_when_the_size_stands() {
-        // The placement anchors at the band's origin: a geometry change
-        // that moves the band without resizing it must read as a new
-        // seat, or the photograph stays anchored where the old geometry
-        // put it while the cell art moves on underneath.
-        let band = (20_u16, 4_u16, 41_u16, 11_u16);
-        assert!(placement_due(None, band), "first contact places");
-        assert!(
-            !placement_due(Some(band), band),
-            "a stable band does not re-place — placements never stack"
-        );
-        assert!(
-            placement_due(Some((2, 9, 41, 11)), band),
-            "same size, moved origin — a re-placement is owed"
-        );
-    }
-
-    #[test]
-    fn a_proven_zoom_re_places_the_rendition_already_aboard() {
-        // The moved branch's whole effect is the dropped seat; this
-        // state is exactly its aftermath. The frame seam must owe a
-        // re-placement, not a transmission: the bytes already seated
-        // are scaled to the new cells by the terminal itself.
-        let mut app = TuiApp::new(dch_config::DchConfig::default());
-        app.graphics = crate::terminal::GraphicsSupport::Kitty;
-        app.welcome_band = Some(ratatui::layout::Rect::new(20, 4, 41, 11));
-        app.welcome.image_transmitted = true;
-        app.welcome.image_seat = None;
-        assert_eq!(
-            app.welcome_graphics_frame(),
-            WelcomeGraphicsFrame::Place(ratatui::layout::Rect::new(20, 4, 41, 11), false),
-            "a zoom that moved re-anchors the rendition aboard — no second transmission"
-        );
-        assert!(
-            app.welcome.image_transmitted,
-            "the transmission latch stands — no rendition is rebuilt for the new cells"
         );
     }
 
@@ -20622,6 +20434,52 @@ mod tests {
     }
 
     #[test]
+    fn a_repair_under_standing_damage_reseeds_and_releases_the_adoption_guard() {
+        // The repair's serialization pin: with the driver's adoption
+        // guard installed the way production wires it, the recovery
+        // runs its two steps — the verdict's clearing, the cell's
+        // re-seed — under that guard and gives it back, so a
+        // concurrent resume adoption cannot interleave between them
+        // and a leaked guard cannot deadlock the next adoption.
+        let mut config = dch_config::DchConfig::default();
+        config.permissions.rules = vec![dch_config::PermissionRuleConfig {
+            id: None,
+            outcome: dch_config::PermissionRuleOutcome::Allow,
+            tool: Some("Bash".to_string()),
+            shell_prefix: None,
+            path_glob: None,
+        }];
+        let mut app = TuiApp::new(config.clone());
+        let memory = crate::queue::PermissionMemory::default();
+        memory.mark_damaged();
+        app.set_permission_memory(memory);
+        let rules_cell = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        app.set_permission_config_rules_cell(Some(std::sync::Arc::clone(&rules_cell)));
+        let adoption_guard = std::sync::Arc::new(std::sync::Mutex::new(()));
+        app.set_permission_adoption_guard(Some(std::sync::Arc::clone(&adoption_guard)));
+
+        app.permissions_command(Some("repair"));
+
+        let rules = rules_cell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            *rules,
+            config.permissions.engine_rules(),
+            "the repair re-seeds the config layer at the configuration's own join"
+        );
+        drop(rules);
+        assert!(
+            adoption_guard.try_lock().is_ok(),
+            "the repair releases the adoption guard — a leak would deadlock the next adoption"
+        );
+        assert!(
+            !app.permission_memory.damage_standing(),
+            "the verdict cleared"
+        );
+    }
+
+    #[test]
     fn a_preset_selection_waits_for_repair_and_takes_effect_at_it() {
         // The round-4 damage interaction, end to end: a healthy swap
         // joins the new preset's rules at once; under a standing
@@ -20663,6 +20521,11 @@ mod tests {
             std::sync::Arc::new(std::sync::Mutex::new(config.permissions.preset.clone()));
         app.set_permission_config_rules_cell(Some(std::sync::Arc::clone(&rules_cell)));
         app.set_permission_preset_cell(Some(std::sync::Arc::clone(&preset_cell)));
+        // The swap runs under the driver's adoption guard in production;
+        // hand the app the same lane so the paths below exercise it —
+        // and prove at the end that every swap gave it back.
+        let adoption_guard = std::sync::Arc::new(std::sync::Mutex::new(()));
+        app.set_permission_adoption_guard(Some(std::sync::Arc::clone(&adoption_guard)));
 
         app.preset_command(Some("p2"));
 
@@ -20717,6 +20580,12 @@ mod tests {
             config.permissions.engine_rules_at(Some("p1")),
             "the repair re-seeds at the selection in effect — the swap the \
              damage held takes effect with it"
+        );
+
+        assert!(
+            adoption_guard.try_lock().is_ok(),
+            "a finished swap always releases the adoption guard — a leak \
+             would deadlock the next adoption"
         );
     }
 

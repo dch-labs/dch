@@ -406,9 +406,15 @@ impl PermissionsConfig {
     /// and the gate's re-seeds — the swap itself, a `/clear` rotation,
     /// a healthy resume — all join from the selection in effect, so
     /// the rules cell and the listing it mirrors cannot drift apart.
-    /// `None` selects nothing, whatever the file says; a name the
-    /// presets do not carry joins nothing, exactly as a dangling
-    /// selection in the file does.
+    /// `None` selects nothing, whatever the file says. A name the
+    /// presets do not carry is refused where it can be — the
+    /// configuration rejects a dangling selection at load, and the
+    /// CLI flag is validated the same way — so the join-nothing arm
+    /// here belongs to the one holder that cannot be refused on the
+    /// spot: the process-live selection cell, which a configuration
+    /// reload can leave naming a preset that no longer exists, and
+    /// which then joins nothing until the next selection says
+    /// otherwise.
     #[must_use]
     pub fn engine_rules_at(&self, preset: Option<&str>) -> Vec<Rule> {
         let mut rules = self.engine_rules_with_prefix("");
@@ -600,12 +606,15 @@ impl Preset {
 /// the call, never a display string.
 ///
 /// For a Bash ask, [`RememberRules::Segments`] carries one arity-trimmed
-/// verb prefix per clean command segment — readers included; they are
-/// part of the chain the user approved — plus the exact text of any
-/// segment too complex to prefix safely (substitutions, redirections,
-/// control flow). Approving `cargo test -p dch-tui | tail -5` remembers
-/// `cargo test` and `tail`, so every later variant of the same work —
-/// different flags, different packages — runs without asking again; an
+/// verb prefix per *writer* command segment — reader segments mint
+/// nothing, on either side of the sheet: the carve-out runs them free
+/// on their own, so a rule for them records nothing the approval was
+/// about — plus the exact text of any segment too complex to prefix
+/// safely (substitutions, redirections, control flow). Approving
+/// `cargo test -p dch-tui | tail -5` remembers `cargo test` — `tail`
+/// rides the reader carve-out, free without a blessing — so every
+/// later variant of the writer — different flags, different packages —
+/// runs without asking again; an
 /// `echo "EXIT: $?"` trailer is remembered as that exact text alone
 /// and can never ride an `echo` verb. A multi-line script is remembered
 /// per line. A write-family ask remembers [`RememberRules::PathGlobs`] —
@@ -623,8 +632,9 @@ pub enum RememberRules {
     Tool(String),
 
     /// A Bash ask's remember set: one arity-trimmed verb prefix per
-    /// command segment (readers included — they are part of the chain
-    /// the user approved), plus the exact text of any segment too
+    /// *writer* command segment (reader segments mint nothing, on
+    /// either side of the sheet — the carve-out runs them free on
+    /// their own), plus the exact text of any segment too
     /// complex to prefix safely (substitutions, redirections, control
     /// flow, a quoted first word). Coverage is all-or-nothing across
     /// the whole set: every segment of a later ask must be remembered,
@@ -685,7 +695,8 @@ pub enum PermissionRule {
     /// segment begins with these words.
     ///
     /// The fine-grained shape: remembered from the approved command's
-    /// clean segments — readers included — so approval of one spelling
+    /// *writer* segments — reader segments mint nothing, on either
+    /// side of the sheet — so approval of one spelling
     /// of the work covers its later variants — flags and arguments
     /// differ, the verb holds.
     ShellPrefix {

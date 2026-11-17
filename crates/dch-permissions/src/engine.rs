@@ -104,14 +104,14 @@ pub struct RememberedRules {
     /// write the tool makes.
     pub tools: Vec<String>,
 
-    /// Remembered shell verb prefixes, one per approved clean command
-    /// segment.
+    /// Remembered shell verb prefixes, one per approved writer
+    /// command segment.
     ///
     /// Coverage requires every clean segment of the new call to appear
     /// here, so the set grows by one entry per distinct verb an "allow
-    /// always" approved. Reader segments are remembered here too — they
-    /// are part of the chain the user approved — though the reader
-    /// gate would allow them without any rule.
+    /// always" approved. Reader segments mint nothing on either side
+    /// of the sheet — the carve-out runs them free on their own — so
+    /// no reader-derived entry ever arrives here through the mint.
     pub shell_prefixes: Vec<String>,
 
     /// Remembered exact command texts — the complex segments

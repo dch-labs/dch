@@ -22,7 +22,6 @@ pub mod theme;
 pub mod todo_view;
 pub mod tool_capture;
 pub mod tool_render;
-pub mod welcome_image;
 
 pub use app::{CopyAnswer, TuiApp};
 pub use commands::{Command, CommandSpec, CompletionSources, Parsed};

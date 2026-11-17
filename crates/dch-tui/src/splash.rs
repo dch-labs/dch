@@ -88,6 +88,232 @@ fn scales() -> &'static [SplashArt] {
     })
 }
 
+/// The dissolve's reach, in columns from each vertical edge.
+///
+/// The photograph's own margins — the flat night its subject floats
+/// in — are blue-black, and the canvas they sit on is neutral: side by
+/// side the two read as a mismatched background flanking the image.
+/// Four columns is the width of those margins in every rung, so the
+/// dissolve never reaches the subject itself.
+const EDGE_DISSOLVE_COLUMNS: usize = 4;
+
+/// Dissolve the art's outer columns into the canvas it floats on.
+///
+/// The welcome's render path runs this over the cropped rows before
+/// painting them, keyed to the live theme's canvas: the outermost
+/// column goes **unstyled** — no ink, no ground, a cell the terminal
+/// paints as its own default, which *is* the canvas, exactly, in
+/// every vocabulary — and the strength falls off with the square of
+/// the remaining reach, so the second column keeps most of its own
+/// color and the photograph's margins fade as a gradient, the way a
+/// printed photograph vignettes into its mat. Truecolor cells step
+/// toward the canvas itself; palette cells step toward the palette's
+/// floor beneath the canvas ([`palette_floor`]), because the fixed
+/// ramp cannot name the canvas — its gray steps straddle it — and
+/// snapping a blend onto the nearer step above would paint a rim
+/// *lighter* than the page it dissolves into. Both the ink and the
+/// ground blend, so a fraction block's glyphs vanish with the ground
+/// instead of speckling the fade. A canvas the theme cannot name —
+/// [`Color::Reset`], the transparent and deferred sessions —
+/// dissolves nothing: the terminal's own background is the user's
+/// choice, and the photograph keeps the margins it was authored
+/// with.
+pub(crate) fn dissolve_edges(lines: &mut [Line<'static>], canvas: Color) {
+    let Color::Rgb(base_red, base_green, base_blue) = canvas else {
+        return;
+    };
+    let reach = EDGE_DISSOLVE_COLUMNS;
+    let span_square = u32::try_from(reach.saturating_mul(reach)).unwrap_or(1);
+    let floor = palette_floor((base_red, base_green, base_blue));
+    for line in lines {
+        let width = line.spans.len();
+        for (column, span) in line.spans.iter_mut().enumerate() {
+            let from_left = column;
+            let from_right = width.saturating_sub(column.saturating_add(1));
+            let edge_distance = from_left.min(from_right);
+            if edge_distance >= reach {
+                continue;
+            }
+            let inside = reach.saturating_sub(edge_distance);
+            if inside == reach {
+                *span = Span::raw(" ");
+                continue;
+            }
+            let numerator = u32::try_from(inside.saturating_mul(inside)).unwrap_or(0);
+            let step = |color: Option<Color>| -> Option<Color> {
+                toward_canvas(
+                    color,
+                    (base_red, base_green, base_blue),
+                    floor,
+                    numerator,
+                    span_square,
+                )
+            };
+            let style = span.style;
+            if let Some(color) = step(style.fg) {
+                span.style = style.fg(color);
+            }
+            if let Some(color) = step(style.bg) {
+                span.style = span.style.bg(color);
+            }
+        }
+    }
+}
+
+/// One color stepped toward the canvas by `numerator / denominator` of
+/// the distance.
+///
+/// Truecolor steps in place; a palette index decodes, steps toward the
+/// palette's floor beneath the canvas, and snaps back to the nearest
+/// fixed entry; anything else — a color the dissolve cannot speak —
+/// stands exactly as it was.
+fn toward_canvas(
+    color: Option<Color>,
+    canvas: (u8, u8, u8),
+    floor: (u8, u8, u8),
+    numerator: u32,
+    denominator: u32,
+) -> Option<Color> {
+    let color = color?;
+    Some(match color {
+        Color::Rgb(red, green, blue) => Color::Rgb(
+            blend_channel(red, canvas.0, numerator, denominator),
+            blend_channel(green, canvas.1, numerator, denominator),
+            blend_channel(blue, canvas.2, numerator, denominator),
+        ),
+        Color::Indexed(entry) => {
+            let (red, green, blue) = palette_triple(entry);
+            let stepped = (
+                blend_channel(red, floor.0, numerator, denominator),
+                blend_channel(green, floor.1, numerator, denominator),
+                blend_channel(blue, floor.2, numerator, denominator),
+            );
+            Color::Indexed(nearest_palette_entry(stepped))
+        }
+        other => other,
+    })
+}
+
+/// One channel stepped toward the canvas, in saturation-safe integers.
+///
+/// The dissolve's whole arithmetic in miniature, written the way the
+/// workspace's lint policy demands: the byte widens losslessly
+/// ([`u32::from`]), the distance is an absolute difference (either
+/// direction of the blend is one code path), the fraction of it that
+/// applies multiplies and divides through the checked and saturating
+/// operations — a zero denominator steps nothing, an oversized
+/// numerator saturates — and the result narrows back through
+/// [`u8::try_from`] with the original byte as its own fallback, never
+/// an `as` cast that could truncate. A `numerator` of zero leaves the
+/// channel exactly where it stood; the full `denominator` lands it on
+/// the canvas.
+fn blend_channel(value: u8, base: u8, numerator: u32, denominator: u32) -> u8 {
+    let widened = u32::from(value);
+    let base = u32::from(base);
+    let gap = base.abs_diff(widened);
+    let step = gap
+        .saturating_mul(numerator)
+        .checked_div(denominator)
+        .unwrap_or(0);
+    let blended = if base > widened {
+        widened.saturating_add(step)
+    } else {
+        widened.saturating_sub(step)
+    };
+    u8::try_from(blended).unwrap_or(value)
+}
+
+/// The fixed palette entry whose triple sits nearest `target`.
+///
+/// The dissolve's palette arm must speak an index the terminal paints
+/// verbatim, so a blended color snaps to the nearest entry rather than
+/// falling back to truecolor — which tmux would re-encode and mangle,
+/// the exact fate the palette rendition exists to avoid. Distance is
+/// squared Euclidean over the decoded triples; a tie names the lower
+/// entry, so the choice is deterministic.
+fn nearest_palette_entry(target: (u8, u8, u8)) -> u8 {
+    let channel = |a: u8, b: u8| -> u32 {
+        let gap = u32::from(a).abs_diff(u32::from(b));
+        gap.saturating_mul(gap)
+    };
+    let distance = |entry: u8| -> u32 {
+        let (red, green, blue) = palette_triple(entry);
+        channel(red, target.0)
+            .saturating_add(channel(green, target.1))
+            .saturating_add(channel(blue, target.2))
+    };
+    let mut best = PALETTE_FIRST;
+    let mut best_distance = distance(best);
+    for entry in PALETTE_FIRST.saturating_add(1)..=u8::MAX {
+        let candidate = distance(entry);
+        if candidate < best_distance {
+            best = entry;
+            best_distance = candidate;
+        }
+    }
+    best
+}
+
+/// The fixed palette's floor beneath the canvas.
+///
+/// The target the dissolve's palette arm walks toward: the nearest
+/// entry that does not sit lighter than the canvas, or the darkest
+/// entry when every one does. The ramp's gray steps straddle any
+/// canvas between them — the default theme's `(14, 14, 14)` between
+/// the ramp's 8 and 18 — so the nearest entry outright can be a step
+/// *above* the canvas, and a fade snapped onto it paints a rim
+/// lighter than the page it dissolves into. The floor keeps the walk
+/// darkward; the unstyled boundary column — not any entry — is what
+/// meets the canvas itself.
+fn palette_floor(canvas: (u8, u8, u8)) -> (u8, u8, u8) {
+    let weight = |triple: (u8, u8, u8)| -> u32 {
+        u32::from(triple.0)
+            .saturating_add(u32::from(triple.1))
+            .saturating_add(u32::from(triple.2))
+    };
+    let canvas_weight = weight(canvas);
+    let distance = |triple: (u8, u8, u8)| -> u32 {
+        let channel = |a: u8, b: u8| -> u32 {
+            let gap = u32::from(a).abs_diff(u32::from(b));
+            gap.saturating_mul(gap)
+        };
+        channel(triple.0, canvas.0)
+            .saturating_add(channel(triple.1, canvas.1))
+            .saturating_add(channel(triple.2, canvas.2))
+    };
+    let mut best: Option<(u8, u8, u8)> = None;
+    for entry in PALETTE_FIRST..=u8::MAX {
+        let triple = palette_triple(entry);
+        if weight(triple) > canvas_weight {
+            continue;
+        }
+        if best.is_none_or(|current| distance(triple) < distance(current)) {
+            best = Some(triple);
+        }
+    }
+    best.unwrap_or_else(|| palette_triple(PALETTE_FIRST))
+}
+
+/// The sRGB triple one fixed palette entry paints.
+///
+/// The cube's and the ramp's own decode — the inverse of
+/// [`palette_entry`] — in one place, shared by the dissolve and the
+/// round-trip pins.
+fn palette_triple(entry: u8) -> (u8, u8, u8) {
+    let index = usize::from(entry);
+    if index < 232 {
+        let cube = index.saturating_sub(usize::from(PALETTE_FIRST));
+        let pick = |slot: usize| -> u8 { CUBE_STEPS.get(slot % 6).copied().unwrap_or(u8::MAX) };
+        (pick(cube / 36), pick(cube / 6), pick(cube))
+    } else {
+        let step = u32::try_from(index.saturating_sub(232))
+            .unwrap_or(u32::MAX)
+            .saturating_mul(10);
+        let level = u8::try_from(step.saturating_add(8)).unwrap_or(u8::MAX);
+        (level, level, level)
+    }
+}
+
 /// The truecolor rendition's rungs, decoded from their embedded
 /// assets.
 ///
@@ -321,20 +547,8 @@ mod tests {
 
     /// One palette entry's sRGB triple, as the pins below spell it.
     fn palette_rgb(entry: u8) -> [u8; 3] {
-        let index = usize::from(entry);
-        if index < 232 {
-            let cube = index.saturating_sub(usize::from(PALETTE_FIRST));
-            let red = CUBE_STEPS.get(cube / 36).copied().unwrap_or(0);
-            let green = CUBE_STEPS.get((cube / 6) % 6).copied().unwrap_or(0);
-            let blue = CUBE_STEPS.get(cube % 6).copied().unwrap_or(0);
-            [red, green, blue]
-        } else {
-            let step = u32::try_from(index.saturating_sub(232))
-                .unwrap_or(u32::MAX)
-                .saturating_mul(10);
-            let level = u8::try_from(step.saturating_add(8)).unwrap_or(u8::MAX);
-            [level, level, level]
-        }
+        let (red, green, blue) = palette_triple(entry);
+        [red, green, blue]
     }
 
     #[test]
@@ -420,5 +634,193 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_dissolve_lands_the_outermost_column_on_the_canvas() {
+        // The seam the dissolve exists to kill: the art's outermost
+        // column becomes exactly the canvas (ink and ground both, so
+        // no glyph specks it), the columns past the reach keep their
+        // authored colors untouched, and the fade between them is a
+        // real gradient — the second column steps toward the canvas
+        // without landing on it.
+        let art = art(34, 9, include_str!("fjord_splash_w34.txt"), false);
+        let canvas = Color::Rgb(14, 14, 14);
+        let before = art
+            .lines
+            .first()
+            .map(|line| line.spans.clone())
+            .unwrap_or_default();
+        let mut faded = art.lines.clone();
+        dissolve_edges(&mut faded, canvas);
+        let row = faded
+            .first()
+            .map(|line| line.spans.clone())
+            .unwrap_or_default();
+        let outer = row
+            .first()
+            .map(|span| (span.content.as_ref(), span.style.fg, span.style.bg));
+        assert_eq!(
+            outer,
+            Some((" ", None, None)),
+            "the outermost column is an unstyled space — the terminal's own default, the canvas, with no glyph dots on it"
+        );
+        let second = row.get(1).map(|span| span.style.bg);
+        assert_ne!(second, Some(None), "the second column keeps its own color");
+        assert_ne!(
+            second,
+            before.first().map(|span| span.style.bg),
+            "and it moved"
+        );
+        for column in [8usize, 17, 25] {
+            assert_eq!(
+                row.get(column).map(|span| span.style.bg),
+                before.get(column).map(|span| span.style.bg),
+                "the picture past the reach stands exactly as authored"
+            );
+        }
+    }
+
+    #[test]
+    fn a_canvas_the_theme_cannot_name_dissolves_nothing() {
+        // Reset is the transparent and deferred sessions: the
+        // terminal's own background is the user's choice, and the
+        // photograph keeps the margins it was authored with.
+        let art = art(34, 9, include_str!("fjord_splash_w34.txt"), false);
+        let mut faded = art.lines.clone();
+        dissolve_edges(&mut faded, Color::Reset);
+        assert_eq!(
+            faded, art.lines,
+            "a Reset canvas leaves every span exactly as decoded"
+        );
+    }
+
+    #[test]
+    fn the_palette_rendition_dissolves_within_the_palette() {
+        // The palette arm must speak indexes tmux passes verbatim: a
+        // blended color snaps to the nearest fixed entry, never to a
+        // truecolor escape that would come back re-encoded and
+        // mangled — and the boundary column goes unstyled instead, the
+        // one spelling whose pixels are the canvas itself, which no
+        // entry can name.
+        let art = art(34, 9, include_str!("fjord_palette_w34.txt"), true);
+        let mut faded = art.lines.clone();
+        dissolve_edges(&mut faded, Color::Rgb(14, 14, 14));
+        let last = faded
+            .first()
+            .map_or(0, |line| line.spans.len())
+            .saturating_sub(1);
+        for (row, line) in faded.iter().enumerate() {
+            for (column, span) in line.spans.iter().enumerate() {
+                if column == 0 || column == last {
+                    assert_eq!(
+                        (span.content.as_ref(), span.style.fg, span.style.bg),
+                        (" ", None, None),
+                        "row {row}: the boundary column is an unstyled space — the canvas default, no glyph dots"
+                    );
+                    continue;
+                }
+                for color in [span.style.fg, span.style.bg] {
+                    assert!(
+                        matches!(color, Some(Color::Indexed(n)) if (16..=255).contains(&n)),
+                        "row {row} column {column}: the dissolve stays in the fixed palette: {color:?}"
+                    );
+                }
+            }
+        }
+        assert_ne!(
+            faded, art.lines,
+            "and the dissolve actually moved the colors"
+        );
+    }
+
+    #[test]
+    fn the_palette_fade_never_rims_lighter_than_the_canvas() {
+        // The tmux symptom this pins away: the gray ramp's steps
+        // straddle the canvas (the default theme's 14 sits between the
+        // ramp's 8 and 18), so a fade that snaps onto the nearer step
+        // above paints a rim lighter than the page it dissolves into.
+        // The boundary is unstyled now, and every faded palette column
+        // walks darkward — its decoded weight never above the authored
+        // color's — so no column of the fade is lighter than the art
+        // it came from.
+        let art = art(34, 9, include_str!("fjord_palette_w34.txt"), true);
+        let canvas = (14_u8, 14_u8, 14_u8);
+        let mut faded = art.lines.clone();
+        dissolve_edges(&mut faded, Color::Rgb(14, 14, 14));
+        let weight = |triple: (u8, u8, u8)| -> u32 {
+            u32::from(triple.0)
+                .saturating_add(u32::from(triple.1))
+                .saturating_add(u32::from(triple.2))
+        };
+        let ground = |span: &Span| -> (u8, u8, u8) {
+            match span.style.bg {
+                Some(Color::Indexed(entry)) => palette_triple(entry),
+                Some(Color::Rgb(red, green, blue)) => (red, green, blue),
+                _ => canvas,
+            }
+        };
+        for (row, (authored, dissolved)) in art.lines.iter().zip(&faded).enumerate() {
+            let width = authored.spans.len();
+            for column in 1..width.saturating_sub(1) {
+                let edge_distance = column.min(width.saturating_sub(column.saturating_add(1)));
+                if edge_distance == 0 || edge_distance >= EDGE_DISSOLVE_COLUMNS {
+                    continue;
+                }
+                let Some(before) = authored.spans.get(column) else {
+                    continue;
+                };
+                let Some(after) = dissolved.spans.get(column) else {
+                    continue;
+                };
+                assert!(
+                    weight(ground(after)) <= weight(ground(before)),
+                    "row {row} column {column}: the fade walks darkward, never lighter"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_palette_floor_sits_at_or_below_the_canvas() {
+        // The floor the palette arm walks toward: the nearest entry
+        // the canvas is not darker than. The default theme's neutral
+        // 14 lands on the ramp's 8 — never the 18 above it — and a
+        // canvas the whole palette sits under falls to black.
+        assert_eq!(
+            palette_floor((14, 14, 14)),
+            (8, 8, 8),
+            "the ramp's 8 is the nearest entry the canvas outweighs"
+        );
+        assert_eq!(
+            palette_floor((240, 240, 240)),
+            (238, 238, 238),
+            "a light canvas still finds its floor beneath"
+        );
+        assert_eq!(
+            palette_floor((0, 0, 0)),
+            (0, 0, 0),
+            "a black canvas floors on black itself"
+        );
+    }
+
+    #[test]
+    fn the_nearest_palette_entry_names_an_exact_triple_itself() {
+        // The decode is the search's own yardstick: every entry's
+        // triple snaps back to the entry, and an off-ladder gray
+        // snaps to the ramp rung beside it.
+        for entry in [16u8, 17, 59, 231, 232, 245, 255] {
+            let (red, green, blue) = palette_triple(entry);
+            assert_eq!(
+                nearest_palette_entry((red, green, blue)),
+                entry,
+                "entry {entry}'s own triple is its nearest"
+            );
+        }
+        assert_eq!(
+            nearest_palette_entry((14, 14, 14)),
+            233,
+            "a neutral gray between the ramp's 8 and 18 snaps to the nearer 18"
+        );
     }
 }

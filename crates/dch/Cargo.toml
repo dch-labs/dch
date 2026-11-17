@@ -24,6 +24,9 @@ name = "resume_exactness"
 name = "smoke"
 
 [[test]]
+name = "stdin_task_combine"
+
+[[test]]
 name = "tui_signal_restore"
 
 [[test]]
