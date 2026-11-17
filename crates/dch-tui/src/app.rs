@@ -5483,6 +5483,12 @@ impl TuiApp {
             KeyCode::Char('a' | 'A') if bare || shift => {
                 if let Some(front) = self.pending_permissions.front() {
                     let always = front.always.clone();
+                    let adoption = self.permission_adoption_guard.clone();
+                    let _held = adoption.as_ref().map(|guard| {
+                        guard
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    });
                     self.permission_memory.remember_rules(&always);
                 }
                 self.resolve_pending_permission(PermissionResolution::AllowOnce);
@@ -5491,6 +5497,12 @@ impl TuiApp {
             KeyCode::Char('d' | 'D') if bare || shift => {
                 if let Some(front) = self.pending_permissions.front() {
                     let never = front.never.clone();
+                    let adoption = self.permission_adoption_guard.clone();
+                    let _held = adoption.as_ref().map(|guard| {
+                        guard
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    });
                     self.permission_memory.remember_deny(&never);
                 }
                 self.resolve_pending_permission(PermissionResolution::DenyOnce);
@@ -8758,6 +8770,12 @@ impl TuiApp {
                 .load(std::sync::atomic::Ordering::SeqCst);
         if prompts_retired {
             self.pending_permissions.clear();
+            // The sheet's own entry state retires with it: a reason
+            // draft half-typed or a command preview left expanded
+            // would greet the next ask as if the retired sheet's keys
+            // had carried over.
+            self.permission_reason = None;
+            self.permission_command_expanded = false;
         }
         let questions_retired = !self.pending_questions.is_empty()
             && !self
@@ -9965,10 +9983,34 @@ impl TuiApp {
             .into_iter()
             .map(|row| Line::styled(row, Style::default().fg(self.theme.ui.foreground)))
             .collect();
+        let sheet_area = Rect {
+            height: area.height.saturating_sub(STATUS_BAR_ROWS - STATUS_BAR_AIR),
+            ..area
+        };
         if let Some(command) = &sheet.command {
             let runs = format!("runs: {command}");
             let rows = if self.permission_command_expanded {
-                wrap_prompt_rows_last(&runs, wrap_at, MAX_EXPANDED_OVERLAY_ROWS)
+                let scope = if sheet.always.is_empty() {
+                    0
+                } else {
+                    FIXED_SCOPE_ROWS
+                };
+                let deny_scope = if sheet.never.is_empty() {
+                    0
+                } else {
+                    FIXED_DENY_ROWS
+                };
+                let reason = if sheet.reason.is_some() {
+                    FIXED_REASON_ROWS
+                } else {
+                    0
+                };
+                let budget = expanded_command_budget(
+                    sheet_area.height,
+                    lines.len(),
+                    expanded_fixed_rows(scope | deny_scope | reason, &hints, wrap_at),
+                );
+                wrap_prompt_rows_last(&runs, wrap_at, budget)
             } else {
                 wrap_prompt_rows(&runs, wrap_at, MAX_OVERLAY_ROWS)
             };
@@ -10007,10 +10049,6 @@ impl TuiApp {
                 .into_iter()
                 .map(|row| Line::styled(row, Style::default().fg(self.theme.ui.secondary))),
         );
-        let sheet_area = Rect {
-            height: area.height.saturating_sub(STATUS_BAR_ROWS - STATUS_BAR_AIR),
-            ..area
-        };
         let height = u16::try_from(lines.len())
             .unwrap_or(u16::MAX)
             .saturating_add(2)
@@ -13834,7 +13872,7 @@ fn pane(chunks: &[Rect], index: usize, fallback: Rect) -> Rect {
 const MAX_OVERLAY_ROWS: usize = 3;
 
 /// The most rows the expanded command preview keeps from its wrap's
-/// tail.
+/// tail — the ceiling for panes tall enough to spend it.
 ///
 /// Expansion exists so the *end* of a command — where a destructive
 /// suffix hides — is never invisible at the approval press: the kept
@@ -13842,7 +13880,54 @@ const MAX_OVERLAY_ROWS: usize = 3;
 /// and the cap keeps a pathological command from filling the whole
 /// sheet on a terminal that could not scroll it anyway. The collapsed
 /// head and the expanded tail together cover any command that fits.
+/// The budget a sheet actually spends is derived from its own height
+/// ([`expanded_command_budget`]) and clamped to this ceiling; the
+/// collapsed path is unchanged.
 const MAX_EXPANDED_OVERLAY_ROWS: usize = 40;
+
+/// The sheet's inner height, minus the borders.
+///
+/// The block draws a rounded border on every side, so two of the
+/// sheet's rows are chrome; the content rows live between them.
+fn sheet_inner_height(sheet_height: u16) -> usize {
+    usize::from(sheet_height.saturating_sub(2))
+}
+
+/// Which optional rows the sheet owes besides the prompt and preview.
+///
+/// A bit-set over the sheet's conditional rows, so the fixed-row
+/// count takes one argument instead of a bool per row — the pane's
+/// budget math reads as arithmetic, not flag soup.
+const FIXED_SCOPE_ROWS: usize = 1;
+const FIXED_DENY_ROWS: usize = 1 << 1;
+const FIXED_REASON_ROWS: usize = 1 << 2;
+
+/// The rows the sheet draws besides the prompt and the preview.
+///
+/// The scopes, reason, blank spacer, and hint rows are counted here
+/// so the preview's budget spends only what remains; the hint wrap is
+/// measured rather than guessed, because a narrow pane wraps a long
+/// hint across several rows.
+fn expanded_fixed_rows(fixed: usize, hints: &str, wrap_at: usize) -> usize {
+    let rows = fixed.count_ones() as usize;
+    // The blank spacer ahead of the hints, then the hints themselves.
+    let hint_rows = wrap_prompt_rows(hints, wrap_at, MAX_OVERLAY_ROWS).len();
+    rows.saturating_add(1).saturating_add(hint_rows)
+}
+
+/// The row budget an expanded command preview may spend on this sheet.
+///
+/// The sheet's inner height, less the prompt rows already drawn and
+/// the fixed rows it must still draw, floored at one row so a cramped
+/// pane still shows the preview's first line — and capped at the
+/// standing ceiling so a tall pane does not hand an enormous command
+/// the whole sheet.
+fn expanded_command_budget(sheet_height: u16, prompt_rows: usize, fixed_rows: usize) -> usize {
+    let remaining = sheet_inner_height(sheet_height)
+        .saturating_sub(prompt_rows)
+        .saturating_sub(fixed_rows);
+    remaining.clamp(1, MAX_EXPANDED_OVERLAY_ROWS)
+}
 
 /// The boot-time permission pair a stand-in config save restores.
 ///
@@ -19892,6 +19977,87 @@ mod tests {
         assert!(
             app.welcome_band.is_none(),
             "an artless welcome carries no band — the composer box alone"
+        );
+    }
+
+    #[test]
+    fn retiring_pending_permissions_clears_the_sheet_entry_state() {
+        // The sheet's own drafting state retires with the sheet: a
+        // half-typed reason or a left-expanded preview would greet the
+        // next ask as if the retired sheet's keys had carried over.
+        // The ask itself is dropped unanswered — the resolver reads a
+        // dropped reply as denial — so only the entry state needs
+        // proving here.
+        let mut subject = app();
+        let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
+        subject
+            .pending_permissions
+            .push_back(crate::permission::PermissionRequest {
+                tool_name: "Bash".to_string(),
+                prompt: "run it?".to_string(),
+                input: serde_json::json!({"command": "cargo test"}),
+                always: Vec::new(),
+                never: Vec::new(),
+                reply: reply_tx,
+            });
+        subject.permission_reason = Some("because".to_string());
+        subject.permission_command_expanded = true;
+
+        let _ = subject.tick_wake(std::time::Instant::now());
+
+        assert!(
+            subject.pending_permissions.is_empty(),
+            "the run at rest retires the pending ask"
+        );
+        assert!(
+            subject.permission_reason.is_none(),
+            "the reason draft retires with the sheet"
+        );
+        assert!(
+            !subject.permission_command_expanded,
+            "the preview's expansion retires with the sheet"
+        );
+    }
+
+    #[test]
+    fn an_expanded_preview_spends_only_the_rows_the_sheet_has() {
+        // The budget is the sheet's inner height minus the prompt rows
+        // drawn and the fixed rows owed (scopes, reason, spacer,
+        // hints), floored at one so a cramped pane still shows the
+        // preview's first line, and capped at the standing ceiling so
+        // a tall pane does not hand an enormous command the sheet.
+        let hints = "y allows · n or esc denies · e expands";
+        let fixed = expanded_fixed_rows(
+            FIXED_SCOPE_ROWS | FIXED_DENY_ROWS | FIXED_REASON_ROWS,
+            hints,
+            80,
+        );
+        // A tall sheet: everything fits, the ceiling binds.
+        assert_eq!(
+            expanded_command_budget(100, 3, fixed),
+            MAX_EXPANDED_OVERLAY_ROWS,
+            "a tall pane spends the standing ceiling, no more"
+        );
+        // A short sheet: inner height (less borders) minus prompt and
+        // fixed rows is exactly the preview's budget — nothing more.
+        let budget = expanded_command_budget(20, 3, fixed);
+        assert_eq!(
+            budget,
+            usize::from(20u16.saturating_sub(2))
+                .saturating_sub(3)
+                .saturating_sub(fixed),
+            "the short pane spends its remaining rows, no more"
+        );
+        assert_eq!(
+            3 + fixed + budget,
+            usize::from(20u16.saturating_sub(2)),
+            "prompt, fixed rows, and preview fill the sheet exactly"
+        );
+        // A pane with nothing to spare: the floor still shows one row.
+        assert_eq!(
+            expanded_command_budget(6, 3, fixed),
+            1,
+            "a cramped pane still shows the preview's first line"
         );
     }
 

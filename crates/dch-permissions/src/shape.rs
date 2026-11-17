@@ -428,8 +428,9 @@ fn command_reads_only(segment: &str) -> bool {
 /// waved-through write costs the file.
 fn reader_arguments_read_only(program: &str, args: &[&str]) -> bool {
     // The shared refusal: `--output` names a file to write wherever a
-    // program accepts it, so no argument to any reader may start it.
-    if args.iter().any(|arg| arg.starts_with("--output")) {
+    // program accepts it, so no argument to any reader may start it —
+    // in full or as the GNU abbreviation of it.
+    if args.iter().any(|arg| abbreviates(arg, "output")) {
         return false;
     }
     // A quoted span collapses to one opaque token before this policy
@@ -464,16 +465,19 @@ fn reader_arguments_read_only(program: &str, args: &[&str]) -> bool {
         "sort" => !args.iter().any(|arg| {
             *arg == "--output"
                 || arg.starts_with("--output=")
-                || *arg == "--compress-program"
-                || arg.starts_with("--compress-program=")
+                || abbreviates(arg, "compress-program")
                 || short_cluster(arg, 'o')
         }),
-        "date" => !args
-            .iter()
-            .any(|arg| *arg == "--set" || arg.starts_with("--set=") || short_cluster(arg, 's')),
+        "date" => !args.iter().any(|arg| {
+            *arg == "--set"
+                || arg.starts_with("--set=")
+                || abbreviates(arg, "set")
+                || short_cluster(arg, 's')
+        }),
         "less" => !args.iter().any(|arg| {
             arg.starts_with("--log-file")
                 || arg.starts_with("--LOG-FILE")
+                || abbreviates(arg, "log-file")
                 // `-O` is the family's overwrite spelling — the
                 // uppercase twin of the `-o` beside it — and the
                 // cluster scan refuses either case, so no spelling
@@ -609,11 +613,6 @@ fn git_arguments_read_only(args: &[&str]) -> bool {
         if takes_value {
             takes_value = false;
         } else if matches!(*arg, "-c" | "--paginate" | "--ext-diff") || arg.starts_with("--pager") {
-            // Each names a program git runs: `-c` can carry an
-            // external diff driver or a pager command, `--paginate`
-            // and `--pager=…` force one, `--ext-diff` turns drivers
-            // on. `--no-pager` and `--no-ext-diff` disable and stay
-            // walked-past flags.
             return false;
         } else if matches!(*arg, "-C" | "--git-dir" | "--work-tree") {
             takes_value = true;
@@ -631,8 +630,11 @@ fn git_arguments_read_only(args: &[&str]) -> bool {
     let rest: Vec<&str> = args.iter().skip(at).skip(1).copied().collect();
     match subcommand {
         "log" | "status" | "diff" | "show" | "blame" | "rev-parse" | "ls-files" | "ls-tree"
-        | "describe" | "shortlog" | "reflog" | "whatchanged" | "cat-file" | "version"
-        | "check-ignore" | "check-attr" | "check-mailmap" => true,
+        | "describe" | "shortlog" | "whatchanged" | "cat-file" | "version" | "check-ignore"
+        | "check-attr" | "check-mailmap" => true,
+        "reflog" => rest
+            .first()
+            .is_none_or(|sub| matches!(*sub, "show" | "exists")),
         "grep" => !rest
             .iter()
             .any(|arg| arg.starts_with("-O") || arg.starts_with("--open-files-in-pager")),
@@ -676,6 +678,9 @@ fn journalctl_arguments_read_only(args: &[&str]) -> bool {
     for arg in args {
         if arg.starts_with("--vacuum")
             || arg.starts_with("--cursor-file")
+            || abbreviates(arg, "vacuum-time")
+            || abbreviates(arg, "vacuum-size")
+            || abbreviates(arg, "cursor-file")
             || matches!(
                 *arg,
                 "--rotate" | "--flush" | "--setup-keys" | "--relinquish-var"
@@ -822,6 +827,25 @@ fn find_arguments_read_only(args: &[&str]) -> bool {
 /// scanned for the letter.
 fn short_cluster(arg: &str, letter: char) -> bool {
     arg.starts_with('-') && !arg.starts_with("--") && arg.contains(letter)
+}
+
+/// Whether a long option abbreviates `name` — the GNU getopt bargain
+/// readers honor.
+///
+/// A long option may spell any unambiguous prefix of its name, so
+/// `--out=x` is `--output=x` and `--se=x` is `--set=x` to the program
+/// that receives them; exact-name matching would wave the abbreviation
+/// through as an unknown flag. The check errs conservative on purpose:
+/// it refuses every prefix of `name`, ambiguous-or-not, because a
+/// refused read costs a prompt while a waved-through write costs the
+/// file. `less` accepts its long options case-insensitively, so the
+/// head is lowered before the comparison.
+fn abbreviates(arg: &str, name: &str) -> bool {
+    let Some(rest) = arg.strip_prefix("--") else {
+        return false;
+    };
+    let head = rest.split('=').next().unwrap_or("").to_ascii_lowercase();
+    !head.is_empty() && name.starts_with(&head)
 }
 
 /// One command segment: a single command's text plus the vocabulary
@@ -2309,6 +2333,58 @@ mod tests {
             assert!(
                 !shell_reads_only(command),
                 "{command} is a shell command like any other"
+            );
+        }
+    }
+
+    #[test]
+    fn long_option_abbreviations_refuse_like_their_full_names() {
+        // The GNU getopt bargain: a long option may spell any
+        // unambiguous prefix of its name, so `--out=x` IS `--output=x`
+        // and `--se=x` IS `--set=x` to the program that parses them.
+        // Exact-name matching would wave the abbreviation through as
+        // an unknown flag; the reader arms refuse every prefix of
+        // their dangerous options, and the shared `--output` refusal
+        // carries the same bargain to every reader.
+        for command in [
+            "sort --out=x list.txt",
+            "sort --com=x list.txt",
+            "date --se=12:00",
+            "less --log=x notes.txt",
+            "journalctl --cursor=/tmp/cursor",
+            "wc --out=x Cargo.toml",
+            "rg --out=x TODO .",
+        ] {
+            assert!(
+                !shell_reads_only(command),
+                "{command} abbreviates a writing option and refuses"
+            );
+        }
+        for command in [
+            "sort -n list.txt",
+            "date --rfc-3339=seconds",
+            "journalctl --unit dch --no-pager",
+            "wc -l Cargo.toml",
+        ] {
+            assert!(
+                shell_reads_only(command),
+                "{command} spells no dangerous option, in full or in prefix"
+            );
+        }
+    }
+
+    #[test]
+    fn git_reflog_reads_only_through_its_reading_half() {
+        // Bare `git reflog` lists the log, and `show`/`exists` consult
+        // it; `expire` and `delete` rewrite the very record the
+        // carve-out was trusting, so every other subcommand refuses.
+        for command in ["git reflog", "git reflog show", "git reflog exists HEAD"] {
+            assert!(shell_reads_only(command), "{command} only looks");
+        }
+        for command in ["git reflog expire --all", "git reflog delete HEAD@{0}"] {
+            assert!(
+                !shell_reads_only(command),
+                "{command} rewrites the reflog the reader was trusting"
             );
         }
     }

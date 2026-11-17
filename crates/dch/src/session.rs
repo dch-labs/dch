@@ -678,6 +678,17 @@ impl SessionSaver {
             }
         };
         if stored.format == PERMISSIONS_FORMAT || stored.format == PERMISSIONS_FORMAT_V3 {
+            if stored.deny.iter().any(|rule| match rule {
+                dch_tui::PermissionRule::PathGlob { pattern } => {
+                    dch_permissions::rule::PathGlob::new(pattern.clone()).is_err()
+                }
+                _ => false,
+            }) {
+                tracing::warn!(
+                    "a remembered deny glob no longer compiles; failing the restore closed"
+                );
+                return PermissionsRestore::Damaged;
+            }
             return PermissionsRestore::Restored {
                 allow: stored.allow,
                 deny: stored.deny,
@@ -1360,6 +1371,32 @@ mod tests {
             .expect("the pair saves");
         let (allow, deny) = saver(dir.path(), id).load_permissions().into_lists();
         assert_eq!(allow, rules);
+        assert_eq!(deny, deny_rules);
+        // A deny glob the compiler cannot rebuild is a "never" the
+        // restore must not silently drop: the whole restore stands
+        // damaged, and the damaged posture asks instead of assuming
+        // the dropped refusal never existed.
+        let deny_glob = vec![dch_tui::PermissionRule::PathGlob {
+            pattern: "[unclosed".to_string(),
+        }];
+        session
+            .save_permissions(&rules, &deny_glob, false)
+            .expect("the corrupt-deny pair saves");
+        let reloaded = saver(dir.path(), id);
+        assert!(
+            reloaded.load_permissions().damage_stands(),
+            "an uncompilable deny glob fails the restore closed"
+        );
+        // A corrupt *allow* glob keeps its lenient arm: the blessing
+        // stops covering, the rest of the pair restores untouched.
+        let allow_glob = vec![dch_tui::PermissionRule::PathGlob {
+            pattern: "[unclosed".to_string(),
+        }];
+        session
+            .save_permissions(&allow_glob, &deny_rules, false)
+            .expect("the corrupt-allow pair saves");
+        let (allow, deny) = saver(dir.path(), id).load_permissions().into_lists();
+        assert_eq!(allow, allow_glob);
         assert_eq!(deny, deny_rules);
         // The file is v1, and the two pre-release spellings load as
         // aliases: a v3 file carries both lists, a v2 file loads

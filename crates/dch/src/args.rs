@@ -242,11 +242,10 @@ fn parse_permission_mode(spelling: &str) -> Result<CliPermissionMode, String> {
         }
     };
     if migrated {
-        tracing::warn!(
-            "--permission-mode = {spelling:?} is retired and was applied as \
-             {:?} — update the spelling",
-            mode
-        );
+        crate::signals::report(&format!(
+            "dch: --permission-mode = {spelling:?} is retired and was applied as \
+             {mode:?} — update the spelling"
+        ));
     }
     Ok(mode)
 }

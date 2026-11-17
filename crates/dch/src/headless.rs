@@ -685,6 +685,11 @@ async fn construct_run(
             outcome,
             config.security.redact_secrets,
         ));
+        let saver =
+            crate::session::SessionSaver::with_model(outcome.session_id, config.api.model.clone());
+        let memory = resumed_permission_memory(&saver);
+        let snapshot: dch_loop::MemorySnapshot = std::sync::Arc::new(move || memory.snapshot());
+        builder = builder.with_permission_memory(snapshot);
     }
     let runner = builder.build().await.map_err(|err| {
         construction_failure(args, format!("agent construction: {err}"), inherited_mode)
@@ -1133,6 +1138,24 @@ fn outcome_after_delivery(run: &Run, delivery: std::io::Result<()>) -> HeadlessO
     }
 }
 
+/// The resumed session's remembered permissions, as the headless host
+/// installs them on the runner.
+///
+/// The TUI resume path's equal: without them a headless continuation
+/// would start from an empty memory and re-run exactly the work the
+/// session's own "never" answers had banned. A damaged restore adopts
+/// nothing and stands damaged — the headless posture already denies
+/// every uncovered side effect, so the fail-closed verdict changes no
+/// verdict it did not already carry.
+fn resumed_permission_memory(saver: &crate::session::SessionSaver) -> dch_tui::PermissionMemory {
+    let restored = saver.load_permissions();
+    let damage_stands = restored.damage_stands();
+    let (allow, deny) = restored.into_lists();
+    let memory = dch_tui::PermissionMemory::default();
+    memory.adopt(allow, deny, damage_stands);
+    memory
+}
+
 /// Write the done-file when `--done-file` is supplied.
 ///
 /// Called on every terminal path. Successful runs and answerless runs carry
@@ -1193,9 +1216,15 @@ mod tests {
     /// reporting — a refused delivery, an unwritable done-file — and
     /// their assertions pin the outcome, not the emission; without the
     /// hush the suite's own report lines leak into `make test`'s
-    /// output and read as trouble they are not.
+    /// output and read as trouble they are not. The guard holds a
+    /// dedicated lock for its whole lifetime — create to restore — so
+    /// two overlapping guards cannot capture each other's redirect
+    /// and restore `/dev/null` over the real stderr; the signal-test
+    /// lock is deliberately not relied on, because callers acquire it
+    /// only after the guard already stands.
     #[cfg(unix)]
     struct HushedStderr {
+        _serializes: std::sync::MutexGuard<'static, ()>,
         saved: i32,
     }
 
@@ -1216,12 +1245,21 @@ mod tests {
     #[cfg(unix)]
     fn hush_stderr() -> HushedStderr {
         use std::os::fd::AsRawFd as _;
+        static STDERR_HUSH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        // The guard is stored under its underscore-free name inside
+        // the struct; the shorthand-field syntax would bind it under
+        // an underscore-prefixed name here, which the used-underscore
+        // lint refuses.
+        let serializes = STDERR_HUSH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let sink = std::fs::OpenOptions::new()
             .write(true)
             .open("/dev/null")
             .expect("/dev/null opens");
         // SAFETY: dup/dup2 on this process's own descriptors; both fds are
-        // valid for the whole call and the save happens before the redirect.
+        // valid for the whole call and the save happens before the redirect,
+        // under the lock every other guard also takes.
         let (saved, redirected) = unsafe {
             (libc::dup(libc::STDERR_FILENO), {
                 libc::dup2(sink.as_raw_fd(), libc::STDERR_FILENO)
@@ -1229,7 +1267,10 @@ mod tests {
         };
         assert!(saved != -1, "stderr duplicates for the restore");
         assert!(redirected != -1, "stderr redirects to the sink");
-        HushedStderr { saved }
+        HushedStderr {
+            _serializes: serializes,
+            saved,
+        }
     }
 
     /// Parse a flag list into [`Args`], prefixing the program name.
@@ -1480,6 +1521,60 @@ mod tests {
         assert_eq!(outcome.exit_code, 0);
         assert!(outcome.success);
         assert_eq!(outcome.message, "the answer");
+    }
+
+    #[test]
+    fn a_resumed_session_installs_its_remembered_permissions_on_the_runner() {
+        // The headless resume's equal of the TUI adoption: the saved
+        // pair loads from the session's own sibling file, the verdict
+        // rides with it, and the memory the runner carries denies
+        // exactly what the session denied — a damaged sibling adopts
+        // no lists and keeps the verdict, so the fail-closed posture
+        // stands on the continuation too.
+        let root = tempfile::tempdir().unwrap();
+        let id = uuid::Uuid::new_v4();
+        let saver = crate::session::SessionSaver::with_base_dir(
+            id,
+            "test-model".to_string(),
+            root.path().to_path_buf(),
+        );
+        let allow = vec![dch_tui::PermissionRule::ShellPrefix {
+            prefix: "cargo test".to_string(),
+        }];
+        let deny = vec![dch_tui::PermissionRule::Tool {
+            tool: "WebFetch".to_string(),
+        }];
+        saver
+            .save_permissions(&allow, &deny, false)
+            .expect("the pair saves");
+
+        let memory = resumed_permission_memory(&saver);
+
+        assert_eq!(memory.allow_rules(), allow, "the blessings ride along");
+        assert_eq!(memory.deny_rules(), deny, "the bans ride along");
+        assert!(
+            !memory.damage_standing(),
+            "a healthy restore stands healthy"
+        );
+
+        let damaged_id = uuid::Uuid::new_v4();
+        let damaged = crate::session::SessionSaver::with_base_dir(
+            damaged_id,
+            "test-model".to_string(),
+            root.path().to_path_buf(),
+        );
+        damaged
+            .save_permissions(&[], &[], true)
+            .expect("the damaged marker saves");
+        let memory = resumed_permission_memory(&damaged);
+        assert!(
+            memory.damage_standing(),
+            "the damage verdict rides the headless adoption"
+        );
+        assert!(
+            memory.allow_rules().is_empty() && memory.deny_rules().is_empty(),
+            "the damaged restore adopts no lists"
+        );
     }
 
     #[test]
