@@ -4,7 +4,7 @@
 //! block, list, quote, table — parsed into rows of styled words and
 //! laid out to a terminal width by the transforms in this module.
 
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use super::cells::{char_cells, display_width};
 
 use super::word::{MetaData, Word, WordType};
 
@@ -79,14 +79,17 @@ pub struct TextComponent {
     ///
     /// Selects the layout transform and how the renderer paints the block.
     kind: TextNode,
+
     /// Rows of words; each row renders as one visual line.
     ///
     /// Built by the parse, reshaped by the layout transform; empty rows are meaningful in tables.
     content: Vec<Vec<Word>>,
+
     /// Non-renderable metadata words, such as language and list kinds.
     ///
     /// Languages, list kinds, indents, and column counts live here rather than in renderable rows.
     meta_info: Vec<Word>,
+
     /// Visual height after the layout transform.
     ///
     /// What the renderer allocates vertically; recomputed by every `transform` call.
@@ -200,17 +203,12 @@ impl TextComponent {
         if let TextNode::Table(widths, row_heights) = &self.kind {
             let column_count = widths.len();
             if column_count == 0 {
-                // Degenerate table (malformed/empty): each content row
-                // stands as its own plain line.
                 return self
                     .content
                     .iter()
                     .map(|row| row.iter().map(Word::content).collect::<String>())
                     .collect();
             }
-            // Content is laid out per data row as `heights[r]` sub-rows
-            // per cell; take each cell's first sub-row as its primary
-            // text and join a row's cells with spaces.
             let mut result = Vec::new();
             let mut offset = 0;
             for max_h in row_heights {
@@ -225,9 +223,6 @@ impl TextComponent {
             }
             result
         } else if let TextNode::CodeBlock = &self.kind {
-            // Interior blank lines are code: the highlighter's source
-            // must keep them, so only leading and trailing empties are
-            // trimmed — each is the grammar's leading-newline artifact.
             let stripped: Vec<String> = self
                 .content
                 .iter()
@@ -339,44 +334,38 @@ pub fn word_wrapping(words: &[Word], width: usize) -> Vec<Vec<Word>> {
     lines
 }
 
-/// The terminal display width of `text`, counting wide characters.
-///
-/// Wide glyphs count as their terminal columns, not bytes or characters.
-fn display_width(text: &str) -> usize {
-    UnicodeWidthStr::width(text)
-}
-
 /// Split `text` at the widest prefix that fits `max_width` columns.
 ///
 /// The split lands on a character boundary and the tail carries the
 /// remainder. A single character wider than the budget is returned
 /// alone — an unsplittable wide glyph owns its row — so the head can
-/// exceed `max_width` by at most one character.
+/// exceed `max_width` by at most one character. The head is built
+/// character by character and the tail is the head's complement by
+/// prefix, so no byte offset is ever computed or sliced: a boundary
+/// exists by construction, not by trust.
 #[must_use]
 fn split_by_width(text: &str, max_width: usize) -> (String, String) {
     if max_width == 0 {
         return (String::new(), text.to_string());
     }
-    let mut width: usize = 0;
-    let mut split_idx = 0;
-    for (i, c) in text.char_indices() {
-        let char_width = UnicodeWidthChar::width(c).unwrap_or(0);
+    let mut head = String::new();
+    let mut width = 0usize;
+    for c in text.chars() {
+        let char_width = char_cells(c);
         if width.saturating_add(char_width) > max_width {
-            if split_idx == 0 {
-                split_idx = i.saturating_add(c.len_utf8());
+            if head.is_empty() {
+                head.push(c);
             }
             break;
         }
+        head.push(c);
         width = width.saturating_add(char_width);
-        split_idx = i.saturating_add(c.len_utf8());
         if width == max_width {
             break;
         }
     }
-    // `split_idx` only ever holds a `char_indices` boundary or 0.
-    #[allow(clippy::string_slice)]
-    let (head, tail) = text.split_at(split_idx);
-    (head.to_string(), tail.to_string())
+    let tail = text.strip_prefix(&head).unwrap_or_default().to_string();
+    (head, tail)
 }
 
 /// Lay out a paragraph-like component: wrap its words to the width.
@@ -675,4 +664,61 @@ fn transform_table(component: &mut TextComponent, width: u16) {
     )
     .unwrap_or(u16::MAX);
     component.kind = TextNode::Table(final_widths, row_heights);
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::missing_panics_doc,
+    clippy::missing_errors_doc,
+    clippy::expect_used,
+    clippy::unwrap_used
+)]
+mod tests {
+    use super::split_by_width;
+
+    #[test]
+    fn a_zero_budget_hands_the_whole_text_to_the_tail() {
+        assert_eq!(
+            split_by_width("hello", 0),
+            (String::new(), "hello".to_string())
+        );
+    }
+
+    #[test]
+    fn a_text_that_fits_returns_whole_with_an_empty_tail() {
+        assert_eq!(split_by_width("hi", 5), ("hi".to_string(), String::new()));
+        assert_eq!(split_by_width("", 5), (String::new(), String::new()));
+    }
+
+    #[test]
+    fn a_cut_lands_on_the_character_boundary_the_walk_reached() {
+        // The head is the built prefix and the tail is its complement,
+        // so a multibyte cut can never split a character: the two
+        // halves rejoin to the source exactly.
+        let source = "a中文测试";
+        let (head, tail) = split_by_width(source, 3);
+        assert_eq!(head, "a中".to_string());
+        assert_eq!(tail, "文测试".to_string());
+        assert_eq!(format!("{head}{tail}"), source);
+        let (head, tail) = split_by_width(source, 5);
+        assert_eq!(head, "a中文".to_string());
+        assert_eq!(tail, "测试".to_string());
+    }
+
+    #[test]
+    fn an_unsplittable_wide_glyph_owns_its_row() {
+        // The first glyph alone exceeds the budget: it still heads
+        // the row — the head may run past the budget by at most one
+        // character — and the tail carries the rest.
+        let (head, tail) = split_by_width("中ab", 1);
+        assert_eq!(head, "中".to_string());
+        assert_eq!(tail, "ab".to_string());
+    }
+
+    #[test]
+    fn an_exact_fit_breaks_before_the_overflowing_character() {
+        let (head, tail) = split_by_width("abcd", 2);
+        assert_eq!(head, "ab".to_string());
+        assert_eq!(tail, "cd".to_string());
+    }
 }

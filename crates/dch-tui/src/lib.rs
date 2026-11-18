@@ -28,6 +28,8 @@ pub use commands::{Command, CommandSpec, CompletionSources, Parsed};
 pub use events::TerminalEvents;
 pub use guidance::Guidance;
 pub use input::{InputAction, InputEditor, InputHistory};
+pub use markdown::cells;
+pub use markdown::cells::{char_cells, display_width, for_display, str_width};
 pub use message::{ActiveTool, ContentBlock, TokenCounts, TuiMessage};
 pub use observer::{
     CompactionEvent, CompactionFiling, Graduation, HealthNotice, ToolResultDisplay, TuiObserver,

@@ -72,7 +72,7 @@ fn the_caret_matches_the_last_row_for_every_typed_prefix() {
                 let (rows, caret) = editor.display_rows_and_caret(width);
                 let (row, column) = caret.expect("a caret always exists");
                 let last = rows.last().map_or("", String::as_str);
-                let last_width = unicode_width::UnicodeWidthStr::width(last);
+                let last_width = dch_tui::str_width(last);
                 let ends_in_space = chars[..end].last().is_some_and(|c| c.is_whitespace());
                 if ends_in_space {
                     assert_eq!(

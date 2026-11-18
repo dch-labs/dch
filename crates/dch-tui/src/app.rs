@@ -4,6 +4,17 @@
 //! state background producers write through; `run` drives the
 //! render ↔ input ↔ scroll loop until the user quits.
 
+mod caches;
+mod copies;
+mod keys;
+mod paint;
+mod run;
+
+use self::caches::{BakeMeta, BakeOutputs, InputWrapCache};
+#[cfg(test)]
+use self::copies::copy_answer_notice;
+use self::copies::{copy_verdict_notice, copy_via_transports};
+use self::paint::conversation::visible_window;
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -12,18 +23,16 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use crossterm::event::{
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+use crate::cells::{
+    char_cells, display_width, for_display, painted_steps, prefix_within, str_width,
 };
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
-use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use unicode_segmentation::UnicodeSegmentation as _;
-use unicode_width::UnicodeWidthChar as _;
-use unicode_width::UnicodeWidthStr as _;
 
 use dch_config::DchConfig;
 use dch_config::PathStyle;
@@ -33,7 +42,7 @@ use dch_config::StripStyle;
 use crate::Graduation;
 use crate::commands::{self, Command, CompletionSources, Parsed};
 use crate::config_fields;
-use crate::events::{InputQuiesce, TerminalEvents};
+use crate::events::InputQuiesce;
 use crate::guidance::Guidance;
 use crate::input::{InputAction, InputEditor};
 use crate::markdown;
@@ -2365,108 +2374,6 @@ pub struct TuiApp {
     input_quiesce: Option<Arc<InputQuiesce>>,
 }
 
-/// The accumulators one conversation render pass fills.
-///
-/// A render of a message range produces the styled rows themselves
-/// and the five index structures the app's press resolution and
-/// lane overlays read — one output, always filled together, so it
-/// folds into a single struct the pass fills. The bake pass owns
-/// the half the app keeps between frames; the tail pass starts
-/// empty each time and merges its result over the baked half.
-#[derive(Default)]
-struct BakeOutputs {
-    /// The rendered rows, in conversation order.
-    ///
-    /// One entry per visual line; every index structure below keys
-    /// positions in this vector.
-    lines: Vec<Line<'static>>,
-
-    /// Row spans registered under their tool-call id.
-    ///
-    /// Every row a foldable tool block produced maps to the call it
-    /// belongs to, so a press on any of them resolves the toggle.
-    tool_summary_lines: HashMap<usize, String>,
-
-    /// Row spans registered under their thinking section's key.
-    ///
-    /// The completed thinking sections' fold rows, keyed the way the
-    /// tool rows are for the same press resolution.
-    thinking_summary_lines: HashMap<usize, String>,
-
-    /// Row spans registered under their compaction notice's key.
-    ///
-    /// A notice's rows map to its message key so a press anywhere on
-    /// the notice resolves its own toggle.
-    compaction_summary_lines: HashMap<usize, String>,
-
-    /// Each user turn's row span, with its mark row.
-    ///
-    /// `(tint_start, turn_end, mark_row)` triples: the span the
-    /// caller tints as the turn's box, and the row the prompt mark
-    /// draws on.
-    user_turn_ranges: Vec<(usize, usize, usize)>,
-
-    /// The rows where submitted prompts' texts begin.
-    ///
-    /// One entry per user message the user actually sent — steered
-    /// and unsent rows stay out — at the row the prompt's first text
-    /// line lands on.
-    user_prompt_marks: Vec<usize>,
-
-    /// The row spans of the conversation's inline todo blocks.
-    ///
-    /// Whole-block ranges, so the scroll can keep an inline plan
-    /// render visible in full or not at all.
-    todo_block_ranges: Vec<std::ops::Range<usize>>,
-}
-
-/// The bake's own index metadata, in bake-absolute rows.
-///
-/// What [`BakeOutputs`] carries for one render pass, kept for the
-/// baked prefix alone: the index structures the frame's merged view
-/// products are rebuilt from every frame, each rebased by the bake's
-/// line count before the painters or the click paths ever see them.
-#[derive(Default)]
-struct BakeMeta {
-    /// Row spans registered under their tool-call id.
-    ///
-    /// Every row a foldable baked tool block produced maps to the
-    /// call it belongs to, so a press on any of them resolves the
-    /// toggle.
-    tool_summary_lines: HashMap<usize, String>,
-
-    /// Row spans registered under their thinking section's key.
-    ///
-    /// The baked thinking sections' fold rows, keyed the way the
-    /// tool rows are for the same press resolution.
-    thinking_summary_lines: HashMap<usize, String>,
-
-    /// Row spans registered under their compaction notice's key.
-    ///
-    /// A baked notice's rows map to its message key so a press
-    /// anywhere on the notice resolves its own toggle.
-    compaction_summary_lines: HashMap<usize, String>,
-
-    /// Each baked user turn's row span, with its mark row.
-    ///
-    /// `(tint_start, turn_end, mark_row)` triples in bake-absolute
-    /// rows, grown as turns bake and never holding the tail's
-    /// relative rows.
-    user_turn_ranges: Vec<(usize, usize, usize)>,
-
-    /// The rows where baked submitted prompts' texts begin.
-    ///
-    /// Bake-absolute rows, the prefix-only half of the merged marks
-    /// the frame's products rebuild each render.
-    user_prompt_marks: Vec<usize>,
-
-    /// The row spans of the baked conversation's inline todo blocks.
-    ///
-    /// Whole-block ranges in bake-absolute rows, for the scroll's
-    /// whole-or-nothing todo-block rule.
-    todo_block_ranges: Vec<std::ops::Range<usize>>,
-}
-
 impl TuiApp {
     /// Construct the shell with freshly-allocated, empty shared state.
     ///
@@ -4044,37 +3951,6 @@ impl TuiApp {
             timestamp: now,
         });
         self.scroll_to_bottom();
-    }
-
-    /// Copy the most recent answer to the system clipboard.
-    ///
-    /// Walks the conversation back to the last assistant turn and lifts its
-    /// text blocks (thinking and tool chrome aside), handing them to the same
-    /// clipboard path a selection copy uses. With no answer yet it says so
-    /// rather than copying an empty string.
-    fn copy_command(&mut self) {
-        let answer = self
-            .conversation
-            .iter()
-            .rev()
-            .find_map(|message| match message {
-                TuiMessage::Assistant { blocks, .. } => {
-                    let text: String = blocks
-                        .iter()
-                        .filter_map(|block| match block {
-                            ContentBlock::Text { text } => Some(text.as_str()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    (!text.trim().is_empty()).then_some(text)
-                }
-                _ => None,
-            });
-        match answer {
-            Some(text) => self.copy_selection_and_notice(&text),
-            None => self.post_notice("no answer to copy yet".to_string()),
-        }
     }
 
     /// Print the running build's version.
@@ -6255,170 +6131,6 @@ impl TuiApp {
         self.turn_end_hook = Some(hook);
     }
 
-    /// Run the UI event loop until the user exits.
-    ///
-    /// Selects over terminal events, the shared notify (the path
-    /// background state uses to request a redraw), and a periodic
-    /// tick. A notify listener stays registered across draws and
-    /// event handling, so a notification sent while the loop is busy
-    /// is delivered on the next iteration rather than lost.
-    /// Background redraws are frame-capped: a notify renders at most
-    /// once per frame interval, a request arriving sooner parks
-    /// itself for the tick to claim, and any queued graduation
-    /// forces the frame. Input-driven redraws are not capped. The
-    /// tick redraws while tool calls are in flight (keeping their
-    /// elapsed stamps live), claims parked background requests, and
-    /// otherwise draws nothing. The caller owns terminal setup and
-    /// teardown.
-    ///
-    /// # Errors
-    /// Propagates terminal draw failures; the caller's guard still
-    /// restores the terminal.
-    pub async fn run(
-        &mut self,
-        terminal: &mut ratatui::Terminal<CrosstermBackend<std::io::Stdout>>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        self.quit = QuitState::default();
-        self.full_repaint_due = Some(Instant::now());
-        let mut events = TerminalEvents::spawn();
-        self.input_quiesce = Some(events.quiesce_handle());
-        let mut tick = tokio::time::interval(TICK_INTERVAL);
-        let mut animation = tokio::time::interval(ANIMATION_INTERVAL);
-        animation.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let notify = Arc::clone(&self.state.render_notify);
-        let mut listener = notify.listen();
-        let mut permission_rx = self.permission_rx.take();
-        let mut permission_closed = false;
-        let mut question_rx = self.question_rx.take();
-        let mut question_closed = false;
-        let mut session_rx = self.session_rx.take();
-        let mut session_closed = false;
-
-        terminal.draw(|frame| self.render(frame))?;
-
-        while !self.quit.requested {
-            let mut needs_redraw = tokio::select! {
-                maybe_event = events.recv() => {
-                    match maybe_event {
-                        Some(result) => match result {
-                            Ok(event) => {
-                                let mut handled = self.handle_event(&event);
-                                handled |= self.drain_ready(|| events.poll())?;
-                                handled
-                            }
-                            Err(err) => return Err(err.into()),
-                        },
-                        None => return Ok(()),
-                    }
-                }
-                () = &mut listener => self.notify_wake(&notify, &mut listener),
-                maybe_question = async {
-                    match question_rx.as_mut() {
-                        Some(rx) => rx.recv().await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    if let Some(prompt) = maybe_question {
-                        match question_rx.as_mut() {
-                            Some(rx) => self.land_question_requests(prompt, rx),
-                            None => {
-                                self.pending_questions
-                                    .push_back(PendingQuestion::new(prompt));
-                            }
-                        }
-                        true
-                    } else {
-                        question_closed = true;
-                        false
-                    }
-                }
-                _instant = tick.tick() => self.tick_wake(Instant::now()),
-                _anim = animation.tick() => {
-                    let animating = self.pulse_animation_living();
-                    if animating {
-                        self.frame_stats.anim_wakes =
-                            self.frame_stats.anim_wakes.saturating_add(1);
-                    }
-                    animating
-                }
-                maybe_request = async {
-                    match permission_rx.as_mut() {
-                        Some(rx) => rx.recv().await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    if let Some(request) = maybe_request {
-                        match permission_rx.as_mut() {
-                            Some(rx) => self.land_permission_requests(request, rx),
-                            None => self.pending_permissions.push_back(request),
-                        }
-                        true
-                    } else {
-                        permission_closed = true;
-                        false
-                    }
-                }
-                maybe_update = async {
-                    match session_rx.as_mut() {
-                        Some(rx) => rx.recv().await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    if let Some(update) = maybe_update {
-                        self.apply_session_update(update);
-                        true
-                    } else {
-                        session_closed = true;
-                        false
-                    }
-                }
-            };
-            if permission_closed {
-                permission_rx = None;
-                permission_closed = false;
-            }
-            if question_closed {
-                question_rx = None;
-                question_closed = false;
-            }
-            if session_closed {
-                session_rx = None;
-                session_closed = false;
-            }
-            if self.retire_withdrawn_questions() {
-                needs_redraw = true;
-            }
-            if self.take_full_repaint() {
-                if let Err(err) = terminal.clear() {
-                    tracing::warn!("full repaint clear failed: {err}");
-                }
-                needs_redraw = true;
-            }
-            if needs_redraw {
-                let theme_burst = self.pending_theme_osc.take();
-                if theme_burst.is_some() {
-                    crate::terminal::begin_synchronized_output();
-                }
-                let started = Instant::now();
-                terminal.draw(|frame| self.render(frame))?;
-                let took = started.elapsed();
-                if let Some((background, primary)) = theme_burst {
-                    crate::terminal::finish_theme_burst(background, primary);
-                }
-                if let Some(lane) = self.frame_stats.note_draw(took, Instant::now()) {
-                    tracing::debug!(
-                        target: "dch_tui::frames",
-                        anim_wakes = lane.anim_wakes,
-                        draws = lane.draws,
-                        worst_draw_ms = lane.worst_draw_ms,
-                        "frame lane"
-                    );
-                }
-            }
-        }
-        Ok(())
-    }
-
     /// Whether the run loop's animation wake should draw this beat.
     ///
     /// The lane draws while anything on screen animates. A running
@@ -6436,115 +6148,6 @@ impl TuiApp {
                 .state
                 .agent_running
                 .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Render the pinned pulse strip into its row.
-    ///
-    /// While the agent runs, the strip's configured row becomes the
-    /// activity strip: the bar, full width, in the theme's
-    /// composer-border color (the primary edge on themes without one
-    /// — the same color the prompt box's left border paints). The row
-    /// is the spacer directly above the composer by default, or the
-    /// terminal's dedicated first row when the config says so; the
-    /// glow style holds a static full-width bar whose color breathes,
-    /// and the off style yields the row back, nothing drawn. The bar
-    /// anchors on the run's first frame and never re-anchors: streams
-    /// beginning and graduating inside the run leave its phase
-    /// untouched, so one continuous animation runs from the frame the
-    /// run starts to the frame it ends. Returns whether the strip
-    /// claimed the row, so the composer hairline can stand down for
-    /// the frame when the row was its spacer.
-    fn render_pulse_strip(&self, frame: &mut Frame, area: Rect) -> bool {
-        if matches!(self.strip_style, StripStyle::Off) {
-            return false;
-        }
-        if !self
-            .state
-            .agent_running
-            .load(std::sync::atomic::Ordering::Relaxed)
-            || area.height == 0
-        {
-            return false;
-        }
-        let now = Instant::now();
-        let base = self
-            .theme
-            .ui
-            .composer_border
-            .unwrap_or(self.theme.ui.primary);
-        let anchor = self.run_anchor.unwrap_or(now);
-        let color = if matches!(self.strip_style, StripStyle::Glow) {
-            scaled_color(base, glow_eighths(anchor, now))
-        } else {
-            base
-        };
-        let pulse = pulse_span(
-            self.strip_style,
-            anchor,
-            now,
-            usize::from(area.width),
-            color,
-        );
-        frame.render_widget(pulse, area);
-        true
-    }
-
-    /// Copy the live selection, if any.
-    ///
-    /// The terminal-standard copy chord. A span that covered no
-    /// characters leaves the clipboard alone — the same discipline
-    /// the release and the keyboard walk apply. A delivered copy
-    /// lands its confirmation on the notice row, like every path.
-    fn copy_selection_now(&mut self) {
-        let covered = self
-            .selection
-            .as_ref()
-            .map(|selection| self.selection_text(selection));
-        if let Some((text, covered_any)) = covered
-            && covered_any
-        {
-            self.copy_selection_and_notice(&text);
-        }
-    }
-
-    /// Hand a completed selection's text to the clipboard and say so.
-    ///
-    /// The funnel every copy path — the mouse release, the copy chord,
-    /// and the keyboard walk's re-copy — delivers through, so each one
-    /// posts from the same vocabulary on the notice row above the
-    /// composer. Every copy takes its attempt id here and records it
-    /// as the wording that holds the row; the immediate post answers
-    /// with what the copier knows right now, and when the production
-    /// chain has transports in flight, the frame drain replaces it
-    /// with the same attempt's verdict — never with one older than
-    /// what a newer copy already posted.
-    fn copy_selection_and_notice(&mut self, text: &str) {
-        let attempt = next_attempt(&self.copy_attempts);
-        let answer = (self.copier)(attempt, text);
-        self.posted_copy_attempt = attempt;
-        let wording = copy_answer_notice(answer);
-        if !wording.is_empty() {
-            self.post_notice(wording.to_string());
-        }
-    }
-
-    /// Copy the session id when the click landed inside its segment.
-    ///
-    /// Reads the span recorded by the last status-bar render; a click
-    /// inside it routes the id through the same transport and notice
-    /// path a text selection uses. Returns whether the click consumed
-    /// itself here, so the caller can treat a bar click as handled.
-    fn copy_session_id_at(&mut self, column: u16, row: u16) -> bool {
-        let Some((span_row, start, end)) = self.session_id_span.get() else {
-            return false;
-        };
-        if row != span_row || column < start || column >= end {
-            return false;
-        }
-        if let Some(id) = self.session_id.clone() {
-            self.copy_selection_and_notice(&id);
-        }
-        true
     }
 
     /// Handle the events already waiting behind the first one.
@@ -6580,45 +6183,6 @@ impl TuiApp {
             needs_redraw |= self.handle_event(&event);
         }
         Ok(needs_redraw)
-    }
-
-    /// Apply one terminal event to the app state.
-    ///
-    /// Returns whether the event requires a redraw. Key releases and
-    /// repeats are ignored so a held key fires once per press. While a
-    /// permission ask is pending, the overlay owns the keyboard —
-    /// keystrokes and pastes alike.
-    pub fn handle_event(&mut self, event: &Event) -> bool {
-        match event {
-            Event::Key(key) => {
-                self.caret_blink.resolidify();
-                if key.kind != KeyEventKind::Press {
-                    return false;
-                }
-                self.handle_key(*key)
-            }
-            Event::Mouse(mouse) => self.handle_mouse(*mouse),
-            Event::Paste(text) => {
-                if self.pending_permissions.front().is_some() {
-                    return true;
-                }
-                self.caret_blink.resolidify();
-                if !self.pending_questions.is_empty() {
-                    return self.paste_into_the_question(text);
-                }
-                if self.queue_mode == QueueMode::Focused {
-                    return true;
-                }
-                self.input.insert_str(&normalize_pasted_newlines(text));
-                true
-            }
-            Event::Resize(_, _) => true,
-            Event::FocusGained => {
-                self.full_repaint_due = Some(Instant::now());
-                true
-            }
-            Event::FocusLost => false,
-        }
     }
 
     /// Ask every overlay that can own the keyboard, innermost first.
@@ -6662,287 +6226,6 @@ impl TuiApp {
         self.cancel_arm = true;
         self.post_notice("press Esc again to cancel the run".to_string());
         true
-    }
-
-    /// Apply one key press: the quit chord, copy chord, and
-    /// page-scroll keys stay app-level, everything else belongs to the
-    /// input editor — unless a permission ask is pending, in which
-    /// case the overlay owns the keyboard first (`y` allows,
-    /// `n`/Esc deny, the rest swallowed) and only the two `c` chords and
-    /// the keys [`key_survives_the_sheet`] names pass through to the
-    /// machinery below.
-    ///
-    /// Under a running agent, Ctrl+C Ctrl+C is one action in the
-    /// Esc-Esc shape: with an empty composer, the first press only
-    /// arms — nothing stops, nothing leaves — and the second press
-    /// fires the cancel exactly as Esc-Esc fires it (the same
-    /// canceller, the same record) with the program's termination
-    /// riding the same press. Text in the composer clears first,
-    /// run or not — clearing is not consenting, and the fire needs
-    /// its presses behind an empty buffer like everywhere else. A
-    /// stray key between the presses stands the whole action down.
-    /// At rest the chord is the exit alone: a non-empty buffer clears
-    /// first, arming nothing; on an empty one the first press arms
-    /// and the second quits; any other key disarms, so the chord
-    /// never fires from stale intent. Each rung is named by a notice,
-    /// so the ladder reads from the frame instead of from memory.
-    /// Ctrl+Shift+C copies the live selection where the terminal
-    /// reports the shift; on terminals that collapse it to a plain
-    /// Ctrl+C it simply joins the chord's clearing behavior. Up,
-    /// Down, Home, and End fall back to the transcript while the
-    /// input sits empty — Home jumps to the oldest line, End snaps
-    /// to the newest, and the arrows scroll by one once nothing is
-    /// recallable. The arrows join the editor as soon as anything
-    /// is typed or recallable; Home and End follow the input's
-    /// emptiness alone, so with an empty draft they keep scrolling
-    /// the transcript even while history is recallable. Shift and
-    /// an arrow, with a transcript selection up, moves the
-    /// selection's head instead: the editor's select-by-keyboard.
-    fn handle_key(&mut self, key: KeyEvent) -> bool {
-        let handled = self.handle_key_inner(key);
-        self.retire_theme_browse_if_gone();
-        handled
-    }
-
-    /// The key dispatch itself, the core [`Self::handle_key`] wraps.
-    ///
-    /// Order is the contract. The chord ladders are disarmed first —
-    /// any key but their own stands them down, so stale intent never
-    /// fires. Then the overlays get their look in turn
-    /// ([`Self::sheet_key`], then [`Self::completion_key`]): whoever
-    /// claims the key owns it, and nothing beneath runs. Only a key
-    /// no overlay wanted reaches the editor-and-chrome match below —
-    /// chords, scrolling, the transcript's fallbacks, selection
-    /// motion. Returns whether the key was consumed; the wrapper
-    /// runs its post-key retirement on every path this can take.
-    fn handle_key_inner(&mut self, key: KeyEvent) -> bool {
-        if !matches!(
-            (key.code, key.modifiers),
-            (KeyCode::Char('c'), KeyModifiers::CONTROL)
-        ) {
-            self.quit.disarm();
-        }
-        if !matches!(
-            (key.code, key.modifiers),
-            (KeyCode::Esc, KeyModifiers::NONE)
-        ) {
-            self.cancel_arm = false;
-        }
-        if let Some(handled) = self.sheet_key(key) {
-            return handled;
-        }
-        if let Some(handled) = self.completion_key(key) {
-            return handled;
-        }
-        match (key.code, key.modifiers) {
-            (KeyCode::Esc, KeyModifiers::NONE) => self.esc_under_run_or_idle(),
-            (KeyCode::Char('s'), KeyModifiers::CONTROL) => self.steer_now(),
-            (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
-                self.cycle_plan_view();
-                true
-            }
-            (KeyCode::Char('c'), mods) if mods == KeyModifiers::CONTROL | KeyModifiers::SHIFT => {
-                self.copy_selection_now();
-                true
-            }
-            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                if !self.input.is_empty() {
-                    self.input.clear();
-                } else if self
-                    .state
-                    .agent_running
-                    .load(std::sync::atomic::Ordering::SeqCst)
-                {
-                    if self.quit.armed {
-                        self.shutdown_flag.store(true, Ordering::SeqCst);
-                        if let Some(cancel) = &self.run_canceller {
-                            cancel();
-                        }
-                        self.post_notice("Agent cancelled".to_string());
-                        self.quit.requested = true;
-                    } else {
-                        self.post_notice("press ctrl+c again to cancel and exit".to_string());
-                        self.quit.arm();
-                    }
-                } else if self.quit.armed {
-                    self.shutdown_flag.store(true, Ordering::SeqCst);
-                    self.quit.requested = true;
-                } else {
-                    self.quit.arm();
-                }
-                true
-            }
-            (KeyCode::F(2), _) => {
-                self.cycle_verbosity();
-                true
-            }
-            (KeyCode::PageUp, _) => {
-                self.scroll_offset = self.scroll_offset.saturating_add(10);
-                self.stick = Stick::Hold;
-                true
-            }
-            (KeyCode::PageDown, _) => {
-                self.scroll_offset = self.scroll_offset.saturating_sub(10);
-                self.rearm_if_near_bottom();
-                true
-            }
-            (KeyCode::Up, KeyModifiers::ALT) => {
-                self.jump_user_message(true);
-                true
-            }
-            (KeyCode::Down, KeyModifiers::ALT) => {
-                self.jump_user_message(false);
-                true
-            }
-            (KeyCode::Up, KeyModifiers::NONE)
-                if self.input.is_empty() && !self.input.has_history() =>
-            {
-                self.scroll_offset = self.scroll_offset.saturating_add(1);
-                self.stick = Stick::Hold;
-                true
-            }
-            (KeyCode::Down, KeyModifiers::NONE)
-                if self.input.is_empty() && !self.input.has_history() =>
-            {
-                self.scroll_offset = self.scroll_offset.saturating_sub(1);
-                self.rearm_if_near_bottom();
-                true
-            }
-            (KeyCode::Home, _) if self.input.is_empty() => {
-                self.scroll_to_top();
-                true
-            }
-            (KeyCode::End, _) if self.input.is_empty() => {
-                self.scroll_to_bottom();
-                true
-            }
-            (KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right, KeyModifiers::SHIFT)
-                if self.selection.is_some() =>
-            {
-                self.nudge_selection(key.code);
-                true
-            }
-            (KeyCode::Tab | KeyCode::BackTab, KeyModifiers::NONE | KeyModifiers::SHIFT)
-                if self.input.text().starts_with('/') =>
-            {
-                self.tab_completion(key)
-            }
-            _ => {
-                self.drop_applied_row_for_typing(key);
-                let action = self.input.handle_key(key, self.input_wrap_width);
-                self.apply_input_action(action)
-            }
-        }
-    }
-
-    /// Apply one mouse event.
-    ///
-    /// The wheel scrolls by [`WHEEL_SCROLL_LINES`]; a press-drag-
-    /// release over the conversation pane selects rendered
-    /// characters — inside the app — and the release hands the
-    /// covered text to the clipboard, confirmed on the notice row,
-    /// while the highlight stays up until the next press. A drag
-    /// pushed against the pane's
-    /// top or bottom row scrolls the view in the drag's direction,
-    /// extending the selection — one line per movement report, and
-    /// one per tick while the pointer stays parked there; a press
-    /// over the composer pane places its caret where it landed.
-    /// Anything else is ignored. While a permission ask is pending,
-    /// the overlay owns the pointer as it owns the keyboard: every
-    /// report is swallowed and any parked drag is dropped. A question
-    /// sheet holds the presses for the same reason but not the wheel —
-    /// reading the conversation above the box is how a question gets
-    /// answered, and the wheel is how that reading happens.
-    fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
-        if self.pending_permissions.front().is_some() {
-            self.drag_position = None;
-            return true;
-        }
-        if !self.pending_questions.is_empty() {
-            return match mouse.kind {
-                MouseEventKind::ScrollUp => self.scroll_the_wheel(true),
-                MouseEventKind::ScrollDown => self.scroll_the_wheel(false),
-                _ => {
-                    self.drag_position = None;
-                    true
-                }
-            };
-        }
-        match mouse.kind {
-            MouseEventKind::ScrollUp if self.wheel_over_todo_section(mouse.row) => {
-                self.scroll_todo_section(true);
-                true
-            }
-            MouseEventKind::ScrollDown if self.wheel_over_todo_section(mouse.row) => {
-                self.scroll_todo_section(false);
-                true
-            }
-            MouseEventKind::ScrollUp => self.scroll_the_wheel(true),
-            MouseEventKind::ScrollDown => self.scroll_the_wheel(false),
-            MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
-                self.quit.disarm();
-                if let Some(cell) = self.cell_at(mouse.column, mouse.row) {
-                    self.selection = Some(CellSelection {
-                        anchor: cell,
-                        head: cell,
-                    });
-                    self.drag_position = Some((mouse.column, mouse.row));
-                    true
-                } else {
-                    let retired = self.selection.take().is_some();
-                    self.drag_position = None;
-                    if self.toggle_plan_section_at(mouse.column, mouse.row)
-                        || self.toggle_queue_section_at(mouse.column, mouse.row)
-                    {
-                        return true;
-                    }
-                    self.place_input_caret(mouse.column, mouse.row) || retired
-                }
-            }
-            MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
-                if self.selection.is_none() {
-                    return false;
-                }
-                self.drag_position = Some((mouse.column, mouse.row));
-                let mut handled = false;
-                if let Some(cell) = self.cell_at(mouse.column, mouse.row)
-                    && let Some(selection) = self.selection.as_mut()
-                {
-                    selection.head = cell;
-                    handled = true;
-                }
-                self.drag_autoscroll() || handled
-            }
-            MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
-                self.drag_position = None;
-                if let Some(selection) = self.selection.take() {
-                    if selection.anchor == selection.head {
-                        self.toggle_thinking_at(mouse.column, mouse.row);
-                        self.toggle_compaction_at(mouse.column, mouse.row);
-                        self.toggle_tool_at(mouse.column, mouse.row);
-                        self.copy_session_id_at(mouse.column, mouse.row);
-                    } else {
-                        let (text, covered_any) = self.selection_text(&selection);
-                        if covered_any {
-                            self.copy_selection_and_notice(&text);
-                        }
-                        self.selection = Some(selection);
-                    }
-                    true
-                } else {
-                    let toggled_thinking = self.toggle_thinking_at(mouse.column, mouse.row);
-                    let toggled_compaction = self.toggle_compaction_at(mouse.column, mouse.row);
-                    let toggled_tool = self.toggle_tool_at(mouse.column, mouse.row);
-                    let copied_id = self.copy_session_id_at(mouse.column, mouse.row);
-                    toggled_thinking || toggled_compaction || toggled_tool || copied_id
-                }
-            }
-            MouseEventKind::Moved => {
-                self.drag_position = None;
-                false
-            }
-            _ => false,
-        }
     }
 
     /// One wheel notch: up pages into the conversation, down toward the
@@ -7143,7 +6426,12 @@ impl TuiApp {
         self.selectable_window(index, 1)
             .into_iter()
             .next()
-            .map(|line| line.spans.iter().map(|span| span.content.width()).sum())
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| display_width(&span.content))
+                    .sum()
+            })
     }
 
     /// A window over the lines a selection can cover.
@@ -8997,162 +8285,6 @@ impl TuiApp {
         })
     }
 
-    /// Render the fresh session's welcome: splash, notice, open
-    /// composer, and the pinned status bar.
-    ///
-    /// One compact group — the splash band, the notice on its own
-    /// row, and the composer as an open, borderless field the width
-    /// of the art, murmuring the name in night colors until the
-    /// first keystroke — rides between two equal fillers, so the
-    /// group centers in the frame while the status bar keeps the
-    /// bottom edge. The docked composer's identity row and rules do
-    /// not follow it here, and the first traffic of any kind returns
-    /// the frame to the docked layout.
-    fn render_welcome(
-        &mut self,
-        frame: &mut Frame,
-        area: Rect,
-        shape: &WelcomeShape,
-        rows: &[String],
-        caret: (u16, u16),
-        composer_height: u16,
-    ) {
-        let box_height = composer_height;
-        let rule_row = u16::from(self.theme.ui.composer_border.is_some());
-        let chunks = welcome_rows(area, shape.band_height, rule_row, box_height);
-        let origin = area
-            .x
-            .saturating_add(area.width.saturating_sub(shape.block_width) / 2);
-        if let Some(scale) = shape.art {
-            let band = pane(&chunks, 1, area);
-            let mut cropped: Vec<Line<'static>> = scale
-                .lines
-                .iter()
-                .skip(usize::from(shape.row_skip))
-                .take(usize::from(shape.rows_shown))
-                .cloned()
-                .collect();
-            crate::splash::dissolve_edges(&mut cropped, self.theme.ui.background);
-            let rect = Rect {
-                x: origin,
-                y: band.y,
-                width: scale.width,
-                height: shape.rows_shown,
-            };
-            frame.render_widget(Paragraph::new(cropped), rect);
-        }
-        let box_row = pane(&chunks, 4, area);
-        let inner = Rect {
-            x: origin,
-            y: box_row.y,
-            width: shape.block_width,
-            height: box_height,
-        };
-        if let Some(color) = self.theme.ui.composer_border {
-            let rule = Style::default()
-                .fg(color)
-                .add_modifier(ratatui::style::Modifier::UNDERLINED);
-            let spacer = pane(&chunks, 3, area);
-            if spacer.height > 0 {
-                let top = Rect {
-                    x: inner.x,
-                    y: spacer.y,
-                    width: inner.width,
-                    height: 1,
-                };
-                frame.buffer_mut().set_style(top, rule);
-            }
-            let bottom = Rect {
-                y: inner.bottom().saturating_sub(2),
-                height: 1,
-                ..inner
-            };
-            frame.buffer_mut().set_style(bottom, rule);
-        }
-        let band_row = pane(&chunks, 1, area);
-        self.welcome_band = shape.art.map(|scale| ratatui::layout::Rect {
-            x: origin,
-            y: band_row.y,
-            width: scale.width,
-            height: shape.band_height,
-        });
-        if self.input.is_empty() {
-            let spans: Vec<Span<'static>> = Self::WELCOME_PLACEHOLDER
-                .iter()
-                .zip(Self::WELCOME_WORD_COLORS.iter())
-                .enumerate()
-                .flat_map(|(index, (word, color))| {
-                    let space = (index > 0).then(|| Span::raw(" ")).into_iter();
-                    space.chain(std::iter::once(Span::styled(
-                        (*word).to_string(),
-                        Style::default().fg(*color),
-                    )))
-                })
-                .collect();
-            frame.render_widget(
-                Paragraph::new(Line::from(spans)),
-                Rect {
-                    x: inner.x.saturating_add(INPUT_SIDE_INSET),
-                    y: inner.y.saturating_add(INPUT_VERTICAL_PADDING),
-                    width: inner.width.saturating_sub(INPUT_SIDE_INSET),
-                    height: 1,
-                },
-            );
-        }
-        self.render_input(frame, inner, rows, caret);
-        let notice_row = pane(&chunks, 2, area);
-        let notice = self.notice_text();
-        let notice_len = notice
-            .as_ref()
-            .map_or(0u16, |text| u16::try_from(text.width()).unwrap_or(u16::MAX))
-            .saturating_add(1);
-        let standing = self.working_dir.clone().or_else(|| {
-            std::env::current_dir()
-                .ok()
-                .map(|dir| dir.display().to_string())
-        });
-        if let Some(dir) = standing {
-            let mut shown = dir;
-            if let Some(branch) = self.git_branch.clone() {
-                shown.push_str(" (");
-                shown.push_str(&branch);
-                shown.push(')');
-            }
-            let room = shape.block_width.saturating_sub(notice_len);
-            let count = shown.chars().count();
-            if count > usize::from(room) {
-                let keep = usize::from(room.saturating_sub(1));
-                let start = count.saturating_sub(keep);
-                shown = format!("…{}", shown.chars().skip(start).collect::<String>());
-            }
-            frame.render_widget(
-                Paragraph::new(Span::styled(shown, Style::default().fg(self.theme.ui.dim))),
-                Rect {
-                    x: origin,
-                    y: notice_row.y,
-                    width: room.max(1),
-                    height: 1,
-                },
-            );
-        }
-        if let Some(notice) = notice {
-            frame.render_widget(
-                Paragraph::new(notice)
-                    .style(Style::default().fg(self.theme.ui.input_border))
-                    .alignment(ratatui::layout::Alignment::Right),
-                Rect {
-                    x: origin.saturating_add(shape.block_width.saturating_sub(notice_len)),
-                    y: notice_row.y,
-                    width: notice_len.min(shape.block_width),
-                    height: 1,
-                },
-            );
-        }
-        self.render_completion(frame, inner, false);
-        self.render_session_picker(frame, inner, false);
-        self.render_model_picker(frame, inner, false);
-    }
-
     /// Settle the run timer's anchor against the running flag.
     ///
     /// A running turn arms the anchor once — the first frame of the run
@@ -9437,153 +8569,6 @@ impl TuiApp {
         };
     }
 
-    /// Render the pinned plan section: the run's current tasks,
-    /// standing over the furniture while any do.
-    ///
-    /// Lines of text, not a box — the same register the conversation's
-    /// todo blocks and the notice row use — inset from the frame's
-    /// edges, headed by the done fraction, completed rows uniform and
-    /// retired, moved rows still standing in the accent, and an
-    /// ellipsis naming whatever the cap cut. Read-only by design: the
-    /// tasks are the agent's bookkeeping, the model owns the list, and
-    /// the section asks for no keys at all — it is furniture, not a
-    /// sheet, and its one interaction is the posture cycle a click on
-    /// it walks.
-    fn render_todo_section(&mut self, frame: &mut Frame, area: Rect) {
-        if area.height == 0 || area.width == 0 {
-            return;
-        }
-        self.todo_section_rect = area;
-        let colors = todo_view::TodoColors {
-            plain: self.theme.ui.foreground,
-            dim: self.theme.ui.dim,
-            accent: self.theme.ui.primary,
-            moved: self.theme.ui.secondary,
-            badge_fill: self.theme.ui.primary,
-            badge_letters: self.theme.ui.background,
-        };
-        if self.plan_view == PlanView::Hidden {
-            frame.render_widget(
-                Paragraph::new(todo_view::folded_lines(&self.latest_todos, &colors)),
-                Rect {
-                    x: area
-                        .x
-                        .saturating_add(TODO_SECTION_INSET)
-                        .min(area.right().saturating_sub(1)),
-                    width: area
-                        .width
-                        .saturating_sub(TODO_SECTION_INSET.saturating_mul(2))
-                        .max(1),
-                    ..area
-                },
-            );
-            return;
-        }
-        let body_cap = match self.plan_view {
-            PlanView::Full => self.full_body_cap.get(),
-            _ => TODO_SECTION_BODY_ROWS,
-        };
-        let chord_hint = self.plan_chord_hint();
-        let lines = todo_view::section_lines(
-            &self.latest_todos,
-            &self.todo_section_changes,
-            &colors,
-            area.width
-                .saturating_sub(TODO_SECTION_INSET.saturating_mul(2))
-                .max(1),
-            body_cap,
-            self.clamped_todo_skip(),
-            chord_hint,
-        );
-        frame.render_widget(
-            Paragraph::new(lines),
-            Rect {
-                x: area
-                    .x
-                    .saturating_add(TODO_SECTION_INSET)
-                    .min(area.right().saturating_sub(1)),
-                width: area
-                    .width
-                    .saturating_sub(TODO_SECTION_INSET.saturating_mul(2))
-                    .max(1),
-                ..area
-            },
-        );
-    }
-
-    /// Render the pending question as a sheet over the prompt box.
-    ///
-    /// The same anchored sheet the permission ask uses, carrying the
-    /// question's optional header chip, its text, its option rows (the
-    /// cursor row marked `›`, a marked row also `•`), each option's
-    /// dimmed description, the key hints — and, after the model's
-    /// options, the compose row: the escape the option list never
-    /// offered, where Enter or Space opens a draft the user types freely
-    /// and the next Enter sends as the answer. While that draft is open
-    /// the terminal cursor rides its caret, so the cell the next
-    /// character lands in is visible; the composer's own caret is hidden
-    /// under a question anyway, so nothing competes for it. Long question
-    /// text wraps at the box's inner width; option labels and
-    /// descriptions clamp to one row each, ellipsized — the pickable
-    /// surface stays scannable whatever the model asked. The frame
-    /// reserves the sheet's height above the conversation (see
-    /// [`TuiApp::render`]), so nothing the run said hides behind the
-    /// box. A terminal shorter than the sheet does not clip it: the same
-    /// walk chooses the rows that fit, keeping the draft row and the hints
-    /// and windowing the options around the cursor.
-    fn render_question_overlay(&self, frame: &mut Frame, area: Rect, more: usize) {
-        let Some(entry) = self.shown_question() else {
-            return;
-        };
-        let wrap_at = usize::from(area.width.saturating_sub(4));
-        let sheet_area = self.question_sheet_area(area);
-        let budget = usize::from(sheet_area.height.saturating_sub(2));
-        let sheet = self.question_sheet(entry, wrap_at, more, budget);
-        let lines = sheet.lines;
-        let height = u16::try_from(lines.len())
-            .unwrap_or(u16::MAX)
-            .saturating_add(2)
-            .min(sheet_area.height);
-        let overlay = bottom_sheet_rect(height, sheet_area);
-        if overlay.width == 0 || overlay.height == 0 {
-            return;
-        }
-        let accent = Style::default().fg(self.theme.ui.primary);
-        let title = if more == 0 {
-            " Question ".to_string()
-        } else {
-            format!(
-                " Question {} of {} ",
-                self.question_view.saturating_add(1),
-                more.saturating_add(1)
-            )
-        };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(accent)
-            .title(Span::styled(title, accent));
-        frame.render_widget(Clear, overlay);
-        frame.render_widget(Paragraph::new(lines).block(block), overlay);
-        if let Some((row, column)) = sheet.caret
-            && row.saturating_add(1) < usize::from(overlay.height)
-        {
-            let caret_x = usize::from(overlay.x)
-                .saturating_add(1)
-                .saturating_add(COMPOSE_PREFIX.width())
-                .saturating_add(column)
-                .min(usize::from(overlay.right()).saturating_sub(1));
-            let caret_y = usize::from(overlay.y)
-                .saturating_add(1)
-                .saturating_add(row)
-                .min(usize::from(overlay.bottom()).saturating_sub(1));
-            frame.set_cursor_position((
-                u16::try_from(caret_x).unwrap_or(0),
-                u16::try_from(caret_y).unwrap_or(0),
-            ));
-        }
-    }
-
     /// The question sheet's rows and the caret riding them, laid out for
     /// the width the box has and the height the terminal leaves it.
     ///
@@ -9633,12 +8618,12 @@ impl TuiApp {
         let mut lines: Vec<Line<'static>> = Vec::new();
         if let Some(header) = &question.header {
             lines.push(Line::styled(
-                format!("[{header}]"),
+                format!("[{}]", for_display(header)),
                 Style::default().fg(self.theme.ui.secondary),
             ));
         }
         lines.extend(
-            wrap_prompt_rows(&question.question, wrap_at, MAX_OVERLAY_ROWS)
+            wrap_prompt_rows(&for_display(&question.question), wrap_at, MAX_OVERLAY_ROWS)
                 .into_iter()
                 .map(|row| Line::styled(row, Style::default().fg(self.theme.ui.foreground))),
         );
@@ -9684,11 +8669,14 @@ impl TuiApp {
                 } else {
                     "  "
                 };
-                let label =
-                    wrap_prompt_rows(&format!("{marker}{checked}{}", option.label), wrap_at, 1)
-                        .first()
-                        .cloned()
-                        .unwrap_or_default();
+                let label = wrap_prompt_rows(
+                    &for_display(&format!("{marker}{checked}{}", option.label)),
+                    wrap_at,
+                    1,
+                )
+                .first()
+                .cloned()
+                .unwrap_or_default();
                 let style = if index == ui.cursor {
                     Style::default().fg(self.theme.ui.primary)
                 } else {
@@ -9697,8 +8685,8 @@ impl TuiApp {
                 let mut rows = vec![Line::styled(label, style)];
                 if let Some(description) = &option.description {
                     let detail = wrap_prompt_rows(
-                        description,
-                        wrap_at.saturating_sub(DETAIL_INDENT.width()),
+                        &for_display(description),
+                        wrap_at.saturating_sub(str_width(DETAIL_INDENT)),
                         1,
                     )
                     .first()
@@ -9726,6 +8714,13 @@ impl TuiApp {
     /// comes out of that wrap too, which is the only place that knows
     /// which row the caret's character landed on.
     ///
+    /// The draft renders exactly as typed, the display policy aside:
+    /// its rows and the caret's column come from one wrap, and
+    /// projecting the text through the policy would move painted
+    /// cells off the math the caret rides. The block repaints on
+    /// every keystroke, so a cluster the terminal sizes differently
+    /// cannot outlive the next press.
+    ///
     /// Outside the draft the block is the row at rest plus the subtext
     /// saying what it is for: the invitation, or the words already typed,
     /// which Esc leaves in place precisely because stepping out of the
@@ -9738,13 +8733,14 @@ impl TuiApp {
         let ui = &entry.ui;
         let mut lines: Vec<Line<'static>> = vec![Line::default()];
         if ui.composing {
-            let draft_width = u16::try_from(wrap_at.saturating_sub(COMPOSE_PREFIX.width()).max(1))
-                .unwrap_or(u16::MAX);
+            let draft_width =
+                u16::try_from(wrap_at.saturating_sub(str_width(COMPOSE_PREFIX)).max(1))
+                    .unwrap_or(u16::MAX);
             let caret_byte = byte_index(&ui.draft, ui.caret);
             let (rows, caret) =
                 crate::input::wrap_rows_and_caret(&ui.draft, caret_byte, draft_width);
             let first = lines.len();
-            let continuation = " ".repeat(COMPOSE_PREFIX.width());
+            let continuation = " ".repeat(str_width(COMPOSE_PREFIX));
             for (index, row) in rows.iter().enumerate() {
                 let prefix = if index == 0 {
                     COMPOSE_PREFIX
@@ -9919,156 +8915,31 @@ impl TuiApp {
     fn shown_permission(&self) -> Option<PermissionSheet> {
         self.pending_permissions.front().map(|request| {
             let phrases = |rules: &[PermissionRule]| {
-                rules.iter().map(PermissionRule::remember_phrase).collect()
+                rules
+                    .iter()
+                    .map(PermissionRule::remember_phrase)
+                    .collect::<Vec<String>>()
             };
             PermissionSheet {
-                prompt: request.prompt.clone(),
-                always: phrases(&self.permission_memory.would_record(&request.always, false)),
-                never: phrases(&self.permission_memory.would_record(&request.never, true)),
-                command: request.command_detail(),
-                reason: self.permission_reason.clone(),
+                prompt: for_display(&request.prompt).into_owned(),
+                always: phrases(&self.permission_memory.would_record(&request.always, false))
+                    .iter()
+                    .map(|phrase| for_display(phrase).into_owned())
+                    .collect(),
+                never: phrases(&self.permission_memory.would_record(&request.never, true))
+                    .iter()
+                    .map(|phrase| for_display(phrase).into_owned())
+                    .collect(),
+                command: request
+                    .command_detail()
+                    .map(|command| for_display(&command).into_owned()),
+                reason: self
+                    .permission_reason
+                    .as_deref()
+                    .map(|reason| for_display(reason).into_owned()),
                 more: self.pending_permissions.len().saturating_sub(1),
             }
         })
-    }
-
-    /// Render the pending permission ask as a sheet over the prompt
-    /// box.
-    ///
-    /// Draws where the user's attention already is: anchored at the
-    /// bottom, directly above the status bar, covering the bottom
-    /// furniture — the place row (or, with no place, the notice row),
-    /// the spacer, and the composer — the box the user would type in
-    /// is replaced by the question. The conversation above keeps
-    /// rendering behind it, so what the run is doing stays visible
-    /// while the ask waits. The prompt and the hints are each
-    /// pre-wrapped at the box's inner width (a block at most
-    /// `MAX_OVERLAY_ROWS` rows, the last ellipsized), so no rendered
-    /// line can re-flow inside the border and the hints always fit,
-    /// whatever the tool name's length or the terminal's width; only
-    /// a terminal shorter than the box clips, at the box's top. The
-    /// sheet is gathered already — this borrows nothing from the
-    /// queue.
-    ///
-    /// `always` carries what an "allow always" answer would record, in
-    /// the rules' own phrases; the line stands between the command and
-    /// the hints so the scope of the `a` press is read before the key
-    /// is pressed, not after. `command` is the call's raw command from
-    /// the input — exactly what will run — drawn as its own block, and
-    /// `reason` is the live text when the sheet's `r` press opened the
-    /// reason line, whose hints swap for the reason line's own.
-    fn render_permission_overlay(&self, frame: &mut Frame, area: Rect, sheet: &PermissionSheet) {
-        let wrap_at = usize::from(area.width.saturating_sub(2));
-        let command_truncated = sheet.command.as_ref().is_some_and(|command| {
-            wrap_rows(&format!("runs: {command}"), wrap_at).len() > MAX_OVERLAY_ROWS
-        });
-        let mut hints = if sheet.reason.is_some() {
-            "[enter] deny with this reason · [esc] back to the ask".to_string()
-        } else if sheet.more == 0 {
-            "[y] allow · [a] allow always · [d] deny always · [n] deny · [r] deny with a reason · esc or ctrl+c cancels".to_string()
-        } else {
-            format!(
-                "[y] allow · [a] allow always · [d] deny always · [n] deny · [r] deny with a reason · esc or ctrl+c cancels · {more} more waiting",
-                more = sheet.more,
-            )
-        };
-        if command_truncated {
-            hints.push_str(if self.permission_command_expanded {
-                " · [e] collapse"
-            } else {
-                " · [e] expand"
-            });
-        }
-        let mut lines: Vec<Line<'_>> = wrap_prompt_rows(&sheet.prompt, wrap_at, MAX_OVERLAY_ROWS)
-            .into_iter()
-            .map(|row| Line::styled(row, Style::default().fg(self.theme.ui.foreground)))
-            .collect();
-        let sheet_area = Rect {
-            height: area.height.saturating_sub(STATUS_BAR_ROWS - STATUS_BAR_AIR),
-            ..area
-        };
-        let scope_line = (!sheet.always.is_empty())
-            .then(|| format!("a remembers: {}", sheet.always.join(" · ")));
-        let deny_line =
-            (!sheet.never.is_empty()).then(|| format!("d remembers: {}", sheet.never.join(" · ")));
-        let reason_line = sheet
-            .reason
-            .as_ref()
-            .map(|reason| format!("reason: {reason}▏"));
-        if let Some(command) = &sheet.command {
-            let runs = format!("runs: {command}");
-            let rows = if self.permission_command_expanded {
-                let blocks = [
-                    scope_line.as_deref(),
-                    deny_line.as_deref(),
-                    reason_line.as_deref(),
-                ]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<&str>>();
-                let budget = expanded_command_budget(
-                    sheet_area.height,
-                    lines.len(),
-                    expanded_fixed_rows(&blocks, &hints, wrap_at),
-                );
-                wrap_prompt_rows_last(&runs, wrap_at, budget)
-            } else {
-                wrap_prompt_rows(&runs, wrap_at, MAX_OVERLAY_ROWS)
-            };
-            lines.extend(
-                rows.into_iter()
-                    .map(|row| Line::styled(row, Style::default().fg(self.theme.ui.primary))),
-            );
-        }
-        if let Some(scope) = scope_line {
-            lines.extend(
-                wrap_prompt_rows(&scope, wrap_at, MAX_OVERLAY_ROWS)
-                    .into_iter()
-                    .map(|row| Line::styled(row, Style::default().fg(self.theme.ui.secondary))),
-            );
-        }
-        if let Some(scope) = deny_line {
-            lines.extend(
-                wrap_prompt_rows(&scope, wrap_at, MAX_OVERLAY_ROWS)
-                    .into_iter()
-                    .map(|row| Line::styled(row, Style::default().fg(self.theme.ui.secondary))),
-            );
-        }
-        if let Some(typed) = reason_line {
-            lines.extend(
-                wrap_prompt_rows(&typed, wrap_at, MAX_OVERLAY_ROWS)
-                    .into_iter()
-                    .map(|row| Line::styled(row, Style::default().fg(self.theme.ui.foreground))),
-            );
-        }
-        lines.push(Line::default());
-        lines.extend(
-            wrap_prompt_rows(&hints, wrap_at, MAX_OVERLAY_ROWS)
-                .into_iter()
-                .map(|row| Line::styled(row, Style::default().fg(self.theme.ui.secondary))),
-        );
-        let height = u16::try_from(lines.len())
-            .unwrap_or(u16::MAX)
-            .saturating_add(2)
-            .min(sheet_area.height);
-        let overlay = bottom_sheet_rect(height, sheet_area);
-        if overlay.width == 0 || overlay.height == 0 {
-            return;
-        }
-        let accent = Style::default().fg(self.theme.ui.primary);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(accent)
-            .title(Span::styled(" Permission required ", accent));
-        frame.render_widget(Clear, overlay);
-        frame.render_widget(
-            Paragraph::new(lines)
-                .block(block)
-                .wrap(Wrap { trim: false })
-                .style(Style::default().bg(self.theme.ui.surface)),
-            overlay,
-        );
     }
 
     /// Render the conversation pane: the settled conversation, the
@@ -10210,251 +9081,6 @@ impl TuiApp {
                 range.start.saturating_add(tail_base)..range.end.saturating_add(tail_base)
             }));
         self.conversation_cache_generation = self.conversation_generation;
-    }
-
-    /// Render the conversation pane: the transcript's windowed view
-    /// and everything live that rides it.
-    ///
-    /// The pane is the layered stack the reader scrolls — the baked
-    /// conversation cache, the speaker-change seam, the live lanes in
-    /// conversation order (thinking rows, the streaming reply's
-    /// frozen and live regions, compaction notices), the running tool
-    /// rows, the turn's ticking timer footer, and — just above that
-    /// timer, in the spot they will land in — a steer waiting for the
-    /// model to read it, pinned as a user row — windowed to the pane's
-    /// height around
-    /// the scroll position, so a keystroke's cost tracks the window,
-    /// never the session. The settled turns' chrome (their raised
-    /// boxes and chevrons) paints from the cached turn ranges over
-    /// the same window; the selection reverses in place; the
-    /// scrollbar rides the gutter when the stack outgrows the pane.
-    /// The view state this records is the click-mapping every later
-    /// pointer event trusts.
-    fn render_conversation(&mut self, frame: &mut Frame, area: Rect) {
-        let padded = Rect {
-            y: area.y.saturating_add(CONVERSATION_TOP_INSET),
-            height: area.height.saturating_sub(CONVERSATION_TOP_INSET),
-            ..area
-        };
-        let (pane, scrollbar_area) = split_scrollbar_gutter(padded);
-        let mark_gutter = (pane.width
-            >= CONVERSATION_MARK_MIN_TEXT
-                .saturating_add(CONVERSATION_MARK_GUTTER)
-                .saturating_add(CONVERSATION_RIGHT_INSET)
-                .saturating_add(CONVERSATION_BOX_MARGIN))
-        .then_some(Rect {
-            width: CONVERSATION_MARK_GUTTER,
-            ..pane
-        });
-        let text_area = mark_gutter.as_ref().map_or(pane, |gutter| Rect {
-            x: gutter.right(),
-            width: pane.width.saturating_sub(CONVERSATION_MARK_GUTTER),
-            ..pane
-        });
-        let text_area = Rect {
-            width: text_area
-                .width
-                .saturating_sub(CONVERSATION_RIGHT_INSET)
-                .saturating_sub(CONVERSATION_BOX_MARGIN),
-            ..text_area
-        };
-        let conversation_height = text_area.height as usize;
-        let width = text_area.width.max(1);
-        if self.conversation_cache_generation != self.conversation_generation
-            || self.conversation_cache_width != width
-        {
-            self.bake_conversation_cache(text_area, width);
-        }
-
-        let streaming_changed = self.refresh_streaming_region(width);
-        let (tools, running_rows) = self.active_tool_lines(width);
-        let thinking_rows = self.live_thinking_lines(width);
-        let compaction_rows = self.live_compaction_lines();
-        let live_open = !thinking_rows.0.is_empty()
-            || !self.frozen_lines.is_empty()
-            || !self.live_lines.is_empty()
-            || !compaction_rows.is_empty()
-            || !tools.is_empty();
-        let seam: Vec<Line<'static>> = if !self.conversation_cache.is_empty() && live_open {
-            vec![Line::from("")]
-        } else {
-            Vec::new()
-        };
-        let shape: SelectableShape = (
-            self.conversation_cache.len(),
-            seam.len(),
-            thinking_rows.0.len(),
-            self.frozen_lines.len(),
-            self.live_lines.len(),
-            compaction_rows.len(),
-            tools.len(),
-        );
-        self.settle_selectable_shape(streaming_changed, shape);
-        self.thinking_live_rows = thinking_rows.1.map(|row| {
-            let start = row
-                .saturating_add(self.conversation_cache.len())
-                .saturating_add(seam.len());
-            start..start.saturating_add(thinking_rows.0.len())
-        });
-        let pre_tool_offset = self
-            .conversation_cache
-            .len()
-            .saturating_add(seam.len())
-            .saturating_add(thinking_rows.0.len())
-            .saturating_add(self.frozen_lines.len())
-            .saturating_add(self.live_lines.len())
-            .saturating_add(compaction_rows.len());
-        self.tool_running_lines = running_rows
-            .into_iter()
-            .map(|(index, call_id)| (index.saturating_add(pre_tool_offset), call_id))
-            .collect();
-        let run_timer = self.live_run_timer();
-        let pending_steer_rows = self.pending_steer_lines(width);
-        let lane_end = self
-            .conversation_cache
-            .len()
-            .saturating_add(seam.len())
-            .saturating_add(thinking_rows.0.len())
-            .saturating_add(self.frozen_lines.len())
-            .saturating_add(self.live_lines.len())
-            .saturating_add(compaction_rows.len())
-            .saturating_add(tools.len());
-        let pinned_steer = (!pending_steer_rows.is_empty())
-            .then(|| (lane_end, lane_end.saturating_add(pending_steer_rows.len())));
-        let total_lines = lane_end
-            .saturating_add(pending_steer_rows.len())
-            .saturating_add(run_timer.len());
-        self.settle_scroll_offset(total_lines, conversation_height);
-        let skip = self.snap_skip_to_whole_todo_blocks(
-            total_lines
-                .saturating_sub(conversation_height)
-                .saturating_sub(self.scroll_offset),
-            conversation_height,
-        );
-        frame.render_widget(ratatui::widgets::Clear, pane);
-        self.paint_user_turn_chrome(
-            frame,
-            pane,
-            mark_gutter,
-            skip,
-            conversation_height,
-            pinned_steer,
-        );
-        self.live_seam_lines = seam;
-        self.live_thinking_cache = thinking_rows.0;
-        self.live_compaction_cache = compaction_rows;
-        self.live_tools_cache = tools;
-        let segments: Vec<&[Line<'_>]> = vec![
-            &self.conversation_cache,
-            &self.live_seam_lines,
-            &self.live_thinking_cache,
-            &self.frozen_lines,
-            &self.live_lines,
-            &self.live_compaction_cache,
-            &self.live_tools_cache,
-            &pending_steer_rows,
-            &run_timer,
-        ];
-        let mut visible = visible_window(&segments, skip, conversation_height);
-        self.last_view = Some(ViewState {
-            area: text_area,
-            skip,
-            total: total_lines,
-            selectable: lane_end,
-        });
-        if let Some(selection) = &self.selection {
-            reverse_selection(&mut visible, skip, selection);
-        }
-        frame.render_widget(Paragraph::new(visible), text_area);
-        if let Some(gutter) = scrollbar_area
-            && let Some((thumb_pos, thumb_len)) =
-                scrollbar_geometry(total_lines, conversation_height, skip)
-        {
-            render_scrollbar(
-                frame,
-                gutter,
-                thumb_pos,
-                thumb_len,
-                self.theme.ui.scrollbar_thumb,
-                self.theme.ui.scrollbar_track,
-            );
-        }
-    }
-
-    /// Paint the settled user turns' chrome: each turn's raised box
-    /// and the chevron at its opening text row.
-    ///
-    /// The box keeps [`CONVERSATION_BOX_MARGIN`] of the pane's own
-    /// background outside itself on both sides and spans the turn's
-    /// padding rows and text; the chevron sits a column inside the
-    /// box's left edge. Both are painted from the cached turn ranges
-    /// against this frame's window, so turns off-screen paint
-    /// nothing.
-    fn paint_user_turn_chrome(
-        &self,
-        frame: &mut Frame,
-        pane: Rect,
-        mark_gutter: Option<Rect>,
-        skip: usize,
-        conversation_height: usize,
-        pinned_steer: Option<(usize, usize)>,
-    ) {
-        let mut turns = self.user_turn_ranges.clone();
-        if let Some((start, end)) = pinned_steer {
-            turns.push((start, end, start.saturating_add(1)));
-        }
-        for &(start, end, _) in &turns {
-            let first_visible = start.max(skip);
-            let last_visible = end.min(skip.saturating_add(conversation_height));
-            if first_visible >= last_visible {
-                continue;
-            }
-            let Some(y) = first_visible
-                .checked_sub(skip)
-                .and_then(|offset| u16::try_from(offset).ok())
-            else {
-                continue;
-            };
-            let Some(h) = last_visible
-                .checked_sub(first_visible)
-                .and_then(|rows| u16::try_from(rows).ok())
-            else {
-                continue;
-            };
-            let block = Rect {
-                x: pane.x.saturating_add(CONVERSATION_BOX_MARGIN),
-                width: pane
-                    .width
-                    .saturating_sub(CONVERSATION_BOX_MARGIN.saturating_mul(2)),
-                y: pane.y.saturating_add(y),
-                height: h,
-            };
-            frame
-                .buffer_mut()
-                .set_style(block, Style::default().bg(self.theme.ui.surface));
-        }
-        let Some(gutter) = mark_gutter else {
-            return;
-        };
-        for &(_, _, mark) in &turns {
-            let Some(on_screen) = mark.checked_sub(skip) else {
-                continue;
-            };
-            let Ok(row) = u16::try_from(on_screen) else {
-                continue;
-            };
-            if row < gutter.height {
-                frame.buffer_mut()[(
-                    gutter
-                        .x
-                        .saturating_add(CONVERSATION_BOX_MARGIN)
-                        .saturating_add(1),
-                    gutter.y.saturating_add(row),
-                )]
-                    .set_symbol("❯")
-                    .set_fg(self.theme.ui.primary);
-            }
-        }
     }
 
     /// The steers a run accepted but no turn boundary has read, as
@@ -11421,138 +10047,10 @@ impl TuiApp {
             return 0;
         };
         let prefix = queue_prompt_prefix(total, shown);
-        let limit = usize::from(width).saturating_sub(prefix.width()).max(1);
+        let limit = usize::from(width).saturating_sub(str_width(&prefix)).max(1);
         let cap = usize::from(QUEUE_ROWS).saturating_sub(3);
-        let body = wrap_prompt_rows(&text, limit, cap).len();
+        let body = wrap_prompt_rows(&for_display(&text), limit, cap).len();
         u16::try_from(body.saturating_add(3)).unwrap_or(QUEUE_ROWS)
-    }
-
-    /// Render the prompts waiting to run.
-    ///
-    /// The section opens with a `QUEUED` title row naming what the rows
-    /// under it are, then shows one prompt at a time, its text across the
-    /// remaining rows rather than a digest: the reason to look at this
-    /// section is to check wording before it reaches the model, so a
-    /// summary of a prompt is precisely what the user came here to avoid.
-    /// The marker and the `[n/total]` count ride the prompt's first row
-    /// rather than spending columns of their own, and the count stands
-    /// down for a lone prompt — being one of one is not a fact worth two
-    /// columns. The marker itself carries the focus cue: dim while the
-    /// composer holds the keys, the primary accent once the section
-    /// does — a voice the dim register never renders, so the cue
-    /// survives a theme (Dracula among them) whose secondary accent
-    /// and dim are the same color.
-    ///
-    /// The keys ride the section's last row when the width can pay for
-    /// them, and name only what the current mode answers: the walk's
-    /// chords while the section has the keyboard, the saving ones while a
-    /// prompt is out in the composer, and otherwise the chord that gets the
-    /// user here. A hint for keys that do nothing from where the keys
-    /// actually are would be a lie printed in the theme's dim. Where the
-    /// text and the hint cannot both fit, the text keeps the row and the
-    /// hint is dropped whole — never re-wrapped around, never allowed to
-    /// push a word off the cut.
-    ///
-    /// Paints no background across its rows, exactly as the notice row
-    /// does: these are lines of text, not a box, and a filled panel
-    /// would put a block of the theme's surface into a terminal
-    /// configured to paint none. The title is the one exception, and it
-    /// is a badge rather than a panel — a pill a few cells wide is a
-    /// label, not a filled box — stood in from the section's left edge,
-    /// held a blank row clear of the prompt below it and another clear
-    /// of the transcript above, and filled with the secondary — the
-    /// voice the plan's badge traded it, so the two pills keep one
-    /// family and two names — letters in the canvas
-    /// color, at rest and under the keys alike. In a theme that defers
-    /// to the terminal the fill resets and the badge degrades to plain
-    /// text — the letters keep at most a foreground voice, which
-    /// paints nothing. The render records the rect it filled — either
-    /// posture's rows — so a later click on the section answers
-    /// against the geometry this frame painted.
-    fn render_queue(&mut self, frame: &mut Frame, area: Rect) {
-        if area.height == 0 || area.width == 0 {
-            return;
-        }
-        let total = self.queued_display_len();
-        if total == 0 {
-            return;
-        }
-        self.queue_section_rect = area;
-        if self.queue_posture == QueuePosture::Folded && self.queue_mode == QueueMode::Plain {
-            frame.render_widget(
-                Paragraph::new(vec![
-                    Line::from(Vec::new()),
-                    Line::from(vec![
-                        Span::styled(
-                            format!(" {QUEUE_TITLE} "),
-                            Style::default()
-                                .fg(self.theme.ui.background)
-                                .bg(self.theme.ui.secondary),
-                        ),
-                        Span::raw(" "),
-                        Span::styled(
-                            format!("{total} waiting · ctrl+q to show"),
-                            Style::default().fg(self.theme.ui.dim),
-                        ),
-                    ]),
-                ]),
-                area,
-            );
-            return;
-        }
-        let shown = self.queue_view.min(total.saturating_sub(1));
-        let Some((_, text)) = self.queued_at(shown) else {
-            return;
-        };
-        let rows = usize::from(area.height.min(QUEUE_ROWS));
-        let top_standoff = usize::from(rows > 3);
-        let bottom_standoff = usize::from(rows > 2);
-        let body_rows = rows
-            .saturating_sub(1)
-            .saturating_sub(top_standoff)
-            .saturating_sub(bottom_standoff);
-        let focused = self.queue_mode == QueueMode::Focused;
-        let prefix = queue_prompt_prefix(total, shown);
-        let width = usize::from(area.width);
-        let limit = width.saturating_sub(prefix.width()).max(1);
-        let body = wrap_prompt_rows(&text, limit, body_rows);
-        let marker_style = Style::default().fg(if focused {
-            self.theme.ui.primary
-        } else {
-            self.theme.ui.dim
-        });
-        let (fill, letters) = (self.theme.ui.secondary, self.theme.ui.background);
-        let mut lines: Vec<Line<'static>> = Vec::with_capacity(rows);
-        if top_standoff > 0 {
-            lines.push(Line::from(Vec::new()));
-        }
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!(" {QUEUE_TITLE} "),
-                Style::default().fg(letters).bg(fill),
-            ),
-            Span::raw(" "),
-            Span::styled(
-                self.queue_hint().to_string(),
-                Style::default().fg(self.theme.ui.dim),
-            ),
-        ]));
-        if bottom_standoff > 0 {
-            lines.push(Line::from(Vec::new()));
-        }
-        for (index, row) in body.into_iter().take(body_rows).enumerate() {
-            let mut spans = Vec::with_capacity(2);
-            if index == 0 {
-                spans.push(Span::styled(prefix.clone(), marker_style));
-            }
-            spans.push(Span::styled(
-                row,
-                Style::default().fg(self.theme.ui.input_text),
-            ));
-            lines.push(Line::from(spans));
-        }
-        lines.resize(rows, Line::from(Vec::new()));
-        frame.render_widget(Paragraph::new(lines), area);
     }
 
     /// The chords the queue section names beside its badge.
@@ -11608,28 +10106,6 @@ impl TuiApp {
         }
     }
 
-    /// Render the notice row: one line of transient or state-driven
-    /// message, right-aligned.
-    ///
-    /// The row the place-less frame reserves so nothing on screen
-    /// shifts when a message arrives or leaves — with a place row
-    /// standing, the notice rides that row's right edge instead and
-    /// this renders nowhere. Blank otherwise; the text is the same
-    /// one [`render_place_row`](Self::render_place_row) hosts.
-    fn render_notice(&self, frame: &mut Frame, area: Rect) {
-        if area.height == 0 {
-            return;
-        }
-        if let Some(text) = self.notice_text() {
-            frame.render_widget(
-                Paragraph::new(text)
-                    .style(Style::default().fg(self.theme.ui.input_border))
-                    .alignment(ratatui::layout::Alignment::Right),
-                area,
-            );
-        }
-    }
-
     /// The one thing the row offers on its own initiative: a draft standing
     /// there while a run holds the agent.
     ///
@@ -11646,453 +10122,6 @@ impl TuiApp {
             return None;
         }
         Some("ctrl+s to guide".to_string())
-    }
-
-    /// Render the saved-session picker on the composer's chosen side.
-    ///
-    /// The same floating shape the completion popup takes: rows
-    /// beside the composer, the cursor row highlighted — inverting
-    /// under a palette that defers its colors, exactly the popup's
-    /// rule — a dim header naming the keys, and a window that follows
-    /// the cursor so a long catalog always keeps the chosen row on
-    /// screen, its capacity sized to the rows the side actually
-    /// offers so a short terminal sheds list rows, never the cursor
-    /// itself. Each row spells the short id, the session's name, the
-    /// model, when the session last saved, and its prompt count.
-    fn render_session_picker(&mut self, frame: &mut Frame, input_area: Rect, above: bool) {
-        const SHOWN: usize = 8;
-        let Some(picker) = self.session_picker.as_ref() else {
-            return;
-        };
-        if picker.rows.is_empty() {
-            return;
-        }
-        let surface = self.theme.ui.surface;
-        let bound = popup_bound(frame, input_area, above);
-        if bound < 2 {
-            return;
-        }
-        let shown = SHOWN.min(usize::from(bound).saturating_sub(1));
-        let (start, cursor_row) = popup_window(picker.cursor, picker.rows.len(), shown);
-        let lines: Vec<Line> = std::iter::once(Line::styled(
-            " sessions — ↑↓ walk · ⏎ resume · esc close ",
-            Style::default().fg(self.theme.ui.dim),
-        ))
-        .chain(
-            picker
-                .rows
-                .iter()
-                .skip(start)
-                .take(shown)
-                .enumerate()
-                .map(|(index, pick)| {
-                    let highlighted = index == cursor_row;
-                    let style = if highlighted {
-                        if self.theme.ui.primary == Color::Reset || surface == Color::Reset {
-                            Style::default().add_modifier(ratatui::style::Modifier::REVERSED)
-                        } else {
-                            Style::default().fg(surface).bg(self.theme.ui.primary)
-                        }
-                    } else {
-                        Style::default().fg(self.theme.ui.input_text).bg(surface)
-                    };
-                    let short = &pick.id[..pick.id.len().min(8)];
-                    let dir = pick
-                        .workdir
-                        .as_deref()
-                        .and_then(|dir| {
-                            std::path::Path::new(dir)
-                                .file_name()
-                                .and_then(|name| name.to_str())
-                        })
-                        .unwrap_or("—");
-                    Line::from(Span::styled(
-                        format!(
-                            " {short}  {}  {:<20} {:<12} {}  {}p ",
-                            fit_picker_title(pick.title.as_deref()),
-                            pick.model,
-                            dir,
-                            pick.saved_at.format("%b %d %H:%M"),
-                            pick.prompts
-                        ),
-                        style,
-                    ))
-                }),
-        )
-        .collect();
-        let height = u16::try_from(lines.len()).unwrap_or(1).min(bound);
-        if height == 0 {
-            return;
-        }
-        let popup = popup_rect(input_area, height, above);
-        frame.render_widget(Clear, popup);
-        frame.render_widget(
-            Paragraph::new(lines).style(Style::default().bg(surface)),
-            popup,
-        );
-    }
-
-    /// Render the configured-models picker on the composer's chosen side.
-    ///
-    /// The same floating shape the session picker takes: a dim header
-    /// naming the keys, each row the model name with the running one
-    /// marked `•`, the cursor row highlighted (inverting under a
-    /// palette that defers its colors). The window follows the cursor
-    /// at its edges, same scroll rule as the session picker.
-    fn render_model_picker(&mut self, frame: &mut Frame, input_area: Rect, above: bool) {
-        const SHOWN: usize = 8;
-        let Some(picker) = self.model_picker.as_ref() else {
-            return;
-        };
-        if picker.rows.is_empty() {
-            return;
-        }
-        let surface = self.theme.ui.surface;
-        let bound = popup_bound(frame, input_area, above);
-        if bound < 2 {
-            return;
-        }
-        let shown = SHOWN.min(usize::from(bound).saturating_sub(1));
-        let total = picker.rows.len();
-        let max_start = total.saturating_sub(shown);
-        let start = picker
-            .cursor
-            .saturating_sub(shown.saturating_sub(1))
-            .min(max_start);
-        let running = &self.config.api.model;
-        let lines: Vec<Line> = std::iter::once(Line::styled(
-            " models — ↑↓ walk · ⏎ switch · esc close ",
-            Style::default().fg(self.theme.ui.dim),
-        ))
-        .chain(
-            picker
-                .rows
-                .iter()
-                .skip(start)
-                .take(shown)
-                .enumerate()
-                .map(|(index, name)| {
-                    let highlighted = index == picker.cursor.saturating_sub(start);
-                    let style = if highlighted {
-                        if self.theme.ui.primary == Color::Reset || surface == Color::Reset {
-                            Style::default().add_modifier(ratatui::style::Modifier::REVERSED)
-                        } else {
-                            Style::default().fg(surface).bg(self.theme.ui.primary)
-                        }
-                    } else {
-                        Style::default().fg(self.theme.ui.input_text).bg(surface)
-                    };
-                    let marker = if name == running { "•" } else { " " };
-                    Line::from(Span::styled(format!(" {marker} {name} "), style))
-                }),
-        )
-        .collect();
-        let height = u16::try_from(lines.len()).unwrap_or(1).min(bound);
-        if height == 0 {
-            return;
-        }
-        let popup = popup_rect(input_area, height, above);
-        frame.render_widget(Clear, popup);
-        frame.render_widget(
-            Paragraph::new(lines).style(Style::default().bg(surface)),
-            popup,
-        );
-    }
-
-    /// Draw a live completion popup above the composer.
-    ///
-    /// While the composer holds a leading-slash line, this lists what the same
-    /// [`commands::complete`] that Tab accepts would offer right now — command
-    /// names for `/t…`, and the command's values (models, theme names, config
-    /// keys) once the command word is complete and an argument has begun, as in
-    /// `/theme def`. A command row carries the same one-line summary `/help`
-    /// prints for it — dimmed, and aligned in one column past the widest name
-    /// the window shows, `/help`'s own shape column sized to the panel, so the
-    /// descriptions read as a column rather than tailing each name; a value
-    /// row stands alone — the value is the whole offer. It is a read-only
-    /// preview recomputed each frame from the
-    /// current text; Tab is what actually accepts or cycles a choice, so this
-    /// never changes what is typed. It hides when there is nothing to offer, or
-    /// when the sole candidate is already fully spelled out in the composer.
-    fn render_completion(&mut self, frame: &mut Frame, input_area: Rect, above: bool) {
-        const SHOWN: usize = 6;
-        let bound = popup_bound(frame, input_area, above);
-        let shown = SHOWN.min(usize::from(bound));
-        let Some((prefix, candidates)) = self.popup_candidates() else {
-            self.completion = None;
-            return;
-        };
-
-        let total = candidates.len();
-        let active_cycle = self
-            .completion
-            .as_ref()
-            .filter(|cycle| cycle.prefix == prefix);
-        let start = active_cycle.map_or(0, |cycle| {
-            let max_start = total.saturating_sub(shown);
-            let start = cycle.window_start.min(max_start);
-            let selected = cycle.index.min(total.saturating_sub(1));
-            if selected < start {
-                selected
-            } else if selected >= start.saturating_add(shown) {
-                selected
-                    .saturating_sub(shown.saturating_sub(1))
-                    .min(max_start)
-            } else {
-                start
-            }
-        });
-        let highlighted_row = active_cycle.map(|cycle| {
-            cycle
-                .index
-                .min(total.saturating_sub(1))
-                .saturating_sub(start)
-        });
-        let window: Vec<&String> = candidates.iter().skip(start).take(shown).collect();
-
-        let surface = self.theme.ui.surface;
-        let completing_command = prefix == "/";
-        let width = usize::from(input_area.width.max(1));
-        let summary_column = if completing_command {
-            window
-                .iter()
-                .map(|candidate| format!("   /{candidate}").width())
-                .max()
-                .unwrap_or(0)
-                .saturating_add(2)
-        } else {
-            0
-        };
-        let lines: Vec<Line> = window
-            .iter()
-            .enumerate()
-            .map(|(index, candidate)| {
-                let highlighted = highlighted_row == Some(index);
-                let style = if highlighted {
-                    if self.theme.ui.primary == Color::Reset
-                        || self.theme.ui.surface == Color::Reset
-                    {
-                        Style::default().add_modifier(ratatui::style::Modifier::REVERSED)
-                    } else {
-                        Style::default()
-                            .fg(self.theme.ui.surface)
-                            .bg(self.theme.ui.primary)
-                    }
-                } else {
-                    Style::default().fg(self.theme.ui.input_text).bg(surface)
-                };
-                let mut spans = if completing_command {
-                    let name = format!("/{candidate}");
-                    vec![Span::styled(format!("{name:<summary_column$}"), style)]
-                } else {
-                    vec![Span::styled(format!("{candidate} "), style)]
-                };
-                if completing_command && let Some(summary) = commands::summary_for(candidate) {
-                    let budget = width.saturating_sub(summary_column);
-                    let summary_style = if highlighted {
-                        style
-                    } else {
-                        Style::default().fg(self.theme.ui.dim).bg(surface)
-                    };
-                    let clamped = wrap_prompt_rows(summary, budget, 1)
-                        .first()
-                        .cloned()
-                        .unwrap_or_default();
-                    spans.push(Span::styled(clamped, summary_style));
-                }
-                Line::from(spans)
-            })
-            .collect();
-
-        let height = u16::try_from(lines.len()).unwrap_or(1).min(bound);
-        if height == 0 {
-            return;
-        }
-        let popup = popup_rect(input_area, height, above);
-        frame.render_widget(Clear, popup);
-        frame.render_widget(
-            Paragraph::new(lines).style(Style::default().bg(surface)),
-            popup,
-        );
-    }
-
-    /// Render the input field: a fixed multi-row window onto the
-    /// buffer, as a borderless composer drawn on the theme's surface
-    /// color and padded on all sides. On painted chrome the pane's
-    /// left edge is a solid one-cell accent column in the theme's
-    /// primary color — the composer is the screen's always-focused
-    /// surface, so its marker takes the focus accent — sitting inside
-    /// the side padding, clear of the text; the paintless theme keeps
-    /// its terminal-drawn hairlines and paints nothing, edge included.
-    ///
-    /// The field's shape is a pure background fill with square
-    /// corners — solid by construction, like the scrollbar. Corners
-    /// stay square deliberately: a cell grid cannot draw a smooth
-    /// curve, and both approximations it can draw (corner glyphs,
-    /// clipped corner cells) render as pixel-like steps. The text sits
-    /// inside horizontal and vertical padding; the window shows the
-    /// caret's line and the lines above it, so typing at the end
-    /// sees the newest lines and browsing up scrolls with the
-    /// caret. The box closes with its identity row — the model, its
-    /// effort, and the permission mode in the dim register, the
-    /// composer's state tag at the row's very right — sitting on the
-    /// box's bottom edge, the padding row above it the breathing.
-    /// It is not a composer row: nothing typed lands there and the
-    /// caret never visits it. The field carries no other text of its
-    /// own — queue state lives in its own section. `rows` and
-    /// `caret` are the frame's single wrap of the buffer, computed by
-    /// [`render`](Self::render) and shared with the identity row's
-    /// tag. The text window takes its height from the pane's own rows
-    /// net of the vertical padding, so no paint of the field's lands
-    /// outside the pane it was given; the caret paints inside the
-    /// pane the same way, so a terminal too short for the field's full
-    /// height shows the caret on a row the field owns, and a field
-    /// allotted no rows at all paints no caret.
-    fn render_input(&mut self, frame: &mut Frame, area: Rect, rows: &[String], caret: (u16, u16)) {
-        let (caret_row, column) = caret;
-        let muted = self.section_holds_keys();
-        let voice = if muted {
-            self.theme.ui.dim
-        } else {
-            self.theme.ui.input_text
-        };
-
-        let surface = self.theme.ui.surface;
-        let text_style = if self.theme.ui.composer_border.is_some() {
-            Style::default().fg(voice)
-        } else {
-            frame
-                .buffer_mut()
-                .set_style(area, Style::default().bg(surface));
-            let edge = Rect {
-                width: area.width.min(1),
-                ..area
-            };
-            frame.buffer_mut().set_style(
-                edge,
-                Style::default().bg(if muted {
-                    self.theme.ui.dim
-                } else {
-                    self.theme.ui.primary
-                }),
-            );
-            Style::default().fg(voice).bg(surface)
-        };
-        let text_height = INPUT_TEXT_ROWS.min(
-            area.height
-                .saturating_sub(INPUT_VERTICAL_PADDING.saturating_mul(2))
-                .saturating_sub(1),
-        );
-        let info_style = if self.theme.ui.composer_border.is_some() {
-            Style::default().fg(self.theme.ui.dim)
-        } else {
-            Style::default().fg(self.theme.ui.dim).bg(surface)
-        };
-        let info_x = area
-            .x
-            .saturating_add(INPUT_SIDE_INSET)
-            .min(area.right().saturating_sub(1));
-        let info_width = area
-            .width
-            .max(1)
-            .saturating_sub(INPUT_SIDE_INSET.saturating_mul(2));
-        if area.height >= 1 {
-            let identity_row = Rect {
-                y: area.bottom().saturating_sub(1),
-                height: 1,
-                width: info_width,
-                x: info_x,
-            };
-            let tag = Self::input_state_tag(rows, caret);
-            let tag_width = if tag.is_empty() {
-                0
-            } else {
-                u16::try_from(tag.width().saturating_add(1))
-                    .unwrap_or(info_width)
-                    .min(info_width)
-            };
-            let identity = self.composer_identity_text();
-            if !identity.is_empty() {
-                frame.render_widget(
-                    Paragraph::new(identity).style(info_style),
-                    Rect {
-                        width: info_width.saturating_sub(tag_width),
-                        ..identity_row
-                    },
-                );
-            }
-            if tag_width > 0 {
-                frame.render_widget(
-                    Paragraph::new(Line::styled(
-                        tag,
-                        Style::default().fg(self.theme.ui.input_border),
-                    ))
-                    .style(info_style)
-                    .alignment(ratatui::layout::Alignment::Right),
-                    identity_row,
-                );
-            }
-        }
-        let interior = Rect {
-            x: area
-                .x
-                .saturating_add(INPUT_SIDE_INSET)
-                .min(area.right().saturating_sub(1)),
-            y: area.y.saturating_add(INPUT_VERTICAL_PADDING),
-            width: area
-                .width
-                .max(1)
-                .saturating_sub(INPUT_SIDE_INSET.saturating_mul(2)),
-            height: text_height,
-        };
-        let visible_rows = usize::from(text_height);
-        let start = usize::from(caret_row).saturating_sub(visible_rows.saturating_sub(1));
-        self.input_view = Some(InputView {
-            pane: area,
-            origin: (interior.x, interior.y),
-            start,
-            visible: visible_rows,
-        });
-        let lines: Vec<Line<'_>> = rows
-            .iter()
-            .skip(start)
-            .take(visible_rows)
-            .map(|row| Line::styled(row.as_str(), text_style))
-            .collect();
-        frame.render_widget(Paragraph::new(lines), interior);
-
-        let caret_x = area
-            .x
-            .saturating_add(INPUT_SIDE_INSET)
-            .saturating_add(column)
-            .min(
-                area.x
-                    .saturating_add(INPUT_SIDE_INSET)
-                    .saturating_add(interior.width)
-                    .saturating_sub(1),
-            )
-            .min(area.right().saturating_sub(2));
-        let caret_y = area
-            .y
-            .saturating_add(INPUT_VERTICAL_PADDING)
-            .saturating_add(
-                u16::try_from(usize::from(caret_row).saturating_sub(start)).unwrap_or(0),
-            )
-            .min(area.bottom().saturating_sub(1));
-        if area.height > 0 && self.composer_caret_visible() {
-            let caret_style = if self.theme.ui.primary == Color::Reset
-                || self.theme.ui.background == Color::Reset
-            {
-                Style::default().add_modifier(ratatui::style::Modifier::REVERSED)
-            } else {
-                Style::default()
-                    .fg(self.theme.ui.background)
-                    .bg(self.theme.ui.primary)
-            };
-            if let Some(cell) = frame.buffer_mut().cell_mut((caret_x, caret_y)) {
-                cell.set_style(caret_style);
-            }
-        }
     }
 
     /// Whether the waiting section holds the keyboard, the composer
@@ -12133,158 +10162,6 @@ impl TuiApp {
             && self.pending_questions.is_empty()
             && self.session_picker.is_none()
             && self.model_picker.is_none()
-    }
-
-    /// Render the footer's three rows: a row of air under the
-    /// composer, the bar's row, and the bottom row. The air is the
-    /// composer's bottom margin — the identity row closes the box and
-    /// the footer's facts start one clear row under it. The context
-    /// readout is the footer's head — the bar a cell in from the
-    /// left edge of its row, standing exactly over the numbers that
-    /// lead the bottom row from that same column — and the session
-    /// id is its tail, right-aligned a cell in from the right edge
-    /// on the bar's row: the footer's middle, vertically centered
-    /// between the air above and the numbers below. The composer's
-    /// state tag no longer rides here —
-    /// it moved to the identity row inside the composer — so the
-    /// footer is all session, no draft state. Both rows sit on the
-    /// themed bar colors, and an id without the room to clear the bar
-    /// is forgone rather than run into it. A chunk allotted no rows
-    /// renders nothing — the bar never paints a row another pane
-    /// owns.
-    fn render_status_bar(&self, frame: &mut Frame, area: Rect) {
-        if area.height == 0 {
-            return;
-        }
-        let bar_style = Style::default()
-            .fg(self.theme.ui.status_bar_fg)
-            .bg(self.theme.ui.status_bar_bg);
-        let (context_tokens, window) = self.context_snapshot();
-        let context_fill = context_bar_fill(context_tokens, window, CONTEXT_BAR_CELLS);
-        let readout = context_bar_readout(context_tokens, window);
-        let air = area.height.saturating_sub(2).min(STATUS_BAR_AIR);
-        frame.buffer_mut().set_style(
-            Rect {
-                y: area.y.saturating_add(air),
-                height: area.height.saturating_sub(air),
-                ..area
-            },
-            Style::default().bg(self.theme.ui.status_bar_bg),
-        );
-        let content = Rect {
-            y: area.bottom().saturating_sub(1),
-            height: 1,
-            ..area
-        };
-        let bar_y = content.y.saturating_sub(1);
-        let id_span = if area.height > 1 {
-            self.session_id.as_ref().and_then(|id| {
-                let id_width = u16::try_from(id.width()).ok()?;
-                let start = area
-                    .width
-                    .checked_sub(id_width)?
-                    .checked_sub(u16::try_from(STATUS_BAR_MARGIN).unwrap_or(0))?;
-                (usize::from(start) > STATUS_BAR_MARGIN + CONTEXT_BAR_CELLS + 1).then(|| {
-                    let x = area.x.saturating_add(start);
-                    (bar_y, x, x.saturating_add(id_width))
-                })
-            })
-        } else {
-            None
-        };
-        self.session_id_span.set(id_span);
-        if area.height > 1 {
-            let mut bar_line = self.context_bar_line(STATUS_BAR_MARGIN, context_fill);
-            if let Some((_, start, _)) = id_span {
-                let pad = usize::from(start)
-                    .saturating_sub(
-                        usize::from(area.x)
-                            .saturating_add(STATUS_BAR_MARGIN)
-                            .saturating_add(CONTEXT_BAR_CELLS),
-                    )
-                    .max(1);
-                bar_line.spans.push(Span::raw(" ".repeat(pad)));
-                bar_line.spans.push(Span::raw(
-                    self.session_id.as_deref().unwrap_or_default().to_string(),
-                ));
-            }
-            frame.render_widget(
-                Paragraph::new(bar_line).style(bar_style),
-                Rect {
-                    y: bar_y,
-                    height: 1,
-                    ..area
-                },
-            );
-        }
-        let mut spans = vec![Span::raw(" ".repeat(STATUS_BAR_MARGIN))];
-        if let Some((percent, totals)) = &readout {
-            spans.push(Span::styled(
-                totals.clone(),
-                Style::default().fg(self.theme.ui.dim),
-            ));
-            spans.push(Span::styled(
-                format!(" ({percent})"),
-                Style::default().fg(self.theme.ui.scrollbar_thumb),
-            ));
-        }
-        frame.render_widget(Paragraph::new(Line::from(spans)).style(bar_style), content);
-    }
-
-    /// Render the place row: the working directory and its branch on
-    /// their own row directly above the composer, outside the box —
-    /// a caption, dim on the plain background, inset to line up with
-    /// the composer's text. The caption closes tight against the box:
-    /// the box's top padding row keeps the blank row between the
-    /// caption and the text, so no air row of the layout's own rides
-    /// between the two. The caption costs the frame a single row until
-    /// the host names a directory.
-    fn render_place_row(&self, frame: &mut Frame, area: Rect) {
-        if area.height == 0 || area.width == 0 {
-            return;
-        }
-        let text = self.place_text();
-        if text.is_empty() {
-            return;
-        }
-        let notice = self.notice_text();
-        let notice_len = notice
-            .as_ref()
-            .map_or(0u16, |text| u16::try_from(text.width()).unwrap_or(u16::MAX))
-            .saturating_add(1);
-        let row_width = area
-            .width
-            .max(1)
-            .saturating_sub(INPUT_SIDE_INSET.saturating_mul(2));
-        frame.render_widget(
-            Paragraph::new(text).style(Style::default().fg(self.theme.ui.dim)),
-            Rect {
-                x: area
-                    .x
-                    .saturating_add(INPUT_SIDE_INSET)
-                    .min(area.right().saturating_sub(1)),
-                y: area.y,
-                height: 1,
-                width: row_width.saturating_sub(notice_len),
-            },
-        );
-        if let Some(notice) = notice {
-            let x = area
-                .x
-                .saturating_add(INPUT_SIDE_INSET)
-                .min(area.right().saturating_sub(1));
-            frame.render_widget(
-                Paragraph::new(notice)
-                    .style(Style::default().fg(self.theme.ui.input_border))
-                    .alignment(ratatui::layout::Alignment::Right),
-                Rect {
-                    x: x.saturating_add(row_width.saturating_sub(notice_len)),
-                    y: area.y,
-                    height: 1,
-                    width: notice_len.min(row_width),
-                },
-            );
-        }
     }
 
     /// The place row's text: the working directory spelled per the
@@ -12725,27 +10602,18 @@ impl QuitState {
 /// or a naming call that never answered) takes a dash so the column
 /// stays aligned across rows. A title is prose in any script, so
 /// both the pad and the cap measure display cells — the same
-/// measure the pane spends — never characters.
+/// measure the pane spends — never characters, and the title
+/// carries the display policy first, so a joiner cluster spends
+/// what it paints.
 fn fit_picker_title(title: Option<&str>) -> String {
     const WIDTH: usize = 24;
-    let text = title.unwrap_or("—");
-    let cells = text.width();
+    let text = for_display(title.unwrap_or("—"));
+    let cells = str_width(&text);
     if cells <= WIDTH {
         let pad = " ".repeat(WIDTH.saturating_sub(cells));
         return format!("{text}{pad}");
     }
-    let budget = WIDTH.saturating_sub(1);
-    let mut used = 0usize;
-    let mut kept = String::new();
-    for glyph in text.chars() {
-        let span = glyph.width().unwrap_or(0);
-        if used.saturating_add(span) > budget {
-            break;
-        }
-        kept.push(glyph);
-        used = used.saturating_add(span);
-    }
-    format!("{kept}…")
+    format!("{}…", prefix_within(&text, WIDTH.saturating_sub(1)))
 }
 
 /// The saved-session picker `/sessions` stands on.
@@ -12848,45 +10716,6 @@ impl CaretBlink {
         self.on = on;
         flipped
     }
-}
-
-/// The composer's cached wrap.
-///
-/// One buffer mutation at one width: the rows the buffer wraps to
-/// and the caret's resolved cell among them, kept until the
-/// editor's stamp or the pane width moves. The answers a frame's
-/// sizing, painting, and status tag all need, computed once per
-/// change instead of once per frame.
-struct InputWrapCache {
-    /// The editor mutation stamp the wrap was computed at.
-    ///
-    /// The cache holds exactly while this matches the editor's
-    /// current stamp; every accepted edit and caret move advances
-    /// it, which is what tells an untouched frame to reuse the
-    /// grid.
-    stamp: u64,
-
-    /// The wrap width the grid was built for.
-    ///
-    /// A resize re-wraps rather than reuses — wrapped rows are
-    /// width-shaped, and a pane of another width would clip rows
-    /// baked for the old one.
-    width: u16,
-
-    /// The wrapped rows, shared by `Arc`.
-    ///
-    /// The same grid `display_rows` would rebuild; a cache hit
-    /// clones the reference, not the grid — an idle frame pays
-    /// neither the wrap nor a copy of its tens of thousands of
-    /// rows.
-    rows: Arc<Vec<String>>,
-
-    /// The caret's cell on that grid.
-    ///
-    /// Resolved, the empty buffer's `(0, 0)` parking spot included,
-    /// so a hit answers both questions the frame asks without
-    /// touching the editor again.
-    caret: (u16, u16),
 }
 
 /// What the last frame's composer pane looked like.
@@ -13066,19 +10895,6 @@ pub enum CopyAnswer {
     Failed,
 }
 
-/// The notice wording a synchronous copy answer earns.
-///
-/// Word-for-word the vocabulary [`copy_verdict_notice`] settles on, so
-/// the immediate phase never claims more than the phase after it.
-#[must_use]
-fn copy_answer_notice(answer: CopyAnswer) -> &'static str {
-    match answer {
-        CopyAnswer::Verified => "selection copied",
-        CopyAnswer::Unconfirmed => "",
-        CopyAnswer::Failed => "copy failed — set display.copy_command",
-    }
-}
-
 /// The synchronous answer once the escape write is known.
 ///
 /// With nothing schedulable the escape is the whole story — its write
@@ -13139,21 +10955,6 @@ type CopyOutcomes = Arc<std::sync::Mutex<Vec<CopyVerdict>>>;
 /// and a test recorder from its own script.
 type SelectionCopier = Box<dyn Fn(u64, &str) -> CopyAnswer>;
 
-/// The notice wording a copy's verdict settles on.
-///
-/// A verified transport earned the plain claim; an escape that only
-/// left the process says so; nothing at all names the escape hatch.
-#[must_use]
-fn copy_verdict_notice(verdict: CopyVerdict) -> &'static str {
-    if verdict.verified {
-        "selection copied"
-    } else if verdict.escape_written {
-        ""
-    } else {
-        "copy failed — set display.copy_command"
-    }
-}
-
 /// Take the next copy-attempt id from the shared counter.
 ///
 /// One counter per app, shared with the copier: the read-modify-write
@@ -13165,55 +10966,6 @@ fn next_attempt(counter: &std::sync::atomic::AtomicU64) -> u64 {
         .saturating_add(1)
 }
 
-/// Hand `text` to every clipboard transport the environment offers.
-///
-/// The terminal-side OSC 52 escape runs inline — one buffered write —
-/// and every process transport moves to a background task bounded by
-/// one shared kill deadline, so a hanging helper or a child that
-/// never reads its stdin cannot freeze input and rendering. The
-/// caller-stamped `attempt` rides onto the verdict unchanged. The
-/// transports' verdict lands as a follow-up notice through the render
-/// wake this pings; until then the returned escape result is all the
-/// caller can honestly claim. Failures stay silent per attempt: a
-/// copy that cannot be delivered is a nuisance, not an error worth
-/// interrupting a session for.
-fn copy_via_transports(
-    custom: Option<&str>,
-    attempt: u64,
-    text: &str,
-    outcomes: &CopyOutcomes,
-    wake: &Arc<event_listener::Event>,
-) -> CopyAnswer {
-    let escape_written = osc52_write(text);
-    let command_line = configured_copy_command(custom).map(str::to_string);
-    let transports_scheduled = command_line.is_some()
-        || cfg!(target_os = "macos")
-        || !host_transports(clipboard_env()).is_empty();
-    let answer = transport_answer(escape_written, transports_scheduled);
-    if !transports_scheduled {
-        return answer;
-    }
-    let outcomes = Arc::clone(outcomes);
-    let wake = Arc::clone(wake);
-    let text = text.to_string();
-    let job = move || {
-        let verified = run_process_transports(command_line.as_deref(), &text, COPY_DEADLINE);
-        let mut slot = outcomes.lock().unwrap_or_else(PoisonError::into_inner);
-        slot.push(CopyVerdict {
-            attempt,
-            escape_written,
-            verified,
-        });
-        wake.notify(1);
-    };
-    if tokio::runtime::Handle::try_current().is_ok() {
-        drop(tokio::task::spawn_blocking(job));
-    } else {
-        drop(std::thread::spawn(job));
-    }
-    answer
-}
-
 /// The configured copy command, blank values dropped.
 ///
 /// A blank or whitespace-only `display.copy_command` is the one-input
@@ -13221,28 +10973,6 @@ fn copy_via_transports(
 /// successfully and count as a delivery that delivered nothing.
 fn configured_copy_command(custom: Option<&str>) -> Option<&str> {
     custom.filter(|command| !command.trim().is_empty())
-}
-
-/// Write the OSC 52 clipboard escape for `text`.
-///
-/// Both terminator spellings are written — BEL and ST — because a few
-/// terminals accept only one of them. The write is the only signal
-/// available from this side: acceptance by the receiving terminal is
-/// unknowable, so success here means the bytes left and nothing more.
-fn osc52_write(text: &str) -> bool {
-    use std::io::Write as _;
-
-    use base64::Engine as _;
-
-    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
-    let mut stdout = std::io::stdout();
-    stdout
-        .write_all(format!("\x1b]52;c;{encoded}\x07").as_bytes())
-        .is_ok()
-        && stdout
-            .write_all(format!("\x1b]52;c;{encoded}\x1b\\").as_bytes())
-            .is_ok()
-        && stdout.flush().is_ok()
 }
 
 /// Which host clipboard transports the environment makes possible.
@@ -13630,19 +11360,22 @@ fn cells_overlap(cell: usize, width: usize, start: usize, end: usize) -> bool {
     cell <= end && cell.saturating_add(width).saturating_sub(1) >= start
 }
 
-/// The graphemes of `flat` whose cells meet `start..=end`.
+/// The graphemes of `flat` whose painted cells meet `start..=end`.
 ///
-/// Walks by display cells and takes every grapheme cluster that
-/// overlaps the span — so the copied text matches the highlighted
-/// cells exactly. Clusters, not characters: a combining mark adds
-/// no cell of its own, so the selection's grid stays the one the
-/// renderer painted, and a selected base carries its marks.
+/// Walks the display projection — the same cells the pane painted
+/// for the reader to sweep — and takes every painted grapheme that
+/// overlaps the span, copying each through its raw source range so
+/// the clipboard reproduces the author's bytes (a covered selector
+/// cluster copies whole, a covered family copies its members and
+/// joiners). Clusters, not characters: a combining mark adds no cell
+/// of its own, and a selected base carries its marks.
 fn covered_chars(flat: &str, start: usize, end_inclusive: usize) -> String {
     let mut out = String::new();
     let mut cell = 0;
-    for cluster in flat.graphemes(true) {
-        let width = cluster.width();
-        if cells_overlap(cell, width, start, end_inclusive) {
+    for (range, width) in painted_steps(flat) {
+        if cells_overlap(cell, width, start, end_inclusive)
+            && let Some(cluster) = flat.get(range)
+        {
             out.push_str(cluster);
         }
         cell = cell.saturating_add(width);
@@ -13658,6 +11391,11 @@ fn covered_chars(flat: &str, start: usize, end_inclusive: usize) -> String {
 /// Splits the affected lines' spans at the selection's cell
 /// boundaries and flips exactly the covered characters, so the
 /// highlight is character-granular whatever the underlying styles.
+/// The walk runs on the display projection — the same cells the pane
+/// paints — and flips each covered grapheme through its raw source
+/// range, so the reversed ink lands on exactly the cells the reader
+/// swept and the strip that follows the highlight still receives the
+/// author's bytes.
 fn reverse_selection(lines: &mut [Line<'_>], skip: usize, selection: &CellSelection) {
     let (from, to) = ordered(selection);
     for (offset, line) in lines.iter_mut().enumerate() {
@@ -13676,8 +11414,10 @@ fn reverse_selection(lines: &mut [Line<'_>], skip: usize, selection: &CellSelect
         for span in line.spans.drain(..) {
             let content = span.content;
             let mut chunk = String::new();
-            for cluster in content.graphemes(true) {
-                let width = cluster.width();
+            for (range, width) in painted_steps(&content) {
+                let Some(cluster) = content.get(range) else {
+                    continue;
+                };
                 let selected = cells_overlap(cell, width, start, end);
                 if selected {
                     if !chunk.is_empty() {
@@ -13710,58 +11450,6 @@ fn reverse_selection(lines: &mut [Line<'_>], skip: usize, selection: &CellSelect
 /// panic left the lock poisoned.
 fn take_locked<T: Default>(mutex: &Mutex<T>) -> T {
     std::mem::take(&mut *mutex.lock().unwrap_or_else(PoisonError::into_inner))
-}
-/// Collect the viewport window across concatenated line segments.
-///
-/// The settled conversation renders from a cache that must survive the
-/// frame, so instead of concatenating and cloning every segment this
-/// walks them with the skip offset and clones only the lines the
-/// viewport actually shows — per-frame cost tracks the pane height,
-/// not the session length. The segments' borrow and their content are
-/// decoupled lifetimes: the caller may assemble the window from
-/// transient borrows of lines it keeps beyond them.
-fn visible_window<'a>(segments: &[&'a [Line<'a>]], skip: usize, height: usize) -> Vec<Line<'a>> {
-    let mut visible = Vec::with_capacity(height.min(64));
-    let mut skip = skip;
-    for segment in segments {
-        if skip >= segment.len() {
-            skip = skip.saturating_sub(segment.len());
-            continue;
-        }
-        let take = segment
-            .len()
-            .saturating_sub(skip)
-            .min(height.saturating_sub(visible.len()));
-        if let Some(window) = segment.get(skip..skip.saturating_add(take)) {
-            visible.extend(window.iter().cloned());
-        }
-        skip = 0;
-        if visible.len() >= height {
-            break;
-        }
-    }
-    visible
-}
-
-/// The welcome group's six rows: a filler above and below, the band,
-/// the notice, the rule, the composer box.
-///
-/// One split in one place — the arithmetic cannot drift between two
-/// copies of it.
-fn welcome_rows(area: Rect, band_height: u16, rule_row: u16, box_height: u16) -> Vec<Rect> {
-    let constraints = [
-        Constraint::Min(0),
-        Constraint::Length(band_height),
-        Constraint::Length(1),
-        Constraint::Length(rule_row),
-        Constraint::Length(box_height),
-        Constraint::Min(0),
-    ];
-    Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(constraints)
-        .split(area)
-        .to_vec()
 }
 
 /// Count a band's leading star-sky rows.
@@ -13971,8 +11659,9 @@ struct PermissionSheet {
     /// The command the ask would run, read from the raw call input —
     /// never from the prompt string.
     ///
-    /// Some only for shell calls; the overlay shows it verbatim so
-    /// the approval names the exact command line.
+    /// Some only for shell calls; the overlay shows it under the
+    /// display policy — the letters on the sheet are the command
+    /// line's own — so the approval names exactly what would run.
     command: Option<String>,
 
     /// The reason being typed, when the sheet's `r` press opened the
@@ -14001,14 +11690,14 @@ fn wrap_rows(text: &str, limit: usize) -> Vec<String> {
     let mut current = String::new();
     let mut current_width = 0usize;
     for word in text.split(' ') {
-        let word_width = word.width();
+        let word_width = str_width(word);
         if word_width > limit {
             if !current.is_empty() {
                 rows.push(std::mem::take(&mut current));
                 current_width = 0;
             }
             for grapheme in word.graphemes(true) {
-                let grapheme_width = grapheme.width();
+                let grapheme_width = str_width(grapheme);
                 if current_width.saturating_add(grapheme_width) > limit {
                     rows.push(std::mem::take(&mut current));
                     current_width = 0;
@@ -14051,11 +11740,11 @@ fn wrap_prompt_rows(text: &str, limit: usize, max_rows: usize) -> Vec<String> {
     if rows.len() > max_rows {
         rows.truncate(max_rows);
         if let Some(last) = rows.last_mut() {
-            let keep = last.width().saturating_sub(1);
+            let keep = str_width(last).saturating_sub(1);
             let mut trimmed = String::new();
             let mut kept = 0usize;
             for grapheme in last.graphemes(true) {
-                let grapheme_width = grapheme.width();
+                let grapheme_width = str_width(grapheme);
                 if kept.saturating_add(grapheme_width) > keep {
                     break;
                 }
@@ -14110,79 +11799,9 @@ fn bottom_sheet_rect(height: u16, area: Rect) -> Rect {
     }
 }
 
-/// Split the conversation pane into its text area and scrollbar
-/// gutter.
-///
-/// The gutter is one column off the right edge, reserved whether or
-/// not the document scrolls — wrapped text can never collide with
-/// the scrollbar, and the wrap width never churns when the document
-/// crosses the scrollability threshold. Returns the gutter as `None`
-/// only in the degenerate one-column pane, where the text keeps the
-/// full width and no scrollbar renders.
-fn split_scrollbar_gutter(area: Rect) -> (Rect, Option<Rect>) {
-    if area.width < 2 {
-        return (area, None);
-    }
-    let gutter = Rect {
-        x: area.right().saturating_sub(1),
-        width: 1,
-        ..area
-    };
-    let text = Rect {
-        width: area.width.saturating_sub(1),
-        ..area
-    };
-    (text, Some(gutter))
-}
-
 /// Columns of tinted breathing room at each end of the input field's
 /// text, inside the fill's edge.
 const INPUT_SIDE_INSET: u16 = 2;
-
-/// Blank columns a user turn's box keeps outside itself, between its
-/// edges and the pane's.
-///
-/// The prompt box is a raised surface floating on the terminal's own
-/// background, not a band pinned to the pane's edges: this much
-/// regular background shows on the box's left and right alike, with
-/// the scrollbar's gutter beyond. The chevron sits a column inside
-/// the box's left edge, this margin in from the pane's.
-const CONVERSATION_BOX_MARGIN: u16 = 1;
-
-/// Columns the conversation reserves at its left edge before its
-/// text starts.
-///
-/// The marker is chrome drawn into the gutter, never span content, so
-/// selections and copies walk only the text. The width covers the
-/// box's left margin, a pad column, the chevron, and the gap before
-/// the text.
-const CONVERSATION_MARK_GUTTER: u16 = 5;
-
-/// The narrowest conversation text that still carries the marker
-/// gutter beside it.
-///
-/// Below this the pane keeps its full width and draws no chevrons — a
-/// marker that starves the text is worse than no marker.
-const CONVERSATION_MARK_MIN_TEXT: u16 = 8;
-
-/// Blank rows the conversation keeps between the pane's top edge and
-/// its first line of text.
-///
-/// The transcript opens this far below the pane's edge — the same
-/// breathing-room convention the composer and the status bar use — so
-/// the topmost line never touches whatever sits above the pane. The
-/// scrollbar track starts below the inset too: the track measures the
-/// padded content window, not the raw pane.
-const CONVERSATION_TOP_INSET: u16 = 1;
-
-/// Blank columns a user turn's box keeps between its wrapped text and
-/// its right edge, inside the box.
-///
-/// Wrapped user lines stop this far short of the box's edge, the
-/// padding the prompt surface carries around its text; agent lines
-/// share the stop so every message column aligns, leaving the box's
-/// margin and the scrollbar's gutter blank beyond.
-const CONVERSATION_RIGHT_INSET: u16 = 3;
 
 /// Rows of text the input field shows at its largest.
 ///
@@ -14195,62 +11814,6 @@ const INPUT_TEXT_ROWS: u16 = 3;
 /// Blank tinted rows of breathing room above and below the field's
 /// text rows — the vertical half of the composer's inner padding.
 const INPUT_VERTICAL_PADDING: u16 = 1;
-
-/// The scrollbar thumb's track position and length for a document of
-/// `content` lines shown through a `viewport`-line window whose top
-/// line is `skip` lines into the document.
-///
-/// Exact integer proportion: the thumb covers the viewport's share
-/// of the track — never less than one cell, never more than the
-/// track — and sits where the viewport sits in the document, flush
-/// with the track's top at the document's start and its bottom at
-/// the end. Returns `None` when the document fits the viewport or
-/// the viewport has no rows: no thumb, and the caller leaves the
-/// gutter blank.
-fn scrollbar_geometry(content: usize, viewport: usize, skip: usize) -> Option<(usize, usize)> {
-    let scrollable = content.checked_sub(viewport)?;
-    let track = viewport;
-    if scrollable == 0 || track == 0 {
-        return None;
-    }
-    let thumb = track
-        .saturating_mul(viewport)
-        .checked_div(content)?
-        .clamp(1, track);
-    let reach = track.saturating_sub(thumb);
-    let position = skip
-        .min(scrollable)
-        .saturating_mul(reach)
-        .checked_div(scrollable)?;
-    Some((position, thumb))
-}
-
-/// Paint the scrollbar into its gutter as background fills: a
-/// bright thumb segment over a dim rail, both in the theme's
-/// scrollbar colors.
-///
-/// Background color is the only solid-fill primitive a terminal
-/// guarantees: it covers the whole cell rectangle regardless of
-/// font metrics, so consecutive rows join into one unbroken bar.
-/// Glyphs cannot do this — on terminals whose cell height exceeds
-/// the font's em, every glyph (blocks included) leaves a hairline
-/// gap between rows and a glyph column reads as stacked bars.
-fn render_scrollbar(
-    frame: &mut Frame,
-    gutter: Rect,
-    thumb_pos: usize,
-    thumb_len: usize,
-    thumb_color: ratatui::style::Color,
-    track_color: ratatui::style::Color,
-) {
-    for (row, y) in (gutter.y..gutter.bottom()).enumerate() {
-        let in_thumb = row >= thumb_pos && row < thumb_pos.saturating_add(thumb_len);
-        let color = if in_thumb { thumb_color } else { track_color };
-        frame.buffer_mut()[(gutter.x, y)]
-            .set_char(' ')
-            .set_bg(color);
-    }
-}
 
 /// How a non-blank line can continue a block across a blank line.
 ///
@@ -14565,14 +12128,14 @@ fn summary_preview_line(summary: &str, width: usize) -> Option<String> {
         .map(str::trim)
         .find(|line| !line.is_empty() && !line.starts_with("## "))?;
     let budget = width.saturating_sub(2).max(1);
-    if line.width() <= budget {
+    if display_width(line) <= budget {
         return Some(line.to_string());
     }
     let cell_budget = budget.saturating_sub(1);
     let mut used = 0usize;
     let mut kept = String::new();
     for glyph in line.chars() {
-        let span = glyph.width().unwrap_or(0);
+        let span = char_cells(glyph);
         if used.saturating_add(span) > cell_budget {
             break;
         }
@@ -15296,7 +12859,7 @@ pub(crate) fn plain_wrapped_lines_styled(
         let mut current = String::new();
         let mut current_width = 0;
         for ch in raw.chars() {
-            let ch_width = ch.width().unwrap_or(0);
+            let ch_width = char_cells(ch);
             if cap.saturating_sub(current_width) < ch_width && !current.is_empty() {
                 lines.push(Line::styled(std::mem::take(&mut current), style));
                 current_width = 0;
@@ -15349,22 +12912,35 @@ mod tests {
         // title push the model column sideways.
         let padded = fit_picker_title(Some("端末のセッション"));
         assert_eq!(
-            padded.width(),
+            str_width(&padded),
             24,
             "a wide-script title pads to the column's cell width: {padded:?}"
         );
         let over_long = "題".repeat(40);
         let capped = fit_picker_title(Some(&over_long));
         assert!(
-            capped.width() <= 24,
+            str_width(&capped) <= 24,
             "the cap is a cell budget, never a character count: {capped:?}"
         );
         assert!(
             capped.ends_with('…'),
             "the cap keeps its head visible: {capped:?}"
         );
+        let joined = format!(
+            "前\u{2714}\u{fe0f}\u{1f468}\u{200d}\u{1f469}{}",
+            "題".repeat(30)
+        );
+        let policy_capped = fit_picker_title(Some(&joined));
+        assert!(
+            str_width(&policy_capped) <= 24,
+            "a joiner cluster spends what it paints: {policy_capped:?}"
+        );
+        assert!(
+            !policy_capped.contains('\u{fe0f}') && !policy_capped.contains('\u{200d}'),
+            "the title carries the display policy before either measure: {policy_capped:?}"
+        );
         assert_eq!(
-            fit_picker_title(None).width(),
+            str_width(&fit_picker_title(None)),
             24,
             "the untitled dash pads to the same column edge"
         );
@@ -15736,6 +13312,404 @@ mod tests {
     }
 
     #[test]
+    fn a_selector_cluster_reaches_the_screen_stripped_and_the_copy_source_whole() {
+        // The screen and the shared width table must agree: a
+        // selector-bearing cluster strips before display, so the cell
+        // after the glyph receives the letter the wrap laid beside it —
+        // the letter the pre-fix disagreement starved — while the
+        // cached line a copy reads keeps the selector the author
+        // wrote.
+        let mut subject = TuiApp::new(dch_config::DchConfig::default());
+        subject.push_message(TuiMessage::Assistant {
+            blocks: vec![ContentBlock::Text {
+                text: "done \u{2714}\u{fe0f} shipped".to_string(),
+            }],
+            timestamp: chrono::Utc::now(),
+            duration_ms: Some(10),
+        });
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| subject.render(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered: String = buffer
+            .content
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(
+            !rendered.contains('\u{fe0f}'),
+            "the selector never reaches the screen"
+        );
+        let glyph = buffer
+            .content
+            .iter()
+            .position(|cell| cell.symbol() == "\u{2714}")
+            .expect("the check glyph renders on its own cell");
+        assert_eq!(
+            glyph
+                .checked_add(1)
+                .and_then(|next| buffer.content.get(next))
+                .map(ratatui::buffer::Cell::symbol),
+            Some(" "),
+            "the cluster's measured second cell is a written pad, never elided"
+        );
+        assert_eq!(
+            glyph
+                .checked_add(2)
+                .and_then(|next| buffer.content.get(next))
+                .map(ratatui::buffer::Cell::symbol),
+            Some("s"),
+            "the letter beside the cluster lands at the column the model laid it"
+        );
+        let cached: String = subject
+            .conversation_cache
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.to_string())
+            .collect();
+        assert!(
+            cached.contains('\u{fe0f}'),
+            "the copy source keeps the selector the author wrote"
+        );
+    }
+
+    #[test]
+    fn no_rendered_cell_carries_a_composition_input_or_a_split_measure() {
+        // The incident pin: a streamed reply full of every cluster
+        // class the screen cannot size — the joined family that
+        // leaked beside its row, a selector cluster, a skin-tone
+        // compound, a keycap, a flag pair, a tagged flag — renders
+        // with nothing left to compose and no cell whose whole-string
+        // width disagrees with its per-character sum. Those two
+        // properties together are the no-leak contract: ratatui's
+        // diff skip measures the whole string, a terminal advances by
+        // its own measure, and no surviving grapheme lets the two
+        // diverge.
+        let vectors = concat!(
+            "family \u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467} rests; ",
+            "check \u{2714}\u{fe0f} done; ",
+            "tone \u{1f44d}\u{1f3fd} ships; ",
+            "key 1\u{fe0f}\u{20e3} holds; ",
+            "flag \u{1f1f3}\u{1f1f4} flies; ",
+            "tagged \u{1f3f3}\u{fe0f}\u{200d}\u{26a7}\u{fe0f}\u{e0074}\u{e0067} too"
+        );
+        let mut subject = TuiApp::new(dch_config::DchConfig::default());
+        subject.push_message(TuiMessage::Assistant {
+            blocks: vec![ContentBlock::Text {
+                text: vectors.to_string(),
+            }],
+            timestamp: chrono::Utc::now(),
+            duration_ms: Some(10),
+        });
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| subject.render(frame)).unwrap();
+        for cell in terminal.backend().buffer().content.clone() {
+            let symbol = cell.symbol();
+            let carries_input = symbol
+                .chars()
+                .any(|ch| matches!(ch, '\u{fe0f}' | '\u{fe0e}' | '\u{200d}' | '\u{20e3}' | '\u{1f3fb}'..='\u{1f3ff}' | '\u{e0020}'..='\u{e007f}'));
+            assert!(
+                !carries_input,
+                "the composition input {symbol:?} reached the screen"
+            );
+            assert_eq!(
+                str_width(symbol),
+                symbol.chars().map(char_cells).sum::<usize>(),
+                "the cell {symbol:?} splits the whole and summed measures"
+            );
+        }
+        let cached: String = subject
+            .conversation_cache
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.to_string())
+            .collect();
+        assert!(
+            cached.contains('\u{200d}') && cached.contains('\u{fe0f}'),
+            "the copy source keeps the family and the selector the author wrote"
+        );
+    }
+
+    #[test]
+    fn a_row_painted_wider_than_its_raw_score_keeps_its_tail() {
+        // The family's raw cluster scores two cells, its stripped
+        // render spends six, and a wrap that budgeted by the raw
+        // score let the row paint past its column — the tail's
+        // letters clipped off the pane. The wrap gates by the
+        // post-policy width now, so the same text breaks onto the
+        // next row and every letter lands.
+        let text =
+            "alpha beta \u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}tail wording now".to_string();
+        let mut subject = app();
+        subject.push_message(TuiMessage::Assistant {
+            blocks: vec![ContentBlock::Text { text }],
+            timestamp: chrono::Utc::now(),
+            duration_ms: Some(10),
+        });
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 24)).unwrap();
+        terminal.draw(|frame| subject.render(frame)).unwrap();
+        let screen = buffer_text(terminal.backend().buffer());
+        assert!(
+            screen.contains("tail") && screen.contains("now"),
+            "the row's tail survives the family's painted width: {screen:?}"
+        );
+    }
+
+    #[test]
+    fn a_compaction_preview_budgets_by_the_painted_width() {
+        // The preview's gate once measured the raw cluster (two
+        // cells) and passed a line that paints at eight; it now
+        // truncates under the same budget, so the collapsed notice
+        // never renders wider than the pane it sits in.
+        let summary =
+            "## Kept\n\nkept \u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467} decisions follow"
+                .to_string();
+        let preview = summary_preview_line(&summary, 28).expect("a content line exists");
+        assert!(
+            preview.ends_with('…'),
+            "the over-budget line truncates: {preview:?}"
+        );
+        assert!(
+            display_width(&preview) <= 26,
+            "the preview fits the budget it paints against: {}",
+            display_width(&preview)
+        );
+    }
+
+    #[test]
+    fn a_drag_across_a_selector_cluster_copies_exactly_the_swept_cells() {
+        // On "done ✔️ shipped" the check paints one cell at column 5, so
+        // a sweep of columns 5..=8 covers "✔ sh" — and the copy is
+        // exactly those characters, the cluster's raw bytes whole.
+        // The raw walk this replaces scored the cluster two cells and
+        // copied one character further ("✔️ s").
+        let flat = "done \u{2714}\u{fe0f} shipped";
+        assert_eq!(covered_chars(flat, 5, 8), "\u{2714}\u{fe0f} sh");
+    }
+
+    #[test]
+    fn a_drag_past_a_family_copies_the_swept_characters_not_four_further() {
+        // A family paints six cells (three members at two each); the
+        // raw walk scored it two, so every sweep right of it copied
+        // four characters further than the ink the reader covered.
+        let flat = "xx \u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467} yy";
+        assert_eq!(covered_chars(flat, 9, 11), " yy");
+        assert_eq!(
+            covered_chars(flat, 3, 8),
+            "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}",
+            "a sweep over the family copies its members and joiners whole"
+        );
+    }
+
+    #[test]
+    fn the_flipped_highlight_covers_exactly_the_swept_cells() {
+        // reverse_selection walks the same projection the copy walks:
+        // the reversed ink spans exactly the swept columns — four
+        // cells for a four-cell sweep — whatever the raw bytes
+        // underneath measure.
+        let mut lines = vec![Line::from("done \u{2714}\u{fe0f} shipped")];
+        reverse_selection(
+            &mut lines,
+            0,
+            &CellSelection {
+                anchor: CellPos { line: 0, col: 5 },
+                head: CellPos { line: 0, col: 8 },
+            },
+        );
+        let line = lines.first().expect("the fixture line survives the flip");
+        let flipped: Vec<&ratatui::text::Span<'_>> = line
+            .spans
+            .iter()
+            .filter(|span| {
+                span.style
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::REVERSED)
+            })
+            .collect();
+        let ink: String = flipped
+            .iter()
+            .map(|span| span.content.to_string())
+            .collect();
+        assert_eq!(ink, "\u{2714}\u{fe0f} sh");
+        let cells: usize = flipped
+            .iter()
+            .map(|span| display_width(span.content.as_ref()))
+            .sum();
+        assert_eq!(
+            cells, 4,
+            "the flipped ink paints the four swept cells and no more"
+        );
+    }
+
+    #[test]
+    fn the_keyboard_walk_bounds_by_the_painted_width() {
+        // Left and Right clamp at the row's painted width — twelve
+        // cells for a family row the raw clusters score at eight —
+        // so the walk never runs past the letters on screen.
+        let mut subject = app();
+        subject.push_message(TuiMessage::Assistant {
+            blocks: vec![ContentBlock::Text {
+                text: "xx \u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467} yy".to_string(),
+            }],
+            timestamp: chrono::Utc::now(),
+            duration_ms: Some(10),
+        });
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| subject.render(frame)).unwrap();
+        assert_eq!(
+            subject.line_width(0),
+            Some(12),
+            "the walk bounds by the twelve painted cells, not the eight raw ones"
+        );
+    }
+
+    #[test]
+    fn chrome_rows_paint_the_stripped_projection() {
+        // The round-4 surfaces: the notice row (a user-typed theme
+        // argument rides it), the place row (the working directory),
+        // and the welcome screen's notice and directory caption —
+        // every chrome row that embeds outside text now paints the
+        // display projection, so no composition input reaches the
+        // screen outside the composer and the question draft, the
+        // two documented raw surfaces. The first draw catches the
+        // welcome's rows, the second the standing furniture once a
+        // message retires the welcome.
+        let mut subject = app();
+        let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+        subject.post_notice(format!("unknown theme 'x{family}'"));
+        subject.working_dir = Some(format!("/home/dch/{family}-labs"));
+        subject.git_branch = None;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| subject.render(frame)).unwrap();
+        for cell in terminal.backend().buffer().content.clone() {
+            let symbol = cell.symbol();
+            let carries_input = symbol.chars().any(|ch| {
+                matches!(
+                    ch,
+                    '\u{fe0f}' | '\u{fe0e}'
+                        | '\u{200d}'
+                        | '\u{20e3}'
+                        | '\u{1f3fb}'..='\u{1f3ff}'
+                        | '\u{e0020}'..='\u{e007f}'
+                )
+            });
+            assert!(
+                !carries_input,
+                "the composition input {symbol:?} reached a welcome chrome row"
+            );
+        }
+        subject.push_message(TuiMessage::Assistant {
+            blocks: vec![ContentBlock::Text {
+                text: "hello".to_string(),
+            }],
+            timestamp: chrono::Utc::now(),
+            duration_ms: Some(10),
+        });
+        terminal.draw(|frame| subject.render(frame)).unwrap();
+        for cell in terminal.backend().buffer().content.clone() {
+            let symbol = cell.symbol();
+            let carries_input = symbol.chars().any(|ch| {
+                matches!(
+                    ch,
+                    '\u{fe0f}' | '\u{fe0e}'
+                        | '\u{200d}'
+                        | '\u{20e3}'
+                        | '\u{1f3fb}'..='\u{1f3ff}'
+                        | '\u{e0020}'..='\u{e007f}'
+                )
+            });
+            assert!(
+                !carries_input,
+                "the composition input {symbol:?} reached a standing chrome row"
+            );
+        }
+        let screen = buffer_text(terminal.backend().buffer());
+        assert!(
+            screen.contains('\u{1f468}'),
+            "the notice's family paints stripped, not vanished: {screen:?}"
+        );
+    }
+
+    #[test]
+    fn the_identity_row_picker_and_completion_paint_the_stripped_projection() {
+        // Round 5's three surfaces on one welcome draw: the composer
+        // identity row (a free-form config model rides it), the
+        // session picker's model column, and the completion popup's
+        // candidate values. All paint the projection; the picker's
+        // wide columns also pad by cells, so a CJK workdir stops its
+        // pad at its own painted width and the row's trailing
+        // columns stay on their grid.
+        let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+        let mut config = dch_config::DchConfig::default();
+        config.api.model = family.to_string();
+        let mut subject = TuiApp::new(config);
+        // A standing frame, not the welcome: the splash box bounds
+        // the popup at the art's width there, and the honest row
+        // clips at that bound whatever the pad discipline — here the
+        // composer spans the pane and the row fits whole.
+        subject.push_message(TuiMessage::Assistant {
+            blocks: vec![ContentBlock::Text {
+                text: "hello".to_string(),
+            }],
+            timestamp: chrono::Utc::now(),
+            duration_ms: Some(10),
+        });
+        subject.apply_session_update(SessionUpdate::SessionCatalog {
+            rows: vec![SessionPick {
+                id: "11111111-1111-1111-1111-111111111111".to_string(),
+                model: family.to_string(),
+                saved_at: chrono::Utc::now(),
+                prompts: 3,
+                title: None,
+                workdir: Some(format!("/x/{}", "长".repeat(10))),
+            }],
+        });
+        subject.completion = Some(CompletionCycle {
+            prefix: "/model ".to_string(),
+            candidates: vec![family.to_string()],
+            index: 0,
+            bare: true,
+            window_start: 0,
+        });
+        // A 120-column pane: the picker's widest honest row (24-cell
+        // title, 20-cell dir, 12-cell model) fits whole; at 80 the
+        // row clips at the pane regardless of the pad discipline.
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+        terminal.draw(|frame| subject.render(frame)).unwrap();
+        for cell in terminal.backend().buffer().content.clone() {
+            let symbol = cell.symbol();
+            let carries_input = symbol.chars().any(|ch| {
+                matches!(
+                    ch,
+                    '\u{fe0f}' | '\u{fe0e}'
+                        | '\u{200d}'
+                        | '\u{20e3}'
+                        | '\u{1f3fb}'..='\u{1f3ff}'
+                        | '\u{e0020}'..='\u{e007f}'
+                )
+            });
+            assert!(
+                !carries_input,
+                "the composition input {symbol:?} reached the identity, picker, or completion rows"
+            );
+        }
+        let screen = buffer_text(terminal.backend().buffer());
+        assert!(
+            screen.contains('\u{1f468}'),
+            "the family's members paint stripped, not vanished: {screen:?}"
+        );
+        assert!(
+            screen.contains("3p"),
+            "the picker's trailing columns stay on the grid: {screen:?}"
+        );
+    }
+
+    #[test]
     fn the_incremental_bake_matches_a_full_rebuild() {
         // The optimization may not change what the reader sees: the
         // incrementally baked cache and a from-scratch rebuild of the
@@ -15886,6 +13860,48 @@ mod tests {
             subject.queued_display_len(),
             1,
             "genuinely waiting rows show under the title"
+        );
+    }
+
+    #[test]
+    fn a_family_bearing_queued_prompt_reserves_the_rows_it_paints() {
+        // The height fn once wrapped the raw prompt (the family
+        // scoring two cells) while the painter
+        // wrapped the stripped one (six), so the section reserved
+        // fewer rows than it painted and the wording truncated
+        // behind the queue's ellipsis. Both wrap the same projection
+        // now, and the reserved height is exactly the rows the paint
+        // spends plus the section's furniture.
+        let mut subject = app();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        subject.submit_tx = Some(tx);
+        subject.submit_text("first".to_string());
+        subject
+            .remove_queued(0)
+            .expect("the first push is the driver's claim");
+        subject.settle_handed();
+        subject
+            .state
+            .live_claim
+            .store(7, std::sync::atomic::Ordering::SeqCst);
+        let width = 60u16;
+        let prefix = queue_prompt_prefix(1, 0);
+        let limit = usize::from(width).saturating_sub(str_width(&prefix)).max(1);
+        let cap = usize::from(QUEUE_ROWS).saturating_sub(3);
+        // Sized against the computed limit: the raw text fits one
+        // row, the stripped render needs two.
+        let filler = "a".repeat(limit.saturating_sub(3));
+        let prompt = format!("{filler} \u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}");
+        subject.submit_text(prompt.clone());
+        let painted = wrap_prompt_rows(&for_display(&prompt), limit, cap).len();
+        assert_eq!(
+            painted, 2,
+            "the fixture genuinely crosses a row boundary only after the strip"
+        );
+        assert_eq!(
+            usize::from(subject.queue_section_height(width)),
+            painted.saturating_add(3),
+            "the section reserves exactly the rows it paints"
         );
     }
 
@@ -16314,63 +14330,6 @@ mod tests {
             expanded.contains("16686 → 4231 tokens"),
             "the click rebakes the notice's rows — a mid-conversation \
              expansion cannot ride the tail re-render: {expanded}"
-        );
-    }
-
-    #[test]
-    fn scrollbar_geometry_is_hidden_when_the_document_fits() {
-        assert_eq!(
-            scrollbar_geometry(10, 10, 0),
-            None,
-            "exactly full: no thumb"
-        );
-        assert_eq!(
-            scrollbar_geometry(9, 10, 0),
-            None,
-            "shorter than the viewport: none"
-        );
-    }
-
-    #[test]
-    fn scrollbar_geometry_pins_flush_at_both_ends() {
-        assert_eq!(
-            scrollbar_geometry(100, 10, 0),
-            Some((0, 1)),
-            "at the document's start the thumb is flush with the track's top"
-        );
-        assert_eq!(
-            scrollbar_geometry(100, 10, 90),
-            Some((9, 1)),
-            "at its end the thumb is flush with the track's bottom"
-        );
-    }
-
-    #[test]
-    fn scrollbar_geometry_sizes_the_thumb_proportionally() {
-        assert_eq!(
-            scrollbar_geometry(20, 10, 0),
-            Some((0, 5)),
-            "a document twice the viewport gives the thumb half the track"
-        );
-        assert_eq!(
-            scrollbar_geometry(11, 10, 1),
-            Some((1, 9)),
-            "one scrollable line gives a near-full thumb at the far end"
-        );
-        let (mid_pos, thumb) = scrollbar_geometry(100, 10, 45).expect("scrollable");
-        assert_eq!(
-            (mid_pos, thumb),
-            (4, 1),
-            "the midpoint sits at the track's middle"
-        );
-    }
-
-    #[test]
-    fn scrollbar_geometry_clamps_an_out_of_range_skip() {
-        assert_eq!(
-            scrollbar_geometry(100, 10, 999),
-            scrollbar_geometry(100, 10, 90),
-            "a skip past the end reports the end, never past the track"
         );
     }
 
@@ -17994,10 +15953,10 @@ mod tests {
         let summary = format!("## Conversation summary (compacted)\n{}", "題".repeat(40));
         let preview = summary_preview_line(&summary, 78).expect("a content line");
         assert!(
-            preview.width() <= 78,
+            str_width(&preview) <= 78,
             "the preview fits the pane's cells, a wide glyph spending \
              two: {} cells",
-            preview.width()
+            str_width(&preview)
         );
         assert!(
             preview.ends_with('…'),

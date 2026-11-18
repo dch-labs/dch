@@ -169,6 +169,12 @@ fn find<'a>(pkgs: &'a [Package], name: &str) -> Option<&'a Package> {
 /// the unit tests, so a rule's verdict is pinned without a misbehaving
 /// manifest or a `cargo metadata` invocation.
 pub struct Checker<'a> {
+    /// The resolved packages the rules inspect, borrowed for the
+    /// checker's lifetime.
+    ///
+    /// The rules select from this slice by name, so it is the whole
+    /// graph rather than a caller-filtered subset — no rule can be
+    /// handed a slice that hides its own subject.
     pkgs: &'a [Package],
 }
 
@@ -181,7 +187,7 @@ impl<'a> Checker<'a> {
         Self { pkgs }
     }
 
-    /// Run all six rules, collecting every violation.
+    /// Run the six manifest rules, collecting every violation.
     ///
     /// The rules are independent, so one pass reports every boundary
     /// problem in the manifest rather than stopping at the first; an
@@ -405,6 +411,51 @@ impl<'a> Checker<'a> {
     }
 }
 
+/// Rule 6: the `unicode_width` table has exactly one home.
+///
+/// Every width decision in the workspace routes through the cells
+/// oracle (`dch-tui/src/markdown/cells.rs`), which rides the same
+/// `unicode-width` version ratatui renders and diffs with. A second
+/// importer reintroduces the class of bug the oracle exists to close
+/// — two tables measuring the same text — so the rule reads every
+/// workspace source file and reports any but the oracle (and this
+/// rule's own matcher, which must spell the name to match it) that
+/// names the crate. The matcher keys on the underscore spelling in
+/// its import shapes — `use unicode_width` and the `unicode_width::`
+/// path — so an identifier like a manifest-pinning test's
+/// `saw_unicode_width` flag, or its hyphenated strings, cannot trip
+/// it.
+fn rule_unicode_width_one_home(files: &[(String, String)]) -> Vec<Violation> {
+    /// The one importer the rule exempts, as the workspace walk
+    /// spells it.
+    ///
+    /// Root-relative because [`workspace_sources`] yields paths
+    /// against the workspace root — an unqualified `dch-tui/...`
+    /// would never match and the rule would flag the oracle itself.
+    const ORACLE: &str = "crates/dch-tui/src/markdown/cells.rs";
+    /// The rule's own source, as the workspace walk spells it.
+    ///
+    /// The matcher must name the crate to recognize its import
+    /// shapes, and the tests that pin the matcher carry the same
+    /// strings — this file is the rule, not an importer, so it reads
+    /// itself without violation.
+    const ENFORCER: &str = "xtask/src/boundary.rs";
+    files
+        .iter()
+        .filter(|(path, content)| {
+            path != ORACLE
+                && path != ENFORCER
+                && (content.contains("unicode_width::") || content.contains("use unicode_width"))
+        })
+        .map(|(path, _)| Violation {
+            crate_name: path.clone(),
+            detail: "unicode_width may be imported only by dch-tui/src/markdown/cells.rs \
+                     (the cells oracle) — route width math through dch_tui::cells"
+                .to_string(),
+        })
+        .collect()
+}
+
 /// The part of the `cargo metadata` document this check reads.
 ///
 /// Declaring only these fields keeps an unrelated metadata format change
@@ -412,8 +463,22 @@ impl<'a> Checker<'a> {
 /// without.
 #[derive(Debug, serde::Deserialize)]
 struct MetadataDoc {
+    /// Every package the resolved graph carries, workspace members
+    /// and fetched externals alike.
+    ///
+    /// The rules select from this list by name, so the document is
+    /// taken whole rather than pre-filtered — rule 5 must see every
+    /// package to judge where each resolves from.
     packages: Vec<MetadataPackage>,
+
+    /// The `cargo metadata` ids of the packages this workspace owns.
+    ///
+    /// Ids, not names: the id encodes the source a package resolved
+    /// from, so membership is a direct comparison against each
+    /// package's own id rather than a name lookup two versions of one
+    /// crate could confuse.
     workspace_members: Vec<String>,
+
     /// The absolute path of the workspace root `cargo metadata`
     /// resolved.
     ///
@@ -423,15 +488,29 @@ struct MetadataDoc {
     workspace_root: String,
 }
 
+/// One package as `cargo metadata` reports it, narrowed to the
+/// fields the rule view reads.
+///
+/// The raw document's per-package truth: identity, source, manifest
+/// location, and the declared edges — the [`Package`] view is built
+/// from these by [`packages_from_metadata`], which is where the
+/// non-shipping dependency kinds drop.
 #[derive(Debug, serde::Deserialize)]
 struct MetadataPackage {
+    /// The crate name, spelled as its manifest spells it.
+    ///
+    /// The same field the [`Package`] view carries:
+    /// every rule addresses packages by name, and the manifest's own
+    /// spelling is the address the rules' name tables share.
     name: String,
+
     /// The `cargo metadata` id of this package.
     ///
     /// The membership list the same document carries is expressed in
     /// this form, so deciding whether a package belongs to the
     /// workspace is a direct id comparison.
     id: String,
+
     /// Where the package is fetched from, when it is fetched at all.
     ///
     /// `cargo metadata` reports `null` for a crate read off the local
@@ -439,13 +518,41 @@ struct MetadataPackage {
     /// and a foreign path dependency from a published crate.
     #[serde(default)]
     source: Option<String>,
+
+    /// The package's manifest path, as `cargo metadata` reports it.
+    ///
+    /// The workspace-source walk locates each member's root from it,
+    /// so the rule reads members wherever the manifest names them
+    /// rather than where a walker guesses they live.
+    #[serde(default)]
+    manifest_path: String,
+
+    /// The dependency edges this package declares, each with its
+    /// kind.
+    ///
+    /// `cargo metadata` lists dev- and build-dependencies beside the
+    /// runtime ones here; the view-building step is where the
+    /// non-shipping kinds drop, so this struct carries the document's
+    /// truth and the filtering lives in the one place that builds the
+    /// rule-facing view.
     #[serde(default)]
     dependencies: Vec<MetadataDep>,
 }
 
+/// One declared dependency edge as `cargo metadata` reports it.
+///
+/// The narrowed half of [`MetadataPackage`]: the target's name and
+/// the edge's kind, because every rule reads dependencies as names
+/// and only ever asks which of them ship in a built binary.
 #[derive(Debug, serde::Deserialize)]
 struct MetadataDep {
+    /// The dependency target's crate name, as its manifest spells it.
+    ///
+    /// Names, not ids or paths: the rules' allowed-set tables are name
+    /// tables, so an edge must arrive in the same vocabulary the rules
+    /// compare against.
     name: String,
+
     /// The dependency kind, `None` for a runtime dependency.
     ///
     /// `"dev"` and `"build"` mark edges that do not ship; they are
@@ -455,8 +562,15 @@ struct MetadataDep {
     kind: Option<String>,
 }
 
-/// Converts the parsed `cargo metadata` document into the [`Package`] view the
-/// [`Checker`] consumes, dropping dev- and build-dependencies.
+/// Converts the parsed `cargo metadata` document into the [`Package`]
+/// view the [`Checker`] consumes, dropping dev- and
+/// build-dependencies.
+///
+/// The view is the whole rule surface: names, runtime edges, source,
+/// and membership — everything the six manifest rules read — while
+/// the dev- and build-only edges a document also carries never ship
+/// in a built binary and are dropped here so no rule can count them
+/// as a coupling.
 fn packages_from_metadata(doc: MetadataDoc) -> Vec<Package> {
     let MetadataDoc {
         packages,
@@ -516,15 +630,19 @@ pub fn run_check() -> ExitCode {
     // The bridge config lives at the workspace root; `cargo
     // metadata` names that root whatever directory the check was
     // launched from, so the read cannot land on a member's config.
-    let config_path = std::path::Path::new(&doc.workspace_root).join(".cargo/config.toml");
+    let workspace_root = std::path::PathBuf::from(doc.workspace_root.clone());
+    let roots = member_roots(&doc);
+    let config_path = workspace_root.join(".cargo/config.toml");
     let pkgs = packages_from_metadata(doc);
     let bridge = local_bridge_declared(&config_path);
     let checker = Checker::new(&pkgs);
-    let violations = if bridge {
+    let mut violations = if bridge {
         checker.check_with_local_bridge(true)
     } else {
         checker.check()
     };
+    let sources = workspace_sources(&roots, &workspace_root);
+    violations.extend(rule_unicode_width_one_home(&sources));
 
     if bridge {
         for pkg in pkgs
@@ -541,7 +659,7 @@ pub fn run_check() -> ExitCode {
         }
     }
     if violations.is_empty() {
-        println!("xtask: boundary check passed (6 rules, 0 violations)");
+        println!("xtask: boundary check passed (7 rules, 0 violations)");
         ExitCode::SUCCESS
     } else {
         eprintln!(
@@ -553,6 +671,58 @@ pub fn run_check() -> ExitCode {
         }
         ExitCode::FAILURE
     }
+}
+
+/// Every workspace member's source root, as `cargo metadata` names it.
+///
+/// One root per member — `crates/*` and `xtask` alike — taken from
+/// each member's manifest path, so the walk reads members wherever
+/// the manifest says they live and no member's sources sit outside
+/// the rule's reach by layout.
+fn member_roots(doc: &MetadataDoc) -> Vec<std::path::PathBuf> {
+    doc.packages
+        .iter()
+        .filter(|pkg| doc.workspace_members.contains(&pkg.id))
+        .filter_map(|pkg| {
+            std::path::Path::new(&pkg.manifest_path)
+                .parent()
+                .map(std::path::Path::to_path_buf)
+        })
+        .collect()
+}
+
+/// Every workspace source file as `(relative path, content)`.
+///
+/// Walks the member roots [`member_roots`] finds under the workspace
+/// root `cargo metadata` itself resolved — the same root the bridge
+/// config is located from, so the walk cannot land on a member's
+/// checkout neighbor — collecting `.rs` files with paths relative to
+/// that root. Unreadable files are skipped: a file this process
+/// cannot read is not evidence of a boundary breach, and the compiler
+/// is the authority on those anyway.
+fn workspace_sources(
+    roots: &[std::path::PathBuf],
+    workspace_root: &std::path::Path,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut stack: Vec<std::path::PathBuf> = roots.to_vec();
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs")
+                && let Ok(content) = std::fs::read_to_string(&path)
+                && let Ok(relative) = path.strip_prefix(workspace_root)
+            {
+                out.push((relative.to_string_lossy().into_owned(), content));
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -609,7 +779,10 @@ mod tests {
             .collect()
     }
 
-    /// A workspace that satisfies all five rules.
+    /// A workspace that satisfies every manifest rule.
+    ///
+    /// The fixture every negative test mutates one package of — the
+    /// whole-graph rules pass it untouched.
     fn good_workspace() -> Vec<Package> {
         vec![
             pkg(
@@ -943,6 +1116,116 @@ mod tests {
             declared, enforced,
             "the binary's manifest and the boundary rules must name one \
              dch-* dependency set"
+        );
+    }
+
+    #[test]
+    fn the_cells_oracle_is_the_one_unicode_width_home() {
+        // The oracle imports the table; every other file routes
+        // through it. A manifest-pinning test's identifier and
+        // hyphenated strings are not imports and must not trip the
+        // matcher.
+        let clean = vec![
+            (
+                "crates/dch-tui/src/markdown/cells.rs".to_string(),
+                "use unicode_width::UnicodeWidthStr;".to_string(),
+            ),
+            (
+                "xtask/src/boundary.rs".to_string(),
+                "content.contains(\"unicode_width::\")".to_string(),
+            ),
+            (
+                "dch-tui/src/app.rs".to_string(),
+                "use crate::cells::{char_cells, str_width};".to_string(),
+            ),
+            (
+                "dch-tui/tests/extraction_seam.rs".to_string(),
+                "let saw_unicode_width = false;\nassert!(saw_unicode_width, \"unicode-width is a plain dependency\");"
+                    .to_string(),
+            ),
+        ];
+        assert!(
+            rule_unicode_width_one_home(&clean).is_empty(),
+            "the oracle alone may name the crate"
+        );
+        let mut stray = clean;
+        stray.push((
+            "dch/src/resume.rs".to_string(),
+            "use unicode_width::UnicodeWidthStr as _;".to_string(),
+        ));
+        let violations = rule_unicode_width_one_home(&stray);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.crate_name == "dch/src/resume.rs"),
+            "a second importer is reported by file: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn member_roots_name_every_member_wherever_the_manifest_lives() {
+        let doc = MetadataDoc {
+            packages: vec![
+                MetadataPackage {
+                    name: "dch-tui".to_string(),
+                    id: "a".to_string(),
+                    source: None,
+                    manifest_path: "/ws/crates/dch-tui/Cargo.toml".to_string(),
+                    dependencies: Vec::new(),
+                },
+                MetadataPackage {
+                    name: "xtask".to_string(),
+                    id: "b".to_string(),
+                    source: None,
+                    manifest_path: "/ws/xtask/Cargo.toml".to_string(),
+                    dependencies: Vec::new(),
+                },
+                MetadataPackage {
+                    name: "ratatui".to_string(),
+                    id: "c".to_string(),
+                    source: Some("registry+https://github.com".to_string()),
+                    manifest_path: "/cargo/registry/ratatui/Cargo.toml".to_string(),
+                    dependencies: Vec::new(),
+                },
+            ],
+            workspace_members: vec!["a".to_string(), "b".to_string()],
+            workspace_root: "/ws".to_string(),
+        };
+        assert_eq!(
+            member_roots(&doc),
+            vec![
+                std::path::PathBuf::from("/ws/crates/dch-tui"),
+                std::path::PathBuf::from("/ws/xtask"),
+            ],
+            "members only — a registry package's checkout is not the workspace's"
+        );
+    }
+
+    #[test]
+    fn workspace_sources_walks_every_member_root_and_nothing_else() {
+        let tmp = tempfile::tempdir().expect("a tempdir");
+        let root = tmp.path();
+        let member_a = root.join("crates/one");
+        let member_x = root.join("xtask");
+        std::fs::create_dir_all(member_a.join("src")).expect("member dirs");
+        std::fs::create_dir_all(member_x.join("src")).expect("member dirs");
+        std::fs::create_dir_all(root.join("elsewhere")).expect("a stray dir");
+        std::fs::write(member_a.join("src/lib.rs"), "fn main() {}").expect("a source");
+        std::fs::write(member_x.join("src/main.rs"), "fn main() {}").expect("a source");
+        std::fs::write(root.join("elsewhere/stray.rs"), "fn main() {}").expect("a source");
+        let sources = workspace_sources(&[member_a, member_x], root);
+        let paths: Vec<&str> = sources.iter().map(|(path, _)| path.as_str()).collect();
+        assert!(
+            paths.contains(&"crates/one/src/lib.rs"),
+            "the crates member's sources are read: {paths:?}"
+        );
+        assert!(
+            paths.contains(&"xtask/src/main.rs"),
+            "the xtask member's sources are read: {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|path| path.contains("elsewhere")),
+            "a directory no member owns sits outside the walk: {paths:?}"
         );
     }
 }

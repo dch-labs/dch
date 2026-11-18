@@ -7,10 +7,10 @@
 //! function is a mapping from records to lines and back to nothing
 //! else.
 
+use crate::cells::{char_cells, display_width, str_width};
 use dch_config::Verbosity;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use unicode_width::{UnicodeWidthChar as _, UnicodeWidthStr as _};
 
 use crate::ToolResultDisplay;
 use crate::message::ActiveTool;
@@ -109,7 +109,7 @@ pub fn display_input(name: &str, input: &serde_json::Value) -> String {
         "MultiEdit" => match edit_count(&compact) {
             Some(count) => {
                 let suffix = format!(" ({count} edits)");
-                let budget = SUMMARY_WIDTH.saturating_sub(suffix.width());
+                let budget = SUMMARY_WIDTH.saturating_sub(str_width(&suffix));
                 format!("{}{suffix}", truncate_width(&value, budget))
             }
             None => value,
@@ -253,13 +253,13 @@ fn todo_count(input: &str) -> Option<String> {
 /// mid-glyph, and the ellipsis's one column is reserved inside the
 /// budget.
 fn truncate_width(value: &str, budget: usize) -> String {
-    if value.width() <= budget {
+    if display_width(value) <= budget {
         return value.to_string();
     }
     let mut used: usize = 0;
     let mut cut = String::new();
     for glyph in value.chars() {
-        let span = glyph.width().unwrap_or(0);
+        let span = char_cells(glyph);
         if used.saturating_add(span) > budget.saturating_sub(1) {
             break;
         }
@@ -292,7 +292,7 @@ fn batch_subject(first: &str, rest: usize) -> String {
         0 => truncate(first),
         more => {
             let suffix = format!(" ({more} more)");
-            let budget = SUMMARY_WIDTH.saturating_sub(suffix.width());
+            let budget = SUMMARY_WIDTH.saturating_sub(str_width(&suffix));
             format!("{}{suffix}", truncate_width(first, budget))
         }
     }
