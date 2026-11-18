@@ -873,7 +873,10 @@ pub(crate) fn resumed_read_paths_with_machine(
     }
     for message in history {
         for part in &message.parts {
-            let MessagePart::ToolCall { id, name, input } = part else {
+            let MessagePart::ToolCall {
+                id, name, input, ..
+            } = part
+            else {
                 continue;
             };
             if !succeeded.contains(id) {
