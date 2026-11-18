@@ -11389,11 +11389,14 @@ fn covered_chars(flat: &str, start: usize, end_inclusive: usize) -> String {
 /// Splits the affected lines' spans at the selection's cell
 /// boundaries and flips exactly the covered characters, so the
 /// highlight is character-granular whatever the underlying styles.
-/// The walk runs on the display projection — the same cells the pane
-/// paints — and flips each covered grapheme through its raw source
-/// range, so the reversed ink lands on exactly the cells the reader
-/// swept and the strip that follows the highlight still receives the
-/// author's bytes.
+/// The walk runs on the flattened line's display projection — the
+/// same walk and the same cells the copy takes — with each painted
+/// grapheme's raw range mapped back to the span that owns its first
+/// byte for styling. Flattening is what keeps a cluster split across
+/// spans whole: an emoji ending one span and its modifier opening the
+/// next strip together exactly as they paint, so the reversed ink
+/// lands on the cells the reader swept and spends the same cells the
+/// clipboard copies for the same sweep.
 fn reverse_selection(lines: &mut [Line<'_>], skip: usize, selection: &CellSelection) {
     let (from, to) = ordered(selection);
     for (offset, line) in lines.iter_mut().enumerate() {
@@ -11407,35 +11410,51 @@ fn reverse_selection(lines: &mut [Line<'_>], skip: usize, selection: &CellSelect
         } else {
             usize::MAX
         };
-        let mut cell = 0;
-        let mut spans = Vec::with_capacity(line.spans.len().saturating_add(2));
+        let mut flat = String::new();
+        let mut owners: Vec<(usize, ratatui::style::Style)> = Vec::new();
         for span in line.spans.drain(..) {
-            let content = span.content;
-            let mut chunk = String::new();
-            for (range, width) in painted_steps(&content) {
-                let Some(cluster) = content.get(range) else {
-                    continue;
-                };
-                let selected = cells_overlap(cell, width, start, end);
-                if selected {
-                    if !chunk.is_empty() {
-                        spans.push(ratatui::text::Span::styled(
-                            std::mem::take(&mut chunk),
-                            span.style,
-                        ));
-                    }
+            owners.push((flat.len(), span.style));
+            flat.push_str(&span.content);
+        }
+        let mut cell = 0;
+        let mut spans = Vec::with_capacity(owners.len().saturating_add(2));
+        let mut chunk = String::new();
+        let mut chunk_style = ratatui::style::Style::default();
+        for (range, width) in painted_steps(&flat) {
+            let Some(cluster) = flat.get(range.clone()) else {
+                continue;
+            };
+            let style = owners
+                .iter()
+                .rev()
+                .find(|(at, _)| *at <= range.start)
+                .map_or(chunk_style, |(_, style)| *style);
+            let selected = cells_overlap(cell, width, start, end);
+            if selected {
+                if !chunk.is_empty() {
                     spans.push(ratatui::text::Span::styled(
-                        cluster.to_string(),
-                        span.style.add_modifier(ratatui::style::Modifier::REVERSED),
+                        std::mem::take(&mut chunk),
+                        chunk_style,
                     ));
-                } else {
-                    chunk.push_str(cluster);
                 }
-                cell = cell.saturating_add(width);
+                spans.push(ratatui::text::Span::styled(
+                    cluster.to_string(),
+                    style.add_modifier(ratatui::style::Modifier::REVERSED),
+                ));
+            } else {
+                if !chunk.is_empty() && style != chunk_style {
+                    spans.push(ratatui::text::Span::styled(
+                        std::mem::take(&mut chunk),
+                        chunk_style,
+                    ));
+                }
+                chunk.push_str(cluster);
+                chunk_style = style;
             }
-            if !chunk.is_empty() {
-                spans.push(ratatui::text::Span::styled(chunk, span.style));
-            }
+            cell = cell.saturating_add(width);
+        }
+        if !chunk.is_empty() {
+            spans.push(ratatui::text::Span::styled(chunk, chunk_style));
         }
         line.spans = spans;
     }
@@ -13704,6 +13723,55 @@ mod tests {
         assert!(
             screen.contains("3p"),
             "the picker's trailing columns stay on the grid: {screen:?}"
+        );
+    }
+
+    #[test]
+    fn a_cluster_split_across_spans_counts_the_same_cells_flipped_and_copied() {
+        // The copy walks the flattened line, so an emoji ending one
+        // span and its modifier opening the next strips together and
+        // paint four cells fewer than a per-span highlight walk that
+        // forgets the emoji at the span boundary. Both walks run on
+        // the one flattened projection now: the flipped ink and the
+        // clipboard text spend the same cells for the same sweep.
+        // A partial sweep — cells 0..=3, which the flattened walk
+        // reads as `a`, the emoji, and the space — makes the
+        // divergence visible in the ink itself: a per-span walk
+        // forgets the emoji at the span boundary, keeps the modifier
+        // as its own two cells, and flips it instead of the space.
+        let flat = "a\u{1f44d}\u{1f3fd} b";
+        let mut lines = vec![Line::from(vec![
+            Span::raw("a\u{1f44d}"),
+            Span::raw("\u{1f3fd} b"),
+        ])];
+        reverse_selection(
+            &mut lines,
+            0,
+            &CellSelection {
+                anchor: CellPos { line: 0, col: 0 },
+                head: CellPos { line: 0, col: 3 },
+            },
+        );
+        let line = lines.first().expect("the fixture line survives the flip");
+        let ink: String = line
+            .spans
+            .iter()
+            .filter(|span| {
+                span.style
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::REVERSED)
+            })
+            .map(|span| span.content.to_string())
+            .collect();
+        let copied = covered_chars(flat, 0, 3);
+        assert_eq!(
+            ink, copied,
+            "the flip and the copy take the same characters for the same sweep"
+        );
+        assert_eq!(
+            display_width(&ink),
+            4,
+            "and both spend the four painted cells the sweep covers"
         );
     }
 

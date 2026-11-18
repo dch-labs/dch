@@ -313,9 +313,11 @@ fn push_escape(ch: char, out: &mut String) {
 /// exactly what the display policy removes — one decision list,
 /// shared with [`for_display`] — but renders each removed input as
 /// its Rust escape: the preview stays measurable plain text, and two
-/// distinct inputs can never share one preview. Plain text passes
-/// through unchanged, and the caller's originals are untouched; only
-/// the preview changes.
+/// distinct inputs can never share one preview. A literal backslash
+/// doubles — the one way a typed escape spelling could otherwise
+/// collide with a removed code point's escape — so plain text passes
+/// through unchanged except its backslashes, and the caller's
+/// originals are untouched; only the preview changes.
 #[must_use]
 pub fn for_review(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -325,7 +327,11 @@ pub fn for_review(text: &str) -> String {
             push_escape(ch, &mut out);
             continue;
         }
-        out.push(ch);
+        if ch == '\\' {
+            out.push_str("\\\\");
+        } else {
+            out.push(ch);
+        }
         previous = Some(ch);
     }
     out
@@ -612,6 +618,31 @@ mod tests {
                 cluster.chars().map(char_cells).sum::<usize>()
             );
         }
+    }
+
+    #[test]
+    fn the_review_projection_escapes_literal_backslashes_too() {
+        // A removed code point renders as its escape, so a command
+        // carrying the literal escape spelling must not share that
+        // preview with the command carrying the real code point —
+        // the backslash doubles and the two previews read apart.
+        let real = "echo '\u{2714}\u{fe0f}'";
+        let spelled = "echo '\u{2714}\\u{FE0F}'";
+        assert_eq!(
+            for_review(real),
+            "echo '\u{2714}\\u{FE0F}'",
+            "the removed selector renders as its escape"
+        );
+        assert_ne!(
+            for_review(real),
+            for_review(spelled),
+            "the real code point and its literal spelling must not share a preview"
+        );
+        assert_eq!(
+            for_review(spelled),
+            "echo '\u{2714}\\\\u{FE0F}'",
+            "the literal backslash doubles in the preview"
+        );
     }
 
     #[test]
