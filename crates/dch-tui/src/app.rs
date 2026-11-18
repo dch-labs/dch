@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::cells::{
-    char_cells, display_width, for_display, painted_steps, prefix_within, str_width,
+    char_cells, display_width, for_display, for_review, painted_steps, prefix_within, str_width,
 };
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
@@ -8924,15 +8924,13 @@ impl TuiApp {
                 prompt: for_display(&request.prompt).into_owned(),
                 always: phrases(&self.permission_memory.would_record(&request.always, false))
                     .iter()
-                    .map(|phrase| for_display(phrase).into_owned())
+                    .map(|phrase| for_review(phrase))
                     .collect(),
                 never: phrases(&self.permission_memory.would_record(&request.never, true))
                     .iter()
-                    .map(|phrase| for_display(phrase).into_owned())
+                    .map(|phrase| for_review(phrase))
                     .collect(),
-                command: request
-                    .command_detail()
-                    .map(|command| for_display(&command).into_owned()),
+                command: request.command_detail().map(|command| for_review(&command)),
                 reason: self
                     .permission_reason
                     .as_deref()

@@ -424,31 +424,24 @@ impl<'a> Checker<'a> {
 /// its import shapes — `use unicode_width` and the `unicode_width::`
 /// path — so an identifier like a manifest-pinning test's
 /// `saw_unicode_width` flag, or its hyphenated strings, cannot trip
-/// it.
-fn rule_unicode_width_one_home(files: &[(String, String)]) -> Vec<Violation> {
-    /// The one importer the rule exempts, as the workspace walk
-    /// spells it.
-    ///
-    /// Root-relative because [`workspace_sources`] yields paths
-    /// against the workspace root — an unqualified `dch-tui/...`
-    /// would never match and the rule would flag the oracle itself.
-    const ORACLE: &str = "crates/dch-tui/src/markdown/cells.rs";
-    /// The rule's own source, as the workspace walk spells it.
-    ///
-    /// The matcher must name the crate to recognize its import
-    /// shapes, and the tests that pin the matcher carry the same
-    /// strings — this file is the rule, not an importer, so it reads
-    /// itself without violation.
-    const ENFORCER: &str = "xtask/src/boundary.rs";
+/// it. The two exemptions — the oracle and this rule's own matcher,
+/// which must spell the name to recognize it — compare as paths
+/// rather than strings, so the exemption holds however the host's
+/// walker spells its separators: a Windows walk yields backslashes
+/// where the constants carry forward slashes, and byte comparison
+/// would flag the rule's own oracle there.
+fn rule_unicode_width_one_home(files: &[(std::path::PathBuf, String)]) -> Vec<Violation> {
+    let oracle = std::path::Path::new("crates/dch-tui/src/markdown/cells.rs");
+    let enforcer = std::path::Path::new("xtask/src/boundary.rs");
     files
         .iter()
         .filter(|(path, content)| {
-            path != ORACLE
-                && path != ENFORCER
+            path != oracle
+                && path != enforcer
                 && (content.contains("unicode_width::") || content.contains("use unicode_width"))
         })
         .map(|(path, _)| Violation {
-            crate_name: path.clone(),
+            crate_name: path.to_string_lossy().into_owned(),
             detail: "unicode_width may be imported only by dch-tui/src/markdown/cells.rs \
                      (the cells oracle) — route width math through dch_tui::cells"
                 .to_string(),
@@ -703,7 +696,7 @@ fn member_roots(doc: &MetadataDoc) -> Vec<std::path::PathBuf> {
 fn workspace_sources(
     roots: &[std::path::PathBuf],
     workspace_root: &std::path::Path,
-) -> Vec<(String, String)> {
+) -> Vec<(std::path::PathBuf, String)> {
     let mut out = Vec::new();
     let mut stack: Vec<std::path::PathBuf> = roots.to_vec();
     while let Some(dir) = stack.pop() {
@@ -718,7 +711,7 @@ fn workspace_sources(
                 && let Ok(content) = std::fs::read_to_string(&path)
                 && let Ok(relative) = path.strip_prefix(workspace_root)
             {
-                out.push((relative.to_string_lossy().into_owned(), content));
+                out.push((relative.to_path_buf(), content));
             }
         }
     }
@@ -1120,6 +1113,27 @@ mod tests {
     }
 
     #[test]
+    fn the_exemptions_compare_as_paths_not_bytes() {
+        // Finding D: the exemption must hold however the host's
+        // walker spells a separator. Path equality compares
+        // components — repeated separators collapse, and on Windows
+        // the native backslash form equals this constant's forward
+        // slashes — where the old byte comparison flagged the
+        // oracle itself.
+        let content = "use unicode_width::UnicodeWidthStr;";
+        let oracle_doubled = std::path::PathBuf::from("crates//dch-tui//src//markdown//cells.rs");
+        assert!(
+            rule_unicode_width_one_home(&[(oracle_doubled, content.to_string())]).is_empty(),
+            "a separator-heavy spelling of the oracle's path still exempts"
+        );
+        let stray = std::path::PathBuf::from("crates//dch//src//lib.rs");
+        assert!(
+            !rule_unicode_width_one_home(&[(stray, content.to_string())]).is_empty(),
+            "a stray importer under any spelling still violates"
+        );
+    }
+
+    #[test]
     fn the_cells_oracle_is_the_one_unicode_width_home() {
         // The oracle imports the table; every other file routes
         // through it. A manifest-pinning test's identifier and
@@ -1127,19 +1141,19 @@ mod tests {
         // matcher.
         let clean = vec![
             (
-                "crates/dch-tui/src/markdown/cells.rs".to_string(),
+                std::path::PathBuf::from("crates/dch-tui/src/markdown/cells.rs"),
                 "use unicode_width::UnicodeWidthStr;".to_string(),
             ),
             (
-                "xtask/src/boundary.rs".to_string(),
+                std::path::PathBuf::from("xtask/src/boundary.rs"),
                 "content.contains(\"unicode_width::\")".to_string(),
             ),
             (
-                "dch-tui/src/app.rs".to_string(),
+                std::path::PathBuf::from("dch-tui/src/app.rs"),
                 "use crate::cells::{char_cells, str_width};".to_string(),
             ),
             (
-                "dch-tui/tests/extraction_seam.rs".to_string(),
+                std::path::PathBuf::from("dch-tui/tests/extraction_seam.rs"),
                 "let saw_unicode_width = false;\nassert!(saw_unicode_width, \"unicode-width is a plain dependency\");"
                     .to_string(),
             ),
@@ -1150,7 +1164,7 @@ mod tests {
         );
         let mut stray = clean;
         stray.push((
-            "dch/src/resume.rs".to_string(),
+            std::path::PathBuf::from("dch/src/resume.rs"),
             "use unicode_width::UnicodeWidthStr as _;".to_string(),
         ));
         let violations = rule_unicode_width_one_home(&stray);
@@ -1214,17 +1228,19 @@ mod tests {
         std::fs::write(member_x.join("src/main.rs"), "fn main() {}").expect("a source");
         std::fs::write(root.join("elsewhere/stray.rs"), "fn main() {}").expect("a source");
         let sources = workspace_sources(&[member_a, member_x], root);
-        let paths: Vec<&str> = sources.iter().map(|(path, _)| path.as_str()).collect();
+        let paths: Vec<&std::path::Path> = sources.iter().map(|(path, _)| path.as_path()).collect();
         assert!(
-            paths.contains(&"crates/one/src/lib.rs"),
+            paths.contains(&std::path::Path::new("crates/one/src/lib.rs")),
             "the crates member's sources are read: {paths:?}"
         );
         assert!(
-            paths.contains(&"xtask/src/main.rs"),
+            paths.contains(&std::path::Path::new("xtask/src/main.rs")),
             "the xtask member's sources are read: {paths:?}"
         );
         assert!(
-            !paths.iter().any(|path| path.contains("elsewhere")),
+            !paths
+                .iter()
+                .any(|path| path.to_string_lossy().contains("elsewhere")),
             "a directory no member owns sits outside the walk: {paths:?}"
         );
     }

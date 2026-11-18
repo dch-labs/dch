@@ -6755,6 +6755,45 @@ fn a_permission_sheet_strips_the_clusters_the_screen_cannot_size() {
     );
 }
 
+#[test]
+fn a_sheet_tells_selector_differing_commands_apart() {
+    // Findings B and C: two commands differing only by a composition
+    // input must never share one preview — the approval runs the
+    // original, so the sheet has to show which one it holds. The
+    // preview renders the removed input as a visible escape while no
+    // raw composition input reaches the screen.
+    let mut app = app();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (reply, _reply_rx) = tokio::sync::oneshot::channel();
+    tx.send(dch_tui::PermissionRequest {
+        tool_name: "Bash".to_string(),
+        prompt: "allow this?".to_string(),
+        input: serde_json::json!({ "command": "echo '\u{2714}\u{fe0f}'" }),
+        always: Vec::new(),
+        never: Vec::new(),
+        reply,
+    })
+    .expect("receiver alive");
+    app.set_permission_requests(rx);
+    app.poll_permission_requests();
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let screen: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(ratatui::buffer::Cell::symbol)
+        .collect();
+    assert!(
+        screen.contains("runs: echo '\u{2714}\\u{FE0F}'"),
+        "the preview shows the selector as a visible escape, telling it apart from the bare glyph: {screen:?}"
+    );
+    assert!(
+        !screen.contains('\u{fe0f}'),
+        "no raw composition input reaches the screen"
+    );
+}
+
 /// The first row index whose rendered text contains `needle`.
 ///
 /// Panics when `needle` is nowhere on screen — the position pins read

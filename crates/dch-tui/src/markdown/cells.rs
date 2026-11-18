@@ -147,6 +147,21 @@ pub fn for_display(text: &str) -> Cow<'_, str> {
     Cow::Owned(policy_projection(text).0)
 }
 
+/// Whether the policy removes `ch` given the character kept before
+/// it.
+///
+/// The one decision list every projection consults — the strip,
+/// the painted mapping, and the review walk — so no two projections
+/// can ever disagree about what the policy removes.
+fn policy_removes(ch: char, previous: Option<char>) -> bool {
+    ch == EMOJI_PRESENTATION_SELECTOR
+        || ch == TEXT_PRESENTATION_SELECTOR
+        || ch == ZERO_WIDTH_JOINER
+        || is_tag_character(ch)
+        || (ch == KEYCAP_MARK && previous.is_some_and(is_keycap_base))
+        || (is_emoji_modifier(ch) && previous.is_some_and(is_modifier_base))
+}
+
 /// The strip walk itself, returning the projection and each kept
 /// character's raw byte offset.
 ///
@@ -161,13 +176,7 @@ fn policy_projection(text: &str) -> (String, Vec<usize>) {
     let mut starts = Vec::new();
     let mut previous: Option<char> = None;
     for (index, ch) in text.char_indices() {
-        if ch == EMOJI_PRESENTATION_SELECTOR
-            || ch == TEXT_PRESENTATION_SELECTOR
-            || ch == ZERO_WIDTH_JOINER
-            || is_tag_character(ch)
-            || (ch == KEYCAP_MARK && previous.is_some_and(is_keycap_base))
-            || (is_emoji_modifier(ch) && previous.is_some_and(is_modifier_base))
-        {
+        if policy_removes(ch, previous) {
             continue;
         }
         cleaned.push(ch);
@@ -262,6 +271,64 @@ fn needs_policy_walk(ch: char) -> bool {
 pub fn display_width(text: &str) -> usize {
     let cleaned = for_display(text);
     str_width(&cleaned)
+}
+
+/// Append `ch` to `out` as its `\u{…}` escape, uppercase hex.
+///
+/// Hand-rolled rather than `fmt`: the crate's denied-lint set admits
+/// neither a discarded `write!` result nor the `format!`-push, and
+/// the hex table plus a fixed shift list is the whole story for the
+/// policy's removed code points — every one of them four or five
+/// significant digits.
+fn push_escape(ch: char, out: &mut String) {
+    /// The digit a nibble spells, uppercase.
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    /// Nibble shifts, most significant first.
+    const SHIFTS: [u32; 8] = [28, 24, 20, 16, 12, 8, 4, 0];
+    let value = u32::from(ch);
+    out.push_str("\\u{");
+    let mut leading = true;
+    for &shift in &SHIFTS {
+        let nibble = ((value >> shift) & 0xf) as usize;
+        if nibble == 0 && leading && shift != 0 {
+            continue;
+        }
+        leading = false;
+        if let Some(digit) = HEX.get(nibble) {
+            out.push(*digit as char);
+        }
+    }
+    out.push('}');
+}
+
+/// The text as the permission sheet previews it: composition inputs
+/// rendered as visible `\u{…}` escapes.
+///
+/// The strip that serves prose serves a decision surface badly: two
+/// strings differing only by a composition input — a scope with and
+/// without its selector, a command with and without its joiner —
+/// strip to one preview while the arms still record and run the
+/// distinct originals, so the sheet could ask a reader to approve
+/// one of two commands it cannot tell apart. The review walk removes
+/// exactly what the display policy removes — one decision list,
+/// shared with [`for_display`] — but renders each removed input as
+/// its Rust escape: the preview stays measurable plain text, and two
+/// distinct inputs can never share one preview. Plain text passes
+/// through unchanged, and the caller's originals are untouched; only
+/// the preview changes.
+#[must_use]
+pub fn for_review(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut previous: Option<char> = None;
+    for ch in text.chars() {
+        if policy_removes(ch, previous) {
+            push_escape(ch, &mut out);
+            continue;
+        }
+        out.push(ch);
+        previous = Some(ch);
+    }
+    out
 }
 
 /// The widest head of `text` that fits `budget` display cells.
@@ -519,6 +586,32 @@ mod tests {
         assert_eq!(slices, vec!["\u{fe0f}a", "b", "c"]);
         let joined: String = slices.concat();
         assert_eq!(joined, text, "the ranges tile the source from byte zero");
+    }
+
+    #[test]
+    fn the_review_projection_keeps_distinct_inputs_distinct() {
+        // Findings B and C's class: two strings differing only by a
+        // composition input strip to one preview, so a permission
+        // sheet could not tell the scopes or commands apart. The
+        // review walk renders each removed input as its escape, and
+        // the previews stay distinct while plain text passes through
+        // untouched.
+        let bare = "echo '\u{2714}'";
+        let selected = "echo '\u{2714}\u{fe0f}'";
+        assert_eq!(for_display(bare), for_display(selected));
+        assert_ne!(for_review(bare), for_review(selected));
+        assert!(for_review(selected).contains("\\u{FE0F}"));
+        assert_eq!(for_review(bare), "echo '\u{2714}'");
+        let joined = "\u{1f468}\u{200d}\u{1f469}";
+        assert!(for_review(joined).contains("\\u{200D}"));
+        // The escaped preview is plain measurable text: no
+        // composition input survives it.
+        for cluster in for_review(joined).graphemes(true) {
+            assert_eq!(
+                str_width(cluster),
+                cluster.chars().map(char_cells).sum::<usize>()
+            );
+        }
     }
 
     #[test]
