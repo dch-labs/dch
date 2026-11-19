@@ -19,10 +19,9 @@ use std::io::IsTerminal as _;
 use std::io::Write;
 use std::path::Path;
 
+use dch_tui::cells::{prefix_within, str_width, suffix_within};
 use dch_tui::{ContentBlock, TuiMessage};
 use loopctl::message::{Message, MessagePart, Role};
-use unicode_width::UnicodeWidthChar as _;
-use unicode_width::UnicodeWidthStr as _;
 use uuid::Uuid;
 
 use crate::args::Args;
@@ -874,7 +873,10 @@ pub(crate) fn resumed_read_paths_with_machine(
     }
     for message in history {
         for part in &message.parts {
-            let MessagePart::ToolCall { id, name, input } = part else {
+            let MessagePart::ToolCall {
+                id, name, input, ..
+            } = part
+            else {
                 continue;
             };
             if !succeeded.contains(id) {
@@ -1035,26 +1037,15 @@ pub(crate) fn render_sessions(
 /// Keeps one row's over-long title or model name from shifting the
 /// columns that follow it. A title is prose in any script, so both
 /// the pad and the cap measure display cells — a wide glyph counts
-/// twice — never characters, and the ellipsis's one cell is reserved
-/// inside the cap.
+/// twice — never characters, the cut keeps whole graphemes, and the
+/// ellipsis's one cell is reserved inside the cap.
 fn fit_column(text: &str, width: usize) -> String {
-    let cells = text.width();
+    let cells = str_width(text);
     if cells <= width {
         let pad = " ".repeat(width.saturating_sub(cells));
         return format!("{text}{pad}");
     }
-    let budget = width.saturating_sub(1);
-    let mut used = 0usize;
-    let mut kept = String::new();
-    for glyph in text.chars() {
-        let span = glyph.width().unwrap_or(0);
-        if used.saturating_add(span) > budget {
-            break;
-        }
-        kept.push(glyph);
-        used = used.saturating_add(span);
-    }
-    format!("{kept}…")
+    format!("{}…", prefix_within(text, width.saturating_sub(1)))
 }
 
 /// Pad `text` to `width` display cells, truncating with a leading
@@ -1065,27 +1056,16 @@ fn fit_column(text: &str, width: usize) -> String {
 /// at the end, so a cap that keeps the prefix renders both rows the
 /// same; keeping the suffix keeps the repository directory name —
 /// the part that tells the listings apart — on the page. Short
-/// values pad exactly as [`fit_column`] pads them, and the ellipsis's
-/// one cell is reserved inside the cap the same way.
+/// values pad exactly as [`fit_column`] pads them, the cut keeps
+/// whole graphemes the same way, and the ellipsis's one cell is
+/// reserved inside the cap the same way.
 fn fit_column_tail(text: &str, width: usize) -> String {
-    let cells = text.width();
+    let cells = str_width(text);
     if cells <= width {
         let pad = " ".repeat(width.saturating_sub(cells));
         return format!("{text}{pad}");
     }
-    let budget = width.saturating_sub(1);
-    let mut used = 0usize;
-    let mut kept = String::new();
-    for glyph in text.chars().rev() {
-        let span = glyph.width().unwrap_or(0);
-        if used.saturating_add(span) > budget {
-            break;
-        }
-        kept.push(glyph);
-        used = used.saturating_add(span);
-    }
-    let tail: String = kept.chars().rev().collect();
-    format!("…{tail}")
+    format!("…{}", suffix_within(text, width.saturating_sub(1)))
 }
 
 #[cfg(test)]
@@ -3123,7 +3103,7 @@ model = "plain"
         let offsets: Vec<usize> = lines
             .map(|row| {
                 let model_at = row.find(" m ").expect("the model column");
-                row[..model_at].width()
+                str_width(&row[..model_at])
             })
             .collect();
         assert_eq!(

@@ -12,6 +12,7 @@
 //! or where its strings come from, and its only attachment is the
 //! `pub mod` line that includes it.
 
+pub mod cells;
 #[cfg(feature = "syntax-highlight")]
 mod highlight;
 mod parser;
@@ -20,6 +21,7 @@ pub mod text_component;
 pub mod theme;
 pub mod word;
 
+pub use cells::{char_cells, display_width, for_display, str_width};
 pub use parser::{ComponentRoot, parse_markdown};
 pub use render::render_markdown;
 pub use text_component::{TextComponent, TextNode};

@@ -4571,7 +4571,10 @@ mod tests {
         }
         for message in rebuilt.committed_history() {
             for part in &message.parts {
-                let MessagePart::ToolCall { id, name, input } = part else {
+                let MessagePart::ToolCall {
+                    id, name, input, ..
+                } = part
+                else {
                     continue;
                 };
                 if !succeeded.contains(id) {

@@ -86,7 +86,7 @@ fn wide_glyphs_at_minimum_width_own_their_rows() {
         .expect("should have a heading");
     for row in heading.content() {
         let text: String = row.iter().map(dch_tui::markdown::Word::content).collect();
-        let width = unicode_width::UnicodeWidthStr::width(text.as_str());
+        let width = dch_tui::str_width(text.as_str());
         assert!(
             width <= 2,
             "a row may exceed width 1 by at most one character, got {width}: {text:?}"
@@ -198,7 +198,7 @@ fn a_heading_wraps_when_it_exceeds_the_width() {
 
     for (i, row) in rows.iter().enumerate() {
         let text: String = row.iter().map(dch_tui::markdown::Word::content).collect();
-        let w = unicode_width::UnicodeWidthStr::width(text.as_str());
+        let w = dch_tui::str_width(text.as_str());
         assert!(
             w <= 40,
             "Row {} has display width {} > 40: {:?}",
@@ -574,7 +574,7 @@ fn nested_list_items_keep_their_indentation() {
                         && !w.content().is_empty()
                         && w.content().trim().is_empty()
                 })
-                .map(|w| unicode_width::UnicodeWidthStr::width(w.content()))
+                .map(|w| dch_tui::str_width(w.content()))
                 .sum()
         })
         .collect();

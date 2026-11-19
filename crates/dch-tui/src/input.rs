@@ -7,8 +7,8 @@
 //! [`InputEditor::display_rows`] and positions the terminal
 //! cursor from [`InputEditor::cursor_cell`].
 
+use crate::cells::str_width;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use unicode_width::UnicodeWidthStr;
 
 /// Spaces inserted by the Tab key.
 ///
@@ -53,7 +53,7 @@ fn end_of_line_caret(line: &str, cap: usize) -> (usize, usize) {
             guarded.len().saturating_sub(1),
             guarded
                 .last()
-                .map_or(0, |row| UnicodeWidthStr::width(row.as_ref()))
+                .map_or(0, |row| str_width(row.as_ref()))
                 .saturating_sub(1),
         )
     }
@@ -80,20 +80,20 @@ fn caret_cell_in_line(
         let row_start = consumed.saturating_add(found);
         let row_end = row_start.saturating_add(row.len());
         if offset >= row_start && offset <= row_end {
-            let column = UnicodeWidthStr::width(logical.get(row_start..offset).unwrap_or(""));
+            let column = str_width(logical.get(row_start..offset).unwrap_or(""));
             return Some((index, column));
         }
         if let Some((row_index, end, width)) = above
             && offset < row_start
         {
-            let extra = UnicodeWidthStr::width(logical.get(end..offset).unwrap_or(""));
+            let extra = str_width(logical.get(end..offset).unwrap_or(""));
             return Some((row_index, width.saturating_add(extra)));
         }
-        above = Some((index, row_end, UnicodeWidthStr::width(row.as_ref())));
+        above = Some((index, row_end, str_width(row.as_ref())));
         consumed = row_end;
     }
     above.map(|(row_index, end, width)| {
-        let extra = UnicodeWidthStr::width(logical.get(end..offset).unwrap_or(""));
+        let extra = str_width(logical.get(end..offset).unwrap_or(""));
         (row_index, width.saturating_add(extra))
     })
 }

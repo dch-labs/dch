@@ -94,9 +94,11 @@ fn code_block_words_carry_captures_not_colors() {
 /// feature forgets would be unreachable dead weight. Ratatui is the
 /// module's other legitimate dependency by design — a manifest cannot
 /// scope dependencies to one module, so the test asserts the surface
-/// it can.
+/// it can. Unicode-width belongs to the module's `cells` oracle — the
+/// one file allowed to import it — so the entry stays plain whatever
+/// else moves.
 #[test]
-fn parser_hard_dependencies_are_pest_and_unicode_width() {
+fn parser_hard_dependencies_are_pest_and_cells() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
     let text = std::fs::read_to_string(&manifest).expect("manifest is readable");
 
@@ -147,7 +149,10 @@ fn parser_hard_dependencies_are_pest_and_unicode_width() {
         }
     }
     assert!(saw_pest, "pest is a plain dependency");
-    assert!(saw_unicode_width, "unicode-width is a plain dependency");
+    assert!(
+        saw_unicode_width,
+        "unicode-width is a plain dependency of the cells oracle"
+    );
     assert!(
         !tree_sitter_deps.is_empty(),
         "the syntax-highlight feature skeleton should exist"
@@ -226,7 +231,7 @@ fn retransform_at_a_narrower_width_reflows() {
         .expect("the paragraph survives the transform");
     for row in component.content() {
         let text: String = row.iter().map(dch_tui::markdown::Word::content).collect();
-        let width = unicode_width::UnicodeWidthStr::width(text.as_str());
+        let width = dch_tui::str_width(text.as_str());
         assert!(
             width <= 30,
             "row exceeds the new width ({}): {text:?}",

@@ -14,8 +14,7 @@
 
 use std::sync::Arc;
 
-use unicode_width::UnicodeWidthChar as _;
-use unicode_width::UnicodeWidthStr as _;
+use dch_tui::{char_cells, str_width};
 
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
@@ -1162,7 +1161,7 @@ fn clicking_the_session_id_segment_copies_it() {
         .find(|r| r.contains("f005d097"))
         .expect("the bar renders the id");
     let id_start = cell_col(status, id);
-    let id_width: usize = id.chars().map(|c| c.width().unwrap_or(0)).sum();
+    let id_width: usize = id.chars().map(char_cells).sum();
     let last_cell = u16::try_from(id_start.saturating_add(id_width).saturating_sub(1)).unwrap_or(0);
     let separator_cell = u16::try_from(id_start.saturating_sub(1)).unwrap_or(0);
     let row = rows
@@ -1728,10 +1727,10 @@ fn the_session_picker_names_each_row() {
     );
     let title_edge = titled_row
         .find("newest-model")
-        .map(|at| titled_row[..at].width());
+        .map(|at| str_width(&titled_row[..at]));
     let untitled_edge = untitled_row
         .find("older-model")
-        .map(|at| untitled_row[..at].width());
+        .map(|at| str_width(&untitled_row[..at]));
     assert_eq!(
         title_edge, untitled_edge,
         "the model text starts at the same display offset on both rows"
@@ -1756,9 +1755,8 @@ fn row_texts(terminal: &Terminal<TestBackend>) -> Vec<String> {
 /// in bytes while clicks address cells — this walks display width so a
 /// multibyte glyph before the text cannot skew a click's column.
 fn cell_col(row: &str, needle: &str) -> usize {
-    row.find(needle).map_or(0, |byte| {
-        row[..byte].chars().map(|c| c.width().unwrap_or(0)).sum()
-    })
+    row.find(needle)
+        .map_or(0, |byte| row[..byte].chars().map(char_cells).sum())
 }
 
 #[test]
@@ -6691,6 +6689,109 @@ fn question_app(
     app.set_question_requests(rx);
     app.poll_question_requests();
     (app, receivers)
+}
+
+#[test]
+fn a_question_sheet_strips_the_clusters_the_screen_cannot_size() {
+    let (mut app, _receivers) = question_app(&[StagedQuestion {
+        question: "done \u{2714}\u{fe0f} and family \u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467} shipped?",
+        options: &[
+            ("yes", Some("the run's own words \u{2714}\u{fe0f}")),
+            ("no", None),
+        ],
+        multi_select: false,
+    }]);
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let screen: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(ratatui::buffer::Cell::symbol)
+        .collect();
+    assert!(
+        !screen.contains('\u{fe0f}') && !screen.contains('\u{200d}'),
+        "a sheet the user must read to answer never shows a cluster the screen cannot size"
+    );
+    assert!(
+        screen.contains('\u{2714}'),
+        "the question's letters survive the strip"
+    );
+}
+
+#[test]
+fn a_permission_sheet_strips_the_clusters_the_screen_cannot_size() {
+    let mut app = app();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (reply, _reply_rx) = tokio::sync::oneshot::channel();
+    tx.send(dch_tui::PermissionRequest {
+        tool_name: "Bash".to_string(),
+        prompt: "allow this \u{2714}\u{fe0f}?".to_string(),
+        input: serde_json::json!({
+            "command": "echo done \u{2714}\u{fe0f} \u{1f468}\u{200d}\u{1f469}"
+        }),
+        always: Vec::new(),
+        never: Vec::new(),
+        reply,
+    })
+    .expect("receiver alive");
+    app.set_permission_requests(rx);
+    app.poll_permission_requests();
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let screen: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(ratatui::buffer::Cell::symbol)
+        .collect();
+    assert!(
+        !screen.contains('\u{fe0f}') && !screen.contains('\u{200d}'),
+        "the command the approval names never shows a cluster the screen cannot size"
+    );
+    assert!(
+        screen.contains("runs: echo done"),
+        "the command's letters survive the strip"
+    );
+}
+
+#[test]
+fn a_sheet_tells_selector_differing_commands_apart() {
+    // Findings B and C: two commands differing only by a composition
+    // input must never share one preview — the approval runs the
+    // original, so the sheet has to show which one it holds. The
+    // preview renders the removed input as a visible escape while no
+    // raw composition input reaches the screen.
+    let mut app = app();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let (reply, _reply_rx) = tokio::sync::oneshot::channel();
+    tx.send(dch_tui::PermissionRequest {
+        tool_name: "Bash".to_string(),
+        prompt: "allow this?".to_string(),
+        input: serde_json::json!({ "command": "echo '\u{2714}\u{fe0f}'" }),
+        always: Vec::new(),
+        never: Vec::new(),
+        reply,
+    })
+    .expect("receiver alive");
+    app.set_permission_requests(rx);
+    app.poll_permission_requests();
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let screen: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(ratatui::buffer::Cell::symbol)
+        .collect();
+    assert!(
+        screen.contains("runs: echo '\u{2714}\\u{FE0F}'"),
+        "the preview shows the selector as a visible escape, telling it apart from the bare glyph: {screen:?}"
+    );
+    assert!(
+        !screen.contains('\u{fe0f}'),
+        "no raw composition input reaches the screen"
+    );
 }
 
 /// The first row index whose rendered text contains `needle`.

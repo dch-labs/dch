@@ -829,12 +829,12 @@ fn pane_spans(
 /// text yields no chunks — callers that owe a row for an empty source
 /// line add it themselves.
 fn wrap_chunks(text: &str, room: usize) -> Vec<String> {
-    use unicode_width::UnicodeWidthChar as _;
+    use crate::cells::char_cells;
     let mut chunks = Vec::new();
     let mut current = String::new();
     let mut used = 0_usize;
     for ch in text.chars() {
-        let ch_width = ch.width().unwrap_or(0);
+        let ch_width = char_cells(ch);
         if used.saturating_add(ch_width) > room && !current.is_empty() {
             chunks.push(std::mem::take(&mut current));
             used = 0;
@@ -852,10 +852,14 @@ fn wrap_chunks(text: &str, room: usize) -> Vec<String> {
 /// columns, or leave it when it already meets or exceeds them.
 ///
 /// Solid bands need full-width rows; the padding rides the band's
-/// own style, so it costs no span of its own.
+/// own style, so it costs no span of its own. The measure is what
+/// the paint spends — the post-policy width — because the band
+/// text rides the conversation viewport and paints stripped: a raw
+/// cluster scores narrower than its members paint, and a pad sized
+/// by the raw score would send the band past its column.
 fn pad_to_width(text: &str, target: usize) -> String {
-    use unicode_width::UnicodeWidthStr as _;
-    let current = text.width();
+    use crate::cells::display_width;
+    let current = display_width(text);
     if current >= target {
         text.to_string()
     } else {
@@ -874,6 +878,20 @@ fn pad_to_width(text: &str, target: usize) -> String {
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_family_bearing_band_pads_to_its_room_by_the_painted_width() {
+        // The pad once measured the raw cluster (a family scoring
+        // two cells) and padded eight spaces into a ten-column room;
+        // the strip paints the family at six and the band ran four
+        // cells past its column. Padded by the painted width, the
+        // band lands exactly on its room for both cluster classes.
+        let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+        let padded = pad_to_width(family, 10);
+        assert_eq!(crate::cells::display_width(&padded), 10);
+        let selector = pad_to_width("a\u{2714}\u{fe0f}b", 6);
+        assert_eq!(crate::cells::display_width(&selector), 6);
+    }
 
     /// The receipt shape the edit tool emits for a mid-file
     /// replacement — summary prose, hunk header, context, removal,

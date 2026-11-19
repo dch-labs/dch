@@ -12,10 +12,11 @@
     clippy::indexing_slicing
 )]
 
+use dch_tui::display_width;
 use dch_tui::markdown::{MarkdownTheme, SyntaxTheme, render_markdown};
+use dch_tui::str_width;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
-use unicode_width::UnicodeWidthStr;
 
 const BASE: Color = Color::White;
 
@@ -93,7 +94,7 @@ fn joined(line: &Line<'_>) -> String {
 }
 
 fn line_width(line: &Line<'_>) -> usize {
-    UnicodeWidthStr::width(joined(line).as_str())
+    str_width(joined(line).as_str())
 }
 
 #[test]
@@ -102,6 +103,54 @@ fn a_plain_paragraph_renders_as_one_line_per_row() {
     assert_eq!(lines.len(), 1);
     assert_eq!(joined(&lines[0]), "hello world");
     assert_eq!(lines[0].spans[0].style.fg, Some(BASE));
+}
+
+#[test]
+fn wrapped_rows_keep_their_painted_width_within_the_pane() {
+    // The wrap once budgeted by the raw cluster score (the family
+    // counting two cells), so a row could paint wider than the pane
+    // once the display policy rendered its members apart. Every
+    // wrapped row now measures — by the post-policy width — inside
+    // the width it was wrapped at.
+    let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+    let text = format!("alpha beta {family} tail wording goes right here now");
+    let lines = render(&text, 31);
+    assert!(lines.len() > 1, "the pane is narrow enough to wrap");
+    for line in &lines {
+        let painted = display_width(&joined(line));
+        assert!(
+            painted <= 31,
+            "a wrapped row paints {painted} cells inside its 31-cell pane"
+        );
+    }
+}
+
+#[test]
+fn a_family_bearing_table_cell_keeps_its_borders_on_the_grid() {
+    // The table's columns are sized by the post-policy measure, so
+    // the cell pad must budget by the same one: a family cell whose
+    // raw cluster scores two but paints six over-pads against the
+    // raw score and pushes its row's borders past the frame the
+    // other rows drew.
+    let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+    let table = format!("| a | b |\n| --- | --- |\n| {family} | x |");
+    let lines = render(&table, 40);
+    let grid: Vec<Vec<usize>> = lines
+        .iter()
+        .map(joined)
+        .filter(|text| text.contains('│'))
+        .map(|text| {
+            text.char_indices()
+                .filter(|&(_, ch)| ch == '│')
+                .map(|(at, _)| display_width(&text[..at]))
+                .collect()
+        })
+        .collect();
+    assert_eq!(grid.len(), 2, "the header and the family row both render");
+    assert_eq!(
+        grid[0], grid[1],
+        "every row's borders sit at the same display columns"
+    );
 }
 
 #[test]
@@ -322,7 +371,7 @@ fn a_horizontal_rule_spans_min_of_width_and_forty() {
     let lines = render("---", 80);
     assert_eq!(lines.len(), 1);
     let span = &lines[0].spans[0];
-    assert_eq!(UnicodeWidthStr::width(span.content.as_ref()), 40);
+    assert_eq!(str_width(span.content.as_ref()), 40);
     assert_eq!(span.style, md_theme().horizontal_rule);
 }
 

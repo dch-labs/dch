@@ -6,10 +6,9 @@
 //! framing — is assembled here. The renderer is stateless: callers own
 //! any caching.
 
+use super::cells::{char_cells, display_width, str_width};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use unicode_width::UnicodeWidthChar;
-use unicode_width::UnicodeWidthStr;
 
 use super::parser::parse_markdown;
 use super::text_component::{TextComponent, TextNode};
@@ -369,7 +368,7 @@ fn wrap_code_rows(
             let style = span.style;
             let mut piece = String::new();
             for ch in span.content.chars() {
-                let ch_width = ch.width().unwrap_or(0);
+                let ch_width = char_cells(ch);
                 if used.saturating_add(ch_width) > budget && used > 0 {
                     if !piece.is_empty() {
                         out.push(Span::styled(std::mem::take(&mut piece), style));
@@ -453,14 +452,13 @@ fn render_table(
                 );
                 let cell_words = content.get(idx).unwrap_or(&empty);
                 let cell_text: String = cell_words.iter().map(Word::content).collect();
-                let cell_width = UnicodeWidthStr::width(cell_text.as_str());
+                let cell_width = display_width(&cell_text);
                 let target_width = usize::from(column_widths.get(col_idx).copied().unwrap_or(0));
 
                 row_spans.push(Span::styled(" ", style));
                 if cell_width > target_width {
                     let mut truncated = unicode_truncate(&cell_text, target_width);
-                    let shortfall =
-                        target_width.saturating_sub(UnicodeWidthStr::width(truncated.as_str()));
+                    let shortfall = target_width.saturating_sub(display_width(&truncated));
                     if shortfall > 0 {
                         truncated.push_str(&" ".repeat(shortfall));
                     }
@@ -539,7 +537,7 @@ fn unicode_truncate(text: &str, max_width: usize) -> String {
     let mut width: usize = 0;
     let mut chars = String::new();
     for c in text.chars() {
-        let char_width = UnicodeWidthChar::width(c).unwrap_or(0);
+        let char_width = char_cells(c);
         if width.saturating_add(char_width) > max_width {
             break;
         }
@@ -561,7 +559,7 @@ fn clip_line(line: Line<'static>, max_width: usize) -> Line<'static> {
     let mut used = 0;
 
     for span in line.spans {
-        let span_width = UnicodeWidthStr::width(span.content.as_ref());
+        let span_width = str_width(span.content.as_ref());
         let remaining = max_width.saturating_sub(used);
 
         if remaining == 0 {
@@ -576,7 +574,7 @@ fn clip_line(line: Line<'static>, max_width: usize) -> Line<'static> {
                 .content
                 .chars()
                 .scan(0usize, |width, c| {
-                    let char_width = UnicodeWidthChar::width(c).unwrap_or(0);
+                    let char_width = char_cells(c);
                     *width = width.saturating_add(char_width);
                     if *width <= remaining { Some(c) } else { None }
                 })
@@ -636,7 +634,7 @@ mod tests {
     fn clip_line_respects_wide_glyphs() {
         let line = Line::from(Span::raw("中文中文"));
         let clipped = clip_line(line, 3);
-        let width = UnicodeWidthStr::width(clipped.spans[0].content.as_ref());
+        let width = str_width(clipped.spans[0].content.as_ref());
         assert!(width <= 3, "clipped width {width} exceeds 3");
     }
 
@@ -672,7 +670,7 @@ mod tests {
             rendered[1].contains('g') && !rendered[1].contains('f'),
             "the boundary glyph leads the continuation: {rendered:?}"
         );
-        let first_width = UnicodeWidthStr::width(rendered[0].as_str());
+        let first_width = str_width(rendered[0].as_str());
         assert!(
             first_width <= 8,
             "the first row stays inside its frame budget: {rendered:?}"

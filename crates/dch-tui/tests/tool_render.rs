@@ -13,13 +13,14 @@
 
 use dch_config::Verbosity;
 use dch_tui::ToolResultDisplay;
+use dch_tui::display_width;
 use dch_tui::message::ActiveTool;
+use dch_tui::str_width;
 use dch_tui::theme::Theme;
 use dch_tui::tool_render::{
     ERR_GLYPH, OK_GLYPH, RUNNING_GLYPH, SPINNER_FRAME_MS, SPINNER_FRAMES, completed_tool_lines,
     humanize_tool_summary, running_tool_lines, spinner_frame_at,
 };
-use unicode_width::UnicodeWidthStr;
 
 fn result(name: &str, input: &str, is_error: bool, secs: f64) -> ToolResultDisplay {
     ToolResultDisplay {
@@ -310,9 +311,39 @@ fn long_summaries_truncate_to_the_width() {
     let summary = humanize_tool_summary("Read", &format!(r#"{{"file_path":"{long_path}"}}"#));
     assert!(summary.ends_with('…'), "the cut is marked: {summary:?}");
     assert!(
-        summary.width() <= 96 + "Reading …".width(),
+        str_width(&summary) <= 96 + str_width("Reading …"),
         "the truncated summary stays near the budget: {}",
-        summary.width()
+        str_width(&summary)
+    );
+}
+
+#[test]
+fn a_family_bearing_summary_truncates_by_the_painted_width() {
+    // The gate's hard case: a value whose raw score fits the budget
+    // (each family cluster scoring two) while its painted width runs
+    // past it (each family rendering six) — the gate must judge by
+    // the painted width and cut, so the summary line never renders
+    // wider than the pane it was sized for.
+    let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+    let families = format!("{family}{family}");
+    let command = format!("echo {families}{}", "x".repeat(84));
+    assert!(
+        str_width(&command) <= 96,
+        "the fixture's raw score fits the budget the raw gate judged by"
+    );
+    assert!(
+        display_width(&command) > 96,
+        "the fixture paints past the budget the gate must judge by"
+    );
+    let summary = humanize_tool_summary("Bash", &format!(r#"{{"command":"{command}"}}"#));
+    assert!(
+        display_width(&summary) <= 96 + str_width("Running: "),
+        "the truncated summary stays inside the painted budget: {}",
+        display_width(&summary)
+    );
+    assert!(
+        summary.ends_with('…'),
+        "the over-budget cut is marked: {summary:?}"
     );
 }
 
@@ -391,7 +422,7 @@ fn elapsed_time_selects_the_spinner_frame() {
 #[test]
 fn braille_frames_are_one_column_wide() {
     assert!(
-        SPINNER_FRAMES.iter().all(|frame| frame.width() == 1),
+        SPINNER_FRAMES.iter().all(|frame| str_width(frame) == 1),
         "every spinner frame is one display column"
     );
 }
@@ -414,9 +445,9 @@ fn a_long_multiedit_path_keeps_its_edit_count() {
         "the count suffix survives a path that alone exceeds the budget: {value:?}"
     );
     assert!(
-        value.width() <= 96,
+        str_width(&value) <= 96,
         "the combined value stays inside the summary budget: {}",
-        value.width()
+        str_width(&value)
     );
     assert!(
         humanize_tool_summary("MultiEdit", &value).contains("(3 edits)"),
@@ -430,9 +461,9 @@ fn a_wide_value_truncates_by_display_columns() {
     let wide = "漢".repeat(60);
     let summary = humanize_tool_summary("Read", &format!(r#"{{"file_path":"{wide}"}}"#));
     assert!(
-        summary.width() <= 96 + "Reading ".width(),
+        str_width(&summary) <= 96 + str_width("Reading "),
         "a wide value's summary stays inside the column budget: {}",
-        summary.width()
+        str_width(&summary)
     );
     assert!(summary.ends_with('…'), "the cut is marked: {summary:?}");
 }
@@ -463,9 +494,9 @@ fn a_long_readfiles_path_keeps_its_batch_count() {
         "the count survives a path that alone exceeds the budget: {value:?}"
     );
     assert!(
-        value.width() <= 96,
+        str_width(&value) <= 96,
         "the combined value stays inside the summary budget: {}",
-        value.width()
+        str_width(&value)
     );
     assert!(
         humanize_tool_summary("ReadFiles", &value).contains("(2 more)"),

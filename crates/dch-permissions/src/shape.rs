@@ -2012,7 +2012,7 @@ mod tests {
                 "grep".to_string(),
                 "tail".to_string()
             ],
-            "every segment is remembered — the preamble included"
+            "the split carries every command — the inert preamble its own segment"
         );
         let shape_for = |cmd: &str| crate::engine::CallShape {
             segments: command_segments(cmd),
