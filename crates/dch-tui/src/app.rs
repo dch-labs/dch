@@ -6421,16 +6421,21 @@ impl TuiApp {
     /// same line segments [`Self::selectable_window`] windows over,
     /// running tools included, with the pending-steer and run-timer
     /// rows below left out. Left and Right use the width as their
-    /// wrap boundary and Down uses existence as its floor.
+    /// wrap boundary and Down uses existence as its floor. The
+    /// measure is the line's flattened projection — the same single
+    /// policy walk the flip, the copy, and the screen's strip run —
+    /// so the keyboard's cell space and the selection's are one
+    /// space, seam clusters included.
     fn line_width(&self, index: usize) -> Option<usize> {
         self.selectable_window(index, 1)
             .into_iter()
             .next()
             .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| display_width(&span.content))
-                    .sum()
+                let mut flat = String::new();
+                for span in &line.spans {
+                    flat.push_str(span.content.as_ref());
+                }
+                display_width(&flat)
             })
     }
 
@@ -13772,6 +13777,106 @@ mod tests {
             display_width(&ink),
             4,
             "and both spend the four painted cells the sweep covers"
+        );
+    }
+
+    #[test]
+    fn a_seam_cluster_keeps_its_columns_before_and_during_selection() {
+        // The frame paints in one order — the flip on the raw clone,
+        // then the display strip (paint/conversation.rs) — and a
+        // cluster split across spans must sit on the same cells in
+        // both states. The screen column here is measured the way the
+        // buffer advances: per-span widths of the stripped contents.
+        // A strip that projected each span alone kept a span-opening
+        // modifier as its own two cells until a selection covering
+        // the cluster flipped it into one span — and only then
+        // stripped it — so the text after the seam jumped two columns
+        // the moment the selection landed, and the unselected row
+        // never matched the cells the selection math budgeted.
+        fn strip(lines: &mut Vec<Line<'_>>) {
+            super::paint::conversation::for_display_lines(lines);
+        }
+        fn screen_column(lines: &[Line<'_>], needle: char) -> usize {
+            let line = lines.first().expect("the fixture line survives the strip");
+            let mut column: usize = 0;
+            for span in &line.spans {
+                let content = span.content.as_ref();
+                if let Some(at) = content.find(needle) {
+                    let prefix = content.get(..at).expect("find lands on a boundary");
+                    return column.saturating_add(str_width(prefix));
+                }
+                column = column.saturating_add(str_width(content));
+            }
+            panic!("the needle never paints");
+        }
+        fn screen_width(lines: &[Line<'_>]) -> usize {
+            lines
+                .first()
+                .expect("the fixture line survives the strip")
+                .spans
+                .iter()
+                .map(|span| str_width(span.content.as_ref()))
+                .sum()
+        }
+        let seam = || {
+            vec![Line::from(vec![
+                Span::raw("a\u{1f44d}"),
+                Span::raw("\u{1f3fd} b"),
+            ])]
+        };
+
+        let mut before = seam();
+        strip(&mut before);
+        let mut during = seam();
+        reverse_selection(
+            &mut during,
+            0,
+            &CellSelection {
+                anchor: CellPos { line: 0, col: 0 },
+                head: CellPos { line: 0, col: 3 },
+            },
+        );
+        strip(&mut during);
+
+        assert_eq!(
+            screen_column(&before, 'b'),
+            screen_column(&during, 'b'),
+            "covering the seam cluster moved the text after it"
+        );
+        assert_eq!(
+            screen_column(&before, 'b'),
+            4,
+            "the row paints the flattened cells: a, the emoji, the space, then b"
+        );
+        assert_eq!(
+            screen_width(&before),
+            display_width("a\u{1f44d}\u{1f3fd} b"),
+            "the unselected row paints the width the selection math budgets"
+        );
+        assert_eq!(
+            screen_width(&during),
+            display_width("a\u{1f44d}\u{1f3fd} b"),
+            "the selected row paints the width the selection math budgets"
+        );
+    }
+
+    #[test]
+    fn the_keyboard_wraps_at_the_painted_line_not_the_raw_spans() {
+        // line_width feeds Left/Right their wrap boundary and Down its
+        // floor, so its measure must be the same flattened projection
+        // the flip, the copy, and the screen's strip walk — a per-span
+        // sum counts a span-opening modifier as its own two cells and
+        // walks the keyboard two cells past everything the selection
+        // can cover.
+        let mut subject = TuiApp::new(dch_config::DchConfig::default());
+        subject.conversation_cache = vec![Line::from(vec![
+            Span::raw("a\u{1f44d}"),
+            Span::raw("\u{1f3fd} b"),
+        ])];
+        assert_eq!(
+            subject.line_width(0),
+            Some(5),
+            "the wrap boundary is the flattened five cells: a, the cluster, a space, b"
         );
     }
 

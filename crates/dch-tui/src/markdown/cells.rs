@@ -255,6 +255,17 @@ fn needs_policy_walk(ch: char) -> bool {
         || is_tag_character(ch)
 }
 
+/// Whether `text` carries any input the display policy might strip.
+///
+/// The cheap gate for whole-line flattening: a line whose spans
+/// carry none of these code points cannot change under the policy,
+/// neither within a span nor across a seam, so the strip skips it
+/// without paying for the flattened walk.
+#[must_use]
+pub fn carries_policy_input(text: &str) -> bool {
+    text.chars().any(needs_policy_walk)
+}
+
 /// The cells the screen will spend on `text` — the post-policy
 /// measure every layout gate must budget by.
 ///

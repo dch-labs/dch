@@ -9,10 +9,10 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::cells::for_display;
+use crate::cells::{carries_policy_input, for_display, painted_steps};
 
 use super::super::{SelectableShape, TuiApp, ViewState, reverse_selection};
 
@@ -402,22 +402,55 @@ fn render_scrollbar(
 /// the model's width, the buffer's width, and some terminal class's
 /// width disagree, and a diff-based renderer cannot survive the
 /// disagreement — the cells the model believes a cluster consumed
-/// keep whatever an earlier frame wrote there. What survives the
-/// strip measures one width to every terminal, and the layout gates
-/// budget by that same post-policy width through
-/// [`display_width`](crate::cells::display_width), so no row paints
-/// wider than it reserved. The viewport [`visible_window`] returns
-/// is already a per-frame clone, so this mutates nothing a selection
-/// copies from; a clean span — the common case — costs nothing, and
-/// only a span actually carrying a composition input pays for its
-/// stripped copy.
+/// keep whatever an earlier frame wrote there. The walk is flattened:
+/// one policy pass over the line's concatenated spans, each surviving
+/// grapheme re-attached to the span that owns its first byte — the
+/// same single projection the selection's flip and copy walk — so a
+/// cluster split across a span boundary strips exactly as it paints
+/// and the row on the screen spends the cells the selection math
+/// budgets. A per-span strip would keep a span-opening modifier as
+/// its own ink, two cells the flattened walk never counted. The
+/// viewport [`visible_window`] returns is already a per-frame clone,
+/// so this mutates nothing a selection copies from; a line whose
+/// spans carry no policy input — the common case — costs one scan
+/// and no allocation.
 pub(in crate::app) fn for_display_lines(lines: &mut [Line<'_>]) {
     for line in lines {
-        for span in &mut line.spans {
-            if let std::borrow::Cow::Owned(clean) = for_display(span.content.as_ref()) {
-                span.content = clean.into();
-            }
+        if !line
+            .spans
+            .iter()
+            .any(|span| carries_policy_input(span.content.as_ref()))
+        {
+            continue;
         }
+        let mut flat = String::new();
+        let mut owners: Vec<(usize, Style)> = Vec::new();
+        for span in line.spans.drain(..) {
+            owners.push((flat.len(), span.style));
+            flat.push_str(span.content.as_ref());
+        }
+        let mut spans: Vec<Span<'_>> = Vec::with_capacity(owners.len().saturating_add(2));
+        let mut chunk = String::new();
+        let mut chunk_style = Style::default();
+        for (range, _width) in painted_steps(&flat) {
+            let Some(raw) = flat.get(range.clone()) else {
+                continue;
+            };
+            let style = owners
+                .iter()
+                .rev()
+                .find(|(at, _)| *at <= range.start)
+                .map_or(chunk_style, |(_, style)| *style);
+            if !chunk.is_empty() && style != chunk_style {
+                spans.push(Span::styled(std::mem::take(&mut chunk), chunk_style));
+            }
+            chunk.push_str(for_display(raw).as_ref());
+            chunk_style = style;
+        }
+        if !chunk.is_empty() {
+            spans.push(Span::styled(chunk, chunk_style));
+        }
+        line.spans = spans;
     }
 }
 
