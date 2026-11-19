@@ -266,6 +266,28 @@ pub fn carries_policy_input(text: &str) -> bool {
     text.chars().any(needs_policy_walk)
 }
 
+/// The raw offset of `text`'s first character the policy keeps.
+///
+/// [`painted_steps`] opens its first step's range at byte zero so
+/// the ranges tile the source — leading composition inputs belong
+/// to the first grapheme for copying — but a style lookup keyed on
+/// that normalized start attributes the first retained character to
+/// whichever span owns the removed inputs. The first retained
+/// character is the one that paints, so its own span's style is
+/// what it carries. Every walk in the removed prefix sees the same
+/// `None` context the projection saw (removed characters never
+/// become `previous`), so this can never disagree with the
+/// projection that produced the range.
+#[must_use]
+pub fn first_retained_offset(text: &str) -> usize {
+    for (index, ch) in text.char_indices() {
+        if !policy_removes(ch, None) {
+            return index;
+        }
+    }
+    text.len()
+}
+
 /// The cells the screen will spend on `text` — the post-policy
 /// measure every layout gate must budget by.
 ///

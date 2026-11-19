@@ -12,7 +12,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::cells::{carries_policy_input, for_display, painted_steps};
+use crate::cells::{carries_policy_input, first_retained_offset, for_display, painted_steps};
 
 use super::super::{SelectableShape, TuiApp, ViewState, reverse_selection};
 
@@ -404,7 +404,8 @@ fn render_scrollbar(
 /// disagreement — the cells the model believes a cluster consumed
 /// keep whatever an earlier frame wrote there. The walk is flattened:
 /// one policy pass over the line's concatenated spans, each surviving
-/// grapheme re-attached to the span that owns its first byte — the
+/// grapheme re-attached to the span that owns its first retained
+/// character — the
 /// same single projection the selection's flip and copy walk — so a
 /// cluster split across a span boundary strips exactly as it paints
 /// and the row on the screen spends the cells the selection math
@@ -432,14 +433,20 @@ pub(in crate::app) fn for_display_lines(lines: &mut [Line<'_>]) {
         let mut spans: Vec<Span<'_>> = Vec::with_capacity(owners.len().saturating_add(2));
         let mut chunk = String::new();
         let mut chunk_style = Style::default();
+        let head_kept = first_retained_offset(&flat);
         for (range, _width) in painted_steps(&flat) {
             let Some(raw) = flat.get(range.clone()) else {
                 continue;
             };
+            let style_at = if range.start == 0 {
+                head_kept
+            } else {
+                range.start
+            };
             let style = owners
                 .iter()
                 .rev()
-                .find(|(at, _)| *at <= range.start)
+                .find(|(at, _)| *at <= style_at)
                 .map_or(chunk_style, |(_, style)| *style);
             if !chunk.is_empty() && style != chunk_style {
                 spans.push(Span::styled(std::mem::take(&mut chunk), chunk_style));
@@ -499,6 +506,37 @@ pub(in crate::app) fn visible_window<'a>(
 )]
 mod tests {
     use super::scrollbar_geometry;
+
+    #[test]
+    fn a_retained_opener_carries_its_own_spans_style() {
+        // painted_steps opens the first step's range at byte zero so
+        // the ranges tile the source — leading composition inputs
+        // belong to the first grapheme for copying — but the style
+        // lookup must key on the first retained character, the one
+        // that paints. A selector opening the line inside its own
+        // span mis-attributed the character after it to the
+        // selector's style.
+        use ratatui::style::{Color, Style};
+        use ratatui::text::{Line, Span};
+        let selector_style = Style::default().fg(Color::Red);
+        let text_style = Style::default().fg(Color::Green);
+        let mut lines = vec![Line::from(vec![
+            Span::styled("\u{fe0f}", selector_style),
+            Span::styled("a b", text_style),
+        ])];
+        super::for_display_lines(&mut lines);
+        let line = lines.first().expect("the fixture line survives the strip");
+        let painted = line
+            .spans
+            .iter()
+            .find(|span| span.content.contains('a'))
+            .expect("the retained opener paints");
+        assert_eq!(
+            painted.style.fg,
+            Some(Color::Green),
+            "the retained opener carries its own span's style, not the removed selector's"
+        );
+    }
 
     #[test]
     fn scrollbar_geometry_is_hidden_when_the_document_fits() {

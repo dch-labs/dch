@@ -24,7 +24,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::cells::{
-    char_cells, display_width, for_display, for_review, painted_steps, prefix_within, str_width,
+    char_cells, display_width, first_retained_offset, for_display, for_review, painted_steps,
+    prefix_within, str_width,
 };
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
@@ -11397,7 +11398,7 @@ fn covered_chars(flat: &str, start: usize, end_inclusive: usize) -> String {
 /// The walk runs on the flattened line's display projection — the
 /// same walk and the same cells the copy takes — with each painted
 /// grapheme's raw range mapped back to the span that owns its first
-/// byte for styling. Flattening is what keeps a cluster split across
+/// retained character for styling. Flattening is what keeps a cluster split across
 /// spans whole: an emoji ending one span and its modifier opening the
 /// next strip together exactly as they paint, so the reversed ink
 /// lands on the cells the reader swept and spends the same cells the
@@ -11425,14 +11426,20 @@ fn reverse_selection(lines: &mut [Line<'_>], skip: usize, selection: &CellSelect
         let mut spans = Vec::with_capacity(owners.len().saturating_add(2));
         let mut chunk = String::new();
         let mut chunk_style = ratatui::style::Style::default();
+        let head_kept = first_retained_offset(&flat);
         for (range, width) in painted_steps(&flat) {
             let Some(cluster) = flat.get(range.clone()) else {
                 continue;
             };
+            let style_at = if range.start == 0 {
+                head_kept
+            } else {
+                range.start
+            };
             let style = owners
                 .iter()
                 .rev()
-                .find(|(at, _)| *at <= range.start)
+                .find(|(at, _)| *at <= style_at)
                 .map_or(chunk_style, |(_, style)| *style);
             let selected = cells_overlap(cell, width, start, end);
             if selected {
@@ -13728,6 +13735,45 @@ mod tests {
         assert!(
             screen.contains("3p"),
             "the picker's trailing columns stay on the grid: {screen:?}"
+        );
+    }
+
+    #[test]
+    fn the_flip_styles_the_retained_opener_by_its_own_span() {
+        // The flip's owner lookup keys on the same first retained
+        // character as the strip's: a selector opening the line inside
+        // its own span once attributed the character after it to the
+        // selector's style, so the reversed ink flashed the wrong
+        // color for the sweep.
+        let mut lines = vec![Line::from(vec![
+            Span::styled("\u{fe0f}", Style::default().fg(Color::Red)),
+            Span::styled("a b", Style::default().fg(Color::Green)),
+        ])];
+        reverse_selection(
+            &mut lines,
+            0,
+            &CellSelection {
+                anchor: CellPos { line: 0, col: 0 },
+                head: CellPos { line: 0, col: 0 },
+            },
+        );
+        let line = lines.first().expect("the fixture line survives the flip");
+        let flipped = line
+            .spans
+            .iter()
+            .find(|span| span.content.contains('a'))
+            .expect("the retained opener flips");
+        assert!(
+            flipped
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::REVERSED),
+            "the swept cell flips"
+        );
+        assert_eq!(
+            flipped.style.fg,
+            Some(Color::Green),
+            "the flipped ink carries the character's own span's style"
         );
     }
 
