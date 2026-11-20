@@ -175,12 +175,6 @@ pub fn decide(mode: PermissionMode, category: ToolCategory) -> PermissionOutcome
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::missing_panics_doc
-)]
 mod tests {
     use super::*;
 

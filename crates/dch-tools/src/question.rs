@@ -99,12 +99,6 @@ pub struct QuestionResponse {
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::missing_panics_doc,
-    clippy::indexing_slicing
-)]
 mod tests {
     use super::*;
 

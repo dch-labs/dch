@@ -498,12 +498,6 @@ pub(in crate::app) fn visible_window<'a>(
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::missing_panics_doc,
-    clippy::missing_errors_doc,
-    clippy::expect_used,
-    clippy::unwrap_used
-)]
 mod tests {
     use super::scrollbar_geometry;
 

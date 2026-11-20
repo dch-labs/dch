@@ -430,12 +430,6 @@ fn config_allows(config_rules: &[Rule], shape: &CallShape) -> bool {
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::missing_panics_doc
-)]
 mod tests {
     use super::*;
     use crate::mode::PermissionMode::{Auto, Interactive, ReadOnly};

@@ -532,8 +532,7 @@ fn seeded_tool_blocks_stay_expandable_after_a_resume() {
         timestamp: now,
         duration_ms: None,
     }]);
-    let probe = render_to_buffer(&mut app, 80, 24);
-    let rows = row_texts(&probe);
+    let rows = rendered_rows(&mut app, 80, 24);
     let row = rows
         .iter()
         .position(|r| r.contains("Running: make test"))
@@ -553,8 +552,7 @@ fn seeded_tool_blocks_stay_expandable_after_a_resume() {
         5,
         u16::try_from(row).unwrap_or(0),
     ));
-    let open = render_to_buffer(&mut app, 80, 24);
-    let rows = row_texts(&open);
+    let rows = rendered_rows(&mut app, 80, 24);
     assert!(
         rows.iter()
             .any(|r| r.contains("\"command\": \"make test\"")),
@@ -1013,8 +1011,7 @@ fn ctrl_shift_c_copies_the_selection_without_quitting() {
         sink.lock().expect("sink").push(text.to_string());
         dch_tui::CopyAnswer::Verified
     }));
-    let probe = render_to_buffer(&mut app, 80, 24);
-    let rows = row_texts(&probe);
+    let rows = rendered_rows(&mut app, 80, 24);
     let row = rows
         .iter()
         .position(|r| r.contains("abcdefghij"))
@@ -1154,8 +1151,7 @@ fn clicking_the_session_id_segment_copies_it() {
         sink.lock().expect("sink").push(text.to_string());
         dch_tui::CopyAnswer::Verified
     }));
-    let probe = render_to_buffer(&mut app, 100, 24);
-    let rows = row_texts(&probe);
+    let rows = rendered_rows(&mut app, 100, 24);
     let status = rows
         .iter()
         .find(|r| r.contains("f005d097"))
@@ -1635,8 +1631,7 @@ fn growth_after_a_frozen_closer_renders_without_waiting_for_a_newline() {
         .lock()
         .expect("the streaming lock")
         .push_str("tail-growth");
-    let grown = render_to_buffer(&mut app, 60, 20);
-    let rows = row_texts(&grown);
+    let rows = rendered_rows(&mut app, 60, 20);
     assert!(
         rows.iter().any(|row| row.contains("tail-growth")),
         "a newline-free delta after the frozen closer renders on arrival: {rows:?}"
@@ -1659,8 +1654,7 @@ fn active_tools_render_as_running_lines() {
             input_summary: "\"todo\"".to_string(),
             start: std::time::Instant::now(),
         });
-    let terminal = render_to_buffer(&mut app, 80, 30);
-    let rows = row_texts(&terminal);
+    let rows = rendered_rows(&mut app, 80, 30);
     assert!(
         rows.iter()
             .any(|row| row.contains("⏳") && row.contains("Grep \"todo\"")),
@@ -1706,8 +1700,7 @@ fn the_session_picker_names_each_row() {
             },
         ],
     });
-    let terminal = render_to_buffer(&mut app, 100, 30);
-    let rows = row_texts(&terminal);
+    let rows = rendered_rows(&mut app, 100, 30);
     let titled_row = rows
         .iter()
         .find(|row| row.contains("newest-model"))
@@ -1735,6 +1728,15 @@ fn the_session_picker_names_each_row() {
         title_edge, untitled_edge,
         "the model text starts at the same display offset on both rows"
     );
+}
+
+/// Render `app` at `width` x `height` and return the painted rows.
+///
+/// The render probe most tests want — one line instead of the
+/// render-then-extract pair.
+fn rendered_rows(app: &mut TuiApp, width: u16, height: u16) -> Vec<String> {
+    let terminal = render_to_buffer(app, width, height);
+    row_texts(&terminal)
 }
 
 fn row_texts(terminal: &Terminal<TestBackend>) -> Vec<String> {
@@ -1795,8 +1797,7 @@ fn elapsed_stamps_round_once_before_splitting() {
         timestamp: chrono::Utc::now(),
         duration_ms: None,
     });
-    let terminal = render_to_buffer(&mut app, 80, 30);
-    let rows = row_texts(&terminal);
+    let rows = rendered_rows(&mut app, 80, 30);
     let joined = rows.join("\n");
     assert!(
         joined.contains("Reading a.rs… (1m30s)"),
@@ -2274,8 +2275,7 @@ fn a_drag_selects_characters_and_copies_silently() {
     let _ = render_to_buffer(&mut app, 80, 24);
     let before = app.conversation().len();
     // how user text renders: find its row and leading offset
-    let probe = render_to_buffer(&mut app, 80, 24);
-    let rows = row_texts(&probe);
+    let rows = rendered_rows(&mut app, 80, 24);
     let row = rows
         .iter()
         .position(|r| r.contains("abcdefghij"))
@@ -2476,8 +2476,7 @@ fn the_welcome_composer_is_an_open_field_with_a_greeting() {
     // in night colors while the input stands empty — and the murmur
     // stands down at the first keystroke.
     let mut fresh = app();
-    let terminal = render_to_buffer(&mut fresh, 80, 24);
-    let rows = row_texts(&terminal);
+    let rows = rendered_rows(&mut fresh, 80, 24);
     assert!(
         rows.iter()
             .any(|row| row.contains("dream, create, harness")),
@@ -2520,8 +2519,7 @@ fn a_drag_shows_the_highlight_before_release() {
         unsent: false,
     });
     let _ = render_to_buffer(&mut app, 80, 24);
-    let probe = render_to_buffer(&mut app, 80, 24);
-    let rows = row_texts(&probe);
+    let rows = rendered_rows(&mut app, 80, 24);
     let row = rows
         .iter()
         .position(|r| r.contains("abcdefghij"))
@@ -2806,8 +2804,7 @@ fn a_released_selection_stays_highlighted_until_the_next_press() {
         dch_tui::CopyAnswer::Verified
     }));
 
-    let probe = render_to_buffer(&mut app, 80, 24);
-    let rows = row_texts(&probe);
+    let rows = rendered_rows(&mut app, 80, 24);
     let row = rows
         .iter()
         .position(|r| r.contains("abcdefghij"))
@@ -2884,8 +2881,7 @@ fn a_released_selection_copy_confirms_on_the_notice_row() {
         dch_tui::CopyAnswer::Verified
     }));
 
-    let probe = render_to_buffer(&mut app, 80, 24);
-    let rows = row_texts(&probe);
+    let rows = rendered_rows(&mut app, 80, 24);
     let row = rows
         .iter()
         .position(|r| r.contains("abcdefghij"))
@@ -2942,8 +2938,7 @@ fn a_click_without_travel_copies_and_notices_nothing() {
         dch_tui::CopyAnswer::Verified
     }));
 
-    let probe = render_to_buffer(&mut app, 80, 24);
-    let rows = row_texts(&probe);
+    let rows = rendered_rows(&mut app, 80, 24);
     let row = rows
         .iter()
         .position(|r| r.contains("abcdefghij"))
@@ -2989,8 +2984,7 @@ fn a_copy_no_transport_delivers_notices_the_failure() {
     });
     app.set_selection_copier(Box::new(|_attempt, _text| dch_tui::CopyAnswer::Failed));
 
-    let probe = render_to_buffer(&mut app, 80, 24);
-    let rows = row_texts(&probe);
+    let rows = rendered_rows(&mut app, 80, 24);
     let row = rows
         .iter()
         .position(|r| r.contains("abcdefghij"))
@@ -3047,8 +3041,7 @@ fn a_hanging_copy_command_never_blocks_the_render_task() {
         unsent: false,
     });
 
-    let probe = render_to_buffer(&mut app, 80, 24);
-    let rows = row_texts(&probe);
+    let rows = rendered_rows(&mut app, 80, 24);
     let row = rows
         .iter()
         .position(|r| r.contains("abcdefghij"))
@@ -3109,8 +3102,7 @@ fn a_pending_transport_copy_posts_no_row_until_the_verdict() {
         unsent: false,
     });
 
-    let probe = render_to_buffer(&mut app, 80, 24);
-    let rows = row_texts(&probe);
+    let rows = rendered_rows(&mut app, 80, 24);
     let row = rows
         .iter()
         .position(|r| r.contains("abcdefghij"))
@@ -3162,8 +3154,7 @@ fn the_copy_chord_confirms_on_the_notice_row() {
         dch_tui::CopyAnswer::Verified
     }));
 
-    let probe = render_to_buffer(&mut app, 80, 24);
-    let rows = row_texts(&probe);
+    let rows = rendered_rows(&mut app, 80, 24);
     let row = rows
         .iter()
         .position(|r| r.contains("abcdefghij"))
@@ -3222,8 +3213,7 @@ fn a_shift_arrow_recopy_confirms_on_the_notice_row() {
         dch_tui::CopyAnswer::Verified
     }));
 
-    let probe = render_to_buffer(&mut app, 80, 24);
-    let rows = row_texts(&probe);
+    let rows = rendered_rows(&mut app, 80, 24);
     let row = rows
         .iter()
         .position(|r| r.contains("abcdefghij"))
@@ -3516,8 +3506,7 @@ fn shift_arrows_extend_and_shrink_a_released_selection() {
         dch_tui::CopyAnswer::Verified
     }));
 
-    let probe = render_to_buffer(&mut app, 80, 24);
-    let rows = row_texts(&probe);
+    let rows = rendered_rows(&mut app, 80, 24);
     let row = rows
         .iter()
         .position(|r| r.contains("abcdefghij"))
@@ -3643,8 +3632,7 @@ fn plain_arrows_still_scroll_while_a_selection_is_up() {
         sink.lock().expect("sink").push(text.to_string());
         dch_tui::CopyAnswer::Verified
     }));
-    let probe = render_to_buffer(&mut app, 80, 25);
-    let rows = row_texts(&probe);
+    let rows = rendered_rows(&mut app, 80, 25);
     let text_row =
         u16::try_from(rows.iter().rposition(|r| r.contains("line2")).unwrap_or(0)).unwrap_or(0);
     app.handle_event(&mouse_event(
@@ -3728,8 +3716,7 @@ fn a_rebuilt_line_space_forfeits_the_selection() {
     );
 
     // a re-selected highlight survives renders and dies on the re-wrap
-    let probe = render_to_buffer(&mut app, 80, 24);
-    let rows = row_texts(&probe);
+    let rows = rendered_rows(&mut app, 80, 24);
     let row = rows
         .iter()
         .position(|r| r.contains("abcdefghij"))
@@ -3791,8 +3778,7 @@ fn a_press_on_a_running_tool_row_selects_it_alongside_the_transcript() {
         dch_tui::CopyAnswer::Verified
     }));
 
-    let probe = render_to_buffer(&mut app, 80, 24);
-    let rows = row_texts(&probe);
+    let rows = rendered_rows(&mut app, 80, 24);
     let row = rows
         .iter()
         .position(|r| r.contains("abcdefghij"))
@@ -3882,8 +3868,7 @@ fn a_press_below_a_running_tool_clamps_onto_the_tool_row() {
         dch_tui::CopyAnswer::Verified
     }));
 
-    let probe = render_to_buffer(&mut app, 80, 24);
-    let rows = row_texts(&probe);
+    let rows = rendered_rows(&mut app, 80, 24);
     let tool_row = rows.iter().position(|r| r.contains("Grep")).unwrap_or(0);
     // the covered head of the running row is its glyph, spacing, and
     // the name — the elapsed tail stays outside the span
@@ -3943,8 +3928,7 @@ fn a_renumbered_running_lane_forfeits_a_selection_reaching_into_it() {
         dch_tui::CopyAnswer::Verified
     }));
 
-    let probe = render_to_buffer(&mut app, 80, 24);
-    let rows = row_texts(&probe);
+    let rows = rendered_rows(&mut app, 80, 24);
     let row = rows
         .iter()
         .position(|r| r.contains("abcdefghij"))
@@ -4004,8 +3988,7 @@ fn a_press_on_the_live_thinking_body_selects_it() {
         dch_tui::CopyAnswer::Verified
     }));
 
-    let probe = render_to_buffer(&mut app, 80, 24);
-    let rows = row_texts(&probe);
+    let rows = rendered_rows(&mut app, 80, 24);
     let row = rows
         .iter()
         .position(|r| r.contains("pondering the thing"))
@@ -4054,8 +4037,7 @@ fn a_streaming_delta_forfeits_a_selection_reaching_into_the_live_region() {
         .lock()
         .expect("the streaming lock")
         .push_str("streaming reply");
-    let probe = render_to_buffer(&mut app, 80, 24);
-    let rows = row_texts(&probe);
+    let rows = rendered_rows(&mut app, 80, 24);
     let row = rows
         .iter()
         .position(|r| r.contains("streaming reply"))
@@ -4124,8 +4106,7 @@ fn a_streaming_delta_preserves_a_selection_in_the_settled_transcript() {
         .lock()
         .expect("the streaming lock")
         .push_str("streaming reply");
-    let probe = render_to_buffer(&mut app, 80, 24);
-    let rows = row_texts(&probe);
+    let rows = rendered_rows(&mut app, 80, 24);
     let row = rows
         .iter()
         .position(|r| r.contains("abcdefghij"))
@@ -4194,8 +4175,7 @@ fn a_release_over_blank_cells_copies_nothing() {
         dch_tui::CopyAnswer::Verified
     }));
 
-    let probe = render_to_buffer(&mut app, 80, 24);
-    let rows = row_texts(&probe);
+    let rows = rendered_rows(&mut app, 80, 24);
     let row = rows
         .iter()
         .position(|r| r.contains("abcdefghij"))
@@ -4267,8 +4247,7 @@ fn combining_marks_carry_with_their_base_and_line_up_with_the_rendered_cells() {
         sink.lock().expect("sink").push(text.to_string());
         dch_tui::CopyAnswer::Verified
     }));
-    let probe = render_to_buffer(&mut app, 80, 24);
-    let rows = row_texts(&probe);
+    let rows = rendered_rows(&mut app, 80, 24);
     let row = rows.iter().position(|r| r.contains('x')).unwrap_or(0);
     let col = cell_col(&rows[row], "e");
 
@@ -4338,8 +4317,7 @@ fn a_press_outside_the_conversation_retires_the_selection_without_recopying() {
         sink.lock().expect("sink").push(text.to_string());
         dch_tui::CopyAnswer::Verified
     }));
-    let probe = render_to_buffer(&mut app, 80, 24);
-    let rows = row_texts(&probe);
+    let rows = rendered_rows(&mut app, 80, 24);
     let row = rows
         .iter()
         .position(|r| r.contains("abcdefghij"))
@@ -4414,8 +4392,7 @@ fn an_interior_blank_line_stays_in_a_multi_row_copy() {
         dch_tui::CopyAnswer::Verified
     }));
 
-    let probe = render_to_buffer(&mut app, 80, 24);
-    let rows = row_texts(&probe);
+    let rows = rendered_rows(&mut app, 80, 24);
     let row = rows
         .iter()
         .position(|r| r.contains("abcdefghij"))
@@ -4469,8 +4446,7 @@ fn a_selection_landing_on_a_wide_characters_second_cell_takes_it() {
         dch_tui::CopyAnswer::Verified
     }));
 
-    let probe = render_to_buffer(&mut app, 80, 24);
-    let rows = row_texts(&probe);
+    let rows = rendered_rows(&mut app, 80, 24);
     let row = rows.iter().position(|r| r.contains("日")).unwrap_or(0);
     let col = cell_col(&rows[row], "日");
     app.handle_event(&mouse_event(
@@ -4684,8 +4660,7 @@ fn the_input_field_grows_with_its_buffer_up_to_the_cap() {
     // five lines: the pane caps at three text rows, the window keeps
     // the caret's tail visible, and the tag reports the overflow
     app.handle_event(&Event::Paste("\nfour\nfive\nsix".to_string()));
-    let capped = render_to_buffer(&mut app, 40, 26);
-    let rows = row_texts(&capped);
+    let rows = rendered_rows(&mut app, 40, 26);
     assert!(
         rows[20].contains("six"),
         "the window keeps the caret's line visible: {}",
@@ -4880,8 +4855,7 @@ fn the_state_tag_claims_the_identity_row_s_right_edge() {
         "a prompt\nthat spans\nseveral\nlines\nnow".to_string(),
     ));
 
-    let terminal = render_to_buffer(&mut app, 20, 14);
-    let rows = row_texts(&terminal);
+    let rows = rendered_rows(&mut app, 20, 14);
     let identity_at = rows
         .iter()
         .position(|row| row.contains("a-very"))
@@ -5020,8 +4994,7 @@ fn a_width_change_reflows_the_cached_conversation() {
         "at width 60 the message fits the first content row"
     );
 
-    let narrow = render_to_buffer(&mut app, 24, 18);
-    let narrow_rows = row_texts(&narrow);
+    let narrow_rows = rendered_rows(&mut app, 24, 18);
     assert!(
         !narrow_rows[1].contains("dddddddddd")
             && narrow_rows.iter().any(|row| row.contains("dddddddddd")),
@@ -5146,8 +5119,7 @@ fn multiline_user_and_system_echoes_render_on_separate_rows() {
         text: "alpha\nbeta".to_string(),
         timestamp: chrono::Utc::now(),
     });
-    let terminal = render_to_buffer(&mut app, 40, 20);
-    let rows = row_texts(&terminal);
+    let rows = rendered_rows(&mut app, 40, 20);
     let row_of = |needle: &str| rows.iter().position(|row| row.contains(needle));
     let (Some(first), Some(second), Some(alpha), Some(beta)) = (
         row_of("first"),
@@ -5302,8 +5274,7 @@ fn running_tools_render_their_humanized_summary() {
             input_summary: r#"{"file_path":"src/lib.rs"}"#.to_string(),
             start: std::time::Instant::now(),
         });
-    let terminal = render_to_buffer(&mut app, 80, 30);
-    let rows = row_texts(&terminal);
+    let rows = rendered_rows(&mut app, 80, 30);
     assert!(
         rows.iter().any(|row| row.contains("Reading src/lib.rs")),
         "a running tool humanizes its summary live: {rows:?}"
@@ -5379,8 +5350,7 @@ fn a_click_expands_a_completed_tool_block_and_clicking_again_collapses_it() {
         }));
     let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
 
-    let probe = render_to_buffer(&mut app, 80, 30);
-    let rows = row_texts(&probe);
+    let rows = rendered_rows(&mut app, 80, 30);
     let row = rows
         .iter()
         .position(|r| r.contains("Running: make test"))
@@ -5430,8 +5400,7 @@ fn a_click_expands_a_completed_tool_block_and_clicking_again_collapses_it() {
         5,
         u16::try_from(row).unwrap_or(0),
     ));
-    let shut = render_to_buffer(&mut app, 80, 30);
-    let rows = row_texts(&shut);
+    let rows = rendered_rows(&mut app, 80, 30);
     assert!(
         rows.iter()
             .all(|r| !r.contains("\"command\": \"make test\"")),
@@ -5469,8 +5438,7 @@ fn a_selectionless_release_still_toggles_a_tool_row_and_reports_the_redraw() {
         }));
     let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
 
-    let probe = render_to_buffer(&mut app, 80, 30);
-    let rows = row_texts(&probe);
+    let rows = rendered_rows(&mut app, 80, 30);
     let row = rows
         .iter()
         .position(|r| r.contains("Running: make test"))
@@ -5527,8 +5495,7 @@ fn a_running_tool_row_expands_to_its_captured_input() {
             start: std::time::Instant::now(),
         });
 
-    let probe = render_to_buffer(&mut app, 80, 30);
-    let rows = row_texts(&probe);
+    let rows = rendered_rows(&mut app, 80, 30);
     let row = rows
         .iter()
         .position(|r| r.contains("Running: cargo test"))
@@ -5549,8 +5516,7 @@ fn a_running_tool_row_expands_to_its_captured_input() {
         5,
         u16::try_from(row).unwrap_or(0),
     ));
-    let open = render_to_buffer(&mut app, 80, 30);
-    let rows = row_texts(&open);
+    let rows = rendered_rows(&mut app, 80, 30);
     assert!(
         rows.iter()
             .any(|r| r.contains("\"command\": \"cargo test\"")),
@@ -5597,8 +5563,7 @@ fn an_expansion_opened_while_running_survives_the_calls_completion() {
             start: std::time::Instant::now(),
         });
 
-    let probe = render_to_buffer(&mut app, 80, 30);
-    let rows = row_texts(&probe);
+    let rows = rendered_rows(&mut app, 80, 30);
     let row = rows
         .iter()
         .position(|r| r.contains("Reading src/lib.rs"))
@@ -5633,8 +5598,7 @@ fn an_expansion_opened_while_running_survives_the_calls_completion() {
             full_input: "{\n  \"file_path\": \"src/lib.rs\" }".to_string(),
             full_output: "pub fn answer() -> u32 { 42 }".to_string(),
         }));
-    let done = render_to_buffer(&mut app, 80, 30);
-    let rows = row_texts(&done);
+    let rows = rendered_rows(&mut app, 80, 30);
     assert!(
         rows.iter()
             .any(|r| r.contains("pub fn answer() -> u32 { 42 }")),
@@ -5675,8 +5639,7 @@ fn the_oldest_tool_details_retire_past_the_cap() {
         }
     }
     let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
-    let probe = render_to_buffer(&mut app, 80, 300);
-    let rows = row_texts(&probe);
+    let rows = rendered_rows(&mut app, 80, 300);
     let oldest = rows
         .iter()
         .position(|r| r.contains("cmd 0"))
@@ -5734,8 +5697,7 @@ fn carriage_return_pastes_fold_to_line_breaks() {
     );
 
     app.handle_event(&plain(KeyCode::Enter));
-    let echo = render_to_buffer(&mut app, 80, 24);
-    let rows = row_texts(&echo);
+    let rows = rendered_rows(&mut app, 80, 24);
     let first = rows.iter().position(|r| r.contains("FIRST LINE"));
     let second = rows.iter().position(|r| r.contains("SECOND LINE"));
     let third = rows.iter().position(|r| r.contains("THIRD LINE"));
@@ -5763,8 +5725,7 @@ fn long_user_lines_wrap_in_the_conversation_instead_of_clipping() {
         steered: false,
         unsent: false,
     });
-    let terminal = render_to_buffer(&mut app, 80, 24);
-    let rows = row_texts(&terminal);
+    let rows = rendered_rows(&mut app, 80, 24);
     assert!(
         rows.iter().any(|row| row.contains("THE-TAIL-IS-HERE")),
         "the line's tail is visible past the pane width: {rows:?}"
@@ -5843,8 +5804,7 @@ fn a_pad_row_and_a_blank_line_breathe_between_user_turns_and_agent_material() {
         steered: false,
         unsent: false,
     });
-    let follow_terminal = render_to_buffer(&mut app, 40, 18);
-    let follow_rows = row_texts(&follow_terminal);
+    let follow_rows = rendered_rows(&mut app, 40, 18);
     let answer_now = follow_rows
         .iter()
         .position(|r| r.contains("the answer"))
@@ -6027,8 +5987,7 @@ fn a_retried_call_ages_from_its_newest_attempt() {
         queue.push(graduation("call-dup".to_string()));
     }
     let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
-    let probe = render_to_buffer(&mut app, 80, 300);
-    let rows = row_texts(&probe);
+    let rows = rendered_rows(&mut app, 80, 300);
     assert!(
         rows.iter()
             .any(|r| r.contains("cmd call-0") && r.contains("▸")),
@@ -6077,8 +6036,7 @@ fn a_captureless_completion_never_advertises_an_expansion() {
             full_output: String::new(),
         }));
     let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
-    let probe = render_to_buffer(&mut app, 80, 24);
-    let rows = row_texts(&probe);
+    let rows = rendered_rows(&mut app, 80, 24);
     let row = rows.iter().position(|r| r.contains("rm -rf")).unwrap_or(0);
     assert!(
         !rows.iter().any(|r| r.contains("▸")),
@@ -6148,8 +6106,7 @@ fn a_block_without_retained_detail_is_not_expandable() {
         }));
     let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
 
-    let probe = render_to_buffer(&mut app, 80, 30);
-    let rows = row_texts(&probe);
+    let rows = rendered_rows(&mut app, 80, 30);
     let row = rows
         .iter()
         .position(|r| r.contains("Running: ls"))
@@ -6213,8 +6170,7 @@ fn dragging_from_a_summary_row_still_selects_instead_of_toggling() {
         dch_tui::CopyAnswer::Verified
     }));
 
-    let probe = render_to_buffer(&mut app, 80, 30);
-    let rows = row_texts(&probe);
+    let rows = rendered_rows(&mut app, 80, 30);
     let user_row = rows
         .iter()
         .position(|r| r.contains("abcdefghij"))
@@ -6331,8 +6287,7 @@ fn a_click_on_any_row_of_an_expanded_block_collapses_it() {
                 .join("\n"),
         }));
     let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
-    let probe = render_to_buffer(&mut app, 80, 24);
-    let rows = row_texts(&probe);
+    let rows = rendered_rows(&mut app, 80, 24);
     let row = rows
         .iter()
         .position(|r| r.contains("Running: make test"))
@@ -6348,8 +6303,7 @@ fn a_click_on_any_row_of_an_expanded_block_collapses_it() {
         5,
         u16::try_from(row).unwrap_or(0),
     ));
-    let open = render_to_buffer(&mut app, 80, 24);
-    let open_rows = row_texts(&open);
+    let open_rows = rendered_rows(&mut app, 80, 24);
     let output_row = open_rows
         .iter()
         .position(|r| r.contains("output line"))
@@ -6369,8 +6323,7 @@ fn a_click_on_any_row_of_an_expanded_block_collapses_it() {
         5,
         u16::try_from(output_row).unwrap_or(0),
     ));
-    let shut = render_to_buffer(&mut app, 80, 24);
-    let shut_rows = row_texts(&shut);
+    let shut_rows = rendered_rows(&mut app, 80, 24);
     assert!(
         shut_rows
             .iter()
@@ -6406,8 +6359,7 @@ fn expanding_holds_the_clicked_row_steady_instead_of_chasing_the_tail() {
                 .join("\n"),
         }));
     let mut app = TuiApp::from_observer_state(config_with_theme("dracula"), kept);
-    let probe = render_to_buffer(&mut app, 80, 24);
-    let rows = row_texts(&probe);
+    let rows = rendered_rows(&mut app, 80, 24);
     let row = rows
         .iter()
         .position(|r| r.contains("Running: make build"))
@@ -6427,8 +6379,7 @@ fn expanding_holds_the_clicked_row_steady_instead_of_chasing_the_tail() {
         5,
         u16::try_from(row).unwrap_or(0),
     ));
-    let open = render_to_buffer(&mut app, 80, 24);
-    let open_rows = row_texts(&open);
+    let open_rows = rendered_rows(&mut app, 80, 24);
     assert!(
         open_rows
             .get(1)
@@ -6459,8 +6410,7 @@ fn hostile_elapsed_values_render_instead_of_panicking() {
             duration_ms: None,
         });
     }
-    let terminal = render_to_buffer(&mut app, 80, 30);
-    let rows = row_texts(&terminal);
+    let rows = rendered_rows(&mut app, 80, 30);
     assert_eq!(
         rows.iter()
             .filter(|row| row.contains("Reading a.rs"))
@@ -8899,8 +8849,7 @@ fn the_expanded_live_body_caps_rendered_lines() {
     // render while the stream is live.
     let wall = "word ".repeat(4000);
     observer.on_thinking_delta(&thinking_delta(0, &wall));
-    let terminal = render_to_buffer(&mut app, 80, 24);
-    let rows = row_texts(&terminal);
+    let rows = rendered_rows(&mut app, 80, 24);
     let body = rows.iter().filter(|row| row.contains("word")).count();
     assert!(
         body <= 500,
@@ -8912,8 +8861,7 @@ fn the_expanded_live_body_caps_rendered_lines() {
 fn redacted_reasoning_renders_a_placeholder_body() {
     let (observer, mut app) = live_thinking_app();
     observer.on_thinking_delta(&thinking_delta(0, ""));
-    let terminal = render_to_buffer(&mut app, 80, 24);
-    let rows = row_texts(&terminal);
+    let rows = rendered_rows(&mut app, 80, 24);
     assert!(
         rows.iter()
             .any(|row| row.contains("reasoning withheld by the provider")),
@@ -8937,8 +8885,7 @@ fn a_live_thinking_stream_renders_expanded_and_collapses_at_graduation() {
     );
     drop(terminal);
     observer.on_response(&responded(0, "the answer"));
-    let terminal = render_to_buffer(&mut app, 80, 24);
-    let rows = row_texts(&terminal);
+    let rows = rendered_rows(&mut app, 80, 24);
     assert!(
         rows.iter().any(|row| row.contains("▸ Thinking")),
         "graduation auto-collapses the section: {rows:?}"
@@ -8972,8 +8919,7 @@ fn collapsing_a_live_thinking_stream_suppresses_the_next() {
     );
     observer.on_response(&responded(0, "answer one"));
     observer.on_thinking_delta(&thinking_delta(1, "second thoughts"));
-    let terminal = render_to_buffer(&mut app, 80, 24);
-    let rows = row_texts(&terminal);
+    let rows = rendered_rows(&mut app, 80, 24);
     assert!(
         rows.iter().any(|row| row.contains("▸ Thinking")),
         "a suppressed session renders the next stream collapsed from its first delta: {rows:?}"
@@ -10631,8 +10577,7 @@ fn the_conversation_block_shows_the_enforced_fraction() {
         ]}"#,
         "# Task List\n\nSummary: 0 pending, 1 in progress, 2 completed\n\n\u{25d0} [3] third thing\n\n\u{25cf} [1] first thing\n\n\u{25cf} [2] second thing\n\n",
     );
-    let terminal = render_to_buffer(&mut app, 80, 30);
-    let rows = row_texts(&terminal);
+    let rows = rendered_rows(&mut app, 80, 30);
     let flat: String = rows.join("\n");
     assert!(
         flat.contains("2/3 done"),
@@ -12101,8 +12046,7 @@ fn the_capped_plan_badge_names_the_chord_that_opens_it() {
     );
 
     app.handle_event(&key(KeyCode::Char('t'), KeyModifiers::CONTROL));
-    let terminal = render_to_buffer(&mut app, 80, 30);
-    let rows = row_texts(&terminal);
+    let rows = rendered_rows(&mut app, 80, 30);
     let badge_row = rows
         .iter()
         .find(|row| row.contains(" TODO "))
@@ -12176,8 +12120,7 @@ fn ctrl_t_opens_only_when_the_cap_cut_an_entry() {
     );
 
     app.handle_event(&key(KeyCode::Char('t'), KeyModifiers::CONTROL));
-    let terminal = render_to_buffer(&mut app, 80, 30);
-    let rows = row_texts(&terminal);
+    let rows = rendered_rows(&mut app, 80, 30);
     assert!(
         rows.iter()
             .any(|row| row.contains("+2 more (ctrl+t for all)")),
@@ -12208,8 +12151,7 @@ fn a_folded_queue_keeps_its_air_over_the_plan() {
         queue.push("second waiting".to_string());
     }
     app.handle_event(&key(KeyCode::Char('q'), KeyModifiers::CONTROL));
-    let terminal = render_to_buffer(&mut app, 80, 30);
-    let rows = row_texts(&terminal);
+    let rows = rendered_rows(&mut app, 80, 30);
     let fold_row = rows
         .iter()
         .position(|row| row.contains("2 waiting · ctrl+q to show"))
@@ -12275,8 +12217,7 @@ fn a_click_folds_the_plan_section_and_a_click_stands_it_back_up() {
 
     click(&mut app, 20, u16::try_from(marker_row).unwrap_or(0));
 
-    let standing = render_to_buffer(&mut app, 80, 30);
-    let rows = row_texts(&standing);
+    let rows = rendered_rows(&mut app, 80, 30);
     assert_eq!(
         rows.iter()
             .filter(|row| row.contains("dig the trench"))
@@ -12331,8 +12272,7 @@ fn a_click_folds_the_waiting_section_and_a_click_lifts_it() {
 
     click(&mut app, 20, u16::try_from(badge_row).unwrap_or(0));
 
-    let standing = render_to_buffer(&mut app, 80, 30);
-    let rows = row_texts(&standing);
+    let rows = rendered_rows(&mut app, 80, 30);
     assert!(
         rows.iter().any(|row| row.contains("first waiting")),
         "a click on the badge lifts the section back: {rows:?}"
@@ -12397,8 +12337,7 @@ fn a_published_history_backfills_the_compaction_rows_summary() {
     drop(folded);
 
     click(&mut app, 10, u16::try_from(notice_row).unwrap_or(0));
-    let expanded = render_to_buffer(&mut app, 80, 30);
-    let rows = row_texts(&expanded);
+    let rows = rendered_rows(&mut app, 80, 30);
     let flat: String = rows.join("\n");
     assert!(
         flat.contains("The session mapped the login flow and fixed the retry loop"),
@@ -12561,8 +12500,7 @@ fn the_running_elapsed_line_opens_with_a_spinning_frame() {
         started.saturating_sub(65_000),
         std::sync::atomic::Ordering::SeqCst,
     );
-    let terminal = render_to_buffer(&mut app, 80, 24);
-    let rows = row_texts(&terminal);
+    let rows = rendered_rows(&mut app, 80, 24);
     let timer_row = rows
         .iter()
         .find(|row| row.contains("1m 5s"))
@@ -12607,8 +12545,7 @@ fn the_running_turn_carries_its_elapsed_time() {
 
     // The line leaves with the run: nothing ticks between turns.
     kept.mark_run_ended();
-    let terminal = render_to_buffer(&mut app, 80, 24);
-    let rows = row_texts(&terminal);
+    let rows = rendered_rows(&mut app, 80, 24);
     assert!(
         !rows.iter().any(|row| row.trim() == "1m 5s"),
         "no elapsed line stands over an idle composer: {rows:?}"
@@ -12962,8 +12899,7 @@ fn the_timer_spinner_advances_with_the_elapsed_clock() {
             now.saturating_sub(elapsed),
             std::sync::atomic::Ordering::SeqCst,
         );
-        let terminal = render_to_buffer(&mut app, 80, 24);
-        let rows = row_texts(&terminal);
+        let rows = rendered_rows(&mut app, 80, 24);
         let timer_row = rows
             .iter()
             .find(|row| {
@@ -13045,8 +12981,7 @@ fn the_timer_row_names_its_count_with_a_quiet_elapsed_word() {
             duration_ms: Some(84_000),
         },
     ]);
-    let terminal = render_to_buffer(&mut app, 80, 24);
-    let rows = row_texts(&terminal);
+    let rows = rendered_rows(&mut app, 80, 24);
     assert!(
         rows.iter().any(|row| row.trim() == "duration 1m 24s"),
         "the settled footer names its total — the duration word beside the figure: {rows:?}"
@@ -13070,8 +13005,7 @@ fn the_running_tool_stands_above_the_turn_s_timer_footer() {
             input_summary: "cargo build".to_string(),
             start: std::time::Instant::now(),
         });
-    let terminal = render_to_buffer(&mut app, 80, 30);
-    let rows = row_texts(&terminal);
+    let rows = rendered_rows(&mut app, 80, 30);
     let tool_row = rows
         .iter()
         .position(|row| row.contains("Running: cargo build"))
@@ -13462,8 +13396,7 @@ fn the_notice_rides_the_place_row_and_saves_its_own() {
     app.set_working_dir(std::path::Path::new("/home/dch/repos/dch"));
     app.set_git_branch(Some("feat/x".to_string()));
     app.post_notice("THE NOTICE SPEAKS".to_string());
-    let terminal = render_to_buffer(&mut app, 80, 26);
-    let rows = row_texts(&terminal);
+    let rows = rendered_rows(&mut app, 80, 26);
     let shared = rows
         .iter()
         .find(|row| row.contains("repos/dch (feat/x)"))
@@ -13495,8 +13428,7 @@ fn a_place_less_frame_keeps_the_reserved_notice_row() {
         unsent: false,
     });
     app.post_notice("THE NOTICE SPEAKS".to_string());
-    let terminal = render_to_buffer(&mut app, 80, 26);
-    let rows = row_texts(&terminal);
+    let rows = rendered_rows(&mut app, 80, 26);
     let notice_row = rows
         .iter()
         .find(|row| row.contains("THE NOTICE SPEAKS"))
@@ -13525,8 +13457,7 @@ fn a_wide_glyph_notice_reserves_its_full_width() {
     });
     app.set_working_dir(std::path::Path::new("/home/dch/repos/dch"));
     app.post_notice("ワイドゴ通知".to_string());
-    let terminal = render_to_buffer(&mut app, 80, 26);
-    let rows = row_texts(&terminal);
+    let rows = rendered_rows(&mut app, 80, 26);
     let shared = rows
         .iter()
         .find(|row| row.contains("repos/dch"))
@@ -13564,8 +13495,7 @@ fn a_published_retirement_drops_only_the_pending_rows() {
             ("done".to_string(), "the finished work".to_string()),
         ]);
     }
-    let terminal = render_to_buffer(&mut app, 80, 30);
-    let rows = row_texts(&terminal);
+    let rows = rendered_rows(&mut app, 80, 30);
     assert_eq!(
         rows.iter()
             .filter(|row| row.contains("the filed idea"))
@@ -13618,8 +13548,7 @@ fn a_reborn_id_survives_its_stale_retirement() {
             {"id":"owed","subject":"the owed work","status":"in_progress"}
         ]}"#,
     );
-    let terminal = render_to_buffer(&mut app, 80, 30);
-    let rows = row_texts(&terminal);
+    let rows = rendered_rows(&mut app, 80, 30);
     assert!(
         rows.iter()
             .any(|row| row.contains("\u{2610} the reborn task")),
@@ -13666,8 +13595,7 @@ fn a_reborn_row_of_the_same_id_and_subject_survives_its_stale_retirement() {
             {"id":"owed","subject":"the owed work","status":"in_progress"}
         ]}"#,
     );
-    let terminal = render_to_buffer(&mut app, 80, 30);
-    let rows = row_texts(&terminal);
+    let rows = rendered_rows(&mut app, 80, 30);
     assert!(
         rows.iter()
             .any(|row| row.contains("\u{2610} the filed idea")),
@@ -13707,8 +13635,7 @@ fn a_multiline_subject_retires_through_its_whole_wording() {
         "idea".to_string(),
         "the filed wording\nand its second line".to_string(),
     )]);
-    let terminal = render_to_buffer(&mut app, 80, 30);
-    let rows = row_texts(&terminal);
+    let rows = rendered_rows(&mut app, 80, 30);
     assert_eq!(
         rows.iter()
             .filter(|row| row.contains("the filed wording"))
@@ -13748,8 +13675,7 @@ fn a_notice_that_fills_the_row_leaves_the_place_no_cell() {
         "the fixture's width is the contract: one cell short of the row"
     );
     app.post_notice(notice.to_string());
-    let terminal = render_to_buffer(&mut app, 40, 26);
-    let rows = row_texts(&terminal);
+    let rows = rendered_rows(&mut app, 40, 26);
     let notice_row = rows
         .iter()
         .find(|row| row.contains(notice))
@@ -13796,10 +13722,11 @@ fn tab_after_arrows_applies_from_the_arrow_position() {
     for glyph in "/theme ".chars() {
         app.handle_event(&plain(KeyCode::Char(glyph)));
     }
-    // Two arrows land on index 2 (nord).
+    // Three arrows land on index 3 (nord).
     app.handle_event(&key(KeyCode::Down, KeyModifiers::NONE));
     app.handle_event(&key(KeyCode::Down, KeyModifiers::NONE));
-    // Tab applies the next row (index 3 = tokyo_night).
+    app.handle_event(&key(KeyCode::Down, KeyModifiers::NONE));
+    // Tab applies the next row (index 4 = tokyo_night).
     app.handle_event(&key(KeyCode::Tab, KeyModifiers::NONE));
     assert_eq!(
         app.input(),
@@ -13880,8 +13807,7 @@ fn arrows_and_tab_interoperate_in_both_directions() {
     // highlighted one, not the list's head. The row is matched as a
     // whole trimmed line, so the composer's own copy of the candidate
     // cannot satisfy the check on its own.
-    let drawn = render_to_buffer(&mut app, 80, 24);
-    let rows = row_texts(&drawn);
+    let rows = rendered_rows(&mut app, 80, 24);
     let highlighted = cands.get(5).cloned().unwrap_or_default();
     assert!(
         rows.iter().any(|r| r.trim() == highlighted),

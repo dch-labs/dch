@@ -1,6 +1,25 @@
 //! Composition layer wiring `loopctl`, `dch-tools`, and `dch-config` into the `dch` loop.
 
 #![warn(missing_docs)]
+// Tests assert on internals and fixtures: panicking helpers,
+// `unwrap` and `expect` on states the fixture itself built, and
+// docs-free test fns are the test canon, so the denied-lint set
+// stands down for the whole crate under `cfg(test)` — one
+// justification, in one place, instead of one per module.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::arithmetic_side_effects,
+        clippy::expect_used,
+        clippy::field_reassign_with_default,
+        clippy::indexing_slicing,
+        clippy::let_underscore_must_use,
+        clippy::missing_errors_doc,
+        clippy::missing_panics_doc,
+        clippy::panic,
+        clippy::unwrap_used,
+    )
+)]
 
 pub mod console_observer;
 pub mod context_probe;

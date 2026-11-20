@@ -566,18 +566,6 @@ pub(crate) mod test_support {
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::missing_panics_doc,
-    clippy::missing_errors_doc,
-    clippy::field_reassign_with_default,
-    clippy::indexing_slicing,
-    clippy::arithmetic_side_effects,
-    clippy::cast_possible_wrap,
-    clippy::map_unwrap_or
-)]
 mod tests {
     use super::test_support::{assert_bounded, ctx_in, tail_of};
     use super::*;

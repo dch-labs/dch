@@ -20,56 +20,25 @@ use ratatui::text::Line;
 pub(super) struct BakeOutputs {
     /// The rendered rows, in conversation order.
     ///
-    /// One entry per visual line; every index structure below keys
-    /// positions in this vector.
+    /// One entry per visual line; every index the metadata carries
+    /// keys positions in this vector.
     pub(super) lines: Vec<Line<'static>>,
 
-    /// Row spans registered under their tool-call id.
+    /// The pass's index metadata, in pass-relative rows.
     ///
-    /// Every row a foldable tool block produced maps to the call it
-    /// belongs to, so a press on any of them resolves the toggle.
-    pub(super) tool_summary_lines: HashMap<usize, String>,
-
-    /// Row spans registered under their thinking section's key.
-    ///
-    /// The completed thinking sections' fold rows, keyed the way the
-    /// tool rows are for the same press resolution.
-    pub(super) thinking_summary_lines: HashMap<usize, String>,
-
-    /// Row spans registered under their compaction notice's key.
-    ///
-    /// A notice's rows map to its message key so a press anywhere on
-    /// the notice resolves its own toggle.
-    pub(super) compaction_summary_lines: HashMap<usize, String>,
-
-    /// Each user turn's row span, with its mark row.
-    ///
-    /// `(tint_start, turn_end, mark_row)` triples: the span the
-    /// caller tints as the turn's box, and the row the prompt mark
-    /// draws on.
-    pub(super) user_turn_ranges: Vec<(usize, usize, usize)>,
-
-    /// The rows where submitted prompts' texts begin.
-    ///
-    /// One entry per user message the user actually sent — steered
-    /// and unsent rows stay out — at the row the prompt's first text
-    /// line lands on.
-    pub(super) user_prompt_marks: Vec<usize>,
-
-    /// The row spans of the conversation's inline todo blocks.
-    ///
-    /// Whole-block ranges, so the scroll can keep an inline plan
-    /// render visible in full or not at all.
-    pub(super) todo_block_ranges: Vec<std::ops::Range<usize>>,
+    /// The same shape the baked prefix keeps: a pass fills it beside
+    /// its rows and the frame adopts or rebases it whole, so the
+    /// field set lives once.
+    pub(super) meta: BakeMeta,
 }
 
 /// The bake's own index metadata, in bake-absolute rows.
 ///
-/// What [`BakeOutputs`] carries for one render pass, kept for the
-/// baked prefix alone: the index structures the frame's merged view
+/// The shape [`BakeOutputs`] embeds for one render pass, kept for
+/// the baked prefix alone: the index structures the frame's merged view
 /// products are rebuilt from every frame, each rebased by the bake's
 /// line count before the painters or the click paths ever see them.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(super) struct BakeMeta {
     /// Row spans registered under their tool-call id.
     ///
@@ -108,6 +77,69 @@ pub(super) struct BakeMeta {
     /// Whole-block ranges in bake-absolute rows, for the scroll's
     /// whole-or-nothing todo-block rule.
     pub(super) todo_block_ranges: Vec<std::ops::Range<usize>>,
+}
+
+impl BakeMeta {
+    /// Adopt a completed pass's metadata into the baked prefix's.
+    ///
+    /// The incremental bake's tail handshake: a pass's indexes land
+    /// after the rows they name, so its maps extend the baked ones
+    /// and its spans append.
+    pub(super) fn adopt(&mut self, pass: BakeMeta) {
+        self.tool_summary_lines.extend(pass.tool_summary_lines);
+        self.thinking_summary_lines
+            .extend(pass.thinking_summary_lines);
+        self.compaction_summary_lines
+            .extend(pass.compaction_summary_lines);
+        self.user_turn_ranges.extend(pass.user_turn_ranges);
+        self.user_prompt_marks.extend(pass.user_prompt_marks);
+        self.todo_block_ranges.extend(pass.todo_block_ranges);
+    }
+
+    /// The frame's merged indexes: the baked prefix's plus the tail's,
+    /// rebased past the prefix's rows.
+    ///
+    /// Every tail index is pass-relative; `tail_base` is the prefix's
+    /// row count, and each entry shifts by it onto the merged line
+    /// space the frame's products read.
+    pub(super) fn merged_over(self, tail: BakeMeta, tail_base: usize) -> Self {
+        let mut merged = self;
+        for (index, id) in tail.tool_summary_lines {
+            merged
+                .tool_summary_lines
+                .insert(index.saturating_add(tail_base), id);
+        }
+        for (index, id) in tail.thinking_summary_lines {
+            merged
+                .thinking_summary_lines
+                .insert(index.saturating_add(tail_base), id);
+        }
+        for (index, id) in tail.compaction_summary_lines {
+            merged
+                .compaction_summary_lines
+                .insert(index.saturating_add(tail_base), id);
+        }
+        merged
+            .user_turn_ranges
+            .extend(tail.user_turn_ranges.into_iter().map(|(start, end, mark)| {
+                (
+                    start.saturating_add(tail_base),
+                    end.saturating_add(tail_base),
+                    mark.saturating_add(tail_base),
+                )
+            }));
+        merged.user_prompt_marks.extend(
+            tail.user_prompt_marks
+                .into_iter()
+                .map(|mark| mark.saturating_add(tail_base)),
+        );
+        merged
+            .todo_block_ranges
+            .extend(tail.todo_block_ranges.into_iter().map(|range| {
+                range.start.saturating_add(tail_base)..range.end.saturating_add(tail_base)
+            }));
+        merged
+    }
 }
 
 /// The composer's cached wrap.

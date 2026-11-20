@@ -361,15 +361,6 @@ pub fn no_matches_message(pattern: &str) -> ToolOutput {
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::missing_panics_doc,
-    clippy::missing_errors_doc,
-    clippy::indexing_slicing,
-    clippy::arithmetic_side_effects
-)]
 mod tests {
     use super::*;
     use crate::regex_cache::clear_cache;

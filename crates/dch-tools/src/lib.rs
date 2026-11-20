@@ -8,6 +8,31 @@
 //! root — lives in loopctl's `FileSession`, attached beside it per dispatch.
 
 #![warn(missing_docs)]
+// Tests assert on internals and fixtures: panicking helpers,
+// `unwrap` and `expect` on states the fixture itself built, and
+// docs-free test fns are the test canon, so the denied-lint set
+// stands down for the whole crate under `cfg(test)` — one
+// justification, in one place, instead of one per module.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::arithmetic_side_effects,
+        clippy::cast_possible_wrap,
+        clippy::expect_used,
+        clippy::field_reassign_with_default,
+        clippy::format_collect,
+        clippy::indexing_slicing,
+        clippy::let_underscore_must_use,
+        clippy::map_unwrap_or,
+        clippy::missing_errors_doc,
+        clippy::missing_panics_doc,
+        clippy::must_use_candidate,
+        clippy::panic,
+        clippy::redundant_closure_for_method_calls,
+        clippy::too_many_lines,
+        clippy::unwrap_used,
+    )
+)]
 
 pub mod ask;
 pub mod bash;

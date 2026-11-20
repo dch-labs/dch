@@ -685,16 +685,6 @@ pub(crate) fn section_lines(
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::missing_panics_doc,
-    clippy::missing_errors_doc,
-    clippy::indexing_slicing,
-    clippy::arithmetic_side_effects,
-    clippy::let_underscore_must_use
-)]
 mod tests {
     use super::*;
 
@@ -1165,9 +1155,7 @@ Summary: 9 pending, 1 in progress, 2 completed\n\n\
     }
 }
 
-// Test code panics by design — its asserts are the assertions.
 #[cfg(test)]
-#[allow(clippy::missing_panics_doc)]
 mod long_subject_wrap {
     use super::*;
 
@@ -1237,18 +1225,7 @@ mod long_subject_wrap {
     }
 }
 
-// Test code panics by design — its asserts are the assertions.
 #[cfg(test)]
-#[allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::missing_panics_doc,
-    clippy::missing_errors_doc,
-    clippy::indexing_slicing,
-    clippy::arithmetic_side_effects,
-    clippy::let_underscore_must_use
-)]
 mod review_2026_11_01_round {
     use super::*;
 

@@ -679,14 +679,6 @@ fn skip_js_string(quote: char, chars: &mut std::iter::Peekable<std::str::Chars<'
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::unwrap_used,
-    clippy::missing_panics_doc,
-    clippy::missing_errors_doc,
-    clippy::format_collect,
-    clippy::indexing_slicing,
-    clippy::let_underscore_must_use
-)]
 mod tests {
     use super::*;
     use loopctl::tool::Tool as _;

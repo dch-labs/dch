@@ -667,12 +667,6 @@ pub(crate) fn assert_listeners_install() {
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::missing_panics_doc
-)]
 mod tests {
     use super::*;
 

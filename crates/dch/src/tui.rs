@@ -3288,16 +3288,6 @@ async fn drive_submissions(
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::missing_panics_doc,
-    clippy::missing_errors_doc,
-    clippy::indexing_slicing,
-    clippy::arithmetic_side_effects,
-    clippy::let_underscore_must_use
-)]
 mod tests {
     use super::*;
     use clap::Parser as _;
@@ -4200,6 +4190,26 @@ mod tests {
         handle
     }
 
+    /// Spawn the driver over a parked transcript.
+    ///
+    /// The rig every driver test stands up, one line instead of
+    /// seven; no test asserts on the save lane, so the transcript is
+    /// parked in every spawn.
+    fn spawn_driver(
+        runner: dch_loop::Runner,
+        receiver: mpsc::UnboundedReceiver<Submission>,
+        state: TuiObserverState,
+        shutting_down: Arc<AtomicBool>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(drive_submissions(
+            runner,
+            receiver,
+            state,
+            shutting_down,
+            parked_transcript(),
+        ))
+    }
+
     /// A config whose provider endpoint refuses connections on the
     /// loopback interface.
     ///
@@ -4529,13 +4539,7 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         let flag = shutdown_flag(false);
 
-        let driver = tokio::spawn(drive_submissions(
-            runner,
-            rx,
-            state.clone(),
-            Arc::clone(&flag),
-            parked_transcript(),
-        ));
+        let driver = spawn_driver(runner, rx, state.clone(), Arc::clone(&flag));
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         queue_prompt(&state, &tx, "late");
         flag.store(true, Ordering::SeqCst);
@@ -8660,13 +8664,7 @@ mod tests {
         queue_prompt(&state, &tx, "queued behind the cancel");
         drop(tx);
 
-        let driver = tokio::spawn(drive_submissions(
-            runner,
-            rx,
-            state.clone(),
-            shutdown_flag(false),
-            parked_transcript(),
-        ));
+        let driver = spawn_driver(runner, rx, state.clone(), shutdown_flag(false));
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         cancel.cancel();
 
@@ -8742,13 +8740,7 @@ mod tests {
         queue_prompt(&state, &tx, "do the thing");
         drop(tx);
 
-        let driver = tokio::spawn(drive_submissions(
-            runner,
-            rx,
-            state.clone(),
-            shutdown_flag(false),
-            parked_transcript(),
-        ));
+        let driver = spawn_driver(runner, rx, state.clone(), shutdown_flag(false));
         let _ = tokio::time::timeout(std::time::Duration::from_secs(15), driver).await;
 
         let echoes = claimed(&state);
@@ -8788,13 +8780,7 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         let id = queue_prompt(&state, &tx, "a prompt");
         let down = shutdown_flag(false);
-        let driver = tokio::spawn(drive_submissions(
-            runner,
-            rx,
-            state.clone(),
-            Arc::clone(&down),
-            parked_transcript(),
-        ));
+        let driver = spawn_driver(runner, rx, state.clone(), Arc::clone(&down));
         for _ in 0..1800 {
             if state.live_claim.load(Ordering::SeqCst) == id {
                 break;
@@ -8857,13 +8843,7 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         queue_prompt(&state, &tx, "the prompt");
         let down = shutdown_flag(false);
-        let driver = tokio::spawn(drive_submissions(
-            runner,
-            rx,
-            state.clone(),
-            Arc::clone(&down),
-            parked_transcript(),
-        ));
+        let driver = spawn_driver(runner, rx, state.clone(), Arc::clone(&down));
         for _ in 0..1800 {
             if server.request_count() >= 3 {
                 break;
@@ -8924,13 +8904,7 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         let id = queue_prompt(&state, &tx, "the wording that went out");
         let down = shutdown_flag(false);
-        let driver = tokio::spawn(drive_submissions(
-            runner,
-            rx,
-            state.clone(),
-            Arc::clone(&down),
-            parked_transcript(),
-        ));
+        let driver = spawn_driver(runner, rx, state.clone(), Arc::clone(&down));
         for _ in 0..1800 {
             if state.live_claim.load(Ordering::SeqCst) == id {
                 break;
@@ -8991,13 +8965,7 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         let id = queue_prompt(&state, &tx, "the wording that went out");
         let down = shutdown_flag(false);
-        let driver = tokio::spawn(drive_submissions(
-            runner,
-            rx,
-            state.clone(),
-            Arc::clone(&down),
-            parked_transcript(),
-        ));
+        let driver = spawn_driver(runner, rx, state.clone(), Arc::clone(&down));
         for _ in 0..1800 {
             if state.live_claim.load(Ordering::SeqCst) == id {
                 break;
@@ -9102,13 +9070,7 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         let running = queue_prompt(&state, &tx, "the wording that went out");
         let down = shutdown_flag(false);
-        let driver = tokio::spawn(drive_submissions(
-            runner,
-            rx,
-            state.clone(),
-            Arc::clone(&down),
-            parked_transcript(),
-        ));
+        let driver = spawn_driver(runner, rx, state.clone(), Arc::clone(&down));
         for _ in 0..1800 {
             if state.live_claim.load(Ordering::SeqCst) == running {
                 break;
@@ -9182,13 +9144,7 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         queue_prompt(&state, &tx, "the prompt that ran");
         drop(tx);
-        let driver = tokio::spawn(drive_submissions(
-            runner,
-            rx,
-            state.clone(),
-            shutdown_flag(false),
-            parked_transcript(),
-        ));
+        let driver = spawn_driver(runner, rx, state.clone(), shutdown_flag(false));
         for _ in 0..1800 {
             if server.request_count() >= 1 {
                 break;
@@ -9254,13 +9210,7 @@ mod tests {
         queue_prompt(&state, &tx, "the prompt that ran");
         drop(tx);
         let down = shutdown_flag(false);
-        let driver = tokio::spawn(drive_submissions(
-            runner,
-            rx,
-            state.clone(),
-            Arc::clone(&down),
-            parked_transcript(),
-        ));
+        let driver = spawn_driver(runner, rx, state.clone(), Arc::clone(&down));
         for _ in 0..1800 {
             if server.request_count() >= 1 {
                 break;
@@ -9315,13 +9265,7 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         queue_prompt(&state, &tx, "the prompt in flight");
         let down = shutdown_flag(false);
-        let driver = tokio::spawn(drive_submissions(
-            runner,
-            rx,
-            state.clone(),
-            Arc::clone(&down),
-            parked_transcript(),
-        ));
+        let driver = spawn_driver(runner, rx, state.clone(), Arc::clone(&down));
         for _ in 0..1800 {
             if state.live_claim.load(Ordering::SeqCst) != u64::MAX {
                 break;
@@ -9409,13 +9353,7 @@ mod tests {
         let cancel = runner.cancel_signal();
         let (tx, rx) = mpsc::unbounded_channel();
         let superseded_id = queue_prompt(&state, &tx, "the wording that went out");
-        let driver = tokio::spawn(drive_submissions(
-            runner,
-            rx,
-            state.clone(),
-            shutdown_flag(false),
-            parked_transcript(),
-        ));
+        let driver = spawn_driver(runner, rx, state.clone(), shutdown_flag(false));
         // The nudge is provably the request in flight: the server has
         // read it and is holding its answer.
         for _ in 0..1800 {
@@ -9508,13 +9446,7 @@ mod tests {
         queue_prompt(&state, &tx, "do the thing");
         drop(tx);
 
-        let driver = tokio::spawn(drive_submissions(
-            runner,
-            rx,
-            state.clone(),
-            shutdown_flag(false),
-            parked_transcript(),
-        ));
+        let driver = spawn_driver(runner, rx, state.clone(), shutdown_flag(false));
         // Wait for the driver to drain: the run, reminder turn included,
         // completes against its canned turns.
         let _ = tokio::time::timeout(std::time::Duration::from_secs(15), driver).await;
@@ -9583,13 +9515,7 @@ mod tests {
         }
         let (tx, rx) = mpsc::unbounded_channel();
         queue_prompt(&state, &tx, "first");
-        let driver = tokio::spawn(drive_submissions(
-            runner,
-            rx,
-            state.clone(),
-            shutdown_flag(false),
-            parked_transcript(),
-        ));
+        let driver = spawn_driver(runner, rx, state.clone(), shutdown_flag(false));
         // The spared first claim settles before the wake under test
         // registers: one request made and no live claim left means the
         // first run is done, so the listener can only fire on the
@@ -9672,13 +9598,7 @@ mod tests {
         let id = queue_prompt(&state, &tx, "slow");
         drop(tx);
 
-        let driver = tokio::spawn(drive_submissions(
-            runner,
-            rx,
-            state.clone(),
-            shutdown_flag(false),
-            parked_transcript(),
-        ));
+        let driver = spawn_driver(runner, rx, state.clone(), shutdown_flag(false));
         let mut named = false;
         for _ in 0..1800 {
             if state.live_claim.load(Ordering::SeqCst) == id {
@@ -10028,13 +9948,7 @@ mod tests {
         let (_, state) = TuiObserverState::new().into_observer();
         let (tx, rx) = mpsc::unbounded_channel();
         let id = queue_prompt(&state, &tx, "the running prompt");
-        let driver = tokio::spawn(drive_submissions(
-            runner,
-            rx,
-            state.clone(),
-            shutdown_flag(false),
-            parked_transcript(),
-        ));
+        let driver = spawn_driver(runner, rx, state.clone(), shutdown_flag(false));
         let mut live = false;
         for _ in 0..1800 {
             if state.live_claim.load(Ordering::SeqCst) == id {
@@ -10149,13 +10063,7 @@ mod tests {
         let foreign = queue_prompt(&state, &tx, "an older prompt's wording");
         let live = queue_prompt(&state, &tx, "the claim in flight");
         let _ = foreign;
-        let driver = tokio::spawn(drive_submissions(
-            runner,
-            rx,
-            state.clone(),
-            shutdown_flag(false),
-            parked_transcript(),
-        ));
+        let driver = spawn_driver(runner, rx, state.clone(), shutdown_flag(false));
         for _ in 0..1800 {
             if state.live_claim.load(Ordering::SeqCst) == live {
                 break;
@@ -10244,13 +10152,7 @@ mod tests {
         // The live prompt files the plan; its id rides last_claim
         // through the nudge without the test naming it.
         queue_prompt(&state, &tx, "the claim in flight");
-        let driver = tokio::spawn(drive_submissions(
-            runner,
-            rx,
-            state.clone(),
-            shutdown_flag(false),
-            parked_transcript(),
-        ));
+        let driver = spawn_driver(runner, rx, state.clone(), shutdown_flag(false));
         for _ in 0..1800 {
             if server.request_count() >= 4 {
                 break;
@@ -10369,13 +10271,7 @@ mod tests {
         assert_eq!(ids.len(), 2, "both prompts wait under the open edit");
         let later_id = ids[1];
 
-        let driver = tokio::spawn(drive_submissions(
-            runner,
-            rx,
-            state.clone(),
-            shutdown_flag(false),
-            parked_transcript(),
-        ));
+        let driver = spawn_driver(runner, rx, state.clone(), shutdown_flag(false));
         // A lands; the later prompt becomes the turn in flight — the
         // delay holds each answer long enough that the claim is
         // observably live.
@@ -10488,13 +10384,7 @@ mod tests {
         let (_, state) = TuiObserverState::new().into_observer();
         let (tx, rx) = mpsc::unbounded_channel();
         let superseded_id = queue_prompt(&state, &tx, "the wording that went out");
-        let driver = tokio::spawn(drive_submissions(
-            runner,
-            rx,
-            state.clone(),
-            shutdown_flag(false),
-            parked_transcript(),
-        ));
+        let driver = spawn_driver(runner, rx, state.clone(), shutdown_flag(false));
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         // The display's exact order: the correction is sent, then the
         // cancel is raised beside it.
@@ -10862,13 +10752,7 @@ mod tests {
         let edited = queue_prompt(&state, &tx, "the wording first typed");
         drop(tx);
 
-        let driver = tokio::spawn(drive_submissions(
-            runner,
-            rx,
-            state.clone(),
-            shutdown_flag(false),
-            parked_transcript(),
-        ));
+        let driver = spawn_driver(runner, rx, state.clone(), shutdown_flag(false));
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(
             state
@@ -10935,13 +10819,7 @@ mod tests {
         correct_prompt(&tx, running, "the question as corrected");
         drop(tx);
 
-        let driver = tokio::spawn(drive_submissions(
-            runner,
-            rx,
-            state.clone(),
-            shutdown_flag(false),
-            parked_transcript(),
-        ));
+        let driver = spawn_driver(runner, rx, state.clone(), shutdown_flag(false));
         tokio::time::timeout(std::time::Duration::from_secs(30), driver)
             .await
             .expect("the run and the correction settle without hanging")
@@ -10997,13 +10875,7 @@ mod tests {
         let first = queue_prompt(&state, &tx, "the first question");
         queue_prompt(&state, &tx, "the second question");
 
-        let driver = tokio::spawn(drive_submissions(
-            runner,
-            rx,
-            state.clone(),
-            shutdown_flag(false),
-            parked_transcript(),
-        ));
+        let driver = spawn_driver(runner, rx, state.clone(), shutdown_flag(false));
         // Both turns settle while the channel is still open, so the
         // correction provably arrives after a later prompt has been claimed.
         tokio::time::sleep(std::time::Duration::from_millis(900)).await;
@@ -11070,13 +10942,7 @@ mod tests {
         correct_prompt(&tx, running, "the fixed wording");
         drop(tx);
 
-        let driver = tokio::spawn(drive_submissions(
-            runner,
-            rx,
-            state.clone(),
-            shutdown_flag(false),
-            parked_transcript(),
-        ));
+        let driver = spawn_driver(runner, rx, state.clone(), shutdown_flag(false));
         // The settled moment every long-delay cancel test presses at:
         // the run is provably mid-request on an answer that is not
         // coming inside this test's lifetime.
@@ -11268,13 +11134,7 @@ mod tests {
         correct_prompt(&tx, running, "the question as corrected");
         drop(tx);
 
-        let driver = tokio::spawn(drive_submissions(
-            runner,
-            rx,
-            state.clone(),
-            shutdown_flag(false),
-            parked_transcript(),
-        ));
+        let driver = spawn_driver(runner, rx, state.clone(), shutdown_flag(false));
         tokio::time::timeout(std::time::Duration::from_secs(60), driver)
             .await
             .expect("the run and the correction settle without hanging")

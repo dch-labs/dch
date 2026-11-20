@@ -310,16 +310,6 @@ fn render(matches: &[Match], pattern: &str, context_lines: usize, temp_dir: &Pat
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::missing_panics_doc,
-    clippy::missing_errors_doc,
-    clippy::field_reassign_with_default,
-    clippy::indexing_slicing,
-    clippy::too_many_lines
-)]
 mod tests {
     use super::*;
     use crate::context::RunnerContext;

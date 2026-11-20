@@ -10,13 +10,15 @@ use ratatui::style::{Color, Style};
 
 pub(crate) mod theme_data;
 
-/// The tree-sitter capture names, in [`SyntaxTheme::syntax_colors`] slot
+/// The tree-sitter capture names, in [`crate::markdown::SyntaxTheme::emit_order_colors`] slot
 /// order.
 ///
 /// This list is the contract between the palette and any syntax
 /// highlighter: the highlighter's capture-name list must match it slot for
-/// slot, and `syntax_colors` indexes the palette by exactly this order —
-/// a name list that drifts from it miscolors every theme silently, which
+/// slot, and
+/// [`emit_order_colors`](crate::markdown::SyntaxTheme::emit_order_colors)
+/// projects the palette by exactly this order — a name list that drifts
+/// from it miscolors every theme silently, which
 /// is why the two live together here.
 pub const HIGHLIGHT_NAMES: [&str; 18] = [
     "attribute",
@@ -45,22 +47,22 @@ pub const HIGHLIGHT_NAMES: [&str; 18] = [
 /// Construct via [`Theme::by_name`] or [`Default::default`]; every field is
 /// public, so a custom palette can also be assembled as a plain struct
 /// literal. Themes are value types with no behavior beyond
-/// [`SyntaxTheme::syntax_colors`]; rendering logic lives with the
+/// [`crate::markdown::SyntaxTheme::emit_order_colors`]; rendering logic lives with the
 /// components that draw.
 #[derive(Debug, Clone)]
 pub struct Theme {
     /// The theme's display name, as rendered in UI and diagnostics.
     ///
-    /// Matches the constructor's conventional spelling ("Dracula", "Gruvbox
+    /// Matches the spec's conventional spelling ("Dracula", "Gruvbox
     /// Dark") and is independent of the lowercase lookup key used by
     /// [`Theme::by_name`]. Static because every theme is compiled-in data —
-    /// a theme cannot be built with a name its constructor does not carry.
+    /// a theme cannot be built with a name its spec does not carry.
     pub name: &'static str,
 
     /// Colors for the tree-sitter captures highlighted inside code blocks.
     ///
     /// Projected into the highlighter's emit order by
-    /// [`SyntaxTheme::syntax_colors`]; each field tunes one capture class.
+    /// [`crate::markdown::SyntaxTheme::emit_order_colors`]; each field tunes one capture class.
     pub syntax: SyntaxTheme,
 
     /// Styles for each markdown element the renderer distinguishes.
@@ -80,7 +82,7 @@ pub struct Theme {
 ///
 /// One field per core capture the theme author can tune. The field set is
 /// richer than what the highlighter currently indexes — see
-/// [`syntax_colors`](Self::syntax_colors) for the projection into the
+/// [`emit_order_colors`](crate::markdown::SyntaxTheme::emit_order_colors) for the projection into the
 /// highlighter's emit order.
 #[derive(Debug, Clone)]
 pub struct SyntaxTheme {
@@ -206,46 +208,6 @@ pub struct SyntaxTheme {
     pub escape: Color,
 }
 
-impl SyntaxTheme {
-    /// Project the palette into the `[Color; 18]` array the highlighter
-    /// indexes.
-    ///
-    /// The index order is the highlighter's `HIGHLIGHT_NAMES` emit order:
-    /// attribute, constant, function.builtin, function, keyword, operator,
-    /// property, punctuation, punctuation.bracket, punctuation.delimiter,
-    /// string, string.special, tag, type, type.builtin, variable,
-    /// variable.builtin, variable.parameter. Captures the highlighter folds
-    /// together share a field (`function.builtin` renders as `function`);
-    /// four palette entries (`comment`, `constructor`, `embedded`, `number`)
-    /// are not indexed today and remain as palette entries for richer custom
-    /// rendering. The order is [`HIGHLIGHT_NAMES`]: the list a syntax
-    /// highlighter must adopt verbatim as its capture-name order, so the
-    /// palette and the highlighter cannot drift apart silently.
-    #[must_use]
-    pub fn syntax_colors(&self) -> [Color; 18] {
-        [
-            self.attribute,
-            self.constant,
-            self.function,
-            self.function,
-            self.keyword,
-            self.operator,
-            self.property,
-            self.punctuation,
-            self.punctuation,
-            self.delimiter,
-            self.string,
-            self.escape,
-            self.tag,
-            self.r#type,
-            self.r#type,
-            self.variable,
-            self.variable_builtin,
-            self.variable,
-        ]
-    }
-}
-
 /// Styles for each markdown element the renderer distinguishes.
 ///
 /// Unlike [`UIStyle`], these carry full [`Style`] values — modifiers such as
@@ -302,14 +264,15 @@ pub struct MarkdownTheme {
 
     /// Style for inline code rendered inside running text.
     ///
-    /// Shipped palettes pair a tinted background with an accent foreground
-    /// so code reads as a distinct register without breaking the line.
+    /// Shipped palettes carry an accent foreground on the regular
+    /// background so code reads as a distinct register without
+    /// breaking the line.
     pub code_inline: Style,
 
     /// Style for fenced code blocks.
     ///
     /// The block's base style; token colors layer on top of it from the
-    /// syntax palette via [`SyntaxTheme::syntax_colors`].
+    /// syntax palette via [`crate::markdown::SyntaxTheme::emit_order_colors`].
     pub code_block: Style,
 
     /// Style for links.
@@ -492,12 +455,13 @@ pub struct UIStyle {
 impl Theme {
     /// Look up a theme by name, returning `None` when unknown.
     ///
-    /// Lookup keys are the constructor identifiers (`dracula`,
+    /// Lookup keys are the registry keys (`dracula`,
     /// `gruvbox_dark`), matched case-insensitively with whitespace runs
     /// folding to underscores — so the display spelling (`"Gruvbox Dark"`)
     /// resolves the same as the identifier, however it is spaced or cased.
-    /// The `"default"` key aliases [`Default::default`]. Every constructor is
-    /// reachable through this table.
+    /// The `"dch"` key names the fallback palette. Every spec is
+    /// reachable through this table, and retired keys resolve through
+    /// [`Theme::key_for_name`]'s aliases.
     ///
     /// An unknown name is the caller's problem to report: callers should
     /// log a warning naming the unknown theme and fall back to
@@ -506,10 +470,10 @@ impl Theme {
     #[must_use]
     pub fn by_name(name: &str) -> Option<Self> {
         let key = Self::key_for_name(name)?;
-        theme_data::THEME_CONSTRUCTORS
+        theme_data::THEME_SPECS
             .iter()
             .find(|(known, _)| *known == key)
-            .map(|(_, constructor)| constructor())
+            .map(|(_, spec)| spec.build())
     }
 
     /// The registry key a name resolves to, when it resolves at all.
@@ -527,47 +491,57 @@ impl Theme {
             .split_whitespace()
             .collect::<Vec<_>>()
             .join("_");
-        theme_data::THEME_CONSTRUCTORS
+        if let Some((canonical, _)) = theme_data::THEME_SPECS
             .iter()
             .find(|(known, _)| *known == key)
-            .map(|(known, _)| *known)
+        {
+            return Some(*canonical);
+        }
+        theme_data::THEME_ALIASES
+            .iter()
+            .find(|(alias, _)| *alias == key)
+            .map(|(_, canonical)| *canonical)
     }
 
     /// The display names every compiled-in theme answers to, in registry order.
     ///
-    /// Reads the same constructor table [`Theme::by_name`] resolves through,
+    /// Reads the same spec table [`Theme::by_name`] resolves through,
     /// so the list is exactly the set of names that resolve — never a separate
     /// copy that could fall out of step as themes are added or removed. The
     /// names are the display spelling (`"Gruvbox Dark"`) rather than the
     /// lowercase lookup key, which is what a user of `/theme` reads and types,
     /// and [`Theme::by_name`] folds case and whitespace so this spelling still
-    /// resolves. Intended as a completion source; it evaluates every
-    /// constructor, so a caller reaching it on every keypress should cache the
-    /// result rather than call it in a hot path.
+    /// resolves. Intended as a completion source; it reads only the table's
+    /// display labels — it builds no palettes — so a caller may reach it on
+    /// every keypress.
     #[must_use]
     pub fn names() -> Vec<&'static str> {
-        theme_data::THEME_CONSTRUCTORS
+        theme_data::THEME_SPECS
             .iter()
-            .map(|(_, constructor)| constructor().name)
+            .map(|(_, spec)| spec.name)
             .collect()
     }
 
     /// The canonical command spelling of every compiled-in theme.
     ///
-    /// These are the lookup identifiers — `default`, `nord`, `gruvbox_dark`,
-    /// `tokyo_night` — the spellings a well-formed config file carries under
+    /// These are the lookup identifiers — `dch`, `opencode`, `nord`,
+    /// `gruvbox_dark`, `tokyo_night` — the spellings a well-formed config
+    /// file carries under
     /// `theme =` (the loader itself takes any string; these are the words it
     /// resolves) and the exact strings [`Theme::by_name`] matches, so what a
     /// user sees listed by `/themes` or offered by `/theme <Tab>` is
-    /// precisely what they then type. Distinct from [`Theme::names`], which
+    /// precisely what they then type. Retired spellings (`default`)
+    /// resolve through the alias table [`Theme::key_for_name`] walks
+    /// but never appear here. Distinct from [`Theme::names`], which
     /// returns the pretty display spelling (`"Gruvbox Dark"`) the palette is
     /// *labelled* by. Because
-    /// the keys are stored beside their constructors, this reads only the
-    /// table's identifiers — it builds no palettes — so it is cheap enough to
+    /// the keys sit in the compile-time registry beside their palette
+    /// specs, this reads only the table's identifiers — it builds no
+    /// palettes — so it is cheap enough to
     /// call on every keypress, unlike [`Theme::names`].
     #[must_use]
     pub fn command_names() -> Vec<&'static str> {
-        theme_data::THEME_CONSTRUCTORS
+        theme_data::THEME_SPECS
             .iter()
             .map(|(key, _)| *key)
             .collect()
@@ -666,13 +640,6 @@ impl From<&Theme> for crate::markdown::SyntaxTheme {
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::missing_panics_doc,
-    clippy::arithmetic_side_effects
-)]
 mod tests {
     use super::*;
     use ratatui::style::Modifier;
@@ -682,7 +649,7 @@ mod tests {
         // `by_name` resolves with `find`, so a duplicated key would
         // silently shadow: only the first row would ever resolve. The keys
         // must be pairwise distinct for every row to be reachable.
-        let keys: Vec<&str> = theme_data::THEME_CONSTRUCTORS
+        let keys: Vec<&str> = theme_data::THEME_SPECS
             .iter()
             .map(|(key, _)| *key)
             .collect();
@@ -696,7 +663,7 @@ mod tests {
         // what `/themes` lists, `/theme <Tab>` offers, and `by_name` accepts —
         // distinct from the pretty display name (`"Gruvbox Dark"`).
         let commands = Theme::command_names();
-        assert!(commands.contains(&"default"));
+        assert!(commands.contains(&"opencode"));
         assert!(commands.contains(&"gruvbox_dark"));
         // Not display spellings: no spaces, no capitals.
         assert!(
@@ -721,7 +688,7 @@ mod tests {
         // The completion source for `/theme` must be exactly the set that
         // `by_name` resolves, in the same order, and spelled so it resolves.
         let names = Theme::names();
-        assert_eq!(names.len(), theme_data::THEME_CONSTRUCTORS.len());
+        assert_eq!(names.len(), theme_data::THEME_SPECS.len());
         assert!(names.iter().all(|name| !name.is_empty()));
         for name in names {
             assert!(
@@ -760,7 +727,7 @@ mod tests {
             let b = luminance(background);
             (a.max(b) + 0.05) / (a.min(b) + 0.05)
         }
-        let theme = Theme::autumn_night();
+        let theme = Theme::by_name("autumn_night").expect("the autumn night theme is registered");
         let canvas = theme.ui.background;
         let surface = theme.ui.surface;
         for (role, color) in [
@@ -808,7 +775,7 @@ mod tests {
         // own foreground while the painted pairs and accents stand.
         let theme = Theme::default();
         let anchor = theme.ui.foreground;
-        assert_eq!(anchor, Color::Rgb(242, 242, 242));
+        assert_eq!(anchor, Color::Rgb(244, 242, 209));
         let deferred = theme.deferred_to_terminal();
         assert_eq!(
             deferred.ui.foreground,
@@ -822,11 +789,19 @@ mod tests {
             Color::Reset,
             "code punctuation sits on the terminal canvas and defers"
         );
-        assert_eq!(deferred.syntax.delimiter, Color::Reset);
         assert_eq!(
-            deferred.markdown.code_block.fg,
-            Some(Color::Reset),
-            "code block text sits on the terminal canvas and defers"
+            deferred.syntax.delimiter,
+            Color::Reset,
+            "code delimiters sit on the terminal canvas and defer"
+        );
+        // The code-block text is the one anchored register the dch
+        // midpoint leaves off-anchor: opencode pinned it to the
+        // foreground, autumn_night did not, and the channel-wise
+        // average of an equal and an unequal pair is unequal — so the
+        // deferral's equality rule keeps the palette color here.
+        assert_eq!(
+            deferred.markdown.code_block.fg, theme.markdown.code_block.fg,
+            "the midpoint's code block keeps its palette color"
         );
         assert_eq!(
             deferred.ui.input_text, theme.ui.input_text,
@@ -854,7 +829,7 @@ mod tests {
     fn every_known_name_resolves() {
         // The lookup table is the single registry: every entry must resolve,
         // or `by_name` silently degraded for that key.
-        for (key, _) in theme_data::THEME_CONSTRUCTORS {
+        for (key, _) in theme_data::THEME_SPECS {
             let theme = Theme::by_name(key).unwrap_or_else(|| panic!("{key} unresolved"));
             assert!(!theme.name.is_empty(), "{key}: empty display name");
         }
@@ -865,12 +840,13 @@ mod tests {
         // The length assert makes the census exact, so a row added or
         // removed without updating this test fails here first.
         assert_eq!(
-            theme_data::THEME_CONSTRUCTORS.len(),
-            22,
+            theme_data::THEME_SPECS.len(),
+            23,
             "the registry scope moved; update this census with it"
         );
         for key in [
-            "default",
+            "dch",
+            "opencode",
             "dracula",
             "nord",
             "tokyo_night",
@@ -894,9 +870,7 @@ mod tests {
             "transparent",
         ] {
             assert!(
-                theme_data::THEME_CONSTRUCTORS
-                    .iter()
-                    .any(|(k, _)| *k == key),
+                theme_data::THEME_SPECS.iter().any(|(k, _)| *k == key),
                 "{key} must be in the registry"
             );
         }
@@ -983,36 +957,60 @@ mod tests {
     fn default_is_the_near_black_palette() {
         // The shipped default paints: an unconfigured session lands on the
         // near-black canvas, not the paintless one, so the trait
-        // resolution and the registry's `"default"` row must both be
-        // the palette constructor itself.
-        assert_eq!(Theme::default().name, "Default");
-        assert_eq!(Theme::default().syntax.keyword, Color::Rgb(149, 129, 214));
-        assert_eq!(Theme::default().ui.background, Color::Rgb(14, 14, 14));
+        // resolution and the registry's `"dch"` row must both be
+        // the palette spec itself.
+        assert_eq!(Theme::default().name, "Dch");
+        assert_eq!(Theme::default().syntax.keyword, Color::Rgb(255, 178, 0));
+        assert_eq!(Theme::default().ui.background, Color::Rgb(12, 12, 12));
         assert_eq!(
-            Theme::by_name("default").map(|theme| theme.syntax.keyword),
-            Some(Color::Rgb(149, 129, 214)),
+            Theme::by_name("dch").map(|theme| theme.syntax.keyword),
+            Some(Color::Rgb(255, 178, 0)),
             "the registry row resolves through the same palette"
         );
     }
 
     #[test]
-    fn the_default_key_aliases_the_default_theme() {
+    fn the_dch_key_resolves_the_fallback_theme() {
         assert_eq!(
-            Theme::by_name("default").map(|t| t.name),
+            Theme::by_name("dch").map(|t| t.name),
             Some(Theme::default().name)
         );
     }
 
     #[test]
-    fn syntax_colors_match_the_highlighter_names() {
+    fn the_retired_default_key_resolves_the_renamed_palette() {
+        // The rename stranded every config naming the old spelling;
+        // the alias keeps those resolving to the same palette — the
+        // one the near-black pin holds to the old default's exact
+        // colors — so an upgrade changes nothing on screen.
+        assert_eq!(Theme::key_for_name("default"), Some("opencode"));
+        assert_eq!(Theme::by_name("Default").map(|t| t.name), Some("Opencode"));
+        // The alias table stays honest: every target is a live key,
+        // and no alias shadows one.
+        for (alias, target) in theme_data::THEME_ALIASES {
+            assert!(
+                theme_data::THEME_SPECS.iter().any(|(k, _)| k == target),
+                "alias {alias} points at the missing key {target}"
+            );
+            assert!(
+                !theme_data::THEME_SPECS.iter().any(|(k, _)| k == alias),
+                "alias {alias} shadows a live key"
+            );
+        }
+    }
+
+    #[test]
+    fn emit_order_matches_the_highlighter_names() {
         // The names-versus-array pin: walking HIGHLIGHT_NAMES beside the
-        // projected array, every slot must hold the color of the field its
-        // capture name maps to — the documented folds included — so a
-        // reordered array or a drifted name list fails here instead of
-        // miscoloring every theme.
-        for (key, _) in theme_data::THEME_CONSTRUCTORS {
-            let syntax = Theme::by_name(key).unwrap().syntax;
-            let colors = syntax.syntax_colors();
+        // module projection the renderer indexes, every slot must hold
+        // the color of the field its capture name maps to — the
+        // documented folds included — so a reordered array or a drifted
+        // name list fails here instead of miscoloring every theme. The
+        // walk goes through the From bridge, so the bridge is pinned in
+        // the same pass.
+        for (key, _) in theme_data::THEME_SPECS {
+            let syntax: crate::markdown::SyntaxTheme = (&Theme::by_name(key).unwrap()).into();
+            let colors = syntax.emit_order_colors();
             for (name, color) in HIGHLIGHT_NAMES.iter().zip(colors.iter()) {
                 let expected = match *name {
                     "attribute" => syntax.attribute,
@@ -1070,7 +1068,7 @@ mod tests {
     fn scrollbar_thumb_contrasts_with_track() {
         // A thumb painted the track's own color is invisible; the pair must
         // differ in every theme or scrolling stops reading as motion.
-        for (key, _) in theme_data::THEME_CONSTRUCTORS {
+        for (key, _) in theme_data::THEME_SPECS {
             let ui = Theme::by_name(key).unwrap().ui;
             assert_ne!(
                 ui.scrollbar_thumb, ui.scrollbar_track,
@@ -1086,7 +1084,7 @@ mod tests {
         // composer stays the single raised block at the foot of the
         // screen and the status row reads as a pane of its own below
         // the prompt box.
-        for (key, _) in theme_data::THEME_CONSTRUCTORS {
+        for (key, _) in theme_data::THEME_SPECS {
             let ui = Theme::by_name(key).unwrap().ui;
             if defers_to_terminal(&ui) {
                 continue;
@@ -1106,7 +1104,7 @@ mod tests {
     fn every_theme_s_status_text_reads_on_its_bar() {
         // WCAG relative luminance: model and token counts must stay
         // legible on the canvas-colored status bar.
-        for (key, _) in theme_data::THEME_CONSTRUCTORS {
+        for (key, _) in theme_data::THEME_SPECS {
             let ui = Theme::by_name(key).unwrap().ui;
             if defers_to_terminal(&ui) {
                 continue;
@@ -1128,7 +1126,7 @@ mod tests {
         // composer's `surface`, the scrollbar's thumb and track —
         // cannot equal it: a match would render the element invisible
         // on the canvas rather than elevated or visible.
-        for (key, _) in theme_data::THEME_CONSTRUCTORS {
+        for (key, _) in theme_data::THEME_SPECS {
             let ui = Theme::by_name(key).unwrap().ui;
             if !defers_to_terminal(&ui) {
                 assert_ne!(
@@ -1157,7 +1155,7 @@ mod tests {
         // a register leaned on the terminal's default foreground
         // instead of the theme's own; this pins the theme-side half of
         // that contract for every canvas-repainting theme.
-        for (key, _) in theme_data::THEME_CONSTRUCTORS {
+        for (key, _) in theme_data::THEME_SPECS {
             let ui = Theme::by_name(key).unwrap().ui;
             if defers_to_terminal(&ui) {
                 continue;
@@ -1222,7 +1220,7 @@ mod tests {
         // for the transparent theme, whose entire contract is deferral:
         // every theme must fully specify every field of its syntax and
         // chrome palettes.
-        for (key, _) in theme_data::THEME_CONSTRUCTORS {
+        for (key, _) in theme_data::THEME_SPECS {
             let theme = Theme::by_name(key).unwrap();
             if defers_to_terminal(&theme.ui) {
                 continue;
@@ -1286,7 +1284,7 @@ mod tests {
         // Every element style except the pure-modifier ones (bold, italic)
         // must set a foreground: a bare style would render the element in
         // ambient text color, hiding a palette gap instead of surfacing it.
-        for (key, _) in theme_data::THEME_CONSTRUCTORS {
+        for (key, _) in theme_data::THEME_SPECS {
             let theme = Theme::by_name(key).unwrap();
             let markdown = theme.markdown;
             let styled = [
@@ -1320,7 +1318,7 @@ mod tests {
         // The markdown contract the renderer relies on, in every shipped
         // palette: headings are bold, emphasis is italic, links are
         // underlined.
-        for (key, _) in theme_data::THEME_CONSTRUCTORS {
+        for (key, _) in theme_data::THEME_SPECS {
             let markdown = Theme::by_name(key).unwrap().markdown;
             let headings = [
                 markdown.header1,
@@ -1348,6 +1346,160 @@ mod tests {
     }
 
     #[test]
+    fn palette_fingerprints_are_pinned() {
+        // The table rewrite's safety net: one fingerprint over each
+        // theme's complete palette — every field of all three
+        // sections; the pure-modifier styles carry no palette color
+        // and are excluded — so a single
+        // transposed or mistyped literal anywhere in theme_data
+        // fails here instead of silently recoloring a theme.
+        fn fingerprint(theme: &Theme) -> u64 {
+            /// FNV-1a over the palette's canonical bytes: one tag per
+            /// field in a fixed order, then the color's variant and
+            /// raw channels.
+            ///
+            /// Deliberately not `Debug` and not `DefaultHasher`: both
+            /// move under dependency and toolchain bumps — ratatui's
+            /// formats and std's hasher internals alike — which would
+            /// break every pin without a palette change. This encoding
+            /// depends only on the channel values the palette carries.
+            fn mix(bytes: &[u8]) -> u64 {
+                let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+                for byte in bytes {
+                    hash ^= u64::from(*byte);
+                    hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+                hash
+            }
+            fn push(tag: u8, color: Option<Color>, out: &mut Vec<u8>) {
+                out.push(tag);
+                match color {
+                    None => out.push(0x00),
+                    Some(Color::Reset) => out.push(0x01),
+                    Some(Color::Indexed(index)) => {
+                        out.push(0x02);
+                        out.push(index);
+                    }
+                    Some(Color::Rgb(red, green, blue)) => {
+                        out.push(0x03);
+                        out.extend([red, green, blue]);
+                    }
+                    Some(other) => panic!("unencodable color in a pinned palette: {other:?}"),
+                }
+            }
+            let mut bytes = Vec::new();
+            let syntax = [
+                theme.syntax.attribute,
+                theme.syntax.comment,
+                theme.syntax.constant,
+                theme.syntax.constructor,
+                theme.syntax.embedded,
+                theme.syntax.function,
+                theme.syntax.keyword,
+                theme.syntax.number,
+                theme.syntax.operator,
+                theme.syntax.property,
+                theme.syntax.punctuation,
+                theme.syntax.string,
+                theme.syntax.r#type,
+                theme.syntax.variable,
+                theme.syntax.variable_builtin,
+                theme.syntax.tag,
+                theme.syntax.delimiter,
+                theme.syntax.escape,
+            ];
+            for (tag, color) in syntax.iter().enumerate() {
+                push(u8::try_from(tag).unwrap(), Some(*color), &mut bytes);
+            }
+            let markdown = [
+                theme.markdown.header1.fg,
+                theme.markdown.header2.fg,
+                theme.markdown.header3.fg,
+                theme.markdown.header4.fg,
+                theme.markdown.header5.fg,
+                theme.markdown.header6.fg,
+                theme.markdown.code_inline.fg,
+                theme.markdown.code_block.fg,
+                theme.markdown.link.fg,
+                theme.markdown.quote.fg,
+                theme.markdown.list_item.fg,
+                theme.markdown.horizontal_rule.fg,
+            ];
+            for (tag, color) in markdown.iter().enumerate() {
+                push(
+                    u8::try_from(tag.saturating_add(18)).unwrap(),
+                    *color,
+                    &mut bytes,
+                );
+            }
+            // Bold and italic carry no palette color — pure modifiers,
+            // constant across every theme — so they are not encoded.
+            let ui = [
+                Some(theme.ui.background),
+                Some(theme.ui.surface),
+                Some(theme.ui.foreground),
+                Some(theme.ui.primary),
+                Some(theme.ui.secondary),
+                Some(theme.ui.dim),
+                Some(theme.ui.border_color),
+                Some(theme.ui.focused_border_color),
+                Some(theme.ui.user_message_fg),
+                Some(theme.ui.assistant_message_fg),
+                Some(theme.ui.input_border),
+                Some(theme.ui.input_text),
+                Some(theme.ui.status_bar_bg),
+                Some(theme.ui.status_bar_fg),
+                theme.ui.composer_border,
+                Some(theme.ui.status_success),
+                Some(theme.ui.status_warning),
+                Some(theme.ui.status_error),
+                Some(theme.ui.scrollbar_thumb),
+                Some(theme.ui.scrollbar_track),
+            ];
+            for (tag, color) in ui.iter().enumerate() {
+                push(
+                    u8::try_from(tag.saturating_add(31)).unwrap(),
+                    *color,
+                    &mut bytes,
+                );
+            }
+            mix(&bytes)
+        }
+        for (key, expected) in [
+            ("autumn_night", 0x6b5c_0331_9ad8_be5e_u64),
+            ("ayu_dark", 0x1911_6ab3_5ba5_085d_u64),
+            ("catppuccin_frappe", 0xed1a_fff3_2be2_b14a_u64),
+            ("catppuccin_latte", 0x4ad6_21a7_3a75_599a_u64),
+            ("catppuccin_macchiato", 0xd108_9399_a770_34fe_u64),
+            ("catppuccin_mocha", 0x55ed_1a71_705b_6589_u64),
+            ("dark_plus", 0x52c9_4215_dc2f_0181_u64),
+            ("opencode", 0x0a2c_02f0_fc36_358f_u64),
+            ("dch", 0xe72d_168c_1009_5b4d_u64),
+            ("dracula", 0x638a_e1fc_5827_cdfe_u64),
+            ("github_dark", 0x7cd3_3b90_395c_1a0c_u64),
+            ("github_light", 0xdb12_c770_9e0f_1969_u64),
+            ("gruvbox_dark", 0x09dd_c1df_fb96_9cd6_u64),
+            ("gruvbox_light", 0x1794_b68c_612b_6c3e_u64),
+            ("kanagawa_wave", 0xbc3b_0601_1fd3_77a5_u64),
+            ("monokai", 0x9175_0d3e_5b9f_c07d_u64),
+            ("nord", 0xa36f_4a42_fea5_ca2c_u64),
+            ("one_dark", 0xbbcf_dd19_f967_a58b_u64),
+            ("rose_pine", 0x3f18_447f_69cf_792a_u64),
+            ("solarized_dark", 0xbd4b_1daa_eb04_faa0_u64),
+            ("solarized_light", 0x4241_de1e_6433_19bc_u64),
+            ("tokyo_night", 0xddc4_d2c4_83cf_ce68_u64),
+            ("transparent", 0xcf86_d191_b459_f056_u64),
+        ] {
+            let theme = Theme::by_name(key).unwrap();
+            assert_eq!(
+                fingerprint(&theme),
+                expected,
+                "{key}: the palette drifted — a literal in theme_data changed"
+            );
+        }
+    }
+
+    #[test]
     fn host_theme_maps_into_the_module_themes() {
         let theme = Theme::default();
         let markdown: crate::markdown::MarkdownTheme = (&theme).into();
@@ -1361,9 +1513,50 @@ mod tests {
             theme.markdown.code_block.bg.unwrap_or(Color::Reset)
         );
 
-        assert_eq!(syntax.plain, theme.ui.foreground);
-        assert_eq!(syntax.keyword, theme.syntax.keyword);
-        assert_eq!(syntax.escape, theme.syntax.escape);
-        assert_eq!(syntax.emit_order_colors(), theme.syntax.syntax_colors());
+        assert_eq!(
+            [
+                syntax.plain,
+                syntax.attribute,
+                syntax.comment,
+                syntax.constant,
+                syntax.constructor,
+                syntax.embedded,
+                syntax.function,
+                syntax.keyword,
+                syntax.number,
+                syntax.operator,
+                syntax.property,
+                syntax.punctuation,
+                syntax.string,
+                syntax.r#type,
+                syntax.variable,
+                syntax.variable_builtin,
+                syntax.tag,
+                syntax.delimiter,
+                syntax.escape,
+            ],
+            [
+                theme.ui.foreground,
+                theme.syntax.attribute,
+                theme.syntax.comment,
+                theme.syntax.constant,
+                theme.syntax.constructor,
+                theme.syntax.embedded,
+                theme.syntax.function,
+                theme.syntax.keyword,
+                theme.syntax.number,
+                theme.syntax.operator,
+                theme.syntax.property,
+                theme.syntax.punctuation,
+                theme.syntax.string,
+                theme.syntax.r#type,
+                theme.syntax.variable,
+                theme.syntax.variable_builtin,
+                theme.syntax.tag,
+                theme.syntax.delimiter,
+                theme.syntax.escape,
+            ],
+            "the From bridge carries every palette field, plain included"
+        );
     }
 }

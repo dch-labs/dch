@@ -870,12 +870,6 @@ fn pad_to_width(text: &str, target: usize) -> String {
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::missing_panics_doc,
-    clippy::indexing_slicing,
-    clippy::expect_used,
-    clippy::panic
-)]
 mod tests {
     use super::*;
 
@@ -1406,11 +1400,13 @@ mod tests {
             dch_config::DiffPalette::Classic,
         );
         let light = diff_colors(
-            &crate::theme::Theme::gruvbox_light(),
+            &crate::theme::Theme::by_name("gruvbox_light")
+                .expect("the gruvbox light theme is registered"),
             dch_config::DiffPalette::Classic,
         );
         let bare = diff_colors(
-            &crate::theme::Theme::transparent(),
+            &crate::theme::Theme::by_name("transparent")
+                .expect("the transparent theme is registered"),
             dch_config::DiffPalette::Classic,
         );
         assert_eq!(dark.add_bg, ADD_BAND);

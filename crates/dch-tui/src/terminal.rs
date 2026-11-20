@@ -1615,13 +1615,6 @@ impl Drop for TerminalGuard {
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::missing_panics_doc,
-    clippy::missing_errors_doc
-)]
 mod tests {
     use super::*;
 
@@ -2124,15 +2117,7 @@ mod tests {
     }
 }
 
-// Test code panics by design — its asserts are the assertions.
 #[cfg(test)]
-#[allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::missing_panics_doc,
-    clippy::missing_errors_doc
-)]
 mod write_only_warranted_pins {
     use super::*;
 
@@ -2167,15 +2152,7 @@ mod write_only_warranted_pins {
     }
 }
 
-// Test code panics by design — its asserts are the assertions.
 #[cfg(test)]
-#[allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::missing_panics_doc,
-    clippy::missing_errors_doc
-)]
 mod synchronized_output_pins {
     use super::*;
 
@@ -2228,15 +2205,7 @@ mod synchronized_output_pins {
 #[cfg(all(test, unix))]
 static SIGNAL_STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-// Test code panics by design — its asserts are the assertions.
 #[cfg(all(test, unix))]
-#[allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::missing_panics_doc,
-    clippy::missing_errors_doc
-)]
 mod signal_restore_publication_pins {
     use super::*;
 

@@ -8304,6 +8304,21 @@ impl TuiApp {
         }
     }
 
+    /// The composer's height for the rows its buffer wraps to.
+    ///
+    /// Text rows clamped to the input cap, plus the vertical padding
+    /// and the rule row — the one number the welcome block and the
+    /// frame layout both budget the composer by, computed identically
+    /// on both paths.
+    fn composer_height_for(rows: &[String]) -> u16 {
+        let text_rows = u16::try_from(rows.len())
+            .unwrap_or(1)
+            .clamp(1, INPUT_TEXT_ROWS);
+        text_rows
+            .saturating_add(INPUT_VERTICAL_PADDING.saturating_mul(2))
+            .saturating_add(1)
+    }
+
     /// Render one frame of the layout.
     ///
     /// Conversation fills the space above a blank spacer row that
@@ -8327,12 +8342,7 @@ impl TuiApp {
         if let Some(shape) = self.welcome_shape(area) {
             let wrap_width = shape.inner_width();
             let (rows, caret) = self.composer_wrap(wrap_width);
-            let text_rows = u16::try_from(rows.len())
-                .unwrap_or(1)
-                .clamp(1, INPUT_TEXT_ROWS);
-            let composer_height = text_rows
-                .saturating_add(INPUT_VERTICAL_PADDING.saturating_mul(2))
-                .saturating_add(1);
+            let composer_height = Self::composer_height_for(&rows);
             self.input_wrap_width = wrap_width;
             self.render_welcome(frame, area, &shape, &rows, caret, composer_height);
             return;
@@ -8343,12 +8353,7 @@ impl TuiApp {
             .max(1)
             .saturating_sub(INPUT_SIDE_INSET.saturating_mul(2));
         let (rows, caret) = self.composer_wrap(wrap_width);
-        let text_rows = u16::try_from(rows.len())
-            .unwrap_or(1)
-            .clamp(1, INPUT_TEXT_ROWS);
-        let composer_height = text_rows
-            .saturating_add(INPUT_VERTICAL_PADDING.saturating_mul(2))
-            .saturating_add(1);
+        let composer_height = Self::composer_height_for(&rows);
         let strip_at_top = matches!(self.strip_position, StripPosition::Top);
         let question_page = self
             .pending_questions
@@ -9015,24 +9020,7 @@ impl TuiApp {
             self.conversation_baked_prev_user = prev_user;
             self.conversation_baked_through = bake_end;
             self.conversation_bake = baked.lines;
-            self.conversation_bake_meta
-                .tool_summary_lines
-                .extend(baked.tool_summary_lines);
-            self.conversation_bake_meta
-                .thinking_summary_lines
-                .extend(baked.thinking_summary_lines);
-            self.conversation_bake_meta
-                .compaction_summary_lines
-                .extend(baked.compaction_summary_lines);
-            self.conversation_bake_meta
-                .user_turn_ranges
-                .extend(baked.user_turn_ranges);
-            self.conversation_bake_meta
-                .user_prompt_marks
-                .extend(baked.user_prompt_marks);
-            self.conversation_bake_meta
-                .todo_block_ranges
-                .extend(baked.todo_block_ranges);
+            self.conversation_bake_meta.adopt(baked.meta);
         }
         let mut tail = BakeOutputs::default();
         let mut tail_prev = self.conversation_baked_prev_user;
@@ -9048,42 +9036,16 @@ impl TuiApp {
         cache.extend(tail.lines);
         self.conversation_cache = cache;
         let tail_base = self.conversation_bake.len();
-        self.tool_summary_lines = self.conversation_bake_meta.tool_summary_lines.clone();
-        for (index, id) in tail.tool_summary_lines {
-            self.tool_summary_lines
-                .insert(index.saturating_add(tail_base), id);
-        }
-        self.thinking_summary_lines = self.conversation_bake_meta.thinking_summary_lines.clone();
-        for (index, id) in tail.thinking_summary_lines {
-            self.thinking_summary_lines
-                .insert(index.saturating_add(tail_base), id);
-        }
-        self.compaction_summary_lines =
-            self.conversation_bake_meta.compaction_summary_lines.clone();
-        for (index, id) in tail.compaction_summary_lines {
-            self.compaction_summary_lines
-                .insert(index.saturating_add(tail_base), id);
-        }
-        self.user_turn_ranges = self.conversation_bake_meta.user_turn_ranges.clone();
-        self.user_turn_ranges
-            .extend(tail.user_turn_ranges.iter().map(|(start, end, mark)| {
-                (
-                    start.saturating_add(tail_base),
-                    end.saturating_add(tail_base),
-                    mark.saturating_add(tail_base),
-                )
-            }));
-        self.user_prompt_marks = self.conversation_bake_meta.user_prompt_marks.clone();
-        self.user_prompt_marks.extend(
-            tail.user_prompt_marks
-                .iter()
-                .map(|mark| mark.saturating_add(tail_base)),
-        );
-        self.todo_block_ranges = self.conversation_bake_meta.todo_block_ranges.clone();
-        self.todo_block_ranges
-            .extend(tail.todo_block_ranges.iter().map(|range| {
-                range.start.saturating_add(tail_base)..range.end.saturating_add(tail_base)
-            }));
+        let merged = self
+            .conversation_bake_meta
+            .clone()
+            .merged_over(tail.meta, tail_base);
+        self.tool_summary_lines = merged.tool_summary_lines;
+        self.thinking_summary_lines = merged.thinking_summary_lines;
+        self.compaction_summary_lines = merged.compaction_summary_lines;
+        self.user_turn_ranges = merged.user_turn_ranges;
+        self.user_prompt_marks = merged.user_prompt_marks;
+        self.todo_block_ranges = merged.todo_block_ranges;
         self.conversation_cache_generation = self.conversation_generation;
     }
 
@@ -9471,15 +9433,15 @@ impl TuiApp {
         previous_was_user: &mut Option<bool>,
         outputs: &mut BakeOutputs,
     ) {
-        let BakeOutputs {
-            lines,
+        let BakeOutputs { lines, meta } = outputs;
+        let BakeMeta {
             tool_summary_lines: summary_lines,
             thinking_summary_lines: thinking_lines,
             compaction_summary_lines: compaction_lines,
             user_turn_ranges: user_turns,
             user_prompt_marks: prompt_marks,
             todo_block_ranges: todo_blocks,
-        } = outputs;
+        } = meta;
         let width = area.width.max(1);
         let markdown_theme = markdown::MarkdownTheme::from(&self.theme);
         let syntax_theme = markdown::SyntaxTheme::from(&self.theme);
@@ -12903,13 +12865,6 @@ pub(crate) fn plain_wrapped_lines_styled(
 
 #[cfg(test)]
 mod tests {
-    #![allow(
-        clippy::expect_used,
-        clippy::unwrap_used,
-        clippy::panic,
-        clippy::missing_panics_doc,
-        clippy::missing_errors_doc
-    )]
 
     use super::*;
     use crate::observer::CompactionFiling;
@@ -17899,9 +17854,9 @@ mod tests {
     fn themes_command_lists_the_settable_command_names() {
         let mut app = TuiApp::new(dch_config::DchConfig::default());
         let out = command_output(&mut app, "/themes");
-        // The live palette (the default theme) is starred by its command key —
+        // The live palette (the fallback theme) is starred by its command key —
         // the very word you would pass to `/theme`, not its pretty label.
-        assert!(out.contains("* default"), "got {out:?}");
+        assert!(out.contains("* dch"), "got {out:?}");
         for key in crate::theme::Theme::command_names() {
             assert!(out.contains(key), "missing command name {key} in {out:?}");
         }
@@ -19431,13 +19386,14 @@ mod tests {
 
     #[test]
     fn tab_completes_a_theme_argument_to_its_command_name() {
-        // `/theme def` then Tab offers the command spelling `default` — the word
-        // `/theme` accepts and the config file writes, not the display label
-        // ("Default"). Completion and the command share one vocabulary.
+        // `/theme dark` then Tab offers the command spelling `dark_plus` — the
+        // word `/theme` accepts and the config file writes, not the display
+        // label ("Dark Plus"). Completion and the command share one
+        // vocabulary.
         let mut app = TuiApp::new(dch_config::DchConfig::default());
-        app.input.set_text("/theme def".to_string());
+        app.input.set_text("/theme dark".to_string());
         assert!(app.complete_command_line(false));
-        assert_eq!(app.input.text(), "/theme default");
+        assert_eq!(app.input.text(), "/theme dark_plus");
     }
 
     #[test]
@@ -21293,7 +21249,7 @@ model = "plain"
             "a refused set never claims it applied: {out:?}"
         );
         assert_eq!(
-            app.config.display.theme, "default",
+            app.config.display.theme, "dch",
             "the config keeps its theme"
         );
         assert!(
