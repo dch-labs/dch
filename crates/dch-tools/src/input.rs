@@ -109,13 +109,6 @@ pub fn get_string_list(input: &Value, key: &str) -> Result<Vec<String>, ToolErro
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::missing_panics_doc,
-    clippy::missing_errors_doc
-)]
 mod tests {
     use super::*;
     use serde_json::json;

@@ -94,14 +94,6 @@ pub fn clear_cache() {
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::missing_panics_doc,
-    clippy::missing_errors_doc,
-    clippy::must_use_candidate
-)]
 mod tests {
     use super::*;
     use proptest::prelude::*;

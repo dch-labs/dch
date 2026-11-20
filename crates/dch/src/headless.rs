@@ -411,29 +411,19 @@ async fn run_headless_inner(
     };
     let compactions = resumed_compactions
         .saturating_add(compaction_counter.load(std::sync::atomic::Ordering::SeqCst));
-    match &result {
-        Ok(_) => {
-            transcript.extend(crate::messages::transcript_from(
-                &prompt,
-                &turn_outputs,
-                None,
+    transcript.extend(crate::messages::transcript_from(
+        &prompt,
+        &turn_outputs,
+        result.as_ref().err(),
+    ));
+    save_transcript(&saver, &runner, &transcript, compactions);
+    if result.is_ok() {
+        let undone = runner.todo_undone();
+        if undone > 0 {
+            let plural = if undone == 1 { "" } else { "s" };
+            crate::signals::report(&format!(
+                "warning: {undone} todo item{plural} left unfinished"
             ));
-            save_transcript(&saver, &runner, &transcript, compactions);
-            let undone = runner.todo_undone();
-            if undone > 0 {
-                let plural = if undone == 1 { "" } else { "s" };
-                crate::signals::report(&format!(
-                    "warning: {undone} todo item{plural} left unfinished"
-                ));
-            }
-        }
-        Err(err) => {
-            transcript.extend(crate::messages::transcript_from(
-                &prompt,
-                &turn_outputs,
-                Some(err),
-            ));
-            save_transcript(&saver, &runner, &transcript, compactions);
         }
     }
     crate::signals::report(&session_notice(session_id));
@@ -1247,13 +1237,6 @@ fn write_done_file_if_requested(
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::missing_panics_doc,
-    clippy::missing_errors_doc
-)]
 mod tests {
     use super::*;
     use crate::signals::SIGNAL_TEST_LOCK;

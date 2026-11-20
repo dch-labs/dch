@@ -45,12 +45,6 @@ pub(crate) fn known_model_window(model: &str) -> Option<u64> {
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::missing_panics_doc
-)]
 mod tests {
     use super::*;
 

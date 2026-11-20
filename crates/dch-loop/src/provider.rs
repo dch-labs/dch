@@ -692,13 +692,6 @@ fn candidate_env_vars(api_type: ApiType) -> Vec<&'static str> {
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::missing_panics_doc,
-    clippy::field_reassign_with_default
-)]
 mod tests {
     use dch_config::ApiConfig;
     use dch_config::ApiType;

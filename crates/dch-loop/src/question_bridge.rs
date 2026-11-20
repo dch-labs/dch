@@ -236,13 +236,6 @@ impl QuestionPath {
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::missing_panics_doc,
-    clippy::missing_errors_doc
-)]
 mod tests {
     use super::*;
     use dch_tools::Question;

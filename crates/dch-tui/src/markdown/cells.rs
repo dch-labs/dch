@@ -414,12 +414,6 @@ pub fn suffix_within(text: &str, budget: usize) -> &str {
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::missing_panics_doc,
-    clippy::missing_errors_doc,
-    clippy::expect_used,
-    clippy::unwrap_used
-)]
 mod tests {
     use super::*;
 

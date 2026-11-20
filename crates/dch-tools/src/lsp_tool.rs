@@ -238,20 +238,15 @@ impl LspTool {
                 Operation::GoToDefinition { line, character } => {
                     let position = to_wire_position(&text, line, character);
                     let response = client.goto_definition(&document_uri, position).await?;
-                    location_envelope(
-                        LocationQuery {
-                            operation: "goToDefinition",
-                            file_path: &file_path_str,
-                            line,
-                            character,
-                            empty_message: "No definition found at this location",
-                            found: response.map(extract_goto_definition_locations),
-                        },
-                        &document_uri,
-                        &text,
-                        &cwd,
-                        policy,
-                    )
+                    LocationQuery {
+                        operation: "goToDefinition",
+                        file_path: &file_path_str,
+                        line,
+                        character,
+                        empty_message: "No definition found at this location",
+                        found: response.map(extract_goto_definition_locations),
+                    }
+                    .reply(&document_uri, &text, &cwd, policy)
                     .await
                 }
                 Operation::References {
@@ -263,39 +258,29 @@ impl LspTool {
                     let found = client
                         .references(&document_uri, position, include_declaration)
                         .await?;
-                    location_envelope(
-                        LocationQuery {
-                            operation: "references",
-                            file_path: &file_path_str,
-                            line,
-                            character,
-                            empty_message: "No references found at this location",
-                            found,
-                        },
-                        &document_uri,
-                        &text,
-                        &cwd,
-                        policy,
-                    )
+                    LocationQuery {
+                        operation: "references",
+                        file_path: &file_path_str,
+                        line,
+                        character,
+                        empty_message: "No references found at this location",
+                        found,
+                    }
+                    .reply(&document_uri, &text, &cwd, policy)
                     .await
                 }
                 Operation::Implementations { line, character } => {
                     let position = to_wire_position(&text, line, character);
                     let response = client.implementations(&document_uri, position).await?;
-                    location_envelope(
-                        LocationQuery {
-                            operation: "implementations",
-                            file_path: &file_path_str,
-                            line,
-                            character,
-                            empty_message: "No implementations found at this location",
-                            found: response.map(extract_goto_definition_locations),
-                        },
-                        &document_uri,
-                        &text,
-                        &cwd,
-                        policy,
-                    )
+                    LocationQuery {
+                        operation: "implementations",
+                        file_path: &file_path_str,
+                        line,
+                        character,
+                        empty_message: "No implementations found at this location",
+                        found: response.map(extract_goto_definition_locations),
+                    }
+                    .reply(&document_uri, &text, &cwd, policy)
                     .await
                 }
                 Operation::DocumentSymbol => {
@@ -348,7 +333,7 @@ enum Operation {
     /// The definition of the symbol at a position.
     ///
     /// Answered as a location list, so the envelope flows through
-    /// [`location_envelope`] with the shared cap and unit conversion.
+    /// [`LocationQuery::reply`] with the shared cap and unit conversion.
     GoToDefinition {
         /// The 1-indexed line of the symbol being resolved.
         ///
@@ -395,7 +380,7 @@ enum Operation {
     /// The implementors of the trait or type at a position.
     ///
     /// Answered as a location list, so the envelope flows through
-    /// [`location_envelope`] with the shared cap and unit conversion.
+    /// [`LocationQuery::reply`] with the shared cap and unit conversion.
     Implementations {
         /// The 1-indexed line of the trait or type.
         ///
@@ -564,57 +549,60 @@ struct LocationQuery<'a> {
     found: Option<Vec<lsp_types::Location>>,
 }
 
-/// The envelope for a location-list operation.
-///
-/// Rows flow through [`location_json`] with each location's file text —
-/// the queried file's, or a foreign file's loaded under the resolve
-/// policy — so the character-unit contract holds for every row. The
-/// list caps at [`MAX_LOCATION_RESULTS`] rows before foreign texts
-/// load — rows past the cap never render, so their files are never
-/// read — and a cut reports the dropped count as `omitted`.
-async fn location_envelope(
-    query: LocationQuery<'_>,
-    queried_uri: &Url,
-    text: &str,
-    cwd: &Path,
-    policy: ResolvePolicy,
-) -> Value {
-    let Some(found) = query.found else {
-        return json!({
-            "operation": query.operation,
-            "file_path": query.file_path,
-            "line": query.line,
-            "character": query.character,
-            "result": null,
-            "message": query.empty_message,
+impl LocationQuery<'_> {
+    /// Wrap the query in its reply envelope.
+    ///
+    /// Rows flow through [`location_json`] with each location's file
+    /// text — the queried file's, or a foreign file's loaded under
+    /// the resolve policy — so the character-unit contract holds for
+    /// every row. The list caps at [`MAX_LOCATION_RESULTS`] rows
+    /// before foreign texts load — rows past the cap never render, so
+    /// their files are never read — and a cut reports the dropped
+    /// count as `omitted`.
+    async fn reply(
+        self,
+        queried_uri: &Url,
+        text: &str,
+        cwd: &Path,
+        policy: ResolvePolicy,
+    ) -> Value {
+        let Some(found) = self.found else {
+            return json!({
+                "operation": self.operation,
+                "file_path": self.file_path,
+                "line": self.line,
+                "character": self.character,
+                "result": null,
+                "message": self.empty_message,
+            });
+        };
+        let (found, omitted) = cap_rows(found, MAX_LOCATION_RESULTS);
+        let foreign_texts = load_foreign_texts(&found, queried_uri.as_str(), cwd, policy).await;
+        let rows: Vec<Value> = found
+            .iter()
+            .map(|location| {
+                let location_text = if location.uri.as_str() == queried_uri.as_str() {
+                    Some(text)
+                } else {
+                    foreign_texts.get(location.uri.as_str()).map(String::as_str)
+                };
+                location_json(location, location_text)
+            })
+            .collect();
+        let mut envelope = json!({
+            "operation": self.operation,
+            "file_path": self.file_path,
+            "line": self.line,
+            "character": self.character,
+            "result": rows,
         });
-    };
-    let (found, omitted) = cap_rows(found, MAX_LOCATION_RESULTS);
-    let foreign_texts = load_foreign_texts(&found, queried_uri.as_str(), cwd, policy).await;
-    let rows: Vec<Value> = found
-        .iter()
-        .map(|location| {
-            let location_text = if location.uri.as_str() == queried_uri.as_str() {
-                Some(text)
-            } else {
-                foreign_texts.get(location.uri.as_str()).map(String::as_str)
-            };
-            location_json(location, location_text)
-        })
-        .collect();
-    let mut envelope = json!({
-        "operation": query.operation,
-        "file_path": query.file_path,
-        "line": query.line,
-        "character": query.character,
-        "result": rows,
-    });
-    if omitted > 0
-        && let Some(object) = envelope.as_object_mut()
-    {
-        object.insert("omitted".to_string(), json!(omitted));
+        if omitted > 0
+            && let Some(object) = envelope.as_object_mut()
+        {
+            object.insert("omitted".to_string(), json!(omitted));
+        }
+        envelope
     }
-    envelope
 }
 
 /// The envelope for a hover reply.
@@ -1129,15 +1117,6 @@ fn extract_goto_definition_locations(
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::missing_panics_doc,
-    clippy::missing_errors_doc,
-    clippy::indexing_slicing,
-    clippy::redundant_closure_for_method_calls
-)]
 mod tests {
     use super::*;
     use crate::context::RunnerContext;
@@ -1303,15 +1282,15 @@ mod tests {
             uri: Uri::from_str(uri.as_str()).unwrap(),
             range: Range::new(Position::new(line, 0), Position::new(line, 1)),
         };
-        let envelope = location_envelope(
-            LocationQuery {
-                operation: "references",
-                file_path: "src/lib.rs",
-                line: 1,
-                character: 1,
-                empty_message: "none",
-                found: Some((0..55).map(make).collect()),
-            },
+        let envelope = LocationQuery {
+            operation: "references",
+            file_path: "src/lib.rs",
+            line: 1,
+            character: 1,
+            empty_message: "none",
+            found: Some((0..55).map(make).collect()),
+        }
+        .reply(
             &uri,
             "fn add() {}\n",
             std::path::Path::new("/work"),
@@ -1330,15 +1309,15 @@ mod tests {
         assert_eq!(envelope.get("omitted"), Some(&json!(5)));
         assert_eq!(envelope.get("line"), Some(&json!(1)));
 
-        let exact = location_envelope(
-            LocationQuery {
-                operation: "references",
-                file_path: "src/lib.rs",
-                line: 1,
-                character: 1,
-                empty_message: "none",
-                found: Some((0..50).map(make).collect()),
-            },
+        let exact = LocationQuery {
+            operation: "references",
+            file_path: "src/lib.rs",
+            line: 1,
+            character: 1,
+            empty_message: "none",
+            found: Some((0..50).map(make).collect()),
+        }
+        .reply(
             &uri,
             "fn add() {}\n",
             std::path::Path::new("/work"),
@@ -1512,15 +1491,15 @@ mod tests {
     #[tokio::test]
     async fn an_empty_location_list_and_an_absent_answer_render_differently() {
         let uri = Url::from_file_path("/work/lib.rs").unwrap();
-        let empty = location_envelope(
-            LocationQuery {
-                operation: "references",
-                file_path: "src/lib.rs",
-                line: 1,
-                character: 1,
-                empty_message: "No references found at this location",
-                found: Some(Vec::new()),
-            },
+        let empty = LocationQuery {
+            operation: "references",
+            file_path: "src/lib.rs",
+            line: 1,
+            character: 1,
+            empty_message: "No references found at this location",
+            found: Some(Vec::new()),
+        }
+        .reply(
             &uri,
             "fn add() {}\n",
             std::path::Path::new("/work"),
@@ -1543,15 +1522,15 @@ mod tests {
         );
         assert_eq!(empty.get("omitted"), None);
 
-        let absent = location_envelope(
-            LocationQuery {
-                operation: "references",
-                file_path: "src/lib.rs",
-                line: 1,
-                character: 1,
-                empty_message: "No references found at this location",
-                found: None,
-            },
+        let absent = LocationQuery {
+            operation: "references",
+            file_path: "src/lib.rs",
+            line: 1,
+            character: 1,
+            empty_message: "No references found at this location",
+            found: None,
+        }
+        .reply(
             &uri,
             "fn add() {}\n",
             std::path::Path::new("/work"),
@@ -1596,15 +1575,15 @@ mod tests {
             uri: Uri::from_str("file:///elsewhere/other.rs").unwrap(),
             range: Range::new(Position::new(0, 7), Position::new(0, 10)),
         };
-        let envelope = location_envelope(
-            LocationQuery {
-                operation: "references",
-                file_path: "src/lib.rs",
-                line: 1,
-                character: 1,
-                empty_message: "none",
-                found: Some(vec![foreign]),
-            },
+        let envelope = LocationQuery {
+            operation: "references",
+            file_path: "src/lib.rs",
+            line: 1,
+            character: 1,
+            empty_message: "none",
+            found: Some(vec![foreign]),
+        }
+        .reply(
             &queried,
             "fn add() {}\n",
             std::path::Path::new("/work"),

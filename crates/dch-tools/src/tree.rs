@@ -300,15 +300,6 @@ fn format_summary(filtered: &[WalkEntry]) -> String {
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::missing_panics_doc,
-    clippy::missing_errors_doc,
-    clippy::field_reassign_with_default,
-    clippy::indexing_slicing
-)]
 mod tests {
     use super::*;
     use crate::context::RunnerContext;

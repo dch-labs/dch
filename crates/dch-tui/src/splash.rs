@@ -535,13 +535,6 @@ fn palette_entry(channels: [u8; 3]) -> Option<u8> {
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::missing_panics_doc,
-    clippy::indexing_slicing
-)]
 mod tests {
     use super::*;
 

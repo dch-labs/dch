@@ -1,6 +1,24 @@
 //! TOML configuration loading for `dch`.
 
 #![warn(missing_docs)]
+// Tests assert on internals and fixtures: panicking helpers,
+// `unwrap` and `expect` on states the fixture itself built, and
+// docs-free test fns are the test canon, so the denied-lint set
+// stands down for the whole crate under `cfg(test)` — one
+// justification, in one place, instead of one per module.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::arithmetic_side_effects,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::let_underscore_must_use,
+        clippy::missing_errors_doc,
+        clippy::missing_panics_doc,
+        clippy::panic,
+        clippy::unwrap_used,
+    )
+)]
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -1073,7 +1091,7 @@ pub struct DisplayConfig {
     /// Theme name (resolved by the TUI).
     ///
     /// A free-form name the TUI maps to a concrete color scheme. Defaults to
-    /// `"default"`.
+    /// `"dch"`.
     pub theme: String,
 
     /// Where the TUI's activity strip renders while the agent runs.
@@ -1582,7 +1600,7 @@ impl Default for DisplayConfig {
         Self {
             no_color: false,
             verbosity: Verbosity::default(),
-            theme: "default".to_string(),
+            theme: "dch".to_string(),
             strip_position: StripPosition::default(),
             strip_style: StripStyle::default(),
             path_style: PathStyle::default(),
@@ -2264,13 +2282,6 @@ pub fn config_dir() -> PathBuf {
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::missing_panics_doc,
-    clippy::missing_errors_doc,
-    clippy::indexing_slicing,
-    clippy::unwrap_used,
-    clippy::expect_used
-)]
 mod tests {
     /// A one-field wrapper so serde rendering of a bare enum value
     /// can be asserted without a full config document.
@@ -2769,7 +2780,7 @@ redact_secrets = false
         assert_eq!(c.api.max_tokens, 32_000);
         assert_eq!(c.api.request_timeout_secs, 120);
         assert_eq!(c.display.verbosity, Verbosity::Normal);
-        assert_eq!(c.display.theme, "default");
+        assert_eq!(c.display.theme, "dch");
         assert_eq!(c.runner.max_turns, 200);
         assert_eq!(c.runner.turn_timeout_secs, 300);
         assert_eq!(c.runner.compact_threshold, 80);
@@ -2937,7 +2948,7 @@ redact_secrets = false
         write_config(tmp.path(), "config.local.toml", "[api]\nmodel = \"B\"\n");
         let c = DchConfig::load_from_dir(tmp.path()).unwrap();
         assert_eq!(c.api.model, "B");
-        assert_eq!(c.display.theme, "default");
+        assert_eq!(c.display.theme, "dch");
     }
 
     #[test]
@@ -3166,7 +3177,7 @@ redact_secrets = false
         let c = DchConfig::default();
         let _sc = c.to_session_config();
         assert_eq!(c.api.base_url, "");
-        assert_eq!(c.display.theme, "default");
+        assert_eq!(c.display.theme, "dch");
         assert_eq!(c.runner.permission_mode, PermissionMode::Auto);
         assert_eq!(c.telemetry.level, "info");
     }
@@ -3927,18 +3938,7 @@ api_type = "ollama"
     }
 }
 
-// Test code panics by design — its asserts are the assertions.
 #[cfg(test)]
-#[allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::missing_panics_doc,
-    clippy::missing_errors_doc,
-    clippy::indexing_slicing,
-    clippy::arithmetic_side_effects,
-    clippy::let_underscore_must_use
-)]
 mod save_roundtrip {
     use super::*;
 

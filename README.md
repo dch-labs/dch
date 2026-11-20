@@ -193,7 +193,9 @@ Common options:
 | `--done-file PATH` | Write a JSON completion status to PATH (single-run mode) |
 | `-v, --verbose` / `-q, --quiet` | Adjust verbosity — repeat `-v` to step up (`-v` narrates a single run, `-vv` adds token and duration detail; in the TUI the flags set the initial tool-line verbosity). A single-run invocation is quiet by default |
 
-Themes: `default` (near-black, derived from OpenCode's dark palette),
+Themes: `dch` (the house palette and the default — an
+`opencode`-leaning blend of `opencode` and `autumn_night`),
+`opencode` (near-black, derived from OpenCode's dark palette),
 `transparent`, `dracula`, `nord`, `tokyo_night`,
 `gruvbox_dark`, `gruvbox_light`, `solarized_dark`, `solarized_light`,
 `catppuccin_latte`, `catppuccin_frappe`, `catppuccin_macchiato`,
@@ -206,7 +208,9 @@ rules in the terminal's own dim tone mark the composer's top and
 bottom, de-emphasized text (thinking, timestamps, system rows)
 renders in a fixed mid gray so it greys out on every terminal, and
 only the scrollbar and the success/warning/error indicators carry
-colors of their own. An unknown name falls back to the default.
+colors of their own. The former `default` theme is now `opencode`;
+configs and `--theme` spellings that name `default` keep resolving to
+it. An unknown name falls back to the default.
 
 ### Exit codes and the done-file
 

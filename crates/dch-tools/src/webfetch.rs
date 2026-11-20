@@ -467,6 +467,10 @@ fn strip_markdown_sigils(markdown: &str) -> String {
 }
 
 /// Collapse `[label](target)` spans to their label.
+///
+/// The rendered page keeps the words a link carried and drops the
+/// target: the transcript's plain-text captures cannot carry a
+/// clickable destination, so the label reads alone.
 fn unwrap_links(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut rest = line;
@@ -491,15 +495,6 @@ fn unwrap_links(line: &str) -> String {
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::missing_panics_doc,
-    clippy::missing_errors_doc,
-    clippy::indexing_slicing,
-    clippy::redundant_closure_for_method_calls
-)]
 mod tests {
     use super::*;
     use serde_json::json;

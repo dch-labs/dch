@@ -598,14 +598,6 @@ fn is_blank(line: &Line<'_>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #![allow(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::indexing_slicing,
-        clippy::missing_panics_doc,
-        clippy::missing_errors_doc
-    )]
 
     use super::*;
 

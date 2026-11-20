@@ -225,16 +225,6 @@ fn push_match_string(matches: &mut Vec<String>, path: &Path, base: &Path) {
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::missing_panics_doc,
-    clippy::missing_errors_doc,
-    clippy::field_reassign_with_default,
-    clippy::indexing_slicing,
-    clippy::format_collect
-)]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -412,15 +402,6 @@ mod tests {
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::missing_panics_doc,
-    clippy::missing_errors_doc,
-    clippy::field_reassign_with_default,
-    clippy::indexing_slicing
-)]
 mod integration_tests {
     use super::*;
     use crate::context::RunnerContext;

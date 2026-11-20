@@ -207,12 +207,6 @@ fn dir_caption(shown: &str, room: u16) -> String {
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::missing_panics_doc,
-    clippy::missing_errors_doc,
-    clippy::expect_used,
-    clippy::unwrap_used
-)]
 mod tests {
     use super::dir_caption;
     use crate::cells::display_width;

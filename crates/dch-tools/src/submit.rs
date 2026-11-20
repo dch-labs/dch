@@ -726,7 +726,12 @@ impl ProcessGroupGuard {
     fn disarm(&mut self) {}
 }
 
-/// The spawned child's pid as a process-group id, when it still has one.
+/// The spawned child's pid as a process-group id, when it still has
+/// one.
+///
+/// A spawned child begins as its own group leader, so its pid names
+/// the group; `None` once it has exited and the kernel has reaped
+/// it, or when the id overflows the `i32` the signal API takes.
 #[cfg(unix)]
 fn child_pgid(child: &tokio::process::Child) -> Option<i32> {
     i32::try_from(child.id()?).ok()
@@ -1163,14 +1168,6 @@ fn format_summary(
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::missing_panics_doc,
-    clippy::missing_errors_doc,
-    clippy::indexing_slicing
-)]
 mod tests {
     use super::*;
     use loopctl::tool::ToolContext;

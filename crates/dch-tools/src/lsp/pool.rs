@@ -164,13 +164,6 @@ pub(crate) fn pool_spawn_count() -> u32 {
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::missing_panics_doc,
-    clippy::missing_errors_doc
-)]
 mod tests {
     use std::sync::Arc;
 

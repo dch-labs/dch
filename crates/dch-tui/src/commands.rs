@@ -1291,14 +1291,6 @@ pub struct SpecView {
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::missing_panics_doc,
-    clippy::missing_errors_doc,
-    clippy::arithmetic_side_effects
-)]
 mod tests {
     use super::*;
 

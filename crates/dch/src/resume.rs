@@ -1069,14 +1069,6 @@ fn fit_column_tail(text: &str, width: usize) -> String {
 }
 
 #[cfg(test)]
-#[allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::panic,
-    clippy::missing_panics_doc,
-    clippy::missing_errors_doc,
-    clippy::indexing_slicing
-)]
 mod tests {
     use super::*;
     use chrono::TimeZone as _;
