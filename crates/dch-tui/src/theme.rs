@@ -216,38 +216,44 @@ pub struct SyntaxTheme {
 pub struct MarkdownTheme {
     /// Style for level-1 headings, the strongest emphasis a document carries.
     ///
-    /// Shipped palettes give it BOLD plus the leading accent of the heading
-    /// hue ramp, so section starts are visible at a glance.
+    /// Shipped palettes give it BOLD plus their heading color — the
+    /// first step of a hue ramp where the palette carries one, or
+    /// the palette's single heading hue where it repeats at every
+    /// depth — so section starts are visible at a glance.
     pub header1: Style,
 
     /// Style for level-2 headings.
     ///
-    /// BOLD with the second accent of the heading ramp, a visible step below
-    /// level 1 without dropping to body weight.
+    /// BOLD with the heading color a step below level 1 without
+    /// dropping to body weight; the second step of the ramp where
+    /// the palette carries one.
     pub header2: Style,
 
     /// Style for level-3 headings.
     ///
-    /// BOLD with the third ramp color; the deepest level that still reads as
-    /// a section title at conversational font sizes.
+    /// BOLD with the heading color for this depth; the deepest
+    /// level that still reads as a section title at conversational
+    /// font sizes.
     pub header3: Style,
 
     /// Style for level-4 headings.
     ///
-    /// BOLD with the fourth ramp color; below this depth headings are mostly
-    /// distinguished by color alone.
+    /// BOLD with the heading color for this depth; below this
+    /// depth headings are mostly distinguished by color alone.
     pub header4: Style,
 
     /// Style for level-5 headings.
     ///
-    /// BOLD with the fifth ramp color, aimed at outline-level structure that
-    /// rarely appears in chat-length documents.
+    /// BOLD with the heading color for this depth, aimed at
+    /// outline-level structure that rarely appears in chat-length
+    /// documents.
     pub header5: Style,
 
     /// Style for level-6 headings, the quietest of the ramp.
     ///
-    /// BOLD with the final ramp color; present for completeness of the
-    /// markdown contract rather than frequent use.
+    /// BOLD with the heading color for this depth; present for
+    /// completeness of the markdown contract rather than frequent
+    /// use.
     pub header6: Style,
 
     /// Style for bold spans.
@@ -577,7 +583,7 @@ impl Theme {
             if unit <= 0.04045 {
                 unit / 12.92
             } else {
-                ((unit + 0.055) / 1.055).powi(2)
+                ((unit + 0.055) / 1.055).powf(2.4)
             }
         }
         fn contrast(a: Color, b: Color) -> f64 {
@@ -593,13 +599,20 @@ impl Theme {
         fn defer_style(style: Style, anchor: Color) -> Style {
             match style.fg {
                 None => style,
-                Some(fg) => style.fg(
-                    if fg == anchor || contrast(fg, Color::Rgb(255, 255, 255)) < 4.5 {
-                        Color::Reset
-                    } else {
-                        fg
-                    },
-                ),
+                Some(fg) => style.fg(if fg == anchor || !passes_light_floor(fg) {
+                    Color::Reset
+                } else {
+                    fg
+                }),
+            }
+        }
+        /// Whether a heading foreground clears the AA floor against
+        /// white. Non-`Rgb` colors carry no scorable channels — they
+        /// defer rather than pass on an unscored technicality.
+        fn passes_light_floor(fg: Color) -> bool {
+            match fg {
+                Color::Rgb(..) => contrast(fg, Color::Rgb(255, 255, 255)) >= 4.5,
+                _ => false,
             }
         }
         let anchor = self.ui.foreground;
@@ -615,10 +628,7 @@ impl Theme {
         deferred.markdown.header4 = defer_style(deferred.markdown.header4, anchor);
         deferred.markdown.header5 = defer_style(deferred.markdown.header5, anchor);
         deferred.markdown.header6 = defer_style(deferred.markdown.header6, anchor);
-        deferred.markdown.code_block = Style::default().fg(deferring(
-            deferred.markdown.code_block.fg.unwrap_or(anchor),
-            anchor,
-        ));
+        deferred.markdown.code_block = defer_style(deferred.markdown.code_block, anchor);
         deferred
     }
 }
@@ -818,7 +828,7 @@ mod tests {
             if unit <= 0.04045 {
                 unit / 12.92
             } else {
-                ((unit + 0.055) / 1.055).powi(2)
+                ((unit + 0.055) / 1.055).powf(2.4)
             }
         }
         fn ratio(a: Color, b: Color) -> f64 {
@@ -872,15 +882,10 @@ mod tests {
             Color::Reset,
             "code delimiters sit on the terminal canvas and defer"
         );
-        // The code-block text is the one anchored register the dch
-        // midpoint leaves off-anchor: opencode pinned it to the
-        // foreground, autumn_night did not, and the channel-wise
-        // average of an equal and an unequal pair is unequal — so the
-        // deferral's equality rule keeps the palette color here.
-        assert_eq!(
-            deferred.markdown.code_block.fg, theme.markdown.code_block.fg,
-            "the midpoint's code block keeps its palette color"
-        );
+        // The code-block text is off-anchor by construction and its
+        // off-canvas color fails the white floor — the pins below
+        // the gray boundary assert both the installed color and the
+        // deferred Reset.
         assert_eq!(
             deferred.ui.input_text, theme.ui.input_text,
             "the composer paints its surface: its pair stands"
@@ -932,6 +937,60 @@ mod tests {
                     .add_modifier
                     .contains(ratatui::style::Modifier::BOLD),
                 "deferred heading level {level} keeps its bold weight"
+            );
+            // The code-block base text is off-anchor by construction
+            // (the parents' channel midpoint, not the cream) and fails
+            // the white floor (1.52:1), so it defers like the headings —
+            // restoring master's behavior, where the default pinned it
+            // to the foreground and the equality arm answered.
+            assert_eq!(
+                theme.markdown.code_block.fg,
+                Some(Color::Rgb(198, 216, 177)),
+                "the installed palette keeps the code-block color"
+            );
+            assert_eq!(
+                deferred.markdown.code_block.fg,
+                Some(Color::Reset),
+                "the deferred code block falls to the terminal's own foreground"
+            );
+            // A non-Rgb heading fg carries no scorable channels; the
+            // floor test defers it rather than pass it unscored. A
+            // custom palette assembling Indexed headings gets the
+            // conservative read, not a silent 21:1.
+            let mut indexed_heading = theme.clone();
+            indexed_heading.markdown.header3 = Style::default()
+                .fg(Color::Indexed(4))
+                .add_modifier(ratatui::style::Modifier::BOLD);
+            let deferred_indexed = indexed_heading.deferred_to_terminal();
+            assert_eq!(
+                deferred_indexed.markdown.header3.fg,
+                Some(Color::Reset),
+                "a non-Rgb heading fg defers conservatively"
+            );
+            // Boundary: a mid gray clears the 4.5:1 floor against white
+            // under the WCAG exponent (5.1:1) and keeps its palette —
+            // under a squared shortcut it reads 4.0:1 and would wrongly
+            // defer. Not the anchor, so the equality rule never fires:
+            // this exercises the contrast arm alone.
+            let mut gray_heading = theme.clone();
+            let gray = Style::default()
+                .fg(Color::Rgb(110, 110, 110))
+                .add_modifier(ratatui::style::Modifier::BOLD);
+            for level in [
+                &mut gray_heading.markdown.header1,
+                &mut gray_heading.markdown.header2,
+                &mut gray_heading.markdown.header3,
+                &mut gray_heading.markdown.header4,
+                &mut gray_heading.markdown.header5,
+                &mut gray_heading.markdown.header6,
+            ] {
+                *level = gray;
+            }
+            let deferred_gray = gray_heading.deferred_to_terminal();
+            assert_eq!(
+                deferred_gray.markdown.header1.fg,
+                Some(Color::Rgb(110, 110, 110)),
+                "a heading that clears the white-canvas floor keeps its color"
             );
         }
     }
