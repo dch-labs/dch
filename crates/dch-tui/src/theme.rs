@@ -560,12 +560,47 @@ impl Theme {
     /// [`Color::Reset`], the terminal's own foreground, which its own
     /// background guarantees readable. Painted pairs survive
     /// untouched — the composer paints its surface and the status bar
-    /// paints its canvas, so their text keeps its palette — and so do
-    /// the accent colors, which read on both light and dark canvases.
+    /// paints its canvas, so their text keeps its palette. Headings
+    /// get the same test generalized: a heading anchored to the
+    /// canvas defers like the text registers, and a heading whose
+    /// color falls under the 4.5:1 AA floor against white — the
+    /// light canvas the deferral exists for — defers too, because on
+    /// that terminal it would be unreadable. A heading that clears
+    /// the floor on both canvases keeps its palette.
     #[must_use]
     pub fn deferred_to_terminal(&self) -> Self {
         fn deferring(color: Color, anchor: Color) -> Color {
             if color == anchor { Color::Reset } else { color }
+        }
+        fn channel(value: u8) -> f64 {
+            let unit = f64::from(value) / 255.0;
+            if unit <= 0.04045 {
+                unit / 12.92
+            } else {
+                ((unit + 0.055) / 1.055).powi(2)
+            }
+        }
+        fn contrast(a: Color, b: Color) -> f64 {
+            fn luminance(color: Color) -> f64 {
+                let Color::Rgb(red, green, blue) = color else {
+                    return 0.0;
+                };
+                0.2126 * channel(red) + 0.7152 * channel(green) + 0.0722 * channel(blue)
+            }
+            let (la, lb) = (luminance(a), luminance(b));
+            (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+        }
+        fn defer_style(style: Style, anchor: Color) -> Style {
+            match style.fg {
+                None => style,
+                Some(fg) => style.fg(
+                    if fg == anchor || contrast(fg, Color::Rgb(255, 255, 255)) < 4.5 {
+                        Color::Reset
+                    } else {
+                        fg
+                    },
+                ),
+            }
         }
         let anchor = self.ui.foreground;
         let mut deferred = self.clone();
@@ -574,6 +609,12 @@ impl Theme {
         deferred.ui.assistant_message_fg = deferring(deferred.ui.assistant_message_fg, anchor);
         deferred.syntax.punctuation = deferring(deferred.syntax.punctuation, anchor);
         deferred.syntax.delimiter = deferring(deferred.syntax.delimiter, anchor);
+        deferred.markdown.header1 = defer_style(deferred.markdown.header1, anchor);
+        deferred.markdown.header2 = defer_style(deferred.markdown.header2, anchor);
+        deferred.markdown.header3 = defer_style(deferred.markdown.header3, anchor);
+        deferred.markdown.header4 = defer_style(deferred.markdown.header4, anchor);
+        deferred.markdown.header5 = defer_style(deferred.markdown.header5, anchor);
+        deferred.markdown.header6 = defer_style(deferred.markdown.header6, anchor);
         deferred.markdown.code_block = Style::default().fg(deferring(
             deferred.markdown.code_block.fg.unwrap_or(anchor),
             anchor,
@@ -766,6 +807,43 @@ mod tests {
     }
 
     #[test]
+    fn the_heading_orange_diverges_between_canvases() {
+        // The deferral's heading rule exists because this palette's
+        // heading orange clears the AA floor on the house canvas and
+        // fails it on white — the light canvas the deferral serves.
+        // Pinning both sides keeps the rule from being deleted as
+        // unnecessary.
+        fn channel(value: u8) -> f64 {
+            let unit = f64::from(value) / 255.0;
+            if unit <= 0.04045 {
+                unit / 12.92
+            } else {
+                ((unit + 0.055) / 1.055).powi(2)
+            }
+        }
+        fn ratio(a: Color, b: Color) -> f64 {
+            fn luminance(color: Color) -> f64 {
+                let Color::Rgb(red, green, blue) = color else {
+                    return 0.0;
+                };
+                0.2126 * channel(red) + 0.7152 * channel(green) + 0.0722 * channel(blue)
+            }
+            let (la, lb) = (luminance(a), luminance(b));
+            (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+        }
+        let heading = Color::Rgb(255, 193, 51);
+        let canvas = Theme::default().ui.background;
+        assert!(
+            ratio(heading, canvas) >= 4.5,
+            "the heading orange must read on the installed canvas"
+        );
+        assert!(
+            ratio(heading, Color::Rgb(255, 255, 255)) < 4.5,
+            "the heading orange must fail on white — or the deferral rule is dead weight"
+        );
+    }
+
+    #[test]
     fn an_unsynced_terminal_defers_the_canvas_anchored_colors() {
         // The default palette paints conversation text in its own
         // near-canvas foreground on an unpainted terminal background;
@@ -823,6 +901,39 @@ mod tests {
             deferred.ui.background, theme.ui.background,
             "the canvas field is inert without the override; it stands"
         );
+        // The heading orange fails the light-canvas floor (1.62:1
+        // on white) while clearing it on the house canvas (12:1) —
+        // the divergence that makes the heading rule necessary. On
+        // deferral every heading falls to the terminal's own
+        // foreground, readable by construction on either canvas, and
+        // the bold weight that marks a heading survives the swap.
+        let heading_orange = Color::Rgb(255, 193, 51);
+        assert_eq!(
+            theme.markdown.header1.fg,
+            Some(heading_orange),
+            "the installed palette keeps the heading orange"
+        );
+        for level in 1..=6 {
+            let deferred_heading = match level {
+                1 => deferred.markdown.header1,
+                2 => deferred.markdown.header2,
+                3 => deferred.markdown.header3,
+                4 => deferred.markdown.header4,
+                5 => deferred.markdown.header5,
+                _ => deferred.markdown.header6,
+            };
+            assert_eq!(
+                deferred_heading.fg,
+                Some(Color::Reset),
+                "deferred heading level {level} falls to the terminal's own foreground"
+            );
+            assert!(
+                deferred_heading
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::BOLD),
+                "deferred heading level {level} keeps its bold weight"
+            );
+        }
     }
 
     #[test]
