@@ -631,7 +631,11 @@ fn git_branch(workdir: &Path) -> Option<String> {
 /// will become: the adopted outcome reads the queued display, totals,
 /// and machine history — compaction count included — instead of the
 /// stale file contents, so the resumed runner cannot step back over
-/// a publish the stalled writer has not flushed yet.
+/// a publish the stalled writer has not flushed yet. The queued
+/// state's own model, permission mode, and recorded name ride with
+/// it — each is newer than the file's record whenever the queued
+/// snapshot exists — and a launch-flag-named mode still outranks the
+/// queued one.
 fn adopt_queued_snapshots(
     outcome: &mut crate::resume::ResumeOutcome,
     queued: crate::tui::transcript::QueuedForResume,
@@ -640,6 +644,9 @@ fn adopt_queued_snapshots(
     outcome.tokens = queued.tokens;
     outcome.model = queued.model;
     outcome.permission_mode = queued.permission_mode;
+    if queued.title.is_some() {
+        outcome.title = queued.title;
+    }
     if let Some((machine, compactions)) = queued.machine {
         outcome.machine = Some(
             std::sync::Arc::try_unwrap(machine).unwrap_or_else(|shared| shared.as_ref().clone()),

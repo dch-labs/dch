@@ -157,6 +157,8 @@ impl TranscriptHandle {
     /// holds while the resumed runner builds on the newer content. A
     /// machine half older than the display half it would pair with is
     /// left out, the same staleness judgment the disk path applies.
+    /// Snapshots the writer has taken and is writing stay visible
+    /// here until their write lands.
     pub(crate) fn latest_queued_for(&self, id: uuid::Uuid) -> Option<QueuedForResume> {
         let pending = self
             .pending
@@ -166,12 +168,24 @@ impl TranscriptHandle {
             .display
             .iter()
             .rev()
-            .find(|waiting| waiting.saver.session_id() == id)?;
+            .find(|waiting| waiting.saver.session_id() == id)
+            .or_else(|| {
+                pending
+                    .in_flight_display
+                    .iter()
+                    .rev()
+                    .find(|waiting| waiting.saver.session_id() == id)
+            })?;
         let machine = pending
             .machine
             .iter()
             .rev()
             .find(|waiting| waiting.saver.as_ref().map(|pinned| pinned.session_id()) == Some(id))
+            .or_else(|| {
+                pending.in_flight_machine.iter().rev().find(|waiting| {
+                    waiting.saver.as_ref().map(|pinned| pinned.session_id()) == Some(id)
+                })
+            })
             .filter(|waiting| waiting.saved_at >= display.saved_at)
             .map(|waiting| {
                 (
@@ -186,7 +200,23 @@ impl TranscriptHandle {
             model: display.saver.model().to_string(),
             permission_mode: display.saver.permission_mode(),
             saved_at: display.saved_at,
+            title: display.saver.title().map(str::to_string),
         })
+    }
+
+    /// A handle with no writer behind it, for resume-flow tests.
+    ///
+    /// Published snapshots wait in the queue untouched — there is no
+    /// thread to drain them — so a test drives the exact state a
+    /// stalled writer leaves behind without racing one.
+    #[cfg(test)]
+    pub(crate) fn handle_without_writer(saver: Arc<crate::session::SessionSaver>) -> Self {
+        Self {
+            pending: Arc::new(std::sync::Mutex::new(PendingSaves::default())),
+            signal: Arc::new(std::sync::Condvar::new()),
+            saver: Arc::new(std::sync::Mutex::new(saver)),
+            naming_in_flight: Arc::new(std::sync::Mutex::new(None)),
+        }
     }
 
     /// Relabel the saver's model without moving its session id.
@@ -381,6 +411,7 @@ impl TranscriptHandle {
 /// newest file always pairs the transcript with the totals the
 /// status bar showed when it was taken — the two halves of a
 /// session's state that a resume restores as one.
+#[derive(Clone)]
 struct TranscriptSnapshot {
     /// The conversation at turn end.
     ///
@@ -476,7 +507,10 @@ pub(crate) fn recorded_compactions(conversation: &[dch_tui::TuiMessage]) -> u32 
 /// rotation or retarget that swaps the identity in preserves the
 /// outgoing session's snapshot beside the fresh one until both
 /// persist — a stalled writer cannot lose the ended session's last
-/// turn because the fresh session published behind it.
+/// turn because the fresh session published behind it. A snapshot the
+/// writer has taken stays visible in the in-flight half until its
+/// write lands, so a resume read never falls back to the file the
+/// write has not reached yet.
 #[derive(Default)]
 struct PendingSaves {
     /// Display snapshots waiting to persist, newest per session.
@@ -491,6 +525,18 @@ struct PendingSaves {
     /// The same per-session rule on the engine half; the two halves
     /// never block each other.
     machine: Vec<MachineSnapshot>,
+
+    /// Display snapshots the writer has taken and is writing.
+    ///
+    /// Held here — not in a local — so a resume read between the take
+    /// and the write still sees the newest queued state instead of
+    /// falling back to the file the write has not reached yet.
+    in_flight_display: Vec<TranscriptSnapshot>,
+
+    /// Machine snapshots the writer has taken and is writing.
+    ///
+    /// The same visibility rule on the engine half.
+    in_flight_machine: Vec<MachineSnapshot>,
 }
 
 impl PendingSaves {
@@ -499,7 +545,10 @@ impl PendingSaves {
     /// The writer's condvar predicate: sleep only when there is
     /// nothing of either kind to persist.
     fn is_empty(&self) -> bool {
-        self.display.is_empty() && self.machine.is_empty()
+        self.display.is_empty()
+            && self.machine.is_empty()
+            && self.in_flight_display.is_empty()
+            && self.in_flight_machine.is_empty()
     }
 
     /// Queue one display snapshot, newest-wins within its session.
@@ -583,6 +632,14 @@ pub(crate) struct QueuedForResume {
     /// The freshness boundary the disk machine snapshot is re-judged
     /// against once the queued display becomes the adopted truth.
     pub(crate) saved_at: chrono::DateTime<chrono::Utc>,
+
+    /// The session's recorded name at the newest waiting publish.
+    ///
+    /// Read from the pinned saver: a naming answer that landed between
+    /// the disk write and this publish is newer than the file's own
+    /// record, and the adoption carries it instead of leaving the
+    /// resumed session untitled.
+    pub(crate) title: Option<String>,
 }
 
 /// The single writer thread that persists turn-end snapshots.
@@ -708,33 +765,73 @@ impl TranscriptWorker {
                 while guard.is_empty() && !thread_shutdown.load(Ordering::SeqCst) {
                     guard = wait(guard);
                 }
-                let (display, machine) = (
-                    std::mem::take(&mut guard.display),
-                    std::mem::take(&mut guard.machine),
-                );
+                let queued_display = std::mem::take(&mut guard.display);
+                let queued_machine = std::mem::take(&mut guard.machine);
+                guard.in_flight_display.extend(queued_display);
+                guard.in_flight_machine.extend(queued_machine);
                 drop(guard);
-                if display.is_empty() && machine.is_empty() {
-                    break;
-                }
-                for snapshot in display {
-                    if let Err(err) = snapshot.saver.save_at(
-                        &snapshot.messages,
-                        snapshot.tokens,
-                        snapshot.saved_at,
-                    ) {
-                        tracing::warn!(error = %err, "session transcript could not be saved");
-                    }
-                }
-                for snapshot in machine {
-                    if let Some(saver) = snapshot.saver.as_ref()
-                        && let Err(err) = saver.save_machine(
-                            &snapshot.messages,
-                            snapshot.saved_at,
-                            snapshot.compactions,
+                loop {
+                    let (display, machine) = {
+                        let guard = thread_pending
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        (
+                            guard.in_flight_display.first().cloned(),
+                            guard.in_flight_machine.first().map(|snapshot| {
+                                (
+                                    std::sync::Arc::clone(&snapshot.messages),
+                                    snapshot.saved_at,
+                                    snapshot.compactions,
+                                    snapshot.saver.clone(),
+                                )
+                            }),
                         )
-                    {
-                        tracing::warn!(error = %err, "machine history could not be saved");
+                    };
+                    if display.is_none() && machine.is_none() {
+                        break;
                     }
+                    if let Some(snapshot) = display {
+                        if let Err(err) = snapshot.saver.save_at(
+                            &snapshot.messages,
+                            snapshot.tokens,
+                            snapshot.saved_at,
+                        ) {
+                            tracing::warn!(error = %err, "session transcript could not be saved");
+                        }
+                        let mut guard = thread_pending
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        guard.in_flight_display.remove(0);
+                    }
+                    if let Some((messages, saved_at, compactions, saver)) = machine {
+                        let written = saver
+                            .as_ref()
+                            .map(|pinned| pinned.save_machine(&messages, saved_at, compactions));
+                        if let Some(Err(err)) = written {
+                            tracing::warn!(error = %err, "machine history could not be saved");
+                        }
+                        let mut guard = thread_pending
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        guard.in_flight_machine.remove(0);
+                    }
+                    let guard = thread_pending
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if guard.display.is_empty()
+                        && guard.machine.is_empty()
+                        && guard.in_flight_display.is_empty()
+                        && guard.in_flight_machine.is_empty()
+                        && thread_shutdown.load(Ordering::SeqCst)
+                    {
+                        break;
+                    }
+                }
+                let guard = thread_pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if thread_shutdown.load(Ordering::SeqCst) && guard.is_empty() {
+                    break;
                 }
             }
         });
@@ -1165,11 +1262,14 @@ mod tests {
         // this one.
         let dir = tempfile::tempdir().expect("sessions tempdir");
         let first = uuid::Uuid::new_v4();
-        let saver = Arc::new(crate::session::SessionSaver::with_base_dir(
-            first,
-            "m".to_string(),
-            dir.path().to_path_buf(),
-        ));
+        let saver = Arc::new(
+            crate::session::SessionSaver::with_base_dir(
+                first,
+                "m".to_string(),
+                dir.path().to_path_buf(),
+            )
+            .with_title(Some("the recorded title".to_string())),
+        );
         let handle = TranscriptHandle {
             pending: Arc::new(std::sync::Mutex::new(PendingSaves::default())),
             signal: Arc::new(std::sync::Condvar::new()),
@@ -1220,6 +1320,11 @@ mod tests {
             format!("{:?}", ended.messages).contains("the ended session's last turn"),
             "the read reaches the newest publish of the identity asked for"
         );
+        assert_eq!(
+            ended.title.as_deref(),
+            Some("the recorded title"),
+            "the pinned saver's recorded name rides with the queued state"
+        );
         assert!(
             matches!(&ended.machine, Some((history, 3)) if format!("{history:?}").contains("the engine's history")),
             "the machine half rides with its own compaction count"
@@ -1249,6 +1354,32 @@ mod tests {
             pending.display.len(),
             2,
             "the read clones — the queue stays intact for the writer"
+        );
+        drop(pending);
+
+        // The writer's take: queue entries move to the in-flight half
+        // and the resume read follows them there — a write still
+        // running hides nothing from the identity it belongs to.
+        {
+            let mut pending = handle
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let drained_display = std::mem::take(&mut pending.display);
+            let drained_machine = std::mem::take(&mut pending.machine);
+            pending.in_flight_display.extend(drained_display);
+            pending.in_flight_machine.extend(drained_machine);
+        }
+        let in_flight = handle
+            .latest_queued_for(first)
+            .expect("the taken snapshot stays visible while its write runs");
+        assert!(
+            format!("{:?}", in_flight.messages).contains("the ended session's last turn"),
+            "the in-flight half answers the identity's read"
+        );
+        assert!(
+            handle.latest_queued_for(uuid::Uuid::new_v4()).is_none(),
+            "a stranger's identity still reads nothing from the in-flight half"
         );
     }
 

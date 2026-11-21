@@ -822,7 +822,7 @@ mod tests {
             crate::session::SessionSaver::with_base_dir(b, "m2".to_string(), root.clone())
                 .with_permission_mode(Some(dch_config::PermissionMode::ReadOnly)),
         );
-        let (transcript, _worker) = TranscriptWorker::spawn(Arc::clone(&queued_saver));
+        let transcript = TranscriptHandle::handle_without_writer(Arc::clone(&queued_saver));
         transcript.send(
             vec![dch_tui::TuiMessage::User {
                 text: "the newer queued turn".to_string(),
@@ -840,6 +840,11 @@ mod tests {
             compactions: 0,
             saver: None,
         });
+        // The live saver moves on after the publishes land — a relabel
+        // and a mode change the queued snapshots must not inherit: the
+        // resume reads what was pinned, not what the cell holds now.
+        transcript.relabel_model("m9");
+        transcript.set_permission_mode(Some(dch_config::PermissionMode::Auto));
         let mut runner = unreachable_runner().await;
         let (_, state) = TuiObserverState::new().into_observer();
         let (session_tx, _session_rx) = mpsc::unbounded_channel();
@@ -927,7 +932,7 @@ mod tests {
                 0,
             )
             .expect("the disk machine lands");
-        let (transcript, _worker) = TranscriptWorker::spawn(Arc::clone(&disk_saver));
+        let transcript = TranscriptHandle::handle_without_writer(Arc::clone(&disk_saver));
         transcript.send(
             vec![dch_tui::TuiMessage::User {
                 text: "the newer queued turn".to_string(),
