@@ -517,6 +517,25 @@ impl SessionSaver {
         self.title.as_deref()
     }
 
+    /// The model the session runs, as the envelope records it.
+    ///
+    /// A queued snapshot's pinned saver reports its own model, so an
+    /// adoption that trusts the snapshot's content reads the model
+    /// that content was published under.
+    #[must_use]
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// The session's recorded permission-mode override, if any.
+    ///
+    /// `None` means the configuration governs; the recorded mode is
+    /// what a resume adopts when the file names its own posture.
+    #[must_use]
+    pub fn permission_mode(&self) -> Option<dch_config::PermissionMode> {
+        self.permission_mode
+    }
+
     /// The session identity this saver writes under.
     ///
     /// The uuid that names the directory both files land in — the same

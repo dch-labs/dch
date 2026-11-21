@@ -183,6 +183,9 @@ impl TranscriptHandle {
             messages: display.messages.clone(),
             tokens: display.tokens,
             machine,
+            model: display.saver.model().to_string(),
+            permission_mode: display.saver.permission_mode(),
+            saved_at: display.saved_at,
         })
     }
 
@@ -561,6 +564,25 @@ pub(crate) struct QueuedForResume {
     /// and the staleness guard reads the same story the snapshot
     /// tells.
     pub(crate) machine: Option<(std::sync::Arc<Vec<loopctl::message::Message>>, u32)>,
+
+    /// The model the queued state was published under.
+    ///
+    /// Read from the pinned saver: a relabel that landed between the
+    /// disk write and this publish is newer than the file's own
+    /// record, and the adoption trusts the newer one.
+    pub(crate) model: String,
+
+    /// The permission-mode override the queued state carried.
+    ///
+    /// `None` leaves the file's own record standing; a recorded mode
+    /// is what the conversation actually ran under at publish time.
+    pub(crate) permission_mode: Option<dch_config::PermissionMode>,
+
+    /// The publish moment of the newest waiting display.
+    ///
+    /// The freshness boundary the disk machine snapshot is re-judged
+    /// against once the queued display becomes the adopted truth.
+    pub(crate) saved_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// The single writer thread that persists turn-end snapshots.

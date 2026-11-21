@@ -638,6 +638,8 @@ fn adopt_queued_snapshots(
 ) {
     outcome.messages = queued.messages;
     outcome.tokens = queued.tokens;
+    outcome.model = queued.model;
+    outcome.permission_mode = queued.permission_mode;
     if let Some((machine, compactions)) = queued.machine {
         outcome.machine = Some(
             std::sync::Arc::try_unwrap(machine).unwrap_or_else(|shared| shared.as_ref().clone()),
@@ -709,14 +711,18 @@ pub(crate) async fn resume_into_session(
         );
         return false;
     };
-    let Ok(mut outcome) = crate::resume::load_for_resume_in(target, &context.sessions_root) else {
+    let queued = transcript.latest_queued_for(target);
+    let machine_floor = queued.as_ref().map(|waiting| waiting.saved_at);
+    let Ok(mut outcome) =
+        crate::resume::load_for_resume_in_with_floor(target, &context.sessions_root, machine_floor)
+    else {
         post_session_notice(
             session_tx,
             format!("session {id} could not be loaded — the loop kept its conversation"),
         );
         return false;
     };
-    if let Some(queued) = transcript.latest_queued_for(target) {
+    if let Some(queued) = queued {
         adopt_queued_snapshots(&mut outcome, queued);
     }
     let machine =

@@ -339,6 +339,7 @@ mod tests {
     use crate::tui::permissions_bridge::InteractiveLanes;
     use crate::tui::permissions_bridge::tighten_config_rules_cell;
     use crate::tui::test_support::*;
+    use crate::tui::transcript::MachineSnapshot;
     use crate::tui::transcript::TranscriptWorker;
     use dch_tui::SessionCommand;
     use dch_tui::SessionUpdate;
@@ -782,6 +783,193 @@ mod tests {
             context.config.runner.permission_mode,
             dch_config::PermissionMode::Auto,
             "the loop's own config carries the file default, not the base's launch mode"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resume_adopts_the_newest_queued_models_mode_and_turns() {
+        // The adoption trusts the newest published state whole: the
+        // queued snapshot pins its own saver, so the model it was
+        // published under and the permission mode it recorded ride
+        // beside its turns — a resume that took only the messages
+        // would seat the runner on the newest conversation with the
+        // older file's model and posture.
+        let dir = tempfile::tempdir().expect("sessions tempdir");
+        let root = dir.keep();
+        let b = uuid::Uuid::new_v4();
+        let disk_saver =
+            crate::session::SessionSaver::with_base_dir(b, "m1".to_string(), root.clone());
+        disk_saver
+            .save_at(
+                &[dch_tui::TuiMessage::User {
+                    text: "the disk turn".to_string(),
+                    timestamp: chrono::Utc::now(),
+                    steered: false,
+                    unsent: false,
+                }],
+                crate::session::SessionTokens::default(),
+                chrono::Utc::now(),
+            )
+            .expect("the disk session lands");
+        disk_saver
+            .save_machine(
+                &[loopctl::message::Message::user("the older machine turn")],
+                chrono::Utc::now(),
+                0,
+            )
+            .expect("the disk machine lands");
+        let queued_saver = Arc::new(
+            crate::session::SessionSaver::with_base_dir(b, "m2".to_string(), root.clone())
+                .with_permission_mode(Some(dch_config::PermissionMode::ReadOnly)),
+        );
+        let (transcript, _worker) = TranscriptWorker::spawn(Arc::clone(&queued_saver));
+        transcript.send(
+            vec![dch_tui::TuiMessage::User {
+                text: "the newer queued turn".to_string(),
+                timestamp: chrono::Utc::now(),
+                steered: false,
+                unsent: false,
+            }],
+            crate::session::SessionTokens::default(),
+        );
+        transcript.send_machine(MachineSnapshot {
+            messages: Arc::new(vec![loopctl::message::Message::user(
+                "the newer engine turn",
+            )]),
+            saved_at: chrono::Utc::now(),
+            compactions: 0,
+            saver: None,
+        });
+        let mut runner = unreachable_runner().await;
+        let (_, state) = TuiObserverState::new().into_observer();
+        let (session_tx, _session_rx) = mpsc::unbounded_channel();
+        let mut context = DriverContext {
+            config: unreachable_config(),
+            config_base: std::sync::Arc::new(unreachable_config()),
+            workdir: std::path::PathBuf::from("."),
+            sessions_root: root.clone(),
+            state: state.clone(),
+            shutting_down: shutdown_flag(false),
+            lanes: InteractiveLanes::detached(),
+            overrides: RunOverrides {
+                model: None,
+                reasoning_effort: None,
+                permission_named: false,
+                permission_default: dch_config::PermissionMode::Auto,
+            },
+        };
+        let adopted = apply_session_command(
+            &mut runner,
+            &transcript,
+            &session_tx,
+            SessionCommand::Resume { id: b.to_string() },
+            &mut context,
+        )
+        .await;
+        assert!(adopted, "the saved session adopts");
+        assert_eq!(
+            context.config.api.model, "m2",
+            "the resumed loop runs the model the queued state was published under"
+        );
+        assert_eq!(
+            *context
+                .lanes
+                .mode_cell
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            dch_config::PermissionMode::ReadOnly,
+            "the recorded mode the queued state carried is what the gate runs"
+        );
+        let history = state
+            .machine_history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .expect("the resumed runner seeds from the adopted history");
+        assert!(
+            format!("{history:?}").contains("the newer engine turn")
+                && !format!("{history:?}").contains("the older machine turn"),
+            "the queued machine half replaces the disk one: {history:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resume_over_a_queued_display_derives_from_it_when_disk_machine_is_stale() {
+        // No queued machine half is not a free keep: the disk machine
+        // is re-judged against the adopted display's stamp, and one
+        // that predates it reads as absent — the resume's derive walk
+        // covers the difference instead of seeding the runner on a
+        // history older than the conversation it is shown beside.
+        let dir = tempfile::tempdir().expect("sessions tempdir");
+        let root = dir.keep();
+        let b = uuid::Uuid::new_v4();
+        let disk_saver = Arc::new(crate::session::SessionSaver::with_base_dir(
+            b,
+            "m1".to_string(),
+            root.clone(),
+        ));
+        disk_saver
+            .save_at(
+                &[dch_tui::TuiMessage::User {
+                    text: "the disk turn".to_string(),
+                    timestamp: chrono::Utc::now(),
+                    steered: false,
+                    unsent: false,
+                }],
+                crate::session::SessionTokens::default(),
+                chrono::Utc::now(),
+            )
+            .expect("the disk session lands");
+        disk_saver
+            .save_machine(
+                &[loopctl::message::Message::user("the older machine turn")],
+                chrono::Utc::now(),
+                0,
+            )
+            .expect("the disk machine lands");
+        let (transcript, _worker) = TranscriptWorker::spawn(Arc::clone(&disk_saver));
+        transcript.send(
+            vec![dch_tui::TuiMessage::User {
+                text: "the newer queued turn".to_string(),
+                timestamp: chrono::Utc::now(),
+                steered: false,
+                unsent: false,
+            }],
+            crate::session::SessionTokens::default(),
+        );
+        let mut runner = unreachable_runner().await;
+        let (_, state) = TuiObserverState::new().into_observer();
+        let (session_tx, _session_rx) = mpsc::unbounded_channel();
+        let mut context = DriverContext {
+            config: unreachable_config(),
+            config_base: std::sync::Arc::new(unreachable_config()),
+            workdir: std::path::PathBuf::from("."),
+            sessions_root: root.clone(),
+            state: state.clone(),
+            shutting_down: shutdown_flag(false),
+            lanes: InteractiveLanes::detached(),
+            overrides: RunOverrides::default(),
+        };
+        let adopted = apply_session_command(
+            &mut runner,
+            &transcript,
+            &session_tx,
+            SessionCommand::Resume { id: b.to_string() },
+            &mut context,
+        )
+        .await;
+        assert!(adopted, "the saved session adopts");
+        let history = state
+            .machine_history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .expect("the resumed runner seeds from the adopted history");
+        assert!(
+            format!("{history:?}").contains("the newer queued turn")
+                && !format!("{history:?}").contains("the older machine turn"),
+            "the runner derives from the adopted display, not from the stale \
+             disk machine: {history:?}"
         );
     }
 
