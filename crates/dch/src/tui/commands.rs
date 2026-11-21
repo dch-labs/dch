@@ -705,6 +705,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_clear_then_resume_without_a_saved_mode_runs_the_file_default() {
+        // The chain the launch statement's retirement exists for: a
+        // `/clear` reset the live mode to the file default, and the
+        // resumed file records no mode of its own — the fallback must
+        // read the same file default the clear reset to, not the
+        // base config's launch-time snapshot, or the resumed session
+        // inherits a mode nothing chose for it.
+        let dir = tempfile::tempdir().expect("sessions tempdir");
+        let root = dir.keep();
+        let b = uuid::Uuid::new_v4();
+        let saver =
+            crate::session::SessionSaver::with_base_dir(b, "test-model".to_string(), root.clone());
+        saver
+            .save_at(
+                &[dch_tui::TuiMessage::User {
+                    text: "the resumed turn".to_string(),
+                    timestamp: chrono::Utc::now(),
+                    steered: false,
+                    unsent: false,
+                }],
+                crate::session::SessionTokens::default(),
+                chrono::Utc::now(),
+            )
+            .expect("the resumed session lands");
+        let mut runner = unreachable_runner().await;
+        let (_, state) = TuiObserverState::new().into_observer();
+        let (session_tx, _session_rx) = mpsc::unbounded_channel();
+        let parked_saver = Arc::new(crate::session::SessionSaver::with_base_dir(
+            uuid::Uuid::new_v4(),
+            "m".to_string(),
+            root.clone(),
+        ));
+        let (transcript, _worker) = TranscriptWorker::spawn(parked_saver);
+        let mut context = DriverContext {
+            config: unreachable_config(),
+            config_base: std::sync::Arc::new(unreachable_config()),
+            workdir: std::path::PathBuf::from("."),
+            sessions_root: root.clone(),
+            state,
+            shutting_down: shutdown_flag(false),
+            lanes: InteractiveLanes::detached(),
+            overrides: RunOverrides {
+                model: None,
+                reasoning_effort: None,
+                permission_named: false,
+                permission_default: dch_config::PermissionMode::Auto,
+            },
+        };
+        // The launch-time base names a mode nothing chose after the
+        // clear — the fallback that read it instead of the file
+        // default is exactly what this pin refuses.
+        Arc::make_mut(&mut context.config_base)
+            .runner
+            .permission_mode = dch_config::PermissionMode::ReadOnly;
+        context.config.runner.permission_mode = dch_config::PermissionMode::ReadOnly;
+        let adopted = apply_session_command(
+            &mut runner,
+            &transcript,
+            &session_tx,
+            SessionCommand::Resume { id: b.to_string() },
+            &mut context,
+        )
+        .await;
+        assert!(adopted, "the saved session adopts");
+        assert_eq!(
+            *context
+                .lanes
+                .mode_cell
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            dch_config::PermissionMode::Auto,
+            "the resumed session runs the file default the clear had reset to"
+        );
+        assert_eq!(
+            context.config.runner.permission_mode,
+            dch_config::PermissionMode::Auto,
+            "the loop's own config carries the file default, not the base's launch mode"
+        );
+    }
+
+    #[tokio::test]
     async fn a_clear_after_damage_reseeds_the_config_rules_with_the_verdict() {
         // The round-4 lifecycle case: a damaged restore tightened the
         // config-rules cell, and `/clear` adopts a fresh memory —

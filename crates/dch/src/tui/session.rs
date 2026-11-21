@@ -625,6 +625,56 @@ fn git_branch(workdir: &Path) -> Option<String> {
     detached.then(|| head.chars().take(7).collect())
 }
 
+/// Fold the identity's newest queued snapshots into a loaded resume.
+///
+/// A snapshot still waiting on the writer is newer than the file it
+/// will become: the adopted outcome reads the queued display, totals,
+/// and machine history — compaction count included — instead of the
+/// stale file contents, so the resumed runner cannot step back over
+/// a publish the stalled writer has not flushed yet.
+fn adopt_queued_snapshots(
+    outcome: &mut crate::resume::ResumeOutcome,
+    queued: crate::tui::transcript::QueuedForResume,
+) {
+    outcome.messages = queued.messages;
+    outcome.tokens = queued.tokens;
+    if let Some((machine, compactions)) = queued.machine {
+        outcome.machine = Some(
+            std::sync::Arc::try_unwrap(machine).unwrap_or_else(|shared| shared.as_ref().clone()),
+        );
+        outcome.machine_compactions = compactions;
+    }
+}
+
+/// The mode a resumed session runs under, and the mode it records.
+///
+/// A flag named at launch governs both: the live config's mode stands
+/// and is recorded onto the save target. Otherwise the resumed file's
+/// own mode stands — falling back to the file default the launch
+/// recorded when the file names none — and only a saved mode is
+/// recorded, since an absent one means the configuration governs.
+fn resumed_modes(
+    context: &DriverContext,
+    outcome: &crate::resume::ResumeOutcome,
+) -> (
+    dch_config::PermissionMode,
+    Option<dch_config::PermissionMode>,
+) {
+    let standing_mode = if context.overrides.permission_named {
+        context.config.runner.permission_mode
+    } else {
+        outcome
+            .permission_mode
+            .unwrap_or(context.overrides.permission_default)
+    };
+    let recorded_mode = if context.overrides.permission_named {
+        Some(standing_mode)
+    } else {
+        outcome.permission_mode
+    };
+    (standing_mode, recorded_mode)
+}
+
 /// The live resume: adopt a saved session's history, file, and display.
 ///
 /// The driver alone can load: it parses the id, reads the saved pair
@@ -659,13 +709,16 @@ pub(crate) async fn resume_into_session(
         );
         return false;
     };
-    let Ok(outcome) = crate::resume::load_for_resume_in(target, &context.sessions_root) else {
+    let Ok(mut outcome) = crate::resume::load_for_resume_in(target, &context.sessions_root) else {
         post_session_notice(
             session_tx,
             format!("session {id} could not be loaded — the loop kept its conversation"),
         );
         return false;
     };
+    if let Some(queued) = transcript.latest_queued_for(target) {
+        adopt_queued_snapshots(&mut outcome, queued);
+    }
     let machine =
         crate::resume::history_for_resume(&outcome, context.config.security.redact_secrets);
     let mut config = context.config.clone();
@@ -680,18 +733,7 @@ pub(crate) async fn resume_into_session(
         &mut config,
         context.overrides.reasoning_effort.as_deref(),
     );
-    let standing_mode = if context.overrides.permission_named {
-        context.config.runner.permission_mode
-    } else {
-        outcome
-            .permission_mode
-            .unwrap_or_else(|| context.config_base.runner.permission_mode)
-    };
-    let recorded_mode = if context.overrides.permission_named {
-        Some(standing_mode)
-    } else {
-        outcome.permission_mode
-    };
+    let (standing_mode, recorded_mode) = resumed_modes(context, &outcome);
     config.runner.permission_mode = standing_mode;
     let observer = context.state.clone().into_observer().0;
     let new_runner = assemble_runner_builder(

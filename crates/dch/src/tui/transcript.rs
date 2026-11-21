@@ -147,6 +147,45 @@ impl TranscriptHandle {
         self.signal.notify_one();
     }
 
+    /// The newest snapshots queued for `id`, display and machine.
+    ///
+    /// A live resume reads the target's latest published state through
+    /// here before falling back to disk: a snapshot still waiting on
+    /// the writer is newer than the file it will become, and resuming
+    /// from the stale file would replace it. The read clones and
+    /// leaves the queue untouched — the writer still persists what it
+    /// holds while the resumed runner builds on the newer content. A
+    /// machine half older than the display half it would pair with is
+    /// left out, the same staleness judgment the disk path applies.
+    pub(crate) fn latest_queued_for(&self, id: uuid::Uuid) -> Option<QueuedForResume> {
+        let pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let display = pending
+            .display
+            .iter()
+            .rev()
+            .find(|waiting| waiting.saver.session_id() == id)?;
+        let machine = pending
+            .machine
+            .iter()
+            .rev()
+            .find(|waiting| waiting.saver.as_ref().map(|pinned| pinned.session_id()) == Some(id))
+            .filter(|waiting| waiting.saved_at >= display.saved_at)
+            .map(|waiting| {
+                (
+                    std::sync::Arc::clone(&waiting.messages),
+                    waiting.compactions,
+                )
+            });
+        Some(QueuedForResume {
+            messages: display.messages.clone(),
+            tokens: display.tokens,
+            machine,
+        })
+    }
+
     /// Relabel the saver's model without moving its session id.
     ///
     /// A `/model` switch changes the model the session runs, and the
@@ -491,6 +530,37 @@ impl PendingSaves {
             .retain(|waiting| waiting.saver.as_ref().map(|pinned| pinned.session_id()) != Some(id));
         self.machine.push(snapshot);
     }
+}
+
+/// The newest queued halves of one session, read for a live resume.
+///
+/// A resume that is about to adopt an identity reads these before it
+/// trusts the file on disk: a snapshot still waiting on the writer is
+/// newer than the file it will become.
+pub(crate) struct QueuedForResume {
+    /// The display transcript at the newest waiting publish.
+    ///
+    /// Verbatim as the hook published it, ordered as rendered — the
+    /// state the resumed display re-seeds from instead of the older
+    /// contents a stalled writer has not written to the file yet.
+    pub(crate) messages: Vec<TuiMessage>,
+
+    /// The token totals that publish paired with the transcript.
+    ///
+    /// The session's accounting at publish time — lifetime input and
+    /// output plus the last turn's input — so the resumed display
+    /// continues the figures the conversation actually carried rather
+    /// than restarting from the older file's.
+    pub(crate) tokens: crate::session::SessionTokens,
+
+    /// The engine's committed history at the newest waiting publish,
+    /// when one waits.
+    ///
+    /// The history rides with the compaction count its snapshot
+    /// recorded, so the resumed runner continues process-identically
+    /// and the staleness guard reads the same story the snapshot
+    /// tells.
+    pub(crate) machine: Option<(std::sync::Arc<Vec<loopctl::message::Message>>, u32)>,
 }
 
 /// The single writer thread that persists turn-end snapshots.
@@ -1060,6 +1130,103 @@ mod tests {
             machine_ids,
             vec![first, rotated_id],
             "the machine half queues per identity the same way"
+        );
+    }
+
+    #[test]
+    fn the_resume_reads_the_newest_queued_snapshot_for_its_identity() {
+        // The live resume's read path: the newest queued halves of the
+        // identity it adopts — display, totals, and the machine
+        // history with its compaction count — cloned out while the
+        // queue itself stays intact, so the writer still persists what
+        // it holds and no other session's snapshot is mistaken for
+        // this one.
+        let dir = tempfile::tempdir().expect("sessions tempdir");
+        let first = uuid::Uuid::new_v4();
+        let saver = Arc::new(crate::session::SessionSaver::with_base_dir(
+            first,
+            "m".to_string(),
+            dir.path().to_path_buf(),
+        ));
+        let handle = TranscriptHandle {
+            pending: Arc::new(std::sync::Mutex::new(PendingSaves::default())),
+            signal: Arc::new(std::sync::Condvar::new()),
+            saver: Arc::new(std::sync::Mutex::new(saver)),
+            naming_in_flight: Arc::new(std::sync::Mutex::new(None)),
+        };
+        handle.send(
+            vec![dch_tui::TuiMessage::User {
+                text: "the ended session's last turn".to_string(),
+                timestamp: chrono::Utc::now(),
+                steered: false,
+                unsent: false,
+            }],
+            crate::session::SessionTokens::default(),
+        );
+        handle.send_machine(MachineSnapshot {
+            messages: Arc::new(vec![loopctl::message::Message::user(
+                "the engine's history",
+            )]),
+            saved_at: chrono::Utc::now(),
+            compactions: 3,
+            saver: None,
+        });
+        let rotated = handle.rotate("m");
+        let rotated_id = uuid::Uuid::parse_str(&rotated).expect("the rotation mints an id");
+        handle.send_machine(MachineSnapshot {
+            messages: Arc::new(vec![loopctl::message::Message::user(
+                "the fresh engine's history",
+            )]),
+            saved_at: chrono::Utc::now(),
+            compactions: 1,
+            saver: None,
+        });
+        handle.send(
+            vec![dch_tui::TuiMessage::User {
+                text: "the fresh session's opening".to_string(),
+                timestamp: chrono::Utc::now(),
+                steered: false,
+                unsent: false,
+            }],
+            crate::session::SessionTokens::default(),
+        );
+
+        let ended = handle
+            .latest_queued_for(first)
+            .expect("the ended session's snapshot waits");
+        assert!(
+            format!("{:?}", ended.messages).contains("the ended session's last turn"),
+            "the read reaches the newest publish of the identity asked for"
+        );
+        assert!(
+            matches!(&ended.machine, Some((history, 3)) if format!("{history:?}").contains("the engine's history")),
+            "the machine half rides with its own compaction count"
+        );
+        let fresh = handle
+            .latest_queued_for(rotated_id)
+            .expect("the fresh session's snapshot waits");
+        assert!(
+            format!("{:?}", fresh.messages).contains("the fresh session's opening"),
+            "the fresh identity reads its own opening, not the ended one"
+        );
+        assert!(
+            fresh.machine.is_none(),
+            "a machine half older than the display it would pair with is judged \
+             stale — the resume's derive walk covers the difference"
+        );
+        assert!(
+            handle.latest_queued_for(uuid::Uuid::new_v4()).is_none(),
+            "a stranger's identity reads nothing"
+        );
+
+        let pending = handle
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            pending.display.len(),
+            2,
+            "the read clones — the queue stays intact for the writer"
         );
     }
 
