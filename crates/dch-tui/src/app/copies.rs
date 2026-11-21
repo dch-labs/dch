@@ -2,13 +2,13 @@
 //! clipboard transports and their deadlines, and the notices each
 //! transport's verdict posts.
 
-use super::CopyAnswer;
 use super::TuiApp;
-use super::{
-    Arc, COPY_DEADLINE, CopyOutcomes, CopyVerdict, PoisonError, clipboard_env,
-    configured_copy_command, host_transports, next_attempt, run_process_transports,
-    transport_answer,
+use super::clipboard::CopyAnswer;
+use super::clipboard::{
+    COPY_DEADLINE, CopyOutcomes, CopyVerdict, clipboard_env, configured_copy_command,
+    host_transports, next_attempt, run_process_transports, transport_answer,
 };
+use super::{Arc, PoisonError};
 use crate::message::ContentBlock;
 use crate::message::TuiMessage;
 
@@ -52,6 +52,7 @@ impl TuiApp {
     /// lands its confirmation on the notice row, like every path.
     pub(in crate::app) fn copy_selection_now(&mut self) {
         let covered = self
+            .pointer
             .selection
             .as_ref()
             .map(|selection| self.selection_text(selection));
@@ -74,9 +75,9 @@ impl TuiApp {
     /// with the same attempt's verdict — never with one older than
     /// what a newer copy already posted.
     pub(in crate::app) fn copy_selection_and_notice(&mut self, text: &str) {
-        let attempt = next_attempt(&self.copy_attempts);
-        let answer = (self.copier)(attempt, text);
-        self.posted_copy_attempt = attempt;
+        let attempt = next_attempt(&self.copy.copy_attempts);
+        let answer = (self.copy.copier)(attempt, text);
+        self.copy.posted_copy_attempt = attempt;
         let wording = copy_answer_notice(answer);
         if !wording.is_empty() {
             self.post_notice(wording.to_string());
@@ -90,13 +91,13 @@ impl TuiApp {
     /// path a text selection uses. Returns whether the click consumed
     /// itself here, so the caller can treat a bar click as handled.
     pub(in crate::app) fn copy_session_id_at(&mut self, column: u16, row: u16) -> bool {
-        let Some((span_row, start, end)) = self.session_id_span.get() else {
+        let Some((span_row, start, end)) = self.host.session_id_span.get() else {
             return false;
         };
         if row != span_row || column < start || column >= end {
             return false;
         }
-        if let Some(id) = self.session_id.clone() {
+        if let Some(id) = self.host.session_id.clone() {
             self.copy_selection_and_notice(&id);
         }
         true

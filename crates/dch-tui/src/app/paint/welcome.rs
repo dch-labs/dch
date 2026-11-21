@@ -1,14 +1,12 @@
 //! The welcome screen's painter.
-
 use ratatui::Frame;
 use ratatui::layout::Rect;
 
 use super::super::TuiApp;
-use super::super::{
-    Constraint, Direction, INPUT_SIDE_INSET, INPUT_VERTICAL_PADDING, Layout, Line, Paragraph, Span,
-    Style, WelcomeShape, pane,
-};
+use super::super::composer::{INPUT_SIDE_INSET, INPUT_VERTICAL_PADDING};
+use super::super::{Constraint, Direction, Layout, Line, Paragraph, Span, Style, pane};
 use crate::cells::{display_width, for_display, suffix_within};
+use crate::splash;
 
 impl TuiApp {
     /// Render the fresh session's welcome: splash, notice, open
@@ -91,7 +89,7 @@ impl TuiApp {
             width: scale.width,
             height: shape.band_height,
         });
-        if self.input.is_empty() {
+        if self.composer.input.is_empty() {
             let spans: Vec<Span<'static>> = Self::WELCOME_PLACEHOLDER
                 .iter()
                 .zip(Self::WELCOME_WORD_COLORS.iter())
@@ -123,14 +121,14 @@ impl TuiApp {
                 u16::try_from(display_width(text)).unwrap_or(u16::MAX)
             })
             .saturating_add(1);
-        let standing = self.working_dir.clone().or_else(|| {
+        let standing = self.host.working_dir.clone().or_else(|| {
             std::env::current_dir()
                 .ok()
                 .map(|dir| dir.display().to_string())
         });
         if let Some(dir) = standing {
             let mut shown = dir;
-            if let Some(branch) = self.git_branch.clone() {
+            if let Some(branch) = self.host.git_branch.clone() {
                 shown.push_str(" (");
                 shown.push_str(&branch);
                 shown.push(')');
@@ -192,10 +190,10 @@ fn welcome_rows(area: Rect, band_height: u16, rule_row: u16, box_height: u16) ->
 /// The tail is the part worth keeping — a repository's name sits at
 /// the end of its path, so an over-room caption cuts its head and
 /// marks the cut with an ellipsis, the same side
-/// [`fit_column_tail`](super::super::fit_column_tail) keeps for the
-/// session listing. The measure is painted columns (a wide glyph
-/// counts twice) and the display strip runs first, so the room fits
-/// exactly what the row paints.
+/// [`fit_picker_title`](super::super::session_commands::fit_picker_title)
+/// keeps for the session listing. The measure is painted columns (a
+/// wide glyph counts twice) and the display strip runs first, so the
+/// room fits exactly what the row paints.
 fn dir_caption(shown: &str, room: u16) -> String {
     let room = usize::from(room.max(1));
     let shown = for_display(shown);
@@ -208,8 +206,8 @@ fn dir_caption(shown: &str, room: u16) -> String {
 
 #[cfg(test)]
 mod tests {
+
     use super::dir_caption;
-    use crate::cells::display_width;
 
     #[test]
     fn a_wide_caption_fits_its_room_by_painted_columns() {
@@ -238,5 +236,473 @@ mod tests {
             !caption.contains('\u{200d}'),
             "the caption paints the stripped projection: {caption:?}"
         );
+    }
+
+    use crate::app::TuiApp;
+    use crate::app::test_support::*;
+    use crate::cells::display_width;
+
+    use crate::message::TuiMessage;
+
+    #[test]
+    fn an_empty_conversation_paints_the_fjord_splash() {
+        // The empty pane's own shape: a fresh session shows the
+        // half-block fjord, centered, in the art's own colors.
+        let mut subject = app();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 30)).expect("terminal");
+        terminal
+            .draw(|frame| subject.render(frame))
+            .expect("first draw");
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(
+            text.contains('▀'),
+            "the empty conversation paints the half-block art: {text}"
+        );
+    }
+
+    #[test]
+    fn the_splash_margins_dissolve_into_the_theme_canvas() {
+        // The flat blue-black margins the art carries against the
+        // default theme's neutral canvas read as a mismatched
+        // background flanking the image — the outermost art column now
+        // goes unstyled, a cell the terminal paints as its own default
+        // (the canvas, in every color vocabulary), so the art's edge
+        // and the strips beside it are literally the same cell state.
+        // The picture's middle keeps its own colors.
+        let mut subject = app();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 30)).expect("terminal");
+        terminal
+            .draw(|frame| subject.render(frame))
+            .expect("first draw");
+        let buffer = terminal.backend().buffer();
+        let band = subject.welcome_band.expect("band");
+        let mid = band.y + band.height / 2;
+        let canvas = ratatui::style::Color::Reset;
+        for x in [band.x, band.right().saturating_sub(1)] {
+            let cell = buffer
+                .cell((x, mid))
+                .map(|cell| (cell.symbol(), cell.fg, cell.bg));
+            assert_eq!(
+                cell,
+                Some((" ", canvas, canvas)),
+                "the outermost art column is a blank default cell — no glyph dots in the foreground color"
+            );
+        }
+        let middle = buffer
+            .cell((band.x + band.width / 2, mid))
+            .map(|cell| cell.bg);
+        assert_ne!(
+            middle,
+            Some(canvas),
+            "the picture's middle keeps its own color"
+        );
+        let strip = buffer
+            .cell((band.x.saturating_sub(1), mid))
+            .map(|cell| (cell.fg, cell.bg));
+        assert_eq!(
+            strip,
+            Some((canvas, canvas)),
+            "the strips beyond the band are the same default cells as the art's edge"
+        );
+    }
+
+    #[test]
+    fn a_prompt_displaces_the_splash_and_a_clear_keeps_it_displaced() {
+        // Displacement retires the splash for the run: the first
+        // message bakes the cache and the splash stands down; /clear
+        // empties the conversation but the session happened — the
+        // fjord belongs to a process's first breath only and never
+        // returns after it.
+        let mut subject = app();
+        subject.push_message(TuiMessage::User {
+            text: "hello".to_string(),
+            timestamp: chrono::Utc::now(),
+            steered: false,
+            unsent: false,
+        });
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 30)).expect("terminal");
+        terminal
+            .draw(|frame| subject.render(frame))
+            .expect("first draw");
+        let busy = buffer_text(terminal.backend().buffer());
+        assert!(
+            !busy.contains('▀'),
+            "a conversation with traffic paints no splash: {busy}"
+        );
+        subject.clear_command();
+        terminal
+            .draw(|frame| subject.render(frame))
+            .expect("redraw after clear");
+        let cleared = buffer_text(terminal.backend().buffer());
+        assert!(
+            !cleared.contains('▀'),
+            "the cleared conversation keeps the splash retired: {cleared}"
+        );
+    }
+
+    #[test]
+    fn a_narrow_pane_seats_the_small_rung_on_give_way_margins() {
+        // Narrow panes spend their columns on the picture: the margins
+        // give way to two a side, the w34 rung stands where the old
+        // fractions left no room at all, and a pane too narrow even
+        // for that still declines rather than clips.
+        let mut subject = app();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 30)).expect("terminal");
+        terminal
+            .draw(|frame| subject.render(frame))
+            .expect("first draw");
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(
+            text.contains('▀'),
+            "the give-way margins seat the small rung: {text}"
+        );
+        let shape = subject
+            .welcome_shape(ratatui::layout::Rect::new(0, 0, 40, 30))
+            .expect("a shape");
+        let art = shape.art.expect("the narrow lane's rung");
+        assert_eq!(art.width, 34, "the narrow lane seats the w34 rung");
+        let declined = subject
+            .welcome_shape(ratatui::layout::Rect::new(0, 0, 30, 30))
+            .expect("a shape");
+        assert!(
+            declined.art.is_none(),
+            "too narrow for the smallest rung, the splash still declines"
+        );
+    }
+
+    #[test]
+    fn a_wide_tall_pane_shows_the_rung_whole_with_its_water() {
+        // The whole picture, not its richest rows: a pane that seats a
+        // tall rung's columns and rows shows every row of it — the
+        // water at the fjord's foot included, never windowed away. The
+        // three-quarter budget seats a rung below the widest one the
+        // pane could hold.
+        let subject = app();
+        let area = ratatui::layout::Rect::new(0, 0, 120, 44);
+        let shape = subject.welcome_shape(area).expect("a shape");
+        let art = shape.art.expect("the pane seats the 82x21 rung");
+        assert_eq!(art.width, 82, "the rung three-quarter budgets seat");
+        assert_eq!(art.height, 21, "the rung's own height");
+        assert_eq!(shape.rows_shown, art.height, "the rung shows whole");
+        assert_eq!(shape.row_skip, 0, "nothing is windowed away");
+    }
+
+    #[test]
+    fn a_wide_pane_seats_the_rung_its_width_deserves() {
+        // The width governs: a pane wide enough for the w75 rung seats
+        // it even when the pane is shorter than that, as long as the
+        // group still has its floor of room — the old proportional
+        // height budget used to shrink the picture on panes like this.
+        let subject = app();
+        let area = ratatui::layout::Rect::new(0, 0, 120, 32);
+        let shape = subject.welcome_shape(area).expect("a shape");
+        let art = shape.art.expect("the width seats the 75x20 rung");
+        assert_eq!(art.width, 75, "width governs the seat");
+        assert_eq!(art.height, 20, "the pane's floor still fits it");
+    }
+
+    #[test]
+    fn a_ruled_theme_underlines_the_welcome_field_too() {
+        // The open field is still a field: a theme that rules its
+        // docked composer rules the welcome's the same way — hairline
+        // underlines on the field's own top and bottom padding rows,
+        // drawn by the terminal, thin and solid — while the painted
+        // themes' welcome stays bare, and no rule crosses the murmur
+        // itself.
+        let mut subject = app();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 25)).expect("terminal");
+        terminal
+            .draw(|frame| subject.render(frame))
+            .expect("first draw");
+        {
+            let buffer = terminal.backend().buffer();
+            assert!(
+                (0..25u16).all(|y| {
+                    (0..80u16).all(|x| {
+                        !buffer[(x, y)]
+                            .style()
+                            .add_modifier
+                            .contains(ratatui::style::Modifier::UNDERLINED)
+                    })
+                }),
+                "a painted theme's welcome draws no rules — the field is open"
+            );
+        }
+        subject.theme.ui.composer_border = Some(ratatui::style::Color::Indexed(8));
+        terminal
+            .draw(|frame| subject.render(frame))
+            .expect("ruled draw");
+        let buffer = terminal.backend().buffer();
+        let row_text = |y: u16| -> String {
+            (0..80u16)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect()
+        };
+        let murmur = (0..25u16)
+            .find(|&y| row_text(y).contains("dream"))
+            .expect("the murmur row");
+        // The field's width at this pane: the three-quarter ladder
+        // seats the w48 rung, so each rule runs the field's 48 cells.
+        // The top rule rides the spacer two rows above the murmur —
+        // rule, a blank breath, the text — and the bottom rule the
+        // padding row just below it: the docked field's exact shape.
+        for row in [murmur.saturating_sub(2), murmur + 1] {
+            let ruled = (0..80u16)
+                .filter(|x| {
+                    buffer[(*x, row)]
+                        .style()
+                        .add_modifier
+                        .contains(ratatui::style::Modifier::UNDERLINED)
+                })
+                .count();
+            assert_eq!(ruled, 48, "row {row}: the rule runs the field's width");
+        }
+        assert!(
+            !buffer[(40, murmur)]
+                .style()
+                .add_modifier
+                .contains(ratatui::style::Modifier::UNDERLINED),
+            "the murmur rides clear of both rules"
+        );
+    }
+
+    #[test]
+    fn a_pane_too_short_for_the_art_paints_nothing() {
+        // The art is centered or absent, never clipped — vertically
+        // too: a pane whose row floor cannot seat the smallest rung
+        // shows no splash rather than a windowed fjord missing its
+        // water.
+        let subject = app();
+        let area = ratatui::layout::Rect::new(0, 0, 120, 20);
+        let shape = subject.welcome_shape(area).expect("a shape");
+        assert!(
+            shape.art.is_none(),
+            "a short pane clips nothing — the splash declines"
+        );
+    }
+
+    #[test]
+    fn the_welcome_name_murmurs_in_the_placeholder() {
+        // The empty composer carries the name in the picture's own
+        // night colors: dream in starlight gold, create in moonlit
+        // blue, harness in twilight lavender — one quiet row inside
+        // the open field, stood down at the first keystroke.
+        let mut subject = app();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 60)).expect("terminal");
+        terminal.draw(|frame| subject.render(frame)).expect("draw");
+        let buffer = terminal.backend().buffer();
+        let gold = ratatui::style::Color::Rgb(232, 203, 122);
+        let blue = ratatui::style::Color::Rgb(150, 180, 222);
+        let lavender = ratatui::style::Color::Rgb(180, 154, 216);
+        let word_row = |color: ratatui::style::Color| {
+            (0..buffer.area.height)
+                .find(|row| (0..buffer.area.width).any(|column| buffer[(column, *row)].fg == color))
+        };
+        let placeholder_row = word_row(gold).expect("the placeholder murmurs the name");
+        assert_eq!(
+            word_row(blue),
+            Some(placeholder_row),
+            "create shares the placeholder's row"
+        );
+        assert_eq!(
+            word_row(lavender),
+            Some(placeholder_row),
+            "harness shares the placeholder's row"
+        );
+    }
+
+    #[test]
+    fn a_welcome_too_small_for_art_records_no_band() {
+        // The band exists to carry art: a pane too small for the
+        // smallest rung still shows the welcome — its composer box
+        // alone, as the shape's own doc says — and must record no
+        // band.
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).expect("terminal");
+        terminal.draw(|frame| app.render(frame)).expect("draw");
+        assert!(
+            app.welcome_band.is_none(),
+            "an artless welcome carries no band — the composer box alone"
+        );
+    }
+
+    #[test]
+    fn the_welcome_to_docked_transition_requests_a_full_repaint() {
+        // The docked layout paints fewer rows than the splash band did;
+        // trusting the diff across that transition is the stale-splash
+        // symptom. The retirement arms the repaint the loop clears
+        // with.
+        let mut subject = app();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+        terminal
+            .draw(|frame| subject.render(frame))
+            .expect("welcome draw");
+        assert!(!subject.welcome.welcome_retired);
+        assert!(
+            subject.pacing.full_repaint_due.is_none(),
+            "the welcome itself repaints nothing"
+        );
+        subject.push_message(TuiMessage::User {
+            text: "first".to_string(),
+            timestamp: chrono::Utc::now(),
+            steered: false,
+            unsent: false,
+        });
+        terminal
+            .draw(|frame| subject.render(frame))
+            .expect("docked draw");
+        assert!(subject.welcome.welcome_retired);
+        assert!(
+            subject.pacing.full_repaint_due.is_some(),
+            "the transition arms the full repaint the loop clears with"
+        );
+    }
+
+    #[test]
+    fn the_docked_frame_leaves_no_splash_rows_behind() {
+        // The reported symptom, pinned at the buffer: the welcome
+        // paints a deep band, the first docked frame paints a short
+        // window — the rows the window cannot reach must hold nothing,
+        // because the pane erases whole before its widgets write.
+        let mut subject = app();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+        terminal
+            .draw(|frame| subject.render(frame))
+            .expect("welcome draw");
+        let welcome_buffer = terminal.backend().buffer().clone();
+        let deep_splash_row = (0..12)
+            .rev()
+            .find(|y| row_has_text(&welcome_buffer, *y))
+            .expect("the welcome paints a deep band");
+        subject.push_message(TuiMessage::User {
+            text: "first".to_string(),
+            timestamp: chrono::Utc::now(),
+            steered: false,
+            unsent: false,
+        });
+        terminal
+            .draw(|frame| subject.render(frame))
+            .expect("docked draw");
+        assert!(
+            !row_has_text(terminal.backend().buffer(), deep_splash_row),
+            "the splash row the docked window cannot reach must be erased"
+        );
+    }
+}
+/// The welcome screen's lifecycle state, grouped off the app proper.
+///
+/// The fresh-session welcome — the fjord art over the composer — keeps
+/// the one bit of bookkeeping its lifetime needs: whether the
+/// conversation has ever held rows, retiring the screen for good.
+#[derive(Default)]
+pub(crate) struct WelcomeState {
+    /// Whether the conversation has ever held rows, retiring the
+    /// welcome.
+    ///
+    /// The splash belongs to the process's first breath: the latch
+    /// arms when the conversation first holds rows and never opens
+    /// again. `/clear` empties the pane but does not forget a session
+    /// happened — a cleared session meets the plain docked pane
+    /// instead of the fjord's return.
+    pub(crate) welcome_retired: bool,
+}
+
+/// Count a band's leading star-sky rows.
+///
+/// The fjord paints its night sky as dark, blue-dominant grounds;
+/// the first row whose cells stray from that register carries the
+/// horizon's glow, and everything above it is open sky. The window
+/// that trims the band to its budget reads this so the stars keep
+/// their floor while the water keeps its foot.
+pub(crate) fn leading_sky_rows(lines: &[Line<'static>]) -> u16 {
+    let depth = lines
+        .iter()
+        .take_while(|line| {
+            line.spans.iter().all(|span| {
+                matches!(
+                    span.style.bg,
+                    Some(ratatui::style::Color::Rgb(red, green, blue))
+                        if blue > red
+                            && u16::from(red)
+                                .saturating_add(u16::from(green))
+                                .saturating_add(u16::from(blue))
+                                < 220
+                ) && matches!(
+                    span.style.fg,
+                    Some(ratatui::style::Color::Rgb(red, green, blue))
+                        if u32::from(red)
+                            .saturating_mul(299)
+                            .saturating_add(u32::from(green).saturating_mul(587))
+                            .saturating_add(u32::from(blue).saturating_mul(114))
+                            < 100_000
+                )
+            })
+        })
+        .count();
+    u16::try_from(depth).unwrap_or(u16::MAX)
+}
+
+/// The fresh session's welcome geometry.
+///
+/// What the frame's welcome path needs to seat the group: the splash
+/// scale the block holds, the block's width, and the rows the band
+/// above the art spends. Built once per frame by
+/// [`TuiApp::welcome_shape`](crate::app::TuiApp::welcome_shape)
+/// before the composer wraps, for the wrap width depends on the
+/// block, not the frame.
+pub(crate) struct WelcomeShape {
+    /// The largest splash scale the welcome block holds, if any.
+    ///
+    /// `None` when even the smallest scale exceeds the block — the
+    /// welcome still stands, its composer box alone.
+    pub(crate) art: Option<&'static splash::SplashArt>,
+
+    /// The welcome composer box's width, in terminal cells.
+    ///
+    /// The frame's width less its side margins, capped at the welcome
+    /// maximum so the block stays compact on wide terminals.
+    pub(crate) block_width: u16,
+
+    /// The rows the splash band spends, art height or zero.
+    ///
+    /// Zero when no scale fits; otherwise the rows the pane's height
+    /// allows of the chosen rung — the band's one row of spending,
+    /// trimmed never below the greeting's needs.
+    pub(crate) band_height: u16,
+
+    /// The rung rows the welcome shows, after the height trim.
+    ///
+    /// A short pane shows fewer of the rung's rows — a shorter slice
+    /// of the same-wide fjord — so the art's width never follows the
+    /// pane's height.
+    pub(crate) rows_shown: u16,
+
+    /// The rung rows cropped away above.
+    ///
+    /// Half the trim, so the slice is centered; the rows below spend
+    /// the rest.
+    pub(crate) row_skip: u16,
+}
+
+impl WelcomeShape {
+    /// The wrap width the boxed composer wraps its text to.
+    ///
+    /// The block's inner width — the border columns and the input's
+    /// own side insets spent — so the wrapped rows and the caret land
+    /// where the box will show them.
+    pub(crate) fn inner_width(&self) -> u16 {
+        self.block_width
+            .saturating_sub(2)
+            .saturating_sub(INPUT_SIDE_INSET.saturating_mul(2))
+            .max(1)
     }
 }

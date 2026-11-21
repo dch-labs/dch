@@ -6,11 +6,16 @@ use ratatui::layout::Rect;
 use ratatui::widgets::Wrap;
 
 use super::super::TuiApp;
+use super::super::composer::COMPOSE_PREFIX;
+use super::super::context::{STATUS_BAR_AIR, STATUS_BAR_ROWS};
+use super::super::notices::{wrap_prompt_rows, wrap_prompt_rows_last, wrap_rows};
+use super::super::permissions::{
+    MAX_OVERLAY_ROWS, PermissionSheet, bottom_sheet_rect, expanded_command_budget,
+    expanded_fixed_rows, popup_bound, popup_rect, popup_window,
+};
+use super::super::session_commands::fit_picker_title;
 use super::super::{
-    Block, BorderType, Borders, COMPOSE_PREFIX, Clear, Color, Line, MAX_OVERLAY_ROWS, Paragraph,
-    PermissionSheet, STATUS_BAR_AIR, STATUS_BAR_ROWS, Span, Style, bottom_sheet_rect,
-    expanded_command_budget, expanded_fixed_rows, fit_picker_title, popup_bound, popup_rect,
-    popup_window, str_width, wrap_prompt_rows, wrap_prompt_rows_last, wrap_rows,
+    Block, BorderType, Borders, Clear, Color, Line, Paragraph, Span, Style, str_width,
 };
 use crate::cells::{display_width, for_display};
 use crate::commands;
@@ -42,7 +47,7 @@ impl TuiApp {
         area: Rect,
         more: usize,
     ) {
-        let Some(entry) = self.shown_question() else {
+        let Some(entry) = self.questions.shown_question() else {
             return;
         };
         let wrap_at = usize::from(area.width.saturating_sub(4));
@@ -64,7 +69,7 @@ impl TuiApp {
         } else {
             format!(
                 " Question {} of {} ",
-                self.question_view.saturating_add(1),
+                self.questions.question_view.saturating_add(1),
                 more.saturating_add(1)
             )
         };
@@ -140,7 +145,7 @@ impl TuiApp {
             )
         };
         if command_truncated {
-            hints.push_str(if self.permission_command_expanded {
+            hints.push_str(if self.permission.permission_command_expanded {
                 " · [e] collapse"
             } else {
                 " · [e] expand"
@@ -164,7 +169,7 @@ impl TuiApp {
             .map(|reason| format!("reason: {reason}▏"));
         if let Some(command) = &sheet.command {
             let runs = format!("runs: {command}");
-            let rows = if self.permission_command_expanded {
+            let rows = if self.permission.permission_command_expanded {
                 let blocks = [
                     scope_line.as_deref(),
                     deny_line.as_deref(),
@@ -256,7 +261,7 @@ impl TuiApp {
         above: bool,
     ) {
         const SHOWN: usize = 8;
-        let Some(picker) = self.session_picker.as_ref() else {
+        let Some(picker) = self.pickers.session_picker.as_ref() else {
             return;
         };
         if picker.rows.is_empty() {
@@ -348,7 +353,7 @@ impl TuiApp {
         above: bool,
     ) {
         const SHOWN: usize = 8;
-        let Some(picker) = self.model_picker.as_ref() else {
+        let Some(picker) = self.pickers.model_picker.as_ref() else {
             return;
         };
         if picker.rows.is_empty() {
@@ -432,12 +437,13 @@ impl TuiApp {
         let bound = popup_bound(frame, input_area, above);
         let shown = SHOWN.min(usize::from(bound));
         let Some((prefix, candidates)) = self.popup_candidates() else {
-            self.completion = None;
+            self.completion.completion = None;
             return;
         };
 
         let total = candidates.len();
         let active_cycle = self
+            .completion
             .completion
             .as_ref()
             .filter(|cycle| cycle.prefix == prefix);

@@ -1,0 +1,2923 @@
+//! The whole-app integration pins: frames rendered end to end,
+//! commands driven through the panel, and the loop's wake-and-drain
+//! rhythms.
+use super::composer::relativize;
+use super::context::{CONTEXT_BAR_CELLS, context_bar_fill, context_bar_readout};
+use super::keys::key_survives_the_sheet;
+use super::notices::{format_duration, wrap_prompt_rows, wrap_prompt_rows_last};
+use super::permissions::{
+    MAX_EXPANDED_OVERLAY_ROWS, MAX_OVERLAY_ROWS, expanded_command_budget, expanded_fixed_rows,
+    popup_rect, popup_window,
+};
+use super::pulse::scaled_color;
+use super::queue::{QUEUE_ROWS, queue_prompt_prefix};
+use super::run::FrameStats;
+use super::selection::reverse_selection;
+use super::session_commands::fit_picker_title;
+use super::todos::TOOL_DETAIL_CAP;
+
+use super::clipboard::{CopyAnswer, CopyVerdict};
+use super::selection::CellPos;
+use super::selection::CellSelection;
+use super::test_support::*;
+use super::todos::ToolDetail;
+use super::*;
+use crate::cells::display_width;
+use crate::cells::for_display;
+use crate::commands::{self};
+use crate::observer::CompactionFiling;
+use crate::observer::TurnPublication;
+use crate::queue::{PermissionRule, SessionPick};
+use crossterm::event::{KeyCode, KeyModifiers};
+use std::collections::HashMap;
+
+#[test]
+fn the_worst_draw_survives_the_second() {
+    // The lane carries the slowest draw the window saw, not the
+    // draw that happened to be standing when it closed.
+    let epoch = Instant::now();
+    let mut stats = FrameStats::default();
+    stats.note_draw(Duration::from_millis(3), epoch);
+    stats.note_draw(
+        Duration::from_millis(120),
+        epoch + Duration::from_millis(200),
+    );
+    let lane = stats
+        .note_draw(
+            Duration::from_millis(4),
+            epoch + Duration::from_millis(1_000),
+        )
+        .expect("the second closes");
+    assert_eq!(
+        lane.worst_draw_ms, 120,
+        "the window's maximum, not its last draw"
+    );
+}
+
+#[test]
+fn the_flip_styles_the_retained_opener_by_its_own_span() {
+    // The flip's owner lookup keys on the same first retained
+    // character as the strip's: a selector opening the line inside
+    // its own span once attributed the character after it to the
+    // selector's style, so the reversed ink flashed the wrong
+    // color for the sweep.
+    let mut lines = vec![Line::from(vec![
+        Span::styled("\u{fe0f}", Style::default().fg(Color::Red)),
+        Span::styled("a b", Style::default().fg(Color::Green)),
+    ])];
+    reverse_selection(
+        &mut lines,
+        0,
+        &CellSelection {
+            anchor: CellPos { line: 0, col: 0 },
+            head: CellPos { line: 0, col: 0 },
+        },
+    );
+    let line = lines.first().expect("the fixture line survives the flip");
+    let flipped = line
+        .spans
+        .iter()
+        .find(|span| span.content.contains('a'))
+        .expect("the retained opener flips");
+    assert!(
+        flipped
+            .style
+            .add_modifier
+            .contains(ratatui::style::Modifier::REVERSED),
+        "the swept cell flips"
+    );
+    assert_eq!(
+        flipped.style.fg,
+        Some(Color::Green),
+        "the flipped ink carries the character's own span's style"
+    );
+}
+
+#[test]
+fn an_expanded_edit_with_an_undiffable_output_keeps_the_plain_expansion() {
+    // The edit family's rows own the diff render only when the
+    // parser says diff; an error body or a large-file preview
+    // falls back to the plain input/output expansion, and that
+    // branch needs its own witness — a claim without a test is
+    // how the branch rots.
+    let mut subject = app();
+    subject.tools.tool_details.insert(
+        "call_err".to_string(),
+        ToolDetail {
+            input_json: "{\"file_path\": \"src/gone.rs\"}".to_string(),
+            output: "Edit failed: old_text not found in src/gone.rs".to_string(),
+        },
+    );
+    subject
+        .expansion
+        .expanded_tools
+        .insert("call_err".to_string());
+    let block = ContentBlock::Tool {
+        name: "Edit".to_string(),
+        call_id: "call_err".to_string(),
+        input_preview: "src/gone.rs".to_string(),
+        output_preview: String::new(),
+        retained_input: String::new(),
+        success: false,
+        elapsed_secs: 0.1,
+    };
+    let mut lines = Vec::new();
+    let mut summaries = HashMap::new();
+    subject.push_tool_block_lines(&block, 80, &mut lines, &mut summaries, &mut Vec::new());
+    let flat: String = lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.to_string())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        flat.contains("input:"),
+        "the plain expansion renders for an undiffable edit output: {flat}"
+    );
+    assert!(
+        flat.contains("output:"),
+        "the raw output is shown verbatim: {flat}"
+    );
+    assert!(
+        !flat.contains("lines changed"),
+        "no stats bar renders for an undiffable output: {flat}"
+    );
+}
+
+#[test]
+fn an_expanded_edit_renders_its_diff_with_real_line_numbers() {
+    // The expanded detail of an edit-family call is the parsed
+    // diff — banded rows, both gutters — not the raw receipt; the
+    // layout follows the config, and an unparseable output keeps
+    // the plain input/output expansion.
+    let mut config = dch_config::DchConfig::default();
+    config.display.diff_layout = dch_config::DiffLayout::Inline;
+    let mut subject = TuiApp::new(config);
+    let receipt = [
+        "Changed: src/lib.rs (modified)",
+        "│ 1 line removed, 1 added",
+        "@@ -38,3 +38,3 @@",
+        "  fn main() {",
+        "-     let old = previous();",
+        "+     let new = followup();",
+        "  }",
+    ]
+    .join("\n");
+    subject.tools.tool_details.insert(
+        "call_diff".to_string(),
+        ToolDetail {
+            input_json: "{\"file_path\": \"src/lib.rs\"}".to_string(),
+            output: receipt,
+        },
+    );
+    subject
+        .expansion
+        .expanded_tools
+        .insert("call_diff".to_string());
+    let block = ContentBlock::Tool {
+        name: "Edit".to_string(),
+        call_id: "call_diff".to_string(),
+        input_preview: "src/lib.rs".to_string(),
+        output_preview: String::new(),
+        retained_input: String::new(),
+        success: true,
+        elapsed_secs: 0.1,
+    };
+    let mut lines = Vec::new();
+    let mut summaries = HashMap::new();
+    subject.push_tool_block_lines(&block, 100, &mut lines, &mut summaries, &mut Vec::new());
+    let rendered: Vec<String> = lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.to_string())
+                .collect()
+        })
+        .collect();
+    let joined = rendered.join("\n");
+    assert!(
+        joined.contains("+1") && joined.contains("-1") && joined.contains("2 lines changed"),
+        "the stats bar leads the block: {joined}"
+    );
+    assert!(
+        !joined.contains("@@"),
+        "no raw hunk header — the rendered rows carry the addresses"
+    );
+    assert!(
+        joined.contains("39") && joined.contains("previous();"),
+        "the removal carries its real old-side number: {joined}"
+    );
+    assert!(
+        !joined.contains("input:"),
+        "the diff replaces the raw input/output expansion: {joined}"
+    );
+    assert!(
+        subject
+            .tools
+            .tool_details
+            .get("call_diff")
+            .is_some_and(|detail| detail.output.contains("let new")),
+        "the detail record itself is untouched by rendering"
+    );
+}
+
+#[test]
+fn the_half_cell_edges_render_beside_the_center() {
+    let (_observer, state) = crate::observer::TuiObserverState::new().into_observer();
+    let mut config = dch_config::DchConfig::default();
+    config.display.strip_style = dch_config::StripStyle::Worm;
+    let mut app = TuiApp::from_observer_state(config, state.clone());
+    state
+        .agent_running
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    app.run_anchor = Some(
+        Instant::now()
+            .checked_sub(Duration::from_millis(1850))
+            .expect("the monotonic clock is well past its epoch"),
+    );
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 1)).unwrap();
+    terminal
+        .draw(|frame| {
+            app.render_pulse_strip(
+                frame,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 80,
+                    height: 1,
+                },
+            );
+        })
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    assert!(
+        buffer
+            .cell((33, 0))
+            .is_some_and(|cell| cell.symbol() == " "),
+        "clear cells sit before the run"
+    );
+    assert!(
+        buffer
+            .cell((34, 0))
+            .is_some_and(|cell| cell.symbol() == "╶"),
+        "the tail's solid half-tick leads the run"
+    );
+    assert!(
+        buffer
+            .cell((35, 0))
+            .is_some_and(|cell| cell.symbol() == "─"),
+        "full cells carry the run between the dashes"
+    );
+    assert!(
+        buffer
+            .cell((45, 0))
+            .is_some_and(|cell| cell.symbol() == "─"),
+        "full cells reach the head's half"
+    );
+    assert!(
+        buffer
+            .cell((46, 0))
+            .is_some_and(|cell| cell.symbol() == "╴"),
+        "the head's solid half-tick ends the run"
+    );
+    assert!(
+        buffer
+            .cell((47, 0))
+            .is_some_and(|cell| cell.symbol() == " "),
+        "clear cells sit beyond the head"
+    );
+}
+
+#[test]
+fn a_stale_turn_publication_never_backfills_a_later_manual_pass() {
+    // The interleaving the attribution stamps exist for: an earlier
+    // fold's marked head sits in a pending turn-end publication
+    // when a later manual pass's row lands in the same drain. The
+    // publication answers pass one and the row is pass two, so the
+    // row takes its own filing's words and the stale publication
+    // settles nothing.
+    let mut app = app();
+    let stale = std::sync::Arc::new(vec![loopctl::message::Message::user(
+        "## Conversation summary (compacted)\n- the first pass's ledger",
+    )]);
+    app.state
+        .turn_histories
+        .lock()
+        .expect("the turn-history lock")
+        .push(TurnPublication {
+            passes: 1,
+            history: stale,
+        });
+    let own = std::sync::Arc::new(vec![loopctl::message::Message::user(
+        "## Conversation summary (compacted)\n- the second pass's ledger",
+    )]);
+    app.state
+        .compaction_publications
+        .lock()
+        .expect("the publications lock")
+        .push(CompactionFiling {
+            pass: 2,
+            folded: own,
+        });
+    app.state
+        .compactions
+        .lock()
+        .expect("the compaction lock")
+        .push(CompactionEvent {
+            pass: 2,
+            record: TuiMessage::Compacted {
+                tokens_before: 10,
+                tokens_after: 5,
+                reason: "manual".to_string(),
+                evicted: 3,
+                duration_ms: 100,
+                compactor: Some("structured".to_string()),
+                compression_ratio: Some(2.0),
+                summary: None,
+                timestamp: chrono::Utc::now(),
+            },
+        });
+    app.drain_shared_state();
+    match app.conversation().last() {
+        Some(TuiMessage::Compacted { summary, .. }) => assert!(
+            summary
+                .as_deref()
+                .is_some_and(|text| text.contains("the second pass's ledger")),
+            "the row takes its own pass's words, never the earlier fold's: {summary:?}"
+        ),
+        other => panic!("the compacted row landed: {other:?}"),
+    }
+}
+
+#[test]
+fn a_late_filing_never_serves_a_later_pass() {
+    // The orphaned-filing interleaving: a row settles through the
+    // turn-end channel and its own filing arrives only afterwards,
+    // too late to pair. The late filing must linger inert — its
+    // pass is spent, its number never reused — while the next
+    // manual pass's row takes exactly its own filing's words.
+    let mut app = app();
+    let settled = std::sync::Arc::new(vec![loopctl::message::Message::user(
+        "## Conversation summary (compacted)\n- the first pass's ledger",
+    )]);
+    app.state
+        .turn_histories
+        .lock()
+        .expect("the turn-history lock")
+        .push(TurnPublication {
+            passes: 1,
+            history: settled,
+        });
+    app.state
+        .compactions
+        .lock()
+        .expect("the compaction lock")
+        .push(CompactionEvent {
+            pass: 1,
+            record: compacted_row("threshold exceeded"),
+        });
+    app.drain_shared_state();
+    let late = std::sync::Arc::new(vec![loopctl::message::Message::user(
+        "## Conversation summary (compacted)\n- the first pass's late filing",
+    )]);
+    let own = std::sync::Arc::new(vec![loopctl::message::Message::user(
+        "## Conversation summary (compacted)\n- the second pass's ledger",
+    )]);
+    {
+        let mut filings = app
+            .state
+            .compaction_publications
+            .lock()
+            .expect("the publications lock");
+        filings.push(CompactionFiling {
+            pass: 1,
+            folded: late,
+        });
+        filings.push(CompactionFiling {
+            pass: 2,
+            folded: own,
+        });
+    }
+    app.state
+        .compactions
+        .lock()
+        .expect("the compaction lock")
+        .push(CompactionEvent {
+            pass: 2,
+            record: compacted_row("manual"),
+        });
+    app.drain_shared_state();
+    let rows = app.conversation();
+    match rows.first() {
+        Some(TuiMessage::Compacted { summary, .. }) => assert!(
+            summary
+                .as_deref()
+                .is_some_and(|text| text.contains("the first pass's ledger")),
+            "the first row keeps the words its own publication carried: {summary:?}"
+        ),
+        other => panic!("the first compacted row landed: {other:?}"),
+    }
+    match rows.last() {
+        Some(TuiMessage::Compacted { summary, .. }) => assert!(
+            summary
+                .as_deref()
+                .is_some_and(|text| text.contains("the second pass's ledger")),
+            "the later row takes its own filing's words, never the \
+                 orphan's: {summary:?}"
+        ),
+        other => panic!("the second compacted row landed: {other:?}"),
+    }
+    let lingering: Vec<u64> = app
+        .state
+        .compaction_publications
+        .lock()
+        .expect("the publications lock")
+        .iter()
+        .map(|filing| filing.pass)
+        .collect();
+    assert_eq!(
+        lingering,
+        vec![1],
+        "the late filing lingers inert — spent passes are never reused"
+    );
+}
+
+#[test]
+fn an_ordinary_message_addition_keeps_a_standing_debt_standing() {
+    // The release is the replacement's, not the list's: a conversation
+    // that merely grows — a reply landing, a tool result arriving —
+    // keeps its debts, for their indexes still name the rows they
+    // were stamped against.
+    let mut app = app();
+    app.state
+        .compactions
+        .lock()
+        .expect("the compaction lock")
+        .push(CompactionEvent {
+            pass: 1,
+            record: compacted_row("threshold exceeded"),
+        });
+    app.drain_shared_state();
+    assert_eq!(
+        app.compaction_summary_owed,
+        vec![(1, 0)],
+        "the unmarked pass leaves its debt"
+    );
+    app.push_message(TuiMessage::Assistant {
+        blocks: vec![ContentBlock::Text {
+            text: "work continues".to_string(),
+        }],
+        timestamp: chrono::Utc::now(),
+        duration_ms: None,
+    });
+    app.drain_shared_state();
+    assert_eq!(
+        app.compaction_summary_owed,
+        vec![(1, 0)],
+        "an ordinary addition never releases a debt"
+    );
+}
+
+#[test]
+fn the_arts_height_never_trims_the_picture() {
+    // The whole picture at every resolution: a pane that cannot
+    // seat a rung's rows declines to a smaller rung — height
+    // narrows the fjord, it never windows its water away.
+    let short = rendered_art_columns(120, 24);
+    let mid = rendered_art_columns(120, 50);
+    let tall = rendered_art_columns(120, 90);
+    assert_eq!(mid, tall, "past the fit, the width holds: {mid} vs {tall}");
+    assert!(
+        short < mid,
+        "a shorter pane narrows to a smaller whole rung: {short} vs {mid}"
+    );
+
+    let short_rows = rendered_art_rows(120, 24);
+    let tall_rows = rendered_art_rows(120, 90);
+    assert!(
+        short_rows < tall_rows,
+        "a taller pane shows a taller rung, whole: {short_rows} vs {tall_rows}"
+    );
+}
+
+#[test]
+fn the_arts_width_follows_the_panes_width() {
+    // A wider pane earns a wider rung — the ladder's whole point —
+    // up to the ladder's ceiling, beyond which the width holds and
+    // only the height can add rows.
+    let snug = rendered_art_columns(80, 50);
+    let roomy = rendered_art_columns(100, 50);
+    let giant = rendered_art_columns(120, 50);
+    assert!(
+        snug < roomy && roomy < giant,
+        "width drives the rung: {snug} < {roomy} < {giant}"
+    );
+    let beyond = rendered_art_columns(220, 50);
+    let ceiling = rendered_art_columns(200, 50);
+    assert_eq!(
+        ceiling, beyond,
+        "past the ladder's ceiling the width holds: {ceiling} vs {beyond}"
+    );
+}
+
+#[test]
+fn a_roomy_pane_paints_the_larger_scale() {
+    // Quality follows both axes under the cover-crop: width drives
+    // the rung up to the ladder's ceiling, and past it a taller
+    // pane adds rows of the same-wide art.
+    let snug = rendered_art(50, 40);
+    let roomy = rendered_art(140, 30);
+    let giant = rendered_art(220, 80);
+    assert!(snug < 1200, "the snug pane holds the smallest rung: {snug}");
+    assert!(
+        snug * 2 < roomy,
+        "the roomy pane holds a wider rung than snug: {snug} vs {roomy}"
+    );
+    assert!(
+        giant > roomy,
+        "the giant pane shows more rows of the same-wide art: \
+             {giant} vs {roomy}"
+    );
+}
+
+#[test]
+fn alt_arrows_walk_the_submitted_prompts() {
+    // Three prompts with tall answers between them and a steered
+    // echo beside the last: Alt+Up seats each prompt's first row
+    // at the viewport's top in turn — the echo is not a stop — the
+    // walk past the first prompt answers with a notice instead of
+    // a move, and Alt+Down walks back the other way.
+    let mut app = app();
+    let tall = "an answer paragraph of some length, wrapping across \
+             several rows when the pane is narrow\n"
+        .repeat(6);
+    for prompt in ["first ask", "second ask", "third ask"] {
+        app.push_message(TuiMessage::User {
+            text: prompt.to_string(),
+            timestamp: chrono::Utc::now(),
+            steered: false,
+            unsent: false,
+        });
+        app.push_message(TuiMessage::Assistant {
+            blocks: vec![ContentBlock::Text { text: tall.clone() }],
+            timestamp: chrono::Utc::now(),
+            duration_ms: None,
+        });
+    }
+    app.push_message(TuiMessage::User {
+        text: "a steered echo beside the tail".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: true,
+        unsent: false,
+    });
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 20)).expect("terminal");
+    terminal.draw(|frame| app.render(frame)).expect("draw");
+    assert_eq!(
+        app.bake.user_prompt_marks.len(),
+        3,
+        "only submitted prompts are stops: {:?}",
+        app.bake.user_prompt_marks
+    );
+    let total = app.pacing.last_layout_lines;
+    let viewport = app.pacing.last_layout_viewport;
+    let marks = app.bake.user_prompt_marks.clone();
+    let mark = |index: usize| marks.get(index).copied().unwrap_or_default();
+    let expected = |mark: usize| total.saturating_sub(viewport).saturating_sub(mark);
+
+    app.handle_key_inner(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+    assert_eq!(
+        app.scroll_offset(),
+        expected(mark(2)),
+        "Alt+Up seats the newest submitted prompt at the top"
+    );
+    app.handle_key_inner(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+    assert_eq!(
+        app.scroll_offset(),
+        expected(mark(1)),
+        "the second press walks one prompt older"
+    );
+    app.handle_key_inner(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+    assert_eq!(
+        app.scroll_offset(),
+        expected(mark(0)),
+        "the third press seats the first prompt"
+    );
+    app.handle_key_inner(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+    assert!(
+        app.transient_notice
+            .as_ref()
+            .is_some_and(|(text, _)| text.contains("no earlier prompt")),
+        "past the oldest prompt the walk answers with a notice: {:?}",
+        app.transient_notice
+    );
+    app.handle_key_inner(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT));
+    assert_eq!(
+        app.scroll_offset(),
+        expected(mark(1)),
+        "Alt+Down walks back toward the newer prompt"
+    );
+}
+
+#[test]
+fn a_finished_run_stamps_its_total_onto_the_final_reply_only() {
+    let mut app = app();
+    let mut queue = app.state.graduations.lock().expect("the graduation lock");
+    queue.push(crate::observer::Graduation::Reply {
+        text: "checking".to_string(),
+        thinking: None,
+    });
+    queue.push(crate::observer::Graduation::Reply {
+        text: "done".to_string(),
+        thinking: None,
+    });
+    queue.push(crate::observer::Graduation::RunEnded {
+        duration_ms: 84_000,
+        success: true,
+    });
+    drop(queue);
+    app.drain_shared_state();
+    let durations: Vec<Option<u64>> = app
+        .conversation()
+        .iter()
+        .filter_map(|message| match message {
+            TuiMessage::Assistant { duration_ms, .. } => Some(*duration_ms),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        durations,
+        vec![None, Some(84_000)],
+        "only the run's final reply carries the run's total"
+    );
+}
+
+#[test]
+fn a_run_that_graduated_no_reply_drops_its_total() {
+    let mut app = app();
+    app.push_message(TuiMessage::User {
+        text: "do a thing".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
+    app.state
+        .graduations
+        .lock()
+        .expect("the graduation lock")
+        .push(crate::observer::Graduation::RunEnded {
+            duration_ms: 84_000,
+            success: true,
+        });
+    app.drain_shared_state();
+    assert!(
+        app.conversation()
+            .last()
+            .is_some_and(|message| matches!(message, TuiMessage::User { .. })),
+        "a run with no reply leaves the conversation alone — no stranger is stamped"
+    );
+}
+
+#[test]
+fn an_assistant_reply_renders_its_duration_as_a_trailing_line() {
+    let mut app = app();
+    app.push_message(TuiMessage::Assistant {
+        blocks: vec![ContentBlock::Text {
+            text: "the measured answer".to_string(),
+        }],
+        timestamp: chrono::Utc::now(),
+        duration_ms: Some(5_424_500),
+    });
+    app.push_message(TuiMessage::Assistant {
+        blocks: vec![ContentBlock::Text {
+            text: "the unmeasured answer".to_string(),
+        }],
+        timestamp: chrono::Utc::now(),
+        duration_ms: None,
+    });
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).expect("terminal");
+    terminal.draw(|frame| app.render(frame)).expect("draw");
+    let showing = buffer_text(terminal.backend().buffer());
+    assert!(
+        showing.contains("1h 30m 24s"),
+        "a measured reply carries its duration on a trailing line: {showing}"
+    );
+    assert_eq!(
+        showing.matches("1h 30m 24s").count(),
+        1,
+        "an unmeasured reply renders no duration line: {showing}"
+    );
+}
+
+#[test]
+fn durations_render_in_their_largest_fitting_units() {
+    assert_eq!(format_duration(0), "<1s");
+    assert_eq!(format_duration(999), "<1s");
+    assert_eq!(format_duration(1_000), "1s");
+    assert_eq!(format_duration(42_500), "42s");
+    assert_eq!(format_duration(60_000), "1m 0s");
+    assert_eq!(format_duration(84_000), "1m 24s");
+    assert_eq!(format_duration(3_600_000), "1h 0m 0s");
+    assert_eq!(format_duration(5_424_500), "1h 30m 24s");
+}
+
+#[test]
+fn the_keys_that_belong_to_the_app_survive_the_sheet() {
+    // The keys that read the conversation rather than answer the sheet
+    // stay the app's, so a user can page for context with a question up.
+    for code in [KeyCode::PageUp, KeyCode::PageDown, KeyCode::F(2)] {
+        assert!(
+            key_survives_the_sheet(KeyEvent::new(code, KeyModifiers::NONE)),
+            "{code:?} reads the conversation, not the sheet"
+        );
+    }
+    assert!(key_survives_the_sheet(KeyEvent::new(
+        KeyCode::Char('c'),
+        KeyModifiers::CONTROL
+    )));
+    for key in [
+        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+    ] {
+        assert!(
+            !key_survives_the_sheet(key),
+            "{key:?} belongs to the sheet in front of the user"
+        );
+    }
+}
+
+#[test]
+fn relativize_spells_home_as_tilde_and_deeper_paths_under_it() {
+    // The `~/` shape: home itself is the bare tilde, a directory
+    // under it keeps its tail, and a directory outside it has no
+    // relative spelling at all — the caller shows the full path.
+    let home = Path::new("/home/tester");
+    assert_eq!(
+        relativize(Path::new("/home/tester"), home).as_deref(),
+        Some("~"),
+        "the home directory itself is the bare tilde"
+    );
+    assert_eq!(
+        relativize(Path::new("/home/tester/repos/dch"), home).as_deref(),
+        Some("~/repos/dch"),
+        "a directory under home keeps its tail under the tilde"
+    );
+    assert_eq!(
+        relativize(Path::new("/srv/work"), home),
+        None,
+        "a directory outside home has no relative spelling"
+    );
+}
+
+#[test]
+fn an_expanded_preview_spends_only_the_rows_the_sheet_has() {
+    // The budget is the sheet's inner height minus the prompt rows
+    // drawn and the fixed rows owed (scopes, reason, spacer,
+    // hints — each block measured at its wrapped length), floored
+    // at one so a cramped pane still shows the preview's first
+    // line, and capped at the standing ceiling so a tall pane does
+    // not hand an enormous command the sheet.
+    let hints = "y allows · n or esc denies · e expands";
+    let blocks = [
+        "a remembers: cargo build",
+        "d remembers: rm",
+        "reason: ship it▏",
+    ];
+    let fixed = expanded_fixed_rows(&blocks, hints, 80);
+    // A tall sheet: everything fits, the ceiling binds.
+    assert_eq!(
+        expanded_command_budget(100, 3, fixed),
+        MAX_EXPANDED_OVERLAY_ROWS,
+        "a tall pane spends the standing ceiling, no more"
+    );
+    // A short sheet: inner height (less borders) minus prompt and
+    // fixed rows is exactly the preview's budget — nothing more.
+    let budget = expanded_command_budget(20, 3, fixed);
+    assert_eq!(
+        budget,
+        usize::from(20u16.saturating_sub(2))
+            .saturating_sub(3)
+            .saturating_sub(fixed),
+        "the short pane spends its remaining rows, no more"
+    );
+    assert_eq!(
+        3 + fixed + budget,
+        usize::from(20u16.saturating_sub(2)),
+        "prompt, fixed rows, and preview fill the sheet exactly"
+    );
+    // A pane with nothing to spare: the floor still shows one row.
+    assert_eq!(
+        expanded_command_budget(6, 3, fixed),
+        1,
+        "a cramped pane still shows the preview's first line"
+    );
+}
+
+#[test]
+fn an_overflowing_preview_keeps_its_ellipsis_row_inside_the_budget() {
+    // The wrapper's row ceiling includes its own ellipsis row: a
+    // command whose wrap runs past the budget returns exactly the
+    // budget's rows — the ellipsis and the budget's remaining tail
+    // rows — so prompt, preview, and fixed rows fill the sheet
+    // exactly and the final hint row is never clipped. A wrap that
+    // fits the budget, exactly or with room, returns its own rows
+    // unchanged.
+    let wrap_at = 10;
+    let budget = 3;
+    let fits = "aa bb cc";
+    assert_eq!(
+        wrap_prompt_rows_last(fits, wrap_at, budget).len(),
+        1,
+        "a short command returns its own single row"
+    );
+    let exact = "aa bb cc dd ee ff gg hh ii";
+    assert_eq!(
+        wrap_prompt_rows_last(exact, wrap_at, budget).len(),
+        budget,
+        "a wrap that exactly spends the budget returns it whole"
+    );
+    let overflowing = "aa bb cc dd ee ff gg hh ii jj kk ll";
+    let rows = wrap_prompt_rows_last(overflowing, wrap_at, budget);
+    assert_eq!(
+        rows.len(),
+        budget,
+        "the ellipsis row is counted inside the budget, never added on top of it"
+    );
+    assert_eq!(
+        rows.first().map(String::as_str),
+        Some("…"),
+        "the cut is named where the reader's eye lands"
+    );
+    // The sheet-level composition the budget exists for: with the
+    // prompt drawn and the fixed rows owed, an overflowing command
+    // still leaves the sheet's total at or under its inner height.
+    let hints = "y allows · n or esc denies · e expands";
+    let blocks = ["a remembers: cargo build", "d remembers: rm"];
+    let fixed = expanded_fixed_rows(&blocks, hints, 80);
+    let sheet_prompt_rows = 3;
+    let budget = expanded_command_budget(20, sheet_prompt_rows, fixed);
+    let preview = wrap_prompt_rows_last(overflowing, 80, budget);
+    assert!(
+        sheet_prompt_rows + fixed + preview.len() <= usize::from(20u16.saturating_sub(2)),
+        "prompt, fixed rows, and an overflowing preview stay inside the sheet's inner height"
+    );
+}
+
+#[test]
+fn multi_row_blocks_are_counted_at_their_wrapped_length() {
+    // The fixed-rows measurement must count what the renderer
+    // appends: a long scope on a narrow pane wraps to the overlay's
+    // row ceiling, and a one-row-per-block guess would hand the
+    // preview rows the sheet has already spent — pushing scope text
+    // and hints past the sheet's bottom edge.
+    let hints = "y allows · n or esc denies";
+    let narrow = 20;
+    let long_scope = "a remembers: cargo build --workspace --quiet · repeated again and again";
+    let blocks = [long_scope, "d remembers: rm"];
+    let wrapped_scope = wrap_prompt_rows(long_scope, narrow, MAX_OVERLAY_ROWS);
+    assert!(
+        wrapped_scope.len() > 1,
+        "the fixture genuinely wraps — a one-row block could never pin the undercount"
+    );
+    let measured = expanded_fixed_rows(&blocks, hints, narrow);
+    let by_hand = wrapped_scope.len()
+        + wrap_prompt_rows("d remembers: rm", narrow, MAX_OVERLAY_ROWS).len()
+        + 1
+        + wrap_prompt_rows(hints, narrow, MAX_OVERLAY_ROWS).len();
+    assert_eq!(
+        measured, by_hand,
+        "each block counts at the length its wrap will render at"
+    );
+}
+
+#[test]
+fn the_live_case_denies_only_what_was_refused_and_blessings_survive() {
+    // The sheet-level pin on the narrow deny derivation: a session
+    // that blessed
+    // `cargo build` earlier, then pressed `d` on
+    // `cargo build … | tail -30`, records nothing — the narrow
+    // derivation mints only `cargo build`, and the memory skips
+    // what the allow list already carries. The blessing survives;
+    // no reader-deny rule is minted by association.
+    let mut app = TuiApp::new(dch_config::DchConfig::default());
+    let memory = crate::queue::PermissionMemory::default();
+    memory.remember_rules(&[PermissionRule::ShellPrefix {
+        prefix: "cargo build".to_string(),
+    }]);
+    app.set_permission_memory(memory.clone());
+    app.permission
+        .pending_permissions
+        .push_back(crate::permission::PermissionRequest {
+            tool_name: "Bash".to_string(),
+            prompt: "Allow 'Bash' (ShellExecute) in Interactive mode?".to_string(),
+            input: serde_json::json!({
+                "command": "cargo build --workspace --quiet 2>&1 | tail -30"
+            }),
+            always: vec![
+                PermissionRule::ShellPrefix {
+                    prefix: "cargo build".to_string(),
+                },
+                PermissionRule::ShellPrefix {
+                    prefix: "tail".to_string(),
+                },
+            ],
+            never: vec![PermissionRule::ShellPrefix {
+                prefix: "cargo build".to_string(),
+            }],
+            reply: tokio::sync::oneshot::channel().0,
+        });
+    app.permission
+        .permission_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+    assert!(
+        memory.deny_rules().is_empty(),
+        "the refusal minted nothing — the verb was already blessed"
+    );
+    assert_eq!(
+        memory.allow_rules(),
+        vec![PermissionRule::ShellPrefix {
+            prefix: "cargo build".to_string()
+        }],
+        "the blessing is sticky"
+    );
+}
+
+#[test]
+fn a_forget_matches_the_rule_it_rendered_not_the_position_it_landed_on() {
+    // The listing's numbers are a snapshot: the memory can move
+    // between the render and the press — a queued `/resume`'s
+    // adopt replaces the pair wholesale — so the press removes
+    // the rule the user read or nothing, never whatever now
+    // occupies the position.
+    let mut app = TuiApp::new(dch_config::DchConfig::default());
+    app.permission.permission_memory.adopt(
+        vec![crate::queue::PermissionRule::ShellPrefix {
+            prefix: "cargo test".to_string(),
+        }],
+        vec![],
+        false,
+    );
+    let out = command_output(&mut app, "/permissions");
+    assert!(
+        out.contains("1. every future `cargo test` run"),
+        "the render numbers the rule the user read: {out}"
+    );
+    // The adopt the resume rides in: the rendered rule is gone, a
+    // different one holds the position.
+    app.permission.permission_memory.adopt(
+        vec![crate::queue::PermissionRule::ShellPrefix {
+            prefix: "cargo build".to_string(),
+        }],
+        vec![],
+        false,
+    );
+    let out = command_output(&mut app, "/permissions forget 1");
+    assert!(
+        out.contains("no longer remembered as rendered"),
+        "the mismatch is named, not silently re-keyed: {out}"
+    );
+    assert_eq!(
+        app.permission.permission_memory.allow_rules(),
+        vec![crate::queue::PermissionRule::ShellPrefix {
+            prefix: "cargo build".to_string(),
+        }],
+        "the rule holding the position survives the mismatched press"
+    );
+    // The happy twin: a fresh render re-keys the press, and the
+    // forget removes exactly the rule it now names.
+    let out = command_output(&mut app, "/permissions");
+    assert!(
+        out.contains("cargo build"),
+        "the fresh render lists what is live: {out}"
+    );
+    let out = command_output(&mut app, "/permissions forget 1");
+    assert!(
+        out.contains("Forgot remembered permission"),
+        "the re-keyed press removes what it rendered: {out}"
+    );
+    assert!(
+        app.permission.permission_memory.allow_rules().is_empty(),
+        "the rendered rule is out of the memory"
+    );
+}
+
+#[test]
+fn a_repair_under_standing_damage_reseeds_and_releases_the_adoption_guard() {
+    // The repair's serialization pin: with the driver's adoption
+    // guard installed the way production wires it, the recovery
+    // runs its two steps — the verdict's clearing, the cell's
+    // re-seed — under that guard and gives it back, so a
+    // concurrent resume adoption cannot interleave between them
+    // and a leaked guard cannot deadlock the next adoption.
+    let mut config = dch_config::DchConfig::default();
+    config.permissions.rules = vec![dch_config::PermissionRuleConfig {
+        id: None,
+        outcome: dch_config::PermissionRuleOutcome::Allow,
+        tool: Some("Bash".to_string()),
+        shell_prefix: None,
+        path_glob: None,
+    }];
+    let mut app = TuiApp::new(config.clone());
+    let memory = crate::queue::PermissionMemory::default();
+    memory.mark_damaged();
+    app.set_permission_memory(memory);
+    let rules_cell = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    app.set_permission_config_rules_cell(Some(std::sync::Arc::clone(&rules_cell)));
+    let adoption_guard = std::sync::Arc::new(std::sync::Mutex::new(()));
+    app.set_permission_adoption_guard(Some(std::sync::Arc::clone(&adoption_guard)));
+
+    app.permissions_command(Some("repair"));
+
+    let rules = rules_cell
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(
+        *rules,
+        config.permissions.engine_rules(),
+        "the repair re-seeds the config layer at the configuration's own join"
+    );
+    drop(rules);
+    assert!(
+        adoption_guard.try_lock().is_ok(),
+        "the repair releases the adoption guard — a leak would deadlock the next adoption"
+    );
+    assert!(
+        !app.permission.permission_memory.damage_standing(),
+        "the verdict cleared"
+    );
+}
+
+#[test]
+fn returning_to_the_bare_prefix_rederives_not_recycles() {
+    // A cycle opened on a fragment freezes that fragment's filtered
+    // list; deleting back to the bare prefix must re-derive the
+    // whole list, not keep stepping the stale filter. Only a cycle
+    // that opened bare holds the bare prefix.
+    let mut app = TuiApp::new(dch_config::DchConfig::default());
+    app.handle_event(&crossterm::event::Event::Paste("/theme ligh".to_string()));
+    let tab = crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
+        KeyCode::Tab,
+        KeyModifiers::NONE,
+    ));
+    assert!(app.handle_event(&tab), "Tab steps the filtered cycle");
+    let cycle = app
+        .completion
+        .completion
+        .as_ref()
+        .expect("the filtered cycle stands");
+    assert_eq!(cycle.candidates.len(), 3, "ligh* filters three themes");
+    assert!(!cycle.bare, "the cycle opened on a fragment");
+    while app.composer.input.text() != "/theme " {
+        app.handle_event(&crossterm::event::Event::Key(
+            crossterm::event::KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        ));
+    }
+    assert!(app.handle_event(&tab), "Tab at the bare prefix re-derives");
+    let cycle = app
+        .completion
+        .completion
+        .as_ref()
+        .expect("a fresh cycle stands");
+    assert!(
+        cycle.candidates.len() > 3,
+        "the bare prefix cycles the whole palette, not the stale filter"
+    );
+    assert!(cycle.bare, "the fresh cycle opened bare");
+}
+
+#[test]
+fn a_typed_fragment_tab_walks_only_its_filter() {
+    // The user's exact flow, typed character by character: the
+    // fragment's filtered list is what Tab walks, press after
+    // press — never the whole palette. The stale-path guard: a
+    // bare-prefix walk first (the whole list), then typing `ligh`
+    // over it must retire that cycle and re-derive the filter.
+    let mut app = TuiApp::new(dch_config::DchConfig::default());
+    for ch in "/theme ligh".chars() {
+        app.handle_event(&crossterm::event::Event::Key(
+            crossterm::event::KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        ));
+    }
+    let tab = crossterm::event::Event::Key(crossterm::event::KeyEvent::new(
+        KeyCode::Tab,
+        KeyModifiers::NONE,
+    ));
+    for _ in 0..5 {
+        assert!(app.handle_event(&tab), "Tab always answers");
+        let cycle = app.completion.completion.as_ref().expect("a cycle stands");
+        assert_eq!(
+            cycle.candidates.len(),
+            3,
+            "the walk stays on the filtered list: {:?}",
+            cycle.candidates
+        );
+        assert!(!cycle.bare, "the walk never reopens bare");
+    }
+
+    // The stale path: walk the bare prefix's whole list, then
+    // build the fragment by hand over it — the bare cycle must
+    // retire the moment the composer spells something it never
+    // applied, and Tab walks the fragment's filter instead.
+    let mut app = TuiApp::new(dch_config::DchConfig::default());
+    for ch in "/theme ".chars() {
+        app.handle_event(&crossterm::event::Event::Key(
+            crossterm::event::KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        ));
+    }
+    assert!(app.handle_event(&tab), "the bare walk opens");
+    while app.composer.input.text() != "/theme " {
+        app.handle_event(&crossterm::event::Event::Key(
+            crossterm::event::KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        ));
+    }
+    for ch in "ligh".chars() {
+        app.handle_event(&crossterm::event::Event::Key(
+            crossterm::event::KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        ));
+    }
+    assert!(app.handle_event(&tab), "Tab answers the fragment");
+    let cycle = app
+        .completion
+        .completion
+        .as_ref()
+        .expect("a fresh cycle stands");
+    assert_eq!(
+        cycle.candidates.len(),
+        3,
+        "typing over a bare walk re-derives the filter: {:?}",
+        cycle.candidates
+    );
+}
+
+#[test]
+fn a_committed_switch_defers_its_terminal_writes_to_the_flush() {
+    let mut app = TuiApp::new(dch_config::DchConfig::default());
+    for command in ["/theme nord", "/theme", "/set theme nord"] {
+        app.browse.pending_theme_osc = None;
+        command_output(&mut app, command);
+        let (background, primary) = app
+            .browse
+            .pending_theme_osc
+            .expect("{command} parks its terminal writes on the flush");
+        assert_eq!(
+            background, app.theme.ui.background,
+            "{command} parks the landed palette's canvas, not a key-time leftover"
+        );
+        assert_eq!(
+            primary, app.theme.ui.primary,
+            "{command} parks the cursor tint beside the canvas it belongs to"
+        );
+    }
+}
+
+#[test]
+fn tab_completes_a_command_name_from_its_prefix() {
+    let mut app = TuiApp::new(dch_config::DchConfig::default());
+    app.composer.input.set_text("/them".to_string());
+    assert!(app.complete_command_line(false));
+    assert!(
+        app.composer.input.text() == "/theme" || app.composer.input.text() == "/themes",
+        "a command prefix completes to a full command name, got {:?}",
+        app.composer.input.text()
+    );
+}
+
+#[test]
+fn tab_cycles_the_suggestions_with_the_popup_standing() {
+    let mut app = TuiApp::new(dch_config::DchConfig::default());
+    app.composer.input.set_text("/theme ".to_string());
+    let (_, candidates, _) = app.fresh_completion("/theme ");
+    assert!(
+        candidates.len() >= 2,
+        "the probe stem offers at least two themes, got {candidates:?}"
+    );
+    let first = candidates.first().cloned().unwrap_or_default();
+    let second = candidates.get(1).cloned().unwrap_or_default();
+    let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+    assert!(app.handle_key(tab));
+    assert_eq!(
+        app.composer.input.text(),
+        format!("/theme {first}"),
+        "the first Tab applies the highlighted row — the composer names what the screen previews"
+    );
+    assert_eq!(
+        app.theme.name,
+        Theme::by_name(&first).map_or_default(|theme| theme.name),
+        "the palette previews the row the first Tab applied"
+    );
+    assert!(
+        app.completion_popup_live(),
+        "the popup stands after the applied row"
+    );
+    assert!(app.handle_key(tab));
+    assert_eq!(
+        app.composer.input.text(),
+        format!("/theme {second}"),
+        "the second Tab steps to the second row — the same row a Down lands on"
+    );
+    // After applying, the popup stands — the cycle's frozen list
+    // keeps the candidates visible so the next Tab (or the arrows)
+    // continues cycling through them.
+    assert!(
+        app.completion_popup_live(),
+        "the popup stands after an applied candidate — Tab cycles, it does not select"
+    );
+    // A third Tab steps onward to the third row.
+    assert!(app.handle_key(tab));
+    assert_eq!(
+        app.composer.input.text(),
+        format!("/theme {}", candidates.get(2).cloned().unwrap_or_default()),
+        "the third Tab steps to the third row — cycling continues"
+    );
+}
+
+#[test]
+fn backtab_from_a_bare_stem_applies_the_last_row() {
+    let mut app = TuiApp::new(dch_config::DchConfig::default());
+    app.composer.input.set_text("/theme ".to_string());
+    let (_, candidates, _) = app.fresh_completion("/theme ");
+    assert!(candidates.len() >= 2, "themes offer more than one");
+    let last = candidates.last().cloned().unwrap_or_default();
+    assert!(app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)));
+    assert_eq!(
+        app.composer.input.text(),
+        format!("/theme {last}"),
+        "a reverse first press applies the last row, not a browse"
+    );
+    assert!(
+        app.completion_popup_live(),
+        "the popup stands after the applied row"
+    );
+}
+
+#[test]
+fn arrows_walk_the_suggestion_popup_and_preview_the_landed_row() {
+    let mut app = TuiApp::new(dch_config::DchConfig::default());
+    app.composer.input.set_text("/theme ".to_string());
+    let (_, candidates, _) = app.fresh_completion("/theme ");
+    assert!(
+        candidates.len() >= 2,
+        "the probe stem offers at least two themes, got {candidates:?}"
+    );
+    let second = candidates.get(1).cloned().unwrap_or_default();
+    assert!(
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+        "Down with the popup standing is the popup's"
+    );
+    assert_eq!(
+        app.composer.input.text(),
+        format!("/theme {second}"),
+        "the composer takes the landed row — selection, preview, and text agree"
+    );
+    assert_eq!(
+        app.theme.name,
+        Theme::by_name(&second).map_or_default(|theme| theme.name),
+        "the palette previews the landed row"
+    );
+    assert!(
+        app.completion_popup_live(),
+        "the popup stands while the arrows browse"
+    );
+}
+
+#[test]
+fn tab_on_a_fully_typed_command_applies_the_first_argument() {
+    let mut app = TuiApp::new(dch_config::DchConfig::default());
+    app.composer.input.set_text("/theme".to_string());
+    let (_, candidates, _) = app.fresh_completion("/theme ");
+    let first = candidates.first().cloned().unwrap_or_default();
+    assert!(app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+    assert_eq!(
+        app.composer.input.text(),
+        format!("/theme {first}"),
+        "Tab on a fully typed command lands on the first value — space added, row applied"
+    );
+    assert!(
+        app.completion_popup_live(),
+        "the popup stands with the argument candidates"
+    );
+    assert_eq!(
+        app.theme.name,
+        Theme::by_name(&first).map_or_default(|theme| theme.name),
+        "the palette previews the row the composer names"
+    );
+}
+
+#[test]
+fn a_committed_switch_after_browsing_keeps_the_choice() {
+    let mut app = TuiApp::new(dch_config::DchConfig::default());
+    app.composer.input.set_text("/theme ".to_string());
+    assert!(app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+    // Type the rest of a theme name — the browse narrows, not ends.
+    for glyph in "nord".chars() {
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Char(glyph), KeyModifiers::NONE)));
+    }
+    // The text still names a theme; the browse hasn't ended.
+    assert_eq!(
+        app.composer.input.text(),
+        "/theme nord",
+        "the typed name stands"
+    );
+    // Enter commits — the choice keeps, no restore.
+    assert!(app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+    assert_eq!(
+        app.theme.name, "Nord",
+        "the committed switch stands — the browse's restore does not undo it"
+    );
+}
+
+#[test]
+fn arrows_preview_and_tab_applies_from_the_arrows_row() {
+    let mut app = TuiApp::new(dch_config::DchConfig::default());
+    app.composer.input.set_text("/theme ".to_string());
+    let (_, candidates, _) = app.fresh_completion("/theme ");
+    assert!(
+        candidates.len() >= 3,
+        "the themes offer at least three rows, got {candidates:?}"
+    );
+    let third = candidates.get(2).cloned().unwrap_or_default();
+    // Two arrow presses walk to the third row; the palette and the
+    // composer both follow.
+    assert!(app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+    assert!(app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+    assert_eq!(
+        app.composer.input.text(),
+        format!("/theme {third}"),
+        "the composer names the arrow-landed row — Enter submits the choice on screen"
+    );
+    assert_eq!(
+        app.theme.name,
+        Theme::by_name(&third).map_or_default(|theme| theme.name),
+        "the preview follows the arrow-landed row"
+    );
+    // Tab continues from the arrow's position — the shared cycle —
+    // and applies the next row into the composer.
+    assert!(app.complete_command_line(false));
+    assert_eq!(
+        app.composer.input.text(),
+        format!("/theme {}", candidates.get(3).cloned().unwrap_or_default()),
+        "Tab continues from the row the arrows landed on — one position, two keys"
+    );
+}
+
+#[test]
+fn the_popup_arrows_wrap_at_both_ends() {
+    let mut app = TuiApp::new(dch_config::DchConfig::default());
+    app.composer.input.set_text("/theme ".to_string());
+    let (_, candidates, _) = app.fresh_completion("/theme ");
+    let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+    let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+    let last = candidates.last().cloned().unwrap_or_default();
+    let first = candidates.first().cloned().unwrap_or_default();
+    assert!(app.handle_key(up));
+    assert_eq!(
+        app.theme.name,
+        Theme::by_name(&last).map_or_default(|theme| theme.name),
+        "Up from the fresh highlight wraps to the last row"
+    );
+    assert_eq!(
+        app.composer.input.text(),
+        format!("/theme {last}"),
+        "the composer takes the wrapped row"
+    );
+    assert!(app.handle_key(up));
+    assert!(app.handle_key(down));
+    assert_eq!(
+        app.theme.name,
+        Theme::by_name(&last).map_or_default(|theme| theme.name),
+        "Up then Down returns to the last row (Up wrapped, Down stepped back)"
+    );
+    assert!(
+        app.completion_popup_live(),
+        "the popup stands through the walk"
+    );
+    let _ = first;
+}
+
+#[test]
+fn tab_continues_from_the_row_the_arrows_landed_on() {
+    let mut app = TuiApp::new(dch_config::DchConfig::default());
+    app.composer.input.set_text("/theme ".to_string());
+    let (_, candidates, _) = app.fresh_completion("/theme ");
+    assert!(
+        candidates.len() >= 3,
+        "the themes offer at least three rows, got {candidates:?}"
+    );
+    let second = candidates.get(1).cloned().unwrap_or_default();
+    let third = candidates.get(2).cloned().unwrap_or_default();
+    assert!(app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+    assert_eq!(
+        app.theme.name,
+        Theme::by_name(&second).map_or_default(|theme| theme.name),
+        "the arrow lands on the second row — the preview proves the position"
+    );
+    assert!(app.complete_command_line(false));
+    assert_eq!(
+        app.composer.input.text(),
+        format!("/theme {third}"),
+        "Tab continues from the arrow-landed row, applying the third"
+    );
+}
+
+#[test]
+fn an_edit_after_stepping_keeps_the_cycles_position() {
+    let mut app = TuiApp::new(dch_config::DchConfig::default());
+    app.composer.input.set_text("/theme ".to_string());
+    assert!(app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+    // Type after the browse: the text narrows, the position persists.
+    app.composer.input.set_text("/theme d".to_string());
+    assert!(
+        app.completion_popup_live(),
+        "the popup re-arms for the edited draft"
+    );
+    let (_, candidates, _) = app.fresh_completion("/theme d");
+    // The cycle was at index 1 (from the first arrow); the next
+    // arrow continues from there, stepping to index 2 of the
+    // fresh "d"-filtered list.
+    let third = candidates.get(2).cloned().unwrap_or_default();
+    assert!(app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+    assert_eq!(
+        app.theme.name,
+        Theme::by_name(&third).map_or_default(|theme| theme.name),
+        "the step continues from the cycle's position in the fresh list"
+    );
+}
+
+#[test]
+fn a_value_row_in_the_popup_stands_alone() {
+    let mut subject = TuiApp::new(dch_config::DchConfig::default());
+    subject.composer.input.set_text("/theme ".to_string());
+    let rows = screen_rows(&mut subject);
+    let (_, candidates, _) = subject.fresh_completion("/theme ");
+    let value = candidates.first().cloned().unwrap_or_default();
+    let row = rows
+        .iter()
+        .find(|row| row.trim_start().starts_with(&value))
+        .unwrap_or_else(|| panic!("the popup lists {value}, rows: {rows:?}"));
+    let summary = commands::summary_for("theme").unwrap_or_default();
+    assert!(
+        !row.contains(summary),
+        "a theme row is the value alone, not the /theme summary, got {row:?}"
+    );
+}
+
+#[test]
+fn a_wrong_shape_known_command_points_at_the_usage() {
+    // /model with no name is a usage mistake, not an unknown
+    // command: the notice carries the shape the registry spells,
+    // never the command-list pointer a name nothing carries earns.
+    let mut app = TuiApp::new(dch_config::DchConfig::default());
+    app.handle_command(commands::parse("/model"));
+    let (notice, _) = app.transient_notice.as_ref().expect("a notice stands");
+    assert!(
+        notice.contains("/model <name>"),
+        "the notice names the shape: {notice}"
+    );
+    assert!(
+        !notice.contains("unknown command"),
+        "a registered command is never called unknown: {notice}"
+    );
+}
+
+#[test]
+fn fit_picker_title_pads_and_truncates_by_display_cells() {
+    // The picker's title column is a cell budget: a wide-script
+    // title pads to the same column edge an ASCII one does, and
+    // an over-long one keeps a head that fits the budget with the
+    // ellipsis inside it. A character count would let a wide
+    // title push the model column sideways.
+    let padded = fit_picker_title(Some("端末のセッション"));
+    assert_eq!(
+        str_width(&padded),
+        24,
+        "a wide-script title pads to the column's cell width: {padded:?}"
+    );
+    let over_long = "題".repeat(40);
+    let capped = fit_picker_title(Some(&over_long));
+    assert!(
+        str_width(&capped) <= 24,
+        "the cap is a cell budget, never a character count: {capped:?}"
+    );
+    assert!(
+        capped.ends_with('…'),
+        "the cap keeps its head visible: {capped:?}"
+    );
+    let joined = format!(
+        "前\u{2714}\u{fe0f}\u{1f468}\u{200d}\u{1f469}{}",
+        "題".repeat(30)
+    );
+    let policy_capped = fit_picker_title(Some(&joined));
+    assert!(
+        str_width(&policy_capped) <= 24,
+        "a joiner cluster spends what it paints: {policy_capped:?}"
+    );
+    assert!(
+        !policy_capped.contains('\u{fe0f}') && !policy_capped.contains('\u{200d}'),
+        "the title carries the display policy before either measure: {policy_capped:?}"
+    );
+    assert_eq!(
+        str_width(&fit_picker_title(None)),
+        24,
+        "the untitled dash pads to the same column edge"
+    );
+}
+
+#[test]
+fn a_settled_expansion_folds_rebake_off_the_baked_rows() {
+    // The same retirement from the frame's head: a tool starting to
+    // run folds the plan block, and the rows baked in its expanded
+    // shape go with the flag rather than outliving it.
+    let mut subject = app();
+    let receipt = [
+        "Changed: src/lib.rs (modified)",
+        "│ 1 line removed, 1 added",
+        "@@ -1,2 +1,2 @@",
+        "  fn main() {",
+        "-     old();",
+        "+     new();",
+        "  }",
+    ]
+    .join("\n");
+    subject.retain_tool_detail("call_todo", "{\"k\":1}", &receipt);
+    subject.push_message(TuiMessage::Assistant {
+        blocks: vec![ContentBlock::Tool {
+            name: "TodoWrite".to_string(),
+            call_id: "call_todo".to_string(),
+            input_preview: "src/lib.rs".to_string(),
+            output_preview: String::new(),
+            retained_input: String::new(),
+            success: true,
+            elapsed_secs: 0.1,
+        }],
+        timestamp: chrono::Utc::now(),
+        duration_ms: None,
+    });
+    subject.push_message(TuiMessage::User {
+        text: "after the block".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
+    subject
+        .expansion
+        .expanded_tools
+        .insert("call_todo".to_string());
+    subject.expansion.auto_expanded_todo = Some("call_todo".to_string());
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24)).expect("terminal");
+    terminal
+        .draw(|frame| subject.render(frame))
+        .expect("first draw");
+    let expanded = buffer_text(terminal.backend().buffer());
+    assert!(
+        expanded.contains("old();"),
+        "the armed block draws its expanded detail: {expanded}"
+    );
+    subject
+        .active_tools()
+        .lock()
+        .expect("the tools lock")
+        .push(ActiveTool {
+            call_id: "call_next".to_string(),
+            name: "Bash".to_string(),
+            input_summary: String::new(),
+            start: Instant::now(),
+        });
+    subject.settle_todo_expansion();
+    assert!(
+        !subject.expansion.expanded_tools.contains("call_todo"),
+        "the tool starting to run folds it"
+    );
+    terminal
+        .draw(|frame| subject.render(frame))
+        .expect("redraw");
+    let collapsed = buffer_text(terminal.backend().buffer());
+    assert!(
+        !collapsed.contains("old();"),
+        "the fold rebakes — the baked detail rows do not outlive the \
+             flag they rode: {collapsed}"
+    );
+    assert!(
+        collapsed.contains("src/lib.rs"),
+        "the block's own summary row stands: {collapsed}"
+    );
+}
+
+#[test]
+fn the_flipped_highlight_covers_exactly_the_swept_cells() {
+    // reverse_selection walks the same projection the copy walks:
+    // the reversed ink spans exactly the swept columns — four
+    // cells for a four-cell sweep — whatever the raw bytes
+    // underneath measure.
+    let mut lines = vec![Line::from("done \u{2714}\u{fe0f} shipped")];
+    reverse_selection(
+        &mut lines,
+        0,
+        &CellSelection {
+            anchor: CellPos { line: 0, col: 5 },
+            head: CellPos { line: 0, col: 8 },
+        },
+    );
+    let line = lines.first().expect("the fixture line survives the flip");
+    let flipped: Vec<&ratatui::text::Span<'_>> = line
+        .spans
+        .iter()
+        .filter(|span| {
+            span.style
+                .add_modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        })
+        .collect();
+    let ink: String = flipped
+        .iter()
+        .map(|span| span.content.to_string())
+        .collect();
+    assert_eq!(ink, "\u{2714}\u{fe0f} sh");
+    let cells: usize = flipped
+        .iter()
+        .map(|span| display_width(span.content.as_ref()))
+        .sum();
+    assert_eq!(
+        cells, 4,
+        "the flipped ink paints the four swept cells and no more"
+    );
+}
+
+#[test]
+fn the_identity_row_picker_and_completion_paint_the_stripped_projection() {
+    // Round 5's three surfaces on one welcome draw: the composer
+    // identity row (a free-form config model rides it), the
+    // session picker's model column, and the completion popup's
+    // candidate values. All paint the projection; the picker's
+    // wide columns also pad by cells, so a CJK workdir stops its
+    // pad at its own painted width and the row's trailing
+    // columns stay on their grid.
+    let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+    let mut config = dch_config::DchConfig::default();
+    config.api.model = family.to_string();
+    let mut subject = TuiApp::new(config);
+    // A standing frame, not the welcome: the splash box bounds
+    // the popup at the art's width there, and the honest row
+    // clips at that bound whatever the pad discipline — here the
+    // composer spans the pane and the row fits whole.
+    subject.push_message(TuiMessage::Assistant {
+        blocks: vec![ContentBlock::Text {
+            text: "hello".to_string(),
+        }],
+        timestamp: chrono::Utc::now(),
+        duration_ms: Some(10),
+    });
+    subject.apply_session_update(SessionUpdate::SessionCatalog {
+        rows: vec![SessionPick {
+            id: "11111111-1111-1111-1111-111111111111".to_string(),
+            model: family.to_string(),
+            saved_at: chrono::Utc::now(),
+            prompts: 3,
+            title: None,
+            workdir: Some(format!("/x/{}", "长".repeat(10))),
+        }],
+    });
+    subject.completion.completion = Some(CompletionCycle {
+        prefix: "/model ".to_string(),
+        candidates: vec![family.to_string()],
+        index: 0,
+        bare: true,
+        window_start: 0,
+    });
+    // A 120-column pane: the picker's widest honest row (24-cell
+    // title, 20-cell dir, 12-cell model) fits whole; at 80 the
+    // row clips at the pane regardless of the pad discipline.
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+    terminal.draw(|frame| subject.render(frame)).unwrap();
+    for cell in terminal.backend().buffer().content.clone() {
+        let symbol = cell.symbol();
+        let carries_input = symbol.chars().any(|ch| {
+            matches!(
+                ch,
+                '\u{fe0f}' | '\u{fe0e}'
+                    | '\u{200d}'
+                    | '\u{20e3}'
+                    | '\u{1f3fb}'..='\u{1f3ff}'
+                    | '\u{e0020}'..='\u{e007f}'
+            )
+        });
+        assert!(
+            !carries_input,
+            "the composition input {symbol:?} reached the identity, picker, or completion rows"
+        );
+    }
+    let screen = buffer_text(terminal.backend().buffer());
+    assert!(
+        screen.contains('\u{1f468}'),
+        "the family's members paint stripped, not vanished: {screen:?}"
+    );
+    assert!(
+        screen.contains("3p"),
+        "the picker's trailing columns stay on the grid: {screen:?}"
+    );
+}
+
+#[test]
+fn a_seam_cluster_keeps_its_columns_before_and_during_selection() {
+    // The frame paints in one order — the flip on the raw clone,
+    // then the display strip (paint/conversation.rs) — and a
+    // cluster split across spans must sit on the same cells in
+    // both states. The screen column here is measured the way the
+    // buffer advances: per-span widths of the stripped contents.
+    // A strip that projected each span alone kept a span-opening
+    // modifier as its own two cells until a selection covering
+    // the cluster flipped it into one span — and only then
+    // stripped it — so the text after the seam jumped two columns
+    // the moment the selection landed, and the unselected row
+    // never matched the cells the selection math budgeted.
+    fn strip(lines: &mut Vec<Line<'_>>) {
+        super::paint::conversation::for_display_lines(lines);
+    }
+    fn screen_column(lines: &[Line<'_>], needle: char) -> usize {
+        let line = lines.first().expect("the fixture line survives the strip");
+        let mut column: usize = 0;
+        for span in &line.spans {
+            let content = span.content.as_ref();
+            if let Some(at) = content.find(needle) {
+                let prefix = content.get(..at).expect("find lands on a boundary");
+                return column.saturating_add(str_width(prefix));
+            }
+            column = column.saturating_add(str_width(content));
+        }
+        panic!("the needle never paints");
+    }
+    fn screen_width(lines: &[Line<'_>]) -> usize {
+        lines
+            .first()
+            .expect("the fixture line survives the strip")
+            .spans
+            .iter()
+            .map(|span| str_width(span.content.as_ref()))
+            .sum()
+    }
+    let seam = || {
+        vec![Line::from(vec![
+            Span::raw("a\u{1f44d}"),
+            Span::raw("\u{1f3fd} b"),
+        ])]
+    };
+
+    let mut before = seam();
+    strip(&mut before);
+    let mut during = seam();
+    reverse_selection(
+        &mut during,
+        0,
+        &CellSelection {
+            anchor: CellPos { line: 0, col: 0 },
+            head: CellPos { line: 0, col: 3 },
+        },
+    );
+    strip(&mut during);
+
+    assert_eq!(
+        screen_column(&before, 'b'),
+        screen_column(&during, 'b'),
+        "covering the seam cluster moved the text after it"
+    );
+    assert_eq!(
+        screen_column(&before, 'b'),
+        4,
+        "the row paints the flattened cells: a, the emoji, the space, then b"
+    );
+    assert_eq!(
+        screen_width(&before),
+        display_width("a\u{1f44d}\u{1f3fd} b"),
+        "the unselected row paints the width the selection math budgets"
+    );
+    assert_eq!(
+        screen_width(&during),
+        display_width("a\u{1f44d}\u{1f3fd} b"),
+        "the selected row paints the width the selection math budgets"
+    );
+}
+
+#[test]
+fn the_keyboard_wraps_at_the_painted_line_not_the_raw_spans() {
+    // line_width feeds Left/Right their wrap boundary and Down its
+    // floor, so its measure must be the same flattened projection
+    // the flip, the copy, and the screen's strip walk — a per-span
+    // sum counts a span-opening modifier as its own two cells and
+    // walks the keyboard two cells past everything the selection
+    // can cover.
+    let mut subject = TuiApp::new(dch_config::DchConfig::default());
+    subject.bake.conversation_cache = vec![Line::from(vec![
+        Span::raw("a\u{1f44d}"),
+        Span::raw("\u{1f3fd} b"),
+    ])];
+    assert_eq!(
+        subject.line_width(0),
+        Some(5),
+        "the wrap boundary is the flattened five cells: a, the cluster, a space, b"
+    );
+}
+
+#[test]
+fn an_evicted_expansion_rebakes_off_the_baked_rows() {
+    // Past the cap the oldest call's expansion retires with its
+    // detail, and the rows it baked in the expanded shape must
+    // not outlive the flag that backed them: the retirement
+    // rebakes, so the next draw renders the block collapsed —
+    // mid-conversation, where the tail re-render cannot reach it.
+    let mut subject = app();
+    let receipt = [
+        "Changed: src/lib.rs (modified)",
+        "│ 1 line removed, 1 added",
+        "@@ -1,2 +1,2 @@",
+        "  fn main() {",
+        "-     old();",
+        "+     new();",
+        "  }",
+    ]
+    .join("\n");
+    subject.retain_tool_detail("call_old", "{\"k\":1}", &receipt);
+    subject
+        .expansion
+        .expanded_tools
+        .insert("call_old".to_string());
+    subject.push_message(TuiMessage::Assistant {
+        blocks: vec![ContentBlock::Tool {
+            name: "Edit".to_string(),
+            call_id: "call_old".to_string(),
+            input_preview: "src/lib.rs".to_string(),
+            output_preview: String::new(),
+            retained_input: String::new(),
+            success: true,
+            elapsed_secs: 0.1,
+        }],
+        timestamp: chrono::Utc::now(),
+        duration_ms: None,
+    });
+    subject.push_message(TuiMessage::User {
+        text: "after the block".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 24)).expect("terminal");
+    terminal.draw(|frame| subject.render(frame)).expect("draw");
+    let expanded = buffer_text(terminal.backend().buffer());
+    assert!(
+        expanded.contains("old();"),
+        "the expanded block draws its diff while the flag stands: {expanded}"
+    );
+    // TOOL_DETAIL_CAP later graduations retire the oldest call.
+    for index in 0..TOOL_DETAIL_CAP {
+        subject.retain_tool_detail(&format!("call_{index}"), "{\"k\":1}", "plain output");
+    }
+    assert!(
+        !subject.expansion.expanded_tools.contains("call_old"),
+        "the cap retired the oldest call's toggle state"
+    );
+    terminal
+        .draw(|frame| subject.render(frame))
+        .expect("redraw");
+    let collapsed = buffer_text(terminal.backend().buffer());
+    assert!(
+        !collapsed.contains("old();"),
+        "the retirement rebakes — the baked diff rows do not outlive \
+             the flag they rode: {collapsed}"
+    );
+    assert!(
+        collapsed.contains("src/lib.rs"),
+        "the block's own summary row stands: {collapsed}"
+    );
+}
+
+#[test]
+fn copy_verdict_wording_covers_all_three_states() {
+    assert_eq!(
+        copy_verdict_notice(CopyVerdict {
+            attempt: 1,
+            escape_written: false,
+            verified: true,
+        }),
+        "selection copied",
+        "a verified transport earns the plain claim"
+    );
+    assert_eq!(
+        copy_verdict_notice(CopyVerdict {
+            attempt: 1,
+            escape_written: true,
+            verified: false,
+        }),
+        "",
+        "an escape nothing confirmed posts no row at all"
+    );
+    assert_eq!(
+        copy_verdict_notice(CopyVerdict {
+            attempt: 1,
+            escape_written: false,
+            verified: false,
+        }),
+        "copy failed — set display.copy_command",
+        "nothing at all names the escape hatch"
+    );
+}
+
+#[test]
+fn the_copy_answer_wording_matches_the_verdict_vocabulary() {
+    assert_eq!(
+        copy_answer_notice(CopyAnswer::Verified),
+        "selection copied",
+        "verified delivery earns the plain claim"
+    );
+    assert_eq!(
+        copy_answer_notice(CopyAnswer::Unconfirmed),
+        "",
+        "a pending delivery posts nothing — the verdict is the only wording"
+    );
+    assert_eq!(
+        copy_answer_notice(CopyAnswer::Failed),
+        "copy failed — set display.copy_command",
+        "nothing at all names the escape hatch"
+    );
+}
+
+#[test]
+fn copy_command_hands_the_last_answer_to_the_copier() {
+    // The copy leg's real path: an injected copier records exactly what it
+    // was handed, standing in for the clipboard so the test never shells
+    // out. A turn carrying prose plus tool chrome must yield just the prose.
+    use std::sync::atomic::AtomicU64;
+    let mut app = TuiApp::new(dch_config::DchConfig::default());
+    let now = chrono::Utc::now();
+    app.push_message(TuiMessage::User {
+        text: "explain it".to_string(),
+        timestamp: now,
+        steered: false,
+        unsent: false,
+    });
+    app.push_message(TuiMessage::Assistant {
+        blocks: vec![
+            ContentBlock::Text {
+                text: "the answer".to_string(),
+            },
+            ContentBlock::Tool {
+                name: "Read".to_string(),
+                call_id: "c1".to_string(),
+                input_preview: "a.rs".to_string(),
+                success: true,
+                elapsed_secs: 0.1,
+                output_preview: "…".to_string(),
+                retained_input: String::new(),
+            },
+        ],
+        timestamp: now,
+        duration_ms: Some(0),
+    });
+    let captured: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+    let calls = Arc::new(AtomicU64::new(0));
+    let sink = Arc::clone(&captured);
+    let counted = Arc::clone(&calls);
+    app.set_selection_copier(Box::new(move |_attempt, text| {
+        *sink
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(text.to_string());
+        counted.fetch_add(1, Ordering::SeqCst);
+        CopyAnswer::Verified
+    }));
+
+    let out = command_output(&mut app, "/copy");
+
+    assert_eq!(
+        captured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_deref(),
+        Some("the answer"),
+        "the copier receives the answer text, tool chrome excluded"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "exactly one copy attempted"
+    );
+    assert!(
+        !out.contains("no answer"),
+        "an answer was present, got {out:?}"
+    );
+}
+
+#[test]
+fn the_popup_spans_the_composer_s_width() {
+    let area = Rect {
+        x: 2,
+        y: 10,
+        width: 40,
+        height: 3,
+    };
+    let popup = popup_rect(area, 4, true);
+    assert_eq!(popup.width, 40, "the popup is as wide as the composer");
+    assert_eq!(popup.x, 2, "it shares the composer's left edge");
+    assert_eq!(popup.y, 6, "it floats immediately above the composer");
+    assert_eq!(popup.height, 4, "it is as tall as its content needs");
+}
+
+#[test]
+fn context_bar_fill_rounds_usage_into_cells() {
+    assert_eq!(context_bar_fill(0, 200_000, 10), 0);
+    assert_eq!(context_bar_fill(100_000, 200_000, 10), 5);
+    assert_eq!(context_bar_fill(20_000, 200_000, 10), 1);
+    assert_eq!(context_bar_fill(200_000, 200_000, 10), 10);
+    assert_eq!(
+        context_bar_fill(300_000, 200_000, 10),
+        10,
+        "usage past the window clamps at full"
+    );
+    assert_eq!(
+        context_bar_fill(100_000, 0, 10),
+        0,
+        "an unknown window draws the bar empty"
+    );
+}
+
+#[test]
+fn the_status_bar_reads_the_live_window() {
+    let mut app = app();
+    // The footer belongs to a conversation with turns — the
+    // welcome paints none — so the bar rides a landed prompt.
+    app.push_message(TuiMessage::User {
+        text: "hello".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
+    app.config.api.context_window = Some(200_000);
+    app.state
+        .context_window
+        .store(100_000, std::sync::atomic::Ordering::SeqCst);
+    app.state
+        .tokens
+        .lock()
+        .expect("the tokens lock")
+        .context_tokens = 50_000;
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+    terminal.draw(|frame| app.render(frame)).expect("draw");
+    let thumb = app.theme.ui.scrollbar_thumb;
+    let buffer = terminal.backend().buffer();
+    let mut thumb_cells = 0usize;
+    for y in 0..24u16 {
+        for x in 0..80u16 {
+            if buffer[(x, y)].style().bg == Some(thumb) {
+                thumb_cells += 1;
+            }
+        }
+    }
+    let expected = context_bar_fill(50_000, 100_000, CONTEXT_BAR_CELLS);
+    assert_eq!(
+        thumb_cells, expected,
+        "the bar divides by the live window, not the config field"
+    );
+}
+
+#[test]
+fn context_bar_readout_rounds_from_the_true_ratio() {
+    assert_eq!(
+        context_bar_readout(55_000, 100_000),
+        Some(("55%".to_string(), "55k/100k".to_string())),
+        "the readout spells the same fraction the bar paints"
+    );
+    assert_eq!(
+        context_bar_readout(419_000, 1_000_000),
+        Some(("42%".to_string(), "419k/1M".to_string())),
+        "a million-strong window spells its unit: 1M, not 1000k"
+    );
+    assert_eq!(
+        context_bar_readout(1_234_000, 2_000_000),
+        Some(("62%".to_string(), "1.2M/2M".to_string())),
+        "millions in between render in tenths"
+    );
+    assert_eq!(
+        context_bar_readout(999_999, 1_000_000),
+        Some(("100%".to_string(), "1M/1M".to_string())),
+        "rounding into a million promotes the unit rather than printing 1000k"
+    );
+    assert_eq!(
+        context_bar_readout(2_499, 200_000),
+        Some(("1%".to_string(), "2k/200k".to_string())),
+        "small usage rounds to its own numbers, not to zero"
+    );
+    assert_eq!(
+        context_bar_readout(250_000, 200_000),
+        Some(("125%".to_string(), "250k/200k".to_string())),
+        "an over-window session reads its honest over-100 percent"
+    );
+    assert_eq!(
+        context_bar_readout(30_000, 0),
+        None,
+        "an unknown window spells nothing — no denominator"
+    );
+}
+
+#[test]
+fn a_drained_verdict_replaces_the_notice_wording() {
+    let mut app = TuiApp::new(dch_config::DchConfig::default());
+    app.post_notice("selection copied".to_string());
+    let mut slot = app.copy.copy_outcomes.lock().expect("the outcomes slot");
+    slot.push(CopyVerdict {
+        attempt: 1,
+        escape_written: true,
+        verified: false,
+    });
+    drop(slot);
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+    terminal.draw(|frame| app.render(frame)).expect("draw");
+    assert_eq!(
+        app.transient_notice.as_ref().map(|(text, _)| text.as_str()),
+        Some("selection copied"),
+        "an unconfirmed verdict clears no posted wording — the row a \
+             verified claim posted stays"
+    );
+}
+
+#[test]
+fn an_off_strip_paints_nothing_but_the_wake_stays_up() {
+    let (_observer, state) = crate::observer::TuiObserverState::new().into_observer();
+    state
+        .agent_running
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut config = dch_config::DchConfig::default();
+    config.display.strip_style = dch_config::StripStyle::Off;
+    let app = TuiApp::from_observer_state(config, state);
+    assert!(
+        app.pulse_animation_living(),
+        "an off strip still owes the elapsed row its cadence, mid-run"
+    );
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 1)).unwrap();
+    let drew = terminal
+        .draw(|frame| {
+            app.render_pulse_strip(
+                frame,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 80,
+                    height: 1,
+                },
+            );
+        })
+        .unwrap();
+    let _ = drew;
+    let buffer = terminal.backend().buffer();
+    for column in 0..80u16 {
+        assert!(
+            buffer
+                .cell((column, 0))
+                .is_some_and(|cell| cell.symbol() == " "),
+            "the off strip leaves the row empty at {column}"
+        );
+    }
+}
+
+#[test]
+fn a_glow_breathes_its_color_while_staying_put() {
+    let (_observer, state) = crate::observer::TuiObserverState::new().into_observer();
+    state
+        .agent_running
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut config = dch_config::DchConfig::default();
+    config.display.theme = "dracula".to_string();
+    config.display.strip_style = dch_config::StripStyle::Glow;
+    let mut app = TuiApp::from_observer_state(config, state);
+    let base = app.theme.ui.composer_border.unwrap_or(app.theme.ui.primary);
+    assert!(
+        matches!(base, ratatui::prelude::Color::Rgb(..)),
+        "the dracula strip color is RGB, so the breath is visible"
+    );
+    let render = |app: &TuiApp| -> (usize, ratatui::prelude::Color) {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 1)).unwrap();
+        terminal
+            .draw(|frame| {
+                app.render_pulse_strip(
+                    frame,
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: 80,
+                        height: 1,
+                    },
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let bar = (0..80u16)
+            .filter(|&column| {
+                buffer
+                    .cell((column, 0))
+                    .is_some_and(|cell| cell.symbol() == "─")
+            })
+            .count();
+        let color = buffer
+            .cell((0, 0))
+            .map_or(ratatui::prelude::Color::Reset, |cell| cell.fg);
+        (bar, color)
+    };
+    app.run_anchor = Some(Instant::now());
+    let (bar, full) = render(&app);
+    assert_eq!(bar, 80, "the glow bar holds the full row");
+    assert_eq!(full, base, "the breath starts at full brightness");
+    app.run_anchor = Some(
+        Instant::now()
+            .checked_sub(Duration::from_millis(1800))
+            .expect("now is past the epoch"),
+    );
+    let (bar, dim) = render(&app);
+    assert_eq!(bar, 80, "the bar never moves");
+    assert_eq!(
+        dim,
+        scaled_color(base, 4),
+        "the half-breath sits at half brightness"
+    );
+    app.run_anchor = Some(
+        Instant::now()
+            .checked_sub(Duration::from_millis(3600))
+            .expect("now is past the epoch"),
+    );
+    let (bar, wrapped) = render(&app);
+    assert_eq!(bar, 80, "the bar stays full through the wrap");
+    assert_eq!(wrapped, base, "the wrap returns to full brightness");
+}
+
+#[test]
+fn a_named_strip_color_glows_without_breathing() {
+    let (_observer, state) = crate::observer::TuiObserverState::new().into_observer();
+    state
+        .agent_running
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut config = dch_config::DchConfig::default();
+    config.display.strip_style = dch_config::StripStyle::Glow;
+    let mut app = TuiApp::from_observer_state(config, state);
+    let named = ratatui::prelude::Color::Blue;
+    app.theme.ui.composer_border = Some(named);
+    let render = |app: &TuiApp| -> ratatui::prelude::Color {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 1)).unwrap();
+        terminal
+            .draw(|frame| {
+                app.render_pulse_strip(
+                    frame,
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: 80,
+                        height: 1,
+                    },
+                );
+            })
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .cell((0, 0))
+            .map_or(ratatui::prelude::Color::Reset, |cell| cell.fg)
+    };
+    app.run_anchor = Some(Instant::now());
+    assert_eq!(
+        render(&app),
+        named,
+        "the named color draws as itself at full breath"
+    );
+    app.run_anchor = Some(
+        Instant::now()
+            .checked_sub(Duration::from_millis(1800))
+            .expect("now is past the epoch"),
+    );
+    assert_eq!(
+        render(&app),
+        named,
+        "a named color cannot scale, so the glow stays static through the half breath"
+    );
+}
+
+#[test]
+fn the_bounce_renders_right_anchored_on_its_reverse_pass() {
+    let (_observer, state) = crate::observer::TuiObserverState::new().into_observer();
+    let mut config = dch_config::DchConfig::default();
+    config.display.strip_style = dch_config::StripStyle::Bounce;
+    let mut app = TuiApp::from_observer_state(config, state.clone());
+    state
+        .agent_running
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    app.run_anchor = Some(
+        Instant::now()
+            .checked_sub(Duration::from_millis(4500))
+            .expect("the monotonic clock is well past its epoch"),
+    );
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 1)).unwrap();
+    terminal
+        .draw(|frame| {
+            app.render_pulse_strip(
+                frame,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 80,
+                    height: 1,
+                },
+            );
+        })
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    assert_eq!(
+        buffer.cell((79, 0)).expect("the last cell").symbol(),
+        "─",
+        "the reverse pass anchors its run at the right edge"
+    );
+    assert!(
+        buffer
+            .cell((40, 0))
+            .is_some_and(|cell| cell.symbol() == "─"),
+        "the reverse fill reached its halfway extent"
+    );
+    assert!(
+        buffer
+            .cell((35, 0))
+            .is_some_and(|cell| cell.symbol() == " "),
+        "before the fill the row stays clear"
+    );
+}
+
+#[test]
+fn the_travel_renders_right_anchored_on_its_reverse_pass() {
+    let (_observer, state) = crate::observer::TuiObserverState::new().into_observer();
+    let mut config = dch_config::DchConfig::default();
+    config.display.strip_style = dch_config::StripStyle::Travel;
+    let mut app = TuiApp::from_observer_state(config, state.clone());
+    state
+        .agent_running
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    app.run_anchor = Some(
+        Instant::now()
+            .checked_sub(Duration::from_millis(4500))
+            .expect("the monotonic clock is well past its epoch"),
+    );
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 1)).unwrap();
+    terminal
+        .draw(|frame| {
+            app.render_pulse_strip(
+                frame,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 80,
+                    height: 1,
+                },
+            );
+        })
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    assert!(
+        buffer
+            .cell((45, 0))
+            .is_some_and(|cell| cell.symbol() == "─"),
+        "the reverse pass carries the segment past mid-row"
+    );
+    assert!(
+        buffer
+            .cell((64, 0))
+            .is_some_and(|cell| cell.symbol() == "─"),
+        "the segment's right end trails it"
+    );
+    assert!(
+        buffer
+            .cell((70, 0))
+            .is_some_and(|cell| cell.symbol() == " "),
+        "clear cells sit beyond the segment"
+    );
+    assert!(
+        buffer
+            .cell((20, 0))
+            .is_some_and(|cell| cell.symbol() == " "),
+        "and before it, where the forward pass would have begun at column 0"
+    );
+}
+
+#[test]
+fn the_snake_renders_split_at_the_wrap() {
+    let (_observer, state) = crate::observer::TuiObserverState::new().into_observer();
+    let mut config = dch_config::DchConfig::default();
+    config.display.strip_style = dch_config::StripStyle::Snake;
+    let mut app = TuiApp::from_observer_state(config, state.clone());
+    state
+        .agent_running
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    app.run_anchor = Some(
+        Instant::now()
+            .checked_sub(Duration::from_millis(3150))
+            .expect("the monotonic clock is well past its epoch"),
+    );
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 1)).unwrap();
+    terminal
+        .draw(|frame| {
+            app.render_pulse_strip(
+                frame,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 80,
+                    height: 1,
+                },
+            );
+        })
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    assert!(
+        buffer.cell((0, 0)).is_some_and(|cell| cell.symbol() == "─"),
+        "the entering head run claims the left edge"
+    );
+    assert!(
+        buffer
+            .cell((10, 0))
+            .is_some_and(|cell| cell.symbol() == " "),
+        "clear cells follow the head run"
+    );
+    assert!(
+        buffer
+            .cell((69, 0))
+            .is_some_and(|cell| cell.symbol() == " "),
+        "and precede the exiting tail run"
+    );
+    assert!(
+        buffer
+            .cell((79, 0))
+            .is_some_and(|cell| cell.symbol() == "─"),
+        "the exiting tail run holds the right edge"
+    );
+}
+
+#[test]
+fn the_sheet_is_measured_against_the_rows_left_after_the_strip() {
+    // The rows the question sheet may occupy: the frame's height less
+    // the status bar, less the pulse strip's row when it is configured
+    // to the top. The sheet's reservation and its box are both measured
+    // from here, which is what keeps the layout's fixed rows from ever
+    // summing past the frame the solver was handed.
+    use ratatui::layout::Rect;
+
+    let mut app = app();
+    let area = Rect::new(0, 0, 40, 12);
+    assert_eq!(
+        app.question_sheet_area(area).height,
+        12u16
+            .saturating_sub(STATUS_BAR_ROWS)
+            .saturating_add(STATUS_BAR_AIR),
+        "only the bar's content rows are spoken for before the sheet sees the frame — its air is margin the sheet stands on"
+    );
+
+    app.display.strip_position = dch_config::StripPosition::Top;
+    assert_eq!(
+        app.question_sheet_area(area).height,
+        12u16
+            .saturating_sub(STATUS_BAR_ROWS)
+            .saturating_add(STATUS_BAR_AIR)
+            .saturating_sub(1),
+        "a strip at the top spends a row the sheet is then not offered"
+    );
+}
+
+#[test]
+fn a_family_bearing_queued_prompt_reserves_the_rows_it_paints() {
+    // The height fn once wrapped the raw prompt (the family
+    // scoring two cells) while the painter
+    // wrapped the stripped one (six), so the section reserved
+    // fewer rows than it painted and the wording truncated
+    // behind the queue's ellipsis. Both wrap the same projection
+    // now, and the reserved height is exactly the rows the paint
+    // spends plus the section's furniture.
+    let mut subject = app();
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    subject.host.submit_tx = Some(tx);
+    subject.submit_text("first".to_string());
+    subject
+        .remove_queued(0)
+        .expect("the first push is the driver's claim");
+    subject.settle_handed();
+    subject
+        .state
+        .live_claim
+        .store(7, std::sync::atomic::Ordering::SeqCst);
+    let width = 60u16;
+    let prefix = queue_prompt_prefix(1, 0);
+    let limit = usize::from(width).saturating_sub(str_width(&prefix)).max(1);
+    let cap = usize::from(QUEUE_ROWS).saturating_sub(3);
+    // Sized against the computed limit: the raw text fits one
+    // row, the stripped render needs two.
+    let filler = "a".repeat(limit.saturating_sub(3));
+    let prompt = format!("{filler} \u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}");
+    subject.submit_text(prompt.clone());
+    let painted = wrap_prompt_rows(&for_display(&prompt), limit, cap).len();
+    assert_eq!(
+        painted, 2,
+        "the fixture genuinely crosses a row boundary only after the strip"
+    );
+    assert_eq!(
+        usize::from(subject.queue_section_height(width)),
+        painted.saturating_add(3),
+        "the section reserves exactly the rows it paints"
+    );
+}
+
+#[test]
+fn the_steering_chord_survives_the_sheets_and_the_section() {
+    // The hint row offers Ctrl+S the moment a draft meets a running
+    // agent, and the queue's focus swallows everything the section
+    // does not answer — the survival set is what keeps an advertised
+    // key from becoming advertised noise.
+    assert!(key_survives_the_sheet(KeyEvent::new(
+        KeyCode::Char('s'),
+        KeyModifiers::CONTROL
+    )));
+}
+
+#[test]
+fn the_frame_window_opens_on_the_first_draw() {
+    // The per-second lane measures from the first draw it counts,
+    // not from the draw standing at its close — the difference
+    // between a second that can pass and one that never does. So
+    // the opening draw seeds the window and says nothing, and the
+    // counters go out whole when the window falls.
+    let epoch = Instant::now();
+    let mut stats = FrameStats {
+        anim_wakes: 4,
+        ..FrameStats::default()
+    };
+    assert!(
+        stats.note_draw(Duration::from_millis(5), epoch).is_none(),
+        "the opening draw seeds the window and reports nothing"
+    );
+    assert_eq!(stats.draws, 1, "and is counted itself");
+    assert!(
+        stats
+            .note_draw(Duration::from_millis(5), epoch + Duration::from_millis(900))
+            .is_none(),
+        "a draw inside the second leaves it standing"
+    );
+    let lane = stats
+        .note_draw(
+            Duration::from_millis(5),
+            epoch + Duration::from_millis(1_100),
+        )
+        .expect("a draw past the second closes the window");
+    assert_eq!(
+        (lane.anim_wakes, lane.draws),
+        (4, 3),
+        "the closed window reports everything it counted"
+    );
+    assert_eq!(stats.draws, 0, "the reopened window starts empty");
+    assert_eq!(stats.anim_wakes, 0, "in every counter");
+    assert!(stats.worst_draw.is_none(), "including the worst draw");
+    assert_eq!(
+        stats.second_start,
+        Some(epoch + Duration::from_millis(1_100)),
+        "the next window opens at the draw that closed the last"
+    );
+}
+
+#[test]
+fn the_tick_redraws_only_while_tools_run() {
+    let app = app();
+    assert!(!app.any_tools_running(), "no tools in flight yet");
+
+    app.active_tools()
+        .lock()
+        .expect("the tools lock")
+        .push(ActiveTool {
+            call_id: String::new(),
+            name: "Grep".to_string(),
+            input_summary: "\"needle\"".to_string(),
+            start: std::time::Instant::now(),
+        });
+    assert!(app.any_tools_running(), "a running tool asks for redraws");
+
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = app.active_tools().lock().expect("the tools lock");
+        panic!("poison the tools lock");
+    }));
+    assert!(panicked.is_err(), "the poisoning panic must unwind");
+    assert!(
+        !app.any_tools_running(),
+        "a poisoned lock reads as no tools in flight"
+    );
+}
+
+#[test]
+fn stop_cancels_a_run_in_flight_without_quitting() {
+    // The stop leg's live path: with a run marked in flight, the shared
+    // canceller fires and a notice lands, yet the session is asked to stay —
+    // the distinction from `/exit` that the whole command turns on.
+    use std::sync::atomic::AtomicBool;
+    let mut app = TuiApp::new(dch_config::DchConfig::default());
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let fired = Arc::clone(&cancelled);
+    app.set_run_canceller(Box::new(move || fired.store(true, Ordering::SeqCst)));
+    app.state.agent_running.store(true, Ordering::SeqCst);
+
+    let out = command_output(&mut app, "/stop");
+
+    assert!(out.contains("stopped the current run"), "got {out:?}");
+    assert!(
+        cancelled.load(Ordering::SeqCst),
+        "the run was actually cancelled"
+    );
+    assert!(
+        !app.quit.requested,
+        "stopping a run must not leave the session"
+    );
+}
+
+#[test]
+fn the_popup_window_follows_the_highlight() {
+    assert_eq!(
+        popup_window(3, 12, 6),
+        (0, 3),
+        "near the head the window sits at the top"
+    );
+    assert_eq!(
+        popup_window(7, 12, 6),
+        (2, 5),
+        "past the last row the highlight pins to the window's bottom"
+    );
+    assert_eq!(
+        popup_window(11, 12, 6),
+        (6, 5),
+        "at the very end the window rides the list's tail"
+    );
+    assert_eq!(
+        popup_window(0, 1, 6),
+        (0, 0),
+        "a list shorter than the cap shows whole"
+    );
+}
+
+#[test]
+fn the_sweep_renders_left_anchored_when_configured() {
+    let (_observer, state) = crate::observer::TuiObserverState::new().into_observer();
+    let mut config = dch_config::DchConfig::default();
+    config.display.strip_style = dch_config::StripStyle::Sweep;
+    let mut app = TuiApp::from_observer_state(config, state.clone());
+    state
+        .agent_running
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    app.run_anchor = Some(
+        Instant::now()
+            .checked_sub(Duration::from_millis(900))
+            .expect("the monotonic clock is well past its epoch"),
+    );
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 1)).unwrap();
+    terminal
+        .draw(|frame| {
+            app.render_pulse_strip(
+                frame,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 80,
+                    height: 1,
+                },
+            );
+        })
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    assert_eq!(
+        buffer.cell((0, 0)).expect("the first cell").symbol(),
+        "─",
+        "the sweep run starts at column 0, where the breath would pad first"
+    );
+    assert!(
+        buffer
+            .cell((39, 0))
+            .is_some_and(|cell| cell.symbol() == "─"),
+        "the fill reached its 900 ms extent"
+    );
+    assert!(
+        buffer
+            .cell((45, 0))
+            .is_some_and(|cell| cell.symbol() == " "),
+        "beyond the fill the row stays clear"
+    );
+}
+
+#[test]
+fn a_canvas_repainting_theme_keeps_the_running_titles_visible() {
+    // The reported bug, pinned at the scene: github_light repaints
+    // the canvas white, and a terminal launched under a dark scheme
+    // keeps a light default foreground — any register that leans on
+    // the terminal default renders white on white. The running
+    // title must carry the theme's own standing foreground, which
+    // on this canvas is a dark register.
+    let (_observer, state) = crate::observer::TuiObserverState::new().into_observer();
+    let mut config = dch_config::DchConfig::default();
+    config.display.theme = "github_light".to_string();
+    let app = TuiApp::from_observer_state(config, state.clone());
+    assert_eq!(
+        app.theme.ui.background,
+        ratatui::style::Color::Rgb(255, 255, 255),
+        "fixture premise: the theme repaints a white canvas"
+    );
+    assert_eq!(
+        app.theme.ui.foreground,
+        ratatui::style::Color::Rgb(36, 41, 47),
+        "fixture premise: the standing register is dark on that canvas"
+    );
+    state
+        .agent_running
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    *state.thinking.lock().expect("the thinking lock") = crate::observer::ThinkingStream {
+        text: "reasoning in flight".to_string(),
+        began: Some(Instant::now()),
+        ..Default::default()
+    };
+    let (lines, _) = app.live_thinking_lines(80);
+    let title = lines
+        .first()
+        .expect("the marker row")
+        .spans
+        .iter()
+        .find(|span| span.content.contains("Thinking"))
+        .expect("the title span");
+    assert_eq!(
+        title.style.fg,
+        Some(ratatui::style::Color::Rgb(36, 41, 47)),
+        "the title paints in the theme's dark standing register — never the \
+             terminal default a dark-scheme terminal would betray"
+    );
+}
+
+#[test]
+fn a_browse_left_by_backspace_restores_the_theme() {
+    let mut app = TuiApp::new(dch_config::DchConfig::default());
+    app.composer.input.set_text("/theme ".to_string());
+    let original = app.theme.name;
+    let (_, candidates, _) = app.fresh_completion("/theme ");
+    let third = candidates.get(2).cloned().unwrap_or_default();
+    // Two arrows land on the third theme; the preview follows.
+    assert!(app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+    assert!(app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+    assert_eq!(
+        app.theme.name,
+        Theme::by_name(&third).map_or_default(|theme| theme.name),
+        "the arrows previewed the third theme"
+    );
+    // Backspace out of the applied row and past the space: the
+    // text leaves the browse, and the theme returns to the
+    // session's own — not the preview.
+    while app.composer.input.text().starts_with("/theme ") {
+        assert!(
+            app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+            "the editor takes the backspace"
+        );
+    }
+    assert_eq!(
+        app.theme.name, original,
+        "the browse the backspace ended restores the session's theme"
+    );
+}
+
+#[test]
+fn the_browse_previews_the_theme_it_highlights() {
+    let mut app = TuiApp::new(dch_config::DchConfig::default());
+    app.composer.input.set_text("/theme ".to_string());
+    let original = app.theme.name;
+    let (_, candidates, _) = app.fresh_completion("/theme ");
+    let second = candidates.get(1).cloned().unwrap_or_default();
+    assert!(app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+    assert_eq!(
+        app.composer.input.text(),
+        format!("/theme {second}"),
+        "the composer names the row the highlight stands on"
+    );
+    assert!(
+        app.completion_popup_live(),
+        "the browse leaves the popup standing"
+    );
+    assert_eq!(
+        app.theme.name,
+        Theme::by_name(&second).map_or_default(|theme| theme.name),
+        "the palette previews the highlighted row, not the theme the browse started from"
+    );
+    assert!(
+        app.theme.name != original || original.eq_ignore_ascii_case(&second),
+        "the preview moved to the highlighted row (or that row was the original)"
+    );
+    assert!(app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+    assert_eq!(
+        app.theme.name, original,
+        "Esc after the browse restores the theme the session was on"
+    );
+}
+
+#[test]
+fn the_live_lane_opens_with_the_speaker_change_row() {
+    // The running turn owes the same blank row under the prompt
+    // that the batch render puts between a user message and the
+    // assistant content answering it: without it the first running
+    // row rides one row tighter than the same content sits after
+    // graduating, and the gap opens as a jump the moment it does.
+    let mut subject = app();
+    subject.push_message(TuiMessage::User {
+        text: "go check the files".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
+    subject
+        .active_tools()
+        .lock()
+        .expect("the tools lock")
+        .push(ActiveTool {
+            call_id: "call_seam".to_string(),
+            name: "Grep".to_string(),
+            input_summary: "\"needle\"".to_string(),
+            start: std::time::Instant::now(),
+        });
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+    terminal.draw(|frame| subject.render(frame)).expect("draw");
+    let buffer = terminal.backend().buffer();
+    let rows: Vec<String> = (0..24u16)
+        .map(|y| {
+            (0..80u16)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect::<String>()
+        })
+        .collect();
+    let prompt = rows
+        .iter()
+        .position(|row| row.contains("go check the files"))
+        .expect("the submitted prompt renders");
+    let tool = rows
+        .iter()
+        .position(|row| row.contains("Grep"))
+        .expect("the running tool renders");
+    assert_eq!(
+        tool.saturating_sub(prompt),
+        3,
+        "the prompt's closing blank, the speaker-change row, then the \
+             running tool — the same air the graduated turn sits in: {rows:?}"
+    );
+}
+
+#[test]
+fn the_pulse_bar_runs_on_the_runs_clock_not_the_streams() {
+    let (_observer, state) = crate::observer::TuiObserverState::new().into_observer();
+    let mut app = TuiApp::from_observer_state(dch_config::DchConfig::default(), state.clone());
+    state
+        .agent_running
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    // 900 ms into the run, a stream that began this instant: the
+    // bar must follow the run's clock, not the stream's.
+    app.run_anchor = Some(
+        Instant::now()
+            .checked_sub(Duration::from_millis(900))
+            .expect("the monotonic clock is well past its epoch"),
+    );
+    *state.thinking.lock().expect("the thinking lock") = crate::observer::ThinkingStream {
+        text: "a stream that just began".to_string(),
+        began: Some(Instant::now()),
+        ..Default::default()
+    };
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 1)).unwrap();
+    terminal
+        .draw(|frame| {
+            app.render_pulse_strip(
+                frame,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 80,
+                    height: 1,
+                },
+            );
+        })
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    let bar = (0..80u16)
+        .filter(|&column| {
+            buffer
+                .cell((column, 0))
+                .is_some_and(|cell| cell.symbol() == "─")
+        })
+        .count();
+    assert!(
+        bar > 8,
+        "a run 900 ms old grows the bar wide ({bar} cells), not the one-cell seed \
+             a fresh stream's clock would draw"
+    );
+}

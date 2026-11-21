@@ -5,7 +5,9 @@
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent};
 
 use super::TuiApp;
-use super::{CellSelection, QueueMode, Stick, normalize_pasted_newlines};
+use super::composer::normalize_pasted_newlines;
+use super::queue::QueueMode;
+use super::selection::{CellSelection, Stick};
 use crossterm::event::MouseEventKind;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -20,7 +22,7 @@ impl TuiApp {
     pub fn handle_event(&mut self, event: &Event) -> bool {
         match event {
             Event::Key(key) => {
-                self.caret_blink.resolidify();
+                self.composer.caret_blink.resolidify();
                 if key.kind != KeyEventKind::Press {
                     return false;
                 }
@@ -28,22 +30,24 @@ impl TuiApp {
             }
             Event::Mouse(mouse) => self.handle_mouse(*mouse),
             Event::Paste(text) => {
-                if self.pending_permissions.front().is_some() {
+                if self.permission.pending_permissions.front().is_some() {
                     return true;
                 }
-                self.caret_blink.resolidify();
-                if !self.pending_questions.is_empty() {
+                self.composer.caret_blink.resolidify();
+                if !self.questions.pending_questions.is_empty() {
                     return self.paste_into_the_question(text);
                 }
-                if self.queue_mode == QueueMode::Focused {
+                if self.queue.queue_mode == QueueMode::Focused {
                     return true;
                 }
-                self.input.insert_str(&normalize_pasted_newlines(text));
+                self.composer
+                    .input
+                    .insert_str(&normalize_pasted_newlines(text));
                 true
             }
             Event::Resize(_, _) => true,
             Event::FocusGained => {
-                self.full_repaint_due = Some(Instant::now());
+                self.pacing.full_repaint_due = Some(Instant::now());
                 true
             }
             Event::FocusLost => false,
@@ -112,7 +116,7 @@ impl TuiApp {
             (key.code, key.modifiers),
             (KeyCode::Esc, KeyModifiers::NONE)
         ) {
-            self.cancel_arm = false;
+            self.exit.cancel_arm = false;
         }
         if let Some(handled) = self.sheet_key(key) {
             return handled;
@@ -124,7 +128,7 @@ impl TuiApp {
             (KeyCode::Esc, KeyModifiers::NONE) => self.esc_under_run_or_idle(),
             (KeyCode::Char('s'), KeyModifiers::CONTROL) => self.steer_now(),
             (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
-                self.cycle_plan_view();
+                self.plan.cycle_plan_view();
                 true
             }
             (KeyCode::Char('c'), mods) if mods == KeyModifiers::CONTROL | KeyModifiers::SHIFT => {
@@ -132,16 +136,16 @@ impl TuiApp {
                 true
             }
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                if !self.input.is_empty() {
-                    self.input.clear();
+                if !self.composer.input.is_empty() {
+                    self.composer.input.clear();
                 } else if self
                     .state
                     .agent_running
                     .load(std::sync::atomic::Ordering::SeqCst)
                 {
                     if self.quit.armed {
-                        self.shutdown_flag.store(true, Ordering::SeqCst);
-                        if let Some(cancel) = &self.run_canceller {
+                        self.exit.shutdown_flag.store(true, Ordering::SeqCst);
+                        if let Some(cancel) = &self.exit.run_canceller {
                             cancel();
                         }
                         self.post_notice("Agent cancelled".to_string());
@@ -151,7 +155,7 @@ impl TuiApp {
                         self.quit.arm();
                     }
                 } else if self.quit.armed {
-                    self.shutdown_flag.store(true, Ordering::SeqCst);
+                    self.exit.shutdown_flag.store(true, Ordering::SeqCst);
                     self.quit.requested = true;
                 } else {
                     self.quit.arm();
@@ -163,13 +167,13 @@ impl TuiApp {
                 true
             }
             (KeyCode::PageUp, _) => {
-                self.scroll_offset = self.scroll_offset.saturating_add(10);
-                self.stick = Stick::Hold;
+                self.scroll.scroll_offset = self.scroll.scroll_offset.saturating_add(10);
+                self.scroll.stick = Stick::Hold;
                 true
             }
             (KeyCode::PageDown, _) => {
-                self.scroll_offset = self.scroll_offset.saturating_sub(10);
-                self.rearm_if_near_bottom();
+                self.scroll.scroll_offset = self.scroll.scroll_offset.saturating_sub(10);
+                self.scroll.rearm_if_near_bottom();
                 true
             }
             (KeyCode::Up, KeyModifiers::ALT) => {
@@ -181,41 +185,44 @@ impl TuiApp {
                 true
             }
             (KeyCode::Up, KeyModifiers::NONE)
-                if self.input.is_empty() && !self.input.has_history() =>
+                if self.composer.input.is_empty() && !self.composer.input.has_history() =>
             {
-                self.scroll_offset = self.scroll_offset.saturating_add(1);
-                self.stick = Stick::Hold;
+                self.scroll.scroll_offset = self.scroll.scroll_offset.saturating_add(1);
+                self.scroll.stick = Stick::Hold;
                 true
             }
             (KeyCode::Down, KeyModifiers::NONE)
-                if self.input.is_empty() && !self.input.has_history() =>
+                if self.composer.input.is_empty() && !self.composer.input.has_history() =>
             {
-                self.scroll_offset = self.scroll_offset.saturating_sub(1);
-                self.rearm_if_near_bottom();
+                self.scroll.scroll_offset = self.scroll.scroll_offset.saturating_sub(1);
+                self.scroll.rearm_if_near_bottom();
                 true
             }
-            (KeyCode::Home, _) if self.input.is_empty() => {
-                self.scroll_to_top();
+            (KeyCode::Home, _) if self.composer.input.is_empty() => {
+                self.scroll.scroll_to_top();
                 true
             }
-            (KeyCode::End, _) if self.input.is_empty() => {
-                self.scroll_to_bottom();
+            (KeyCode::End, _) if self.composer.input.is_empty() => {
+                self.scroll.scroll_to_bottom();
                 true
             }
             (KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right, KeyModifiers::SHIFT)
-                if self.selection.is_some() =>
+                if self.pointer.selection.is_some() =>
             {
                 self.nudge_selection(key.code);
                 true
             }
             (KeyCode::Tab | KeyCode::BackTab, KeyModifiers::NONE | KeyModifiers::SHIFT)
-                if self.input.text().starts_with('/') =>
+                if self.composer.input.text().starts_with('/') =>
             {
                 self.tab_completion(key)
             }
             _ => {
                 self.drop_applied_row_for_typing(key);
-                let action = self.input.handle_key(key, self.input_wrap_width);
+                let action = self
+                    .composer
+                    .input
+                    .handle_key(key, self.composer.input_wrap_width);
                 self.apply_input_action(action)
             }
         }
@@ -240,59 +247,59 @@ impl TuiApp {
     /// reading the conversation above the box is how a question gets
     /// answered, and the wheel is how that reading happens.
     pub(in crate::app) fn handle_mouse(&mut self, mouse: MouseEvent) -> bool {
-        if self.pending_permissions.front().is_some() {
-            self.drag_position = None;
+        if self.permission.pending_permissions.front().is_some() {
+            self.pointer.drag_position = None;
             return true;
         }
-        if !self.pending_questions.is_empty() {
+        if !self.questions.pending_questions.is_empty() {
             return match mouse.kind {
                 MouseEventKind::ScrollUp => self.scroll_the_wheel(true),
                 MouseEventKind::ScrollDown => self.scroll_the_wheel(false),
                 _ => {
-                    self.drag_position = None;
+                    self.pointer.drag_position = None;
                     true
                 }
             };
         }
         match mouse.kind {
-            MouseEventKind::ScrollUp if self.wheel_over_todo_section(mouse.row) => {
-                self.scroll_todo_section(true);
+            MouseEventKind::ScrollUp if self.plan.wheel_over_todo_section(mouse.row) => {
+                self.plan.scroll_todo_section(true);
                 true
             }
-            MouseEventKind::ScrollDown if self.wheel_over_todo_section(mouse.row) => {
-                self.scroll_todo_section(false);
+            MouseEventKind::ScrollDown if self.plan.wheel_over_todo_section(mouse.row) => {
+                self.plan.scroll_todo_section(false);
                 true
             }
             MouseEventKind::ScrollUp => self.scroll_the_wheel(true),
             MouseEventKind::ScrollDown => self.scroll_the_wheel(false),
             MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
                 self.quit.disarm();
-                if let Some(cell) = self.cell_at(mouse.column, mouse.row) {
-                    self.selection = Some(CellSelection {
+                if let Some(cell) = self.pointer.cell_at(mouse.column, mouse.row) {
+                    self.pointer.selection = Some(CellSelection {
                         anchor: cell,
                         head: cell,
                     });
-                    self.drag_position = Some((mouse.column, mouse.row));
+                    self.pointer.drag_position = Some((mouse.column, mouse.row));
                     true
                 } else {
-                    let retired = self.selection.take().is_some();
-                    self.drag_position = None;
+                    let retired = self.pointer.selection.take().is_some();
+                    self.pointer.drag_position = None;
                     if self.toggle_plan_section_at(mouse.column, mouse.row)
                         || self.toggle_queue_section_at(mouse.column, mouse.row)
                     {
                         return true;
                     }
-                    self.place_input_caret(mouse.column, mouse.row) || retired
+                    self.composer.place_input_caret(mouse.column, mouse.row) || retired
                 }
             }
             MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
-                if self.selection.is_none() {
+                if self.pointer.selection.is_none() {
                     return false;
                 }
-                self.drag_position = Some((mouse.column, mouse.row));
+                self.pointer.drag_position = Some((mouse.column, mouse.row));
                 let mut handled = false;
-                if let Some(cell) = self.cell_at(mouse.column, mouse.row)
-                    && let Some(selection) = self.selection.as_mut()
+                if let Some(cell) = self.pointer.cell_at(mouse.column, mouse.row)
+                    && let Some(selection) = self.pointer.selection.as_mut()
                 {
                     selection.head = cell;
                     handled = true;
@@ -300,8 +307,8 @@ impl TuiApp {
                 self.drag_autoscroll() || handled
             }
             MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
-                self.drag_position = None;
-                if let Some(selection) = self.selection.take() {
+                self.pointer.drag_position = None;
+                if let Some(selection) = self.pointer.selection.take() {
                     if selection.anchor == selection.head {
                         self.toggle_thinking_at(mouse.column, mouse.row);
                         self.toggle_compaction_at(mouse.column, mouse.row);
@@ -312,7 +319,7 @@ impl TuiApp {
                         if covered_any {
                             self.copy_selection_and_notice(&text);
                         }
-                        self.selection = Some(selection);
+                        self.pointer.selection = Some(selection);
                     }
                     true
                 } else {
@@ -324,10 +331,34 @@ impl TuiApp {
                 }
             }
             MouseEventKind::Moved => {
-                self.drag_position = None;
+                self.pointer.drag_position = None;
                 false
             }
             _ => false,
         }
     }
+}
+/// Whether a key belongs to the app while an overlay owns the screen.
+///
+/// Paging the transcript and cycling the display verbosity read the
+/// conversation; neither answers the question or the permission waiting on
+/// top of it, and that conversation is exactly what a user needs in order
+/// to decide. Both overlays therefore hold these keys off the sheet and
+/// hand them to the machinery below, the way they already hold off the `c`
+/// chords: swallowing them would leave a user scrolling for context with a
+/// keyboard that answers nothing. The steering chord rides the same rule
+/// — the hint row offers it the moment a draft meets a running agent, and
+/// an overlay swallowing a chord the interface is advertising would be
+/// advertising noise.
+pub(crate) fn key_survives_the_sheet(key: KeyEvent) -> bool {
+    let chord = key.code == KeyCode::Char('c')
+        && (key.modifiers == KeyModifiers::CONTROL
+            || key.modifiers == KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+    let steering = key.code == KeyCode::Char('s') && key.modifiers == KeyModifiers::CONTROL;
+    chord
+        || steering
+        || matches!(
+            key.code,
+            KeyCode::PageUp | KeyCode::PageDown | KeyCode::F(2)
+        )
 }

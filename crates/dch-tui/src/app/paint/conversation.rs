@@ -5,16 +5,17 @@
 //! helpers that shape it: the pane split, the furniture constants,
 //! and the display-width policy the viewport passes on its way to
 //! the screen.
+use ratatui::style::Style;
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::cells::{carries_policy_input, first_retained_offset, for_display, painted_steps};
 
-use super::super::{SelectableShape, TuiApp, ViewState, reverse_selection};
+use super::super::selection::{ViewState, reverse_selection};
+use super::super::{SelectableShape, TuiApp};
 
 impl TuiApp {
     /// Render the conversation pane: the transcript's windowed view
@@ -65,8 +66,8 @@ impl TuiApp {
         };
         let conversation_height = text_area.height as usize;
         let width = text_area.width.max(1);
-        if self.conversation_cache_generation != self.conversation_generation
-            || self.conversation_cache_width != width
+        if self.bake.conversation_cache_generation != self.bake.conversation_generation
+            || self.bake.conversation_cache_width != width
         {
             self.bake_conversation_cache(text_area, width);
         }
@@ -76,52 +77,54 @@ impl TuiApp {
         let thinking_rows = self.live_thinking_lines(width);
         let compaction_rows = self.live_compaction_lines();
         let live_open = !thinking_rows.0.is_empty()
-            || !self.frozen_lines.is_empty()
-            || !self.live_lines.is_empty()
+            || !self.freeze.frozen_lines.is_empty()
+            || !self.freeze.live_lines.is_empty()
             || !compaction_rows.is_empty()
             || !tools.is_empty();
-        let seam: Vec<Line<'static>> = if !self.conversation_cache.is_empty() && live_open {
+        let seam: Vec<Line<'static>> = if !self.bake.conversation_cache.is_empty() && live_open {
             vec![Line::from("")]
         } else {
             Vec::new()
         };
         let shape: SelectableShape = (
-            self.conversation_cache.len(),
+            self.bake.conversation_cache.len(),
             seam.len(),
             thinking_rows.0.len(),
-            self.frozen_lines.len(),
-            self.live_lines.len(),
+            self.freeze.frozen_lines.len(),
+            self.freeze.live_lines.len(),
             compaction_rows.len(),
             tools.len(),
         );
         self.settle_selectable_shape(streaming_changed, shape);
         self.thinking_live_rows = thinking_rows.1.map(|row| {
             let start = row
-                .saturating_add(self.conversation_cache.len())
+                .saturating_add(self.bake.conversation_cache.len())
                 .saturating_add(seam.len());
             start..start.saturating_add(thinking_rows.0.len())
         });
         let pre_tool_offset = self
+            .bake
             .conversation_cache
             .len()
             .saturating_add(seam.len())
             .saturating_add(thinking_rows.0.len())
-            .saturating_add(self.frozen_lines.len())
-            .saturating_add(self.live_lines.len())
+            .saturating_add(self.freeze.frozen_lines.len())
+            .saturating_add(self.freeze.live_lines.len())
             .saturating_add(compaction_rows.len());
-        self.tool_running_lines = running_rows
+        self.tools.tool_running_lines = running_rows
             .into_iter()
             .map(|(index, call_id)| (index.saturating_add(pre_tool_offset), call_id))
             .collect();
         let run_timer = self.live_run_timer();
         let pending_steer_rows = self.pending_steer_lines(width);
         let lane_end = self
+            .bake
             .conversation_cache
             .len()
             .saturating_add(seam.len())
             .saturating_add(thinking_rows.0.len())
-            .saturating_add(self.frozen_lines.len())
-            .saturating_add(self.live_lines.len())
+            .saturating_add(self.freeze.frozen_lines.len())
+            .saturating_add(self.freeze.live_lines.len())
             .saturating_add(compaction_rows.len())
             .saturating_add(tools.len());
         let pinned_steer = (!pending_steer_rows.is_empty())
@@ -133,7 +136,7 @@ impl TuiApp {
         let skip = self.snap_skip_to_whole_todo_blocks(
             total_lines
                 .saturating_sub(conversation_height)
-                .saturating_sub(self.scroll_offset),
+                .saturating_sub(self.scroll.scroll_offset),
             conversation_height,
         );
         frame.render_widget(ratatui::widgets::Clear, pane);
@@ -145,29 +148,29 @@ impl TuiApp {
             conversation_height,
             pinned_steer,
         );
-        self.live_seam_lines = seam;
-        self.live_thinking_cache = thinking_rows.0;
-        self.live_compaction_cache = compaction_rows;
-        self.live_tools_cache = tools;
+        self.lane.live_seam_lines = seam;
+        self.lane.live_thinking_cache = thinking_rows.0;
+        self.lane.live_compaction_cache = compaction_rows;
+        self.lane.live_tools_cache = tools;
         let segments: Vec<&[Line<'_>]> = vec![
-            &self.conversation_cache,
-            &self.live_seam_lines,
-            &self.live_thinking_cache,
-            &self.frozen_lines,
-            &self.live_lines,
-            &self.live_compaction_cache,
-            &self.live_tools_cache,
+            &self.bake.conversation_cache,
+            &self.lane.live_seam_lines,
+            &self.lane.live_thinking_cache,
+            &self.freeze.frozen_lines,
+            &self.freeze.live_lines,
+            &self.lane.live_compaction_cache,
+            &self.lane.live_tools_cache,
             &pending_steer_rows,
             &run_timer,
         ];
         let mut visible = visible_window(&segments, skip, conversation_height);
-        self.last_view = Some(ViewState {
+        self.pointer.last_view = Some(ViewState {
             area: text_area,
             skip,
             total: total_lines,
             selectable: lane_end,
         });
-        if let Some(selection) = &self.selection {
+        if let Some(selection) = &self.pointer.selection {
             reverse_selection(&mut visible, skip, selection);
         }
         for_display_lines(&mut visible);
@@ -205,7 +208,7 @@ impl TuiApp {
         conversation_height: usize,
         pinned_steer: Option<(usize, usize)>,
     ) {
-        let mut turns = self.user_turn_ranges.clone();
+        let mut turns = self.bake.user_turn_ranges.clone();
         if let Some((start, end)) = pinned_steer {
             turns.push((start, end, start.saturating_add(1)));
         }
@@ -499,8 +502,9 @@ pub(in crate::app) fn visible_window<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::scrollbar_geometry;
 
+    use super::scrollbar_geometry;
+    use ratatui::text::{Line, Span};
     #[test]
     fn a_retained_opener_carries_its_own_spans_style() {
         // painted_steps opens the first step's range at byte zero so
@@ -511,7 +515,6 @@ mod tests {
         // span mis-attributed the character after it to the
         // selector's style.
         use ratatui::style::{Color, Style};
-        use ratatui::text::{Line, Span};
         let selector_style = Style::default().fg(Color::Red);
         let text_style = Style::default().fg(Color::Green);
         let mut lines = vec![Line::from(vec![

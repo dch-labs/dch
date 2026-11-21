@@ -6,13 +6,17 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 
 use super::super::TuiApp;
-use super::super::{
-    CONTEXT_BAR_CELLS, Color, INPUT_SIDE_INSET, INPUT_TEXT_ROWS, INPUT_VERTICAL_PADDING, InputView,
-    Line, Paragraph, PlanView, QUEUE_ROWS, QUEUE_TITLE, QueueMode, QueuePosture, STATUS_BAR_AIR,
-    STATUS_BAR_MARGIN, Span, StripStyle, Style, TODO_SECTION_BODY_ROWS, TODO_SECTION_INSET,
-    context_bar_fill, context_bar_readout, glow_eighths, pulse_span, queue_prompt_prefix,
-    scaled_color, str_width, wrap_prompt_rows,
+use super::super::composer::{
+    INPUT_SIDE_INSET, INPUT_TEXT_ROWS, INPUT_VERTICAL_PADDING, InputView,
 };
+use super::super::context::{
+    CONTEXT_BAR_CELLS, STATUS_BAR_AIR, STATUS_BAR_MARGIN, context_bar_fill, context_bar_readout,
+};
+use super::super::notices::wrap_prompt_rows;
+use super::super::pulse::{glow_eighths, pulse_span, scaled_color};
+use super::super::queue::{QUEUE_ROWS, QUEUE_TITLE, QueueMode, QueuePosture, queue_prompt_prefix};
+use super::super::todos::{PlanView, TODO_SECTION_BODY_ROWS, TODO_SECTION_INSET};
+use super::super::{Color, Line, Paragraph, Span, StripStyle, Style, str_width};
 use super::conversation::for_display_lines;
 use crate::cells::{display_width, for_display};
 use crate::todo_view;
@@ -36,7 +40,7 @@ impl TuiApp {
     /// claimed the row, so the composer hairline can stand down for
     /// the frame when the row was its spacer.
     pub(in crate::app) fn render_pulse_strip(&self, frame: &mut Frame, area: Rect) -> bool {
-        if matches!(self.strip_style, StripStyle::Off) {
+        if matches!(self.display.strip_style, StripStyle::Off) {
             return false;
         }
         if !self
@@ -54,13 +58,13 @@ impl TuiApp {
             .composer_border
             .unwrap_or(self.theme.ui.primary);
         let anchor = self.run_anchor.unwrap_or(now);
-        let color = if matches!(self.strip_style, StripStyle::Glow) {
+        let color = if matches!(self.display.strip_style, StripStyle::Glow) {
             scaled_color(base, glow_eighths(anchor, now))
         } else {
             base
         };
         let pulse = pulse_span(
-            self.strip_style,
+            self.display.strip_style,
             anchor,
             now,
             usize::from(area.width),
@@ -86,7 +90,7 @@ impl TuiApp {
         if area.height == 0 || area.width == 0 {
             return;
         }
-        self.todo_section_rect = area;
+        self.plan.todo_section_rect = area;
         let colors = todo_view::TodoColors {
             plain: self.theme.ui.foreground,
             dim: self.theme.ui.dim,
@@ -95,8 +99,8 @@ impl TuiApp {
             badge_fill: self.theme.ui.primary,
             badge_letters: self.theme.ui.background,
         };
-        if self.plan_view == PlanView::Hidden {
-            let mut folded = todo_view::folded_lines(&self.latest_todos, &colors);
+        if self.plan.plan_view == PlanView::Hidden {
+            let mut folded = todo_view::folded_lines(&self.plan.latest_todos, &colors);
             for_display_lines(&mut folded);
             frame.render_widget(
                 Paragraph::new(folded),
@@ -114,20 +118,20 @@ impl TuiApp {
             );
             return;
         }
-        let body_cap = match self.plan_view {
+        let body_cap = match self.plan.plan_view {
             PlanView::Full => self.full_body_cap.get(),
             _ => TODO_SECTION_BODY_ROWS,
         };
         let chord_hint = self.plan_chord_hint();
         let mut lines = todo_view::section_lines(
-            &self.latest_todos,
-            &self.todo_section_changes,
+            &self.plan.latest_todos,
+            &self.plan.todo_section_changes,
             &colors,
             area.width
                 .saturating_sub(TODO_SECTION_INSET.saturating_mul(2))
                 .max(1),
             body_cap,
-            self.clamped_todo_skip(),
+            self.plan.clamped_todo_skip(),
             chord_hint,
         );
         for_display_lines(&mut lines);
@@ -197,8 +201,10 @@ impl TuiApp {
         if total == 0 {
             return;
         }
-        self.queue_section_rect = area;
-        if self.queue_posture == QueuePosture::Folded && self.queue_mode == QueueMode::Plain {
+        self.queue.queue_section_rect = area;
+        if self.queue.queue_posture == QueuePosture::Folded
+            && self.queue.queue_mode == QueueMode::Plain
+        {
             frame.render_widget(
                 Paragraph::new(vec![
                     Line::from(Vec::new()),
@@ -220,7 +226,7 @@ impl TuiApp {
             );
             return;
         }
-        let shown = self.queue_view.min(total.saturating_sub(1));
+        let shown = self.queue.queue_view.min(total.saturating_sub(1));
         let Some((_, text)) = self.queued_at(shown) else {
             return;
         };
@@ -231,7 +237,7 @@ impl TuiApp {
             .saturating_sub(1)
             .saturating_sub(top_standoff)
             .saturating_sub(bottom_standoff);
-        let focused = self.queue_mode == QueueMode::Focused;
+        let focused = self.queue.queue_mode == QueueMode::Focused;
         let prefix = queue_prompt_prefix(total, shown);
         let width = usize::from(area.width);
         let limit = width.saturating_sub(str_width(&prefix)).max(1);
@@ -439,7 +445,7 @@ impl TuiApp {
         };
         let visible_rows = usize::from(text_height);
         let start = usize::from(caret_row).saturating_sub(visible_rows.saturating_sub(1));
-        self.input_view = Some(InputView {
+        self.composer.input_view = Some(InputView {
             pane: area,
             origin: (interior.x, interior.y),
             start,
@@ -530,7 +536,7 @@ impl TuiApp {
         };
         let bar_y = content.y.saturating_sub(1);
         let id_span = if area.height > 1 {
-            self.session_id.as_ref().and_then(|id| {
+            self.host.session_id.as_ref().and_then(|id| {
                 let id_width = u16::try_from(str_width(id)).ok()?;
                 let start = area
                     .width
@@ -544,7 +550,7 @@ impl TuiApp {
         } else {
             None
         };
-        self.session_id_span.set(id_span);
+        self.host.session_id_span.set(id_span);
         if area.height > 1 {
             let mut bar_line = self.context_bar_line(STATUS_BAR_MARGIN, context_fill);
             if let Some((_, start, _)) = id_span {
@@ -557,7 +563,11 @@ impl TuiApp {
                     .max(1);
                 bar_line.spans.push(Span::raw(" ".repeat(pad)));
                 bar_line.spans.push(Span::raw(
-                    self.session_id.as_deref().unwrap_or_default().to_string(),
+                    self.host
+                        .session_id
+                        .as_deref()
+                        .unwrap_or_default()
+                        .to_string(),
                 ));
             }
             frame.render_widget(
