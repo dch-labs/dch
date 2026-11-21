@@ -8,6 +8,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
 use dch_tui::HealthNotice;
+use dch_tui::SessionCommand;
 use dch_tui::SessionUpdate;
 use dch_tui::Submission;
 use dch_tui::TuiObserverState;
@@ -274,6 +275,52 @@ pub(crate) fn retirement_publisher(
     }
 }
 
+/// Apply one queued command and retire the boundary it ended.
+///
+/// A command that replaced the conversation — a landed rotation, an
+/// adopted resume — takes the recorded claim with it: the runner the
+/// boundary named is gone, and a correction naming that runner must
+/// not rewind its replacement with the old prefix. A command that
+/// left the conversation unchanged keeps both states, so its own
+/// correction semantics still apply.
+async fn apply_command_and_retire_boundary(
+    runner: &mut dch_loop::Runner,
+    transcript: &TranscriptHandle,
+    session_tx: &mpsc::UnboundedSender<SessionUpdate>,
+    command: SessionCommand,
+    context: &mut DriverContext,
+    last_claim: &mut Option<crate::tui::corrections::ClaimBoundary>,
+    interrupted_for: &mut Option<u64>,
+) {
+    let replaced = apply_session_command(runner, transcript, session_tx, command, context).await;
+    if replaced {
+        *last_claim = None;
+        *interrupted_for = None;
+    }
+}
+
+/// Cut a correction's superseded turn when the claim still names it.
+///
+/// The claim taken here is the driver's whole correction state: a
+/// claim for another turn is left untouched, so an older correction
+/// runs as an ordinary turn, and the claimed prefix rides beside the
+/// length for the boundary check the cut performs.
+fn cut_superseded_turn(
+    runner: &mut dch_loop::Runner,
+    state: &TuiObserverState,
+    last_claim: &mut Option<crate::tui::corrections::ClaimBoundary>,
+    id: u64,
+    interrupted: bool,
+) {
+    let superseded = last_claim
+        .take()
+        .filter(|(claimed, _, _)| *claimed == id)
+        .map(|(_, before, claimed)| (before, std::sync::Arc::clone(&claimed)));
+    if let Some((before, claimed)) = superseded {
+        apply_correction_cut(runner, state, before, interrupted, &claimed);
+    }
+}
+
 /// Execute submitted tasks one at a time until the session ends.
 ///
 /// Owns the runner for the session's whole lifetime, so runs never
@@ -326,7 +373,7 @@ pub(crate) async fn run_driver_loop(
     transcript: TranscriptHandle,
     session_tx: mpsc::UnboundedSender<SessionUpdate>,
 ) {
-    let mut last_claim: Option<(u64, usize)> = None;
+    let mut last_claim: Option<crate::tui::corrections::ClaimBoundary> = None;
     let mut revived: std::collections::VecDeque<Submission> = std::collections::VecDeque::new();
     let mut interrupted_for: Option<u64> = None;
     context.state.record_todos_undone(runner.todo_undone());
@@ -357,7 +404,8 @@ pub(crate) async fn run_driver_loop(
                 let Some(text) = take_queued(&context.state, id, &context.shutting_down) else {
                     continue;
                 };
-                last_claim = Some((id, runner.committed_history().len()));
+                let claimed = std::sync::Arc::new(runner.committed_history());
+                last_claim = Some((id, claimed.len(), claimed));
                 context.state.live_claim.store(id, Ordering::SeqCst);
                 interrupted_for = None;
                 text
@@ -366,18 +414,26 @@ pub(crate) async fn run_driver_loop(
                 let interrupted = interrupted_for
                     .take()
                     .is_some_and(|cancelled| cancelled == id);
-                let superseded = last_claim
-                    .take()
-                    .filter(|(claimed, _)| *claimed == id)
-                    .map(|(_, before)| before);
-                if let Some(before) = superseded {
-                    apply_correction_cut(&mut runner, &context.state, before, interrupted);
-                }
+                cut_superseded_turn(
+                    &mut runner,
+                    &context.state,
+                    &mut last_claim,
+                    id,
+                    interrupted,
+                );
                 text
             }
             Submission::Command { command } => {
-                apply_session_command(&mut runner, &transcript, &session_tx, command, &mut context)
-                    .await;
+                Box::pin(apply_command_and_retire_boundary(
+                    &mut runner,
+                    &transcript,
+                    &session_tx,
+                    command,
+                    &mut context,
+                    &mut last_claim,
+                    &mut interrupted_for,
+                ))
+                .await;
                 continue;
             }
         };
@@ -420,7 +476,7 @@ pub(crate) async fn run_driver_loop(
             if exit_owns_cancel(err, &context.shutting_down) {
                 post_run_error(&context.state, err);
                 if let Some(corrected) =
-                    pull_corrected_wording(last_claim, &mut receiver, &mut revived)
+                    pull_corrected_wording(last_claim.clone(), &mut receiver, &mut revived)
                 {
                     rescue_correction_text(&context.state, corrected);
                 } else {
@@ -437,7 +493,9 @@ pub(crate) async fn run_driver_loop(
             } else {
                 u64::MAX
             };
-            let names_this_turn = last_claim.is_none_or(|(claimed, _)| claimed == interrupted_id);
+            let names_this_turn = last_claim
+                .as_ref()
+                .is_none_or(|(claimed, _, _)| *claimed == interrupted_id);
             let correction = if interrupted_id != u64::MAX
                 && names_this_turn
                 && pull_pending_correction(interrupted_id, &mut receiver, &mut revived)
@@ -572,6 +630,86 @@ mod tests {
                 .await
                 .is_ok(),
             "the driver wakes the frame, so the error row renders without a keypress"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_correction_behind_a_conversation_replacing_resume_cuts_nothing() {
+        // The replaced conversation retires the boundary: a claim the
+        // ended runner recorded — the prompt taken before a queued
+        // `/resume` — must not rewind the resumed runner's history when
+        // its correction lands behind the command. The resumed turn
+        // stands; only a claim the new conversation mints may cut it.
+        let dir = tempfile::tempdir().expect("sessions tempdir");
+        let workdir = dir.path().to_path_buf();
+        let root = dir.keep();
+        let b = uuid::Uuid::new_v4();
+        let saver = Arc::new(crate::session::SessionSaver::with_base_dir(
+            b,
+            "test-model".to_string(),
+            root.clone(),
+        ));
+        saver
+            .save_at(
+                &[dch_tui::TuiMessage::User {
+                    text: "the resumed turn".to_string(),
+                    timestamp: chrono::Utc::now(),
+                    steered: false,
+                    unsent: false,
+                }],
+                crate::session::SessionTokens::default(),
+                chrono::Utc::now(),
+            )
+            .expect("the resumed session lands");
+        let runner = unreachable_runner().await;
+        let (_, state) = TuiObserverState::new().into_observer();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (session_tx, _session_rx) = mpsc::unbounded_channel();
+        let claim = queue_prompt(&state, &tx, "the ended runner's prompt");
+        tx.send(Submission::Command {
+            command: SessionCommand::Resume { id: b.to_string() },
+        })
+        .expect("driver channel open");
+        correct_prompt(&tx, claim, "the correction rides behind the resume");
+        drop(tx);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_driver_loop(
+                runner,
+                rx,
+                DriverContext {
+                    config: unreachable_config(),
+                    config_base: Arc::new(unreachable_config()),
+                    workdir,
+                    sessions_root: root,
+                    state: state.clone(),
+                    shutting_down: shutdown_flag(false),
+                    lanes: InteractiveLanes::detached(),
+                    overrides: RunOverrides::default(),
+                },
+                parked_transcript(),
+                session_tx,
+            ),
+        )
+        .await
+        .expect("the loop ends once the channel closes");
+        let history = state
+            .machine_history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .expect("the correction's turn published the history");
+        assert_eq!(
+            history.len(),
+            2,
+            "the resumed turn and the correction behind it both stand — a \
+             rewind to the ended runner's boundary would have emptied the \
+            resumed one: {history:?}"
+        );
+        let first = history.first().expect("the resumed turn leads the history");
+        assert!(
+            format!("{first:?}").contains("the resumed turn"),
+            "the resumed turn leads the conversation the new runner runs: {first:?}"
         );
     }
 

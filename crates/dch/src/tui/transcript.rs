@@ -99,9 +99,12 @@ impl Clone for TranscriptHandle {
 impl TranscriptHandle {
     /// Publish one conversation snapshot for the writer.
     ///
-    /// Overwrites a still-pending snapshot — only the newest
-    /// transcript is ever worth writing — then wakes the writer.
-    /// Never blocks and never fails visibly.
+    /// Replaces the session's own waiting snapshot — within a session
+    /// only the newest transcript is worth writing — while a snapshot
+    /// the identity swap stranded for the outgoing session stays
+    /// queued beside it, so a stalled writer cannot drop the ended
+    /// session's last turn because the fresh session published behind
+    /// it. Never blocks and never fails visibly.
     pub(crate) fn send(&self, messages: Vec<TuiMessage>, tokens: crate::session::SessionTokens) {
         let saver = self
             .saver
@@ -112,7 +115,7 @@ impl TranscriptHandle {
             .pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        pending.display = Some(TranscriptSnapshot {
+        pending.push_display(TranscriptSnapshot {
             messages,
             tokens,
             saved_at: chrono::Utc::now(),
@@ -124,10 +127,10 @@ impl TranscriptHandle {
 
     /// Publish one machine-history snapshot for the writer.
     ///
-    /// Same overwrite-newest semantics as [`send`](Self::send), for
-    /// the engine's committed history; the writer persists it under
-    /// its own sibling file, so the display half in flight beside it
-    /// is never held back by this half or vice versa.
+    /// Same per-session replacement as [`send`](Self::send), for the
+    /// engine's committed history; the writer persists it under its
+    /// own sibling file, so the display half in flight beside it is
+    /// never held back by this half or vice versa.
     pub(crate) fn send_machine(&self, mut machine: MachineSnapshot) {
         machine.saver = Some(
             self.saver
@@ -139,7 +142,7 @@ impl TranscriptHandle {
             .pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        pending.machine = Some(machine);
+        pending.push_machine(machine);
         drop(pending);
         self.signal.notify_one();
     }
@@ -421,26 +424,31 @@ pub(crate) fn recorded_compactions(conversation: &[dch_tui::TuiMessage]) -> u32 
     .unwrap_or(u32::MAX)
 }
 
-/// The writer's pending halves, newest-wins per half.
+/// The writer's pending halves, newest-wins per session identity.
 ///
 /// Display and machine snapshots arrive from different tasks on
 /// different schedules — the hook fires from observer events while
 /// the run future is still resolving, the driver's machine read
-/// follows the resolution — so each half overwrites only its own
-/// kind and the writer persists whichever halves it finds.
+/// follows the resolution — so each half queues only its own kind.
+/// Within a session the newest snapshot replaces the waiting one; a
+/// rotation or retarget that swaps the identity in preserves the
+/// outgoing session's snapshot beside the fresh one until both
+/// persist — a stalled writer cannot lose the ended session's last
+/// turn because the fresh session published behind it.
 #[derive(Default)]
 struct PendingSaves {
-    /// The newest display snapshot, when one is waiting.
+    /// Display snapshots waiting to persist, newest per session.
     ///
-    /// Overwritten by every publish, so a stalled writer always
-    /// persists the newest transcript rather than a queue of them.
-    display: Option<TranscriptSnapshot>,
+    /// One entry per waiting session identity: the session's own next
+    /// publish replaces it, a swap in identity appends. Bounded by the
+    /// sessions a swap strands while the writer stalls.
+    display: Vec<TranscriptSnapshot>,
 
-    /// The newest machine-history snapshot, when one is waiting.
+    /// Machine-history snapshots waiting to persist, newest per session.
     ///
-    /// The same newest-wins rule on the engine half; the two halves
-    /// never block each other, only replace their own kind.
-    machine: Option<MachineSnapshot>,
+    /// The same per-session rule on the engine half; the two halves
+    /// never block each other.
+    machine: Vec<MachineSnapshot>,
 }
 
 impl PendingSaves {
@@ -449,26 +457,58 @@ impl PendingSaves {
     /// The writer's condvar predicate: sleep only when there is
     /// nothing of either kind to persist.
     fn is_empty(&self) -> bool {
-        self.display.is_none() && self.machine.is_none()
+        self.display.is_empty() && self.machine.is_empty()
+    }
+
+    /// Queue one display snapshot, newest-wins within its session.
+    ///
+    /// The session the snapshot is pinned to decides which waiting
+    /// entry it replaces — its own next publish, so a stalled writer
+    /// persists only the newest transcript of a session — while an
+    /// entry pinned to another identity stays queued beside it, so a
+    /// rotation or retarget cannot silently drop the outgoing
+    /// session's last turn.
+    fn push_display(&mut self, snapshot: TranscriptSnapshot) {
+        let id = snapshot.saver.session_id();
+        self.display
+            .retain(|waiting| waiting.saver.session_id() != id);
+        self.display.push(snapshot);
+    }
+
+    /// Queue one machine snapshot, newest-wins within its session.
+    ///
+    /// The same per-identity rule as the display half, judged by the
+    /// pin the publish stamped. A snapshot that carries no pin is
+    /// dropped here: the writer could not aim it at any file, and no
+    /// send path produces one — the stamp happens before the queue is
+    /// reached.
+    fn push_machine(&mut self, snapshot: MachineSnapshot) {
+        let Some(saver) = snapshot.saver.as_ref() else {
+            return;
+        };
+        let id = saver.session_id();
+        self.machine
+            .retain(|waiting| waiting.saver.as_ref().map(|pinned| pinned.session_id()) != Some(id));
+        self.machine.push(snapshot);
     }
 }
 
 /// The single writer thread that persists turn-end snapshots.
 ///
-/// One thread takes the newest published snapshot, writes it, and
-/// waits for the next — so the newest transcript always lands last
-/// and an older, slower save can never rename over a newer one.
-/// The one-slot mailbox bounds retention at a single snapshot even
-/// while a write is stalled. Joining waits out the in-flight write
-/// and any snapshot still in the slot, so a quitting session
-/// persists its last turn.
+/// One thread takes the queued snapshots — one per waiting session —
+/// writes each under the destination it was published under, and
+/// waits for the next — so the newest transcript of a session always
+/// lands last and an older, slower save can never rename over a
+/// newer one. Retention is bounded at one snapshot per waiting
+/// session identity even while a write is stalled. Joining waits out
+/// the in-flight write and anything still queued, so a quitting
+/// session persists its last turn.
 pub(crate) struct TranscriptWorker {
-    /// The one-slot mailbox the writer drains, shared with the
-    /// handles.
+    /// The mailbox the writer drains, shared with the handles.
     ///
     /// The same lock every publish goes through: newest-wins per
-    /// half, so the writer persists the newest snapshot of each
-    /// kind and never a queue of stale ones.
+    /// session identity, so the writer persists the newest snapshot
+    /// of each waiting session and never a stack of stale ones.
     pending: Arc<std::sync::Mutex<PendingSaves>>,
 
     /// The condvar the writer waits on between snapshots.
@@ -576,29 +616,33 @@ impl TranscriptWorker {
                 while guard.is_empty() && !thread_shutdown.load(Ordering::SeqCst) {
                     guard = wait(guard);
                 }
-                let (display, machine) = (guard.display.take(), guard.machine.take());
+                let (display, machine) = (
+                    std::mem::take(&mut guard.display),
+                    std::mem::take(&mut guard.machine),
+                );
                 drop(guard);
-                if display.is_none() && machine.is_none() {
+                if display.is_empty() && machine.is_empty() {
                     break;
                 }
-                if let Some(snapshot) = display
-                    && let Err(err) = snapshot.saver.save_at(
+                for snapshot in display {
+                    if let Err(err) = snapshot.saver.save_at(
                         &snapshot.messages,
                         snapshot.tokens,
                         snapshot.saved_at,
-                    )
-                {
-                    tracing::warn!(error = %err, "session transcript could not be saved");
+                    ) {
+                        tracing::warn!(error = %err, "session transcript could not be saved");
+                    }
                 }
-                if let Some(snapshot) = machine
-                    && let Some(saver) = snapshot.saver.as_ref()
-                    && let Err(err) = saver.save_machine(
-                        &snapshot.messages,
-                        snapshot.saved_at,
-                        snapshot.compactions,
-                    )
-                {
-                    tracing::warn!(error = %err, "machine history could not be saved");
+                for snapshot in machine {
+                    if let Some(saver) = snapshot.saver.as_ref()
+                        && let Err(err) = saver.save_machine(
+                            &snapshot.messages,
+                            snapshot.saved_at,
+                            snapshot.compactions,
+                        )
+                    {
+                        tracing::warn!(error = %err, "machine history could not be saved");
+                    }
                 }
             }
         });
@@ -908,7 +952,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let pinned = pending
             .display
-            .as_ref()
+            .first()
             .expect("the published snapshot waits in the slot")
             .saver
             .session_id();
@@ -925,6 +969,97 @@ mod tests {
             cell.session_id().to_string(),
             rotated,
             "the cell itself moved to the fresh identity"
+        );
+    }
+
+    #[test]
+    fn a_rotation_preserves_the_outgoing_sessions_pending_snapshots() {
+        // The stall the one-slot mailbox lost: the ended session's
+        // last publish is still waiting when the rotation swaps the
+        // identity, and the fresh session's first publish arrives
+        // behind it. Both snapshots wait — each pinned to its own
+        // destination — so the writer drains the ended session's
+        // final turn and the fresh session's opening, not only the
+        // fresh one.
+        let dir = tempfile::tempdir().expect("sessions tempdir");
+        let first = uuid::Uuid::new_v4();
+        let saver = Arc::new(crate::session::SessionSaver::with_base_dir(
+            first,
+            "m".to_string(),
+            dir.path().to_path_buf(),
+        ));
+        let handle = TranscriptHandle {
+            pending: Arc::new(std::sync::Mutex::new(PendingSaves::default())),
+            signal: Arc::new(std::sync::Condvar::new()),
+            saver: Arc::new(std::sync::Mutex::new(saver)),
+            naming_in_flight: Arc::new(std::sync::Mutex::new(None)),
+        };
+        handle.send(
+            vec![dch_tui::TuiMessage::User {
+                text: "the ended session's last turn".to_string(),
+                timestamp: chrono::Utc::now(),
+                steered: false,
+                unsent: false,
+            }],
+            crate::session::SessionTokens::default(),
+        );
+        handle.send_machine(MachineSnapshot {
+            messages: Arc::new(vec![loopctl::message::Message::user(
+                "the engine's history",
+            )]),
+            saved_at: chrono::Utc::now(),
+            compactions: 0,
+            saver: None,
+        });
+        let rotated = handle.rotate("m");
+        handle.send_machine(MachineSnapshot {
+            messages: Arc::new(vec![loopctl::message::Message::user(
+                "the fresh engine's history",
+            )]),
+            saved_at: chrono::Utc::now(),
+            compactions: 0,
+            saver: None,
+        });
+        handle.send(
+            vec![dch_tui::TuiMessage::User {
+                text: "the fresh session's opening".to_string(),
+                timestamp: chrono::Utc::now(),
+                steered: false,
+                unsent: false,
+            }],
+            crate::session::SessionTokens::default(),
+        );
+        let rotated_id = uuid::Uuid::parse_str(&rotated).expect("the rotation mints an id");
+        let pending = handle
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let display_ids: Vec<uuid::Uuid> = pending
+            .display
+            .iter()
+            .map(|waiting| waiting.saver.session_id())
+            .collect();
+        let machine_ids: Vec<uuid::Uuid> = pending
+            .machine
+            .iter()
+            .map(|waiting| {
+                waiting
+                    .saver
+                    .as_ref()
+                    .expect("the publish pinned its saver")
+                    .session_id()
+            })
+            .collect();
+        drop(pending);
+        assert_eq!(
+            display_ids,
+            vec![first, rotated_id],
+            "both sessions' snapshots wait — the outgoing one is not replaced"
+        );
+        assert_eq!(
+            machine_ids,
+            vec![first, rotated_id],
+            "the machine half queues per identity the same way"
         );
     }
 

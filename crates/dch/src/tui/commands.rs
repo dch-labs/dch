@@ -44,7 +44,7 @@ pub(crate) async fn apply_session_command(
     session_tx: &mpsc::UnboundedSender<SessionUpdate>,
     command: SessionCommand,
     context: &mut DriverContext,
-) {
+) -> bool {
     match command {
         SessionCommand::Model { name } => {
             let mut config = context.config_base.as_ref().clone();
@@ -56,7 +56,7 @@ pub(crate) async fn apply_session_command(
                         context.config.api.model
                     ),
                 );
-                return;
+                return false;
             }
             crate::headless::reapply_reasoning_effort(
                 &mut config,
@@ -110,12 +110,14 @@ pub(crate) async fn apply_session_command(
                     ),
                 ),
             }
+            false
         }
         SessionCommand::Mode { mode } => {
             Box::pin(move_mode(runner, transcript, session_tx, context, mode)).await;
+            false
         }
         SessionCommand::Clear => {
-            land_session_clear(runner.rewind_history_to(0), transcript, session_tx, context);
+            land_session_clear(runner.rewind_history_to(0), transcript, session_tx, context)
         }
         SessionCommand::SwitchProvider {
             model,
@@ -126,12 +128,13 @@ pub(crate) async fn apply_session_command(
                 runner, transcript, session_tx, context, model, base_url, api_type,
             ))
             .await;
+            false
         }
         SessionCommand::Resume { id } => {
             Box::pin(resume_into_session(
                 runner, transcript, session_tx, context, id,
             ))
-            .await;
+            .await
         }
         SessionCommand::ListSessions => {
             match crate::session::list_sessions_in(&context.sessions_root) {
@@ -159,9 +162,11 @@ pub(crate) async fn apply_session_command(
                     format!("the saved sessions could not be read ({err})"),
                 ),
             }
+            false
         }
         SessionCommand::Compact { compactions } => {
             apply_manual_compaction(runner, transcript, session_tx, context, compactions).await;
+            false
         }
     }
 }
@@ -191,7 +196,11 @@ pub(crate) fn post_session_notice(session_tx: &mpsc::UnboundedSender<SessionUpda
 /// configuration's own join, and a damage posture an earlier resume
 /// armed cannot outlive the verdict that keyed it. Returns the mode
 /// the resumed display should publish beside the damage verdict, so
-/// the caller can retain the enforced mode and say the damage aloud.
+/// the caller can retain the enforced mode and say the damage aloud:
+/// with damage standing, that is the mode the cell enforces after
+/// the fallback — the asking posture when the fallback moved an
+/// auto cell, the cell's own held mode when it already asks — never
+/// a standing mode the gate no longer runs.
 pub(crate) fn adopt_resumed_permissions(
     transcript: &TranscriptHandle,
     context: &mut DriverContext,
@@ -210,12 +219,17 @@ pub(crate) fn adopt_resumed_permissions(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     context.lanes.memory.adopt(allow, deny, damage_stands);
-    let enforced_mode =
-        if damage_stands && fail_permissions_restore_closed(&context.lanes.mode_cell) {
-            dch_config::PermissionMode::Interactive
-        } else {
-            standing_mode
-        };
+    let enforced_mode = if !damage_stands {
+        standing_mode
+    } else if fail_permissions_restore_closed(&context.lanes.mode_cell) {
+        dch_config::PermissionMode::Interactive
+    } else {
+        *context
+            .lanes
+            .mode_cell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
     if damage_stands {
         tighten_config_rules_cell(&context.lanes.config_rules_cell);
     } else {
@@ -259,14 +273,19 @@ fn rewind_earned_fresh_session<E>(rewind: &Result<usize, E>) -> bool {
 /// clears the verdict, and the config-rules cell re-seeds from the
 /// configuration's own join beside it, so the ended session's
 /// fail-closed posture cannot withdraw the config's allows from the
-/// fresh one.
+/// fresh one. The rotation also retires the launch permission
+/// statement: the flag named the ended session's mode, so a later
+/// resume adopts the resumed file's own standing instead of
+/// re-reading the cleared default as an override — a refused rewind
+/// keeps the statement, the still-open session still runs under it.
 fn land_session_clear<E: std::fmt::Display>(
     rewind: Result<usize, E>,
     transcript: &TranscriptHandle,
     session_tx: &mpsc::UnboundedSender<SessionUpdate>,
     context: &mut DriverContext,
-) {
-    if rewind_earned_fresh_session(&rewind) {
+) -> bool {
+    let rotated = rewind_earned_fresh_session(&rewind);
+    if rotated {
         let _adoption = context
             .lanes
             .adoption_guard
@@ -280,6 +299,7 @@ fn land_session_clear<E: std::fmt::Display>(
             .mode_cell
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = default;
+        context.overrides.permission_named = false;
         context.lanes.memory.adopt(Vec::new(), Vec::new(), false);
         let selection = context
             .lanes
@@ -300,12 +320,14 @@ fn land_session_clear<E: std::fmt::Display>(
         {
             tracing::warn!("session cleared but the display is gone");
         }
+        return true;
     } else if let Err(err) = rewind {
         post_session_notice(
             session_tx,
             format!("the session could not be cleared — the loop kept its history ({err})"),
         );
     }
+    false
 }
 
 #[cfg(test)]
@@ -331,9 +353,20 @@ mod tests {
         // The session lane's clear leg at rest: the driver empties the loop's
         // history and moves the save target to a new session through the
         // transcript handle, then publishes the new id so the bar shows the
-        // conversation's replacement, not the ended one. The id must be a real
-        // identity — a fresh uuid — not the empty string or the old one.
+        // conversation's replacement, not the ended one. The pin reads the
+        // saver's identity before and after: the published id is the save
+        // target the rotation opened, never the ended session's — an id
+        // that is merely a valid uuid proves nothing, the old one is one
+        // too.
         let runner = unreachable_runner().await;
+        let dir = tempfile::tempdir().expect("sessions tempdir");
+        let id = uuid::Uuid::new_v4();
+        let saver = Arc::new(crate::session::SessionSaver::with_base_dir(
+            id,
+            "m".to_string(),
+            dir.path().to_path_buf(),
+        ));
+        let (transcript, worker) = TranscriptWorker::spawn(Arc::clone(&saver));
         let (_, state) = TuiObserverState::new().into_observer();
         let (submit_tx, submit_rx) = mpsc::unbounded_channel();
         let (session_tx, mut session_rx) = mpsc::unbounded_channel();
@@ -351,26 +384,38 @@ mod tests {
                 config: dch_config::DchConfig::default(),
                 config_base: std::sync::Arc::new(dch_config::DchConfig::default()),
                 workdir: std::path::PathBuf::from("."),
-                sessions_root: crate::session::sessions_dir(),
+                sessions_root: dir.path().to_path_buf(),
                 state,
                 shutting_down: shutdown_flag(false),
                 lanes: InteractiveLanes::detached(),
                 overrides: RunOverrides::default(),
             },
-            parked_transcript(),
+            transcript.clone(),
             session_tx,
         )));
         let update = tokio::time::timeout(std::time::Duration::from_secs(5), session_rx.recv())
             .await
             .expect("a session id is published")
             .expect("the session channel is open when the command lands");
-        let SessionUpdate::SessionId { id } = update else {
+        let SessionUpdate::SessionId { id: published } = update else {
             panic!("a clear publishes a fresh session id, got {update:?}");
         };
-        assert!(
-            uuid::Uuid::parse_str(&id).is_ok(),
-            "the published id is a session identity, got {id}"
+        assert_ne!(
+            published,
+            id.to_string(),
+            "the rotation moved off the session it ended"
         );
+        let live_id = transcript
+            .saver
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .session_id()
+            .to_string();
+        assert_eq!(
+            published, live_id,
+            "the published id names the save target the rotation opened"
+        );
+        worker.join();
         let _ = driver.await;
     }
 
@@ -507,6 +552,156 @@ mod tests {
             "the gate's shared cell hands the ended session's move back"
         );
         worker.join();
+    }
+
+    #[test]
+    fn a_cleared_session_retires_the_launch_permission_statement() {
+        // The flag named the launch's mode; the rotation adopted the
+        // file default, so the statement retires with the session it
+        // named — a later `/resume` must adopt the resumed file's own
+        // standing rather than re-read the cleared default as an
+        // override. A refused rewind keeps the statement: the
+        // still-open session still runs under it.
+        let dir = tempfile::tempdir().expect("sessions tempdir");
+        let saver = Arc::new(crate::session::SessionSaver::with_base_dir(
+            uuid::Uuid::new_v4(),
+            "m".to_string(),
+            dir.path().to_path_buf(),
+        ));
+        let (handle, worker) = TranscriptWorker::spawn(Arc::clone(&saver));
+        let (session_tx, _session_rx) = mpsc::unbounded_channel();
+        let mut context = DriverContext {
+            config: unreachable_config(),
+            config_base: std::sync::Arc::new(unreachable_config()),
+            workdir: std::path::PathBuf::from("."),
+            sessions_root: dir.path().to_path_buf(),
+            state: TuiObserverState::new().into_observer().1,
+            shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            lanes: InteractiveLanes::detached(),
+            overrides: RunOverrides {
+                model: None,
+                reasoning_effort: None,
+                permission_named: true,
+                permission_default: dch_config::PermissionMode::Auto,
+            },
+        };
+        context.config.runner.permission_mode = dch_config::PermissionMode::ReadOnly;
+        land_session_clear::<loopctl::error::LoopError>(
+            Ok(1_usize),
+            &handle,
+            &session_tx,
+            &mut context,
+        );
+        assert!(
+            !context.overrides.permission_named,
+            "the rotation retires the launch statement it ended"
+        );
+        assert_eq!(
+            context.config.runner.permission_mode,
+            dch_config::PermissionMode::Auto,
+            "the cleared session runs the file default the statement retired onto"
+        );
+        let mut kept = DriverContext {
+            config: unreachable_config(),
+            config_base: std::sync::Arc::new(unreachable_config()),
+            workdir: std::path::PathBuf::from("."),
+            sessions_root: dir.path().to_path_buf(),
+            state: TuiObserverState::new().into_observer().1,
+            shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            lanes: InteractiveLanes::detached(),
+            overrides: RunOverrides {
+                model: None,
+                reasoning_effort: None,
+                permission_named: true,
+                permission_default: dch_config::PermissionMode::Auto,
+            },
+        };
+        kept.config.runner.permission_mode = dch_config::PermissionMode::ReadOnly;
+        land_session_clear(
+            Err("a turn is in flight".to_string()),
+            &handle,
+            &session_tx,
+            &mut kept,
+        );
+        assert!(
+            kept.overrides.permission_named,
+            "a refused rewind keeps the launch statement — the session it named still stands"
+        );
+        assert_eq!(
+            kept.config.runner.permission_mode,
+            dch_config::PermissionMode::ReadOnly,
+            "the refusal moves no mode"
+        );
+        worker.join();
+    }
+
+    #[test]
+    fn a_damaged_resume_reports_the_mode_the_cell_enforces() {
+        // The fallback's return half: with damage standing and the
+        // cell already asking, the verdict must publish the mode the
+        // cell enforces — not the standing mode the gate no longer
+        // runs, which a later failed rebuild would roll the asking
+        // cell back to. An auto cell takes the asking posture and
+        // reports it.
+        let dir = tempfile::tempdir().expect("sessions tempdir");
+        let root = dir.keep();
+        let b = uuid::Uuid::new_v4();
+        let saver = Arc::new(crate::session::SessionSaver::with_base_dir(
+            b,
+            "m".to_string(),
+            root.clone(),
+        ));
+        saver
+            .save_permissions(&[], &[], false)
+            .expect("the sibling saves");
+        let path = root.join(b.to_string()).join("permissions.json");
+        let intact = std::fs::read_to_string(&path).expect("the sibling reads");
+        let cut = intact.len().saturating_sub(3);
+        std::fs::write(&path, intact.get(..cut).unwrap_or("")).expect("the damaged sibling writes");
+        let (handle, _worker) = TranscriptWorker::spawn(Arc::clone(&saver));
+        let mut context = DriverContext {
+            config: unreachable_config(),
+            config_base: std::sync::Arc::new(unreachable_config()),
+            workdir: std::path::PathBuf::from("."),
+            sessions_root: root.clone(),
+            state: TuiObserverState::new().into_observer().1,
+            shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            lanes: InteractiveLanes::detached(),
+            overrides: RunOverrides::default(),
+        };
+        *context
+            .lanes
+            .mode_cell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            dch_config::PermissionMode::ReadOnly;
+        let (mode, damaged) =
+            adopt_resumed_permissions(&handle, &mut context, dch_config::PermissionMode::Auto);
+        assert!(damaged, "the truncated sibling fails the restore closed");
+        assert_eq!(
+            mode,
+            dch_config::PermissionMode::ReadOnly,
+            "the verdict names the mode the cell enforces — a failed rebuild \
+             cannot roll the asking cell back to the standing auto"
+        );
+        let mut fresh = DriverContext {
+            config: unreachable_config(),
+            config_base: std::sync::Arc::new(unreachable_config()),
+            workdir: std::path::PathBuf::from("."),
+            sessions_root: root,
+            state: TuiObserverState::new().into_observer().1,
+            shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            lanes: InteractiveLanes::detached(),
+            overrides: RunOverrides::default(),
+        };
+        let (mode, damaged) =
+            adopt_resumed_permissions(&handle, &mut fresh, dch_config::PermissionMode::Auto);
+        assert!(damaged, "the same damaged sibling stands for both cells");
+        assert_eq!(
+            mode,
+            dch_config::PermissionMode::Interactive,
+            "an auto cell takes the asking posture and the verdict says so"
+        );
     }
 
     #[tokio::test]
@@ -1429,19 +1624,16 @@ mod tests {
         );
         let mut damage_notice = None;
         let mut resumed_mode = None;
-        for _ in 0..8 {
-            let Some(update) = session_rx.recv().await else {
-                break;
-            };
+        // The dispatch publishes on the lane before it returns, so the
+        // queue is read without waiting: a missing update fails here
+        // instead of parking on a channel whose sender never closes.
+        while let Ok(update) = session_rx.try_recv() {
             match update {
                 SessionUpdate::Notice { text } => damage_notice = Some(text),
                 SessionUpdate::Resumed {
                     permission_mode, ..
                 } => resumed_mode = Some(permission_mode),
                 _ => {}
-            }
-            if damage_notice.is_some() && resumed_mode.is_some() {
-                break;
             }
         }
         let notice = damage_notice.expect("the damage is said aloud on the notice lane");
@@ -1773,7 +1965,7 @@ mod tests {
             .expect("the marked pair saves");
         let mut runner = unreachable_runner().await;
         let (_, state) = TuiObserverState::new().into_observer();
-        let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+        let (session_tx, _session_rx) = mpsc::unbounded_channel();
         let mut context = DriverContext {
             config: unreachable_config(),
             config_base: std::sync::Arc::new(unreachable_config()),
@@ -1880,7 +2072,6 @@ mod tests {
             raw.contains("cargo fmt"),
             "the re-answer itself did land: {raw}"
         );
-        let _ = session_rx.recv().await;
     }
 
     #[tokio::test]

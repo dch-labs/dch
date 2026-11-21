@@ -144,11 +144,11 @@ pub(crate) fn rescue_stranded_corrections(
 /// already sent, and its row already stands in the transcript — the
 /// record the deliberate-stop rule reads — so nothing is collected.
 pub(crate) fn pull_corrected_wording(
-    claim: Option<(u64, usize)>,
+    claim: Option<ClaimBoundary>,
     receiver: &mut mpsc::UnboundedReceiver<Submission>,
     revived: &mut std::collections::VecDeque<Submission>,
 ) -> Option<String> {
-    claim.and_then(|(id, _)| {
+    claim.and_then(|(id, _, _)| {
         if pull_pending_correction(id, receiver, revived) {
             revived.pop_back().and_then(|submission| match submission {
                 Submission::Correct { text, .. } => Some(text),
@@ -175,24 +175,56 @@ pub(crate) fn exit_owns_cancel(
     matches!(err, loopctl::error::LoopError::Cancelled) && shutting_down.load(Ordering::SeqCst)
 }
 
+/// The boundary a claimed turn recorded.
+///
+/// The claim's id, the committed length its turn started from, and the
+/// history that length named — the prefix a later correction's cut
+/// must still find in place before it rewinds.
+pub(crate) type ClaimBoundary = (u64, usize, std::sync::Arc<Vec<loopctl::message::Message>>);
+
 /// Cut the superseded turn out of the committed history and post
 /// the verdict's notice, if any.
 ///
 /// The correction names the committed length its turn started from;
 /// the cut is attempted wherever that claim still stands, and the
 /// notice — or the verdict's silence — is the driver's honest word
-/// about how the rewind landed.
+/// about how the rewind landed. The claim's own history rides beside
+/// the length: a compaction during the turn folds the conversation
+/// and regrowth can carry its length back past the recorded boundary,
+/// so the length alone cannot say the cut still names the turn — the
+/// conversation must still begin with exactly the messages the claim
+/// recorded, and where it does not, the correction follows the fold
+/// with a notice instead of cutting into the turns that came after.
 pub(crate) fn apply_correction_cut(
     runner: &mut dch_loop::Runner,
     state: &TuiObserverState,
     before: usize,
     interrupted: bool,
+    claimed: &std::sync::Arc<Vec<loopctl::message::Message>>,
 ) {
-    let committed = runner.committed_history().len();
+    let committed = runner.committed_history();
+    let boundary_moved = committed.len() >= before && {
+        let standing = boundary_digest(committed.get(..before));
+        let recorded = boundary_digest(Some(claimed.as_slice()));
+        standing != recorded
+    };
+    if boundary_moved {
+        state
+            .errors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(
+                "the conversation was rewritten since the superseded turn began — a compaction \
+                 folded it into the summary that stands there now, so the correction follows \
+                 the fold rather than cutting into the turns that came after it"
+                    .to_string(),
+            );
+        return;
+    }
     let removed = runner.rewind_history_to(before);
     let notice = correction_cut_notice(
         before,
-        committed,
+        committed.len(),
         &removed,
         runner.committed_history().len(),
         interrupted,
@@ -204,6 +236,17 @@ pub(crate) fn apply_correction_cut(
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(notice);
     }
+}
+
+/// The prefix identity a correction's boundary is checked against.
+///
+/// The claimed history's Debug rendering stands in for content
+/// equality: the cut is placed only where the conversation still
+/// begins with exactly the messages the claim recorded, so a
+/// compaction-then-regrowth cannot pass its rewritten prefix off as
+/// the turn the correction named.
+fn boundary_digest(history: Option<&[loopctl::message::Message]>) -> String {
+    format!("{history:?}")
 }
 
 #[cfg(test)]
@@ -309,6 +352,107 @@ mod tests {
         assert!(
             notice.contains("stayed in the conversation"),
             "the refusal outranks the lengths beside it: {notice}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_correction_cut_after_compaction_and_regrowth_refuses_to_rewind() {
+        // The regrowth shape the lengths alone cannot see: a fold
+        // during the superseded turn shrinks the conversation, and the
+        // turns that follow carry its length back past the recorded
+        // boundary. The prefix check refuses the rewind — the fold's
+        // summary and the later turns keep their place — and the
+        // notice says the correction went on top of the fold instead
+        // of cutting into what came after it.
+        let mut runner =
+            dch_loop::Runner::builder(&unreachable_config(), std::path::Path::new("."))
+                .with_history(vec![
+                    loopctl::message::Message::user("turn one"),
+                    loopctl::message::Message::assistant("answer one"),
+                    loopctl::message::Message::user("turn two"),
+                    loopctl::message::Message::assistant("answer two"),
+                    loopctl::message::Message::user("turn three"),
+                    loopctl::message::Message::assistant("answer three"),
+                ])
+                .build()
+                .await
+                .expect("runner over the recorded history");
+        let (_, state) = TuiObserverState::new().into_observer();
+        let claimed = std::sync::Arc::new(runner.committed_history());
+        let before = claimed.len();
+        runner
+            .rewind_history_to(2)
+            .expect("the fold lands while the loop is at rest");
+        for turn in 0..5 {
+            runner
+                .run(&format!("the turn after the fold {turn}"))
+                .await
+                .ok();
+        }
+        let regrown = runner.committed_history().len();
+        assert!(
+            regrown >= before,
+            "the fixture must reach the regrown shape the fold hides: {regrown} vs {before}"
+        );
+        apply_correction_cut(&mut runner, &state, before, false, &claimed);
+        assert_eq!(
+            runner.committed_history().len(),
+            regrown,
+            "the rewritten conversation refuses the rewind — the fold and the \
+             turns after it stand untouched"
+        );
+        let errors = state
+            .errors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(errors.len(), 1, "the stale boundary is reported once");
+        assert!(
+            errors
+                .first()
+                .expect("the notice is present")
+                .contains("rewritten since the superseded turn began"),
+            "the notice names the fold the correction rides on: {:?}",
+            errors.first()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cut_over_an_untouched_conversation_still_lands_in_place() {
+        // The control for the prefix check: the conversation the claim
+        // recorded is still the conversation the cut sees — the check
+        // passes and the rewind removes exactly the superseded turn,
+        // silently, as it always did.
+        let mut runner =
+            dch_loop::Runner::builder(&unreachable_config(), std::path::Path::new("."))
+                .with_history(vec![
+                    loopctl::message::Message::user("turn one"),
+                    loopctl::message::Message::assistant("answer one"),
+                    loopctl::message::Message::user("turn two"),
+                    loopctl::message::Message::assistant("answer two"),
+                ])
+                .build()
+                .await
+                .expect("runner over the recorded history");
+        let (_, state) = TuiObserverState::new().into_observer();
+        let claimed = std::sync::Arc::new(runner.committed_history());
+        let before = claimed.len();
+        runner
+            .run("the superseded turn")
+            .await
+            .expect_err("the unreachable provider refuses the turn");
+        apply_correction_cut(&mut runner, &state, before, false, &claimed);
+        assert_eq!(
+            runner.committed_history().len(),
+            before,
+            "the cut removed exactly the turn the correction named"
+        );
+        let errors = state
+            .errors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            errors.is_empty(),
+            "an exact cut over an untouched conversation stays silent: {errors:?}"
         );
     }
 

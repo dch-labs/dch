@@ -641,29 +641,33 @@ fn git_branch(workdir: &Path) -> Option<String> {
 /// does the loaded transcript travel to the display, which re-seeds
 /// from it. Every failure — a malformed id, an unreadable session, a
 /// refused rebuild — posts a notice and leaves the loop exactly as it
-/// stood.
+/// stood. Returns whether the resumed runner replaced the loop's
+/// conversation — every refusal keeps it and reports `false`, so the
+/// driver can tell a boundary the old conversation named from one the
+/// new one owns.
 pub(crate) async fn resume_into_session(
     runner: &mut dch_loop::Runner,
     transcript: &TranscriptHandle,
     session_tx: &mpsc::UnboundedSender<SessionUpdate>,
     context: &mut DriverContext,
     id: String,
-) {
+) -> bool {
     let Ok(target) = uuid::Uuid::parse_str(&id) else {
         post_session_notice(
             session_tx,
             format!("{id} is not a session id — nothing was resumed"),
         );
-        return;
+        return false;
     };
     let Ok(outcome) = crate::resume::load_for_resume_in(target, &context.sessions_root) else {
         post_session_notice(
             session_tx,
             format!("session {id} could not be loaded — the loop kept its conversation"),
         );
-        return;
+        return false;
     };
-    let machine = outcome.machine.clone().unwrap_or_default();
+    let machine =
+        crate::resume::history_for_resume(&outcome, context.config.security.redact_secrets);
     let mut config = context.config.clone();
     if context.overrides.model.is_none() && !outcome.model.trim().is_empty() {
         let mut fresh = context.config_base.as_ref().clone();
@@ -713,7 +717,7 @@ pub(crate) async fn resume_into_session(
                     "session {id} could not be adopted — the loop kept its conversation ({err})"
                 ),
             );
-            return;
+            return false;
         }
     };
     for path in crate::resume::resumed_read_paths_with_machine(
@@ -793,6 +797,7 @@ pub(crate) async fn resume_into_session(
     if session_tx.send(update).is_err() {
         tracing::warn!("session resumed but the display is gone");
     }
+    true
 }
 
 #[cfg(test)]
