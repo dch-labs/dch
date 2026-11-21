@@ -529,6 +529,30 @@ fn scrub_json_strings(
 /// same conditions the session loader reports, mapped once for the
 /// resume flow.
 pub(crate) fn load_for_resume_in(id: Uuid, base: &Path) -> Result<ResumeOutcome, ResumeError> {
+    load_for_resume_in_with_floor(id, base, None)
+}
+
+/// Load one saved session for resuming, with a freshness floor the
+/// machine snapshot is judged against.
+///
+/// The floor exists for the live resume: when the adopting host holds
+/// a queued snapshot of the target newer than the file on disk, the
+/// disk machine is stale the moment the queued display becomes the
+/// adopted truth, so the caller passes the queued display's stamp and
+/// a machine that predates it reads as absent — the derive walk over
+/// the adopted transcript covers the difference.
+///
+/// # Errors
+///
+/// Propagates [`ResumeError`] when neither file is readable — the
+/// same conditions the session loader reports, mapped once for the
+/// resume flow. A machine snapshot that predates the floor is not an
+/// error: it reads as absent and the resume derives its history.
+pub(crate) fn load_for_resume_in_with_floor(
+    id: Uuid,
+    base: &Path,
+    machine_floor: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<ResumeOutcome, ResumeError> {
     let loaded = crate::session::load_with_meta_in(id, base)?;
     let messages: Vec<TuiMessage> = loaded
         .messages
@@ -541,7 +565,7 @@ pub(crate) fn load_for_resume_in(id: Uuid, base: &Path) -> Result<ResumeOutcome,
         })
         .collect();
     let (machine, machine_compactions) =
-        match crate::session::load_machine_in(id, base, loaded.saved_at) {
+        match crate::session::load_machine_in(id, base, machine_floor.unwrap_or(loaded.saved_at)) {
             Some((messages, compactions)) => (
                 Some(dch_loop::history_without_nudge(&messages)),
                 compactions,
