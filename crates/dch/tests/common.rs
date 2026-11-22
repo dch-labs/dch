@@ -653,6 +653,20 @@ impl Sandbox {
     /// terminal — a PTY is both. Scenarios type into the composer, read
     /// what renders, and watch the child exit.
     pub fn dch_pty(&self, args: &[&str]) -> PtySession {
+        self.dch_pty_in_env(args, &[])
+    }
+
+    /// Run the real binary on a pseudoterminal under an injected
+    /// environment.
+    ///
+    /// The same seat [`Self::dch_pty`] builds, with the environment a
+    /// scenario needs to stand the binary in: a multiplexer's
+    /// spellings — `TMUX`, a `tmux-…` terminal type — for pins over
+    /// the launch-time decisions the shell reads from its
+    /// environment. The base environment is the helper's own; an
+    /// entry whose key it already carries overrides it, so a scenario
+    /// naming `TERM` decides the terminal type the binary sees.
+    pub fn dch_pty_in_env(&self, args: &[&str], env: &[(&str, &str)]) -> PtySession {
         use portable_pty::CommandBuilder;
         use portable_pty::PtySize;
         let pty = portable_pty::native_pty_system()
@@ -670,6 +684,9 @@ impl Sandbox {
         command.env("HOME", self.home.path());
         command.env("XDG_CONFIG_HOME", self.home.path());
         command.env("TERM", "xterm-truecolor");
+        for (key, value) in env {
+            command.env(key, value);
+        }
         let child = pty
             .slave
             .spawn_command(command)

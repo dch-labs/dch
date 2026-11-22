@@ -202,6 +202,17 @@ impl TuiApp {
             return;
         }
         self.queue.queue_section_rect = area;
+        let pane = Rect {
+            x: area
+                .x
+                .saturating_add(TODO_SECTION_INSET)
+                .min(area.right().saturating_sub(1)),
+            width: area
+                .width
+                .saturating_sub(TODO_SECTION_INSET.saturating_mul(2))
+                .max(1),
+            ..area
+        };
         if self.queue.queue_posture == QueuePosture::Folded
             && self.queue.queue_mode == QueueMode::Plain
         {
@@ -222,7 +233,7 @@ impl TuiApp {
                         ),
                     ]),
                 ]),
-                area,
+                pane,
             );
             return;
         }
@@ -239,7 +250,7 @@ impl TuiApp {
             .saturating_sub(bottom_standoff);
         let focused = self.queue.queue_mode == QueueMode::Focused;
         let prefix = queue_prompt_prefix(total, shown);
-        let width = usize::from(area.width);
+        let width = usize::from(pane.width);
         let limit = width.saturating_sub(str_width(&prefix)).max(1);
         let body = wrap_prompt_rows(&for_display(&text), limit, body_rows);
         let marker_style = Style::default().fg(if focused {
@@ -278,7 +289,7 @@ impl TuiApp {
             lines.push(Line::from(spans));
         }
         lines.resize(rows, Line::from(Vec::new()));
-        frame.render_widget(Paragraph::new(lines), area);
+        frame.render_widget(Paragraph::new(lines), pane);
     }
 
     /// Render the notice row: one line of transient or state-driven

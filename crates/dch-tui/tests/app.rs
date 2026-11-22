@@ -2117,6 +2117,109 @@ fn a_turn_end_hook_fires_for_surfaced_errors() {
 }
 
 #[test]
+fn the_error_block_separates_from_the_tool_footer_it_lands_beneath() {
+    // Session 1fab4451's shape: a long tool call completes, then the
+    // next model request dies. The error block must open on rows of
+    // its own — a spacer between the tool's duration footer and the
+    // failure, then a header naming the request's own facts — so the
+    // failure reads as the model request's, never the tool's.
+    let now = chrono::Utc::now();
+    let mut app = app();
+    app.seed_messages(vec![
+        TuiMessage::User {
+            text: "run the suite".to_string(),
+            timestamp: now,
+            steered: false,
+            unsent: false,
+        },
+        TuiMessage::Assistant {
+            blocks: vec![ContentBlock::Tool {
+                call_id: "call-1".to_string(),
+                name: "Bash".to_string(),
+                input_preview: "cargo test".to_string(),
+                success: true,
+                elapsed_secs: 203.0,
+                output_preview: "test result: ok".to_string(),
+                retained_input: String::new(),
+            }],
+            timestamp: now,
+            duration_ms: None,
+        },
+        TuiMessage::Error {
+            text: "API error: stream (stream failed before completing after 4 attempts: \
+HTTP error: HTTP 502: <html><head><title>502 Bad Gateway</title></head>\
+<hr><center>alibaba-ga</center></html>) and fallback failed: HTTP error: \
+HTTP 502: upstream reset"
+                .to_string(),
+            timestamp: now,
+        },
+    ]);
+    let rows = row_texts(&render_to_buffer(&mut app, 80, 30));
+    let footer = rows
+        .iter()
+        .position(|row| row.contains("3m23s"))
+        .expect("the tool's elapsed footer renders");
+    let spacer = rows.get(footer.saturating_add(1)).map(String::as_str);
+    assert!(
+        spacer.is_some_and(|row| row.trim().is_empty()),
+        "a blank row separates the tool's footer from the error block: {spacer:?}"
+    );
+    let header = &rows[footer.saturating_add(2)];
+    assert!(
+        header.contains("✗ model request failed"),
+        "the block opens on a header of its own: {header:?}"
+    );
+    assert!(
+        header.contains("4 attempts") && header.contains("HTTP 502"),
+        "the header carries the request's own facts: {header:?}"
+    );
+}
+
+#[test]
+fn a_persisted_raw_error_row_bakes_clean_on_resume() {
+    // Transcripts written before any composition-side fix store the
+    // failure verbatim — `role: "error"`, the raw Display text with
+    // its CRLF pairs and HTML body. A resume must parse that row back
+    // and bake it clean: no control byte reaches a cell, and the
+    // restored pane still gets the header presentation.
+    let raw = "API error: stream (stream failed before completing after 4 attempts: \
+HTTP error: HTTP 502: <html>\r\n<head><title>502 Bad Gateway</title></head>\r\n\
+<body bgcolor=\"white\">\r\n<center><h1>502 Bad Gateway</h1></center>\r\n\
+<hr><center>alibaba-ga</center>\r\n</body>\r\n</html>\r\n) \
+and fallback failed: HTTP error: HTTP 502: upstream reset";
+    let stored = serde_json::json!({
+        "role": "error",
+        "text": raw,
+        "timestamp": "2026-11-22T02:09:19Z",
+    })
+    .to_string();
+    let parsed: TuiMessage = serde_json::from_str(&stored).expect("the persisted row parses");
+    assert!(matches!(parsed, TuiMessage::Error { .. }));
+    let mut app = app();
+    app.seed_messages(vec![parsed]);
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let buffer = terminal.backend().buffer();
+    for y in 0..buffer.area.height {
+        for x in 0..buffer.area.width {
+            let symbol = buffer[(x, y)].symbol();
+            assert!(
+                !symbol.chars().any(char::is_control),
+                "cell ({x}, {y}) carries a control byte: {symbol:?}"
+            );
+        }
+    }
+    let flat: String = row_texts(&terminal).join("\n");
+    assert!(
+        flat.contains("✗ model request failed"),
+        "the restored raw row bakes the header presentation: {flat:?}"
+    );
+    assert!(
+        flat.contains("4 attempts") && flat.contains("HTTP 502"),
+        "the restored row's facts parse out of the stored text: {flat:?}"
+    );
+}
+
+#[test]
 fn a_quiet_frame_does_not_fire_the_turn_end_hook() {
     let state = dch_tui::TuiObserverState::new();
     let (observer, kept) = state.into_observer();
@@ -4825,6 +4928,101 @@ fn the_conversation_pane_renders_on_the_terminal_s_own_background() {
         buffer[(0, 13)].bg,
         app.theme.ui.status_bar_bg,
         "the status bar paints its own row"
+    );
+}
+
+#[test]
+fn a_locally_painted_canvas_covers_the_transparent_regions() {
+    // The multiplexer contract, the mirror of the one-layer pin above:
+    // inside tmux the client-shared default background cannot be
+    // leaned on — another pane's write repaints it — so the frame
+    // paints the canvas on its own cells. Every region the direct
+    // terminal leaves to the default carries the palette's own
+    // background, and the raised surfaces keep their fills over it.
+    let mut app = docked_app();
+    app.set_canvas_painted_locally(true);
+    let terminal = render_to_buffer(&mut app, 40, 14);
+    let buffer = terminal.backend().buffer();
+    let composer = composer_chunk(40, 14, 4);
+    assert_eq!(
+        buffer[(5, composer.y.saturating_sub(2))].bg,
+        app.theme.ui.background,
+        "the conversation pane carries the painted canvas, not the shared default"
+    );
+    assert_eq!(
+        buffer[(1, composer.y)].bg,
+        app.theme.ui.surface,
+        "the composer body keeps its surface fill over the canvas"
+    );
+    assert_eq!(
+        buffer[(0, 13)].bg,
+        app.theme.ui.status_bar_bg,
+        "the status bar paints its own row"
+    );
+}
+
+#[test]
+fn a_scrolled_error_row_paints_no_reset_cell_in_the_conversation_pane() {
+    // The two defects of session 1fab4451 pinned at their crossing:
+    // the pane scrolled to a baked API-error row inside a multiplexer
+    // (local canvas). The leak's second mechanism — cells handed back
+    // to the client-shared default background — must not show at the
+    // error block: every cell the conversation pane paints carries a
+    // background the palette owns, and the error rows stand on the
+    // painted canvas like every other row.
+    let now = chrono::Utc::now();
+    let mut app = app();
+    app.set_canvas_painted_locally(true);
+    app.seed_messages(vec![
+        TuiMessage::User {
+            text: "run the suite".to_string(),
+            timestamp: now,
+            steered: false,
+            unsent: false,
+        },
+        TuiMessage::Assistant {
+            blocks: vec![ContentBlock::Tool {
+                call_id: "call-1".to_string(),
+                name: "Bash".to_string(),
+                input_preview: "cargo test".to_string(),
+                success: true,
+                elapsed_secs: 203.0,
+                output_preview: "test result: ok".to_string(),
+                retained_input: String::new(),
+            }],
+            timestamp: now,
+            duration_ms: None,
+        },
+        TuiMessage::Error {
+            text: "API error: stream (stream failed before completing after 4 attempts: \
+HTTP error: HTTP 502: <html><head><title>502 Bad Gateway</title></head>\
+<hr><center>alibaba-ga</center></html>) and fallback failed: HTTP error: \
+HTTP 502: upstream reset"
+                .to_string(),
+            timestamp: now,
+        },
+    ]);
+    let terminal = render_to_buffer(&mut app, 80, 30);
+    let rows = row_texts(&terminal);
+    let header_y = rows
+        .iter()
+        .position(|row| row.contains("✗ model request failed"))
+        .and_then(|index| u16::try_from(index).ok())
+        .expect("the error block's header renders");
+    let buffer = terminal.backend().buffer();
+    for y in 0..buffer.area.height.saturating_sub(4) {
+        for x in 0..buffer.area.width {
+            assert_ne!(
+                buffer[(x, y)].bg,
+                ratatui::style::Color::Reset,
+                "no conversation-pane cell leans on the shared default at ({x}, {y})"
+            );
+        }
+    }
+    assert_eq!(
+        buffer[(10, header_y)].bg,
+        app.theme.ui.background,
+        "the error block's own rows stand on the painted canvas"
     );
 }
 

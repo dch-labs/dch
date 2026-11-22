@@ -79,7 +79,12 @@ impl TuiApp {
             .border_style(accent)
             .title(Span::styled(title, accent));
         frame.render_widget(Clear, overlay);
-        frame.render_widget(Paragraph::new(lines).block(block), overlay);
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(block)
+                .style(Style::default().bg(self.theme.ui.surface)),
+            overlay,
+        );
         if let Some((row, column)) = sheet.caret
             && row.saturating_add(1) < usize::from(overlay.height)
         {

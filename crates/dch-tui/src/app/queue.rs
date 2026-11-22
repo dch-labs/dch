@@ -191,8 +191,8 @@ impl TuiApp {
         if key_survives_the_sheet(key) {
             return None;
         }
-        if let QueueMode::Confirming { act } = self.queue.queue_mode {
-            return Some(self.queue_confirm_key(key, act));
+        if let QueueMode::Confirming { act, id } = self.queue.queue_mode {
+            return Some(self.queue_confirm_key(key, act, id));
         }
         if self.queue.queue_mode == QueueMode::Focused {
             return Some(self.queue_focused_key(key));
@@ -254,7 +254,7 @@ impl TuiApp {
     /// swallowed here rather than handed down: a letter typed while the
     /// user reads the backlog has nowhere it should be going, and letting
     /// it reach the composer would build a draft behind their back.
-    fn queue_focused_key(&mut self, key: KeyEvent) -> bool {
+    pub(crate) fn queue_focused_key(&mut self, key: KeyEvent) -> bool {
         let bare = key.modifiers == KeyModifiers::NONE;
         match key.code {
             KeyCode::Left if bare => self.step_queue_view(false),
@@ -268,13 +268,23 @@ impl TuiApp {
             }
             KeyCode::Char('e') if bare => self.open_queue_edit(),
             KeyCode::Delete | KeyCode::Char('d') if bare => {
+                let Some((id, _)) = self.queued_at(self.queue.queue_view) else {
+                    self.clamp_queue_view();
+                    return true;
+                };
                 self.queue.queue_mode = QueueMode::Confirming {
                     act: QueueAct::Drop,
+                    id,
                 };
             }
             KeyCode::Char('s') if bare => {
+                let Some((id, _)) = self.queued_at(self.queue.queue_view) else {
+                    self.clamp_queue_view();
+                    return true;
+                };
                 self.queue.queue_mode = QueueMode::Confirming {
                     act: QueueAct::Steer,
+                    id,
                 };
             }
             _ => {}
@@ -286,16 +296,26 @@ impl TuiApp {
     ///
     /// `y` performs the act the ask holds — after the mode returns to
     /// `Focused`, so the act's own emptying of the queue still releases
-    /// the focus the way the immediate keypress once did. Everything
-    /// else stands the ask down: `n` and Esc plainly, and any stray key
-    /// too, because a key that lands by accident must never be the one
-    /// that spends the prompt.
-    fn queue_confirm_key(&mut self, key: KeyEvent, act: QueueAct) -> bool {
+    /// the focus the way the immediate keypress once did. The act
+    /// resolves against the prompt whose id the ask recorded: if a
+    /// claim took it in the window between the arming press and `y`,
+    /// whatever slid into its display position is a stranger the
+    /// confirm refuses to spend. Everything else stands the ask down:
+    /// `n` and Esc plainly, and any stray key too, because a key that
+    /// lands by accident must never be the one that spends the prompt.
+    pub(crate) fn queue_confirm_key(&mut self, key: KeyEvent, act: QueueAct, id: u64) -> bool {
         if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::Char('y') {
             self.queue.queue_mode = QueueMode::Focused;
+            if self.queued_index_of(id).is_none() {
+                self.post_notice(
+                    "the prompt left the queue — the confirmation stood down".to_string(),
+                );
+                self.clamp_queue_view();
+                return true;
+            }
             match act {
-                QueueAct::Drop => self.drop_queue_entry(),
-                QueueAct::Steer => self.steer_queued(),
+                QueueAct::Drop => self.drop_queue_entry(id),
+                QueueAct::Steer => self.steer_queued(id),
             }
         } else {
             self.queue.queue_mode = QueueMode::Focused;
@@ -401,20 +421,22 @@ impl TuiApp {
         self.leave_queue_edit();
     }
 
-    /// Take the shown prompt out of the queue for good.
+    /// Take the named prompt out of the queue for good.
     ///
     /// A waiting prompt is the only thing this touches: the run in flight
     /// keeps running, the prompts behind it keep their order, and the
-    /// prompt itself simply never runs. There is no confirmation because
-    /// there is nothing to lose that cannot be retyped — the entry is on
-    /// screen at the press, and it is the only way to unload an entry a
-    /// blank save refuses to empty.
-    fn drop_queue_entry(&mut self) {
-        let Some((id, _)) = self.queued_at(self.queue.queue_view) else {
-            self.clamp_queue_view();
-            return;
-        };
-        self.remove_queued(id);
+    /// prompt itself simply never runs. The removal keys on the id the
+    /// caller armed — the confirmation's ask, or the focused press — so
+    /// whatever slid into a stale view position is never the prompt
+    /// spent; a miss (the id left between the ask and the act) stands
+    /// down with the same notice the confirm's own gate gives. There is
+    /// no confirmation here because there is nothing to lose that
+    /// cannot be retyped — the entry is on screen at the press, and it
+    /// is the only way to unload an entry a blank save refuses to empty.
+    fn drop_queue_entry(&mut self, id: u64) {
+        if self.remove_queued(id).is_none() {
+            self.post_notice("the prompt left the queue — the confirmation stood down".to_string());
+        }
         self.clamp_queue_view();
         self.release_queue_if_empty();
     }
@@ -551,7 +573,12 @@ impl TuiApp {
             return 0;
         };
         let prefix = queue_prompt_prefix(total, shown);
-        let limit = usize::from(width).saturating_sub(str_width(&prefix)).max(1);
+        let inner = usize::from(
+            width
+                .saturating_sub(super::todos::TODO_SECTION_INSET.saturating_mul(2))
+                .max(1),
+        );
+        let limit = inner.saturating_sub(str_width(&prefix)).max(1);
         let cap = usize::from(QUEUE_ROWS).saturating_sub(3);
         let body = wrap_prompt_rows(&for_display(&text), limit, cap).len();
         u16::try_from(body.saturating_add(3)).unwrap_or(QUEUE_ROWS)
@@ -568,7 +595,7 @@ impl TuiApp {
     pub(crate) fn queue_hint(&self) -> &'static str {
         if matches!(self.queue.queue_mode, QueueMode::Editing { .. }) {
             "enter save  esc discard"
-        } else if let QueueMode::Confirming { act } = self.queue.queue_mode {
+        } else if let QueueMode::Confirming { act, .. } = self.queue.queue_mode {
             match act {
                 QueueAct::Steer => "guide the running turn? y/n",
                 QueueAct::Drop => "drop this prompt? y/n",
@@ -660,35 +687,103 @@ impl TuiApp {
         self.submit_text(text);
     }
 
-    /// Guide the waiting prompt on screen: `s` in the focused section.
+    /// Guide the named prompt into the run on screen: `s`'s act.
     ///
     /// The hole `Ctrl+S` cannot reach: a prompt typed a minute ago, queued
     /// patiently, that the running turn has since made urgent. It leaves
     /// the queue and joins the turn in flight, which is also why it leaves
     /// first — the same words must not both reach the model now and run
-    /// again from the queue later.
+    /// again from the queue later. The removal keys on the id the caller
+    /// armed and the text delivered is the one that removal returned: if a
+    /// claim took the prompt in the window between the arming press and
+    /// the act, whatever slid into its display position is a stranger the
+    /// guide refuses to spend, and the prompt already on its way to the
+    /// model is never duplicated.
     ///
     /// Refused while nothing is running. Guidance is advice for a turn, and
     /// a session between turns has no turn to advise; the prompt stays
-    /// where it is, in order, rather than being fired into a gap. If the
-    /// run ends in the instant between the key and the offer, the fallback
-    /// gives it a turn of its own — the words outrank the slot they came
-    /// out of.
-    fn steer_queued(&mut self) {
-        let Some((id, text)) = self.queued_at(self.queue.queue_view) else {
-            self.clamp_queue_view();
-            return;
-        };
+    /// where it is, in order, rather than being fired into a gap.
+    pub(crate) fn steer_queued(&mut self, id: u64) {
         if !self.state.agent_running.load(Ordering::SeqCst) {
             self.post_notice(
                 "nothing is running to guide — the prompt waits in its place".to_string(),
             );
             return;
         }
-        self.remove_queued(id);
+        let Some(text) = self.remove_queued(id) else {
+            self.post_notice("the prompt left the queue before the guide landed".to_string());
+            self.clamp_queue_view();
+            self.release_queue_if_empty();
+            return;
+        };
         self.clamp_queue_view();
         self.release_queue_if_empty();
-        self.deliver_guidance(text);
+        self.deliver_guidance_literal(text);
+    }
+
+    /// Hand `text` to the run in flight, or send it as a turn —
+    /// literally.
+    ///
+    /// The queue-originated counterpart to [`deliver_guidance`]: when
+    /// guidance is refused and the text must fall back to its own
+    /// turn, a slash-prefixed prompt that the user saved as literal
+    /// words is delivered as those words, not dispatched as the
+    /// command it happens to spell. The composer's own submissions
+    /// still parse commands; this path never does.
+    fn deliver_guidance_literal(&mut self, text: String) {
+        let steered = self
+            .state
+            .steering
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|guidance| guidance.steer(text.clone()))
+            || self
+                .host
+                .guidance
+                .as_ref()
+                .is_some_and(|guidance| guidance.steer(text.clone()));
+        if steered {
+            self.state.push_steered(text);
+            self.scroll.scroll_to_bottom();
+            return;
+        }
+        self.submit_literal(text);
+    }
+
+    /// Send a text as a prompt without command parsing.
+    ///
+    /// The literal delivery half of the submission surface: whatever
+    /// the text starts with, it joins the conversation as the user's
+    /// words. Queue-originated fallbacks use this so a saved `/clear`
+    /// reaches the model as prompt text rather than clearing the
+    /// session.
+    fn submit_literal(&mut self, text: String) {
+        if self.host.submit_tx.is_some() {
+            let was_empty = self.queued_len() == 0;
+            let idle = self.state.live_claim.load(Ordering::SeqCst) == u64::MAX
+                && !self.state.agent_running.load(Ordering::SeqCst);
+            self.queue.handed = None;
+            let id = self.push_queued(text.clone());
+            if self.send_queued_id(id) {
+                if was_empty && idle {
+                    self.queue.handed = Some(id);
+                }
+                self.scroll.scroll_to_bottom();
+                return;
+            }
+            self.remove_queued(id);
+            self.post_notice("the driver has gone — nothing more can be sent".to_string());
+            self.composer.input.set_text(text);
+        } else {
+            self.push_message(crate::message::TuiMessage::User {
+                text,
+                timestamp: chrono::Utc::now(),
+                steered: false,
+                unsent: false,
+            });
+        }
+        self.scroll.scroll_to_bottom();
     }
 
     /// Deliver what the last run never reached.
@@ -922,16 +1017,17 @@ pub(crate) const QUEUE_MARKER: &str = "\u{231b}";
 ///
 /// Rendered as a badge — the word on a filled pill, one cell proud of
 /// its letters on either side, filled with the accent the composer's
-/// edge column wears — flush with the section's left edge, so the
-/// prompts waiting behind the turn in flight are a named region of
-/// the screen rather than a strip a first-time reader must decode
-/// from the hourglass alone. It rides the section's first row, flush
-/// with the prompt rows' left edge, and exists only while prompts
-/// wait — an empty queue is no panel, title included. The section's
-/// chords ride beside it on the same row, dim after the pill: the
-/// badge row is short and always drawn, where the prompt rows wrap
-/// and a right-edge hint would vanish exactly when the terminal
-/// narrows.
+/// edge column wears — at the section's inset, the same left margin
+/// the plan section's rows carry, so the prompts waiting behind the
+/// turn in flight are a named region of the screen standing in one
+/// family with the plan rather than a strip a first-time reader must
+/// decode from the hourglass alone. It rides the section's first row,
+/// flush with the prompt rows' left edge, and exists only while
+/// prompts wait — an empty queue is no panel, title included. The
+/// section's chords ride beside it on the same row, dim after the
+/// pill: the badge row is short and always drawn, where the prompt
+/// rows wrap and a right-edge hint would vanish exactly when the
+/// terminal narrows.
 pub(crate) const QUEUE_TITLE: &str = "QUEUED";
 
 /// The prefix the shown prompt's first row carries.
@@ -1040,6 +1136,15 @@ pub(crate) enum QueueMode {
         /// The answer `y` performs and the ask's wording names — the
         /// one fact the ask exists to settle before anything is spent.
         act: QueueAct,
+
+        /// The prompt the ask was armed against.
+        ///
+        /// A claim can take the prompt between the arming press and
+        /// `y`, sliding a different prompt into its display position.
+        /// The confirm resolves against this id — if the prompt has
+        /// left the queue, `y` stands down without acting on whatever
+        /// shifted into its place.
+        id: u64,
     },
 
     /// A prompt's body is out in the composer, held for the prompt this id

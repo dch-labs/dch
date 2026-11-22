@@ -937,7 +937,14 @@ pub(crate) fn plain_wrapped_lines(
 ///
 /// The same greedy wrapping as [`plain_wrapped_lines`]; the style
 /// carries modifiers as well as the foreground, so registers like the
-/// italic thinking body — color plus slant — pass through intact.
+/// italic thinking body — color plus slant — pass through intact. The
+/// text passes through [`crate::tool_capture::sanitize_for_display`]
+/// first: carriage returns break the line, escape sequences and the
+/// remaining control characters drop, so no control byte can reach a
+/// cell and re-execute against the frame. Everything wrapped here is
+/// producer-controlled prose — a provider error body, a thinking
+/// dump, a system notice — and any of it can carry the bytes that
+/// once leaked a pane mid-scroll.
 pub(crate) fn plain_wrapped_lines_styled(
     text: &str,
     width: usize,
@@ -945,7 +952,8 @@ pub(crate) fn plain_wrapped_lines_styled(
 ) -> Vec<Line<'static>> {
     let cap = width.max(1);
     let mut lines = Vec::new();
-    for raw in text.split('\n') {
+    let cleaned = crate::tool_capture::sanitize_for_display(text);
+    for raw in cleaned.split('\n') {
         let mut current = String::new();
         let mut current_width = 0;
         for ch in raw.chars() {
@@ -960,6 +968,214 @@ pub(crate) fn plain_wrapped_lines_styled(
         lines.push(Line::styled(current, style));
     }
     lines
+}
+
+/// The rows a conversation error message renders as.
+///
+/// A blank spacer row opens the block when rows stand above it, so a
+/// failure never reads as the tail of whatever it landed beneath — a
+/// completed tool's duration footer being exactly the row it must not
+/// glue onto. When the text carries the well-known loopctl API
+/// failure shape, a header row names the failure's own facts — the
+/// attempt count, the HTTP status, and the gateway tag an edge body
+/// carried — before the wrapped detail, indented under the header, in
+/// the error tone. Prose failures — a cancellation, a compaction
+/// notice — render without a header, as the wrapped text alone. The
+/// text itself passes through the same sanitizer the wrap funnel
+/// applies, so a persisted HTML body bakes clean on resume too.
+pub(crate) fn error_block_lines(
+    text: &str,
+    width: u16,
+    error_color: Color,
+    rows_above: bool,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if rows_above {
+        lines.push(Line::from(String::new()));
+    }
+    let facts = api_failure_facts(text);
+    if let Some(header) = facts.as_ref().map(ApiFailureFacts::header) {
+        lines.push(Line::styled(header, Style::default().fg(error_color)));
+    }
+    let indent = if facts.is_some() { "  " } else { "" };
+    let budget = usize::from(width.max(1))
+        .saturating_sub(indent.len())
+        .max(1);
+    let cleaned = crate::tool_capture::sanitize_for_display(text);
+    for raw in cleaned.split('\n') {
+        if raw.is_empty() {
+            lines.push(Line::styled(
+                String::new(),
+                Style::default().fg(error_color),
+            ));
+            continue;
+        }
+        for row in wrap_rows(raw, budget) {
+            lines.push(Line::styled(
+                format!("{indent}{row}"),
+                Style::default().fg(error_color),
+            ));
+        }
+    }
+    lines
+}
+
+/// The failure facts an API error's well-known text shape carries.
+///
+/// The engine surfaces a provider failure as a `Display` string — the
+/// only place the attempt count and HTTP status exist — so the
+/// presentation parses those facts back out of the shape the engine
+/// formats: `API error: … after {n} attempts … HTTP {code}`. Any
+/// other text parses to `None`, and the row renders without a header
+/// rather than a wrong one.
+#[derive(Debug, PartialEq, Eq)]
+struct ApiFailureFacts {
+    /// The attempts the stream burned before the failure.
+    ///
+    /// Parsed from the `after {n} attempts` phrase; `None` when the
+    /// text names no count.
+    attempts: Option<u32>,
+
+    /// The HTTP status the provider answered with.
+    ///
+    /// The first `HTTP {code}` the body names; `None` when the failure
+    /// carries no status.
+    status: Option<u16>,
+
+    /// The gateway tag an edge error page named, if one appears.
+    ///
+    /// The text of the last `<center>…</center>` span — the mark an
+    /// HTML body signs itself with; `None` for non-HTML bodies. The
+    /// tag is provider-controlled text, so it is sanitized where it
+    /// is parsed: the header interpolates it verbatim, and a crafted
+    /// edge page must not carry its control bytes there. The sanitizer
+    /// spells a carriage return as a line break, so the sanitized tag
+    /// also collapses to one row — the header is a single line, and a
+    /// break inside it would ride a cell mid-frame.
+    gateway: Option<String>,
+}
+
+impl ApiFailureFacts {
+    /// The header row the facts spell, in the review's standing form.
+    ///
+    /// The glyph marks the block as a failure of its own — never the
+    /// tool row above it — and the facts follow in the order a reader
+    /// asks for them: what died, how hard it tried, what the provider
+    /// answered, who answered.
+    fn header(&self) -> String {
+        let mut facts = Vec::new();
+        if let Some(attempts) = self.attempts {
+            facts.push(if attempts == 1 {
+                "1 attempt".to_string()
+            } else {
+                format!("{attempts} attempts")
+            });
+        }
+        if let Some(status) = self.status {
+            facts.push(format!("HTTP {status}"));
+        }
+        let core = if facts.is_empty() {
+            format!("{} model request failed", crate::tool_render::ERR_GLYPH)
+        } else {
+            format!(
+                "{} model request failed — {}",
+                crate::tool_render::ERR_GLYPH,
+                facts.join(" · ")
+            )
+        };
+        match self.gateway.as_deref() {
+            Some(gateway) => format!("{core} ({gateway})"),
+            None => core,
+        }
+    }
+}
+
+/// Parse the failure facts out of an API error's text.
+///
+/// The gate is the `API error: ` prefix — the shape the engine's API
+/// variant formats — so no other error row's prose can mint a
+/// model-request header. Inside the body the attempt phrase and the
+/// status code are scanned independently: either alone is enough for
+/// a header, and a body carrying neither yields `None`.
+fn api_failure_facts(text: &str) -> Option<ApiFailureFacts> {
+    let body = text.strip_prefix("API error: ")?;
+    let attempts = attempt_count(body);
+    let status = http_status(body);
+    if attempts.is_none() && status.is_none() {
+        return None;
+    }
+    Some(ApiFailureFacts {
+        attempts,
+        status,
+        gateway: gateway_tag(text).and_then(|tag| {
+            let cleaned = crate::tool_capture::sanitize_for_display(&tag);
+            let one_row = cleaned.replace('\n', " ");
+            let trimmed = one_row.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }),
+    })
+}
+
+/// The `{n}` of an `after {n} attempts` phrase in the body.
+///
+/// Every `after ` occurrence is tried, so a body that quotes the
+/// phrase in prose cannot mask the real count elsewhere in it.
+fn attempt_count(body: &str) -> Option<u32> {
+    for (at, _) in body.match_indices(" after ") {
+        let Some(rest) = body.get(at.saturating_add(" after ".len())..) else {
+            continue;
+        };
+        let digits = rest.chars().take_while(char::is_ascii_digit).count();
+        if digits == 0 {
+            continue;
+        }
+        let Some(count) = rest.get(..digits).and_then(|lead| lead.parse::<u32>().ok()) else {
+            continue;
+        };
+        if rest
+            .get(digits..)
+            .is_some_and(|tail| tail.starts_with(" attempts"))
+        {
+            return Some(count);
+        }
+    }
+    None
+}
+
+/// The first `HTTP {code}` the body names.
+///
+/// The word `HTTP` appears twice in the engine's own shape —
+/// `HTTP error: HTTP 502` — and only a three-digit code following it
+/// counts, so the error-category mention is skipped by scan order.
+fn http_status(body: &str) -> Option<u16> {
+    for (at, _) in body.match_indices("HTTP ") {
+        let Some(rest) = body.get(at.saturating_add("HTTP ".len())..) else {
+            continue;
+        };
+        let digits = rest.chars().take_while(char::is_ascii_digit).count();
+        if digits == 3
+            && let Some(code) = rest.get(..digits).and_then(|lead| lead.parse::<u16>().ok())
+        {
+            return Some(code);
+        }
+    }
+    None
+}
+
+/// The text of the last `<center>…</center>` span in the text.
+///
+/// An edge's HTML error page signs itself in one — `alibaba-ga` in
+/// the session this parsing exists for — and the tag survives as the
+/// only human-readable mark of who answered. The caller sanitizes
+/// the tag before it reaches a row: the span's text is the
+/// provider's own bytes, and a header is exactly where the display
+/// policy must apply.
+fn gateway_tag(text: &str) -> Option<String> {
+    let (open, _) = text.rmatch_indices("<center>").next()?;
+    let after = text.get(open.saturating_add("<center>".len())..)?;
+    let close = after.find("</center>")?;
+    let tag = after.get(..close)?.trim();
+    (!tag.is_empty()).then(|| tag.to_string())
 }
 
 #[cfg(test)]
@@ -1688,5 +1904,241 @@ mod tests {
             .as_ref()
             .expect("a consumed control byte is acknowledged");
         assert!(notice.contains("consumed"), "got {notice:?}");
+    }
+
+    #[test]
+    fn the_wrap_funnel_breaks_on_carriage_returns_and_strips_controls() {
+        // The funnel is the last seam before a cell: a lone CR breaks
+        // the row (the contract the capture-side sanitizer documents),
+        // tabs expand, and no other control byte survives — the class
+        // of bytes that once walked a pane's writes off their rows
+        // mid-scroll.
+        let lines = plain_wrapped_lines_styled("a\r\nb\rc\u{7}d\te", 20, Style::default());
+        let rows: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            ["a", "b", "cd    e"],
+            "CR is a break, controls drop, tabs expand: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn the_session_502_bakes_into_a_spacer_a_header_and_clean_rows() {
+        // The exact failure text session 1fab4451 recorded — CRLF
+        // pairs and the edge's HTML body included. The block must open
+        // on a row of its own, name the failure's facts in a header,
+        // and produce nothing a terminal would re-execute: every row
+        // control-character-free and bounded by the wrap width.
+        let raw = "API error: stream (stream failed before completing after 4 attempts: \
+HTTP error: HTTP 502: <html>\r\n<head><title>502 Bad Gateway</title></head>\r\n\
+<body bgcolor=\"white\">\r\n<center><h1>502 Bad Gateway</h1></center>\r\n\
+<hr><center>alibaba-ga</center>\r\n</body>\r\n</html>\r\n) \
+and fallback failed: HTTP error: HTTP 502: upstream reset";
+        let color = Color::Rgb(200, 30, 30);
+        let lines = error_block_lines(raw, 80, color, true);
+        let joined = |line: &Line<'_>| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
+        let spacer = lines.first().expect("the spacer row");
+        assert_eq!(joined(spacer), "", "the block opens on a blank spacer");
+        let header = joined(lines.get(1).expect("the header row"));
+        assert!(
+            header.contains("✗ model request failed"),
+            "the header names the failure: {header}"
+        );
+        assert!(
+            header.contains("4 attempts"),
+            "the attempt count survives the parse: {header}"
+        );
+        assert!(
+            header.contains("HTTP 502"),
+            "the status survives the parse: {header}"
+        );
+        assert!(
+            header.contains("(alibaba-ga)"),
+            "the gateway tag survives the parse: {header}"
+        );
+        for (index, line) in lines.iter().enumerate() {
+            let row = joined(line);
+            assert!(
+                !row.chars().any(char::is_control),
+                "row {index} carries no control characters: {row:?}"
+            );
+            assert!(
+                str_width(&row) <= 80,
+                "row {index} stays inside the wrap width: {} cells",
+                str_width(&row)
+            );
+        }
+        assert!(
+            lines
+                .iter()
+                .any(|line| joined(line).contains("502 Bad Gateway")),
+            "the persisted detail still renders under the header"
+        );
+    }
+
+    #[test]
+    fn a_crafted_gateway_tag_bakes_clean_into_the_header() {
+        // The header's one provider-controlled span: an edge page that
+        // signs itself with terminal control bytes inside the
+        // `<center>` mark. The detail rows were always sanitized; the
+        // header must be too — the tag is parsed out of the raw body
+        // and interpolated verbatim, so the display policy applies at
+        // the parse, or the bytes the block exists to keep off cells
+        // ride the header in.
+        let raw = "API error: stream failed before completing after 2 attempts: \
+HTTP error: HTTP 500: <center>\u{1b}[2J\u{1b}[Hoops</center>";
+        let lines = error_block_lines(raw, 80, Color::Rgb(1, 2, 3), false);
+        let joined = |line: &Line<'_>| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
+        let header = joined(lines.first().expect("the header row"));
+        assert!(
+            header.contains("(oops)"),
+            "the tag's readable text survives the sanitize — the H belongs \
+             to the \\x1b[H escape the policy strips: {header}"
+        );
+        assert!(
+            !header.chars().any(|ch| ch.is_control() || ch == '\u{1b}'),
+            "the header carries no control bytes: {header:?}"
+        );
+        assert!(
+            !header.contains("[2J") && !header.contains("[H"),
+            "the escape sequences the crafted page carried are gone: {header:?}"
+        );
+    }
+
+    #[test]
+    fn a_gateway_tag_broken_across_rows_stays_one_header_row() {
+        // The sanitizer spells a carriage return as a break, and the
+        // header interpolates the tag on one line — a line nothing
+        // splits on, unlike the detail rows beneath it. A tag the edge
+        // page broke across its rows must collapse to spaces there, or
+        // the break byte rides a cell mid-frame.
+        let raw = "API error: HTTP error: HTTP 503: <center>ali\r\nbaba-ga</center>";
+        let lines = error_block_lines(raw, 80, Color::Rgb(1, 2, 3), false);
+        let header = lines
+            .first()
+            .expect("the header row")
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(
+            header.contains("(ali baba-ga)"),
+            "the tag's broken rows joined inside the parens: {header:?}"
+        );
+        assert!(
+            !header.chars().any(char::is_control),
+            "the header carries no control bytes: {header:?}"
+        );
+    }
+
+    #[test]
+    fn a_prose_failure_renders_as_its_text_without_a_header() {
+        // A cancellation or a compaction notice is prose: no API
+        // shape, no header, no indent — only the spacer separating the
+        // block from the rows above it.
+        let lines = error_block_lines("Agent cancelled", 40, Color::Rgb(1, 2, 3), true);
+        let joined = |line: &Line<'_>| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
+        assert_eq!(
+            lines.len(),
+            2,
+            "the spacer and the text, nothing else: {:?}",
+            lines.iter().map(&joined).collect::<Vec<_>>()
+        );
+        assert_eq!(joined(lines.first().expect("the spacer")), "");
+        assert_eq!(
+            joined(lines.get(1).expect("the text row")),
+            "Agent cancelled",
+            "prose renders verbatim, unindented"
+        );
+    }
+
+    #[test]
+    fn the_first_rows_of_a_bake_take_no_spacer() {
+        // An error that opens the pane — a resume whose transcript
+        // ends in a failure — starts at the top row, not one below it.
+        let lines = error_block_lines("provider unreachable", 40, Color::Rgb(1, 2, 3), false);
+        let joined = |line: &Line<'_>| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
+        assert_eq!(
+            joined(lines.first().expect("the first row")),
+            "provider unreachable",
+            "no spacer precedes the pane's first row"
+        );
+    }
+
+    #[test]
+    fn a_status_without_attempts_still_names_the_status() {
+        // A single-shot failure never reaches the attempt phrase, but
+        // its status is exactly the fact the header exists to carry —
+        // and no count is invented around it.
+        let lines = error_block_lines(
+            "API error: HTTP error: HTTP 503: upstream unavailable",
+            40,
+            Color::Rgb(1, 2, 3),
+            true,
+        );
+        let header = lines
+            .get(1)
+            .expect("the header row")
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(
+            header.contains("HTTP 503"),
+            "the status alone heads the block: {header}"
+        );
+        assert!(
+            !header.contains("attempts"),
+            "no count is invented: {header}"
+        );
+    }
+
+    #[test]
+    fn a_tool_recovery_shape_mints_no_model_request_header() {
+        // The attempt phrase belongs to the API shape alone: a
+        // tool-recovery failure carries `after {n} attempts` too, and
+        // without the API-prefix gate it would be misattributed to a
+        // model request that never happened.
+        let lines = error_block_lines(
+            "Tool recovery exhausted after 3 attempts: bash",
+            40,
+            Color::Rgb(1, 2, 3),
+            true,
+        );
+        assert!(
+            lines.iter().all(|line| !line
+                .spans
+                .iter()
+                .any(|span| span.content.contains("model request"))),
+            "no header is minted outside the API shape"
+        );
     }
 }

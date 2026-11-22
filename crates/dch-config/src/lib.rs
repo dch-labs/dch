@@ -2445,6 +2445,55 @@ mod tests {
     }
 
     #[test]
+    fn from_toml_str_rejects_a_read_ceiling_above_the_dispatch_cap() {
+        // The registry keeps the read pair ordered on purpose: the per-file
+        // ceiling must sit under the batch budget, or every batch degrades
+        // to its longest file plus budget markers. The load-time check is
+        // the only thing holding that order for configured values.
+        let err = DchConfig::from_toml_str(
+            "[runner]\nread_max_bytes = 200\nmax_tool_output_chars = 100\n",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                DchConfigError::Invalid(message)
+                    if message.contains("read_max_bytes = 200") && message.contains("100")
+            ),
+            "the rejection names the ceiling and the cap: {err:?}"
+        );
+    }
+
+    #[test]
+    fn from_toml_str_loads_a_read_ceiling_at_the_dispatch_cap() {
+        // The boundary: equal ceilings are the tightest legal pairing — a
+        // whole file view exactly fills the batch budget — so the check
+        // must reject only the strictly-greater side.
+        let config = DchConfig::from_toml_str(
+            "[runner]\nread_max_bytes = 100\nmax_tool_output_chars = 100\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.runner.read_max_bytes, 100,
+            "a ceiling at the cap is an accepted pairing"
+        );
+    }
+
+    #[test]
+    fn from_toml_str_lets_a_disabled_dispatch_cap_exempt_the_read_ceiling() {
+        // `max_tool_output_chars = 0` disables the dispatch cap, and with
+        // it the inversion the check guards against: an unbudgeted batch
+        // cannot cut a file view, so a larger read ceiling is harmless.
+        let config =
+            DchConfig::from_toml_str("[runner]\nread_max_bytes = 100\nmax_tool_output_chars = 0\n")
+                .unwrap();
+        assert_eq!(
+            config.runner.max_tool_output_chars, 0,
+            "a zero cap stays a disabled cap, not a floor"
+        );
+    }
+
+    #[test]
     fn the_output_cap_defaults_and_round_trips() {
         assert_eq!(
             DchConfig::default().runner.max_tool_output_chars,

@@ -233,6 +233,62 @@ pub fn init_terminal(mouse_capture: bool) -> io::Result<Terminal<CrosstermBacken
     initialized
 }
 
+/// Whether this session runs as a pane inside a terminal multiplexer.
+///
+/// The multiplexers name themselves in the environment: tmux exports
+/// `TMUX` for every pane, GNU screen `STY`, zellij `ZELLIJ`; tmux and
+/// screen also type the pane's `TERM` with their own prefix. Any one
+/// spelling is evidence enough; none needs a query or a subprocess to
+/// settle.
+fn multiplexer_client() -> bool {
+    multiplexer_client_of(
+        &[
+            std::env::var_os("TMUX"),
+            std::env::var_os("STY"),
+            std::env::var_os("ZELLIJ"),
+        ],
+        std::env::var_os("TERM").as_deref(),
+    )
+}
+
+/// The pure half of [`multiplexer_client`]: the same verdict over
+/// supplied spellings.
+///
+/// Split from the environment reader so the decision itself is
+/// pinnable without a process-wide environment write — any non-empty
+/// multiplexer variable, or a `TERM` beginning `tmux` or `screen`,
+/// settles multiplexed; anything else direct.
+fn multiplexer_client_of(
+    multiplexers: &[Option<std::ffi::OsString>; 3],
+    term: Option<&std::ffi::OsStr>,
+) -> bool {
+    multiplexers
+        .iter()
+        .any(|spelling| spelling.as_ref().is_some_and(|value| !value.is_empty()))
+        || term.is_some_and(|typed| {
+            let typed = typed.as_encoded_bytes();
+            typed.starts_with(b"tmux") || typed.starts_with(b"screen")
+        })
+}
+
+/// Whether the theme canvas is painted on the app's own cells.
+///
+/// A multiplexer shares one client terminal among panes: the default
+/// background an OSC 11 write retargets belongs to the client, not to
+/// this pane, and a pane's default-background cells repaint with
+/// whatever default was set last — another pane's theme, on every
+/// full redraw the multiplexer takes. Inside a multiplexer the canvas
+/// therefore never rides the terminal default: the frame paints it on
+/// its own cells, and no OSC 11/12 byte is written, so each pane is
+/// self-contained whatever its neighbours do — a theme switch
+/// repaints every cell through the diff, and a redraw shows each pane
+/// its own palette. Decided once per process; an app that renders
+/// under a pinned mode carries its own verdict instead.
+pub fn canvas_painted_locally() -> bool {
+    static LOCAL: OnceLock<bool> = OnceLock::new();
+    *LOCAL.get_or_init(multiplexer_client)
+}
+
 /// Point the terminal's default background at the session theme's
 /// canvas color.
 ///
@@ -254,6 +310,11 @@ pub fn init_terminal(mouse_capture: bool) -> io::Result<Terminal<CrosstermBacken
 /// deadline before the event reader starts, and typed-ahead input in
 /// that window is gated, not blindly consumed (the query's own doc
 /// records the accepted residual).
+///
+/// A multiplexed pane never reaches the exchange at all — its canvas
+/// is painted locally ([`canvas_painted_locally`]) — so this returns
+/// `false` there without a query: a locally painted caller is
+/// expected to stand its palette down from neither arm.
 ///
 /// Returns whether the override landed: `true` when the terminal
 /// answered and its default background now carries the theme's
@@ -321,6 +382,11 @@ pub(crate) struct QueryOutcome {
 /// mid-session halves. The caller owns stdin; the halves differ only
 /// in who guarantees that.
 fn query_and_install(background: Color) -> QueryOutcome {
+    if canvas_painted_locally() {
+        // A multiplexed pane never retargets the client-shared
+        // default: the canvas is painted on the app's own cells.
+        return QueryOutcome::default();
+    }
     let Color::Rgb(red, green, blue) = background else {
         return QueryOutcome::default();
     };
@@ -2149,6 +2215,53 @@ mod write_only_warranted_pins {
             );
             assert!(!write_only_warranted(Color::Reset));
         }
+    }
+}
+
+#[cfg(test)]
+mod canvas_verdict_pins {
+    use super::*;
+
+    #[test]
+    fn every_multiplexer_spelling_settles_local_painting() {
+        // The detector's whole vocabulary: tmux, GNU screen, and
+        // zellij each name themselves in the environment, and tmux
+        // and screen also type the pane's `TERM`. Any one spelling
+        // alone settles a multiplexed session; a direct terminal's
+        // spellings — and an empty variable — settle nothing.
+        fn term(value: &str) -> &std::ffi::OsStr {
+            std::ffi::OsStr::new(value)
+        }
+        let spelling = |value: &str| Some(std::ffi::OsString::from(value));
+        assert!(multiplexer_client_of(
+            &[spelling("/tmp/tmux-0/default,1,2"), None, None],
+            None
+        ));
+        assert!(multiplexer_client_of(
+            &[None, spelling("12345.dch"), None],
+            None
+        ));
+        assert!(multiplexer_client_of(
+            &[None, None, spelling("session-name")],
+            None
+        ));
+        assert!(multiplexer_client_of(
+            &[None, None, None],
+            Some(term("tmux-256color"))
+        ));
+        assert!(multiplexer_client_of(
+            &[None, None, None],
+            Some(term("screen.linux"))
+        ));
+        assert!(!multiplexer_client_of(
+            &[None, None, None],
+            Some(term("xterm-256color"))
+        ));
+        assert!(!multiplexer_client_of(
+            &[spelling(""), spelling(""), spelling("")],
+            Some(term("xterm-truecolor"))
+        ));
+        assert!(!multiplexer_client_of(&[None, None, None], None));
     }
 }
 

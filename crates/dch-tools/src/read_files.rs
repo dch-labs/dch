@@ -411,6 +411,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exactly_ten_files_are_accepted() {
+        // The boundary on the accepted side of the cap: a batch at
+        // MAX_FILES_PER_CALL itself is served, so the check cuts only
+        // the strictly-greater sizes.
+        let (tool, tmp) = tool_in_tmp();
+        let names: Vec<String> = (0..MAX_FILES_PER_CALL)
+            .map(|i| format!("f{i}.rs"))
+            .collect();
+        for name in &names {
+            std::fs::write(tmp.path().join(name), "kept\n").unwrap();
+        }
+        let ctx = ctx_in(tmp.path());
+        let out = tool
+            .call(json!({ "files": names }), &ctx)
+            .await
+            .expect("a batch at the cap is served");
+        assert!(!out.is_error, "{}", out.text_content());
+        assert_eq!(
+            out.text_content().matches("kept").count(),
+            MAX_FILES_PER_CALL,
+            "every file at the cap arrives"
+        );
+    }
+
+    #[tokio::test]
     async fn a_batched_read_arms_the_staleness_guard_for_every_file_in_the_batch() {
         // The batch dispatches through the session's shared file source, so
         // each path in the call records the read baseline the single-file

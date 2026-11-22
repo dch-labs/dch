@@ -1506,8 +1506,13 @@ fn fit_picker_title_pads_and_truncates_by_display_cells() {
         "the cap is a cell budget, never a character count: {capped:?}"
     );
     assert!(
-        capped.ends_with('…'),
+        capped.contains('…'),
         "the cap keeps its head visible: {capped:?}"
+    );
+    assert!(
+        str_width(&capped) == 24,
+        "a truncated title pads to the same column edge as a short one: {capped:?} is {} cells",
+        str_width(&capped)
     );
     let joined = format!(
         "前\u{2714}\u{fe0f}\u{1f468}\u{200d}\u{1f469}{}",
@@ -2919,5 +2924,708 @@ fn the_pulse_bar_runs_on_the_runs_clock_not_the_streams() {
         bar > 8,
         "a run 900 ms old grows the bar wide ({bar} cells), not the one-cell seed \
              a fresh stream's clock would draw"
+    );
+}
+
+#[test]
+fn a_local_canvas_switch_repaints_the_transparent_regions() {
+    // The tmux incident, pinned at the scene: a multiplexed pane
+    // cannot lean on the client-shared default background, so the
+    // frame paints the canvas itself. A dark→light switch must then
+    // repaint the regions a direct terminal leaves transparent — the
+    // conversation rows, the todo section's rows, the composer's
+    // surroundings — in the new palette's own canvas, and the palette
+    // never defers: its colors are anchored on the canvas the frame
+    // paints beneath them. Every light palette walks the same scene:
+    // each carries its own canvas and surface, and the switch must
+    // land whichever of them the command names.
+    use crate::message::{ContentBlock, TuiMessage};
+    use crate::todo_view::{TodoRow, TodoStatus};
+    let dark = ratatui::style::Color::Rgb(12, 12, 12);
+    for key in [
+        "gruvbox_light",
+        "solarized_light",
+        "catppuccin_latte",
+        "github_light",
+    ] {
+        let mut subject = app();
+        subject.set_canvas_painted_locally(true);
+        subject.plan.latest_todos = vec![TodoRow {
+            id: "t1".to_string(),
+            subject: "hunt the stale background".to_string(),
+            status: TodoStatus::InProgress,
+        }];
+        subject.push_message(TuiMessage::Assistant {
+            blocks: vec![ContentBlock::Text {
+                text: "conversation body".to_string(),
+            }],
+            timestamp: chrono::Utc::now(),
+            duration_ms: Some(10),
+        });
+        let theme = Theme::by_name(key).unwrap_or_default();
+        let light = theme.ui.background;
+        let surface = theme.ui.surface;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| subject.render(frame)).unwrap();
+        assert_eq!(
+            terminal.backend().buffer().cell((0, 0)).unwrap().bg,
+            dark,
+            "[{key}] the dark frame paints its own canvas, not a transparent one"
+        );
+        command_output(&mut subject, &format!("/theme {key}"));
+        terminal.draw(|frame| subject.render(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        for (x, y) in [
+            (0, 0),
+            (79, 0),
+            (40, 12),
+            (0, 16),
+            (79, 16),
+            (0, 21),
+            (40, 21),
+        ] {
+            assert_eq!(
+                buffer.cell((x, y)).unwrap().bg,
+                light,
+                "[{key}] the transparent row {y} repaints in the light canvas"
+            );
+        }
+        // The conversation pane erases itself before its view lands;
+        // the erase must not come back transparent under the local
+        // canvas — the band it cleared repaints in the palette's own
+        // canvas, or the whole conversation would ride the
+        // multiplexer's shared default again.
+        for y in 1..=8u16 {
+            for x in [0, 40, 79] {
+                assert_ne!(
+                    buffer.cell((x, y)).unwrap().bg,
+                    ratatui::style::Color::Reset,
+                    "[{key}] the conversation pane's erased row {y} keeps the painted \
+                     canvas at x={x}"
+                );
+            }
+            assert_eq!(
+                buffer.cell((40, y)).unwrap().bg,
+                light,
+                "[{key}] the conversation pane's row {y} carries the light canvas"
+            );
+        }
+        assert_eq!(
+            buffer.cell((40, 17)).unwrap().bg,
+            surface,
+            "[{key}] the composer box keeps its own surface fill"
+        );
+        assert_ne!(
+            subject.theme.ui.foreground,
+            ratatui::style::Color::Reset,
+            "[{key}] a locally painted canvas never defers the palette's foreground"
+        );
+    }
+}
+
+#[test]
+fn a_locally_painted_frame_leaves_no_terminal_default_behind() {
+    // The invariant the canvas walk enforces, at the scene it was
+    // written for: a fenced code block's panel — transparent by
+    // design on a direct terminal, where the terminal default *is*
+    // the canvas — must not survive as a `Reset` band under the
+    // locally painted canvas, or the multiplexer's shared default
+    // would show through it as an unthemed block, whatever palette
+    // the session wears. No cell in the frame may end on the default.
+    use crate::message::{ContentBlock, TuiMessage};
+    let mut subject = app();
+    subject.set_canvas_painted_locally(true);
+    subject.push_message(TuiMessage::Assistant {
+        blocks: vec![ContentBlock::Text {
+            text: "suggestion:\n```\nfix: the stale canvas hole\n```\ndone".to_string(),
+        }],
+        timestamp: chrono::Utc::now(),
+        duration_ms: Some(10),
+    });
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    terminal.draw(|frame| subject.render(frame)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let defaults: Vec<(u16, u16)> = (0..buffer.area.height)
+        .flat_map(|y| {
+            (0..buffer.area.width).filter_map(move |x| {
+                (buffer.cell((x, y)).unwrap().bg == ratatui::style::Color::Reset).then_some((x, y))
+            })
+        })
+        .collect();
+    assert!(
+        defaults.is_empty(),
+        "the locally painted frame leaves {} cells on the terminal default, \
+         first at {:?}",
+        defaults.len(),
+        defaults.first(),
+    );
+}
+
+#[test]
+fn a_locally_painted_frame_themes_the_diff_s_context_rows() {
+    // The Edit receipt's diff, under the locally painted canvas: the
+    // banded rows keep their fixed GitHub hues — bands carry their own
+    // contrast by design — but the context rows between them owe the
+    // theme's ground, not the terminal default. The stale shape this
+    // pin retires painted the unpainted rows `Reset`, which a direct
+    // terminal reads as its canvas and a multiplexed one as a black
+    // band through every palette.
+    use crate::message::{ContentBlock, TuiMessage};
+    let receipt = [
+        "Changed: src/lib.rs (modified)",
+        "│ 1 line removed, 1 added",
+        "@@ -1,2 +1,2 @@",
+        "  fn main() {",
+        "-     old();",
+        "+     new();",
+        "  }",
+    ]
+    .join("\n");
+    let mut subject = app();
+    subject.set_canvas_painted_locally(true);
+    subject.retain_tool_detail("call_edit", "{}", &receipt);
+    subject
+        .expansion
+        .expanded_tools
+        .insert("call_edit".to_string());
+    subject.theme = Theme::by_name("github_light").unwrap();
+    subject.push_message(TuiMessage::Assistant {
+        blocks: vec![ContentBlock::Tool {
+            name: "Edit".to_string(),
+            call_id: "call_edit".to_string(),
+            input_preview: "src/lib.rs".to_string(),
+            output_preview: receipt,
+            retained_input: "{}".to_string(),
+            success: true,
+            elapsed_secs: 0.1,
+        }],
+        timestamp: chrono::Utc::now(),
+        duration_ms: None,
+    });
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    terminal.draw(|frame| subject.render(frame)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let canvas = subject.theme.ui.background;
+    let defaults: Vec<(u16, u16)> = (0..buffer.area.height)
+        .flat_map(|y| {
+            (0..buffer.area.width).filter_map(move |x| {
+                (buffer.cell((x, y)).unwrap().bg == ratatui::style::Color::Reset).then_some((x, y))
+            })
+        })
+        .collect();
+    assert!(
+        defaults.is_empty(),
+        "the diff frame leaves {} cells on the terminal default, first at {:?}",
+        defaults.len(),
+        defaults.first(),
+    );
+    // The context row — `fn main() {` under its address gutter — sits
+    // on the theme's canvas, the same ground the pane paints.
+    let context_row = (0..buffer.area.height)
+        .find(|&y| {
+            (0..buffer.area.width).any(|x| {
+                buffer.cell((x, y)).is_some_and(|cell| cell.symbol() == "f")
+                    && buffer
+                        .cell((x.saturating_add(1), y))
+                        .is_some_and(|cell| cell.symbol() == "n")
+            })
+        })
+        .expect("the diff's context row renders");
+    for x in 10..50u16 {
+        assert_eq!(
+            buffer.cell((x, context_row)).unwrap().bg,
+            canvas,
+            "the context row's cell at x={x} rides the theme canvas"
+        );
+    }
+    // The banded rows keep their explicit fills: the walk replaces
+    // only the terminal default, never a color a span painted. The
+    // removal row reads as one solid band across the pane — its own
+    // hue, not the canvas, not the default.
+    let band_row = (0..buffer.area.height)
+        .find(|&y| {
+            (0..buffer.area.width).any(|x| {
+                buffer.cell((x, y)).is_some_and(|cell| cell.symbol() == "o")
+                    && buffer
+                        .cell((x.saturating_add(1), y))
+                        .is_some_and(|cell| cell.symbol() == "l")
+                    && buffer
+                        .cell((x.saturating_add(2), y))
+                        .is_some_and(|cell| cell.symbol() == "d")
+            })
+        })
+        .expect("the diff's removal row renders");
+    let band = buffer.cell((30, band_row)).unwrap().bg;
+    assert_ne!(
+        band,
+        ratatui::style::Color::Reset,
+        "the removal band is a painted color, not the terminal default"
+    );
+    assert_ne!(
+        band, canvas,
+        "the removal band keeps its own hue, not the canvas the walk paints"
+    );
+    for x in 10..70u16 {
+        assert_eq!(
+            buffer.cell((x, band_row)).unwrap().bg,
+            band,
+            "the removal row's padded cell at x={x} keeps the band"
+        );
+    }
+    // The pane's own right gutter is not the band's to paint: the
+    // line fills its wrap width and the chrome beside it rides the
+    // canvas like every other ground the frame owns.
+    assert_eq!(
+        buffer.cell((79, band_row)).unwrap().bg,
+        canvas,
+        "the pane's gutter column beside the band rides the canvas"
+    );
+}
+
+#[test]
+fn a_locally_painted_welcome_leaves_no_terminal_default_behind() {
+    // The welcome screen under the same contract: the art band's
+    // pixels, its dissolved margins, the notice rows, and the
+    // centered composer all land on painted ground. The fresh
+    // session — no messages, the welcome still standing — is the
+    // first frame a user sees, and it may not lean on the shared
+    // default any more than a settled conversation does.
+    let mut subject = app();
+    subject.set_canvas_painted_locally(true);
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    terminal.draw(|frame| subject.render(frame)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let defaults: Vec<(u16, u16)> = (0..buffer.area.height)
+        .flat_map(|y| {
+            (0..buffer.area.width).filter_map(move |x| {
+                (buffer.cell((x, y)).unwrap().bg == ratatui::style::Color::Reset).then_some((x, y))
+            })
+        })
+        .collect();
+    assert!(
+        defaults.is_empty(),
+        "the locally painted welcome leaves {} cells on the terminal default, \
+         first at {:?}",
+        defaults.len(),
+        defaults.first(),
+    );
+}
+
+#[test]
+fn a_confirm_spends_the_prompt_it_armed_not_the_one_that_slid_into_view() {
+    // The review's interleaving, pinned: three prompts wait, the view
+    // shows the middle one, the drop ask arms against its id — and a
+    // claim then takes the front prompt. The view still points in
+    // range, now at the third prompt. `y` must spend the prompt the
+    // ask named, never the stranger that slid into the view's
+    // position: resolving the act by display position destroys a
+    // prompt the user never aimed at.
+    use super::queue::QueueAct;
+    let mut subject = app();
+    for text in ["first", "second", "third"] {
+        subject.push_queued(text.to_string());
+    }
+    subject.queue.queue_mode = QueueMode::Focused;
+    subject.queue.queue_view = 1;
+    assert!(
+        subject.queue_focused_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)),
+        "the arming press is swallowed by the section"
+    );
+    let QueueMode::Confirming { act, id } = subject.queue.queue_mode else {
+        panic!("the drop ask armed");
+    };
+    assert!(matches!(act, QueueAct::Drop), "the ask is a drop");
+    assert_eq!(id, 1, "the ask armed against the shown prompt's id");
+    // The driver claims the front prompt — every claim takes the
+    // oldest — sliding `third` into the view's position.
+    let claimed = subject.remove_queued(0);
+    assert_eq!(
+        claimed.as_deref(),
+        Some("first"),
+        "the claim took the front"
+    );
+    assert_eq!(
+        subject.queued_at(1).map(|(_, text)| text),
+        Some("third".to_string()),
+        "the stale view now points at the stranger"
+    );
+    assert!(
+        subject.queue_confirm_key(
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+            act,
+            id
+        ),
+        "the confirm is swallowed by the section"
+    );
+    let remaining: Vec<String> = (0..subject.queued_len())
+        .filter_map(|index| subject.queued_at(index).map(|(_, text)| text))
+        .collect();
+    assert_eq!(
+        remaining,
+        vec!["third".to_string()],
+        "the armed prompt is spent and the stranger survives"
+    );
+}
+
+#[test]
+fn a_confirm_stands_down_when_the_armed_prompt_was_claimed() {
+    // The ask's own gate: when the claim takes the prompt the ask
+    // armed against — not a neighbour, the prompt itself — `y` spends
+    // nothing. The notice says the confirmation stood down, and the
+    // queue keeps every prompt that survived the claim.
+    let mut subject = app();
+    for text in ["first", "second"] {
+        subject.push_queued(text.to_string());
+    }
+    subject.queue.queue_mode = QueueMode::Focused;
+    subject.queue.queue_view = 1;
+    assert!(subject.queue_focused_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)));
+    let QueueMode::Confirming { act, id } = subject.queue.queue_mode else {
+        panic!("the drop ask armed");
+    };
+    assert_eq!(id, 1, "the ask armed against the shown prompt");
+    let _claimed = subject.remove_queued(1);
+    assert!(subject.queue_confirm_key(
+        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        act,
+        id
+    ));
+    assert_eq!(
+        subject.notice_text().as_deref(),
+        Some("the prompt left the queue — the confirmation stood down"),
+        "the confirm says it stood down rather than spending silently"
+    );
+    assert_eq!(
+        subject.queued_len(),
+        1,
+        "the surviving prompt keeps its place"
+    );
+    assert_eq!(
+        subject.queued_at(0).map(|(_, text)| text),
+        Some("first".to_string()),
+        "the survivor is the claim's neighbour, untouched"
+    );
+}
+
+#[test]
+fn a_steer_act_refuses_to_duplicate_a_claimed_prompt() {
+    // The steer arm under the same claim window: the ask armed against
+    // a prompt the running turn has since claimed. `y` must not steer
+    // whatever slid into the view — the guide refuses, the notice
+    // names the refusal, and the queue keeps its survivors whole.
+    use super::queue::QueueAct;
+    let mut subject = app();
+    for text in ["first", "second", "third"] {
+        subject.push_queued(text.to_string());
+    }
+    subject
+        .state
+        .agent_running
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    subject.queue.queue_mode = QueueMode::Focused;
+    subject.queue.queue_view = 1;
+    assert!(subject.queue_focused_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)));
+    let QueueMode::Confirming { act, id } = subject.queue.queue_mode else {
+        panic!("the steer ask armed");
+    };
+    assert!(matches!(act, QueueAct::Steer), "the ask is a steer");
+    // The narrow race, modeled head-on: the confirm's gate saw the
+    // prompt stand, and the claim takes it in the window between that
+    // gate and the act's own removal — so the act is driven with the
+    // armed id after the removal, exactly the state the window leaves.
+    let _claimed = subject.remove_queued(1);
+    subject.steer_queued(id);
+    assert_eq!(
+        subject.notice_text().as_deref(),
+        Some("the prompt left the queue before the guide landed"),
+        "the guide names its refusal rather than duplicating the claim"
+    );
+    let remaining: Vec<String> = (0..subject.queued_len())
+        .filter_map(|index| subject.queued_at(index).map(|(_, text)| text))
+        .collect();
+    assert_eq!(
+        remaining,
+        vec!["first".to_string(), "third".to_string()],
+        "the survivors keep their order, nothing steered"
+    );
+}
+
+#[test]
+fn an_ask_never_arms_against_a_stale_view() {
+    // The arming rule: an ask needs a prompt on screen. A view left
+    // pointing past the end — a claim landed since the last frame
+    // clamped it — arms nothing; the press stands down, the view
+    // clamps, and no confirmation mode carries a defaulted id that
+    // could name a real prompt.
+    let mut subject = app();
+    subject.push_queued("only".to_string());
+    subject.queue.queue_mode = QueueMode::Focused;
+    subject.queue.queue_view = 3;
+    assert!(
+        subject.queue_focused_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)),
+        "the press is still swallowed by the section"
+    );
+    assert_eq!(
+        subject.queue.queue_mode,
+        QueueMode::Focused,
+        "no ask armed against the stale view"
+    );
+    assert_eq!(subject.queued_len(), 1, "the waiting prompt is untouched");
+}
+
+#[test]
+fn a_refused_guide_delivers_a_slash_spelled_prompt_as_words() {
+    // The literal-delivery half of the steer act: guidance refused —
+    // nothing to steer into — the armed prompt's words become their
+    // own turn exactly as written. A prompt spelling `/clear` reaches
+    // the conversation as the user's words, not as the command it
+    // happens to spell: the session's history survives the delivery.
+    use crate::message::{ContentBlock, TuiMessage};
+    let mut subject = app();
+    subject.push_message(TuiMessage::Assistant {
+        blocks: vec![ContentBlock::Text {
+            text: "history that must survive".to_string(),
+        }],
+        timestamp: chrono::Utc::now(),
+        duration_ms: None,
+    });
+    subject.push_queued("/clear".to_string());
+    subject
+        .state
+        .agent_running
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    subject.queue.queue_mode = QueueMode::Focused;
+    subject.queue.queue_view = 0;
+    assert!(subject.queue_focused_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)));
+    let QueueMode::Confirming { act, id } = subject.queue.queue_mode else {
+        panic!("the steer ask armed");
+    };
+    assert!(subject.queue_confirm_key(
+        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        act,
+        id
+    ));
+    assert_eq!(subject.queued_len(), 0, "the guided prompt left the queue");
+    let delivered = subject.conversation.iter().any(|message| match message {
+        TuiMessage::User { text, .. } => text == "/clear",
+        _ => false,
+    });
+    assert!(
+        delivered,
+        "the slash-spelled prompt landed in the conversation as literal words"
+    );
+    assert!(
+        subject.conversation.iter().any(|message| match message {
+            TuiMessage::Assistant { blocks, .. } => blocks.iter().any(
+                |block| matches!(block, ContentBlock::Text { text } if text.contains("survive"))
+            ),
+            _ => false,
+        }),
+        "the command it spelled never ran — the history stands"
+    );
+}
+
+#[test]
+fn a_locally_painted_question_sheet_paints_its_own_ground() {
+    // The one overlay that renders after the canvas walk: the
+    // question sheet. It renders after `Clear` with fg-only styles,
+    // so before its own ground it left the sheet's whole rectangle on
+    // the terminal default — the shared multiplexer background, the
+    // exact hole the walk exists to close. The sheet paints the
+    // theme's surface like its permission sibling, and no cell in the
+    // frame — the sheet's rows included — ends on the default.
+    use crate::question::{QuestionChoice, QuestionPrompt};
+    let mut subject = app();
+    subject.set_canvas_painted_locally(true);
+    let (reply, _reply_rx) = tokio::sync::oneshot::channel();
+    subject
+        .questions
+        .pending_questions
+        .push_back(crate::app::questions::PendingQuestion::new(
+            QuestionPrompt {
+                question: "Deploy where?".to_string(),
+                header: Some("Ask".to_string()),
+                options: vec![
+                    QuestionChoice {
+                        label: "staging".to_string(),
+                        description: None,
+                    },
+                    QuestionChoice {
+                        label: "production".to_string(),
+                        description: None,
+                    },
+                ],
+                multi_select: false,
+                reply,
+            },
+        ));
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    terminal.draw(|frame| subject.render(frame)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let defaults: Vec<(u16, u16)> = (0..buffer.area.height)
+        .flat_map(|y| {
+            (0..buffer.area.width).filter_map(move |x| {
+                (buffer.cell((x, y)).unwrap().bg == ratatui::style::Color::Reset).then_some((x, y))
+            })
+        })
+        .collect();
+    assert!(
+        defaults.is_empty(),
+        "the seated question sheet leaves {} cells on the terminal default, \
+         first at {:?}",
+        defaults.len(),
+        defaults.first(),
+    );
+    let question_row = (0..buffer.area.height)
+        .find(|&y| {
+            (0..buffer.area.width).any(|x| {
+                buffer.cell((x, y)).is_some_and(|cell| cell.symbol() == "D")
+                    && buffer
+                        .cell((x.saturating_add(1), y))
+                        .is_some_and(|cell| cell.symbol() == "e")
+            })
+        })
+        .expect("the question sheet's title row renders");
+    assert_eq!(
+        buffer.cell((40, question_row)).unwrap().bg,
+        subject.theme.ui.surface,
+        "the sheet's row rides the theme surface, its own ground"
+    );
+}
+
+#[test]
+fn the_cost_command_agrees_with_the_bar_at_an_odd_window() {
+    // S1's contract, pinned at the number: `/cost` reads the same
+    // snapshot the context bar draws from and rounds it the same way,
+    // so the two figures a user can see side by side never disagree.
+    // The window is odd on purpose — an even split needs no rounding
+    // and would hide the half-up the two computations must share — and
+    // the usage crosses the window, the overshoot case where the old
+    // clamped bar and the command's unclamped number parted ways.
+    let mut subject = app();
+    subject
+        .state
+        .context_window
+        .store(3, std::sync::atomic::Ordering::SeqCst);
+    subject
+        .state
+        .tokens
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .context_tokens = 7;
+    subject.cost_command();
+    let report = subject
+        .conversation
+        .iter()
+        .rev()
+        .find_map(|message| match message {
+            TuiMessage::System { text, .. } if text.starts_with("Context: ") => Some(text.clone()),
+            _ => None,
+        })
+        .expect("the cost report landed");
+    let (bar_percent, bar_counts) = context_bar_readout(7, 3).expect("the bar reads a live window");
+    let command_percent = report
+        .strip_prefix("Context: 7 of 3 tokens used (")
+        .and_then(|rest| rest.strip_suffix("% full)."))
+        .unwrap_or_default();
+    assert_eq!(
+        command_percent,
+        bar_percent.trim_end_matches('%'),
+        "the command's percent and the bar's percent are the same figure: {report} vs \
+         {bar_percent}/{bar_counts}"
+    );
+}
+
+#[test]
+fn a_live_model_switch_that_fails_its_save_says_it_stands_live() {
+    // S2's wording, pinned: a model switch is live the moment the
+    // loop takes it, so a failed config save must not claim the value
+    // "was never applied" — the restart-class phrasing every other
+    // key's failure carries. The save is made to fail against a path
+    // a file already occupies, and the notice names the truth: the
+    // switch is live, the save is what failed.
+    let mut subject = app();
+    let occupied = tempfile::NamedTempFile::new().expect("a file where the dir should be");
+    subject.config_writes.config_persist_dir = Some(occupied.path().to_path_buf());
+    subject.persist_config("model");
+    let notice = subject.notice_text().unwrap_or_default();
+    assert!(
+        notice.starts_with("the switch is live but not saved — the config save failed: "),
+        "the failure names the live switch, not a value never applied: {notice}"
+    );
+}
+
+#[test]
+fn an_empty_session_catalog_answers_with_a_notice() {
+    // S4's empty-catalog reply, pinned: `/sessions` against a catalog
+    // with nothing in it says so on the notice row — the user asked
+    // and deserves an answer, not a blank screen — and seats no
+    // picker there is nothing to seat.
+    let mut subject = app();
+    subject.open_session_picker(Vec::new());
+    assert_eq!(
+        subject.notice_text().as_deref(),
+        Some("no saved sessions yet — one is saved on exit"),
+        "the empty catalog answers aloud"
+    );
+    assert!(
+        subject.pickers.session_picker.is_none(),
+        "no picker opens over an empty catalog"
+    );
+}
+
+#[test]
+fn the_queued_and_todo_sections_share_their_left_margin() {
+    // The two standing panels above the composer are one family of
+    // furniture: the QUEUED badge and the TODO badge sit at the same
+    // column, and the queued prompt's rows start where the plan's rows
+    // do. A section painted flush against its pane's edge while its
+    // sibling insets reads as a stray strip, not a named region.
+    use crate::todo_view::{TodoRow, TodoStatus};
+    let mut subject = app();
+    subject.plan.latest_todos = vec![TodoRow {
+        id: "t1".to_string(),
+        subject: "align the standing panels".to_string(),
+        status: TodoStatus::InProgress,
+    }];
+    for text in ["first queued", "second queued"] {
+        subject.push_queued(text.to_string());
+    }
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    terminal.draw(|frame| subject.render(frame)).unwrap();
+    let buffer = terminal.backend().buffer();
+    let first_marked_column = |row: u16| {
+        (0..buffer.area.width).find(|&x| {
+            buffer
+                .cell((x, row))
+                .is_some_and(|cell| cell.symbol() != " " && cell.symbol() != "")
+        })
+    };
+    let todo_row = (0..buffer.area.height)
+        .find(|&y| {
+            (0..buffer.area.width).any(|x| {
+                buffer.cell((x, y)).is_some_and(|cell| cell.symbol() == "T")
+                    && buffer
+                        .cell((x.saturating_add(1), y))
+                        .is_some_and(|cell| cell.symbol() == "O")
+            })
+        })
+        .expect("the TODO badge renders");
+    let queued_row = (0..buffer.area.height)
+        .find(|&y| {
+            (0..buffer.area.width).any(|x| {
+                buffer.cell((x, y)).is_some_and(|cell| cell.symbol() == "Q")
+                    && buffer
+                        .cell((x.saturating_add(1), y))
+                        .is_some_and(|cell| cell.symbol() == "U")
+            })
+        })
+        .expect("the QUEUED badge renders");
+    assert_ne!(todo_row, queued_row, "the two badges are separate rows");
+    assert_eq!(
+        first_marked_column(todo_row),
+        first_marked_column(queued_row),
+        "the TODO and QUEUED badges sit at the same column"
     );
 }

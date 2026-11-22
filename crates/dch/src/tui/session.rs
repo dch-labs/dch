@@ -297,10 +297,14 @@ pub(crate) async fn run_tui_session(args: &Args, control: ResumeControl) -> Resu
     TerminalGuard::install_panic_hook();
     let (guard, mut terminal) = TerminalGuard::new(driver_config.display.mouse_capture)
         .map_err(|err| format!("terminal init: {err}"))?;
-    if dch_tui::sync_default_background(app.theme.ui.background) {
-        dch_tui::set_cursor_color(app.theme.ui.primary);
-    } else {
-        app.theme = app.theme.deferred_to_terminal();
+    let canvas_local = dch_tui::terminal::canvas_painted_locally();
+    app.set_canvas_painted_locally(canvas_local);
+    if !canvas_local {
+        if dch_tui::sync_default_background(app.theme.ui.background) {
+            dch_tui::set_cursor_color(app.theme.ui.primary);
+        } else {
+            app.theme = app.theme.deferred_to_terminal();
+        }
     }
     dch_tui::arm_fatal_signal_restore();
 

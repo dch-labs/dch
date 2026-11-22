@@ -73,7 +73,7 @@ use dch_config::{DchConfig, StripPosition, StripStyle, Verbosity};
 
 use self::composer::INPUT_SIDE_INSET;
 use self::exit::QuitState;
-use self::notices::{NOTICE_HOLD, format_duration, plain_wrapped_lines};
+use self::notices::{NOTICE_HOLD, error_block_lines, format_duration, plain_wrapped_lines};
 use self::paint::welcome::{WelcomeShape, WelcomeState, leading_sky_rows};
 use self::queue::QueueMode;
 use self::run::FRAME_INTERVAL;
@@ -313,6 +313,23 @@ pub struct TuiApp {
     /// Resolved from `config.display.theme` at construction; an
     /// unknown name warns and falls back to the default theme.
     pub theme: Theme,
+
+    /// Whether the theme canvas is painted on the frame's own cells.
+    ///
+    /// A multiplexed terminal shares its default background among
+    /// panes, so a pane whose regions lean on that default renders
+    /// whatever the last pane to write it chose — stale after a
+    /// switch, cross-contaminated on a redraw. When this stands the
+    /// frame paints the canvas itself, theme switches never query,
+    /// write, or defer, and every region carries a background the
+    /// palette itself owns. The shell stands in the direct shape; the
+    /// driver reads the environment at launch — a multiplexer's
+    /// spelling: `TMUX`, `STY`, `ZELLIJ`, or a `tmux`/`screen`
+    /// terminal type — and pins the multiplexed mode through
+    /// [`TuiApp::set_canvas_painted_locally`], so a harness that
+    /// renders frames pins the mode it asserts whatever machine it
+    /// runs on.
+    pub(crate) canvas_local: bool,
 
     /// The conversation so far, oldest first.
     ///
@@ -565,6 +582,7 @@ impl TuiApp {
         );
         Self {
             theme,
+            canvas_local: false,
             conversation: Vec::new(),
             state,
             copy,
@@ -1718,6 +1736,12 @@ impl TuiApp {
         self.drain_shared_state();
         self.sync_queue_view();
         let area = frame.area();
+        paint::conversation::paint_local_canvas(
+            frame,
+            area,
+            self.theme.ui.background,
+            self.canvas_local,
+        );
         if !self.welcome.welcome_retired && !self.conversation.is_empty() {
             self.welcome.welcome_retired = true;
             self.pacing.full_repaint_due = Some(Instant::now());
@@ -1840,6 +1864,14 @@ impl TuiApp {
             frame,
             pane(&chunks, composer_at.saturating_add(1), fallback),
         );
+        // The canvas contract's last word, in the mode that paints it:
+        // no cell may carry the terminal default — a widget that
+        // paints `Reset` (the code panel's transparent band, a diff's
+        // unbanded rows) would open a hole the multiplexer's shared
+        // default shows through, whatever the palette.
+        if self.canvas_local {
+            close_local_canvas(frame, self.theme.ui.background);
+        }
         if let Some(sheet) = self.permission.shown_permission() {
             self.render_permission_overlay(frame, area, &sheet);
             return;
@@ -2187,15 +2219,18 @@ impl TuiApp {
     ///
     /// Assistant text goes through the markdown pipeline with the
     /// assistant base color; user and system messages render as
-    /// single styled lines; error messages wrap as styled plaintext
-    /// at the pane width, so a long failure body stays readable
-    /// instead of clipping at the right edge; a completed tool
-    /// block renders its verbosity-shaped summary line(s) between
-    /// the text blocks around it. A blank line separates a user
-    /// message from the agent material beside it, and each user
-    /// turn opens and closes with a padding row the caller tints as
-    /// part of its box — pad and blank together are the boundary's
-    /// breathing room. The live region
+    /// single styled lines; error messages render as their own
+    /// block — a spacer row keeps the failure apart from whatever it
+    /// landed beneath, a parsed header names the failure's facts when
+    /// the well-known API shape carries them, and the detail wraps as
+    /// styled plaintext at the pane width, so a long failure body
+    /// stays readable instead of clipping at the right edge; a
+    /// completed tool block renders its verbosity-shaped summary
+    /// line(s) between the text blocks around it. A blank line
+    /// separates a user message from the agent material beside it,
+    /// and each user turn opens and closes with a padding row the
+    /// caller tints as part of its box — pad and blank together are
+    /// the boundary's breathing room. The live region
     /// (streaming text, in-flight tools) is assembled by the caller.
     fn conversation_lines(
         &self,
@@ -2320,10 +2355,16 @@ impl TuiApp {
                     }
                 }
                 TuiMessage::Error { text, .. } => {
-                    lines.extend(plain_wrapped_lines(
+                    // Rows stand above unless the block opens the
+                    // document itself — the tail bake re-renders the
+                    // last message alone, so the segment's own emptiness
+                    // proves nothing about the pane.
+                    let rows_above = !lines.is_empty() || start > 0;
+                    lines.extend(error_block_lines(
                         text,
-                        usize::from(width),
+                        width,
                         self.theme.ui.status_error,
+                        rows_above,
                     ));
                 }
                 message @ TuiMessage::Compacted { .. } => {
@@ -2436,6 +2477,25 @@ type SelectableShape = (usize, usize, usize, usize, usize, usize, usize);
 /// fallback keeps rendering total if a shorter split ever appears.
 fn pane(chunks: &[Rect], index: usize, fallback: Rect) -> Rect {
     chunks.get(index).copied().unwrap_or(fallback)
+}
+
+/// Close a locally painted frame: replace every cell still carrying
+/// the terminal default with the palette's canvas.
+///
+/// The canvas contract's last word in the mode that paints it. On a
+/// direct terminal the default background *is* the canvas, so a
+/// widget may paint `Reset` — the code panel's transparent band, a
+/// diff's unbanded rows — and read as transparent. Under the locally
+/// painted canvas the same cell is a hole the multiplexer's shared
+/// default shows through, unthemed in every palette, so one walk
+/// after the furniture closes the whole class: no cell the frame
+/// leaves behind renders anything but the palette's own ground.
+fn close_local_canvas(frame: &mut Frame, canvas: ratatui::style::Color) {
+    for cell in &mut frame.buffer_mut().content {
+        if cell.bg == ratatui::style::Color::Reset {
+            cell.set_bg(canvas);
+        }
+    }
 }
 
 /// The boot-time permission pair a stand-in config save restores.

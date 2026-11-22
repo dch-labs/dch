@@ -1150,9 +1150,20 @@ fn the_composer_greys_out_while_the_section_holds_the_keys() {
         .filter(|row| row.first().is_some_and(|(_, _, bg)| *bg == dim))
         .count();
     assert_eq!(
-        dim_edges, 5,
-        "the section's focus greys the composer's edge out — four edge rows, \
-         plus the badge whose traded secondary is dracula's dim twin"
+        dim_edges, 4,
+        "the section's focus greys the composer's edge out — four edge rows \
+         at the composer's own column; the badge sits at the section's \
+         inset now, off this column, and joins the count below"
+    );
+    let badge_row = greyed.iter().any(|row| {
+        row.iter()
+            .enumerate()
+            .any(|(column, (symbol, _, bg))| symbol == "Q" && *bg == dim && column >= 2)
+    });
+    assert!(
+        badge_row,
+        "the badge whose traded secondary is dracula's dim twin still \
+         carries the fill — at the section's inset, not column zero"
     );
     assert!(
         !app.composer_caret_visible(),

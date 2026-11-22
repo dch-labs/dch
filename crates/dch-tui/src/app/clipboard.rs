@@ -58,17 +58,16 @@ pub enum CopyAnswer {
 
 /// The synchronous answer once the escape write is known.
 ///
-/// With nothing schedulable the escape is the whole story — its write
-/// settles the answer outright, keeping the no-transports host's
-/// immediate wording. With transports scheduled the answer is
-/// unconfirmed whatever the escape did: confirmation is theirs to
-/// deliver as a verdict.
+/// An escape write carries no acceptance signal — the terminal may
+/// silently ignore it — so even a successful write is only
+/// unconfirmed. With process transports scheduled the answer is
+/// unconfirmed too: confirmation is theirs to deliver as a verdict.
+/// Only a transport that exits successfully can verify.
 #[must_use]
 pub(crate) fn transport_answer(escape_written: bool, transports_scheduled: bool) -> CopyAnswer {
     match (escape_written, transports_scheduled) {
-        (_, true) => CopyAnswer::Unconfirmed,
-        (true, false) => CopyAnswer::Verified,
         (false, false) => CopyAnswer::Failed,
+        _ => CopyAnswer::Unconfirmed,
     }
 }
 
@@ -377,22 +376,32 @@ pub(crate) fn host_transports(env: ClipboardEnv) -> Vec<HostTransport> {
 ///
 /// The configured command, the platform helper, and the transports
 /// the environment names all draw on the same clock, so the whole
-/// chain costs at most the deadline whatever it contains. Returns
-/// whether any transport exited successfully; an empty chain returns
-/// false without spawning anything.
+/// chain costs at most the deadline whatever it contains. Each
+/// transport checks the remaining budget before spawning — a helper
+/// that consumed the full budget leaves nothing for the rest to
+/// spend, so the chain stops rather than spawning past the deadline.
+/// Returns whether any transport exited successfully with its stdin
+/// fully written; an empty chain returns false without spawning
+/// anything.
 pub(crate) fn run_process_transports(custom: Option<&str>, text: &str, deadline: Duration) -> bool {
     let start = Instant::now();
     let mut verified = false;
+    let run = |command: std::process::Command| {
+        if start.elapsed() >= deadline {
+            return false;
+        }
+        run_bounded(command, text, start, deadline)
+    };
     if let Some(command_line) = custom {
         let mut command = std::process::Command::new("sh");
         command.arg("-c").arg(command_line);
-        verified |= run_bounded(command, text, start, deadline);
+        verified |= run(command);
     }
     if cfg!(target_os = "macos") {
-        verified |= run_bounded(std::process::Command::new("pbcopy"), text, start, deadline);
+        verified |= run(std::process::Command::new("pbcopy"));
     }
     for transport in host_transports(clipboard_env()) {
-        verified |= run_bounded(transport.command(), text, start, deadline);
+        verified |= run(transport.command());
     }
     verified
 }
@@ -403,8 +412,10 @@ pub(crate) fn run_process_transports(custom: Option<&str>, text: &str, deadline:
 /// that ignores stdin cannot wedge the chain on a full pipe, and the
 /// poll loop kills the child's whole process tree once the deadline
 /// passes — the worst case is one bounded wait, never an open-ended
-/// one. Returns whether the child exited successfully inside the
-/// deadline.
+/// one. A copy verifies only when both the child exited successfully
+/// inside the deadline and the stdin write completed: a helper that
+/// exits zero without consuming its input has not delivered the
+/// text. Returns whether the transport verified.
 pub(crate) fn run_bounded(
     mut command: std::process::Command,
     text: &str,
@@ -437,25 +448,28 @@ pub(crate) fn run_bounded(
     });
     let Some(expiry) = start.checked_add(deadline) else {
         kill_transport_tree(&mut child);
+        drop(child.wait());
         wait_writer_bounded(writer, &writer_landed);
         return false;
     };
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let succeeded = status.success();
-                wait_writer_bounded(writer, &writer_landed);
-                return succeeded;
+                let exited = status.success();
+                let wrote = wait_writer_bounded(writer, &writer_landed);
+                return exited && wrote;
             }
             Ok(None) => {}
             Err(_) => {
                 kill_transport_tree(&mut child);
+                drop(child.wait());
                 wait_writer_bounded(writer, &writer_landed);
                 return false;
             }
         }
         if Instant::now() >= expiry {
             kill_transport_tree(&mut child);
+            drop(child.wait());
             wait_writer_bounded(writer, &writer_landed);
             return false;
         }
@@ -481,7 +495,8 @@ pub(crate) fn kill_transport_tree(child: &mut std::process::Child) {
     drop(child.kill());
 }
 
-/// Wait out a transport's writer within its grace, then abandon it.
+/// Wait out a transport's writer within its grace, reporting whether
+/// the write completed.
 ///
 /// Every well-behaved transport's write lands inside the grace —
 /// normally in milliseconds — so an exit status is not reported
@@ -489,15 +504,26 @@ pub(crate) fn kill_transport_tree(child: &mut std::process::Child) {
 /// escaped descendant holds cannot be waited out at all: the grace
 /// lapses, the join is dropped, and the thread leaves by itself
 /// whenever the pipe finally closes. The verdict is never held
-/// hostage to it.
+/// hostage to it. Returns whether the write both landed inside the
+/// grace and completed without error — `false` for a timeout, an
+/// abandoned writer, or an error the pipe reported.
 pub(crate) fn wait_writer_bounded(
     writer: std::thread::JoinHandle<()>,
     landed: &std::sync::mpsc::Receiver<std::io::Result<()>>,
-) {
-    if landed.recv_timeout(WRITER_GRACE).is_ok() {
-        drop(writer.join());
-    } else {
-        drop(writer);
+) -> bool {
+    match landed.recv_timeout(WRITER_GRACE) {
+        Ok(Ok(())) => {
+            drop(writer.join());
+            true
+        }
+        Ok(Err(_)) => {
+            drop(writer.join());
+            false
+        }
+        Err(_) => {
+            drop(writer);
+            false
+        }
     }
 }
 
@@ -619,12 +645,10 @@ mod tests {
     #[test]
     fn a_fast_copy_command_verifies_within_the_deadline() {
         let began = std::time::Instant::now();
+        let mut command = std::process::Command::new("sh");
+        command.arg("-c").arg("cat > /dev/null");
         assert!(
-            run_process_transports(
-                Some("cat > /dev/null"),
-                "payload",
-                Duration::from_millis(500),
-            ),
+            run_bounded(command, "payload", began, Duration::from_millis(500)),
             "a command that consumes stdin and exits zero verifies"
         );
         assert!(
@@ -636,8 +660,10 @@ mod tests {
     #[test]
     fn a_hanging_copy_command_is_killed_at_the_deadline() {
         let began = std::time::Instant::now();
+        let mut command = std::process::Command::new("sh");
+        command.arg("-c").arg("sleep 30");
         assert!(
-            !run_process_transports(Some("sleep 30"), "payload", Duration::from_millis(150)),
+            !run_bounded(command, "payload", began, Duration::from_millis(150)),
             "a command that outlives the deadline reports no delivery"
         );
         assert!(
@@ -649,12 +675,10 @@ mod tests {
     #[test]
     fn a_descendant_holding_stdin_cannot_outlive_the_deadline() {
         let began = std::time::Instant::now();
+        let mut command = std::process::Command::new("sh");
+        command.arg("-c").arg("cat > /dev/null & sleep 60");
         assert!(
-            !run_process_transports(
-                Some("cat > /dev/null & sleep 60"),
-                "payload",
-                Duration::from_millis(200),
-            ),
+            !run_bounded(command, "payload", began, Duration::from_millis(200)),
             "a transport whose descendant holds the pipe reports no delivery"
         );
         assert!(
@@ -695,8 +719,8 @@ mod tests {
     fn the_synchronous_answer_follows_what_is_schedulable() {
         assert_eq!(
             transport_answer(true, false),
-            CopyAnswer::Verified,
-            "an escape-only host keeps its immediate wording"
+            CopyAnswer::Unconfirmed,
+            "an escape-only write is unconfirmed — the terminal may ignore it"
         );
         assert_eq!(
             transport_answer(false, false),
@@ -712,6 +736,22 @@ mod tests {
             transport_answer(false, true),
             CopyAnswer::Unconfirmed,
             "a failed escape still waits on the transports' verdict"
+        );
+    }
+
+    #[test]
+    fn a_helper_that_exits_without_consuming_stdin_does_not_verify() {
+        // A helper that exits zero without consuming a payload larger
+        // than the pipe buffer has not delivered the text: the write
+        // fails with a broken pipe once the child's end closes, so
+        // the transport cannot verify even though the exit code was
+        // successful.
+        let began = std::time::Instant::now();
+        let payload = "x".repeat(256 * 1024);
+        let command = std::process::Command::new("true");
+        assert!(
+            !run_bounded(command, &payload, began, Duration::from_millis(2_000)),
+            "a zero-exit helper that never read its stdin does not verify"
         );
     }
 

@@ -489,8 +489,10 @@ impl TuiApp {
     /// fail differently — a display value the panel re-reads has
     /// already applied and only the save is lost, while a restart-class
     /// value applied nothing this session and, unsaved, applies nothing
-    /// next start either. The failure never rolls the session's own
-    /// value back.
+    /// next start either. The model is the restart-class exception: a
+    /// switch has already applied live by the time the save runs, and
+    /// its failure wording says so rather than claiming nothing took.
+    /// The failure never rolls the session's own value back.
     ///
     /// When no config file is wired — an embedder host — the save
     /// serializes the live config through a stand-in that first
@@ -515,10 +517,15 @@ impl TuiApp {
             stand_in
         };
         if let Err(why) = to_save.save_to_dir(&dir) {
-            match config_fields::live(key) {
-                Some(config_fields::Live::Display) => self.post_notice(format!(
-                    "applied for this session only — the config save failed: {why}"
+            match key {
+                "model" => self.post_notice(format!(
+                    "the switch is live but not saved — the config save failed: {why}"
                 )),
+                _ if matches!(config_fields::live(key), Some(config_fields::Live::Display)) => {
+                    self.post_notice(format!(
+                        "applied for this session only — the config save failed: {why}"
+                    ));
+                }
                 _ => self.post_notice(format!(
                     "not saved — the config save failed: {why}. {key} was never applied this \
                      session, and without the save it will not apply next start either"
@@ -756,13 +763,13 @@ impl TuiApp {
 
     /// Open the saved-session picker on a catalog the driver listed.
     ///
-    /// The `/sessions` answer's display half: an empty catalog opens
-    /// nothing and says nothing — the picker itself is the command's
-    /// whole answer, and a sheet with no rows to walk is no answer —
-    /// while anything else seats the cursor on the newest
-    /// conversation.
+    /// The `/sessions` answer's display half: an empty catalog says so
+    /// on the notice row — the user asked and deserves a reply, not a
+    /// silently blank screen — while anything else seats the cursor on
+    /// the newest conversation.
     pub(crate) fn open_session_picker(&mut self, rows: Vec<SessionPick>) {
         if rows.is_empty() {
+            self.post_notice("no saved sessions yet — one is saved on exit".to_string());
             return;
         }
         self.pickers.session_picker = Some(SessionPicker { rows, cursor: 0 });
@@ -835,14 +842,17 @@ impl TuiApp {
     /// Reads the same snapshot the context bar draws from (how full the model's
     /// window is) plus the token tallies the loop keeps, so the number on the
     /// bar and the number here agree. Read-only; nothing is sent.
-    fn cost_command(&mut self) {
+    pub(crate) fn cost_command(&mut self) {
         let now = chrono::Utc::now();
         let (used, window) = self.context_snapshot();
-        let percent = used
-            .checked_mul(100)
-            .and_then(|scaled| scaled.checked_div(window))
-            .unwrap_or(0)
-            .min(100);
+        let percent = if window == 0 {
+            0
+        } else {
+            used.saturating_mul(100)
+                .saturating_add(window.saturating_div(2))
+                .checked_div(window)
+                .unwrap_or(0)
+        };
         let (input, output, total_in, total_out) = {
             let counts = self
                 .state
@@ -904,6 +914,19 @@ impl TuiApp {
         self.invalidate_conversation_renders();
     }
 
+    /// Pin the canvas mode the app renders under.
+    ///
+    /// Construction reads the environment — a multiplexed terminal
+    /// settles local painting — and this override stands the app in
+    /// either mode regardless of the machine it runs on, so a harness
+    /// or test that renders frames and reads cells pins the shape it
+    /// asserts. A switch that lands after the pin follows it: local
+    /// painting never queries, never writes an OSC byte, and never
+    /// defers the palette.
+    pub fn set_canvas_painted_locally(&mut self, local: bool) {
+        self.canvas_local = local;
+    }
+
     /// Land a theme change on every surface the session already painted.
     ///
     /// The startup sequence, replayed on every switch. The background
@@ -924,16 +947,23 @@ impl TuiApp {
     /// regenerates every styled line — the settled bake, the merged
     /// cache the frames serve, and the live lane's streaming rows —
     /// under the new palette rather than serving the old colors from
-    /// cache.
+    /// cache. Inside a multiplexer the landing is all local: the
+    /// canvas is painted on the frame's own cells
+    /// ([`TuiApp::canvas_local`]), so no query runs, no OSC byte is
+    /// written, and no deferral applies — the palette keeps every
+    /// color it was built with, and the invalidation alone carries
+    /// the switch onto the screen.
     fn land_theme_change(&mut self) {
-        let background = self.theme.ui.background;
-        let landed = if crate::terminal::write_only_warranted(background) {
-            true
-        } else {
-            self.ask_background_once(background)
-        };
-        if !landed {
-            self.theme = self.theme.deferred_to_terminal();
+        if !self.canvas_local {
+            let background = self.theme.ui.background;
+            let landed = if crate::terminal::write_only_warranted(background) {
+                true
+            } else {
+                self.ask_background_once(background)
+            };
+            if !landed {
+                self.theme = self.theme.deferred_to_terminal();
+            }
         }
         self.browse.pending_theme_osc = Some((self.theme.ui.background, self.theme.ui.primary));
         self.invalidate_conversation_renders();
@@ -1472,7 +1502,9 @@ pub(crate) fn fit_picker_title(title: Option<&str>) -> String {
         let pad = " ".repeat(WIDTH.saturating_sub(cells));
         return format!("{text}{pad}");
     }
-    format!("{}…", prefix_within(&text, WIDTH.saturating_sub(1)))
+    let truncated = format!("{}…", prefix_within(&text, WIDTH.saturating_sub(1)));
+    let used = str_width(&truncated);
+    format!("{truncated}{}", " ".repeat(WIDTH.saturating_sub(used)))
 }
 
 #[cfg(test)]

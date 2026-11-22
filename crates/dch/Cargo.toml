@@ -33,6 +33,9 @@ name = "stdin_task_combine"
 name = "tui_signal_restore"
 
 [[test]]
+name = "tui_tmux_canvas"
+
+[[test]]
 name = "tui_compaction_notice"
 
 [[test]]
