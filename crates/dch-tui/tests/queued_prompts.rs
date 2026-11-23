@@ -358,6 +358,10 @@ fn a_queue_title_names_the_waiting_section_and_leaves_with_it() {
 /// theme it is no fill at all. Reading the colors off the rendered
 /// cells is the only way to pin any of that.
 fn painted_rows(app: &mut TuiApp, width: u16, height: u16) -> Vec<Vec<(String, Color, Color)>> {
+    // The suite pins the direct seat: a developer's shell may sit
+    // inside tmux, and a pane would ground its own canvas where these
+    // pins expect the terminal's default to show through.
+    app.set_terminal_seat(false);
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
     terminal.draw(|frame| app.render(frame)).unwrap();
     let buffer = terminal.backend().buffer();

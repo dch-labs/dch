@@ -32,7 +32,10 @@ impl TuiApp {
     /// is the spacer directly above the composer by default, or the
     /// terminal's dedicated first row when the config says so; the
     /// glow style holds a static full-width bar whose color breathes,
-    /// and the off style yields the row back, nothing drawn. The bar
+    /// and the off style yields the row back, nothing drawn. Every
+    /// frame the strip does not paint — the off style, a run at rest —
+    /// clears the row first, so its last painted bar never lingers
+    /// into the frames that follow. The bar
     /// anchors on the run's first frame and never re-anchors: streams
     /// beginning and graduating inside the run leave its phase
     /// untouched, so one continuous animation runs from the frame the
@@ -41,6 +44,7 @@ impl TuiApp {
     /// the frame when the row was its spacer.
     pub(in crate::app) fn render_pulse_strip(&self, frame: &mut Frame, area: Rect) -> bool {
         if matches!(self.display.strip_style, StripStyle::Off) {
+            Self::strip_stood_down(frame, area);
             return false;
         }
         if !self
@@ -49,6 +53,7 @@ impl TuiApp {
             .load(std::sync::atomic::Ordering::Relaxed)
             || area.height == 0
         {
+            Self::strip_stood_down(frame, area);
             return false;
         }
         let now = Instant::now();
@@ -72,6 +77,21 @@ impl TuiApp {
         );
         frame.render_widget(pulse, area);
         true
+    }
+
+    /// Erase the strip's row for a frame the strip does not paint.
+    ///
+    /// The frame buffer is cumulative: a cell no widget paints keeps
+    /// whatever the previous frame left there, so a strip that simply
+    /// stopped drawing would leave its last bar — or, after a theme
+    /// switch, the previous palette's colors — standing in the row the
+    /// composer sits beside. On a direct terminal the clear is the
+    /// terminal default the idle row returns to, and a ruled theme's
+    /// hairline paints over it after; inside a multiplexer the
+    /// grounding walk that closes the layout refills it with the
+    /// palette's canvas.
+    fn strip_stood_down(frame: &mut Frame, area: Rect) {
+        frame.render_widget(ratatui::widgets::Clear, area);
     }
 
     /// Render the pinned plan section: the run's current tasks,

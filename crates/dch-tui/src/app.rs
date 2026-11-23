@@ -206,6 +206,14 @@ pub(crate) struct DisplayState {
     /// position are orthogonal; the phase and gating are the same
     /// either way.
     pub(crate) strip_style: StripStyle,
+
+    /// The seat the session was told it sits in, when told.
+    ///
+    /// `None` until a host states it; the environment's own answer —
+    /// a multiplexer's spellings, or none — settles the question
+    /// otherwise. A test states it to pin either seat regardless of
+    /// the shell the suite runs in.
+    pub(crate) terminal_seat: Option<bool>,
 }
 
 impl Stick {
@@ -313,23 +321,6 @@ pub struct TuiApp {
     /// Resolved from `config.display.theme` at construction; an
     /// unknown name warns and falls back to the default theme.
     pub theme: Theme,
-
-    /// Whether the theme canvas is painted on the frame's own cells.
-    ///
-    /// A multiplexed terminal shares its default background among
-    /// panes, so a pane whose regions lean on that default renders
-    /// whatever the last pane to write it chose — stale after a
-    /// switch, cross-contaminated on a redraw. When this stands the
-    /// frame paints the canvas itself, theme switches never query,
-    /// write, or defer, and every region carries a background the
-    /// palette itself owns. The shell stands in the direct shape; the
-    /// driver reads the environment at launch — a multiplexer's
-    /// spelling: `TMUX`, `STY`, `ZELLIJ`, or a `tmux`/`screen`
-    /// terminal type — and pins the multiplexed mode through
-    /// [`TuiApp::set_canvas_painted_locally`], so a harness that
-    /// renders frames pins the mode it asserts whatever machine it
-    /// runs on.
-    pub(crate) canvas_local: bool,
 
     /// The conversation so far, oldest first.
     ///
@@ -582,7 +573,6 @@ impl TuiApp {
         );
         Self {
             theme,
-            canvas_local: false,
             conversation: Vec::new(),
             state,
             copy,
@@ -594,6 +584,7 @@ impl TuiApp {
                 verbosity: config.display.verbosity,
                 strip_position: config.display.strip_position,
                 strip_style: config.display.strip_style,
+                terminal_seat: None,
             },
             pickers: Pickers::default(),
             exit: ExitState::default(),
@@ -829,8 +820,13 @@ impl TuiApp {
     /// one has answered for the session's life. Without a reader
     /// handle (tests, headless constructors) there is nothing to park
     /// and nothing to ask: the palette defers, the honest answer for a
-    /// session that cannot prove its terminal.
-    fn ask_background_once(&mut self, background: ratatui::style::Color) -> bool {
+    /// session that cannot prove its terminal. `install` names the
+    /// write's moment: the committed switch passes `false` so the
+    /// canvas write lands inside the render burst that carries the
+    /// re-styled cells, while the startup retry passes `true` because
+    /// its landing is followed by a whole-screen repaint no early
+    /// write can race.
+    fn ask_background_once(&mut self, background: ratatui::style::Color, install: bool) -> bool {
         if !crate::terminal::next_ask_warranted(crate::terminal::background_support()) {
             return false;
         }
@@ -839,7 +835,11 @@ impl TuiApp {
         };
         quiesce.request();
         let outcome = if quiesce.wait_paused(Self::QUIESCE_ACK) {
-            crate::terminal::ask_default_background(background)
+            if install {
+                crate::terminal::ask_and_install_default_background(background)
+            } else {
+                crate::terminal::ask_default_background(background)
+            }
         } else {
             crate::terminal::QueryOutcome::default()
         };
@@ -848,6 +848,75 @@ impl TuiApp {
             self.return_stolen_byte(byte);
         }
         outcome.installed
+    }
+
+    /// Ask the terminal for its default background once the event
+    /// reader is up, when the startup never could.
+    ///
+    /// The startup query stands down whenever input is already
+    /// waiting — typed-ahead keys are the user's, not ours to eat — so
+    /// a session launched under a fast typist opens deferred, whatever
+    /// its terminal would have answered. The palette the deferral
+    /// masked is one question away: with the reader running, this asks
+    /// once, under the same quiesce handshake a theme switch uses, and
+    /// a terminal that answers lands the canvas the startup meant to
+    /// install through [`Self::land_startup_canvas`]. A terminal that
+    /// stays silent settles the refusal the startup would have recorded,
+    /// and nothing moves. The answer's override is written at the
+    /// question's moment rather than parked for a flush: the landing
+    /// here is followed by the whole-screen repaint the caller draws,
+    /// so an immediate write has no intermediate frame to race. Returns
+    /// whether the canvas landed.
+    fn retry_the_startup_background_ask(&mut self) -> bool {
+        let Some(canvas) = self.startup_background_ask_warranted() else {
+            return false;
+        };
+        self.ask_background_once(canvas, true) && self.land_startup_canvas()
+    }
+
+    /// The canvas a startup retry would ask for, when one is owed.
+    ///
+    /// `None` for a palette without an `Rgb` canvas — the paintless
+    /// vocabulary defers by construction and has nothing to install —
+    /// for a session the terminal has already settled: an answered
+    /// terminal installed its canvas, and a refused one is never asked
+    /// again this session — and for a pane inside a multiplexer, whose
+    /// canvas the frame paints itself with no exchange to retry. Only
+    /// the record the typed-ahead startup leaves behind — never asked
+    /// — owes the question.
+    fn startup_background_ask_warranted(&self) -> Option<ratatui::style::Color> {
+        if crate::terminal::multiplexed_pane() {
+            return None;
+        }
+        let canvas = self.theme.ui.background;
+        if !matches!(canvas, ratatui::style::Color::Rgb(..)) {
+            return None;
+        }
+        crate::terminal::next_ask_warranted(crate::terminal::background_support()).then_some(canvas)
+    }
+
+    /// Land the canvas a startup retry installed: the palette the
+    /// deferral masked, re-resolved from the registry under its own
+    /// name, the cursor tinted, and every cached line rebuilt — the
+    /// caller repaints the frame whole, since every cell's ground may
+    /// change. Returns whether the palette was un-masked.
+    ///
+    /// No registry palette carries the name when the theme is a custom
+    /// literal the deferral cannot un-mask: the canvas is installed and
+    /// must not stand under a palette whose inks defer to a terminal
+    /// that no longer shows it, so the terminal gets its own background
+    /// back and the deferred palette stays — through the plain
+    /// captured restore the exit path shares, never a theme burst: the
+    /// fallback opens no synchronized-output window, so it closes none.
+    fn land_startup_canvas(&mut self) -> bool {
+        let Some(theme) = Theme::by_name(self.theme.name) else {
+            crate::terminal::restore_captured_canvas();
+            return false;
+        };
+        self.theme = theme;
+        crate::terminal::set_cursor_color(self.theme.ui.primary);
+        self.invalidate_conversation_renders();
+        true
     }
 
     /// Hand back a keystroke the terminal query consumed.
@@ -1730,18 +1799,121 @@ impl TuiApp {
     /// method. The input field grows with its buffer up to its
     /// text-row cap and then holds: the conversation pane reflows
     /// while the composer grows and holds still once it has.
+    ///
+    /// The layout painted, the frame is grounded when its canvas must
+    /// be its own: the grounding walk after the layout paints the
+    /// theme canvas under every cell the widgets left on the terminal
+    /// default, which a pane inside a multiplexer cannot lean on.
     pub fn render(&mut self, frame: &mut Frame) {
+        self.render_layout(frame);
+        self.ground_frame_canvas(frame);
+    }
+
+    /// Whether a frame must paint its canvas under every cell itself.
+    ///
+    /// A frame whose canvas is in force but not otherwise guaranteed:
+    /// a pane inside a multiplexer (the multiplexer hands default
+    /// cells to the client as the client's own default), or a direct
+    /// terminal the canvas landed on through the `OSC 11` exchange —
+    /// the set reprograms the default, but the terminal's own
+    /// profile, padding, and any moment the set has not reached (a
+    /// refused reply, a slow answer, a switch mid-flight) all still
+    /// show through cells left on the default, so the frame paints
+    /// what it means: every blank row, tail, and margin carries the
+    /// canvas as an explicit background, and the set remains only as
+    /// the chrome outside the frame — padding, the fraction of a
+    /// cell — joining the same color. A terminal the exchange never
+    /// landed on keeps its own scheme: the deferred palette paints no
+    /// canvas, and nothing of ours may cover the terminal the user
+    /// configured. Only an `Rgb` canvas is grounded — the transparent
+    /// palette's whole contract is the terminal's own default.
+    pub(crate) fn canvas_ground_warranted(
+        multiplexed: bool,
+        support: crate::terminal::BackgroundSupport,
+        canvas: ratatui::style::Color,
+    ) -> bool {
+        (multiplexed || support == crate::terminal::BackgroundSupport::Answered)
+            && matches!(canvas, ratatui::style::Color::Rgb(..))
+    }
+
+    /// State the seat this session sits in: a pane inside a terminal
+    /// multiplexer, or a direct terminal.
+    ///
+    /// Unstated, the environment settles it — the multiplexers sign
+    /// their panes (`TMUX`, `STY`, `ZELLIJ`, a `tmux`- or `screen`-typed
+    /// `TERM`), and a host that already knows better may say so here.
+    /// A test states it to pin either seat's rendering regardless of
+    /// the shell the suite runs in. Stated once, it stands for the
+    /// session's life. The statement governs the frame's grounding
+    /// walk alone, and the one combination it cannot cover is a
+    /// deferred palette behind a stated pane seat: the environment
+    /// never produces it — a pane runs no exchange, so nothing of its
+    /// ever defers — and the walk reads the canvas alone, so the `Rgb`
+    /// canvas a deferred palette still carries is grounded exactly as
+    /// any other. A host seating a session whose palette deferred
+    /// accepts that the canvas paints.
+    pub fn set_terminal_seat(&mut self, multiplexed: bool) {
+        self.display.terminal_seat = Some(multiplexed);
+    }
+
+    /// Whether the frame's canvas is in force on the seat this
+    /// session sits in.
+    ///
+    /// The grounding walk and the welcome's edge dissolve consult the
+    /// same answer: a pane paints its canvas under its own cells, and
+    /// so does a direct terminal the exchange answered — every other
+    /// seat keeps the terminal's own scheme as the ground, and
+    /// nothing of ours may paint or blend toward a canvas the
+    /// terminal is not showing. The `Rgb` leg rides along because the
+    /// transparent palette's whole contract is the terminal's own
+    /// default.
+    fn canvas_in_force(&self) -> bool {
+        let multiplexed = self
+            .display
+            .terminal_seat
+            .unwrap_or_else(crate::terminal::multiplexed_pane);
+        Self::canvas_ground_warranted(
+            multiplexed,
+            crate::terminal::background_support(),
+            self.theme.ui.background,
+        )
+    }
+
+    /// Paint the canvas under every cell the widgets left on the
+    /// terminal default — when the canvas-ground warrant says so.
+    ///
+    /// Runs after the whole layout, so every default cell is covered
+    /// whatever painted or cleared it: a `Clear` that stood a sheet
+    /// down, a pulse strip that yielded its row, the empty rows of a
+    /// short conversation. Cells that carry their own background — the
+    /// composer's surface, a badge's fill, the art of the splash — keep
+    /// it; the walk touches the default alone, and the diff emits only
+    /// the cells whose ground actually changed.
+    fn ground_frame_canvas(&self, frame: &mut Frame) {
+        let canvas = self.theme.ui.background;
+        if !self.canvas_in_force() {
+            return;
+        }
+        ground_default_cells(frame.buffer_mut(), canvas);
+    }
+
+    /// The layout itself: the panes, furniture, and overlays of one frame.
+    ///
+    /// Settles the between-frame state the layout reads, resolves the
+    /// composer's height, and splits the area into the conversation
+    /// pane, the optional sections (plan, waiting queue, place row),
+    /// the notice row, the composer, and the status bar — each painted
+    /// through its own method, with the overlays standing over the
+    /// result. The welcome screen, while it stands, replaces the whole
+    /// layout. Grounding the canvas under the cells the widgets leave
+    /// on the terminal default is [`render`](Self::render)'s closing
+    /// act, kept out of this pass so it runs after every overlay too.
+    fn render_layout(&mut self, frame: &mut Frame) {
         self.settle_handed();
         self.settle_todo_expansion();
         self.drain_shared_state();
         self.sync_queue_view();
         let area = frame.area();
-        paint::conversation::paint_local_canvas(
-            frame,
-            area,
-            self.theme.ui.background,
-            self.canvas_local,
-        );
         if !self.welcome.welcome_retired && !self.conversation.is_empty() {
             self.welcome.welcome_retired = true;
             self.pacing.full_repaint_due = Some(Instant::now());
@@ -1864,14 +2036,6 @@ impl TuiApp {
             frame,
             pane(&chunks, composer_at.saturating_add(1), fallback),
         );
-        // The canvas contract's last word, in the mode that paints it:
-        // no cell may carry the terminal default — a widget that
-        // paints `Reset` (the code panel's transparent band, a diff's
-        // unbanded rows) would open a hole the multiplexer's shared
-        // default shows through, whatever the palette.
-        if self.canvas_local {
-            close_local_canvas(frame, self.theme.ui.background);
-        }
         if let Some(sheet) = self.permission.shown_permission() {
             self.render_permission_overlay(frame, area, &sheet);
             return;
@@ -2479,21 +2643,19 @@ fn pane(chunks: &[Rect], index: usize, fallback: Rect) -> Rect {
     chunks.get(index).copied().unwrap_or(fallback)
 }
 
-/// Close a locally painted frame: replace every cell still carrying
-/// the terminal default with the palette's canvas.
+/// Paint `canvas` under every cell of `buffer` still on the terminal default.
 ///
-/// The canvas contract's last word in the mode that paints it. On a
-/// direct terminal the default background *is* the canvas, so a
-/// widget may paint `Reset` — the code panel's transparent band, a
-/// diff's unbanded rows — and read as transparent. Under the locally
-/// painted canvas the same cell is a hole the multiplexer's shared
-/// default shows through, unthemed in every palette, so one walk
-/// after the furniture closes the whole class: no cell the frame
-/// leaves behind renders anything but the palette's own ground.
-fn close_local_canvas(frame: &mut Frame, canvas: ratatui::style::Color) {
-    for cell in &mut frame.buffer_mut().content {
-        if cell.bg == ratatui::style::Color::Reset {
-            cell.set_bg(canvas);
+/// The grounding walk behind a frame that owns its canvas inside a
+/// multiplexer — see [`TuiApp::canvas_ground_warranted`]. Only the
+/// default is touched, so a cell's own ground — the composer's
+/// surface, a badge's fill, the splash's art — stands exactly as the
+/// widget painted it, and the canvas lands on everything else: the
+/// blank rows, the row tails, the stood-down strips, the pane's own
+/// top. Pure over the buffer, so the walk pins without a terminal.
+fn ground_default_cells(buffer: &mut ratatui::buffer::Buffer, canvas: Color) {
+    for cell in &mut buffer.content {
+        if cell.bg == Color::Reset {
+            cell.bg = canvas;
         }
     }
 }

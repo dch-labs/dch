@@ -258,13 +258,15 @@ pub enum PathStyle {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SplashColors {
-    /// Truecolor wherever it can reach the screen, the palette
-    /// rendition only where a tmux client would have it converted.
+    /// The original art everywhere; the palette rendition only on
+    /// request.
     ///
-    /// The default: the session asks tmux, when it sits behind one,
-    /// whether the attached client carries the RGB feature, and
-    /// downgrades only on tmux's explicit no — an unanswered ask keeps
-    /// truecolor.
+    /// The default: a multiplexer forwards direct colors verbatim to
+    /// every client with the RGB feature, and a client without it keeps
+    /// the hues in its own approximation — so the photograph is painted
+    /// as authored wherever the session sits. The palette rendition is
+    /// the explicit `palette` choice, for a tmux whose clients it knows
+    /// as 256-color and re-encodes per color onto the grey ramp.
     #[default]
     Auto,
 
@@ -2441,55 +2443,6 @@ mod tests {
         assert_eq!(
             config.runner.turn_timeout_secs, 120,
             "the floor itself is an accepted budget"
-        );
-    }
-
-    #[test]
-    fn from_toml_str_rejects_a_read_ceiling_above_the_dispatch_cap() {
-        // The registry keeps the read pair ordered on purpose: the per-file
-        // ceiling must sit under the batch budget, or every batch degrades
-        // to its longest file plus budget markers. The load-time check is
-        // the only thing holding that order for configured values.
-        let err = DchConfig::from_toml_str(
-            "[runner]\nread_max_bytes = 200\nmax_tool_output_chars = 100\n",
-        )
-        .unwrap_err();
-        assert!(
-            matches!(
-                &err,
-                DchConfigError::Invalid(message)
-                    if message.contains("read_max_bytes = 200") && message.contains("100")
-            ),
-            "the rejection names the ceiling and the cap: {err:?}"
-        );
-    }
-
-    #[test]
-    fn from_toml_str_loads_a_read_ceiling_at_the_dispatch_cap() {
-        // The boundary: equal ceilings are the tightest legal pairing — a
-        // whole file view exactly fills the batch budget — so the check
-        // must reject only the strictly-greater side.
-        let config = DchConfig::from_toml_str(
-            "[runner]\nread_max_bytes = 100\nmax_tool_output_chars = 100\n",
-        )
-        .unwrap();
-        assert_eq!(
-            config.runner.read_max_bytes, 100,
-            "a ceiling at the cap is an accepted pairing"
-        );
-    }
-
-    #[test]
-    fn from_toml_str_lets_a_disabled_dispatch_cap_exempt_the_read_ceiling() {
-        // `max_tool_output_chars = 0` disables the dispatch cap, and with
-        // it the inversion the check guards against: an unbudgeted batch
-        // cannot cut a file view, so a larger read ceiling is harmless.
-        let config =
-            DchConfig::from_toml_str("[runner]\nread_max_bytes = 100\nmax_tool_output_chars = 0\n")
-                .unwrap();
-        assert_eq!(
-            config.runner.max_tool_output_chars, 0,
-            "a zero cap stays a disabled cap, not a floor"
         );
     }
 

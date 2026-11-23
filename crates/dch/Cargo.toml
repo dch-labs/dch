@@ -36,6 +36,9 @@ name = "tui_signal_restore"
 name = "tui_tmux_canvas"
 
 [[test]]
+name = "tui_theme_exchange"
+
+[[test]]
 name = "tui_compaction_notice"
 
 [[test]]

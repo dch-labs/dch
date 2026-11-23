@@ -85,10 +85,11 @@ strip: static
 macos-strip: macos
 	@echo "✅ macOS binary: $(BUILD_DIR_MACOS)/$(BINARY) ($$(du -h $(BUILD_DIR_MACOS)/$(BINARY) | cut -f1))"
 
-## install: Install the stripped static binary to ~/.local/bin
+## install: Install the stripped static binary to ~/.local/bin (rename-over: a running dch keeps the old inode, cp would hit ETXTBSY)
 install: strip
 	@mkdir -p $(HOME)/.local/bin
-	@cp $(BUILD_DIR)/$(BINARY) $(HOME)/.local/bin/$(BINARY)
+	@install -m755 $(BUILD_DIR)/$(BINARY) $(HOME)/.local/bin/$(BINARY).new
+	@mv -f $(HOME)/.local/bin/$(BINARY).new $(HOME)/.local/bin/$(BINARY)
 	@chmod +x $(HOME)/.local/bin/$(BINARY)
 	@echo "✅ Installed to $(HOME)/.local/bin/$(BINARY)"
 

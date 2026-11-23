@@ -569,24 +569,3 @@ pub(crate) fn fingerprint(text: &str) -> u64 {
     text.hash(&mut hasher);
     hasher.finish()
 }
-
-#[cfg(test)]
-mod tests {
-    use crate::app::TuiApp;
-
-    #[test]
-    fn a_boundary_mode_update_moves_the_display_without_the_file() {
-        // A `/clear`'s fresh session falls back to the configured
-        // default, and the display hears it over the update lane: the
-        // live config moves, the file copy never does.
-        let mut app = TuiApp::new(dch_config::DchConfig::default());
-        app.apply_session_update(crate::queue::SessionUpdate::PermissionMode {
-            mode: dch_config::PermissionMode::ReadOnly,
-        });
-        assert_eq!(
-            app.config.runner.permission_mode,
-            dch_config::PermissionMode::ReadOnly,
-            "the display answers /mode for the mode actually in force"
-        );
-    }
-}

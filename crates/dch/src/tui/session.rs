@@ -273,9 +273,6 @@ pub(crate) async fn run_tui_session(args: &Args, control: ResumeControl) -> Resu
     app.set_working_dir(&workdir);
     app.set_config_persist_dir(Some(dch_config::config_dir()));
     app.set_git_branch(git_branch(&workdir));
-    if let Some(notice) = dch_tui::terminal::tmux_color_notice() {
-        app.post_notice(notice);
-    }
     let (saver, _session_id, resumed_machine) =
         launch_identity(&mut app, control, &runner, args, flag_mode, model, &workdir);
     let (transcript_handle, transcript_worker) = TranscriptWorker::spawn(saver);
@@ -297,14 +294,10 @@ pub(crate) async fn run_tui_session(args: &Args, control: ResumeControl) -> Resu
     TerminalGuard::install_panic_hook();
     let (guard, mut terminal) = TerminalGuard::new(driver_config.display.mouse_capture)
         .map_err(|err| format!("terminal init: {err}"))?;
-    let canvas_local = dch_tui::terminal::canvas_painted_locally();
-    app.set_canvas_painted_locally(canvas_local);
-    if !canvas_local {
-        if dch_tui::sync_default_background(app.theme.ui.background) {
-            dch_tui::set_cursor_color(app.theme.ui.primary);
-        } else {
-            app.theme = app.theme.deferred_to_terminal();
-        }
+    if dch_tui::sync_default_background(app.theme.ui.background) {
+        dch_tui::set_cursor_color(app.theme.ui.primary);
+    } else {
+        app.theme = app.theme.deferred_to_terminal();
     }
     dch_tui::arm_fatal_signal_restore();
 

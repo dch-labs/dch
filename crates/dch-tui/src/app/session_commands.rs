@@ -892,19 +892,39 @@ impl TuiApp {
         self.scroll.scroll_to_bottom();
     }
 
-    /// Swap the palette for preview, without landing it on the terminal.
+    /// Swap the palette for a live preview, parking its terminal
+    /// writes for the flush.
     ///
     /// The browsing half of a theme switch: the palette field swaps and
     /// the render caches invalidate — the next frame paints in the new
-    /// colors — but no OSC escape is written, no terminal query runs,
-    /// no cursor tint changes. The terminal's own background and cursor
-    /// keep their previous state until the user commits (Enter submits
-    /// the command, or the bare `/theme` settles), at which point
+    /// colors — and the canvas and cursor tint the preview owes are
+    /// parked on [`ThemeBrowse::pending_theme_osc`] for the render
+    /// flush, which writes them, on a terminal that took the canvas,
+    /// inside the same synchronized-output burst that carries the
+    /// re-styled cells. No terminal query runs and nothing persists
+    /// until the user commits (Enter submits the command, or the bare
+    /// `/theme` settles), at which point
     /// [`land_theme_change`](Self::land_theme_change) performs the
-    /// full landing. Browsing stays instant this way: stepping through
-    /// ten themes costs ten cache invalidations, not ten terminal
-    /// round-trips.
+    /// full landing. A browse that ends without a commit — Esc, or the
+    /// composer drifting off the candidates — parks the restored
+    /// palette's pair the same way, so the terminal follows the preview
+    /// and comes back with it. Browsing stays instant this way:
+    /// stepping through ten themes costs ten cache invalidations, not
+    /// ten terminal round-trips.
+    ///
+    /// A session whose terminal has not proven it takes the canvas
+    /// previews the palette in its deferred form — the same adaptation
+    /// the startup applied — because that is the only form the next
+    /// frame can honestly paint: the palette's near-canvas
+    /// foregrounds were chosen against the theme's own canvas and can
+    /// be invisible on a terminal keeping its own scheme, so the
+    /// unadapted preview would misrepresent what a commit can land.
     pub(crate) fn preview_theme(&mut self, theme: Theme) {
+        let theme = if crate::terminal::write_only_warranted(theme.ui.background) {
+            theme
+        } else {
+            theme.deferred_to_terminal()
+        };
         if self.browse.theme_before_browse.is_none() {
             self.browse.theme_before_browse = Some(std::mem::replace(&mut self.theme, theme));
         } else {
@@ -912,19 +932,6 @@ impl TuiApp {
         }
         self.browse.pending_theme_osc = Some((self.theme.ui.background, self.theme.ui.primary));
         self.invalidate_conversation_renders();
-    }
-
-    /// Pin the canvas mode the app renders under.
-    ///
-    /// Construction reads the environment — a multiplexed terminal
-    /// settles local painting — and this override stands the app in
-    /// either mode regardless of the machine it runs on, so a harness
-    /// or test that renders frames and reads cells pins the shape it
-    /// asserts. A switch that lands after the pin follows it: local
-    /// painting never queries, never writes an OSC byte, and never
-    /// defers the palette.
-    pub fn set_canvas_painted_locally(&mut self, local: bool) {
-        self.canvas_local = local;
     }
 
     /// Land a theme change on every surface the session already painted.
@@ -943,27 +950,23 @@ impl TuiApp {
     /// palette goes paintless. Both writes are deferred to the render
     /// flush — the same burst that carries the re-styled cells — so a
     /// committed switch lands in one visible step, never a canvas that
-    /// flips a beat ahead of the text under it. The invalidation
+    /// flips a beat ahead of the text under it; the ask tier captures
+    /// its answer mid-press, and the write that answer warrants rides
+    /// that same flush rather than leaving at the question's moment.
+    /// The invalidation
     /// regenerates every styled line — the settled bake, the merged
     /// cache the frames serve, and the live lane's streaming rows —
     /// under the new palette rather than serving the old colors from
-    /// cache. Inside a multiplexer the landing is all local: the
-    /// canvas is painted on the frame's own cells
-    /// ([`TuiApp::canvas_local`]), so no query runs, no OSC byte is
-    /// written, and no deferral applies — the palette keeps every
-    /// color it was built with, and the invalidation alone carries
-    /// the switch onto the screen.
+    /// cache.
     fn land_theme_change(&mut self) {
-        if !self.canvas_local {
-            let background = self.theme.ui.background;
-            let landed = if crate::terminal::write_only_warranted(background) {
-                true
-            } else {
-                self.ask_background_once(background)
-            };
-            if !landed {
-                self.theme = self.theme.deferred_to_terminal();
-            }
+        let background = self.theme.ui.background;
+        let landed = if crate::terminal::write_only_warranted(background) {
+            true
+        } else {
+            self.ask_background_once(background, false)
+        };
+        if !landed {
+            self.theme = self.theme.deferred_to_terminal();
         }
         self.browse.pending_theme_osc = Some((self.theme.ui.background, self.theme.ui.primary));
         self.invalidate_conversation_renders();
@@ -1355,12 +1358,16 @@ pub(crate) struct Pickers {
 }
 
 /// The theme browse's state: the palette the session stood on and
-/// the terminal escapes a preview owes.
+/// the terminal escapes the next flush owes.
 ///
 /// A browse exists only while the completion popup walks `/theme`
-/// candidates; the pair is what makes leaving the browse honest —
-/// the remembered palette restores, and the deferred escapes keep
-/// the terminal's own colors untouched until a commit lands whole.
+/// candidates, and the pair keeps it honest in both directions: the
+/// remembered palette is what a browse that ends without a commit
+/// restores, and the parked escapes are how a preview reaches the
+/// terminal — the flush writes the previewed canvas and tint beside
+/// the re-styled cells, and the browse's dismissal parks the restored
+/// palette's pair the same way, so the terminal's own colors follow
+/// the preview and return with it.
 #[derive(Default)]
 pub(crate) struct ThemeBrowse {
     /// The theme the session was on before the completion popup

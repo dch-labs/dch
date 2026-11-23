@@ -139,7 +139,7 @@ impl TuiApp {
                 .saturating_sub(self.scroll.scroll_offset),
             conversation_height,
         );
-        erase_conversation_pane(frame, pane, self.theme.ui.background, self.canvas_local);
+        frame.render_widget(ratatui::widgets::Clear, pane);
         self.paint_user_turn_chrome(
             frame,
             pane,
@@ -264,46 +264,6 @@ impl TuiApp {
                     .set_fg(self.theme.ui.primary);
             }
         }
-    }
-}
-
-/// Erase the conversation pane, standing the local canvas back
-/// under it.
-///
-/// The erase resets cells to the terminal default before the
-/// windowed view lands — leak-cleaning for whatever a prior frame
-/// left behind. A locally painted canvas cannot come back
-/// transparent: the multiplexer's shared default would show through
-/// the whole pane, so the palette's own canvas re-fills the pane the
-/// erase cleared, and the chrome and text land over it as ever.
-fn erase_conversation_pane(
-    frame: &mut Frame,
-    pane: Rect,
-    canvas: ratatui::style::Color,
-    canvas_local: bool,
-) {
-    frame.render_widget(ratatui::widgets::Clear, pane);
-    paint_local_canvas(frame, pane, canvas, canvas_local);
-}
-
-/// Fill `area` with the palette's canvas when the frame paints it
-/// locally.
-///
-/// A multiplexed pane cannot lean on the client-shared default
-/// background — another pane's write repaints it — so the frame
-/// stands the theme's canvas under its own cells, every transparent
-/// region included, and a switch repaints them all through the diff.
-/// A direct terminal keeps its own default and this writes nothing.
-pub(in crate::app) fn paint_local_canvas(
-    frame: &mut Frame,
-    area: Rect,
-    canvas: ratatui::style::Color,
-    canvas_local: bool,
-) {
-    if canvas_local {
-        frame
-            .buffer_mut()
-            .set_style(area, Style::default().bg(canvas));
     }
 }
 

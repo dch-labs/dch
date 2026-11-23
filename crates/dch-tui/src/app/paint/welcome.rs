@@ -45,7 +45,9 @@ impl TuiApp {
                 .take(usize::from(shape.rows_shown))
                 .cloned()
                 .collect();
-            crate::splash::dissolve_edges(&mut cropped, self.theme.ui.background);
+            if self.canvas_in_force() {
+                crate::splash::dissolve_edges(&mut cropped, self.theme.ui.background);
+            }
             let rect = Rect {
                 x: origin,
                 y: band.y,
@@ -264,13 +266,20 @@ mod tests {
     #[test]
     fn the_splash_margins_dissolve_into_the_theme_canvas() {
         // The flat blue-black margins the art carries against the
-        // default theme's neutral canvas read as a mismatched
-        // background flanking the image — the outermost art column now
-        // goes unstyled, a cell the terminal paints as its own default
-        // (the canvas, in every color vocabulary), so the art's edge
+        // theme's canvas read as a mismatched background flanking the
+        // image — the outermost art column goes unstyled, a cell the
+        // grounding walk then paints as the canvas, so the art's edge
         // and the strips beside it are literally the same cell state.
-        // The picture's middle keeps its own colors.
+        // The picture's middle keeps its own colors. A stated pane
+        // seat: the canvas is in force there, and the deferred direct
+        // seat — which keeps its authored edges — is pinned by its own
+        // test.
+        let _verdict = crate::terminal::MULTIPLEXER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::terminal::set_multiplexed_for_tests(Some(false));
         let mut subject = app();
+        subject.set_terminal_seat(true);
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 30)).expect("terminal");
         terminal
@@ -279,15 +288,15 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let band = subject.welcome_band.expect("band");
         let mid = band.y + band.height / 2;
-        let canvas = ratatui::style::Color::Reset;
+        let canvas = subject.theme.ui.background;
         for x in [band.x, band.right().saturating_sub(1)] {
             let cell = buffer
                 .cell((x, mid))
                 .map(|cell| (cell.symbol(), cell.fg, cell.bg));
             assert_eq!(
                 cell,
-                Some((" ", canvas, canvas)),
-                "the outermost art column is a blank default cell — no glyph dots in the foreground color"
+                Some((" ", ratatui::style::Color::Reset, canvas)),
+                "the outermost art column is a blank cell the walk grounds — no glyph dots in the foreground color"
             );
         }
         let middle = buffer
@@ -303,8 +312,82 @@ mod tests {
             .map(|cell| (cell.fg, cell.bg));
         assert_eq!(
             strip,
-            Some((canvas, canvas)),
-            "the strips beyond the band are the same default cells as the art's edge"
+            Some((ratatui::style::Color::Reset, canvas)),
+            "the strips beyond the band are the same grounded cells as the art's edge"
+        );
+    }
+
+    #[test]
+    fn a_deferred_welcome_keeps_its_authored_edges() {
+        // A deferred palette keeps its painted pairs, so the surface
+        // probe the dissolve once gated on cannot see the deferral:
+        // on a direct terminal that never answered, the frame's
+        // ground is the terminal's own scheme and the art's margins
+        // keep the exact ink and ground they were authored with — no
+        // span steps toward a canvas that is not showing. The stated
+        // pane seat renders the same deferred theme beside it — there
+        // the canvas is in force and the outermost column dissolves —
+        // the difference that proves the gate reads the seat, not
+        // the palette.
+        let _verdict = crate::terminal::MULTIPLEXER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::terminal::set_multiplexed_for_tests(Some(false));
+        let mut deferred = app();
+        deferred.theme = deferred.theme.deferred_to_terminal();
+        let mut deferred_terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 30)).expect("terminal");
+        deferred_terminal
+            .draw(|frame| deferred.render(frame))
+            .expect("deferred draw");
+        let mut seated = app();
+        seated.theme = seated.theme.deferred_to_terminal();
+        seated.set_terminal_seat(true);
+        let mut seated_terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 30)).expect("terminal");
+        seated_terminal
+            .draw(|frame| seated.render(frame))
+            .expect("seated draw");
+        let band = deferred.welcome_band.expect("band");
+        let mid = band.y + band.height / 2;
+        let shape = deferred
+            .welcome_shape(ratatui::layout::Rect::new(0, 0, 80, 30))
+            .expect("a shape");
+        let art = shape.art.expect("the seated rung");
+        let row = shape.row_skip.saturating_add(mid.saturating_sub(band.y));
+        let authored = art.lines.get(usize::from(row)).expect("the authored row");
+        let width = authored.spans.len();
+        let default_color = ratatui::style::Color::Reset;
+        for (column, span) in [
+            (0usize, authored.spans.first()),
+            (width.saturating_sub(1), authored.spans.last()),
+        ] {
+            let Some(span) = span else {
+                continue;
+            };
+            let cell = deferred_terminal.backend().buffer().cell((
+                band.x
+                    .saturating_add(u16::try_from(column).unwrap_or(u16::MAX)),
+                mid,
+            ));
+            assert_eq!(
+                cell.map(|cell| (cell.fg, cell.bg)),
+                Some((
+                    span.style.fg.unwrap_or(default_color),
+                    span.style.bg.unwrap_or(default_color),
+                )),
+                "the deferred welcome's margin column {column} keeps its authored ink and ground"
+            );
+        }
+        let dissolved = seated_terminal
+            .backend()
+            .buffer()
+            .cell((band.x, mid))
+            .map(|cell| (cell.symbol(), cell.bg));
+        assert_eq!(
+            dissolved,
+            Some((" ", seated.theme.ui.background)),
+            "the pane twin dissolves the same column — the gate reads the seat, not the palette"
         );
     }
 

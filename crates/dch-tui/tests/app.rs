@@ -46,7 +46,12 @@ fn config_with_strip_top() -> DchConfig {
 }
 
 fn app() -> TuiApp {
-    TuiApp::new(config_with_theme("dracula"))
+    let mut app = TuiApp::new(config_with_theme("dracula"));
+    // The suite pins the direct seat: a developer's shell may sit
+    // inside tmux, and a pane would ground its own canvas where these
+    // pins expect the terminal's default to show through.
+    app.set_terminal_seat(false);
+    app
 }
 
 fn docked_app() -> TuiApp {
@@ -115,6 +120,10 @@ fn wheel_event(kind: MouseEventKind) -> Event {
 }
 
 fn render_to_buffer(app: &mut TuiApp, width: u16, height: u16) -> Terminal<TestBackend> {
+    // The suite pins the direct seat: a developer's shell may sit
+    // inside tmux, and a pane would ground its own canvas where these
+    // pins expect the terminal's default to show through.
+    app.set_terminal_seat(false);
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
     terminal.draw(|frame| app.render(frame)).unwrap();
     terminal
@@ -4932,47 +4941,49 @@ fn the_conversation_pane_renders_on_the_terminal_s_own_background() {
 }
 
 #[test]
-fn a_locally_painted_canvas_covers_the_transparent_regions() {
-    // The multiplexer contract, the mirror of the one-layer pin above:
-    // inside tmux the client-shared default background cannot be
-    // leaned on — another pane's write repaints it — so the frame
-    // paints the canvas on its own cells. Every region the direct
-    // terminal leaves to the default carries the palette's own
-    // background, and the raised surfaces keep their fills over it.
+fn a_seated_pane_grounds_its_canvas_and_keeps_its_surfaces() {
+    // The pane twin of the one-layer pin above: inside a multiplexer
+    // the frame cannot lean on the terminal default — the client's
+    // own background would show through it — so the grounding walk
+    // paints the canvas under every cell the widgets left default.
+    // Position by position: a conversation row carries the canvas
+    // where the direct seat leaves the default, the composer body
+    // keeps its surface fill over it, and the status bar still paints
+    // its own row. The render is driven directly because the shared
+    // helper pins the direct seat this pin deliberately leaves.
     let mut app = docked_app();
-    app.set_canvas_painted_locally(true);
-    let terminal = render_to_buffer(&mut app, 40, 14);
+    app.set_terminal_seat(true);
+    let mut terminal = Terminal::new(TestBackend::new(40, 14)).unwrap();
+    terminal.draw(|frame| app.render(frame)).unwrap();
     let buffer = terminal.backend().buffer();
     let composer = composer_chunk(40, 14, 4);
     assert_eq!(
         buffer[(5, composer.y.saturating_sub(2))].bg,
         app.theme.ui.background,
-        "the conversation pane carries the painted canvas, not the shared default"
+        "the conversation pane paints its canvas where the direct seat leaves the \
+         terminal default — a client's own background cannot show through"
     );
     assert_eq!(
         buffer[(1, composer.y)].bg,
         app.theme.ui.surface,
-        "the composer body keeps its surface fill over the canvas"
+        "the composer body keeps its surface fill over the grounded canvas"
     );
     assert_eq!(
         buffer[(0, 13)].bg,
         app.theme.ui.status_bar_bg,
-        "the status bar paints its own row"
+        "the status bar paints its own row over the grounded canvas"
     );
 }
 
 #[test]
-fn a_scrolled_error_row_paints_no_reset_cell_in_the_conversation_pane() {
-    // The two defects of session 1fab4451 pinned at their crossing:
-    // the pane scrolled to a baked API-error row inside a multiplexer
-    // (local canvas). The leak's second mechanism — cells handed back
-    // to the client-shared default background — must not show at the
-    // error block: every cell the conversation pane paints carries a
-    // background the palette owns, and the error rows stand on the
-    // painted canvas like every other row.
+fn the_scrolled_error_block_renders_its_header_and_wrapped_detail() {
+    // The 502 shape from session 1fab4451: an API error with an HTML
+    // edge body bakes into the conversation with its header naming
+    // the attempts, the status, and the gateway tag, and the detail
+    // wraps as clean rows — no control bytes from the provider's
+    // page riding into the cells.
     let now = chrono::Utc::now();
     let mut app = app();
-    app.set_canvas_painted_locally(true);
     app.seed_messages(vec![
         TuiMessage::User {
             text: "run the suite".to_string(),
@@ -5004,25 +5015,17 @@ HTTP 502: upstream reset"
     ]);
     let terminal = render_to_buffer(&mut app, 80, 30);
     let rows = row_texts(&terminal);
-    let header_y = rows
+    let header = rows
         .iter()
-        .position(|row| row.contains("✗ model request failed"))
-        .and_then(|index| u16::try_from(index).ok())
+        .find(|row| row.contains("model request failed"))
         .expect("the error block's header renders");
-    let buffer = terminal.backend().buffer();
-    for y in 0..buffer.area.height.saturating_sub(4) {
-        for x in 0..buffer.area.width {
-            assert_ne!(
-                buffer[(x, y)].bg,
-                ratatui::style::Color::Reset,
-                "no conversation-pane cell leans on the shared default at ({x}, {y})"
-            );
-        }
-    }
-    assert_eq!(
-        buffer[(10, header_y)].bg,
-        app.theme.ui.background,
-        "the error block's own rows stand on the painted canvas"
+    assert!(
+        header.contains("4 attempts") && header.contains("HTTP 502"),
+        "the header names the failure's facts: {header:?}"
+    );
+    assert!(
+        header.contains("alibaba-ga"),
+        "the sanitized gateway tag rides the header: {header:?}"
     );
 }
 

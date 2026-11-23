@@ -948,6 +948,13 @@ mod tests {
 
     #[test]
     fn every_theme_switch_path_rebakes_without_a_screen_clear() {
+        // A direct terminal: the switch with no reader to park defers
+        // the palette — the pane seat lands without an exchange and is
+        // pinned by its own test.
+        let _verdict = crate::terminal::MULTIPLEXER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::terminal::set_multiplexed_for_tests(Some(false));
         let mut app = TuiApp::new(dch_config::DchConfig::default());
         for command in ["/theme nord", "/theme", "/set theme nord"] {
             // Pretend every rendered-line cache is fresh under the old

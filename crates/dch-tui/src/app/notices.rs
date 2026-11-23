@@ -978,11 +978,13 @@ pub(crate) fn plain_wrapped_lines_styled(
 /// glue onto. When the text carries the well-known loopctl API
 /// failure shape, a header row names the failure's own facts — the
 /// attempt count, the HTTP status, and the gateway tag an edge body
-/// carried — before the wrapped detail, indented under the header, in
-/// the error tone. Prose failures — a cancellation, a compaction
-/// notice — render without a header, as the wrapped text alone. The
-/// text itself passes through the same sanitizer the wrap funnel
-/// applies, so a persisted HTML body bakes clean on resume too.
+/// carried — wrapping to the pane like the detail beneath it, so a
+/// tag longer than the width folds rather than clips — before the
+/// wrapped detail, indented under the header, in the error tone.
+/// Prose failures — a cancellation, a compaction notice — render
+/// without a header, as the wrapped text alone. The text itself
+/// passes through the same sanitizer the wrap funnel applies, so a
+/// persisted HTML body bakes clean on resume too.
 pub(crate) fn error_block_lines(
     text: &str,
     width: u16,
@@ -995,7 +997,9 @@ pub(crate) fn error_block_lines(
     }
     let facts = api_failure_facts(text);
     if let Some(header) = facts.as_ref().map(ApiFailureFacts::header) {
-        lines.push(Line::styled(header, Style::default().fg(error_color)));
+        for row in wrap_rows(&header, usize::from(width.max(1))) {
+            lines.push(Line::styled(row, Style::default().fg(error_color)));
+        }
     }
     let indent = if facts.is_some() { "  " } else { "" };
     let budget = usize::from(width.max(1))
@@ -1986,6 +1990,39 @@ and fallback failed: HTTP error: HTTP 502: upstream reset";
                 .iter()
                 .any(|line| joined(line).contains("502 Bad Gateway")),
             "the persisted detail still renders under the header"
+        );
+    }
+
+    #[test]
+    fn a_gateway_tag_longer_than_the_pane_wraps_into_the_width() {
+        // The header is the block's one provider-sized span: an edge
+        // whose tag outgrows the pane wraps like the detail does —
+        // every row inside the width, the whole tag still present —
+        // instead of silently losing its tail to the clip.
+        let tag = "a".repeat(120);
+        let raw = format!("API error: HTTP error: HTTP 502: <center>{tag}</center>");
+        let lines = error_block_lines(&raw, 40, Color::Rgb(1, 2, 3), false);
+        let joined = |line: &Line<'_>| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
+        let rows: Vec<String> = lines.iter().map(joined).collect();
+        assert!(
+            rows.len() > 1,
+            "an over-wide header folds into several rows, not one clipped row"
+        );
+        for (index, row) in rows.iter().enumerate() {
+            assert!(
+                str_width(row) <= 40,
+                "row {index} stays inside the width: {} cells",
+                str_width(row)
+            );
+        }
+        assert!(
+            rows.concat().contains(&tag),
+            "the whole tag survives the fold: {rows:?}"
         );
     }
 

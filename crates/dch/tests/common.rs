@@ -22,6 +22,12 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 /// One canned HTTP response the server hands to the next connection.
+///
+/// The scripted stream is a queue of these: each arriving connection
+/// takes the head entry whole — its hold first, then its bytes — so a
+/// scenario spells a provider's turns out as a list. When the queue
+/// runs dry the server answers 500 and closes, which is how a
+/// scripted stream ends.
 struct CannedResponse {
     /// The `Content-Type` header value the response carries.
     ///
@@ -268,11 +274,21 @@ impl CannedServer {
     }
 
     /// The port the canned endpoint listens on.
+    ///
+    /// The listener took an ephemeral port at start-up, so a scenario
+    /// never chooses one; the value is what the sandbox's written
+    /// config already points `[api]` at, kept public for the rare
+    /// scenario that wants to address the endpoint itself.
     pub fn port(&self) -> u16 {
         self.port
     }
 
     /// The request bodies received so far, in arrival order.
+    ///
+    /// A snapshot clone under the lock, so a scenario can read it
+    /// while the server thread keeps accepting; the order is the
+    /// order the connections arrived in, which is the order the
+    /// scripted turns ran.
     pub fn requests(&self) -> Vec<String> {
         self.requests
             .lock()
@@ -368,11 +384,22 @@ pub struct Sandbox {
 
 impl Sandbox {
     /// Build the sandbox around a scripted provider stream.
+    ///
+    /// Each body becomes one `text/event-stream` response the canned
+    /// server hands out connection by connection, in the order given
+    /// — the shape every provider-turn scenario stands on: the bodies
+    /// are the model's turns, and the run ends when the script runs
+    /// dry.
     pub fn sse(bodies: Vec<String>) -> Self {
         Self::with_server(CannedServer::sse(bodies))
     }
 
     /// Build the sandbox around an already-started server.
+    ///
+    /// The constructor every builder funnels through: it allocates
+    /// the isolated home and workdir, then writes the config file
+    /// that points `[api]` at the given endpoint, so every spawn from
+    /// this sandbox talks to the script and nothing else.
     pub fn with_server(server: CannedServer) -> Self {
         let home = tempfile::tempdir().expect("home tempdir");
         let workdir = tempfile::tempdir().expect("workdir tempdir");
@@ -396,16 +423,29 @@ impl Sandbox {
     }
 
     /// The workdir the spawned binary and its tools operate in.
+    ///
+    /// The same tempdir every spawner passes as the child's current
+    /// directory: relative paths a scenario writes before the run and
+    /// the filesystem effects it asserts on after both resolve here.
     pub fn workdir(&self) -> &Path {
         self.workdir.path()
     }
 
     /// The sessions directory under the isolated HOME.
+    ///
+    /// The path the spawned binary saves sessions into —
+    /// `.dch/sessions` under the sandbox's home — so a scenario finds
+    /// its save files without hard-coding the layout the binary
+    /// settles on.
     pub fn sessions_dir(&self) -> PathBuf {
         self.home.path().join(".dch").join("sessions")
     }
 
     /// The recorded provider request bodies so far.
+    ///
+    /// The sandbox's window onto [`CannedServer::requests`]: what the
+    /// binary sent the scripted model, in arrival order, for
+    /// scenarios that assert on the wire rather than the screen.
     pub fn requests(&self) -> Vec<String> {
         self.server.requests()
     }
@@ -663,9 +703,12 @@ impl Sandbox {
     /// scenario needs to stand the binary in: a multiplexer's
     /// spellings — `TMUX`, a `tmux-…` terminal type — for pins over
     /// the launch-time decisions the shell reads from its
-    /// environment. The base environment is the helper's own; an
-    /// entry whose key it already carries overrides it, so a scenario
-    /// naming `TERM` decides the terminal type the binary sees.
+    /// environment. The helper's own multiplexer spellings are
+    /// removed first, so a scenario that injects none stands the
+    /// binary in a direct terminal whatever shell the suite runs in;
+    /// an entry whose key the base already carries overrides it, so a
+    /// scenario naming `TERM` decides the terminal type the binary
+    /// sees.
     pub fn dch_pty_in_env(&self, args: &[&str], env: &[(&str, &str)]) -> PtySession {
         use portable_pty::CommandBuilder;
         use portable_pty::PtySize;
@@ -684,6 +727,9 @@ impl Sandbox {
         command.env("HOME", self.home.path());
         command.env("XDG_CONFIG_HOME", self.home.path());
         command.env("TERM", "xterm-truecolor");
+        for spelling in ["TMUX", "STY", "ZELLIJ"] {
+            command.env_remove(spelling);
+        }
         for (key, value) in env {
             command.env(key, value);
         }
@@ -693,7 +739,7 @@ impl Sandbox {
             .expect("dch spawns on the pty");
         let reader = pty.master.try_clone_reader().expect("pty reader clones");
         let writer = pty.master.take_writer().expect("pty writer taken");
-        PtySession::new(child, reader, writer)
+        PtySession::new(child, pty.master, reader, writer)
     }
 }
 
@@ -701,8 +747,10 @@ impl Sandbox {
 ///
 /// A background thread drains the PTY into a shared buffer so waits
 /// never block on reads; [`Self::expect`] polls that buffer for a
-/// needle, [`Self::send`] writes keystrokes, and [`Self::finish`]
-/// reaps the child under a deadline.
+/// needle, [`Self::send`] writes keystrokes, [`Self::finish`] reaps
+/// the child under a deadline, and the background writers — the input
+/// flood, the query-answer watcher — take the master's side lane so a
+/// blocked background write never holds the keystroke lock.
 pub struct PtySession {
     /// The binary running on the pseudoterminal.
     ///
@@ -714,9 +762,21 @@ pub struct PtySession {
 
     /// The keystroke side of the terminal.
     ///
-    /// Everything a scenario types — prompts, answers, the quit chord —
-    /// goes through here as raw bytes.
-    writer: Box<dyn Write + Send>,
+    /// Everything a scenario types — prompts, answers, the quit
+    /// chord — goes through here as raw bytes, behind the lock that
+    /// keeps one keystroke whole. The background writers owe this
+    /// lock nothing: they write through the master's side lane, so a
+    /// background write blocked on a full input buffer cannot stall
+    /// the scenario's next keystroke.
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+
+    /// The control side of the pseudoterminal.
+    ///
+    /// The descriptor the side lanes duplicate belongs to it, and it
+    /// keeps the pty's control side open for the session's life — a
+    /// lane may outlive the master through its own duplicate, but the
+    /// session never closes the master a running lane duplicated from.
+    master: Box<dyn portable_pty::MasterPty + Send>,
 
     /// Everything the terminal has rendered so far.
     ///
@@ -730,10 +790,11 @@ impl PtySession {
     ///
     /// The reader thread owns the PTY's read half for the session's
     /// whole life so the shared buffer keeps growing whatever the
-    /// waits are doing; the child and writer halves stay with the
-    /// session for reaping and keystrokes.
+    /// waits are doing; the child, master, and writer halves stay
+    /// with the session for reaping, side lanes, and keystrokes.
     fn new(
         child: Box<dyn portable_pty::Child + Send>,
+        master: Box<dyn portable_pty::MasterPty + Send>,
         reader: Box<dyn Read + Send>,
         writer: Box<dyn Write + Send>,
     ) -> Self {
@@ -755,9 +816,49 @@ impl PtySession {
         });
         Self {
             child,
-            writer,
+            writer: Arc::new(Mutex::new(writer)),
             screen,
+            master,
         }
+    }
+
+    /// Answer the binary's background query like a terminal that
+    /// implements it, the moment the query leaves the pane.
+    ///
+    /// The startup exchange gives the reply a window of a few hundred
+    /// milliseconds; a scenario that waited for the screen before
+    /// replying would always miss it. This parks a watcher on the
+    /// stream instead: when `OSC 11 ; ?` appears, the watcher writes
+    /// the reply — `rgb` in the wire's own `rrrr/gggg/bbbb` spelling —
+    /// from a second writer on the same pty, racing the query the way a
+    /// real terminal does. One reply per query for `lifetime`, then the
+    /// watcher stands down.
+    pub fn answer_background_query(&self, rgb: &str, lifetime: std::time::Duration) {
+        let screen = Arc::clone(&self.screen);
+        let mut lane = self.side_write_lane();
+        let reply = format!("\x1b]11;rgb:{rgb}\x1b\\").into_bytes();
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now()
+                .checked_add(lifetime)
+                .expect("deadline computable");
+            let mut answered = 0_usize;
+            while std::time::Instant::now() < deadline {
+                let seen = screen
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .matches("\x1b]11;?")
+                    .count();
+                if seen > answered {
+                    if let Err(err) = lane.write_all(&reply) {
+                        tracing::warn!(error = %err, "background reply could not be written");
+                    } else if let Err(err) = lane.flush() {
+                        tracing::warn!(error = %err, "background reply could not be flushed");
+                    }
+                    answered = seen;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        });
     }
 
     /// Wait until the rendered output contains `needle`.
@@ -787,6 +888,13 @@ impl PtySession {
     }
 
     /// Everything rendered on the terminal so far.
+    ///
+    /// A clone of the shared buffer the background reader thread
+    /// appends to, taken under its lock, so the call never blocks on
+    /// the terminal itself. The bytes are the raw stream — escapes
+    /// included — so a pin over the wire's own shapes reads this;
+    /// word-level expectations go through [`expect`](Self::expect),
+    /// which strips the escapes and matches the words in order.
     pub fn snapshot(&self) -> String {
         self.screen
             .lock()
@@ -795,12 +903,120 @@ impl PtySession {
     }
 
     /// Write raw bytes to the terminal — keystrokes for the app.
+    ///
+    /// One `write_all` and a flush under the keystroke lock, so the
+    /// bytes arrive as a burst the reader cannot split from a
+    /// keystroke's own tail. A scenario typing a command and its
+    /// return sends them as two calls, the way a keyboard delivers
+    /// them, and the flood lane writes through its own side path — a
+    /// flood blocked on a full input buffer can never stall this one.
     pub fn send(&mut self, bytes: &[u8]) {
-        self.writer.write_all(bytes).expect("keystrokes written");
-        self.writer.flush().expect("keystrokes flushed");
+        let mut writer = self
+            .writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        writer.write_all(bytes).expect("keystrokes written");
+        writer.flush().expect("keystrokes flushed");
+    }
+
+    /// Hold the keystroke lane for as long as the guard lives.
+    ///
+    /// A fixture for pins over the background writers' discipline:
+    /// with the lane held nothing the scenario types can proceed, so
+    /// a flood that still runs to its deadline proves it owes the
+    /// lane nothing.
+    pub fn keystroke_lane(&self) -> std::sync::MutexGuard<'_, Box<dyn Write + Send>> {
+        self.writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The write lane a background thread of this session writes
+    /// through.
+    ///
+    /// The master's own descriptor wherever the platform names one,
+    /// duplicated into the lane so the blocking a full input buffer
+    /// imposes stalls the lane's thread alone; the keystroke lane
+    /// itself where no descriptor exists, the only writer that
+    /// platform offers. [`flood_input`](Self::flood_input) and the
+    /// [`answer_background_query`](Self::answer_background_query)
+    /// watcher both write here.
+    fn side_write_lane(&self) -> SideLane {
+        self.descriptor_lane()
+            .unwrap_or_else(|| SideLane::Keystrokes(Arc::clone(&self.writer)))
+    }
+
+    /// The master's descriptor as an owned write lane, where the
+    /// platform names one.
+    ///
+    /// `None` when the master exposes no raw descriptor, leaving the
+    /// keystroke lane as the only write lane.
+    #[cfg(unix)]
+    fn descriptor_lane(&self) -> Option<SideLane> {
+        let fd = self.master.as_raw_fd()?;
+        // SAFETY: the descriptor belongs to `self.master` and is only
+        // borrowed for the duplication — the wrapper never closes it,
+        // and the lane that returns owns its own duplicate.
+        let borrowed = std::mem::ManuallyDrop::new(unsafe {
+            <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd)
+        });
+        borrowed.try_clone().ok().map(SideLane::Descriptor)
+    }
+
+    /// The descriptor lane's absence off unix, where the master
+    /// names no raw descriptor.
+    ///
+    /// The side lane falls back to the keystroke writer there, the
+    /// one write lane that platform carries.
+    #[cfg(not(unix))]
+    fn descriptor_lane(&self) -> Option<SideLane> {
+        None
+    }
+
+    /// Type `bytes` at the session continuously for `duration`, from a
+    /// thread of its own.
+    ///
+    /// The counterpart of a key held down: the stream never pauses
+    /// long enough for a reader to catch the input empty, which is
+    /// what a launch-time window that stands down on waiting input
+    /// needs to be driven through — a paced trickle always leaves the
+    /// gap one final drain can win. The writes pace themselves by the
+    /// pty alone — `write_all` blocks while the child's input is full
+    /// and resumes as it drains — so the stream outpaces the session
+    /// by no more than the kernel's buffer; the deadline bounds the
+    /// loop, not a blocked write, and the thread finishes only once
+    /// its last write drains. The lane is the session's side lane,
+    /// never the keystroke lock: a flood blocked on a full input
+    /// buffer owes the scenario's next keystroke nothing. The bytes
+    /// are the scenario's to choose — something the session consumes
+    /// without editing the composer or asking for a frame — and the
+    /// returned handle lets a scenario wait the flood out before its
+    /// next keystroke, so a submit never races the backlog.
+    pub fn flood_input(
+        &self,
+        bytes: &[u8],
+        duration: std::time::Duration,
+    ) -> std::thread::JoinHandle<()> {
+        let mut lane = self.side_write_lane();
+        let bytes = bytes.to_vec();
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now()
+                .checked_add(duration)
+                .expect("deadline computable");
+            while std::time::Instant::now() < deadline {
+                if lane.write_all(&bytes).is_err() || lane.flush().is_err() {
+                    return;
+                }
+            }
+        })
     }
 
     /// The child's process id, for tests that deliver signals.
+    ///
+    /// The signal scenarios aim their `kill` at the running session
+    /// the way a user's terminal would, so they need the id while the
+    /// child is live; it stays valid until the session's reaping
+    /// takes the child back.
     pub fn pid(&self) -> u32 {
         self.child.process_id().expect("child reports its pid")
     }
@@ -926,13 +1142,67 @@ impl PtySession {
     }
 }
 
+/// A write lane to the session's pty that a background thread owns.
+///
+/// The descriptor form carries its own duplicate of the master's
+/// file descriptor: it writes the same input stream the keystroke
+/// writer does, without sharing its lock, so a write that blocks on a
+/// full input buffer blocks its thread alone. The keystroke form is
+/// the fallback where the platform names no descriptor — the shared
+/// writer behind its mutex, with the sharing that implies.
+enum SideLane {
+    /// The master's descriptor, duplicated; owned and closed by the
+    /// lane alone.
+    Descriptor(std::fs::File),
+
+    /// The keystroke writer, for platforms without a raw master
+    /// descriptor to duplicate.
+    Keystrokes(Arc<Mutex<Box<dyn Write + Send>>>),
+}
+
+impl Write for SideLane {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            SideLane::Descriptor(file) => file.write(buf),
+            SideLane::Keystrokes(writer) => writer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            SideLane::Descriptor(file) => file.flush(),
+            SideLane::Keystrokes(writer) => writer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .flush(),
+        }
+    }
+}
+
 /// How long a settled screen must hold still before it counts as done.
+///
+/// The ceiling of the wait behind `settle_screen`: a reaped child's
+/// last bytes usually land in milliseconds, and anything still
+/// arriving after half a second is returned as far as it got rather
+/// than gating the scenario.
 pub const SCREEN_STABLE_CAP: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// The gap between two reads of the screen buffer.
+///
+/// The cadence `settle_screen` re-reads at: long enough that a
+/// growing buffer has a beat to grow on, short enough that the
+/// stable verdict arrives promptly after the last byte.
 pub const SCREEN_POLL: std::time::Duration = std::time::Duration::from_millis(25);
 
 /// The number of unchanged reads that settle the screen.
+///
+/// Two, because one unchanged read proves nothing on its own — two
+/// reads with no sleep between them agree just as readily on an empty
+/// buffer, which is exactly how a late trailing line would slip past
+/// a single-read verdict.
 const STABLE_READS: usize = 2;
 
 /// Read until the screen stops growing, then hand it back.

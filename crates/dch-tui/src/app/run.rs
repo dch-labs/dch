@@ -57,6 +57,10 @@ impl TuiApp {
         let mut session_closed = false;
 
         terminal.draw(|frame| self.render(frame))?;
+        if self.retry_the_startup_background_ask() {
+            terminal.clear()?;
+            terminal.draw(|frame| self.render(frame))?;
+        }
 
         while !self.quit.requested {
             let mut needs_redraw = tokio::select! {
@@ -158,15 +162,7 @@ impl TuiApp {
             }
             if needs_redraw {
                 let theme_burst = self.browse.pending_theme_osc.take();
-                if theme_burst.is_some() {
-                    crate::terminal::begin_synchronized_output();
-                }
-                let started = Instant::now();
-                terminal.draw(|frame| self.render(frame))?;
-                let took = started.elapsed();
-                if let Some((background, primary)) = theme_burst {
-                    crate::terminal::finish_theme_burst(background, primary);
-                }
+                let took = self.draw_frame(terminal, theme_burst)?;
                 if let Some(lane) = self.pacing.frame_stats.note_draw(took, Instant::now()) {
                     tracing::debug!(
                         target: "dch_tui::frames",
@@ -179,6 +175,38 @@ impl TuiApp {
             }
         }
         Ok(())
+    }
+
+    /// Draw one frame, closing a parked theme burst's window whether
+    /// the draw succeeds or fails.
+    ///
+    /// A parked burst brackets the frame's cell diff with the
+    /// synchronized-output window so the theme's canvas write lands
+    /// as the burst's final beat. The close is owed when the draw
+    /// fails as well: the restore bytes the caller's terminal guard
+    /// writes after the error must not sit inside a window that never
+    /// ends — a terminal implementing the mode buffers a window's
+    /// content until it closes and would never paint the restore — so
+    /// the closing write goes out before the draw's error escapes.
+    ///
+    /// # Errors
+    /// Propagates the terminal draw's error, with the burst's window
+    /// close already written.
+    pub(super) fn draw_frame(
+        &mut self,
+        terminal: &mut ratatui::Terminal<impl ratatui::backend::Backend>,
+        theme_burst: Option<(ratatui::style::Color, ratatui::style::Color)>,
+    ) -> std::io::Result<Duration> {
+        if theme_burst.is_some() {
+            crate::terminal::begin_synchronized_output();
+        }
+        let started = Instant::now();
+        let drawn = terminal.draw(|frame| self.render(frame));
+        let took = started.elapsed();
+        if let Some((background, primary)) = theme_burst {
+            crate::terminal::finish_theme_burst(background, primary);
+        }
+        drawn.map(|_| took)
     }
 }
 /// The minimum spacing between background-initiated frames.

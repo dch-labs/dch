@@ -566,13 +566,14 @@ impl Theme {
     /// [`Color::Reset`], the terminal's own foreground, which its own
     /// background guarantees readable. Painted pairs survive
     /// untouched — the composer paints its surface and the status bar
-    /// paints its canvas, so their text keeps its palette. Headings
-    /// get the same test generalized: a heading anchored to the
-    /// canvas defers like the text registers, and a heading whose
-    /// color falls under the 4.5:1 AA floor against white — the
-    /// light canvas the deferral exists for — defers too, because on
-    /// that terminal it would be unreadable. A heading that clears
-    /// the floor on both canvases keeps its palette.
+    /// paints its canvas, so their text keeps its palette, and the
+    /// furniture stays the theme's. Headings get the same test
+    /// generalized: a heading anchored to the canvas defers like the
+    /// text registers, and a heading whose color falls under the
+    /// 4.5:1 AA floor against white — the light canvas the deferral
+    /// exists for — defers too, because on that terminal it would be
+    /// unreadable. A heading that clears the floor on both canvases
+    /// keeps its palette.
     #[must_use]
     pub fn deferred_to_terminal(&self) -> Self {
         fn deferring(color: Color, anchor: Color) -> Color {
@@ -882,10 +883,9 @@ mod tests {
             Color::Reset,
             "code delimiters sit on the terminal canvas and defer"
         );
-        // The code-block text is off-anchor by construction and its
-        // off-canvas color fails the white floor — the pins below
-        // the gray boundary assert both the installed color and the
-        // deferred Reset.
+        // Painted pairs survive untouched — the composer paints its
+        // surface and the status bar paints its canvas, so their text
+        // keeps its palette and the furniture stays the theme's.
         assert_eq!(
             deferred.ui.input_text, theme.ui.input_text,
             "the composer paints its surface: its pair stands"
@@ -899,12 +899,20 @@ mod tests {
             "the status bar paints its canvas: its pair stands"
         );
         assert_eq!(
+            deferred.ui.status_bar_bg, theme.ui.status_bar_bg,
+            "the status bar's painted canvas stands"
+        );
+        assert_eq!(
+            deferred.ui.scrollbar_track, theme.ui.scrollbar_track,
+            "the scrollbar's track stands"
+        );
+        assert_eq!(
             deferred.syntax.keyword, theme.syntax.keyword,
             "accent colors read on both schemes and stand"
         );
         assert_eq!(
             deferred.ui.background, theme.ui.background,
-            "the canvas field is inert without the override; it stands"
+            "the canvas field is inert without the override; a later landing needs it"
         );
         // The heading orange fails the light-canvas floor (1.62:1
         // on white) while clearing it on the house canvas (12:1) —
@@ -993,6 +1001,26 @@ mod tests {
                 "a heading that clears the white-canvas floor keeps its color"
             );
         }
+    }
+
+    #[test]
+    fn the_deferral_is_idempotent_on_the_transparent_theme() {
+        // The transparent theme is the deferred register by
+        // construction — every ground and ink already Reset — so a
+        // deferral applied to it must be the identity: a double
+        // deferral that moved anything would mean the deferred path
+        // itself paints a patch somewhere.
+        let theme = Theme::by_name("transparent").expect("transparent resolves");
+        let deferred = theme.deferred_to_terminal();
+        // Idempotence: the deferred palette equals the original for
+        // every painted pair, whatever the original carried.
+        assert_eq!(deferred.ui.surface, theme.ui.surface);
+        assert_eq!(deferred.ui.status_bar_bg, theme.ui.status_bar_bg);
+        assert_eq!(deferred.ui.scrollbar_track, theme.ui.scrollbar_track);
+        assert_eq!(deferred.ui.input_text, theme.ui.input_text);
+        assert_eq!(deferred.ui.status_bar_fg, theme.ui.status_bar_fg);
+        assert_eq!(deferred.ui.background, Color::Reset);
+        assert_eq!(deferred.ui.foreground, Color::Reset);
     }
 
     #[test]

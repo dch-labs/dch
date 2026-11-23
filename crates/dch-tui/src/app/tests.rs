@@ -1178,6 +1178,177 @@ fn a_committed_switch_defers_its_terminal_writes_to_the_flush() {
 }
 
 #[test]
+fn a_preview_parks_its_canvas_and_a_dismissed_browse_re_arms_the_restore() {
+    // The browse preview's terminal half: the palette swap parks the
+    // previewed canvas and tint on the flush — the slot a commit parks
+    // into — and the browse's dismissal parks the restored palette's
+    // pair the same way, so the terminal follows the preview and comes
+    // back with it. A direct seat without a proven canvas keeps the
+    // deferred inks; the parked canvas is still the previewed palette's
+    // own, which the flush writes only on a terminal that took one.
+    let _verdict = crate::terminal::MULTIPLEXER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    crate::terminal::set_multiplexed_for_tests(Some(false));
+    let mut app = TuiApp::new(dch_config::DchConfig::default());
+    let before = app.theme.clone();
+    app.preview_theme(Theme::by_name("nord").expect("nord resolves"));
+    let previewed = app.theme.clone();
+    assert_ne!(
+        previewed.ui.background, before.ui.background,
+        "fixture premise: the preview moved the canvas"
+    );
+    assert_eq!(
+        app.browse.pending_theme_osc,
+        Some((previewed.ui.background, previewed.ui.primary)),
+        "the preview parks the previewed canvas and tint for the flush"
+    );
+    app.composer.input.set_text("/theme ".to_string());
+    assert!(
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        "Esc dismisses the standing browse"
+    );
+    assert_eq!(
+        app.theme.name, before.name,
+        "the dismissed browse restores the session's theme"
+    );
+    assert_eq!(
+        app.browse.pending_theme_osc,
+        Some((before.ui.background, before.ui.primary)),
+        "the dismissal re-arms the restored palette's canvas and tint"
+    );
+    crate::terminal::set_multiplexed_for_tests(None);
+}
+
+#[test]
+fn the_startup_fallback_restores_without_opening_a_burst() {
+    // The branch a host's struct-literal theme reaches: the retry's
+    // landing cannot un-mask a palette the registry does not carry, so
+    // the terminal gets its own background back through the plain
+    // captured restore — never a synchronized-output close the
+    // fallback did not open, which would leave the markers unpaired.
+    let mut app = TuiApp::new(dch_config::DchConfig::default());
+    let mut literal = Theme::by_name("nord").expect("nord resolves");
+    literal.name = "host literal";
+    app.theme = literal;
+    let before =
+        crate::terminal::SYNCHRONIZED_WINDOW_BALANCE.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        !app.land_startup_canvas(),
+        "an unregistered name cannot un-mask the palette"
+    );
+    assert_eq!(
+        app.theme.name, "host literal",
+        "the deferred palette stays as the host installed it"
+    );
+    assert_eq!(
+        crate::terminal::SYNCHRONIZED_WINDOW_BALANCE.load(std::sync::atomic::Ordering::Relaxed),
+        before,
+        "the fallback opens and closes no synchronized window of its own"
+    );
+}
+
+/// A backend whose frame writes always fail — the only arm a dead or
+/// closing terminal takes, which [`ratatui::backend::TestBackend`]
+/// cannot stand in for.
+struct FailingBackend;
+
+impl ratatui::backend::Backend for FailingBackend {
+    fn draw<'a, I>(&mut self, _content: I) -> std::io::Result<()>
+    where
+        I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+    {
+        Err(std::io::Error::other("the frame write failed"))
+    }
+
+    fn hide_cursor(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn show_cursor(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn get_cursor_position(&mut self) -> std::io::Result<ratatui::layout::Position> {
+        Ok(ratatui::layout::Position::ORIGIN)
+    }
+
+    fn set_cursor_position<P: Into<ratatui::layout::Position>>(
+        &mut self,
+        _position: P,
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn clear(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn size(&self) -> std::io::Result<ratatui::layout::Size> {
+        Ok(ratatui::layout::Size {
+            width: 80,
+            height: 24,
+        })
+    }
+
+    fn window_size(&mut self) -> std::io::Result<ratatui::backend::WindowSize> {
+        Ok(ratatui::backend::WindowSize {
+            columns_rows: ratatui::layout::Size {
+                width: 80,
+                height: 24,
+            },
+            pixels: ratatui::layout::Size {
+                width: 0,
+                height: 0,
+            },
+        })
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_failed_draw_closes_the_parked_bursts_window() {
+    // The burst's window opens before the frame's bytes; a draw that
+    // fails mid-frame still owes the close, or the restore bytes the
+    // exit guard writes next land inside a window a mode-2026
+    // terminal keeps buffering and never paints. One test walks both
+    // arms in sequence — the balance is process-wide, so a second
+    // test racing this one could snapshot inside the open window.
+    let mut app = TuiApp::new(dch_config::DchConfig::default());
+    let mut terminal = ratatui::Terminal::new(FailingBackend).expect("terminal");
+    let before =
+        crate::terminal::SYNCHRONIZED_WINDOW_BALANCE.load(std::sync::atomic::Ordering::Relaxed);
+    let drawn = app.draw_frame(
+        &mut terminal,
+        Some((
+            ratatui::style::Color::Rgb(12, 12, 12),
+            ratatui::style::Color::Rgb(255, 178, 0),
+        )),
+    );
+    assert!(
+        drawn.is_err(),
+        "the draw failure propagates to the run loop"
+    );
+    assert_eq!(
+        crate::terminal::SYNCHRONIZED_WINDOW_BALANCE.load(std::sync::atomic::Ordering::Relaxed),
+        before,
+        "the window the burst opened, the failed draw still closed"
+    );
+    assert!(
+        app.draw_frame(&mut terminal, None).is_err(),
+        "the draw failure propagates without a burst"
+    );
+    assert_eq!(
+        crate::terminal::SYNCHRONIZED_WINDOW_BALANCE.load(std::sync::atomic::Ordering::Relaxed),
+        before,
+        "no burst stood, so the failure path writes no window markers"
+    );
+}
+
+#[test]
 fn tab_completes_a_command_name_from_its_prefix() {
     let mut app = TuiApp::new(dch_config::DchConfig::default());
     app.composer.input.set_text("/them".to_string());
@@ -2829,6 +3000,264 @@ fn the_browse_previews_the_theme_it_highlights() {
 }
 
 #[test]
+fn the_exchange_splits_a_direct_terminal_from_a_multiplexed_pane() {
+    // The two seats a session can stand in, pinned in one walk because
+    // the verdict is process-wide: a direct terminal leans on the
+    // OSC 11 exchange — an unanswered startup owes one question, and
+    // a preview defers its grounds until the canvas is proven — while
+    // a pane inside a multiplexer runs no exchange at all: the frame
+    // paints its own canvas, the pane keeps the client's default, and
+    // no erase the multiplexer performs on its own — a resize reflow,
+    // an overlay's clear, the alternate-screen handoff — can ever show
+    // the theme's color where the frame did not put it.
+    let _verdict = crate::terminal::MULTIPLEXER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let canvas = ratatui::style::Color::Rgb(12, 12, 12);
+    crate::terminal::set_multiplexed_for_tests(Some(false));
+    let mut direct = TuiApp::new(dch_config::DchConfig::default());
+    assert!(
+        direct.startup_background_ask_warranted().is_some(),
+        "a direct session the terminal never answered owes the question"
+    );
+    let browsed = Theme::by_name("dracula").expect("dracula resolves");
+    let dracula_foreground = browsed.ui.foreground;
+    direct.preview_theme(browsed);
+    assert_eq!(
+        direct.theme.ui.foreground,
+        ratatui::style::Color::Reset,
+        "a direct terminal without a proven canvas previews the deferred register"
+    );
+    assert_ne!(
+        dracula_foreground,
+        ratatui::style::Color::Reset,
+        "fixture premise: the full palette carries an anchored foreground"
+    );
+    assert_eq!(
+        direct.theme.ui.surface,
+        crate::theme::Theme::by_name("dracula")
+            .map_or(ratatui::style::Color::Reset, |theme| theme.ui.surface),
+        "the previewed painted pairs stand — deferral touches the inks alone"
+    );
+    crate::terminal::set_multiplexed_for_tests(Some(true));
+    let mut pane = TuiApp::new(dch_config::DchConfig::default());
+    assert!(
+        pane.startup_background_ask_warranted().is_none(),
+        "a pane owes no exchange — its canvas is the frame's own to paint"
+    );
+    assert!(
+        crate::terminal::sync_default_background(canvas),
+        "the pane's canvas stands without a byte of the exchange"
+    );
+    assert!(
+        !crate::terminal::ask_default_background(canvas).installed,
+        "no mid-session ask from a pane"
+    );
+    assert!(
+        crate::terminal::write_only_warranted(canvas),
+        "an Rgb palette is always paintable in a pane"
+    );
+    assert!(
+        !crate::terminal::write_only_warranted(ratatui::style::Color::Reset),
+        "the paintless palette stays deferred even in a pane"
+    );
+    let browsed = Theme::by_name("dracula").expect("dracula resolves");
+    pane.preview_theme(browsed);
+    assert_ne!(
+        pane.theme.ui.surface,
+        ratatui::style::Color::Reset,
+        "a pane previews the full palette — the grounding paints the canvas"
+    );
+    crate::terminal::set_multiplexed_for_tests(None);
+}
+
+#[test]
+fn the_startup_retry_lands_the_registry_palette_over_the_deferral() {
+    // The typed-ahead startup defers the palette and leaves the
+    // terminal record at never-asked; the retry that lands re-resolves
+    // the registry palette under the deferred palette's own name — the
+    // grounds and inks come back with it, the same palette the session
+    // would have opened under had the query run.
+    let mut app = TuiApp::new(dch_config::DchConfig::default());
+    let canvas = app.theme.ui.background;
+    let surface = app.theme.ui.surface;
+    let foreground = app.theme.ui.foreground;
+    app.theme = app.theme.deferred_to_terminal();
+    assert_eq!(
+        app.theme.ui.foreground,
+        ratatui::style::Color::Reset,
+        "fixture premise: the deferral masked the anchored inks"
+    );
+    assert_eq!(
+        app.theme.ui.surface, surface,
+        "fixture premise: the deferral kept the painted pairs"
+    );
+    assert!(
+        app.land_startup_canvas(),
+        "a registry palette answers the deferred palette's name"
+    );
+    assert_eq!(
+        app.theme.ui.surface, surface,
+        "the grounds un-mask with the palette"
+    );
+    assert_eq!(app.theme.ui.foreground, foreground);
+    assert_eq!(app.theme.ui.background, canvas);
+    assert_eq!(
+        app.theme.name, "Dch",
+        "the landed palette is the registry default"
+    );
+}
+
+#[test]
+fn a_paintless_palette_owes_no_startup_ask() {
+    // The transparent palette defers by construction — its canvas is
+    // the terminal's own — so the startup retry has nothing to ask and
+    // nothing to install: no handshake, no write, the palette stands,
+    // in a direct terminal or a pane alike.
+    let _verdict = crate::terminal::MULTIPLEXER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    crate::terminal::set_multiplexed_for_tests(Some(false));
+    let mut config = dch_config::DchConfig::default();
+    config.display.theme = "transparent".to_string();
+    let app = TuiApp::new(config);
+    assert_eq!(
+        app.theme.ui.background,
+        ratatui::style::Color::Reset,
+        "fixture premise: the paintless canvas is the terminal's own"
+    );
+    assert!(
+        app.startup_background_ask_warranted().is_none(),
+        "no Rgb canvas, no question owed"
+    );
+    crate::terminal::set_multiplexed_for_tests(None);
+}
+
+#[test]
+fn a_stated_seat_grounds_a_deferred_palette_the_seat_doc_names_out_of_contract() {
+    // The seat seam's one impossible environment: a palette that
+    // deferred (a direct terminal that never answered) behind a
+    // stated pane seat. The grounding walk reads the canvas alone, so
+    // the deferred palette's Rgb canvas is painted anyway — pinned
+    // here as the boundary the seat's doc names out of contract, so
+    // widening the warrant to consult the palette's deferral is a
+    // deliberate change this pin greets, not a silent drift.
+    let _verdict = crate::terminal::MULTIPLEXER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    crate::terminal::set_multiplexed_for_tests(Some(false));
+    let mut subject = TuiApp::new(dch_config::DchConfig::default());
+    subject.theme = Theme::by_name("dracula")
+        .expect("dracula resolves")
+        .deferred_to_terminal();
+    let canvas = subject.theme.ui.background;
+    assert!(
+        matches!(canvas, ratatui::style::Color::Rgb(..)),
+        "fixture premise: deferral keeps the canvas"
+    );
+    assert_eq!(
+        subject.theme.ui.foreground,
+        ratatui::style::Color::Reset,
+        "fixture premise: the palette deferred its anchored ink"
+    );
+    subject.set_terminal_seat(true);
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 40)).expect("terminal");
+    terminal.draw(|frame| subject.render(frame)).expect("draw");
+    let buffer = terminal.backend().buffer();
+    assert!(
+        !buffer
+            .content
+            .iter()
+            .any(|cell| cell.bg == ratatui::style::Color::Reset),
+        "the seated walk paints the deferred palette's canvas on every default cell — the boundary the doc names"
+    );
+    crate::terminal::set_multiplexed_for_tests(None);
+}
+
+#[test]
+fn the_canvas_ground_needs_the_canvas_in_force() {
+    // The warrant's two questions: is the canvas in force — a pane
+    // inside a multiplexer, or a direct terminal the OSC 11 exchange
+    // landed on — and is it an Rgb canvas the frame may paint. A
+    // direct terminal the exchange never landed on keeps its own
+    // scheme (the deferred palette paints no canvas), and the
+    // transparent palette defers to the terminal's own default in any
+    // seat.
+    let canvas = ratatui::style::Color::Rgb(12, 12, 12);
+    let answered = crate::terminal::BackgroundSupport::Answered;
+    let refused = crate::terminal::BackgroundSupport::Refused;
+    let never_asked = crate::terminal::BackgroundSupport::NotAsked;
+    assert!(
+        TuiApp::canvas_ground_warranted(true, never_asked, canvas),
+        "a pane paints its canvas without an exchange"
+    );
+    assert!(
+        TuiApp::canvas_ground_warranted(false, answered, canvas),
+        "a direct terminal the set landed on gets the canvas painted too"
+    );
+    assert!(
+        !TuiApp::canvas_ground_warranted(false, refused, canvas),
+        "a refused terminal keeps its own scheme: nothing to paint"
+    );
+    assert!(
+        !TuiApp::canvas_ground_warranted(false, never_asked, canvas),
+        "an unsettled terminal has proven nothing: nothing to paint"
+    );
+    assert!(
+        !TuiApp::canvas_ground_warranted(true, answered, ratatui::style::Color::Reset),
+        "the paintless palette defers to the terminal's own default"
+    );
+}
+
+#[test]
+fn a_grounding_walk_covers_the_blanks_and_keeps_the_surfaces() {
+    // The walk behind a multiplexed frame: every cell a widget left on
+    // the terminal default takes the canvas — the blank rows, the row
+    // tails, the top of the pane — while the grounds the widgets
+    // painted themselves (the composer's surface, the splash's art)
+    // stand exactly as they were. The pane then shows one canvas
+    // whatever the client terminal keeps as its own default.
+    let _verdict = crate::terminal::MULTIPLEXER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    crate::terminal::set_multiplexed_for_tests(Some(false));
+    let mut subject = app();
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 40)).expect("terminal");
+    terminal.draw(|frame| subject.render(frame)).expect("draw");
+    let canvas = subject.theme.ui.background;
+    let surface = subject.theme.ui.surface;
+    let before = terminal.backend().buffer().clone();
+    assert!(
+        before
+            .content
+            .iter()
+            .any(|cell| cell.bg == ratatui::style::Color::Reset),
+        "fixture premise: an ungrounded frame leaves blanks on the terminal default"
+    );
+    let mut grounded = before;
+    super::ground_default_cells(&mut grounded, canvas);
+    assert!(
+        grounded
+            .content
+            .iter()
+            .all(|cell| cell.bg != ratatui::style::Color::Reset),
+        "the walk leaves no cell on the terminal default — the client's own \
+             background can no longer show through"
+    );
+    assert!(
+        grounded.content.iter().any(|cell| cell.bg == surface),
+        "the composer's painted surface stands untouched by the walk"
+    );
+    assert!(
+        grounded.content.iter().any(|cell| cell.bg == canvas),
+        "the canvas lands on the blanks the widgets left"
+    );
+    crate::terminal::set_multiplexed_for_tests(None);
+}
+
+#[test]
 fn the_live_lane_opens_with_the_speaker_change_row() {
     // The running turn owes the same blank row under the prompt
     // that the batch render puts between a user message and the
@@ -2924,291 +3353,6 @@ fn the_pulse_bar_runs_on_the_runs_clock_not_the_streams() {
         bar > 8,
         "a run 900 ms old grows the bar wide ({bar} cells), not the one-cell seed \
              a fresh stream's clock would draw"
-    );
-}
-
-#[test]
-fn a_local_canvas_switch_repaints_the_transparent_regions() {
-    // The tmux incident, pinned at the scene: a multiplexed pane
-    // cannot lean on the client-shared default background, so the
-    // frame paints the canvas itself. A dark→light switch must then
-    // repaint the regions a direct terminal leaves transparent — the
-    // conversation rows, the todo section's rows, the composer's
-    // surroundings — in the new palette's own canvas, and the palette
-    // never defers: its colors are anchored on the canvas the frame
-    // paints beneath them. Every light palette walks the same scene:
-    // each carries its own canvas and surface, and the switch must
-    // land whichever of them the command names.
-    use crate::message::{ContentBlock, TuiMessage};
-    use crate::todo_view::{TodoRow, TodoStatus};
-    let dark = ratatui::style::Color::Rgb(12, 12, 12);
-    for key in [
-        "gruvbox_light",
-        "solarized_light",
-        "catppuccin_latte",
-        "github_light",
-    ] {
-        let mut subject = app();
-        subject.set_canvas_painted_locally(true);
-        subject.plan.latest_todos = vec![TodoRow {
-            id: "t1".to_string(),
-            subject: "hunt the stale background".to_string(),
-            status: TodoStatus::InProgress,
-        }];
-        subject.push_message(TuiMessage::Assistant {
-            blocks: vec![ContentBlock::Text {
-                text: "conversation body".to_string(),
-            }],
-            timestamp: chrono::Utc::now(),
-            duration_ms: Some(10),
-        });
-        let theme = Theme::by_name(key).unwrap_or_default();
-        let light = theme.ui.background;
-        let surface = theme.ui.surface;
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
-        terminal.draw(|frame| subject.render(frame)).unwrap();
-        assert_eq!(
-            terminal.backend().buffer().cell((0, 0)).unwrap().bg,
-            dark,
-            "[{key}] the dark frame paints its own canvas, not a transparent one"
-        );
-        command_output(&mut subject, &format!("/theme {key}"));
-        terminal.draw(|frame| subject.render(frame)).unwrap();
-        let buffer = terminal.backend().buffer();
-        for (x, y) in [
-            (0, 0),
-            (79, 0),
-            (40, 12),
-            (0, 16),
-            (79, 16),
-            (0, 21),
-            (40, 21),
-        ] {
-            assert_eq!(
-                buffer.cell((x, y)).unwrap().bg,
-                light,
-                "[{key}] the transparent row {y} repaints in the light canvas"
-            );
-        }
-        // The conversation pane erases itself before its view lands;
-        // the erase must not come back transparent under the local
-        // canvas — the band it cleared repaints in the palette's own
-        // canvas, or the whole conversation would ride the
-        // multiplexer's shared default again.
-        for y in 1..=8u16 {
-            for x in [0, 40, 79] {
-                assert_ne!(
-                    buffer.cell((x, y)).unwrap().bg,
-                    ratatui::style::Color::Reset,
-                    "[{key}] the conversation pane's erased row {y} keeps the painted \
-                     canvas at x={x}"
-                );
-            }
-            assert_eq!(
-                buffer.cell((40, y)).unwrap().bg,
-                light,
-                "[{key}] the conversation pane's row {y} carries the light canvas"
-            );
-        }
-        assert_eq!(
-            buffer.cell((40, 17)).unwrap().bg,
-            surface,
-            "[{key}] the composer box keeps its own surface fill"
-        );
-        assert_ne!(
-            subject.theme.ui.foreground,
-            ratatui::style::Color::Reset,
-            "[{key}] a locally painted canvas never defers the palette's foreground"
-        );
-    }
-}
-
-#[test]
-fn a_locally_painted_frame_leaves_no_terminal_default_behind() {
-    // The invariant the canvas walk enforces, at the scene it was
-    // written for: a fenced code block's panel — transparent by
-    // design on a direct terminal, where the terminal default *is*
-    // the canvas — must not survive as a `Reset` band under the
-    // locally painted canvas, or the multiplexer's shared default
-    // would show through it as an unthemed block, whatever palette
-    // the session wears. No cell in the frame may end on the default.
-    use crate::message::{ContentBlock, TuiMessage};
-    let mut subject = app();
-    subject.set_canvas_painted_locally(true);
-    subject.push_message(TuiMessage::Assistant {
-        blocks: vec![ContentBlock::Text {
-            text: "suggestion:\n```\nfix: the stale canvas hole\n```\ndone".to_string(),
-        }],
-        timestamp: chrono::Utc::now(),
-        duration_ms: Some(10),
-    });
-    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
-    terminal.draw(|frame| subject.render(frame)).unwrap();
-    let buffer = terminal.backend().buffer();
-    let defaults: Vec<(u16, u16)> = (0..buffer.area.height)
-        .flat_map(|y| {
-            (0..buffer.area.width).filter_map(move |x| {
-                (buffer.cell((x, y)).unwrap().bg == ratatui::style::Color::Reset).then_some((x, y))
-            })
-        })
-        .collect();
-    assert!(
-        defaults.is_empty(),
-        "the locally painted frame leaves {} cells on the terminal default, \
-         first at {:?}",
-        defaults.len(),
-        defaults.first(),
-    );
-}
-
-#[test]
-fn a_locally_painted_frame_themes_the_diff_s_context_rows() {
-    // The Edit receipt's diff, under the locally painted canvas: the
-    // banded rows keep their fixed GitHub hues — bands carry their own
-    // contrast by design — but the context rows between them owe the
-    // theme's ground, not the terminal default. The stale shape this
-    // pin retires painted the unpainted rows `Reset`, which a direct
-    // terminal reads as its canvas and a multiplexed one as a black
-    // band through every palette.
-    use crate::message::{ContentBlock, TuiMessage};
-    let receipt = [
-        "Changed: src/lib.rs (modified)",
-        "│ 1 line removed, 1 added",
-        "@@ -1,2 +1,2 @@",
-        "  fn main() {",
-        "-     old();",
-        "+     new();",
-        "  }",
-    ]
-    .join("\n");
-    let mut subject = app();
-    subject.set_canvas_painted_locally(true);
-    subject.retain_tool_detail("call_edit", "{}", &receipt);
-    subject
-        .expansion
-        .expanded_tools
-        .insert("call_edit".to_string());
-    subject.theme = Theme::by_name("github_light").unwrap();
-    subject.push_message(TuiMessage::Assistant {
-        blocks: vec![ContentBlock::Tool {
-            name: "Edit".to_string(),
-            call_id: "call_edit".to_string(),
-            input_preview: "src/lib.rs".to_string(),
-            output_preview: receipt,
-            retained_input: "{}".to_string(),
-            success: true,
-            elapsed_secs: 0.1,
-        }],
-        timestamp: chrono::Utc::now(),
-        duration_ms: None,
-    });
-    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
-    terminal.draw(|frame| subject.render(frame)).unwrap();
-    let buffer = terminal.backend().buffer();
-    let canvas = subject.theme.ui.background;
-    let defaults: Vec<(u16, u16)> = (0..buffer.area.height)
-        .flat_map(|y| {
-            (0..buffer.area.width).filter_map(move |x| {
-                (buffer.cell((x, y)).unwrap().bg == ratatui::style::Color::Reset).then_some((x, y))
-            })
-        })
-        .collect();
-    assert!(
-        defaults.is_empty(),
-        "the diff frame leaves {} cells on the terminal default, first at {:?}",
-        defaults.len(),
-        defaults.first(),
-    );
-    // The context row — `fn main() {` under its address gutter — sits
-    // on the theme's canvas, the same ground the pane paints.
-    let context_row = (0..buffer.area.height)
-        .find(|&y| {
-            (0..buffer.area.width).any(|x| {
-                buffer.cell((x, y)).is_some_and(|cell| cell.symbol() == "f")
-                    && buffer
-                        .cell((x.saturating_add(1), y))
-                        .is_some_and(|cell| cell.symbol() == "n")
-            })
-        })
-        .expect("the diff's context row renders");
-    for x in 10..50u16 {
-        assert_eq!(
-            buffer.cell((x, context_row)).unwrap().bg,
-            canvas,
-            "the context row's cell at x={x} rides the theme canvas"
-        );
-    }
-    // The banded rows keep their explicit fills: the walk replaces
-    // only the terminal default, never a color a span painted. The
-    // removal row reads as one solid band across the pane — its own
-    // hue, not the canvas, not the default.
-    let band_row = (0..buffer.area.height)
-        .find(|&y| {
-            (0..buffer.area.width).any(|x| {
-                buffer.cell((x, y)).is_some_and(|cell| cell.symbol() == "o")
-                    && buffer
-                        .cell((x.saturating_add(1), y))
-                        .is_some_and(|cell| cell.symbol() == "l")
-                    && buffer
-                        .cell((x.saturating_add(2), y))
-                        .is_some_and(|cell| cell.symbol() == "d")
-            })
-        })
-        .expect("the diff's removal row renders");
-    let band = buffer.cell((30, band_row)).unwrap().bg;
-    assert_ne!(
-        band,
-        ratatui::style::Color::Reset,
-        "the removal band is a painted color, not the terminal default"
-    );
-    assert_ne!(
-        band, canvas,
-        "the removal band keeps its own hue, not the canvas the walk paints"
-    );
-    for x in 10..70u16 {
-        assert_eq!(
-            buffer.cell((x, band_row)).unwrap().bg,
-            band,
-            "the removal row's padded cell at x={x} keeps the band"
-        );
-    }
-    // The pane's own right gutter is not the band's to paint: the
-    // line fills its wrap width and the chrome beside it rides the
-    // canvas like every other ground the frame owns.
-    assert_eq!(
-        buffer.cell((79, band_row)).unwrap().bg,
-        canvas,
-        "the pane's gutter column beside the band rides the canvas"
-    );
-}
-
-#[test]
-fn a_locally_painted_welcome_leaves_no_terminal_default_behind() {
-    // The welcome screen under the same contract: the art band's
-    // pixels, its dissolved margins, the notice rows, and the
-    // centered composer all land on painted ground. The fresh
-    // session — no messages, the welcome still standing — is the
-    // first frame a user sees, and it may not lean on the shared
-    // default any more than a settled conversation does.
-    let mut subject = app();
-    subject.set_canvas_painted_locally(true);
-    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
-    terminal.draw(|frame| subject.render(frame)).unwrap();
-    let buffer = terminal.backend().buffer();
-    let defaults: Vec<(u16, u16)> = (0..buffer.area.height)
-        .flat_map(|y| {
-            (0..buffer.area.width).filter_map(move |x| {
-                (buffer.cell((x, y)).unwrap().bg == ratatui::style::Color::Reset).then_some((x, y))
-            })
-        })
-        .collect();
-    assert!(
-        defaults.is_empty(),
-        "the locally painted welcome leaves {} cells on the terminal default, \
-         first at {:?}",
-        defaults.len(),
-        defaults.first(),
     );
 }
 
@@ -3427,74 +3571,6 @@ fn a_refused_guide_delivers_a_slash_spelled_prompt_as_words() {
 }
 
 #[test]
-fn a_locally_painted_question_sheet_paints_its_own_ground() {
-    // The one overlay that renders after the canvas walk: the
-    // question sheet. It renders after `Clear` with fg-only styles,
-    // so before its own ground it left the sheet's whole rectangle on
-    // the terminal default — the shared multiplexer background, the
-    // exact hole the walk exists to close. The sheet paints the
-    // theme's surface like its permission sibling, and no cell in the
-    // frame — the sheet's rows included — ends on the default.
-    use crate::question::{QuestionChoice, QuestionPrompt};
-    let mut subject = app();
-    subject.set_canvas_painted_locally(true);
-    let (reply, _reply_rx) = tokio::sync::oneshot::channel();
-    subject
-        .questions
-        .pending_questions
-        .push_back(crate::app::questions::PendingQuestion::new(
-            QuestionPrompt {
-                question: "Deploy where?".to_string(),
-                header: Some("Ask".to_string()),
-                options: vec![
-                    QuestionChoice {
-                        label: "staging".to_string(),
-                        description: None,
-                    },
-                    QuestionChoice {
-                        label: "production".to_string(),
-                        description: None,
-                    },
-                ],
-                multi_select: false,
-                reply,
-            },
-        ));
-    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
-    terminal.draw(|frame| subject.render(frame)).unwrap();
-    let buffer = terminal.backend().buffer();
-    let defaults: Vec<(u16, u16)> = (0..buffer.area.height)
-        .flat_map(|y| {
-            (0..buffer.area.width).filter_map(move |x| {
-                (buffer.cell((x, y)).unwrap().bg == ratatui::style::Color::Reset).then_some((x, y))
-            })
-        })
-        .collect();
-    assert!(
-        defaults.is_empty(),
-        "the seated question sheet leaves {} cells on the terminal default, \
-         first at {:?}",
-        defaults.len(),
-        defaults.first(),
-    );
-    let question_row = (0..buffer.area.height)
-        .find(|&y| {
-            (0..buffer.area.width).any(|x| {
-                buffer.cell((x, y)).is_some_and(|cell| cell.symbol() == "D")
-                    && buffer
-                        .cell((x.saturating_add(1), y))
-                        .is_some_and(|cell| cell.symbol() == "e")
-            })
-        })
-        .expect("the question sheet's title row renders");
-    assert_eq!(
-        buffer.cell((40, question_row)).unwrap().bg,
-        subject.theme.ui.surface,
-        "the sheet's row rides the theme surface, its own ground"
-    );
-}
-
-#[test]
 fn the_cost_command_agrees_with_the_bar_at_an_odd_window() {
     // S1's contract, pinned at the number: `/cost` reads the same
     // snapshot the context bar draws from and rounds it the same way,
@@ -3627,5 +3703,90 @@ fn the_queued_and_todo_sections_share_their_left_margin() {
         first_marked_column(todo_row),
         first_marked_column(queued_row),
         "the TODO and QUEUED badges sit at the same column"
+    );
+}
+
+#[test]
+fn a_strip_that_stands_down_clears_its_row_before_the_composer() {
+    // The frame buffer is cumulative: a cell no widget repaints keeps
+    // the previous frame's content. The pulse strip owns the spacer row
+    // above the composer while the run lives, painting its bar as
+    // foreground glyphs in the theme's strip color; the frame the run
+    // ends it must clear the row, not merely stop painting it — the
+    // last bar (or, after a theme switch, the previous palette's
+    // glyphs) would otherwise stand beside the composer forever, a
+    // leak every light theme wears visibly. Pinned on a direct
+    // terminal, where no canvas walk exists to refill the row.
+    let mut subject = app();
+    subject.theme = Theme::by_name("github_light").unwrap();
+    subject.push_message(TuiMessage::User {
+        text: "hi".to_string(),
+        timestamp: chrono::Utc::now(),
+        steered: false,
+        unsent: false,
+    });
+    subject
+        .state
+        .agent_running
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+    terminal.draw(|frame| subject.render(frame)).expect("draw");
+    let strip_color = subject.theme.ui.primary;
+    let strip_glyph = |symbol: &str| matches!(symbol, "\u{2500}" | "\u{2574}" | "\u{2576}");
+    let strip_row = (0..24u16).find(|&y| {
+        (0..80u16).any(|x| {
+            terminal
+                .backend()
+                .buffer()
+                .cell((x, y))
+                .is_some_and(|cell| strip_glyph(cell.symbol()) && cell.fg == strip_color)
+        })
+    });
+    let strip_row = strip_row.expect("the running strip paints its row's glyphs");
+    subject
+        .state
+        .agent_running
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    terminal.draw(|frame| subject.render(frame)).expect("draw");
+    let leftover: Vec<u16> = (0..80u16)
+        .filter(|&x| {
+            terminal
+                .backend()
+                .buffer()
+                .cell((x, strip_row))
+                .is_some_and(|cell| strip_glyph(cell.symbol()) && cell.fg == strip_color)
+        })
+        .collect();
+    assert!(
+        leftover.is_empty(),
+        "the idle frame clears the strip's row {strip_row} — no bar lingers beside the composer: {leftover:?}"
+    );
+    let cleared = (0..80u16).all(|x| {
+        terminal
+            .backend()
+            .buffer()
+            .cell((x, strip_row))
+            .is_some_and(|cell| cell.symbol() == " " && cell.fg == ratatui::style::Color::Reset)
+    });
+    assert!(
+        cleared,
+        "the stood-down row {strip_row} returns blank on a direct terminal"
+    );
+}
+
+#[test]
+fn a_boundary_mode_update_moves_the_display_without_the_file() {
+    // A `/clear`'s fresh session falls back to the configured
+    // default, and the display hears it over the update lane: the
+    // live config moves, the file copy never does.
+    let mut app = TuiApp::new(dch_config::DchConfig::default());
+    app.apply_session_update(crate::queue::SessionUpdate::PermissionMode {
+        mode: dch_config::PermissionMode::ReadOnly,
+    });
+    assert_eq!(
+        app.config.runner.permission_mode,
+        dch_config::PermissionMode::ReadOnly,
+        "the display answers /mode for the mode actually in force"
     );
 }

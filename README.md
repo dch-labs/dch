@@ -8,20 +8,19 @@ A terminal-based agentic coding assistant written in Rust, built on the
 - **Interactive TUI** — live streaming output, Markdown rendering with
   syntax highlighting, configurable themes, and a fresh-session welcome
   screen — the fjord above a centered composer box, until the first
-  prompt. The splash shows its original truecolors everywhere they can
-  reach the screen — any direct launch, and tmux whenever the attached
-  client carries the RGB feature — and, where tmux would re-encode
-  direct colors (a client without RGB), a rendition of the same
-  photograph authored natively for the fixed 256-color palette, so the
-  art is never mangled by a conversion it cannot survive. When that
-  rendition engages, dch says so on the welcome notice and names the
-  one `tmux.conf` line — `set -as terminal-features ',<TERM>:RGB'` —
-  that lets truecolor through again for terminals that can show it.
-  The art's outer columns dissolve into the theme's canvas, so the
-  photograph's dark margins never read as a strip of mismatched
-  background beside it. The choice is also a setting:
-  `display.splash_colors` is `auto` (the default), or `truecolor` /
-  `palette` to force one rendition everywhere.
+  prompt. The splash paints its original truecolors by default
+  everywhere: a multiplexer forwards them verbatim to clients with the
+  RGB feature, and a terminal without it keeps the hues in its own
+  approximation. A second rendition of the same photograph, authored
+  natively for the fixed 256-color palette, is the explicit
+  `display.splash_colors = "palette"` opt-in for a tmux whose clients
+  it knows as 256-color — an honest grey night, since the fjord is
+  darker than any blue that palette carries. The art's outer columns
+  dissolve into the theme's canvas, so the photograph's dark margins
+  never read as a strip of mismatched background beside it. Inside a
+  multiplexer dch writes no background or cursor color sequence at
+  all — none of the terminal-state exchange reaches the client from a
+  pane — and paints its canvas under its own cells.
 - **Single-run mode** — run one task non-interactively (as an argument
   or piped on stdin), print only the final answer, exit with a
   meaningful shell status, and optionally write a JSON completion

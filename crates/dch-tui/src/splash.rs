@@ -13,17 +13,19 @@
 //! protocol rides along.
 //!
 //! Two renditions of the same photograph ride along, and the session
-//! picks one at first decode. The truecolor set is the original art —
-//! every terminal that takes direct-color escapes shows it exactly,
-//! which is every launch outside tmux and every tmux client carrying
-//! the RGB feature. The palette set is the same photograph re-derived
-//! for the fixed 256-color vocabulary — black, blues, teals, and
-//! blue-grays with the neutral ramp held out, so the night stays a
-//! blue night — for the one environment where truecolor cannot pass:
-//! behind tmux whose client lacks the RGB feature, where tmux would
-//! re-encode every direct color into that same palette per color and
-//! blind, mangling the art. Palette indexes tmux passes through
-//! verbatim, so that rendition arrives exactly as authored.
+//! picks one at first decode. The truecolor set is the original art and
+//! the default everywhere: a direct terminal takes it exactly, and a
+//! multiplexer forwards it verbatim to every client with the RGB
+//! feature — a client without it keeps the hues in its own
+//! approximation, the one mapping every terminal applies to a night
+//! this dark. The palette set is the same photograph re-derived onto
+//! the fixed 256-color vocabulary, and honest about what that costs:
+//! the night's blues sit far darker than the palette's darkest blue,
+//! so their nearest entries are the grey ramp, and the rendition is a
+//! grey night — authored, indexed, and passed through a multiplexer
+//! verbatim. It is the opt-in (`splash-colors = palette`) for a tmux
+//! whose clients it knows as 256-color and re-encodes per color, which
+//! would collapse the truecolor art the same way, minus the control.
 //! [`crate::terminal::truecolor_warranted`] draws the line; the
 //! choice is made once per process.
 
