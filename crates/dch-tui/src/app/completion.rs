@@ -177,7 +177,11 @@ impl TuiApp {
     /// what is selected; the palette previews the theme the landed
     /// row names. Tab and Shift+Tab continue from the row the arrows
     /// landed on; the keys share one position. Typing replaces the
-    /// applied row and restarts the filter from the prefix.
+    /// applied row and restarts the filter from the prefix, and a
+    /// stale cycle position is clamped into whatever list the line now
+    /// filters to — a paste or an edit that shortened the candidates
+    /// can never leave the walk on an index that no longer exists,
+    /// the shape that swallowed the key.
     fn step_completion(&mut self, up: bool) -> bool {
         let Some((prefix, candidates)) = self.popup_candidates() else {
             return false;
@@ -191,7 +195,7 @@ impl TuiApp {
                         .strip_prefix(&cycle.prefix)
                         .is_some_and(|rest| !rest.contains(char::is_whitespace)) =>
             {
-                cycle.index
+                cycle.index.min(len.saturating_sub(1))
             }
             _ => 0,
         };
@@ -287,9 +291,12 @@ impl TuiApp {
     /// Esc's idle duties, innermost first: a standing popup goes away,
     /// then the draft clears.
     ///
-    /// While a run holds, Esc keeps its cancel-arm meaning instead —
-    /// this runs only on the idle branch. An empty composer returns
-    /// the key unhandled rather than claiming it.
+    /// One Esc closes only the popup — the draft it stood over stays,
+    /// so dismissing the menu never costs the half-typed line; the
+    /// next Esc, with no popup standing, is the one that clears the
+    /// draft. While a run holds, Esc keeps its cancel-arm meaning
+    /// instead — this runs only on the idle branch. An empty composer
+    /// returns the key unhandled rather than claiming it.
     pub(crate) fn esc_clears_or_dismisses(&mut self) -> bool {
         if self.completion_popup_live() {
             self.completion.completion_dismissed = Some(self.composer.input.stamp());
@@ -300,8 +307,6 @@ impl TuiApp {
                     Some((self.theme.ui.background, self.theme.ui.primary));
                 self.invalidate_conversation_renders();
             }
-            self.composer.input.clear();
-            self.completion.completion_dismissed = None;
             return true;
         }
         if self.composer.input.is_empty() {
@@ -549,8 +554,8 @@ pub(crate) struct CompletionCycle {
 /// yet the line is on its first word and only the leading `/` is kept, so a
 /// command name is completed onto a bare slash.
 fn completion_prefix(line: &str) -> String {
-    match line.rfind(char::is_whitespace) {
-        Some(last) => line.get(..=last).unwrap_or("/").to_string(),
+    match line.char_indices().rev().find(|(_, ch)| ch.is_whitespace()) {
+        Some((last, ch)) => line[..last.saturating_add(ch.len_utf8())].to_string(),
         None => "/".to_string(),
     }
 }

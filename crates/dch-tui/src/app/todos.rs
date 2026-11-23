@@ -89,7 +89,7 @@ impl TuiApp {
         {
             return false;
         }
-        self.plan.cycle_plan_view();
+        self.cycle_plan_view();
         true
     }
 
@@ -140,6 +140,64 @@ impl TuiApp {
         self.pointer.selection = None;
         self.pointer.drag_position = None;
         true
+    }
+
+    /// Walk the plan section's posture one step, measuring the
+    /// capped window at the press.
+    ///
+    /// The frame's cut flag records what the last layout drew, which
+    /// under rapid presses is the previous posture — a Full frame
+    /// leaves it false, and a burst through Hidden would fold the
+    /// list again instead of opening it. The press measures the
+    /// capped window itself against the section's recorded width, so
+    /// every transition reads the list as it stands.
+    pub(crate) fn cycle_plan_view(&mut self) {
+        let capped_cuts = self.capped_plan_cuts();
+        self.plan.cycle_plan_view(capped_cuts);
+    }
+
+    /// Whether the capped posture would cut an entry, measured now.
+    ///
+    /// The same render the capped section draws — the same colors,
+    /// inset, and body cap at the section's recorded width — read
+    /// only for its last row's ellipsis, the mark the cap leaves
+    /// when the list outgrows it. Measured at the press so a stale
+    /// frame flag never decides the step.
+    fn capped_plan_cuts(&self) -> bool {
+        if self.plan.latest_todos.is_empty() {
+            return false;
+        }
+        let width = if self.plan.todo_section_rect.width > 0 {
+            self.plan.todo_section_rect.width
+        } else {
+            80
+        };
+        let colors = todo_view::TodoColors {
+            plain: self.theme.ui.foreground,
+            dim: self.theme.ui.dim,
+            accent: self.theme.ui.primary,
+            moved: self.theme.ui.secondary,
+            badge_fill: self.theme.ui.primary,
+            badge_letters: self.theme.ui.background,
+        };
+        let inner = width
+            .saturating_sub(TODO_SECTION_INSET.saturating_mul(2))
+            .max(1);
+        todo_view::section_lines(
+            &self.plan.latest_todos,
+            &self.plan.todo_section_changes,
+            &colors,
+            inner,
+            TODO_SECTION_BODY_ROWS,
+            self.plan.clamped_todo_skip(),
+            self.plan_chord_hint(),
+        )
+        .last()
+        .is_some_and(|line| {
+            line.spans
+                .first()
+                .is_some_and(|span| span.content.starts_with('\u{2026}'))
+        })
     }
 
     /// Toggle the compaction notice a press landed on.
@@ -554,15 +612,16 @@ impl PlanState {
 
     /// Walk the plan section's posture one step.
     ///
-    /// Capped opens to the whole list when the cap is actually
-    /// cutting entries — opening a list that already stands whole
-    /// changes nothing — otherwise the next step folds the section
-    /// away, and a fold steps back to the capped posture. The chord
-    /// and a click on the section both spend one press on one step,
-    /// and every step resets the section's scroll window.
-    pub(crate) fn cycle_plan_view(&mut self) {
+    /// Capped opens to the whole list when the capped window is
+    /// actually cutting entries — the caller measures it at the
+    /// press, because the frame's own flag may describe a previous
+    /// posture — otherwise the next step folds the section away, and
+    /// a fold steps back to the capped posture. The chord and a
+    /// click on the section both spend one press on one step, and
+    /// every step resets the section's scroll window.
+    pub(crate) fn cycle_plan_view(&mut self, capped_cuts: bool) {
         self.plan_view = match self.plan_view {
-            PlanView::Capped if self.plan_cut.get() => PlanView::Full,
+            PlanView::Capped if capped_cuts => PlanView::Full,
             PlanView::Capped | PlanView::Full => PlanView::Hidden,
             PlanView::Hidden => PlanView::Capped,
         };
@@ -715,6 +774,7 @@ pub(crate) const TODO_SECTION_INSET: u16 = 2;
 
 #[cfg(test)]
 mod tests {
+    use super::PlanView;
     use crate::app::TuiApp;
     use crate::app::test_support::*;
 
@@ -743,6 +803,56 @@ mod tests {
         assert!(
             subject.plan.latest_todos.is_empty(),
             "the cleared conversation retires its plan"
+        );
+    }
+
+    #[test]
+    fn rapid_ctrl_t_presses_measure_the_capped_window_at_the_press() {
+        // A tall frame drew the Full posture, whose layout cuts
+        // nothing: presses in the burst that follows must measure the
+        // capped window themselves — the frame's stale flag, read
+        // verbatim, folded the list back where the press should have
+        // opened it.
+        let mut subject = app();
+        subject.plan.latest_todos = (0..6)
+            .map(|index| crate::todo_view::TodoRow {
+                id: format!("t{index}"),
+                subject: format!("task {index} stands"),
+                status: crate::todo_view::TodoStatus::InProgress,
+            })
+            .collect();
+        let ctrl_t = KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL);
+        let draw = |subject: &mut TuiApp| {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 40)).unwrap();
+            terminal.draw(|frame| subject.render(frame)).unwrap();
+        };
+        draw(&mut subject);
+        assert!(subject.handle_key(ctrl_t), "the chord is taken");
+        assert_eq!(
+            subject.plan.plan_view,
+            PlanView::Full,
+            "a cutting cap opens"
+        );
+        draw(&mut subject);
+        assert!(subject.handle_key(ctrl_t), "the chord is taken");
+        assert_eq!(
+            subject.plan.plan_view,
+            PlanView::Hidden,
+            "the full list folds"
+        );
+        assert!(subject.handle_key(ctrl_t), "the chord is taken");
+        assert_eq!(
+            subject.plan.plan_view,
+            PlanView::Capped,
+            "the fold steps back to the capped posture"
+        );
+        assert!(subject.handle_key(ctrl_t), "the chord is taken");
+        assert_eq!(
+            subject.plan.plan_view,
+            PlanView::Full,
+            "the press measures the capped window — the stale Full frame's \
+             no-cut flag does not fold the list again"
         );
     }
 

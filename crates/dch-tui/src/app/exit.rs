@@ -24,7 +24,10 @@ impl TuiApp {
     /// the transcript owes rows to, because the queue they wait in
     /// dies with the process.
     #[must_use]
-    pub fn waiting_prompt_texts_at_exit(&self) -> Vec<String> {
+    pub fn waiting_prompt_texts_at_exit(&mut self) -> Vec<String> {
+        if let Some(texts) = self.exit.unclaimed_prompts.take() {
+            return texts;
+        }
         let queue = self
             .state
             .queued
@@ -111,6 +114,25 @@ impl TuiApp {
         self.flush_turn_end();
     }
 
+    /// Arm the exit's pre-cancel snapshots: the partial reply and the
+    /// waiting prompts exactly as they stand at this instant.
+    ///
+    /// Both captures must precede the cancel an exit fires. The
+    /// failed-turn observer clears the streaming buffer without
+    /// graduating its partial text, so a snapshot taken after the
+    /// cancel reads the wreckage rather than the words; and the
+    /// driver's cancel handling can requeue a prompt the run already
+    /// claimed, so a queue read after the cancel double-counts it.
+    /// Called at the moment the exit is confirmed, before any cancel
+    /// leaves the display.
+    pub(crate) fn snapshot_exit_state_before_cancel(&mut self) {
+        let blocks = self.capture_live_lanes();
+        if !blocks.is_empty() {
+            self.exit.partial_reply = Some(blocks);
+        }
+        self.exit.unclaimed_prompts = Some(self.waiting_prompt_texts_at_exit());
+    }
+
     /// Land an exit-confirmed stop as the record a cancel leaves.
     ///
     /// An exit confirmed under a running agent is a cancel first:
@@ -119,18 +141,44 @@ impl TuiApp {
     /// run settles — the stop drains into the conversation as the
     /// same record an in-app cancel leaves, the turn-end hook
     /// persists it, and the resumed session reads one shape whichever
-    /// way the run was stopped. With nothing running this is a no-op.
+    /// way the run was stopped. The partial reply rides along when
+    /// the drain did not already graduate it — the snapshot the
+    /// confirming press took, or the one taken here before this
+    /// cancel, keeps text the failed-turn observer would otherwise
+    /// clear without a trace — and a drain that did graduate the
+    /// reply wins, so the row is never duplicated. With nothing
+    /// running this is a no-op.
     pub fn settle_exit_stop(
         &mut self,
         terminal: &mut ratatui::Terminal<impl ratatui::backend::Backend>,
     ) {
+        if self.exit.partial_reply.is_none() {
+            let blocks = self.capture_live_lanes();
+            if !blocks.is_empty() {
+                self.exit.partial_reply = Some(blocks);
+            }
+        }
         if !self.cancel_run_in_flight() {
+            self.exit.partial_reply = None;
             return;
         }
         let before = self.conversation.len();
         drop(terminal.draw(|frame| self.render(frame)));
-        self.capture_live_lanes_at_exit();
         self.drain_shared_state();
+        let reply_graduated = self.conversation.get(before..).is_some_and(|landed| {
+            landed
+                .iter()
+                .any(|message| matches!(message, TuiMessage::Assistant { .. }))
+        });
+        if !reply_graduated && let Some(blocks) = self.exit.partial_reply.take() {
+            self.conversation.push(TuiMessage::Assistant {
+                blocks,
+                timestamp: chrono::Utc::now(),
+                duration_ms: None,
+            });
+        } else {
+            self.exit.partial_reply = None;
+        }
         let record_landed = self.conversation.get(before..).is_some_and(|landed| {
             landed
                 .iter()
@@ -145,15 +193,15 @@ impl TuiApp {
         self.flush_turn_end();
     }
 
-    /// Snapshot the run's unfinished lanes into the conversation.
+    /// Snapshot the run's unfinished lanes.
     ///
-    /// A cancelled run graduates nothing: the thinking it streamed
-    /// and the partial reply text stay in the live lanes and would
-    /// leave with the process. At the exit they join the transcript
-    /// as their own assistant row — the honest shape of a turn that
-    /// was stopped mid-flight, and what a resumed session reads
-    /// instead of an empty gap between the prompt and the record.
-    fn capture_live_lanes_at_exit(&mut self) {
+    /// The thinking and the partial reply text the run had begun, as
+    /// they stand at the moment of the call. A cancelled run
+    /// graduates nothing, and the failed-turn path clears the
+    /// streaming buffer without a trace, so the exit reads this
+    /// before its cancel fires and keeps what it finds as the turn's
+    /// own assistant row.
+    fn capture_live_lanes(&self) -> Vec<ContentBlock> {
         let mut blocks = Vec::new();
         let thinking = self
             .state
@@ -177,13 +225,7 @@ impl TuiApp {
         if !stream.trim().is_empty() {
             blocks.push(ContentBlock::Text { text: stream });
         }
-        if !blocks.is_empty() {
-            self.conversation.push(TuiMessage::Assistant {
-                blocks,
-                timestamp: chrono::Utc::now(),
-                duration_ms: None,
-            });
-        }
+        blocks
     }
 
     /// Fire the run-cancel at the runner the session is running now.
@@ -285,6 +327,28 @@ pub(crate) struct ExitState {
     /// deliberate double press, so one stray Esc cannot kill a run
     /// mid-flight.
     pub(crate) cancel_arm: bool,
+
+    /// The unfinished lanes as they stood when the exit's cancel
+    /// fired, when a run was in flight.
+    ///
+    /// Snapshot at the confirming press, before the cancel leaves the
+    /// display: the failed-turn observer clears the streaming buffer
+    /// without graduating its partial text, so a later read records
+    /// the wreckage instead of the words. Consumed by
+    /// [`settle_exit_stop`](Self::settle_exit_stop), which keeps it
+    /// only when the drain did not already graduate the reply.
+    pub(crate) partial_reply: Option<Vec<ContentBlock>>,
+
+    /// The waiting prompts as they stood when the exit's cancel
+    /// fired.
+    ///
+    /// Snapshot at the confirming press for the same reason: the
+    /// driver's cancel handling can requeue a prompt the run already
+    /// claimed, and a queue read after the cancel double-counts it.
+    /// [`waiting_prompt_texts_at_exit`](Self::waiting_prompt_texts_at_exit)
+    /// serves this copy first and reads the live queue only when no
+    /// exit armed one.
+    pub(crate) unclaimed_prompts: Option<Vec<String>>,
 }
 /// The quit lifecycle's two halves.
 ///

@@ -730,11 +730,11 @@ fn the_esc_cancel_leaves_the_shutdown_flag_alone() {
 fn esc_esc_cancels_the_run_with_the_popup_standing() {
     // The state machine the scratch scaffold this pin replaced once
     // probed with a bare panic: a run holds and the composer carries
-    // a `/theme` browse with its popup standing. The first Esc
-    // belongs to the popup — the whole command clears and nothing is
-    // armed — and only the next two bare presses walk the cancel
-    // ladder (arm, then fire). The popup adds one rung in front of
-    // the cancel; it never widens Esc into an instant stop.
+    // a `/theme` browse with its popup standing. Esc walks one rung
+    // per press — the popup closes alone, the drafted command
+    // clears, then the cancel ladder arms and fires. The popup adds
+    // rungs in front of the cancel; it never widens Esc into an
+    // instant stop.
     let state = dch_tui::TuiObserverState::new();
     let (observer, kept) = state.into_observer();
     drop(observer);
@@ -755,14 +755,33 @@ fn esc_esc_cancels_the_run_with_the_popup_standing() {
         "the popup stands over the drafted browse: {browsed:?}"
     );
 
-    // First Esc: the popup's own rung — clear, never arm.
+    // First Esc: the popup's own rung — it closes alone, the drafted
+    // command stays, and nothing is armed.
     app.handle_event(&plain(KeyCode::Esc));
     assert_eq!(*cancels.lock().expect("sink"), 0, "one Esc cancels nothing");
-    let cleared = row_texts(&render_to_buffer(&mut app, 80, 24));
+    let dismissed = row_texts(&render_to_buffer(&mut app, 80, 24));
     assert!(
-        !cleared.iter().any(|row| row.contains("nord")),
-        "the popup left with the draft: {cleared:?}"
+        !dismissed.iter().any(|row| row.contains("nord")),
+        "the popup left on the first press: {dismissed:?}"
     );
+    assert!(
+        dismissed.iter().any(|row| row.contains("/theme")),
+        "the drafted command survives the popup's dismissal: {dismissed:?}"
+    );
+    assert!(
+        !dismissed.iter().any(|row| row.contains("press Esc again")),
+        "the dismissal neither arms nor announces the cancel: {dismissed:?}"
+    );
+
+    // Second Esc: the draft's own rung — the composer clears, still
+    // without arming anything.
+    app.handle_event(&plain(KeyCode::Esc));
+    assert_eq!(
+        *cancels.lock().expect("sink"),
+        0,
+        "the draft's clear raises nothing"
+    );
+    let cleared = row_texts(&render_to_buffer(&mut app, 80, 24));
     assert!(
         !cleared.iter().any(|row| row.contains("/theme")),
         "the whole command left the composer: {cleared:?}"
@@ -772,7 +791,7 @@ fn esc_esc_cancels_the_run_with_the_popup_standing() {
         "the clear neither arms nor announces the cancel: {cleared:?}"
     );
 
-    // Second Esc: arms, and says so on the notice row.
+    // Third Esc: arms, and says so on the notice row.
     app.handle_event(&plain(KeyCode::Esc));
     assert_eq!(
         *cancels.lock().expect("sink"),
@@ -787,12 +806,12 @@ fn esc_esc_cancels_the_run_with_the_popup_standing() {
         "the armed state names its next press: {armed:?}"
     );
 
-    // Third Esc: fires the cancel and the session stands.
+    // Fourth Esc: fires the cancel and the session stands.
     app.handle_event(&plain(KeyCode::Esc));
     assert_eq!(
         *cancels.lock().expect("sink"),
         1,
-        "the third press lands the cancel"
+        "the fourth press lands the cancel"
     );
     assert!(!app.is_quitting(), "a cancel is not an exit");
 }
@@ -6792,6 +6811,10 @@ fn permission_app(
     }
     app.set_permission_requests(rx);
     app.poll_permission_requests();
+    // An approval answers the ask the frame has drawn: render once so
+    // the staged requests are on screen and answerable, exactly as
+    // the run loop would have them.
+    drop(render_to_buffer(&mut app, 80, 24));
     (app, tx, receivers)
 }
 
@@ -11211,7 +11234,8 @@ fn the_exit_echo_marks_its_rows_unsent() {
         queue.push("the words no turn took".to_string());
     }
     let before = app.conversation().len();
-    app.echo_waiting_prompts_at_exit(app.waiting_prompt_texts_at_exit());
+    let unclaimed = app.waiting_prompt_texts_at_exit();
+    app.echo_waiting_prompts_at_exit(unclaimed);
     let echoed = app.conversation().get(before..).unwrap_or_default();
     assert_eq!(echoed.len(), 1, "the waiting prompt echoes exactly one row");
     assert!(

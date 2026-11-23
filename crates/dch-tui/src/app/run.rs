@@ -385,6 +385,15 @@ pub(crate) struct FramePacing {
     /// a large worst draw) at a glance.
     pub(crate) frame_stats: FrameStats,
 
+    /// The pulse painter's clock, pinned by the glow pins.
+    ///
+    /// Exists only in the test build: `None` leaves the painter on
+    /// the real clock, while a pin sets both the run's anchor and
+    /// this clock so the asserted phase is the phase the math
+    /// derives, whatever the runner's scheduling.
+    #[cfg(test)]
+    pub(crate) pulse_clock: std::cell::Cell<Option<Instant>>,
+
     /// The instant the terminal regained focus and a whole-screen
     /// repaint is still owed, if one is.
     ///
@@ -562,6 +571,9 @@ mod tests {
                 never: Vec::new(),
                 reply: reply_tx,
             });
+        // An approval answers a rendered ask: the pin draws the sheet
+        // once so the press finds it answerable.
+        let _ = app.permission.shown_permission();
         assert_eq!(
             app.permission
                 .permission_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
@@ -604,14 +616,17 @@ mod tests {
             });
         let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
 
+        // An approval answers a rendered ask: the pin draws the sheet
+        // once so the press finds it answerable.
+        let _ = app.permission.shown_permission();
+
         // The ask's Esc: denies it, does NOT arm the cancel.
         assert!(app.handle_key(esc), "the sheet's Esc is taken");
-        assert!(
-            !matches!(
-                reply_rx.blocking_recv(),
-                Ok(PermissionResolution::AllowOnce)
-            ),
-            "the standing ask still reads the Esc as its deny"
+        assert_eq!(
+            reply_rx.blocking_recv(),
+            Ok(PermissionResolution::DenyOnce),
+            "the standing ask answers the Esc with its deny — a reply, never a \
+             dropped request"
         );
         assert_eq!(
             cancels.load(std::sync::atomic::Ordering::SeqCst),

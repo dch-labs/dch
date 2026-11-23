@@ -699,41 +699,6 @@ pub(crate) struct WelcomeState {
     pub(crate) welcome_retired: bool,
 }
 
-/// Count a band's leading star-sky rows.
-///
-/// The fjord paints its night sky as dark, blue-dominant grounds;
-/// the first row whose cells stray from that register carries the
-/// horizon's glow, and everything above it is open sky. The window
-/// that trims the band to its budget reads this so the stars keep
-/// their floor while the water keeps its foot.
-pub(crate) fn leading_sky_rows(lines: &[Line<'static>]) -> u16 {
-    let depth = lines
-        .iter()
-        .take_while(|line| {
-            line.spans.iter().all(|span| {
-                matches!(
-                    span.style.bg,
-                    Some(ratatui::style::Color::Rgb(red, green, blue))
-                        if blue > red
-                            && u16::from(red)
-                                .saturating_add(u16::from(green))
-                                .saturating_add(u16::from(blue))
-                                < 220
-                ) && matches!(
-                    span.style.fg,
-                    Some(ratatui::style::Color::Rgb(red, green, blue))
-                        if u32::from(red)
-                            .saturating_mul(299)
-                            .saturating_add(u32::from(green).saturating_mul(587))
-                            .saturating_add(u32::from(blue).saturating_mul(114))
-                            < 100_000
-                )
-            })
-        })
-        .count();
-    u16::try_from(depth).unwrap_or(u16::MAX)
-}
-
 /// The fresh session's welcome geometry.
 ///
 /// What the frame's welcome path needs to seat the group: the splash
@@ -769,10 +734,12 @@ pub(crate) struct WelcomeShape {
     /// pane's height.
     pub(crate) rows_shown: u16,
 
-    /// The rung rows cropped away above.
+    /// The rung rows cropped away above: always zero.
     ///
-    /// Half the trim, so the slice is centered; the rows below spend
-    /// the rest.
+    /// The picker seats a rung whole or not at all, so no welcome
+    /// shape ever windows the art — the field stays in the shape so
+    /// the renderer and the pins read one geometry, and the zero is
+    /// the picker's own contract spelled out.
     pub(crate) row_skip: u16,
 }
 

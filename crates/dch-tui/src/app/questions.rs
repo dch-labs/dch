@@ -388,9 +388,16 @@ impl TuiApp {
         let (compose, caret_in_compose) = self.question_sheet_compose(entry, wrap_at);
         let tail = self.question_sheet_tail(entry, wrap_at, more);
         let cursor_option = entry.ui.cursor.min(entry.prompt.options.len());
-        let (lines, compose_start) =
-            fit_question_sheet(head, &options, compose, tail, cursor_option, budget);
-        let caret = caret_in_compose
+        let (lines, compose_start, caret_in_window) = fit_question_sheet(
+            head,
+            &options,
+            compose,
+            tail,
+            cursor_option,
+            budget,
+            caret_in_compose,
+        );
+        let caret = caret_in_window
             .map(|(row, column)| (compose_start.saturating_add(row), column))
             .filter(|(row, _)| *row < lines.len());
         QuestionSheet { lines, caret }
@@ -578,7 +585,7 @@ impl TuiApp {
             },
         ));
         let subtext = if has_draft {
-            "enter opens it again \u{b7} enter there sends"
+            "enter sends it \u{b7} typing reopens the draft"
         } else {
             "a reply the options did not offer"
         };
@@ -688,12 +695,16 @@ impl TuiApp {
     /// the top of the terminal: the sheet cannot occupy a row the
     /// layout has already promised elsewhere, and a reservation that
     /// counted it too asked the solver for one row more than the frame
-    /// had, leaving it to squeeze an unspecified pane to pay. Both the
+    /// had, leaving it to squeeze an unspecified pane to pay. The
+    /// origin moves down with the strip row, so the sheet's bottom
+    /// edge — anchored above the status bar — stays where it is in
+    /// every strip position. Both the
     /// reservation and the box derive their height from here, so they
     /// cannot disagree about how much room there is.
     pub(crate) fn question_sheet_area(&self, area: Rect) -> Rect {
         let strip_rows = u16::from(matches!(self.display.strip_position, StripPosition::Top));
         Rect {
+            y: area.y.saturating_add(strip_rows),
             height: area
                 .height
                 .saturating_sub(STATUS_BAR_ROWS - STATUS_BAR_AIR)
@@ -844,15 +855,17 @@ impl QuestionState {
     /// arrived at stays on screen for as long as it survives.
     pub(crate) fn retire_withdrawn_questions(&mut self) -> bool {
         let view = self.question_view;
-        let withdrawn_ahead = self
-            .pending_questions
-            .iter()
-            .take(view)
-            .filter(|entry| entry.prompt.reply.is_closed())
-            .count();
         let before = self.pending_questions.len();
-        self.pending_questions
-            .retain(|entry| !entry.prompt.reply.is_closed());
+        let mut withdrawn_ahead = 0usize;
+        let mut scanned = 0usize;
+        self.pending_questions.retain(|entry| {
+            let closed = entry.prompt.reply.is_closed();
+            if closed && scanned < view {
+                withdrawn_ahead = withdrawn_ahead.saturating_add(1);
+            }
+            scanned = scanned.saturating_add(1);
+            !closed
+        });
         if before == self.pending_questions.len() {
             return false;
         }
@@ -1267,27 +1280,28 @@ const DETAIL_INDENT: &str = "    ";
 /// fit, and the option list is what gives way.
 ///
 /// The options give way as a window rather than a truncation, anchored on
-/// `cursor_option` and grown outward — see [`option_window`]. Returns the
-/// assembled rows beside the index the compose block starts at, which is
-/// where the caret's row within that block is measured from; a terminal so
-/// short that the untouchable blocks do not fit loses the tail, the only
-/// sacrifice left, and the caret with it.
+/// `cursor_option` and grown outward — see [`option_window`]. A draft that
+/// outgrows the rows left for it takes its own window around `caret`, so
+/// the row the caret writes on stays on screen with the caret translated
+/// into it; a draft that fits shows whole. The assembled rows never exceed
+/// `budget` — zero included — so a caret can never land on the border. A
+/// terminal so short that the untouchable blocks do not fit loses the
+/// tail, the only sacrifice left.
 fn fit_question_sheet(
     head: Vec<Line<'static>>,
     options: &[(usize, Vec<Line<'static>>)],
-    compose: Vec<Line<'static>>,
+    mut compose: Vec<Line<'static>>,
     tail: Vec<Line<'static>>,
     cursor_option: usize,
     budget: usize,
-) -> (Vec<Line<'static>>, usize) {
-    // The blocks that never give way are paid for first; whatever the
-    // budget still holds is what the question and the options may spend.
+    mut caret: Option<(usize, usize)>,
+) -> (Vec<Line<'static>>, usize, Option<(usize, usize)>) {
     let fixed = compose.len().saturating_add(tail.len());
     let spendable = budget.saturating_sub(fixed);
     let head_rows = head.len().min(spendable);
     let room = spendable.saturating_sub(head_rows);
     let (lo, hi) = option_window(options, cursor_option, room);
-    let mut lines = Vec::with_capacity(budget.saturating_add(1));
+    let mut lines = Vec::with_capacity(budget);
     lines.extend(head.into_iter().take(head_rows));
     lines.extend(
         options
@@ -1297,10 +1311,23 @@ fn fit_question_sheet(
             .flat_map(|(_, rows)| rows.clone()),
     );
     let compose_start = lines.len();
+    let compose_room = budget
+        .saturating_sub(compose_start)
+        .saturating_sub(tail.len());
+    if compose.len() > compose_room && compose_room > 0 {
+        let caret_row = caret.map_or(0, |(row, _)| row);
+        let window_start = caret_row
+            .saturating_sub(compose_room.saturating_sub(1))
+            .min(compose.len().saturating_sub(compose_room));
+        caret = caret.map(|(row, column)| (row.saturating_sub(window_start), column));
+        let mut windowed = compose.split_off(window_start);
+        windowed.truncate(compose_room);
+        compose = windowed;
+    }
     lines.extend(compose);
     lines.extend(tail);
-    lines.truncate(budget.saturating_add(1).max(1));
-    (lines, compose_start)
+    lines.truncate(budget);
+    (lines, compose_start, caret)
 }
 
 /// The option groups that fit in `room` rows, as the `(lo, hi)` index
@@ -1378,13 +1405,14 @@ mod tests {
         // option list are what a short terminal takes from.
         let groups: Vec<(usize, Vec<ratatui::text::Line<'static>>)> =
             (0..2).map(|index| (index, block_rows("o", 1))).collect();
-        let (lines, compose_start) = fit_question_sheet(
+        let (lines, compose_start, _) = fit_question_sheet(
             block_rows("h", 3),
             &groups,
             block_rows("c", 2),
             block_rows("t", 1),
             0,
             3,
+            None,
         );
         let rows: Vec<String> = lines.iter().map(ToString::to_string).collect();
         assert_eq!(compose_start, 0, "the draft starts at the top of the sheet");
@@ -1397,13 +1425,14 @@ mod tests {
         // One more row buys the question's text back before it buys a
         // single option: reading the question outranks reading the list.
         let groups = vec![(0, block_rows("o", 1)), (1, block_rows("o", 1))];
-        let (lines, compose_start) = fit_question_sheet(
+        let (lines, compose_start, _) = fit_question_sheet(
             block_rows("h", 3),
             &groups,
             block_rows("c", 2),
             block_rows("t", 1),
             0,
             6,
+            None,
         );
         let rows: Vec<String> = lines.iter().map(ToString::to_string).collect();
         assert_eq!(compose_start, 3);
@@ -1433,6 +1462,65 @@ mod tests {
             (0, 0),
             "a cursor's group that will not fit leaves the list out entirely"
         );
+    }
+
+    #[test]
+    fn a_draft_longer_than_the_sheet_windows_around_the_caret() {
+        // The compose block is five rows against a budget that, with
+        // the hints, holds four of them: the window keeps the rows
+        // around the caret — the row it writes on — and the caret
+        // lands inside the window, never on the border.
+        let (lines, compose_start, caret) = fit_question_sheet(
+            block_rows("h", 1),
+            &[],
+            block_rows("c", 5),
+            block_rows("t", 1),
+            0,
+            5,
+            Some((4, 2)),
+        );
+        let rows: Vec<String> = lines.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            compose_start, 0,
+            "the untouchable blocks take the budget before the head"
+        );
+        assert_eq!(
+            rows,
+            vec!["c1", "c2", "c3", "c4", "t0"],
+            "the draft's window holds its last rows — the caret's end"
+        );
+        assert_eq!(
+            caret,
+            Some((3, 2)),
+            "the caret lands on its own row inside the window"
+        );
+    }
+
+    #[test]
+    fn the_assembled_rows_never_exceed_the_budget() {
+        // Four fixed rows against a three-row budget: the sheet keeps
+        // exactly three, and a zero budget assembles nothing at all — a
+        // caret on the border was the old overflow's symptom.
+        let (lines, _, _) = fit_question_sheet(
+            block_rows("h", 1),
+            &[],
+            block_rows("c", 2),
+            block_rows("t", 1),
+            0,
+            3,
+            None,
+        );
+        assert_eq!(lines.len(), 3, "the assembly is capped at the budget");
+        let (none, _, _) = fit_question_sheet(
+            block_rows("h", 1),
+            &[],
+            block_rows("c", 2),
+            block_rows("t", 1),
+            0,
+            0,
+            None,
+        );
+        assert!(none.is_empty(), "a zero budget assembles no rows");
     }
 
     #[test]

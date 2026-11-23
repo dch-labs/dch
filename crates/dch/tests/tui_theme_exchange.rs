@@ -130,7 +130,11 @@ fn an_answered_startup_installs_the_canvas_and_tints_the_cursor() {
     let sb = common::Sandbox::sse(Vec::new());
     let session = sb.dch_pty_in_env(&[], &[]);
     session.answer_background_query("ffff/ffff/ffff", Duration::from_secs(30));
-    let startup = await_raw(&session, "\x1b]11;rgb:0c/0c/0c", Duration::from_secs(20));
+    let startup = await_raw(&session, "\x1b]12;rgb:ff/b2/00", Duration::from_secs(20));
+    assert!(
+        startup.contains("\x1b]11;rgb:0c/0c/0c"),
+        "the canvas precedes the cursor tint: {startup:?}"
+    );
     assert!(
         startup.contains("\x1b]11;?"),
         "the question the answer rode in on left the pane: {startup:?}"
@@ -166,6 +170,12 @@ fn a_committed_switch_writes_its_canvas_once_inside_the_burst() {
     let sb = common::Sandbox::sse(Vec::new());
     let mut session = sb.dch_pty_in_env(&[], &[]);
     session.answer_background_query("ffff/ffff/ffff", Duration::from_secs(60));
+    // The fixture premise, made deterministic: one focus report is
+    // queued into the pty's input buffer before the child can reach
+    // its startup query, so the query always finds pending input and
+    // stands down — a flood thread alone races the child's
+    // initialization, and a slow scheduler can let the query win.
+    session.send(b"\x1b[O");
     let flood = session.flood_input(b"\x1b[O", Duration::from_millis(4000));
     await_thread(&flood, Duration::from_secs(20));
     let settled = session.snapshot();

@@ -222,17 +222,20 @@ impl TuiApp {
     /// Typing, the caret, and pasting stay the composer's: the draft is
     /// fixed with the same keys a new prompt is written with, which is the
     /// point of lifting it there rather than into a box with its own
-    /// editor. Three chords come back here — Enter saves into the prompt
-    /// the text came from, and Esc and Ctrl+C both put the draft away.
-    /// Ctrl+C is the one whose meaning moves: with a prompt out, the press
-    /// lands on the text in front of the user rather than reaching past it
-    /// to a run they have stopped looking at, and the run's cancel is one
-    /// Esc away. Neither abort drops anything — a key taken as a way out
-    /// of the mode leaves the waiting prompt exactly as it was found.
+    /// editor. Three chords come back here — plain Enter and Ctrl+M save
+    /// into the prompt the text came from, and Esc and Ctrl+C both put the
+    /// draft away; a Shift+Enter stays the editor's newline, the same
+    /// gesture that breaks a line in an ordinary draft. Ctrl+C is the one
+    /// whose meaning moves: with a prompt out, the press lands on the text
+    /// in front of the user rather than reaching past it to a run they
+    /// have stopped looking at, and the run's cancel is one Esc away.
+    /// Neither abort drops anything — a key taken as a way out of the
+    /// mode leaves the waiting prompt exactly as it was found.
     /// Everything else is the composer's, and falls through.
     fn queue_edit_key(&mut self, key: KeyEvent) -> Option<bool> {
         match (key.code, key.modifiers) {
-            (KeyCode::Enter, _) | (KeyCode::Char('m'), KeyModifiers::CONTROL) => {
+            (KeyCode::Enter, KeyModifiers::NONE | KeyModifiers::CONTROL)
+            | (KeyCode::Char('m'), KeyModifiers::CONTROL) => {
                 self.commit_queue_edit();
                 Some(true)
             }
@@ -814,6 +817,9 @@ impl TuiApp {
     /// read them. The new run is not steered with them: a user who meant
     /// them for it still can, seeing the notice, and the alternative
     /// would put words into a conversation their author never aimed at.
+    /// The handoff hide retires before the returned prompts join the
+    /// queue — the same reset a submit performs — so a pending hide
+    /// cannot mask the rows it lands behind.
     pub(crate) fn return_guidance(&mut self) {
         let mut taken = self
             .state
@@ -837,6 +843,7 @@ impl TuiApp {
             .retain(|text| !taken.contains(text));
         let count = taken.len();
         let mut promised = 0usize;
+        self.queue.handed = None;
         for text in taken {
             let id = self.push_queued(text);
             if self.send_queued_id(id) {

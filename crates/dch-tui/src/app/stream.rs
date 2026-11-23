@@ -160,13 +160,7 @@ impl FreezeCache {
         let live_md = unfrozen
             .get(..unfrozen.len().saturating_sub(live.len()))
             .filter(|segment| !segment.is_empty());
-        let stamp = live_md.map_or(0, fingerprint) ^ {
-            let mut seed = live.len() as u64;
-            for ch in live.chars().rev().take(64) {
-                seed = seed.wrapping_mul(31).wrapping_add(u64::from(u32::from(ch)));
-            }
-            seed
-        };
+        let stamp = fingerprint(unfrozen);
         if self.live_stamp == stamp
             && self.live_frozen_upto == self.frozen_upto
             && self.live_width == width

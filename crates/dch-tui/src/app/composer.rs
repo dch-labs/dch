@@ -145,10 +145,10 @@ impl TuiApp {
     /// frame layout both budget the composer by, computed identically
     /// on both paths.
     pub(crate) fn composer_height_for(rows: &[String]) -> u16 {
-        let text_rows = u16::try_from(rows.len())
-            .unwrap_or(1)
-            .clamp(1, INPUT_TEXT_ROWS);
-        text_rows
+        let cap = usize::from(INPUT_TEXT_ROWS);
+        let text_rows = rows.len().clamp(1, cap);
+        u16::try_from(text_rows)
+            .unwrap_or(INPUT_TEXT_ROWS)
             .saturating_add(INPUT_VERTICAL_PADDING.saturating_mul(2))
             .saturating_add(1)
     }

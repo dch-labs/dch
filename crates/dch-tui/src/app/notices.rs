@@ -868,8 +868,13 @@ pub(crate) fn wrap_rows(text: &str, limit: usize) -> Vec<String> {
 ///
 /// The last kept row carries an ellipsis when truncation happens —
 /// the collapsed previews' shape: a short head of the text with the
-/// cut named where the reader's eye lands.
+/// cut named where the reader's eye lands. A `max_rows` of zero buys
+/// no rows at all — the caller's budget is honored exactly, never
+/// exceeded by an ellipsis row.
 pub(crate) fn wrap_prompt_rows(text: &str, limit: usize, max_rows: usize) -> Vec<String> {
+    if max_rows == 0 {
+        return Vec::new();
+    }
     let mut rows = wrap_rows(text, limit);
     if rows.len() > max_rows {
         rows.truncate(max_rows);

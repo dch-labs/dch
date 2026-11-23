@@ -312,11 +312,17 @@ fn cut_superseded_turn(
     id: u64,
     interrupted: bool,
 ) {
-    let superseded = last_claim
-        .take()
-        .filter(|(claimed, _, _)| *claimed == id)
-        .map(|(_, before, claimed)| (before, std::sync::Arc::clone(&claimed)));
-    if let Some((before, claimed)) = superseded {
+    let superseded = if last_claim
+        .as_ref()
+        .is_some_and(|(claimed, _, _)| *claimed == id)
+    {
+        last_claim.take()
+    } else {
+        None
+    };
+    if let Some((before, claimed)) =
+        superseded.map(|(_, before, claimed)| (before, std::sync::Arc::clone(&claimed)))
+    {
         apply_correction_cut(runner, state, before, interrupted, &claimed);
     }
 }

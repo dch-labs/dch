@@ -163,16 +163,25 @@ impl TuiApp {
     /// cell's re-seed and leave the fresh posture tightened under
     /// rules this repair never meant to loosen.
     fn repair_permission_damage(&mut self) {
-        if !self.permission.permission_memory.damage_standing() {
-            self.post_notice("nothing to repair — the saved permissions read whole".to_string());
-            return;
-        }
         let adoption = self.permission.permission_adoption_guard.clone();
         let _held = adoption.as_ref().map(|guard| {
             guard
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
         });
+        let live = Self::listed_permission_state(&self.permission.permission_memory);
+        if let Some(listed) = self.permission.permission_listed_state.clone()
+            && listed != live
+        {
+            self.post_notice(
+                "the permissions changed since the listing — run /permissions again".to_string(),
+            );
+            return;
+        }
+        if !self.permission.permission_memory.damage_standing() {
+            self.post_notice("nothing to repair — the saved permissions read whole".to_string());
+            return;
+        }
         self.permission.permission_memory.clear_damage();
         let rules = self.config.permissions.engine_rules();
         if let Some(cell) = &self.permission.permission_config_rules_cell {
@@ -199,6 +208,9 @@ impl TuiApp {
     /// the rows either way, so the tightened posture they are read
     /// under is never silent.
     fn post_permissions_listing(&mut self) {
+        self.permission.permission_listed_state = Some(Self::listed_permission_state(
+            &self.permission.permission_memory,
+        ));
         let now = chrono::Utc::now();
         let configured: Vec<String> = self
             .config
@@ -312,6 +324,22 @@ impl TuiApp {
             &denied,
             deny_base,
         );
+    }
+
+    /// The permission state a review sees: the remembered rules and
+    /// the damage verdict together.
+    ///
+    /// The listing records it and the repair re-reads it under the
+    /// adoption guard; equality is what binds the repair to the
+    /// session the user reviewed.
+    fn listed_permission_state(
+        memory: &crate::queue::PermissionMemory,
+    ) -> (Vec<PermissionRule>, Vec<PermissionRule>, bool) {
+        (
+            memory.allow_rules(),
+            memory.deny_rules(),
+            memory.damage_standing(),
+        )
     }
 
     /// Move the live permission mode: the shared cell and the
@@ -532,6 +560,28 @@ pub(crate) struct PermissionState {
     /// or `--permissions-preset` also rides no save *out* of one.
     pub(crate) permission_session_start: (dch_config::PermissionMode, Option<String>),
 
+    /// The permission state the last `/permissions` listing rendered.
+    ///
+    /// The review record the repair binds to: the remembered rules
+    /// and the damage verdict as the user read them. A repair that
+    /// finds the live state moved — an adoption landed, an answer
+    /// remembered a rule — refuses rather than act on a session the
+    /// user never reviewed. `None` until a listing runs in this
+    /// session.
+    pub(crate) permission_listed_state: Option<(Vec<PermissionRule>, Vec<PermissionRule>, bool)>,
+
+    /// Whether this render's visibility has been spent by a resolve.
+    ///
+    /// An approval must answer a request the user has seen. The
+    /// event loop drains a burst of keypresses before the next
+    /// redraw, so the first resolving press of a burst spends the
+    /// visibility the render granted and every later press is
+    /// swallowed until a frame draws the ask that stepped forward —
+    /// a double-press can never resolve two requests when only the
+    /// first was on screen. The render clears the flag when it draws
+    /// the front ask; every resolution sets it.
+    pub(crate) permission_spent: std::cell::Cell<bool>,
+
     /// Whether the permission sheet shows the command preview
     /// expanded.
     ///
@@ -596,6 +646,7 @@ impl PermissionState {
     fn resolve_pending_permission(&mut self, resolution: PermissionResolution) {
         self.permission_reason = None;
         self.permission_command_expanded = false;
+        self.permission_spent.set(true);
         if let Some(front) = self.pending_permissions.pop_front()
             && front.reply.send(resolution).is_err()
         {
@@ -621,10 +672,19 @@ impl PermissionState {
     /// ask is cancelled, not the session), which the sheet's own pins
     /// hold.
     /// Modifier-decorated answers (Alt+y, Alt+Enter) do not answer:
-    /// the documented keys are the plain ones.
+    /// the documented keys are the plain ones. A resolving press
+    /// spends the visibility the last render granted: presses that
+    /// trail it inside the same burst — drained before the redraw —
+    /// are swallowed until a frame draws the ask that stepped
+    /// forward, so a double-press can never resolve a request the
+    /// user has not seen.
     pub(crate) fn permission_key(&mut self, key: KeyEvent) -> Option<bool> {
         self.pending_permissions.front()?;
+        let spent = self.permission_spent.get();
         if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
+            if spent {
+                return Some(true);
+            }
             self.resolve_pending_permission(PermissionResolution::DenyOnce);
             return Some(true);
         }
@@ -636,6 +696,9 @@ impl PermissionState {
         }
         let bare = key.modifiers == KeyModifiers::NONE;
         let shift = key.modifiers == KeyModifiers::SHIFT;
+        if spent {
+            return Some(true);
+        }
         match key.code {
             KeyCode::Char('y' | 'Y') if bare || shift => {
                 self.resolve_pending_permission(PermissionResolution::AllowOnce);
@@ -706,6 +769,9 @@ impl PermissionState {
                 true
             }
             KeyCode::Enter if bare => {
+                if self.permission_spent.get() {
+                    return true;
+                }
                 let reason = self
                     .permission_reason
                     .take()
@@ -741,6 +807,7 @@ impl PermissionState {
     /// prompt), any reason line being typed, and how many more asks
     /// wait behind it.
     pub(crate) fn shown_permission(&self) -> Option<PermissionSheet> {
+        self.permission_spent.set(false);
         self.pending_permissions.front().map(|request| {
             let phrases = |rules: &[PermissionRule]| {
                 rules
@@ -1005,6 +1072,95 @@ mod tests {
     }
 
     #[test]
+    fn a_burst_press_cannot_answer_an_unrendered_ask() {
+        // The drain consumes a burst of keypresses before the next
+        // redraw: the first `y` resolves the ask on screen, and a
+        // second `y` in the same burst arrives before the frame has
+        // drawn the ask behind it. That press is swallowed — the
+        // model sees no answer for a request the user never saw — and
+        // the ask becomes answerable again only once a draw renders
+        // it.
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        let mut replies = Vec::new();
+        for command in ["cargo test", "cargo build"] {
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            app.permission
+                .pending_permissions
+                .push_back(crate::permission::PermissionRequest {
+                    tool_name: "Bash".to_string(),
+                    prompt: "Allow 'Bash' (ShellExecute) in Interactive mode?".to_string(),
+                    input: serde_json::json!({ "command": command }),
+                    always: Vec::new(),
+                    never: Vec::new(),
+                    reply: reply_tx,
+                });
+            replies.push(reply_rx);
+        }
+        let _ = app.permission.shown_permission();
+        assert_eq!(
+            app.permission
+                .permission_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
+            Some(true),
+            "the first press answers the rendered ask"
+        );
+        assert_eq!(
+            replies.remove(0).try_recv(),
+            Ok(PermissionResolution::AllowOnce),
+            "the rendered ask was allowed"
+        );
+        assert_eq!(
+            app.permission
+                .permission_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
+            Some(true),
+            "the burst's second press is still the sheet's to swallow"
+        );
+        assert!(
+            replies[0].try_recv().is_err(),
+            "the unrendered ask carries no answer"
+        );
+        let _ = app.permission.shown_permission();
+        assert_eq!(
+            app.permission
+                .permission_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
+            Some(true),
+            "after its render the ask answers again"
+        );
+        assert_eq!(
+            replies.remove(0).try_recv(),
+            Ok(PermissionResolution::AllowOnce),
+            "the now-rendered ask was allowed"
+        );
+    }
+
+    #[test]
+    fn a_repair_refuses_when_the_state_moved_since_the_listing() {
+        // The repair binds to the review: an adoption that replaced
+        // the memory after the listing leaves the user having read a
+        // session that no longer stands, and its fail-closed posture
+        // is not theirs to clear. The notice names the re-read
+        // instead of acting.
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        let memory = crate::queue::PermissionMemory::default();
+        app.set_permission_memory(memory.clone());
+        app.permissions_command(None);
+        memory.adopt(Vec::new(), Vec::new(), true);
+        app.permissions_command(Some("repair"));
+        let (notice, _) = app
+            .transient_notice
+            .as_ref()
+            .expect("the moved state answers with a notice")
+            .clone();
+        assert!(
+            notice.contains("changed since the listing"),
+            "the refusal names the re-read: {notice}"
+        );
+        assert!(
+            memory.damage_standing(),
+            "the adopted session's posture stands untouched"
+        );
+    }
+
+    #[test]
     fn a_write_ask_shows_what_always_would_remember() {
         // The `a` press's scope is read before it is pressed: the sheet
         // carries a dim line naming the rules an allow-always would
@@ -1082,6 +1238,9 @@ mod tests {
                 }],
                 reply: tokio::sync::oneshot::channel().0,
             });
+        // An approval answers a rendered ask: the pin draws the sheet
+        // once so the press finds it answerable.
+        let _ = app.permission.shown_permission();
         app.permission
             .permission_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
         assert_eq!(
@@ -1111,6 +1270,8 @@ mod tests {
                 }],
                 reply: tokio::sync::oneshot::channel().0,
             });
+        // The next ask needs its own render before its own press.
+        let _ = app.permission.shown_permission();
         app.permission
             .permission_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
         assert!(
@@ -1228,22 +1389,30 @@ mod tests {
             "the forget says what lapsed: {out}"
         );
         assert_eq!(
-            memory.allow_rules().len(),
-            1,
-            "the tool rule stays in the allow list"
+            memory.allow_rules(),
+            vec![crate::queue::PermissionRule::PathGlob {
+                pattern: "crates/**".to_string()
+            }],
+            "the glob rule the forget did not name stays in the allow list"
         );
         assert_eq!(
-            memory.deny_rules().len(),
-            0,
-            "the glob rule is out of the memory"
+            memory.deny_rules(),
+            Vec::new(),
+            "the forget records no denial"
         );
         let persisted = written
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
             .expect("the forget fired the write-through");
-        assert_eq!(persisted.0.len(), 1, "the allow half mirrors the memory");
-        assert_eq!(persisted.1.len(), 0, "the deny half mirrors the memory");
+        assert_eq!(
+            persisted.0,
+            vec![crate::queue::PermissionRule::PathGlob {
+                pattern: "crates/**".to_string()
+            }],
+            "the allow half mirrors the memory"
+        );
+        assert_eq!(persisted.1, Vec::new(), "the deny half mirrors the memory");
         let out = command_output(&mut app, "/permissions forget 9");
         assert!(
             out.contains("no remembered rule 9"),
@@ -1366,6 +1535,9 @@ mod tests {
                 });
             replies.push(reply_rx);
         }
+        // Each press answers a rendered ask: the loop staged all three
+        // at once, so every press here is preceded by its own draw.
+        let _ = app.permission.shown_permission();
         assert_eq!(
             app.permission
                 .permission_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
@@ -1377,6 +1549,7 @@ mod tests {
             Ok(PermissionResolution::AllowOnce),
             "`a` allows the call"
         );
+        let _ = app.permission.shown_permission();
         assert_eq!(
             app.permission
                 .permission_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
@@ -1387,6 +1560,7 @@ mod tests {
             Ok(PermissionResolution::AllowOnce),
             "`y` allows too"
         );
+        let _ = app.permission.shown_permission();
         assert_eq!(
             app.permission
                 .permission_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),

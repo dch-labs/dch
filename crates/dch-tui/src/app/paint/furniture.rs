@@ -56,7 +56,7 @@ impl TuiApp {
             Self::strip_stood_down(frame, area);
             return false;
         }
-        let now = Instant::now();
+        let now = self.pulse_now();
         let base = self
             .theme
             .ui
@@ -92,6 +92,23 @@ impl TuiApp {
     /// palette's canvas.
     fn strip_stood_down(frame: &mut Frame, area: Rect) {
         frame.render_widget(ratatui::widgets::Clear, area);
+    }
+
+    /// The instant the strip animates against: a pin's clock when one
+    /// stands, the real clock otherwise.
+    ///
+    /// The glow's phase is a pure function of the time since the
+    /// run's anchor, so a pin that fixes both ends asserts an exact
+    /// brightness instead of racing the milliseconds between setting
+    /// the anchor and drawing the frame.
+    fn pulse_now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(pinned) = self.pacing.pulse_clock.get() {
+            return pinned;
+        }
+        #[cfg(not(test))]
+        let _ = self;
+        Instant::now()
     }
 
     /// Render the pinned plan section: the run's current tasks,

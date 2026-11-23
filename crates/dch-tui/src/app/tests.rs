@@ -934,6 +934,9 @@ fn the_live_case_denies_only_what_was_refused_and_blessings_survive() {
             }],
             reply: tokio::sync::oneshot::channel().0,
         });
+    // An approval answers a rendered ask: the pin draws the sheet
+    // once so the press finds it answerable.
+    let _ = app.permission.shown_permission();
     app.permission
         .permission_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
     assert!(
@@ -1220,6 +1223,15 @@ fn a_preview_parks_its_canvas_and_a_dismissed_browse_re_arms_the_restore() {
     crate::terminal::set_multiplexed_for_tests(None);
 }
 
+/// Serializes the tests that read the process-wide window balance.
+///
+/// The balance is one counter for the whole test binary, so a test
+/// snapshotting it — or sampling it from inside a failing backend —
+/// holds this lock for its whole body; without it a parallel test's
+/// markers could move the counter between the snapshots these pins
+/// compare.
+static WINDOW_BALANCE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn the_startup_fallback_restores_without_opening_a_burst() {
     // The branch a host's struct-literal theme reaches: the retry's
@@ -1227,6 +1239,9 @@ fn the_startup_fallback_restores_without_opening_a_burst() {
     // the terminal gets its own background back through the plain
     // captured restore — never a synchronized-output close the
     // fallback did not open, which would leave the markers unpaired.
+    let _balance = WINDOW_BALANCE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut app = TuiApp::new(dch_config::DchConfig::default());
     let mut literal = Theme::by_name("nord").expect("nord resolves");
     literal.name = "host literal";
@@ -1251,13 +1266,25 @@ fn the_startup_fallback_restores_without_opening_a_burst() {
 /// A backend whose frame writes always fail — the only arm a dead or
 /// closing terminal takes, which [`ratatui::backend::TestBackend`]
 /// cannot stand in for.
-struct FailingBackend;
+struct FailingBackend {
+    /// The process-wide window balance as the failing draw saw it.
+    ///
+    /// Sampled from inside `draw`, between the burst's opener and
+    /// its close, so the owning test can tell an open window from an
+    /// absent pair of markers — the before-and-after balance alone
+    /// cannot.
+    sampled: std::sync::Arc<std::sync::atomic::AtomicIsize>,
+}
 
 impl ratatui::backend::Backend for FailingBackend {
     fn draw<'a, I>(&mut self, _content: I) -> std::io::Result<()>
     where
         I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
     {
+        self.sampled.store(
+            crate::terminal::SYNCHRONIZED_WINDOW_BALANCE.load(std::sync::atomic::Ordering::Relaxed),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         Err(std::io::Error::other("the frame write failed"))
     }
 
@@ -1315,10 +1342,18 @@ fn a_failed_draw_closes_the_parked_bursts_window() {
     // fails mid-frame still owes the close, or the restore bytes the
     // exit guard writes next land inside a window a mode-2026
     // terminal keeps buffering and never paints. One test walks both
-    // arms in sequence — the balance is process-wide, so a second
-    // test racing this one could snapshot inside the open window.
+    // arms in sequence under the balance lock — the counter is
+    // process-wide, so a parallel test's markers could otherwise move
+    // it between these snapshots.
+    let _balance = WINDOW_BALANCE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let sampled = std::sync::Arc::new(std::sync::atomic::AtomicIsize::new(0));
     let mut app = TuiApp::new(dch_config::DchConfig::default());
-    let mut terminal = ratatui::Terminal::new(FailingBackend).expect("terminal");
+    let mut terminal = ratatui::Terminal::new(FailingBackend {
+        sampled: std::sync::Arc::clone(&sampled),
+    })
+    .expect("terminal");
     let before =
         crate::terminal::SYNCHRONIZED_WINDOW_BALANCE.load(std::sync::atomic::Ordering::Relaxed);
     let drawn = app.draw_frame(
@@ -1332,6 +1367,10 @@ fn a_failed_draw_closes_the_parked_bursts_window() {
         drawn.is_err(),
         "the draw failure propagates to the run loop"
     );
+    assert!(
+        sampled.load(std::sync::atomic::Ordering::Relaxed) > before,
+        "the failing draw ran inside the window the burst opened"
+    );
     assert_eq!(
         crate::terminal::SYNCHRONIZED_WINDOW_BALANCE.load(std::sync::atomic::Ordering::Relaxed),
         before,
@@ -1342,9 +1381,14 @@ fn a_failed_draw_closes_the_parked_bursts_window() {
         "the draw failure propagates without a burst"
     );
     assert_eq!(
+        sampled.load(std::sync::atomic::Ordering::Relaxed),
+        before,
+        "no burst stood, so the failing draw ran between no window markers"
+    );
+    assert_eq!(
         crate::terminal::SYNCHRONIZED_WINDOW_BALANCE.load(std::sync::atomic::Ordering::Relaxed),
         before,
-        "no burst stood, so the failure path writes no window markers"
+        "no burst stood, so the failure path opens no window"
     );
 }
 
@@ -1357,6 +1401,51 @@ fn tab_completes_a_command_name_from_its_prefix() {
         app.composer.input.text() == "/theme" || app.composer.input.text() == "/themes",
         "a command prefix completes to a full command name, got {:?}",
         app.composer.input.text()
+    );
+}
+
+#[test]
+fn tab_completes_past_a_multibyte_separator() {
+    // A nonbreaking space separates the command word from its argument
+    // as well as an ASCII one does. The prefix must keep the whole
+    // separator: slicing at its first byte cut inside the character,
+    // dropped the line back to a bare "/", and let the completion
+    // replace the command word with the value it offered.
+    let mut app = TuiApp::new(dch_config::DchConfig::default());
+    app.composer.input.set_text("/theme\u{a0}dark".to_string());
+    assert!(app.complete_command_line(false));
+    assert_eq!(
+        app.composer.input.text(),
+        "/theme\u{a0}dark_plus",
+        "the multibyte separator survives into the completed line"
+    );
+}
+
+#[test]
+fn a_step_past_a_stale_cycle_position_still_lands_on_a_row() {
+    // A paste can replace the composer under a standing cycle with a
+    // fragment whose filtered list is shorter than the position the
+    // walk stood on. The step clamps the stale position into the
+    // fresh list instead of computing an index that no longer exists
+    // — the shape that consumed the key and left the composer
+    // untouched.
+    let mut app = TuiApp::new(dch_config::DchConfig::default());
+    app.composer.input.set_text("/theme ".to_string());
+    assert!(app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
+    app.composer.input.set_text("/theme d".to_string());
+    let (_, fresh, _) = app.fresh_completion("/theme d");
+    let clamped_step = fresh
+        .get(fresh.len().saturating_sub(2))
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+        "the step lands even from a position the fresh list outgrew"
+    );
+    assert_eq!(
+        app.composer.input.text(),
+        format!("/theme {clamped_step}"),
+        "the clamped position steps within the fresh list"
     );
 }
 
@@ -2405,15 +2494,21 @@ fn a_glow_breathes_its_color_while_staying_put() {
             .map_or(ratatui::prelude::Color::Reset, |cell| cell.fg);
         (bar, color)
     };
-    app.run_anchor = Some(Instant::now());
+    // The pinned clock makes each phase exact: the anchor and the
+    // frame's sample are the same instants the glow math derives its
+    // eighths from, so a slow runner cannot round the start below
+    // full brightness.
+    let start = Instant::now();
+    app.run_anchor = Some(start);
+    app.pacing.pulse_clock.set(Some(start));
     let (bar, full) = render(&app);
     assert_eq!(bar, 80, "the glow bar holds the full row");
     assert_eq!(full, base, "the breath starts at full brightness");
-    app.run_anchor = Some(
-        Instant::now()
-            .checked_sub(Duration::from_millis(1800))
-            .expect("now is past the epoch"),
-    );
+    app.pacing.pulse_clock.set(Some(
+        start
+            .checked_add(Duration::from_millis(1800))
+            .expect("the half-breath instant is computable"),
+    ));
     let (bar, dim) = render(&app);
     assert_eq!(bar, 80, "the bar never moves");
     assert_eq!(
@@ -2421,11 +2516,11 @@ fn a_glow_breathes_its_color_while_staying_put() {
         scaled_color(base, 4),
         "the half-breath sits at half brightness"
     );
-    app.run_anchor = Some(
-        Instant::now()
-            .checked_sub(Duration::from_millis(3600))
-            .expect("now is past the epoch"),
-    );
+    app.pacing.pulse_clock.set(Some(
+        start
+            .checked_add(Duration::from_millis(3600))
+            .expect("the wrap instant is computable"),
+    ));
     let (bar, wrapped) = render(&app);
     assert_eq!(bar, 80, "the bar stays full through the wrap");
     assert_eq!(wrapped, base, "the wrap returns to full brightness");
@@ -3062,11 +3157,16 @@ fn the_exchange_splits_a_direct_terminal_from_a_multiplexed_pane() {
         "the paintless palette stays deferred even in a pane"
     );
     let browsed = Theme::by_name("dracula").expect("dracula resolves");
+    let browsed_foreground = browsed.ui.foreground;
     pane.preview_theme(browsed);
     assert_ne!(
         pane.theme.ui.surface,
         ratatui::style::Color::Reset,
         "a pane previews the full palette — the grounding paints the canvas"
+    );
+    assert_eq!(
+        pane.theme.ui.foreground, browsed_foreground,
+        "a pane previews the full palette, its anchored foreground included"
     );
     crate::terminal::set_multiplexed_for_tests(None);
 }
@@ -3177,35 +3277,40 @@ fn a_stated_seat_grounds_a_deferred_palette_the_seat_doc_names_out_of_contract()
 
 #[test]
 fn the_canvas_ground_needs_the_canvas_in_force() {
-    // The warrant's two questions: is the canvas in force — a pane
+    // The warrant's three questions: is the canvas in force — a pane
     // inside a multiplexer, or a direct terminal the OSC 11 exchange
-    // landed on — and is it an Rgb canvas the frame may paint. A
-    // direct terminal the exchange never landed on keeps its own
-    // scheme (the deferred palette paints no canvas), and the
-    // transparent palette defers to the terminal's own default in any
-    // seat.
+    // landed on and still carries — is the canvas installed, and is
+    // it an Rgb canvas the frame may paint. A direct terminal the
+    // exchange never landed on keeps its own scheme (the deferred
+    // palette paints no canvas), an answered terminal whose canvas
+    // was restored keeps the restored scheme, and the transparent
+    // palette defers to the terminal's own default in any seat.
     let canvas = ratatui::style::Color::Rgb(12, 12, 12);
     let answered = crate::terminal::BackgroundSupport::Answered;
     let refused = crate::terminal::BackgroundSupport::Refused;
     let never_asked = crate::terminal::BackgroundSupport::NotAsked;
     assert!(
-        TuiApp::canvas_ground_warranted(true, never_asked, canvas),
+        TuiApp::canvas_ground_warranted(true, never_asked, canvas, false),
         "a pane paints its canvas without an exchange"
     );
     assert!(
-        TuiApp::canvas_ground_warranted(false, answered, canvas),
+        TuiApp::canvas_ground_warranted(false, answered, canvas, true),
         "a direct terminal the set landed on gets the canvas painted too"
     );
     assert!(
-        !TuiApp::canvas_ground_warranted(false, refused, canvas),
+        !TuiApp::canvas_ground_warranted(false, answered, canvas, false),
+        "an answered terminal whose canvas was restored keeps the restored scheme"
+    );
+    assert!(
+        !TuiApp::canvas_ground_warranted(false, refused, canvas, true),
         "a refused terminal keeps its own scheme: nothing to paint"
     );
     assert!(
-        !TuiApp::canvas_ground_warranted(false, never_asked, canvas),
+        !TuiApp::canvas_ground_warranted(false, never_asked, canvas, true),
         "an unsettled terminal has proven nothing: nothing to paint"
     );
     assert!(
-        !TuiApp::canvas_ground_warranted(true, answered, ratatui::style::Color::Reset),
+        !TuiApp::canvas_ground_warranted(true, answered, ratatui::style::Color::Reset, true),
         "the paintless palette defers to the terminal's own default"
     );
 }
@@ -3255,6 +3360,48 @@ fn a_grounding_walk_covers_the_blanks_and_keeps_the_surfaces() {
         "the canvas lands on the blanks the widgets left"
     );
     crate::terminal::set_multiplexed_for_tests(None);
+}
+
+#[test]
+fn a_replaced_live_tail_rebuilds_its_rows() {
+    // The live stamp covers the whole unfrozen suffix: a buffer
+    // cleared and refilled to a comparable length — the documented
+    // cleared-and-refilled case the stamp exists for — must not match
+    // the old tail's stamp, or the pane keeps serving the replaced
+    // turn's rows. The two tails share their length and their last 64
+    // characters; only the head byte differs.
+    let theme = Theme::default();
+    let md = markdown::MarkdownTheme::from(&theme);
+    let syntax = markdown::SyntaxTheme::from(&theme);
+    let mut freeze = FreezeCache::default();
+    let fill = "x".repeat(64);
+    assert!(freeze.refresh(
+        &format!("A{fill}"),
+        80,
+        &md,
+        &syntax,
+        theme.ui.assistant_message_fg
+    ));
+    assert!(
+        freeze.refresh(
+            &format!("B{fill}"),
+            80,
+            &md,
+            &syntax,
+            theme.ui.assistant_message_fg
+        ),
+        "the replaced tail rebuilds"
+    );
+    let text: String = freeze
+        .live_lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .map(|span| span.content.to_string())
+        .collect();
+    assert!(
+        text.contains('B') && !text.contains('A'),
+        "the live rows carry the replacement: {text:?}"
+    );
 }
 
 #[test]

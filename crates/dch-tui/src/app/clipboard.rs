@@ -169,8 +169,16 @@ impl CopyState {
         let copy_outcomes: CopyOutcomes = Arc::new(std::sync::Mutex::new(Vec::new()));
         let copier_outcomes = Arc::clone(&copy_outcomes);
         let copy_attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let copier_attempts = Arc::clone(&copy_attempts);
         let copier: SelectionCopier = Box::new(move |attempt, text| {
-            copy_via_transports(custom.as_deref(), attempt, text, &copier_outcomes, &wake)
+            copy_via_transports(
+                custom.as_deref(),
+                attempt,
+                text,
+                &copier_attempts,
+                &copier_outcomes,
+                &wake,
+            )
         });
         Self {
             copier,
@@ -320,10 +328,12 @@ pub(crate) fn clipboard_env() -> ClipboardEnv {
 /// variables into its panes even while a Wayland session runs
 /// elsewhere, and a terminal that ignores OSC 52 then turns the
 /// tmux-buffer transport into a dead end. libwayland falls back to
-/// the conventional `wayland-0` socket under `$XDG_RUNTIME_DIR`, so a
-/// socket sitting there is evidence enough that `wl-copy` can reach a
-/// compositor; the lock file beside it counts too, since it appears
-/// and disappears with the socket.
+/// the conventional `wayland-0` socket under `$XDG_RUNTIME_DIR`, so
+/// that socket sitting there — a real socket, the endpoint `wl-copy`
+/// itself opens — is evidence enough that the helper can reach a
+/// compositor; a lock file or a later socket names no endpoint the
+/// helper would use, and an ordinary file at the name is not a
+/// socket at all.
 pub(crate) fn wayland_socket_present() -> bool {
     let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR") else {
         return false;
@@ -334,13 +344,26 @@ pub(crate) fn wayland_socket_present() -> bool {
 /// The directory scan behind [`wayland_socket_present`].
 ///
 /// Pure over the directory so the pin can drive it with a fixture;
-/// every entry whose name begins `wayland-` — socket or lock — is
-/// evidence a compositor is reachable through it.
+/// only the default `wayland-0` socket counts — the endpoint
+/// `wl-copy` opens when no display is named — and on unix it must be
+/// a socket file, not an ordinary file or a lock that happens to
+/// carry the name.
 pub(crate) fn wayland_socket_in(dir: &std::path::Path) -> bool {
     std::fs::read_dir(dir).is_ok_and(|entries| {
-        entries
-            .flatten()
-            .any(|entry| entry.file_name().to_string_lossy().starts_with("wayland-"))
+        entries.flatten().any(|entry| {
+            if entry.file_name().to_string_lossy() != "wayland-0" {
+                return false;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::FileTypeExt as _;
+                entry.file_type().is_ok_and(|kind| kind.is_socket())
+            }
+            #[cfg(not(unix))]
+            {
+                true
+            }
+        })
     })
 }
 
@@ -539,26 +562,41 @@ mod tests {
 
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn a_runtime_dir_socket_names_wayland_without_the_variable() {
-        // The console-launched tmux shape: no $WAYLAND_DISPLAY, but the
-        // compositor's socket sits in the runtime dir libwayland
-        // already falls back to — the wl-copy transport engages.
+        // The console-launched tmux shape: no $WAYLAND_DISPLAY, but
+        // the compositor's default socket sits in the runtime dir
+        // libwayland falls back to. The transport engages on that
+        // socket alone: a later socket or a lock names no endpoint
+        // `wl-copy` opens, and an ordinary file at the name is not a
+        // socket at all — the fallback never launches a helper that
+        // cannot reach a compositor.
+        use std::os::unix::net::UnixListener;
         let dir = std::env::temp_dir().join(format!("dch-wayland-pin-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).expect("pin dir");
         assert!(
             !wayland_socket_in(&dir),
             "an empty runtime dir offers no wayland"
         );
-        std::fs::write(dir.join("wayland-0"), b"").expect("socket marker");
+        std::fs::write(dir.join("wayland-1"), b"").expect("later socket marker");
+        std::fs::write(dir.join("wayland-0.lock"), b"").expect("lock marker");
         assert!(
-            wayland_socket_in(&dir),
-            "the conventional socket names a reachable compositor"
+            !wayland_socket_in(&dir),
+            "a later name and the lock are not the endpoint wl-copy opens"
         );
-        std::fs::write(dir.join("wayland-1.lock"), b"").expect("lock marker");
+        let listener = UnixListener::bind(dir.join("wayland-0")).expect("the default socket binds");
         assert!(
             wayland_socket_in(&dir),
-            "the lock file beside the socket counts"
+            "the conventional default socket names a reachable compositor"
+        );
+        drop(listener);
+        std::fs::remove_file(dir.join("wayland-0")).expect("socket removed");
+        std::fs::write(dir.join("wayland-0"), b"").expect("plain file marker");
+        assert!(
+            !wayland_socket_in(&dir),
+            "an ordinary file at the socket's name is no socket"
         );
         std::fs::remove_dir_all(&dir).expect("pin dir cleaned");
     }

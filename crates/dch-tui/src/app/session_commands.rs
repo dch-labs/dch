@@ -633,9 +633,17 @@ impl TuiApp {
             "copy_command" => {
                 let copy_command = self.config.display.copy_command.clone();
                 let outcomes = Arc::clone(&self.copy.copy_outcomes);
+                let attempts = Arc::clone(&self.copy.copy_attempts);
                 let wake = Arc::clone(&self.state.render_notify);
                 self.set_selection_copier(Box::new(move |attempt, text| {
-                    copy_via_transports(copy_command.as_deref(), attempt, text, &outcomes, &wake)
+                    copy_via_transports(
+                        copy_command.as_deref(),
+                        attempt,
+                        text,
+                        &attempts,
+                        &outcomes,
+                        &wake,
+                    )
                 }));
             }
             _ => {}
@@ -742,6 +750,7 @@ impl TuiApp {
         self.exit
             .shutdown_flag
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.snapshot_exit_state_before_cancel();
         self.cancel_run_in_flight();
         self.quit.requested = true;
         self.post_notice("exiting — the session is saved".to_string());
@@ -2090,7 +2099,13 @@ mod tests {
     }
 
     #[test]
-    fn esc_on_a_popup_clears_the_whole_command() {
+    fn esc_on_a_popup_closes_it_and_the_next_esc_clears_the_draft() {
+        // The two duties take one press each: the first Esc dismisses
+        // the suggestion popup alone — the half-typed line it stood
+        // over is the user's and survives — and only the second, with
+        // no popup standing, clears the draft. A press that closed the
+        // menu and consumed the draft in one stroke made dismissal
+        // cost the line for a key the user aimed at the menu.
         let mut app = TuiApp::new(dch_config::DchConfig::default());
         app.composer.input.set_text("/the".to_string());
         let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
@@ -2099,10 +2114,22 @@ mod tests {
             "the standing popup is Esc's first duty"
         );
         assert!(
-            app.composer.input.is_empty(),
-            "one press clears the suggestion and the draft together"
+            !app.completion_popup_live(),
+            "the popup is gone after one press"
         );
-        assert!(!app.completion_popup_live(), "the popup is gone");
+        assert_eq!(
+            app.composer.input.text(),
+            "/the",
+            "the draft survives the popup's dismissal"
+        );
+        assert!(
+            app.handle_key(esc),
+            "the second Esc claims the now-bare composer"
+        );
+        assert!(
+            app.composer.input.is_empty(),
+            "the press with no popup standing clears the draft"
+        );
         assert!(
             !app.handle_key(esc),
             "an empty composer leaves Esc unclaimed"

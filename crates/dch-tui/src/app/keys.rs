@@ -128,7 +128,7 @@ impl TuiApp {
             (KeyCode::Esc, KeyModifiers::NONE) => self.esc_under_run_or_idle(),
             (KeyCode::Char('s'), KeyModifiers::CONTROL) => self.steer_now(),
             (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
-                self.plan.cycle_plan_view();
+                self.cycle_plan_view();
                 true
             }
             (KeyCode::Char('c'), mods) if mods == KeyModifiers::CONTROL | KeyModifiers::SHIFT => {
@@ -145,6 +145,7 @@ impl TuiApp {
                 {
                     if self.quit.armed {
                         self.exit.shutdown_flag.store(true, Ordering::SeqCst);
+                        self.snapshot_exit_state_before_cancel();
                         if let Some(cancel) = &self.exit.run_canceller {
                             cancel();
                         }

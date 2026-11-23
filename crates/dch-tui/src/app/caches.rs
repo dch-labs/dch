@@ -845,12 +845,19 @@ mod tests {
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         terminal.draw(|frame| subject.render(frame)).unwrap();
         let incremental = subject.bake.conversation_cache.clone();
-        // Force a whole-transcript rebake: clear the bake and lie
-        // about the generation.
+        let incremental_meta = (
+            subject.bake.user_turn_ranges.clone(),
+            subject.bake.user_prompt_marks.clone(),
+            subject.bake.tool_summary_lines.clone(),
+            subject.bake.thinking_summary_lines.clone(),
+            subject.bake.compaction_summary_lines.clone(),
+            subject.bake.todo_block_ranges.clone(),
+        );
+        // Force a whole-transcript rebake through the invalidation the
+        // re-shaping paths use — no baked prefix, no baked metadata —
+        // then lie about the generation so the next draw rebuilds.
+        subject.bake.rebake_whole();
         subject.bake.conversation_cache.clear();
-        subject.bake.conversation_bake.clear();
-        subject.bake.conversation_baked_through = 0;
-        subject.bake.conversation_baked_prev_user = None;
         subject.bake.conversation_cache_generation =
             subject.bake.conversation_cache_generation.wrapping_sub(1);
         terminal.draw(|frame| subject.render(frame)).unwrap();
@@ -859,6 +866,18 @@ mod tests {
             texts_of(&incremental),
             texts_of(&full),
             "the bake and the rebuild render identical lines"
+        );
+        let full_meta = (
+            subject.bake.user_turn_ranges.clone(),
+            subject.bake.user_prompt_marks.clone(),
+            subject.bake.tool_summary_lines.clone(),
+            subject.bake.thinking_summary_lines.clone(),
+            subject.bake.compaction_summary_lines.clone(),
+            subject.bake.todo_block_ranges.clone(),
+        );
+        assert_eq!(
+            incremental_meta, full_meta,
+            "the bake and the rebuild index the rows identically"
         );
     }
 

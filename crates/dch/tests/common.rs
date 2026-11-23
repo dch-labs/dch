@@ -712,6 +712,9 @@ impl Sandbox {
     pub fn dch_pty_in_env(&self, args: &[&str], env: &[(&str, &str)]) -> PtySession {
         use portable_pty::CommandBuilder;
         use portable_pty::PtySize;
+        let lane = PTY_LANE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let pty = portable_pty::native_pty_system()
             .openpty(PtySize {
                 rows: 40,
@@ -739,7 +742,7 @@ impl Sandbox {
             .expect("dch spawns on the pty");
         let reader = pty.master.try_clone_reader().expect("pty reader clones");
         let writer = pty.master.take_writer().expect("pty writer taken");
-        PtySession::new(child, pty.master, reader, writer)
+        PtySession::new(lane, child, pty.master, reader, writer)
     }
 }
 
@@ -752,6 +755,13 @@ impl Sandbox {
 /// flood, the query-answer watcher — take the master's side lane so a
 /// blocked background write never holds the keystroke lock.
 pub struct PtySession {
+    /// The seat this session holds in the binary-wide PTY lane.
+    ///
+    /// Dropped when the session drops, releasing the lane for the
+    /// next scenario — see [`PTY_LANE`] for why the sessions run one
+    /// at a time.
+    _lane: std::sync::MutexGuard<'static, ()>,
+
     /// The binary running on the pseudoterminal.
     ///
     /// Polled by [`Self::finish`](PtySession::finish) and its quit
@@ -785,14 +795,36 @@ pub struct PtySession {
     screen: Arc<Mutex<String>>,
 }
 
+/// The binary-wide PTY lane: one scenario's child at a time.
+///
+/// The PTY scenarios drive the real binary, and the binary's own
+/// contracts time-box their terminal handshakes — the background
+/// exchange parks its event reader and waits a bounded beat for the
+/// acknowledgement. A test runner that schedules several scenario
+/// children at once splits the runner's cores across them, and a
+/// child whose reader thread waits its whole acknowledgement budget
+/// for CPU time skips the exchange it exists to perform: the scenario
+/// then watches for bytes the starved child never wrote. Holding one
+/// seat per session keeps each child's timings its own — the lane is
+/// the harness's contract with the binary's time-boxed handshakes,
+/// not a courtesy.
+static PTY_LANE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 impl PtySession {
     /// Assemble the session and start draining the terminal.
     ///
-    /// The reader thread owns the PTY's read half for the session's
-    /// whole life so the shared buffer keeps growing whatever the
-    /// waits are doing; the child, master, and writer halves stay
-    /// with the session for reaping, side lanes, and keystrokes.
+    /// Takes the binary-wide PTY lane for the session's lifetime
+    /// ([`PTY_LANE`]): the scenarios drive real children whose
+    /// terminal-state exchanges time-box their handshakes, and a
+    /// runner that schedules several children at once starves the
+    /// very reader those handshakes wait on — the lane is what keeps
+    /// each scenario's timings its own. The reader thread owns the
+    /// PTY's read half for the session's whole life so the shared
+    /// buffer keeps growing whatever the waits are doing; the child,
+    /// master, and writer halves stay with the session for reaping,
+    /// side lanes, and keystrokes.
     fn new(
+        lane: std::sync::MutexGuard<'static, ()>,
         child: Box<dyn portable_pty::Child + Send>,
         master: Box<dyn portable_pty::MasterPty + Send>,
         reader: Box<dyn Read + Send>,
@@ -815,6 +847,7 @@ impl PtySession {
             }
         });
         Self {
+            _lane: lane,
             child,
             writer: Arc::new(Mutex::new(writer)),
             screen,
@@ -1138,6 +1171,24 @@ impl PtySession {
                 "the child never exited on repeated ctrl-c; screen so far:\n{}",
                 self.snapshot()
             );
+        }
+    }
+}
+
+impl Drop for PtySession {
+    /// Kill a child the scenario left behind, before the handles drop.
+    ///
+    /// A failed scenario unwinds with its session half-used: the
+    /// child may still be running, holding the pty's slave side open
+    /// while a blocked flood lane holds a duplicate of the master —
+    /// the reader thread and the reaper then wait on a process nobody
+    /// asked to leave, and the suite hangs on a test that already
+    /// failed. The kill is best-effort: a child that exited on its
+    /// own makes it a no-op, and the field drops still close every
+    /// handle after it.
+    fn drop(&mut self) {
+        if self.child.try_wait().is_ok_and(|status| status.is_none()) {
+            drop(self.child.kill());
         }
     }
 }

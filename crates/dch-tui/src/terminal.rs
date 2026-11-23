@@ -94,6 +94,34 @@ pub fn background_support() -> BackgroundSupport {
     }
 }
 
+/// Whether the terminal's default background carries a canvas this
+/// session wrote.
+///
+/// The grounding walk's second question on a direct terminal: the
+/// exchange may be [`BackgroundSupport::Answered`] yet carry no
+/// installed canvas — the startup retry's fallback restored the
+/// terminal's own background under a palette the registry cannot
+/// un-mask — and grounding a deferred canvas over the restored
+/// background would paint cells that no longer match what the
+/// terminal shows. Every write that lands a canvas raises the flag;
+/// the captured restore and the paintless restore lower it. A
+/// multiplexed pane paints its own canvas and never consults it.
+static CANVAS_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+/// Whether the terminal's default background carries a canvas this
+/// session wrote.
+///
+/// True only after a canvas write landed — the startup install, or
+/// a theme burst's canvas half — and false again once a restore
+/// gives the terminal its own background back. The display's
+/// grounding walk reads this beside the support verdict so a
+/// deferred palette whose terminal was restored keeps the terminal's
+/// scheme.
+#[must_use]
+pub fn canvas_installed() -> bool {
+    CANVAS_INSTALLED.load(Ordering::SeqCst)
+}
+
 /// Whether a live switch should ask the terminal now: only a session
 /// that never got an answer — skipped at startup, never queried since
 /// — asks. A proven terminal writes; a refused one is never asked
@@ -416,6 +444,7 @@ fn query_unix(red: u8, green: u8, blue: u8, install: bool) -> QueryOutcome {
                     background_sequence((red, green, blue))
                 ));
                 drop(stdout.flush());
+                CANVAS_INSTALLED.store(true, Ordering::SeqCst);
             }
             QueryOutcome {
                 installed: true,
@@ -772,12 +801,13 @@ pub(crate) fn theme_burst_bytes(
 pub fn finish_theme_burst(background: Color, primary: Color) {
     #[cfg(test)]
     SYNCHRONIZED_WINDOW_BALANCE.fetch_sub(1, Ordering::Relaxed);
-    let closer = theme_burst_bytes(
-        ORIGINAL_BACKGROUND.get().copied(),
-        background,
-        primary,
-        multiplexer_client(),
+    let original = ORIGINAL_BACKGROUND.get().copied();
+    let closer = theme_burst_bytes(original, background, primary, multiplexer_client());
+    let lands_canvas = matches!(
+        live_override_plan(original.is_some(), background),
+        LiveOverridePlan::Write
     );
+    CANVAS_INSTALLED.store(lands_canvas, Ordering::SeqCst);
     let mut stdout = io::stdout();
     drop(write!(stdout, "{closer}"));
     drop(stdout.flush());
@@ -1590,6 +1620,7 @@ pub(crate) fn restore_captured_canvas() {
         let mut stdout = io::stdout();
         drop(write!(stdout, "{}", background_sequence(*original)));
         drop(stdout.flush());
+        CANVAS_INSTALLED.store(false, Ordering::SeqCst);
         reset_cursor_color();
     }
 }

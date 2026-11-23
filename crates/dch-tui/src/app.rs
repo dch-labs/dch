@@ -74,7 +74,7 @@ use dch_config::{DchConfig, StripPosition, StripStyle, Verbosity};
 use self::composer::INPUT_SIDE_INSET;
 use self::exit::QuitState;
 use self::notices::{NOTICE_HOLD, error_block_lines, format_duration, plain_wrapped_lines};
-use self::paint::welcome::{WelcomeShape, WelcomeState, leading_sky_rows};
+use self::paint::welcome::{WelcomeShape, WelcomeState};
 use self::queue::QueueMode;
 use self::run::FRAME_INTERVAL;
 use self::todos::PlanView;
@@ -780,6 +780,8 @@ impl TuiApp {
             .config_overrides
             .remove("permission_mode");
         self.compaction_summary_owed.clear();
+        self.plan.latest_todos.clear();
+        self.plan.todo_section_changes.clear();
         self.conversation.clear();
         self.seed_messages(transcript);
         self.bake.conversation_generation = self.bake.conversation_generation.saturating_add(1);
@@ -808,8 +810,12 @@ impl TuiApp {
     /// How long a theme switch waits for the event reader to
     /// acknowledge it is parked before giving up on the one background
     /// ask — it must exceed the reader's own poll wait by enough
-    /// margin that a reader just leaving an idle poll is still seen.
-    const QUIESCE_ACK: Duration = Duration::from_millis(400);
+    /// margin that a reader just leaving an idle poll is still seen,
+    /// and enough more that a starved scheduler still lands the
+    /// reader inside the window: the acknowledgement costs nothing
+    /// when the reader is prompt, so the budget's whole job is the
+    /// worst case.
+    const QUIESCE_ACK: Duration = Duration::from_secs(2);
 
     /// The one mid-session ask the session is allowed: park the event
     /// reader, query the terminal while its reply cannot be stolen,
@@ -1691,13 +1697,6 @@ impl TuiApp {
     /// from the fjord's foot.
     const WELCOME_BAND_MAX_ROWS: u16 = 29;
 
-    /// The night-sky rows the band's fallback window would keep.
-    ///
-    /// Dormant while the picker honors height — no rung is ever
-    /// windowed — this names the sky floor the horizon window keeps
-    /// if an asset ever outgrows the band cap.
-    const WELCOME_MIN_SKY_ROWS: u16 = 6;
-
     /// The give-way lane's ceiling: the w54 rung's band top.
     ///
     /// The largest rung a shrunken margin may seat: above it, the
@@ -1751,14 +1750,7 @@ impl TuiApp {
             !entry.lines.is_empty() && entry.width <= width_budget && entry.height <= row_budget
         });
         let (art, rows_shown, row_skip) = match art {
-            Some(scale) => {
-                let rows = row_budget.min(scale.height);
-                let sky = leading_sky_rows(&scale.lines);
-                let skip = sky
-                    .saturating_sub(Self::WELCOME_MIN_SKY_ROWS)
-                    .min(scale.height.saturating_sub(rows));
-                (Some(scale), rows, skip)
-            }
+            Some(scale) => (Some(scale), row_budget.min(scale.height), 0),
             None => (None, 0, 0),
         };
         let fallback_block = area
@@ -1814,16 +1806,20 @@ impl TuiApp {
     /// A frame whose canvas is in force but not otherwise guaranteed:
     /// a pane inside a multiplexer (the multiplexer hands default
     /// cells to the client as the client's own default), or a direct
-    /// terminal the canvas landed on through the `OSC 11` exchange —
-    /// the set reprograms the default, but the terminal's own
-    /// profile, padding, and any moment the set has not reached (a
-    /// refused reply, a slow answer, a switch mid-flight) all still
-    /// show through cells left on the default, so the frame paints
-    /// what it means: every blank row, tail, and margin carries the
-    /// canvas as an explicit background, and the set remains only as
-    /// the chrome outside the frame — padding, the fraction of a
-    /// cell — joining the same color. A terminal the exchange never
-    /// landed on keeps its own scheme: the deferred palette paints no
+    /// terminal the canvas landed on through the `OSC 11` exchange
+    /// and still carries it — the set reprograms the default, but
+    /// the terminal's own profile, padding, and any moment the set
+    /// has not reached (a refused reply, a slow answer, a switch
+    /// mid-flight) all still show through cells left on the default,
+    /// so the frame paints what it means: every blank row, tail, and
+    /// margin carries the canvas as an explicit background, and the
+    /// set remains only as the chrome outside the frame — padding,
+    /// the fraction of a cell — joining the same color. An answered
+    /// terminal whose canvas was taken back — the startup fallback
+    /// restored its own background under a palette the registry
+    /// cannot un-mask — keeps the restored scheme: the installed
+    /// flag carries that half. A terminal the exchange never landed
+    /// on keeps its own scheme: the deferred palette paints no
     /// canvas, and nothing of ours may cover the terminal the user
     /// configured. Only an `Rgb` canvas is grounded — the transparent
     /// palette's whole contract is the terminal's own default.
@@ -1831,8 +1827,9 @@ impl TuiApp {
         multiplexed: bool,
         support: crate::terminal::BackgroundSupport,
         canvas: ratatui::style::Color,
+        installed: bool,
     ) -> bool {
-        (multiplexed || support == crate::terminal::BackgroundSupport::Answered)
+        (multiplexed || (support == crate::terminal::BackgroundSupport::Answered && installed))
             && matches!(canvas, ratatui::style::Color::Rgb(..))
     }
 
@@ -1876,6 +1873,7 @@ impl TuiApp {
             multiplexed,
             crate::terminal::background_support(),
             self.theme.ui.background,
+            crate::terminal::canvas_installed(),
         )
     }
 
@@ -2244,6 +2242,11 @@ impl TuiApp {
             if let Some(index) = self.tools.retry_row_index.get(&line.episode).copied() {
                 if let Some(TuiMessage::System { text, .. }) = self.conversation.get_mut(index) {
                     *text = line.text;
+                    self.bake.conversation_generation =
+                        self.bake.conversation_generation.saturating_add(1);
+                    if index < self.bake.conversation_baked_through {
+                        self.bake.rebake_whole();
+                    }
                 }
             } else {
                 self.push_message(TuiMessage::System {
@@ -2302,6 +2305,8 @@ impl TuiApp {
                     }) = self.conversation.last_mut()
                     {
                         *reply_duration = Some(duration_ms);
+                        self.bake.conversation_generation =
+                            self.bake.conversation_generation.saturating_add(1);
                     }
                 }
                 Graduation::Tool(result) => {
