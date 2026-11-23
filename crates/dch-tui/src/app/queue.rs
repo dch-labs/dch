@@ -542,11 +542,27 @@ impl TuiApp {
     /// that makes an open edit a correction rather than a save, and it
     /// always lands a frame before the Enter that follows it. [`release_queue_if_empty`]
     /// is why the frame stands down a focus and leaves an edit alone.
+    ///
+    /// A standing confirmation reconciles here too: its preview follows
+    /// the prompt the ask armed, wherever the claims have slid the rows,
+    /// and an ask whose prompt left the queue stands itself down — the
+    /// frame must never render a confirmation aimed at a prompt the
+    /// user cannot see.
     pub(crate) fn sync_queue_view(&mut self) {
         if self.queued_len() == 0 {
             self.queue.queue_view = 0;
             self.release_queue_if_empty();
             return;
+        }
+        if let QueueMode::Confirming { id, .. } = self.queue.queue_mode {
+            if let Some(index) = self.queued_index_of(id) {
+                self.queue.queue_view = index;
+            } else {
+                self.queue.queue_mode = QueueMode::Focused;
+                self.post_notice(
+                    "the prompt left the queue — the confirmation stood down".to_string(),
+                );
+            }
         }
         self.clamp_queue_view();
     }

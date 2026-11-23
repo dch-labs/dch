@@ -1924,6 +1924,10 @@ mod tests {
             "the notice names the door the rules wait at: {notice}"
         );
 
+        // The user walks the door the notices name: the listing reviews
+        // the standing damage under the held selection, and the repair
+        // acts on that review.
+        app.permissions_command(None);
         app.permissions_command(Some("repair"));
 
         assert_eq!(

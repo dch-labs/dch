@@ -25,6 +25,8 @@ mod stream;
 mod test_support;
 mod todos;
 
+pub use self::clipboard::CopyAnswer;
+
 use self::caches::{BakeMeta, BakeOutputs, LaneCaches, TranscriptBake};
 use self::clipboard::{CopyState, SelectionCopier};
 #[cfg(test)]
@@ -1209,8 +1211,7 @@ impl TuiApp {
     ///
     /// The instrumentation seam for the selection pins: a recorder
     /// observes what a release copies without touching any real
-    /// clipboard, answering [`CopyAnswer::Verified`](crate::CopyAnswer::Verified)
-    /// so the notice
+    /// clipboard, answering `CopyAnswer::Verified` so the notice
     /// reads as delivered. Production never calls this.
     pub fn set_selection_copier(&mut self, copier: SelectionCopier) {
         self.copy.copier = copier;

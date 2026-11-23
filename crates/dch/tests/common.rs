@@ -709,6 +709,15 @@ impl Sandbox {
     /// an entry whose key the base already carries overrides it, so a
     /// scenario naming `TERM` decides the terminal type the binary
     /// sees.
+    ///
+    /// One child at a time: the seat is the binary-wide [`PTY_LANE`],
+    /// and the session holds it until it drops. A second `dch_pty_in_env`
+    /// — or [`Self::dch_pty`] — while an earlier session still lives
+    /// blocks that test until the first one drops; a test that stands
+    /// two children in sequence drops or consumes the first session
+    /// explicitly, rather than leaning on a binding's scope to do it.
+    /// A panicking test releases the lane through the poison path, so
+    /// one failure never blocks the suite.
     pub fn dch_pty_in_env(&self, args: &[&str], env: &[(&str, &str)]) -> PtySession {
         use portable_pty::CommandBuilder;
         use portable_pty::PtySize;
@@ -722,6 +731,7 @@ impl Sandbox {
                 ..PtySize::default()
             })
             .expect("pty opens");
+        raw_before_the_first_byte(pty.master.as_raw_fd());
         let mut command = CommandBuilder::new(dch_binary());
         command.args(args);
         command.arg("--config");
@@ -744,6 +754,41 @@ impl Sandbox {
         let writer = pty.master.take_writer().expect("pty writer taken");
         PtySession::new(lane, child, pty.master, reader, writer)
     }
+}
+
+/// Put a freshly opened pty pair into raw mode, before its child spawns.
+///
+/// A pty opens cooked: canonical input with echo. The binary switches
+/// its terminal to raw once it has booted, and until then the pair
+/// speaks a different language than any scenario assumes — input sits
+/// in a line buffer nothing can read until a return lands, and every
+/// byte typed is echoed back, a control byte as two visible
+/// characters. An input flood in that window is the pathology in
+/// miniature: megabytes of focus reports return as megabytes of caret
+/// text, the reader drains them, every watcher rescans them, and on a
+/// loaded runner the child starves behind its own echo before it can
+/// reach the raw-mode entry that would have silenced it. Raw from the
+/// first byte gives the pair the semantics every scenario already
+/// waits for: each byte is readable the moment it lands — the premise
+/// the never-asked scenarios stand on — and the stream carries only
+/// what the child writes. The binary's own raw-mode entry then saves
+/// and restores these settings as its own.
+fn raw_before_the_first_byte(fd: Option<std::os::unix::io::RawFd>) {
+    let Some(fd) = fd else {
+        return;
+    };
+    let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+    // SAFETY: `fd` is the live master of a pair this session owns and
+    // outlives the call, and `termios` is a valid buffer of the size
+    // the call fills.
+    let reported = unsafe { libc::tcgetattr(fd, &raw mut termios) };
+    assert_eq!(reported, 0, "the pty master reports its line settings");
+    // SAFETY: the call only rewrites the buffer just filled.
+    unsafe { libc::cfmakeraw(&raw mut termios) };
+    // SAFETY: the call reads the buffer and programs the pair it came
+    // from.
+    let programmed = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw const termios) };
+    assert_eq!(programmed, 0, "the pty master takes raw mode");
 }
 
 /// A live pseudoterminal session with the binary on the other end.
@@ -1031,15 +1076,16 @@ impl PtySession {
         duration: std::time::Duration,
     ) -> std::thread::JoinHandle<()> {
         let mut lane = self.side_write_lane();
-        let bytes = bytes.to_vec();
+        let gesture = bytes.to_vec();
         std::thread::spawn(move || {
             let deadline = std::time::Instant::now()
                 .checked_add(duration)
                 .expect("deadline computable");
             while std::time::Instant::now() < deadline {
-                if lane.write_all(&bytes).is_err() || lane.flush().is_err() {
+                if lane.write_all(&gesture).is_err() || lane.flush().is_err() {
                     return;
                 }
+                std::thread::sleep(FLOOD_PACE);
             }
         })
     }
@@ -1176,7 +1222,8 @@ impl PtySession {
 }
 
 impl Drop for PtySession {
-    /// Kill a child the scenario left behind, before the handles drop.
+    /// Kill a child the scenario left behind, reap it, then let the
+    /// handles drop.
     ///
     /// A failed scenario unwinds with its session half-used: the
     /// child may still be running, holding the pty's slave side open
@@ -1185,10 +1232,16 @@ impl Drop for PtySession {
     /// asked to leave, and the suite hangs on a test that already
     /// failed. The kill is best-effort: a child that exited on its
     /// own makes it a no-op, and the field drops still close every
-    /// handle after it.
+    /// handle after it. A kill that lands is followed by its wait:
+    /// Rust does not reap a dropped `Child`, and a defunct one would
+    /// outlive the lane's release — holding a name in the process
+    /// table and, on a busy runner, a file the next scenario's
+    /// accounting could trip on — until the test binary itself
+    /// exits. The wait cannot linger past the kill it follows: the
+    /// signal is the kernel's, and the kernel buries what it kills.
     fn drop(&mut self) {
-        if self.child.try_wait().is_ok_and(|status| status.is_none()) {
-            drop(self.child.kill());
+        if self.child.try_wait().is_ok_and(|status| status.is_none()) && self.child.kill().is_ok() {
+            drop(self.child.wait());
         }
     }
 }
@@ -1240,6 +1293,26 @@ impl Write for SideLane {
 /// arriving after half a second is returned as far as it got rather
 /// than gating the scenario.
 pub const SCREEN_STABLE_CAP: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The beat a flood waits between two gestures.
+///
+/// A flood owes the keystroke lane nothing and runs to its deadline —
+/// but it must never outrun the reader. The event source the binary
+/// stands on watches the terminal through an edge-triggered epoll, and
+/// a pty's line discipline stages the master's bytes in a flip buffer
+/// before they reach the read queue: a writer that fills the queue to
+/// the brim, writing again the instant room appears, can land bytes
+/// between the reader's drain and its next wait — an edge the reader
+/// never sees, a queue that stays full, and a writer blocked on it past
+/// every deadline. Unpaced, that is a race the harness loses on a
+/// loaded runner; paced, it is a queue the reader empties between
+/// beats. One gesture per beat keeps input continuously pending —
+/// the continuity a never-asked premise stands on, built from the
+/// backlog a booting child has not yet read rather than from a buffer
+/// held at its brim — while the line settings the pair opens in
+/// (`raw_before_the_first_byte`) make each gesture readable the moment
+/// it lands.
+const FLOOD_PACE: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// The gap between two reads of the screen buffer.
 ///
@@ -1756,6 +1829,30 @@ pub fn sse_thinking_tool_turn(thinking: &str, tool: &str, args: &serde_json::Val
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dropping_a_live_session_reaps_its_child() {
+        // The lane's promise to the next scenario: a session dropped
+        // with its child alive kills the child and reaps it. Rust does
+        // not reap a dropped `Child`, so a kill alone left a defunct
+        // process behind for the test binary's lifetime — a zombie
+        // with the lane already released. After the drop the process
+        // table holds no entry for the child at all: neither running
+        // nor defunct.
+        let sandbox = Sandbox::sse(Vec::new());
+        let session = sandbox.dch_pty_in_env(&[], &[]);
+        let pid = session.pid();
+        assert!(
+            std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "the child runs before the drop"
+        );
+        drop(session);
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "the dropped session reaped its child — no zombie outlives the lane"
+        );
+    }
 
     #[test]
     fn a_silent_endpoint_fails_each_probe_within_its_bound() {

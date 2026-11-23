@@ -156,12 +156,19 @@ impl TuiApp {
     /// configuration's own join, so the configured allows return
     /// exactly as written. The mode stays where it stands — the
     /// user's to move with `/mode` as ever, because a posture is not
-    /// a config value. The whole repair runs under the driver's
-    /// adoption guard — the same lock a live resume or `/clear`
-    /// adoption holds across its whole motion — so a concurrent
-    /// adoption cannot land between the verdict's clearing and the
-    /// cell's re-seed and leave the fresh posture tightened under
-    /// rules this repair never meant to loosen.
+    /// a config value.
+    ///
+    /// The whole repair runs under the driver's adoption guard — the
+    /// same lock a live resume or `/clear` adoption holds across its
+    /// whole motion — and every check inside reads the memory the
+    /// guard holds stable: the damage verdict, the listed state, and
+    /// the session identity the listing rendered under. A repair owes
+    /// its writes to a listing the user actually read: without one,
+    /// or with a memory the listing did not show — rules moved, an
+    /// adoption landed — or with a session the listing did not
+    /// render, it refuses and names the re-read, so a concurrent
+    /// adoption can never borrow a review that belonged to another
+    /// session to clear a posture its own session never earned.
     fn repair_permission_damage(&mut self) {
         let adoption = self.permission.permission_adoption_guard.clone();
         let _held = adoption.as_ref().map(|guard| {
@@ -169,17 +176,23 @@ impl TuiApp {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
         });
-        let live = Self::listed_permission_state(&self.permission.permission_memory);
-        if let Some(listed) = self.permission.permission_listed_state.clone()
-            && listed != live
+        if !self.permission.permission_memory.damage_standing() {
+            self.post_notice("nothing to repair — the saved permissions read whole".to_string());
+            return;
+        }
+        let Some(listed) = self.permission.permission_listed_state.clone() else {
+            self.post_notice(
+                "run /permissions to review the standing damage before repairing".to_string(),
+            );
+            return;
+        };
+        let session_listed = self.permission.permission_listing_session.clone();
+        if listed != Self::listed_permission_state(&self.permission.permission_memory)
+            || session_listed != self.host.session_id
         {
             self.post_notice(
                 "the permissions changed since the listing — run /permissions again".to_string(),
             );
-            return;
-        }
-        if !self.permission.permission_memory.damage_standing() {
-            self.post_notice("nothing to repair — the saved permissions read whole".to_string());
             return;
         }
         self.permission.permission_memory.clear_damage();
@@ -211,6 +224,7 @@ impl TuiApp {
         self.permission.permission_listed_state = Some(Self::listed_permission_state(
             &self.permission.permission_memory,
         ));
+        self.permission.permission_listing_session = self.host.session_id.clone();
         let now = chrono::Utc::now();
         let configured: Vec<String> = self
             .config
@@ -452,8 +466,10 @@ impl TuiApp {
         first: PermissionRequest,
         rx: &mut tokio::sync::mpsc::UnboundedReceiver<PermissionRequest>,
     ) {
+        self.permission.spend_unrendered_front();
         self.permission.pending_permissions.push_back(first);
         while let Ok(request) = rx.try_recv() {
+            self.permission.spend_unrendered_front();
             self.permission.pending_permissions.push_back(request);
         }
     }
@@ -472,6 +488,7 @@ impl TuiApp {
             .as_mut()
             .and_then(|rx| rx.try_recv().ok())
         {
+            self.permission.spend_unrendered_front();
             self.permission.pending_permissions.push_back(request);
         }
     }
@@ -570,6 +587,17 @@ pub(crate) struct PermissionState {
     /// session.
     pub(crate) permission_listed_state: Option<(Vec<PermissionRule>, Vec<PermissionRule>, bool)>,
 
+    /// The session whose permissions the last `/permissions` listing
+    /// rendered.
+    ///
+    /// The identity half of the review record: adoptions can land a
+    /// memory whose rules read exactly as the listing did while
+    /// belonging to a session the user never reviewed, so the repair
+    /// binds to the session id beside the state — an id that moved
+    /// with an adoption refuses exactly as moved rules do. `None`
+    /// until a listing runs in this session.
+    pub(crate) permission_listing_session: Option<String>,
+
     /// Whether this render's visibility has been spent by a resolve.
     ///
     /// An approval must answer a request the user has seen. The
@@ -636,6 +664,20 @@ pub(crate) struct PermissionState {
 }
 
 impl PermissionState {
+    /// Spend the visibility a landing front inherits.
+    ///
+    /// A request stepping into an empty queue has never been drawn:
+    /// the visibility a render grants belongs to the ask the user
+    /// last saw, and an ask landing — first of its burst — must earn
+    /// its own frame before any press may answer it. Nothing to do
+    /// for a queue that already has a front: the landing changes
+    /// nothing the presses read.
+    pub(crate) fn spend_unrendered_front(&mut self) {
+        if self.pending_permissions.is_empty() {
+            self.permission_spent.set(true);
+        }
+    }
+
     /// Answer the front permission request, if one is pending.
     ///
     /// Sends `resolution` on its reply channel and drops it from the
@@ -677,14 +719,15 @@ impl PermissionState {
     /// trail it inside the same burst — drained before the redraw —
     /// are swallowed until a frame draws the ask that stepped
     /// forward, so a double-press can never resolve a request the
-    /// user has not seen.
+    /// user has not seen. The gate holds the sheet's offers — `y`,
+    /// `a`, `d`, `n`, the reason line — and never the interrupt:
+    /// Ctrl+C denies the front ask on any frame, seen or not,
+    /// because a denial is fail-closed and a user pressing the
+    /// interrupt under an ask means one action either way.
     pub(crate) fn permission_key(&mut self, key: KeyEvent) -> Option<bool> {
         self.pending_permissions.front()?;
         let spent = self.permission_spent.get();
         if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
-            if spent {
-                return Some(true);
-            }
             self.resolve_pending_permission(PermissionResolution::DenyOnce);
             return Some(true);
         }
@@ -697,7 +740,7 @@ impl PermissionState {
         let bare = key.modifiers == KeyModifiers::NONE;
         let shift = key.modifiers == KeyModifiers::SHIFT;
         if spent {
-            return Some(true);
+            return Some(false);
         }
         match key.code {
             KeyCode::Char('y' | 'Y') if bare || shift => {
@@ -1111,8 +1154,8 @@ mod tests {
         assert_eq!(
             app.permission
                 .permission_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
-            Some(true),
-            "the burst's second press is still the sheet's to swallow"
+            Some(false),
+            "the burst's second press is swallowed and redraws nothing"
         );
         assert!(
             replies[0].try_recv().is_err(),
@@ -1157,6 +1200,134 @@ mod tests {
         assert!(
             memory.damage_standing(),
             "the adopted session's posture stands untouched"
+        );
+    }
+
+    #[test]
+    fn a_repair_before_any_listing_asks_for_the_listing_first() {
+        // Damage stands, but no listing has rendered it this session:
+        // the repair owes its writes to a review the user actually
+        // read, and a launch announcement is not that review. The
+        // refusal names the listing, and the posture stands.
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        let memory = crate::queue::PermissionMemory::default();
+        app.set_permission_memory(memory.clone());
+        memory.adopt(Vec::new(), Vec::new(), true);
+        app.permissions_command(Some("repair"));
+        let (notice, _) = app
+            .transient_notice
+            .as_ref()
+            .expect("the unreviewed repair answers with a notice")
+            .clone();
+        assert!(
+            notice.contains("review the standing damage"),
+            "the refusal names the listing: {notice}"
+        );
+        assert!(
+            memory.damage_standing(),
+            "the posture stands until the user has seen it"
+        );
+    }
+
+    #[test]
+    fn a_repair_after_an_adoption_changed_the_session_refuses() {
+        // The adoption landed a memory whose state reads exactly as
+        // the listing rendered — same rules, same standing damage —
+        // under a new session id. The state check alone would bless
+        // the repair; the identity check refuses it: the listing the
+        // user read was another session's posture, and clearing this
+        // one on that review would clear a verdict nobody looked at.
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        app.set_session_id("session-a".to_string());
+        let memory = crate::queue::PermissionMemory::default();
+        app.set_permission_memory(memory.clone());
+        memory.adopt(Vec::new(), Vec::new(), true);
+        app.permissions_command(None);
+        app.set_session_id("session-b".to_string());
+        app.permissions_command(Some("repair"));
+        let (notice, _) = app
+            .transient_notice
+            .as_ref()
+            .expect("the refused repair answers with a notice")
+            .clone();
+        assert!(
+            notice.contains("changed since the listing"),
+            "the refusal names the re-read: {notice}"
+        );
+        assert!(
+            memory.damage_standing(),
+            "the adopted session's posture stands untouched"
+        );
+    }
+
+    #[test]
+    fn a_repair_on_the_listed_session_clears_the_posture() {
+        // The door out, in the one case it opens: damage standing, a
+        // listing that rendered it under this very session, and no
+        // rule moved since. The marker clears and the notice says so.
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        app.set_session_id("session-a".to_string());
+        let memory = crate::queue::PermissionMemory::default();
+        app.set_permission_memory(memory.clone());
+        memory.adopt(Vec::new(), Vec::new(), true);
+        app.permissions_command(None);
+        app.permissions_command(Some("repair"));
+        let (notice, _) = app
+            .transient_notice
+            .as_ref()
+            .expect("the repair answers with a notice")
+            .clone();
+        assert!(notice.contains("repaired"), "the repair lands: {notice}");
+        assert!(!memory.damage_standing(), "the marker cleared");
+    }
+
+    #[test]
+    fn an_ask_landing_in_a_burst_waits_for_its_frame() {
+        // The one hole the render gate left: a request landing into an
+        // empty queue inherited whatever visibility the last render
+        // granted — on a fresh session, none spent — so a press drained
+        // in the same burst could answer an ask no frame had drawn. The
+        // landing itself spends the visibility: the ask waits for the
+        // frame that draws it before any press may answer, and answers
+        // normally once drawn.
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
+        let request = crate::permission::PermissionRequest {
+            tool_name: "Bash".to_string(),
+            prompt: "Allow 'Bash' (ShellExecute) in Interactive mode?".to_string(),
+            input: serde_json::json!({ "command": "cargo test" }),
+            always: Vec::new(),
+            never: Vec::new(),
+            reply: reply_tx,
+        };
+        let (_tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.land_permission_requests(request, &mut rx);
+        assert_eq!(
+            app.permission
+                .permission_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
+            Some(false),
+            "the sheet still owns the press, and nothing it changed asks for a redraw"
+        );
+        assert!(
+            reply_rx.try_recv().is_err(),
+            "an ask no frame drew carries no answer"
+        );
+        assert_eq!(
+            app.permission.pending_permissions.len(),
+            1,
+            "the ask waits for its frame"
+        );
+        let _ = app.permission.shown_permission();
+        assert_eq!(
+            app.permission
+                .permission_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
+            Some(true),
+            "the drawn ask answers"
+        );
+        assert_eq!(
+            reply_rx.try_recv(),
+            Ok(PermissionResolution::AllowOnce),
+            "the frame's ask was allowed"
         );
     }
 

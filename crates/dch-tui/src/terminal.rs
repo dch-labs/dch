@@ -308,8 +308,23 @@ pub fn sync_default_background(background: Color) -> bool {
     if multiplexer_client() {
         return true;
     }
-    query_and_install(background, true).installed
+    query_and_install(background, true, std::time::Duration::ZERO).installed
 }
+
+/// The beat a retry of the startup question waits for input to show
+/// itself before asking.
+///
+/// The launch check samples one instant: keys already typed ahead are
+/// sitting in the queue, and a zero wait reads them honestly. A retry
+/// cannot lean on that instant — it runs just after the event reader
+/// parks, and input that arrives continuously (a typist between two
+/// keys, a flood between two gestures) can hold a gap exactly wide
+/// enough for a zero wait to miss. One beat wide enough to span a
+/// gap between gestures — yet short enough that no user could read a
+/// frame in it — lets continuous input defer the ask every time,
+/// exactly as the launch rule intends, while an idle terminal still
+/// settles its answer inside the blink of a first frame.
+const RETRY_INPUT_BEAT: std::time::Duration = std::time::Duration::from_millis(25);
 
 /// Ask the terminal for its default background and capture what it
 /// answers — the mid-session half of the exchange, writing nothing.
@@ -352,7 +367,7 @@ pub(crate) fn ask_default_background(background: Color) -> QueryOutcome {
     if multiplexer_client() {
         return QueryOutcome::default();
     }
-    query_and_install(background, false)
+    query_and_install(background, false, RETRY_INPUT_BEAT)
 }
 
 /// Ask the terminal for its default background and install the new
@@ -372,7 +387,7 @@ pub(crate) fn ask_and_install_default_background(background: Color) -> QueryOutc
     if multiplexer_client() {
         return QueryOutcome::default();
     }
-    query_and_install(background, true)
+    query_and_install(background, true, RETRY_INPUT_BEAT)
 }
 
 /// What the query-and-override exchange left behind.
@@ -406,12 +421,16 @@ pub(crate) struct QueryOutcome {
 /// switch needs the write inside the burst that lands its cells, so
 /// its half asks without installing and the burst performs the write
 /// the answer warrants.
-fn query_and_install(background: Color, install: bool) -> QueryOutcome {
+fn query_and_install(
+    background: Color,
+    install: bool,
+    input_wait: std::time::Duration,
+) -> QueryOutcome {
     let Color::Rgb(red, green, blue) = background else {
         return QueryOutcome::default();
     };
     #[cfg(unix)]
-    let outcome = query_unix(red, green, blue, install);
+    let outcome = query_unix(red, green, blue, install, input_wait);
     #[cfg(not(unix))]
     let outcome = {
         let _ = (red, green, blue);
@@ -429,8 +448,14 @@ fn query_and_install(background: Color, install: bool) -> QueryOutcome {
 /// and recorded on every path; `install` alone decides whether the
 /// override's bytes leave now or stay with the caller's flush.
 #[cfg(unix)]
-fn query_unix(red: u8, green: u8, blue: u8, install: bool) -> QueryOutcome {
-    let outcome = query_default_background();
+fn query_unix(
+    red: u8,
+    green: u8,
+    blue: u8,
+    install: bool,
+    input_wait: std::time::Duration,
+) -> QueryOutcome {
+    let outcome = query_default_background(input_wait);
     record_support(reply_verdict(&outcome));
     match outcome {
         QueryReply::Answered(original) => {
@@ -904,7 +929,7 @@ enum QueryReply {
 /// the failed reply attempt — a one-shot window, bounded well under
 /// half a second, that is accepted rather than bridged.
 #[cfg(unix)]
-fn query_default_background() -> QueryReply {
+fn query_default_background(input_wait: std::time::Duration) -> QueryReply {
     use std::time::Duration;
     use std::time::Instant;
 
@@ -924,7 +949,7 @@ fn query_default_background() -> QueryReply {
     // bytes that had not yet arrived.
     const REPLY_FINISH_DEADLINE: Duration = Duration::from_millis(200);
 
-    if stdin_ready(Duration::ZERO) {
+    if stdin_ready(input_wait) {
         return QueryReply::NotAsked;
     }
     let mut stdout = io::stdout();
@@ -1849,7 +1874,11 @@ mod tests {
             next_ask_warranted(verdict),
             "a later switch may ask again — the terminal never refused"
         );
-        let outcome = query_and_install(ratatui::style::Color::Reset, false);
+        let outcome = query_and_install(
+            ratatui::style::Color::Reset,
+            false,
+            std::time::Duration::ZERO,
+        );
         assert!(
             !outcome.installed,
             "a non-Rgb background has nothing to install"

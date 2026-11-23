@@ -128,6 +128,7 @@ impl TuiApp {
     pub(crate) fn snapshot_exit_state_before_cancel(&mut self) {
         let blocks = self.capture_live_lanes();
         if !blocks.is_empty() {
+            self.exit.partial_reply_since = self.conversation.len();
             self.exit.partial_reply = Some(blocks);
         }
         self.exit.unclaimed_prompts = Some(self.waiting_prompt_texts_at_exit());
@@ -146,8 +147,15 @@ impl TuiApp {
     /// confirming press took, or the one taken here before this
     /// cancel, keeps text the failed-turn observer would otherwise
     /// clear without a trace — and a drain that did graduate the
-    /// reply wins, so the row is never duplicated. With nothing
-    /// running this is a no-op.
+    /// reply wins, so the row is never duplicated: graduation is
+    /// judged over everything landed since the snapshot was taken,
+    /// because a run that settles between the confirming press and
+    /// this stop can graduate its reply through an ordinary frame
+    /// before the settle ever runs. A run that already stopped before
+    /// this moment still owes its record — the snapshot exists
+    /// precisely for the press that cancelled it — so only an idle
+    /// exit, with neither a run to stop nor a snapshot to land,
+    /// returns without writing.
     pub fn settle_exit_stop(
         &mut self,
         terminal: &mut ratatui::Terminal<impl ratatui::backend::Backend>,
@@ -155,21 +163,33 @@ impl TuiApp {
         if self.exit.partial_reply.is_none() {
             let blocks = self.capture_live_lanes();
             if !blocks.is_empty() {
+                self.exit.partial_reply_since = self.conversation.len();
                 self.exit.partial_reply = Some(blocks);
             }
         }
-        if !self.cancel_run_in_flight() {
-            self.exit.partial_reply = None;
+        let cancelled_now = self.cancel_run_in_flight();
+        if !cancelled_now && self.exit.partial_reply.is_none() {
             return;
         }
         let before = self.conversation.len();
         drop(terminal.draw(|frame| self.render(frame)));
         self.drain_shared_state();
-        let reply_graduated = self.conversation.get(before..).is_some_and(|landed| {
-            landed
-                .iter()
-                .any(|message| matches!(message, TuiMessage::Assistant { .. }))
-        });
+        let graduated_from = self.exit.partial_reply_since.min(self.conversation.len());
+        let reply_graduated = self
+            .conversation
+            .get(graduated_from..)
+            .is_some_and(|landed| {
+                landed.iter().any(|message| {
+                    matches!(
+                        message,
+                        TuiMessage::Assistant { blocks, .. }
+                            if blocks.iter().any(|block| matches!(
+                                block,
+                                ContentBlock::Text { .. } | ContentBlock::Thinking { .. }
+                            ))
+                    )
+                })
+            });
         if !reply_graduated && let Some(blocks) = self.exit.partial_reply.take() {
             self.conversation.push(TuiMessage::Assistant {
                 blocks,
@@ -339,6 +359,16 @@ pub(crate) struct ExitState {
     /// only when the drain did not already graduate the reply.
     pub(crate) partial_reply: Option<Vec<ContentBlock>>,
 
+    /// The conversation's length when [`Self::partial_reply`] was
+    /// captured.
+    ///
+    /// The watermark a later settle graduates against: any assistant
+    /// row carrying reply content that landed from this index on is
+    /// the reply graduating through an ordinary frame — between the
+    /// confirming press and the settle — and supersedes the snapshot,
+    /// so the partial is never written beside its own graduated row.
+    pub(crate) partial_reply_since: usize,
+
     /// The waiting prompts as they stood when the exit's cancel
     /// fired.
     ///
@@ -392,6 +422,59 @@ impl QuitState {
 mod tests {
     use crate::app::TuiApp;
     use crate::app::test_support::*;
+    use crate::message::{ContentBlock, TuiMessage};
+    use crate::observer::{Graduation, ToolResultDisplay};
+    use std::sync::atomic::Ordering;
+
+    /// A terminal the settle can draw into without a screen.
+    fn test_terminal() -> ratatui::Terminal<ratatui::backend::TestBackend> {
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24))
+            .expect("the test terminal draws")
+    }
+
+    /// Put a run in flight with a partial reply on the wire.
+    fn seed_partial_reply(app: &mut TuiApp, text: &str) {
+        *app.state
+            .streaming_text
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = text.to_string();
+        app.state.agent_running.store(true, Ordering::SeqCst);
+    }
+
+    /// What the failed-turn observer leaves behind: the stream cleared
+    /// without a graduation, and the run no longer in flight.
+    fn stop_as_a_failed_turn_does(app: &mut TuiApp) {
+        app.state
+            .streaming_text
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        app.state.agent_running.store(false, Ordering::SeqCst);
+    }
+
+    /// The text of every assistant row's reply blocks, in order.
+    fn reply_texts(app: &TuiApp) -> Vec<String> {
+        app.conversation
+            .iter()
+            .filter_map(|message| match message {
+                TuiMessage::Assistant { blocks, .. } => Some(blocks),
+                _ => None,
+            })
+            .flat_map(|blocks| {
+                blocks.iter().filter_map(|block| match block {
+                    ContentBlock::Text { text } => Some(text.clone()),
+                    _ => None,
+                })
+            })
+            .collect()
+    }
+
+    /// Whether the transcript carries the cancel's own record.
+    fn cancel_record_landed(app: &TuiApp) -> bool {
+        app.conversation.iter().any(|message| {
+            matches!(message, TuiMessage::Error { text, .. } if text == "Agent cancelled")
+        })
+    }
 
     #[test]
     fn stop_with_nothing_running_says_so_and_does_not_quit() {
@@ -446,6 +529,136 @@ mod tests {
         assert!(
             notice.contains("was consumed") && !notice.contains("multi-byte"),
             "a control byte is named as itself: {notice:?}"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_outlives_a_run_that_stopped_before_the_settle() {
+        // The confirming press snapshots the partial reply and fires
+        // the cancel; the run can settle on another task before the
+        // settle runs at all — the failed-turn observer clears the
+        // stream without graduating, and nothing is in flight to
+        // cancel. The snapshot exists for exactly that press: the
+        // words the user saw land, and the cancel's record lands with
+        // them, rather than both vanishing with the early return an
+        // idle exit deserves.
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        seed_partial_reply(&mut app, "half said");
+        app.snapshot_exit_state_before_cancel();
+        stop_as_a_failed_turn_does(&mut app);
+        let mut terminal = test_terminal();
+        app.settle_exit_stop(&mut terminal);
+        assert_eq!(
+            reply_texts(&app),
+            ["half said"],
+            "the press's snapshot lands as the turn's reply row"
+        );
+        assert!(
+            cancel_record_landed(&app),
+            "the stop that took the run down is recorded"
+        );
+    }
+
+    #[test]
+    fn a_tool_only_graduation_does_not_stand_in_for_the_reply() {
+        // A tool in flight graduates in the cancel's drain: its row is
+        // an assistant message carrying only a tool block. That is
+        // not the reply graduating — the partial text still standing
+        // in the snapshot must land beside it, not be discarded as
+        // though the drain had already written the reply.
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        seed_partial_reply(&mut app, "half said");
+        app.snapshot_exit_state_before_cancel();
+        app.state
+            .graduations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(Graduation::Tool(ToolResultDisplay {
+                name: "Edit".to_string(),
+                call_id: "call_exit".to_string(),
+                is_error: false,
+                duration: std::time::Duration::ZERO,
+                input_summary: "src/lib.rs".to_string(),
+                output_preview: "done".to_string(),
+                full_input: "{\"k\":1}".to_string(),
+                full_output: "done".to_string(),
+            }));
+        let mut terminal = test_terminal();
+        app.settle_exit_stop(&mut terminal);
+        assert_eq!(
+            reply_texts(&app),
+            ["half said"],
+            "the tool row is not a graduation; the partial reply still lands"
+        );
+        assert!(
+            app.conversation.iter().any(|message| matches!(
+                message,
+                TuiMessage::Assistant { blocks, .. }
+                    if blocks.iter().any(|block| matches!(block, ContentBlock::Tool { .. }))
+            )),
+            "the tool's own row landed in the same drain"
+        );
+    }
+
+    #[test]
+    fn a_reply_graduated_since_the_snapshot_supersedes_it() {
+        // A run that settles between the confirming press and the
+        // stop can graduate its whole reply through an ordinary frame
+        // first. The snapshot predates that row, so the stop must
+        // read the graduation across everything landed since the
+        // capture — not only across its own drain — and keep the
+        // graduated reply alone, never the partial beside it.
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        seed_partial_reply(&mut app, "half sa");
+        app.snapshot_exit_state_before_cancel();
+        app.conversation.push(TuiMessage::Assistant {
+            blocks: vec![ContentBlock::Text {
+                text: "half said and finished".to_string(),
+            }],
+            timestamp: chrono::Utc::now(),
+            duration_ms: None,
+        });
+        stop_as_a_failed_turn_does(&mut app);
+        let mut terminal = test_terminal();
+        app.settle_exit_stop(&mut terminal);
+        assert_eq!(
+            reply_texts(&app),
+            ["half said and finished"],
+            "the graduated reply stands alone; the stale partial is not written beside it"
+        );
+    }
+
+    #[test]
+    fn a_settle_under_a_live_run_captures_the_partial_itself() {
+        // A host that runs the stop without a press snapshot — the
+        // settle is the first thing to touch the run — still reads
+        // the lanes before its own cancel clears them.
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        seed_partial_reply(&mut app, "half said");
+        let mut terminal = test_terminal();
+        app.settle_exit_stop(&mut terminal);
+        assert_eq!(
+            reply_texts(&app),
+            ["half said"],
+            "the settle's own capture lands the partial it found in flight"
+        );
+        assert!(
+            cancel_record_landed(&app),
+            "a live run is cancelled and recorded"
+        );
+    }
+
+    #[test]
+    fn an_idle_exit_writes_nothing() {
+        // Nothing in flight and no snapshot: the settle is a no-op,
+        // drawing no record the transcript never earned.
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        let mut terminal = test_terminal();
+        app.settle_exit_stop(&mut terminal);
+        assert!(
+            app.conversation.is_empty(),
+            "an idle exit lands no rows: {:?}",
+            app.conversation
         );
     }
 

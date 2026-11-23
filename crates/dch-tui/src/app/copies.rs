@@ -5,8 +5,8 @@
 use super::TuiApp;
 use super::clipboard::CopyAnswer;
 use super::clipboard::{
-    COPY_DEADLINE, CopyOutcomes, CopyVerdict, clipboard_env, configured_copy_command,
-    host_transports, next_attempt, run_process_transports, transport_answer,
+    CopyOutcomes, CopyVerdict, clipboard_env, configured_copy_command, fenced_process_writes,
+    host_transports, next_attempt, transport_answer, transport_commands,
 };
 use super::{Arc, PoisonError};
 use crate::message::ContentBlock;
@@ -138,15 +138,17 @@ pub(in crate::app) fn copy_verdict_notice(verdict: CopyVerdict) -> &'static str 
 /// and every process transport moves to a background task bounded by
 /// one shared kill deadline, so a hanging helper or a child that
 /// never reads its stdin cannot freeze input and rendering. The
-/// transports' jobs are fenced by the attempt counter: a copy whose
-/// attempt a newer copy has already superseded runs none of them, so
-/// a slow older helper cannot land the superseded text over the newer
-/// copy's delivery. The caller-stamped `attempt` rides onto the
-/// verdict unchanged. The transports' verdict lands as a follow-up
-/// notice through the render wake this pings; until then the returned
-/// escape result is all the caller can honestly claim. Failures stay
-/// silent per attempt: a copy that cannot be delivered is a nuisance,
-/// not an error worth interrupting a session for.
+/// transports' jobs run through the ordered lane: each takes its
+/// turn under the process-wide write lock, a turn granted after a
+/// newer copy has started is declined outright, and a copy already
+/// superseded before it queues never runs — a slow older helper
+/// cannot land its text over a newer copy's delivery, whichever of
+/// the two finished first. The caller-stamped `attempt` rides onto
+/// the verdict unchanged. The transports' verdict lands as a
+/// follow-up notice through the render wake this pings; until then
+/// the returned escape result is all the caller can honestly claim.
+/// Failures stay silent per attempt: a copy that cannot be delivered
+/// is a nuisance, not an error worth interrupting a session for.
 pub(in crate::app) fn copy_via_transports(
     custom: Option<&str>,
     attempt: u64,
@@ -169,10 +171,8 @@ pub(in crate::app) fn copy_via_transports(
     let attempts = Arc::clone(attempts);
     let text = text.to_string();
     let job = move || {
-        if attempts.load(std::sync::atomic::Ordering::SeqCst) > attempt {
-            return;
-        }
-        let verified = run_process_transports(command_line.as_deref(), &text, COPY_DEADLINE);
+        let commands = transport_commands(command_line.as_deref());
+        let verified = fenced_process_writes(attempt, &attempts, commands, &text);
         let mut slot = outcomes.lock().unwrap_or_else(PoisonError::into_inner);
         slot.push(CopyVerdict {
             attempt,

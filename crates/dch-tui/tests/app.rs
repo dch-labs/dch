@@ -8827,6 +8827,9 @@ fn a_click_behind_a_pending_prompt_leaves_the_hidden_caret_alone() {
         .expect("receiver alive");
     app.set_permission_requests(requests_rx);
     app.poll_permission_requests();
+    // The frame that shows the ask: the click and the press that
+    // follow answer what the user saw.
+    drop(render_to_buffer(&mut app, 80, 25));
 
     assert!(app.handle_event(&mouse_event(
         MouseEventKind::Down(crossterm::event::MouseButton::Left),
@@ -8951,6 +8954,8 @@ fn control_chords_stay_inert_behind_a_pending_prompt() {
     );
     assert_eq!(app.input(), "draft", "no chord edited the draft");
 
+    // The frame that shows the ask: the user answers what they saw.
+    drop(render_to_buffer(&mut app, 80, 25));
     assert!(app.handle_event(&plain(KeyCode::Char('y'))));
     assert_eq!(
         reply_rx.blocking_recv(),
@@ -10206,6 +10211,9 @@ fn a_click_behind_the_permission_sheet_moves_nothing() {
             .expect("receiver alive");
         app.set_permission_requests(requests_rx);
         app.poll_permission_requests();
+        // The frame that shows the ask: the user answers what they
+        // saw, and the render gate arms their press.
+        drop(render_to_buffer(app, 80, 25));
     };
     let click_the_composer = |app: &mut TuiApp| {
         app.handle_event(&mouse_event(
@@ -14485,6 +14493,9 @@ fn a_permissions_repair_clears_the_marker_and_reseeds_the_config_rules() {
     app.set_permission_memory(memory);
     let cell = std::sync::Arc::new(std::sync::Mutex::new(Vec::<dch_permissions::Rule>::new()));
     app.set_permission_config_rules_cell(Some(std::sync::Arc::clone(&cell)));
+    // The listing the repair binds to: the user reviews the standing
+    // damage before clearing it.
+    app.run_command(Command::Permissions { forget: None });
     app.run_command(Command::Permissions {
         forget: Some("repair".to_string()),
     });

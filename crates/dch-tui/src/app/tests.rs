@@ -1036,6 +1036,9 @@ fn a_repair_under_standing_damage_reseeds_and_releases_the_adoption_guard() {
     let adoption_guard = std::sync::Arc::new(std::sync::Mutex::new(()));
     app.set_permission_adoption_guard(Some(std::sync::Arc::clone(&adoption_guard)));
 
+    // The user walks the door the notices name: the listing reviews
+    // the standing damage, and the repair acts on that review.
+    app.permissions_command(None);
     app.permissions_command(Some("repair"));
 
     let rules = rules_cell
@@ -3596,6 +3599,112 @@ fn a_confirm_stands_down_when_the_armed_prompt_was_claimed() {
         subject.queued_at(0).map(|(_, text)| text),
         Some("first".to_string()),
         "the survivor is the claim's neighbour, untouched"
+    );
+}
+
+#[test]
+fn a_confirmations_preview_follows_the_armed_prompt() {
+    // The ask's preview, reconciled by the frame: a claim slides the
+    // rows while the confirmation stands, and a view left at its old
+    // position would render the ask beside a prompt it will not
+    // spend. The frame points the view at the prompt the ask armed,
+    // so what the user reads is what `y` answers.
+    let mut subject = app();
+    for text in ["first", "second", "third"] {
+        subject.push_queued(text.to_string());
+    }
+    subject.queue.queue_mode = QueueMode::Focused;
+    subject.queue.queue_view = 1;
+    assert!(subject.queue_focused_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)));
+    // The driver claims the front prompt — every claim takes the
+    // oldest — sliding `third` into the view's stale position.
+    let claimed = subject.remove_queued(0);
+    assert_eq!(claimed.as_deref(), Some("first"));
+    subject.sync_queue_view();
+    assert_eq!(
+        subject.queue.queue_view, 0,
+        "the preview follows the armed prompt, not the stale position"
+    );
+    assert_eq!(
+        subject
+            .queued_at(subject.queue.queue_view)
+            .map(|(_, text)| text),
+        Some("second".to_string()),
+        "the ask renders beside the prompt it will spend"
+    );
+}
+
+#[test]
+fn a_confirmation_stands_down_when_the_frame_finds_the_prompt_gone() {
+    // The claim takes the armed prompt itself between frames. The
+    // frame finds the ask aimed at nothing and stands it down — the
+    // section returns to browsing, and the notice says the
+    // confirmation went with the prompt.
+    let mut subject = app();
+    for text in ["first", "second"] {
+        subject.push_queued(text.to_string());
+    }
+    subject.queue.queue_mode = QueueMode::Focused;
+    subject.queue.queue_view = 1;
+    assert!(subject.queue_focused_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)));
+    let gone = subject.remove_queued(1);
+    assert_eq!(gone.as_deref(), Some("second"));
+    subject.sync_queue_view();
+    assert!(
+        matches!(subject.queue.queue_mode, QueueMode::Focused),
+        "the ask stands itself down"
+    );
+    assert_eq!(
+        subject.notice_text().as_deref(),
+        Some("the prompt left the queue — the confirmation stood down"),
+        "the frame's dismissal says what it did"
+    );
+    assert_eq!(
+        subject.queued_at(0).map(|(_, text)| text),
+        Some("first".to_string()),
+        "the survivor keeps its place"
+    );
+}
+
+#[test]
+fn a_slash_prompt_refused_as_guidance_is_delivered_literally() {
+    // A prompt saved in the queue may spell a command: `/clear` as
+    // literal words, kept by an edit or typed at a moment that was
+    // never a dispatch. Guiding it into a run that refuses guidance
+    // falls back to its own turn — and the fallback delivers the
+    // words, never the command they spell: a queued prompt that
+    // happens to read `/clear` must not clear the session.
+    let mut subject = app();
+    subject
+        .conversation
+        .push(crate::message::TuiMessage::System {
+            text: "a row the session keeps".to_string(),
+            timestamp: chrono::Utc::now(),
+        });
+    subject
+        .state
+        .agent_running
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let id = subject.push_queued("/clear".to_string());
+    subject.steer_queued(id);
+    assert!(
+        subject
+            .conversation
+            .iter()
+            .any(|message| matches!(message, crate::message::TuiMessage::System { text, .. } if text == "a row the session keeps")),
+        "a literal delivery clears nothing"
+    );
+    assert!(
+        subject
+            .conversation
+            .iter()
+            .any(|message| matches!(message, crate::message::TuiMessage::User { text, .. } if text == "/clear")),
+        "the slash prompt lands as the user's own words"
+    );
+    assert_eq!(
+        subject.queued_len(),
+        0,
+        "the guided prompt left the queue once, delivered once"
     );
 }
 

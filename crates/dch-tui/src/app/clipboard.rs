@@ -346,8 +346,12 @@ pub(crate) fn wayland_socket_present() -> bool {
 /// Pure over the directory so the pin can drive it with a fixture;
 /// only the default `wayland-0` socket counts — the endpoint
 /// `wl-copy` opens when no display is named — and on unix it must be
-/// a socket file, not an ordinary file or a lock that happens to
-/// carry the name.
+/// a socket file, read through a symlink when one carries the name
+/// (a compositor stack that links the conventional name to its own
+/// instance socket still names the endpoint the helper opens, while
+/// the link itself reports as a link), not an ordinary file or a
+/// lock that happens to carry the name. A dangling link names no
+/// endpoint at all and counts as little.
 pub(crate) fn wayland_socket_in(dir: &std::path::Path) -> bool {
     std::fs::read_dir(dir).is_ok_and(|entries| {
         entries.flatten().any(|entry| {
@@ -357,7 +361,7 @@ pub(crate) fn wayland_socket_in(dir: &std::path::Path) -> bool {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::FileTypeExt as _;
-                entry.file_type().is_ok_and(|kind| kind.is_socket())
+                std::fs::metadata(entry.path()).is_ok_and(|meta| meta.file_type().is_socket())
             }
             #[cfg(not(unix))]
             {
@@ -395,18 +399,47 @@ pub(crate) fn host_transports(env: ClipboardEnv) -> Vec<HostTransport> {
     transports
 }
 
-/// Run every process transport under one shared deadline.
+/// The process transports one copy's chain holds, in run order.
 ///
-/// The configured command, the platform helper, and the transports
-/// the environment names all draw on the same clock, so the whole
-/// chain costs at most the deadline whatever it contains. Each
-/// transport checks the remaining budget before spawning — a helper
-/// that consumed the full budget leaves nothing for the rest to
-/// spend, so the chain stops rather than spawning past the deadline.
-/// Returns whether any transport exited successfully with its stdin
-/// fully written; an empty chain returns false without spawning
-/// anything.
-pub(crate) fn run_process_transports(custom: Option<&str>, text: &str, deadline: Duration) -> bool {
+/// Split from [`run_process_transports`] so a caller can prepare the
+/// chain once and hand it to the ordered lane whole, and so the pins
+/// can drive the runner with a chain of their own — nothing ambient
+/// spawns beside the commands a test names.
+pub(crate) fn transport_commands(custom: Option<&str>) -> Vec<std::process::Command> {
+    let mut commands = Vec::new();
+    if let Some(command_line) = custom {
+        let mut command = std::process::Command::new("sh");
+        command.arg("-c").arg(command_line);
+        commands.push(command);
+    }
+    if cfg!(target_os = "macos") {
+        commands.push(std::process::Command::new("pbcopy"));
+    }
+    for transport in host_transports(clipboard_env()) {
+        commands.push(transport.command());
+    }
+    commands
+}
+
+/// Run a prepared transport chain under one shared deadline.
+///
+/// The clocked loop every copy's transports walk, over a chain the
+/// caller assembled — the production jobs hand it the environment's
+/// own chain through [`transport_commands`], and the ordered lane
+/// hands it whichever chain the fenced copy carried, so both share
+/// one bounded runner. Every transport checks the remaining budget
+/// before spawning — a helper that consumed the full budget leaves
+/// nothing for the rest to spend, so the chain stops rather than
+/// spawning past the deadline. The chain is consumed: a command
+/// carries its stdio setup, so each runs exactly once, in the order
+/// it was assembled. Returns whether any transport exited
+/// successfully with its stdin fully written; an empty chain returns
+/// false without spawning anything.
+pub(crate) fn run_command_chain(
+    commands: Vec<std::process::Command>,
+    text: &str,
+    deadline: Duration,
+) -> bool {
     let start = Instant::now();
     let mut verified = false;
     let run = |command: std::process::Command| {
@@ -415,17 +448,55 @@ pub(crate) fn run_process_transports(custom: Option<&str>, text: &str, deadline:
         }
         run_bounded(command, text, start, deadline)
     };
-    if let Some(command_line) = custom {
-        let mut command = std::process::Command::new("sh");
-        command.arg("-c").arg(command_line);
+    for command in commands {
         verified |= run(command);
     }
-    if cfg!(target_os = "macos") {
-        verified |= run(std::process::Command::new("pbcopy"));
+    verified
+}
+
+/// The single lane process clipboard writes take their turn on.
+///
+/// Copies overlap freely — a burst of selections schedules several
+/// transport jobs at once — but the clipboard is one resource, and
+/// writes landing in whatever order the helpers finish would leave an
+/// older slow helper's text standing over the newer copy's delivery.
+/// The lane orders every process write: each job takes its turn, and
+/// a turn granted after a newer copy has started is declined on the
+/// spot by [`fenced_process_writes`], so the newest attempt's write is
+/// the last write the clipboard takes. A helper that hangs holds its
+/// turn no longer than [`COPY_DEADLINE`], so the lane's worst wait is
+/// one bounded deadline per copy ahead in line.
+static TRANSPORT_LANE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Run one copy's transport chain in the lane's order, fenced against
+/// newer copies.
+///
+/// Two checks around one turn: a copy a newer attempt has already
+/// superseded declines before it queues for the lane, and a copy that
+/// was current when it queued but was superseded while it waited
+/// declines the turn the moment the lane grants it — the clipboard
+/// never takes a write a newer copy has overtaken. A copy that holds
+/// the lane when a newer one starts finishes its own write first; the
+/// newer job's write lands after, so the newest text is the last text
+/// the clipboard holds. Returns whether the copy verified; a declined
+/// copy verifies nothing, having written nothing.
+pub(crate) fn fenced_process_writes(
+    attempt: u64,
+    attempts: &std::sync::atomic::AtomicU64,
+    commands: Vec<std::process::Command>,
+    text: &str,
+) -> bool {
+    if attempts.load(std::sync::atomic::Ordering::SeqCst) > attempt {
+        return false;
     }
-    for transport in host_transports(clipboard_env()) {
-        verified |= run(transport.command());
+    let turn = TRANSPORT_LANE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if attempts.load(std::sync::atomic::Ordering::SeqCst) > attempt {
+        return false;
     }
+    let verified = run_command_chain(commands, text, COPY_DEADLINE);
+    drop(turn);
     verified
 }
 
@@ -598,7 +669,117 @@ mod tests {
             !wayland_socket_in(&dir),
             "an ordinary file at the socket's name is no socket"
         );
+        std::fs::remove_file(dir.join("wayland-0")).expect("plain file removed");
+        let instance = UnixListener::bind(dir.join("wayland-instance")).expect("instance socket");
+        std::os::unix::fs::symlink(dir.join("wayland-instance"), dir.join("wayland-0"))
+            .expect("conventional name linked to the instance");
+        assert!(
+            wayland_socket_in(&dir),
+            "a symlink to a live default socket names a reachable compositor"
+        );
+        drop(instance);
+        std::fs::remove_file(dir.join("wayland-instance")).expect("instance removed");
+        assert!(
+            !wayland_socket_in(&dir),
+            "a dangling link at the socket's name names no endpoint"
+        );
         std::fs::remove_dir_all(&dir).expect("pin dir cleaned");
+    }
+
+    /// A copy's chain over a helper that appends `line` to `out`.
+    fn appending_chain(
+        out: &std::path::Path,
+        line: &str,
+        delay: &str,
+    ) -> Vec<std::process::Command> {
+        let mut command = std::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg(format!("{delay}printf '%s\\n' {line} >> {}", out.display()));
+        vec![command]
+    }
+
+    #[test]
+    fn a_superseded_copy_cannot_write_over_a_newer_one() {
+        // Three copies overlap: the first holds the lane inside a slow
+        // helper, the second queues behind it, and the third starts
+        // while both wait. The lane orders the writes and the fence
+        // declines the second's turn — superseded while it queued —
+        // so the clipboard's record ends on the newest copy's text and
+        // never carries the overtaken copy's: the slow helper's text
+        // lands only before the newest write, never after it.
+        let dir = tempfile::tempdir().expect("pin dir");
+        let out = dir.path().join("clipboard");
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let slow = {
+            let out = out.clone();
+            let attempts = Arc::clone(&attempts);
+            std::thread::spawn(move || {
+                fenced_process_writes(
+                    1,
+                    &attempts,
+                    appending_chain(&out, "one", "sleep 0.4; "),
+                    "",
+                )
+            })
+        };
+        std::thread::sleep(Duration::from_millis(120));
+        attempts.store(2, std::sync::atomic::Ordering::SeqCst);
+        let queued = {
+            let out = out.clone();
+            let attempts = Arc::clone(&attempts);
+            std::thread::spawn(move || {
+                fenced_process_writes(2, &attempts, appending_chain(&out, "two", ""), "")
+            })
+        };
+        attempts.store(3, std::sync::atomic::Ordering::SeqCst);
+        let newest = {
+            let out = out.clone();
+            let attempts = Arc::clone(&attempts);
+            std::thread::spawn(move || {
+                fenced_process_writes(3, &attempts, appending_chain(&out, "three", ""), "")
+            })
+        };
+        for job in [slow, queued, newest] {
+            job.join().expect("job finishes");
+        }
+        let record = std::fs::read_to_string(&out).expect("the helpers appended a record");
+        let lines: Vec<&str> = record.lines().collect();
+        assert!(
+            !lines.contains(&"two"),
+            "a copy superseded while it queued writes nothing: {record:?}"
+        );
+        assert_eq!(
+            lines.last().copied(),
+            Some("three"),
+            "the newest copy's text is the last write the clipboard took: {record:?}"
+        );
+    }
+
+    #[test]
+    fn a_copy_superseded_before_it_queues_writes_nothing() {
+        // The fast path: a job whose attempt a newer copy already
+        // overtook never takes the lane and never spawns a helper.
+        let dir = tempfile::tempdir().expect("pin dir");
+        let out = dir.path().join("clipboard");
+        let attempts = std::sync::atomic::AtomicU64::new(7);
+        let verified = fenced_process_writes(3, &attempts, appending_chain(&out, "stale", ""), "");
+        assert!(!verified, "a declined copy verifies nothing");
+        assert!(
+            !out.exists(),
+            "a copy superseded before it queued spawned no helper"
+        );
+    }
+
+    #[test]
+    fn an_empty_chain_verifies_nothing() {
+        // The chain the runner walks is the caller's: with nothing in
+        // it, nothing spawns and nothing verifies.
+        let attempts = std::sync::atomic::AtomicU64::new(1);
+        assert!(
+            !fenced_process_writes(1, &attempts, Vec::new(), ""),
+            "an empty chain never verifies"
+        );
     }
 
     #[test]

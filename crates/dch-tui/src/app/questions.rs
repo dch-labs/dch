@@ -371,11 +371,15 @@ impl TuiApp {
     /// `budget` is the rows the sheet may occupy inside its borders, and
     /// both consumers hand it the same number. When the terminal cannot
     /// hold everything, the rows go where the answer is made: the draft
-    /// row and the key hints keep theirs whatever happens, because a
-    /// sheet that cut the row being typed would leave the user writing
-    /// blind, and it is the option list that gives way — windowed around
-    /// the row the cursor stands on, so the walk stays on screen and the
-    /// arrows walk the window alongside it. See [`fit_question_sheet`].
+    /// row keeps its own row whatever happens, because a sheet that cut
+    /// the row being typed would leave the user writing blind. The
+    /// option list gives way first — windowed around the row the cursor
+    /// stands on, so the walk stays on screen and the arrows walk the
+    /// window alongside it — then a draft that outgrows the rows left
+    /// for it takes its own window around the caret, and only a sheet too
+    /// short to hold both the draft and the key hints gives the hints'
+    /// rows up to the caret: the tail is the last to go. See
+    /// [`fit_question_sheet`].
     pub(crate) fn question_sheet(
         &self,
         entry: &PendingQuestion,
@@ -1284,9 +1288,11 @@ const DETAIL_INDENT: &str = "    ";
 /// outgrows the rows left for it takes its own window around `caret`, so
 /// the row the caret writes on stays on screen with the caret translated
 /// into it; a draft that fits shows whole. The assembled rows never exceed
-/// `budget` — zero included — so a caret can never land on the border. A
-/// terminal so short that the untouchable blocks do not fit loses the
-/// tail, the only sacrifice left.
+/// `budget` — zero included — so a caret can never land on the border. The
+/// key hints keep their rows while any room is left for the draft beside
+/// them; a sheet too short for both gives the hints up to the caret — the
+/// draft windows over the whole remainder, and the tail is the last to
+/// go.
 fn fit_question_sheet(
     head: Vec<Line<'static>>,
     options: &[(usize, Vec<Line<'static>>)],
@@ -1314,6 +1320,11 @@ fn fit_question_sheet(
     let compose_room = budget
         .saturating_sub(compose_start)
         .saturating_sub(tail.len());
+    let compose_room = if compose_room > 0 {
+        compose_room
+    } else {
+        budget.saturating_sub(compose_start)
+    };
     if compose.len() > compose_room && compose_room > 0 {
         let caret_row = caret.map_or(0, |(row, _)| row);
         let window_start = caret_row
@@ -1325,7 +1336,8 @@ fn fit_question_sheet(
         compose = windowed;
     }
     lines.extend(compose);
-    lines.extend(tail);
+    let tail_room = budget.saturating_sub(lines.len());
+    lines.extend(tail.into_iter().take(tail_room));
     lines.truncate(budget);
     (lines, compose_start, caret)
 }
@@ -1494,6 +1506,51 @@ mod tests {
             Some((3, 2)),
             "the caret lands on its own row inside the window"
         );
+    }
+
+    #[test]
+    fn a_sheet_too_short_for_the_draft_and_the_hints_keeps_the_caret_row() {
+        // The zero-room case: a budget of three against a five-row
+        // draft and three rows of hints. Reserving the hints first
+        // leaves the draft nothing, and the old assembly kept the
+        // draft's first rows and dropped the caret's — the user
+        // typed blind. The tail is the last to go: the draft windows
+        // over the whole budget around the caret, the hints lose
+        // their rows, and a one-row budget still keeps the caret's own
+        // row.
+        let (lines, compose_start, caret) = fit_question_sheet(
+            block_rows("h", 1),
+            &[],
+            block_rows("c", 5),
+            block_rows("t", 3),
+            0,
+            3,
+            Some((4, 2)),
+        );
+        let rows: Vec<String> = lines.iter().map(ToString::to_string).collect();
+        assert_eq!(compose_start, 0, "the head cannot fit and gives way");
+        assert_eq!(
+            rows,
+            vec!["c2", "c3", "c4"],
+            "the draft windows around the caret; the hints yield their rows"
+        );
+        assert_eq!(caret, Some((2, 2)), "the caret lands on its own row");
+        let (lines, _, caret) = fit_question_sheet(
+            block_rows("h", 1),
+            &[],
+            block_rows("c", 5),
+            block_rows("t", 3),
+            0,
+            1,
+            Some((4, 2)),
+        );
+        let rows: Vec<String> = lines.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            rows,
+            vec!["c4"],
+            "a one-row budget keeps the caret's row alone"
+        );
+        assert_eq!(caret, Some((0, 2)), "translated into the one-row window");
     }
 
     #[test]
