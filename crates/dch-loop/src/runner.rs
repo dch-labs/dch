@@ -69,6 +69,7 @@ use loopctl::middleware::ToolDispatchContext;
 use loopctl::middleware::ToolMiddleware;
 use loopctl::middleware::ToolPipeline;
 use loopctl::observer::LoopObserver;
+use loopctl::stream::handler::RateLimitConfig;
 use loopctl::stream::handler::StreamHandler;
 use loopctl::stream::handler::StreamTimeoutConfig;
 use loopctl::tool::Tool;
@@ -951,14 +952,8 @@ impl RunnerBuilder<'_> {
         }
         let run_config = self.config.to_run_config();
 
-        let timeout_config = StreamTimeoutConfig {
-            total_stream_timeout: std::time::Duration::from_secs(
-                self.config.runner.turn_timeout_secs,
-            ),
-            ..StreamTimeoutConfig::default()
-        };
         let mut managers = LoopManagers::new()
-            .with_stream_handler(StreamHandler::new().with_timeout_config(timeout_config))
+            .with_stream_handler(stream_handler(&self.config.runner))
             .with_context_manager(Arc::new(context_manager_for(
                 self.config.runner.compactor,
                 &Arc::new(crate::provider::create_compactor_client(&self.config.api)?),
@@ -1299,6 +1294,33 @@ fn arm_fallback(primary: &str, fallback: &str) -> Result<FallbackManager, Runner
     Ok(manager)
 }
 
+/// Build the stream handler one runner session runs its model calls on.
+///
+/// The two halves of the stream policy the host tunes, and nothing
+/// else: the whole-call budget — `[runner] turn_timeout_secs`, the
+/// wall clock one streaming call may consume — and the rate-limit
+/// ladder's floor — `[runner] rate_limit_delay_secs`, the first
+/// hintless backoff and the base the ladder doubles from. Everything
+/// the handler's own defaults own (the hint-honouring policy, the
+/// ladder's cap and escalation threshold, the first-event window)
+/// stays stock: the host's lever is the floor alone, the one number
+/// the provider's quota window — not the transport — should decide.
+/// Lifted out of the runner's construction so the handler a session
+/// runs can be read back and pinned without standing a session up.
+fn stream_handler(runner: &dch_config::RunnerConfig) -> StreamHandler {
+    let timeout_config = StreamTimeoutConfig {
+        total_stream_timeout: std::time::Duration::from_secs(runner.turn_timeout_secs),
+        ..StreamTimeoutConfig::default()
+    };
+    let rate_limit_config = RateLimitConfig {
+        default_delay: std::time::Duration::from_secs(runner.rate_limit_delay_secs),
+        ..RateLimitConfig::default()
+    };
+    StreamHandler::new()
+        .with_timeout_config(timeout_config)
+        .with_rate_limit_config(rate_limit_config)
+}
+
 /// Build the context manager around exactly the compactor the
 /// configuration names.
 ///
@@ -1534,6 +1556,54 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Mutex;
     use tempfile::TempDir;
+
+    #[test]
+    fn the_stream_handler_carries_the_configured_rate_limit_floor() {
+        // The host's one lever on the retry ladder, read back from the
+        // handler a session would run: the hintless floor is exactly the
+        // configured seconds — the tuned floor the quota window asked
+        // for, never the stock five — while the whole-call budget keeps
+        // its own knob and the ladder's policy (cap, escalation
+        // threshold, hint honouring) stays at the handler's defaults.
+        let mut config = DchConfig::default();
+        config.runner.rate_limit_delay_secs = 45;
+        config.runner.turn_timeout_secs = 480;
+        let handler = stream_handler(&config.runner);
+        assert_eq!(
+            handler.rate_limit_config().default_delay,
+            std::time::Duration::from_secs(45),
+            "the hintless floor is the configured seconds"
+        );
+        assert_eq!(
+            handler.rate_limit_config().max_delay,
+            RateLimitConfig::default().max_delay,
+            "the ladder's cap stays at the handler's own default"
+        );
+        assert_eq!(
+            handler.rate_limit_config().fallback_after_retries,
+            RateLimitConfig::default().fallback_after_retries,
+            "the escalation threshold stays at the handler's own default"
+        );
+        assert_eq!(
+            handler.timeout_config().total_stream_timeout,
+            std::time::Duration::from_secs(480),
+            "the whole-call budget keeps its own knob"
+        );
+    }
+
+    #[test]
+    fn the_default_handler_floors_the_ladder_at_fifteen_seconds() {
+        // The untuned session is tuned anyway: the config's default
+        // floor — fifteen — reaches the handler, so the ladder a stock
+        // session runs ramps 15 + 30 + 60, not the library's 5 + 10 +
+        // 20.
+        let handler = stream_handler(&DchConfig::default().runner);
+        assert_eq!(
+            handler.rate_limit_config().default_delay,
+            std::time::Duration::from_secs(15),
+            "the default floor is fifteen seconds at the handler"
+        );
+    }
 
     #[test]
     fn the_compaction_notice_carries_only_measured_figures() {

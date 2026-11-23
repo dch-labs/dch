@@ -15,6 +15,7 @@ use dch_tui::TuiObserverState;
 use tokio::sync::mpsc;
 
 use super::commands::apply_session_command;
+use super::commands::post_session_notice;
 use super::corrections::{
     apply_correction_cut, exit_owns_cancel, pull_corrected_wording, pull_pending_correction,
     rescue_correction_text, rescue_stranded_corrections,
@@ -80,6 +81,54 @@ fn post_run_error(state: &TuiObserverState, err: &loopctl::error::LoopError) {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .push(err.to_string());
     state.render_notify.notify(1);
+}
+
+/// The notice a rate-limit escalation posts beside its error row.
+///
+/// `None` for every failure but the one whose next step is the
+/// user's. An escalation means the retry ladder is spent: retrying
+/// right away re-runs the same dead ladder against the same open
+/// quota window — the observed aftermath of both session deaths was
+/// exactly that retry, inside a minute — while the circuit breaker
+/// has already routed the turns after it to the fallback model. The
+/// error row keeps the provider's facts verbatim; the notice carries
+/// the part no payload spells: what to do next.
+fn rate_limit_escalation_notice(err: &loopctl::error::LoopError) -> Option<String> {
+    let loopctl::error::LoopError::RateLimitEscalation {
+        attempts,
+        retry_after,
+    } = err
+    else {
+        return None;
+    };
+    let hint = match retry_after {
+        Some(wait) => format!("the provider's last hint said {}s", wait.as_secs()),
+        None => "the provider sent no Retry-After".to_string(),
+    };
+    Some(format!(
+        "rate-limited after {attempts} retries — {hint}. Wait a minute or two before \
+         resuming: an immediate retry re-runs the same ladder. The circuit breaker routes \
+         the next turns to the fallback model."
+    ))
+}
+
+/// Land a failed turn where the session reads it.
+///
+/// The verbatim error row the transcript keeps, plus — for the one
+/// failure whose remedy lives outside the session — the notice that
+/// names it, on the lane the transient notice row reads. Split from
+/// the driver loop's error arm so the pairing is a seam a pin can
+/// drive: the row and the notice land together or the row lands
+/// alone, and nothing else changes.
+fn land_run_error(
+    state: &TuiObserverState,
+    session_tx: &mpsc::UnboundedSender<SessionUpdate>,
+    err: &loopctl::error::LoopError,
+) {
+    post_run_error(state, err);
+    if let Some(text) = rate_limit_escalation_notice(err) {
+        post_session_notice(session_tx, text);
+    }
 }
 
 /// The run-scoped CLI statements a mid-session path must keep honouring.
@@ -513,7 +562,7 @@ pub(crate) async fn run_driver_loop(
             if let Some(cancelled_for) = correction {
                 interrupted_for = Some(cancelled_for);
             } else {
-                post_run_error(&context.state, err);
+                land_run_error(&context.state, &session_tx, err);
             }
         }
     }
@@ -594,6 +643,103 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn an_escalation_notice_names_the_facts_and_the_next_step() {
+        // The session's own shape first: the hintless escalation, the
+        // one both session deaths looked like. The notice carries the
+        // payload's facts — four retries, no Retry-After — and the
+        // part no payload spells: wait, because an immediate retry
+        // re-runs the dead ladder, and the breaker already routes the
+        // next turns to the fallback model.
+        let notice =
+            rate_limit_escalation_notice(&loopctl::error::LoopError::RateLimitEscalation {
+                attempts: 4,
+                retry_after: None,
+            })
+            .expect("an escalation earns its notice");
+        assert!(
+            notice.contains("4 retries")
+                && notice.contains("no Retry-After")
+                && notice.contains("Wait a minute or two")
+                && notice.contains("fallback model"),
+            "the notice names the facts and the next step: {notice}"
+        );
+        // A hinted escalation says what the hint said, in seconds.
+        let hinted =
+            rate_limit_escalation_notice(&loopctl::error::LoopError::RateLimitEscalation {
+                attempts: 3,
+                retry_after: Some(std::time::Duration::from_secs(90)),
+            })
+            .expect("a hinted escalation earns its notice too");
+        assert!(
+            hinted.contains("3 retries") && hinted.contains("90s"),
+            "the hint's seconds ride along: {hinted}"
+        );
+        // Every other failure stays wordless: only the escalation's
+        // remedy lives outside the session.
+        assert!(
+            rate_limit_escalation_notice(&loopctl::error::LoopError::Cancelled).is_none(),
+            "a cancel owes no advice"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_escalating_failure_lands_the_error_row_and_the_notice_together() {
+        // The wired arm's pairing, driven through the seam itself: an
+        // escalation writes the verbatim error row the transcript
+        // keeps and posts the actionable notice the session shows,
+        // while a plain failure writes the row alone — no notice a
+        // user could mistake for advice.
+        let (_, state) = TuiObserverState::new().into_observer();
+        let (session_tx, mut session_rx) = mpsc::unbounded_channel();
+        land_run_error(
+            &state,
+            &session_tx,
+            &loopctl::error::LoopError::RateLimitEscalation {
+                attempts: 4,
+                retry_after: None,
+            },
+        );
+        {
+            let errors = state.errors.lock().unwrap();
+            assert_eq!(errors.len(), 1, "the verbatim error row lands");
+            assert!(
+                errors[0].contains("Rate-limit escalation"),
+                "the row keeps the provider's facts verbatim: {:?}",
+                errors[0]
+            );
+        }
+        let SessionUpdate::Notice { text } = session_rx.try_recv().expect("the notice is posted")
+        else {
+            panic!("the escalation's update is a notice");
+        };
+        assert!(
+            text.contains("Wait a minute or two"),
+            "the posted notice is the actionable one: {text}"
+        );
+        assert!(
+            session_rx.try_recv().is_err(),
+            "one escalation posts one notice"
+        );
+
+        let (_, plain_state) = TuiObserverState::new().into_observer();
+        let (plain_tx, mut plain_rx) = mpsc::unbounded_channel();
+        land_run_error(
+            &plain_state,
+            &plain_tx,
+            &loopctl::error::LoopError::Cancelled,
+        );
+        assert_eq!(
+            plain_state.errors.lock().unwrap().len(),
+            1,
+            "a plain failure still records its row"
+        );
+        assert!(
+            plain_rx.try_recv().is_err(),
+            "a plain failure posts no notice"
+        );
+    }
 
     #[tokio::test]
     async fn a_failing_run_routes_its_error_into_the_shared_buffer() {
