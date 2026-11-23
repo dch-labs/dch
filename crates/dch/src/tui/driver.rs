@@ -86,14 +86,20 @@ fn post_run_error(state: &TuiObserverState, err: &loopctl::error::LoopError) {
 /// The notice a rate-limit escalation posts beside its error row.
 ///
 /// `None` for every failure but the one whose next step is the
-/// user's. An escalation means the retry ladder is spent: retrying
-/// right away re-runs the same dead ladder against the same open
-/// quota window — the observed aftermath of both session deaths was
-/// exactly that retry, inside a minute — while the circuit breaker
-/// has already routed the turns after it to the fallback model. The
-/// error row keeps the provider's facts verbatim; the notice carries
-/// the part no payload spells: what to do next.
-fn rate_limit_escalation_notice(err: &loopctl::error::LoopError) -> Option<String> {
+/// user's. An escalation means the retry ladder is spent — the
+/// observed aftermath of both session deaths was a retry inside a
+/// minute, re-running the same dead ladder — so the advice says how
+/// long to wait: the provider's own window when its last hint named
+/// one, a minute or two when it named none. The fallback sentence
+/// rides only when a fallback model is actually armed, and says what
+/// the breaker really does — repeated failures, not the next turn,
+/// reroute the session. The error row keeps the provider's facts
+/// verbatim; the notice carries the part no payload spells: what to
+/// do next.
+fn rate_limit_escalation_notice(
+    err: &loopctl::error::LoopError,
+    fallback_armed: bool,
+) -> Option<String> {
     let loopctl::error::LoopError::RateLimitEscalation {
         attempts,
         retry_after,
@@ -101,14 +107,27 @@ fn rate_limit_escalation_notice(err: &loopctl::error::LoopError) -> Option<Strin
     else {
         return None;
     };
-    let hint = match retry_after {
-        Some(wait) => format!("the provider's last hint said {}s", wait.as_secs()),
+    let facts = match retry_after {
+        Some(window) => format!("the provider's last hint said {}s", window.as_secs()),
         None => "the provider sent no Retry-After".to_string(),
     };
+    let advice = match retry_after {
+        Some(window) => format!(
+            "Resume after the provider's {}-second window closes: an earlier retry \
+             re-runs the same ladder.",
+            window.as_secs()
+        ),
+        None => "Wait a minute or two before resuming: an immediate retry re-runs the \
+             same ladder."
+            .to_string(),
+    };
+    let fallback = if fallback_armed {
+        " Repeated rate-limiting will route the turns that follow to the fallback model."
+    } else {
+        ""
+    };
     Some(format!(
-        "rate-limited after {attempts} retries — {hint}. Wait a minute or two before \
-         resuming: an immediate retry re-runs the same ladder. The circuit breaker routes \
-         the next turns to the fallback model."
+        "rate-limited after {attempts} retries — {facts}. {advice}{fallback}"
     ))
 }
 
@@ -124,9 +143,10 @@ fn land_run_error(
     state: &TuiObserverState,
     session_tx: &mpsc::UnboundedSender<SessionUpdate>,
     err: &loopctl::error::LoopError,
+    fallback_armed: bool,
 ) {
     post_run_error(state, err);
-    if let Some(text) = rate_limit_escalation_notice(err) {
+    if let Some(text) = rate_limit_escalation_notice(err, fallback_armed) {
         post_session_notice(session_tx, text);
     }
 }
@@ -562,7 +582,12 @@ pub(crate) async fn run_driver_loop(
             if let Some(cancelled_for) = correction {
                 interrupted_for = Some(cancelled_for);
             } else {
-                land_run_error(&context.state, &session_tx, err);
+                land_run_error(
+                    &context.state,
+                    &session_tx,
+                    err,
+                    context.config.api.fallback_model.is_some(),
+                );
             }
         }
     }
@@ -648,38 +673,64 @@ mod tests {
     fn an_escalation_notice_names_the_facts_and_the_next_step() {
         // The session's own shape first: the hintless escalation, the
         // one both session deaths looked like. The notice carries the
-        // payload's facts — four retries, no Retry-After — and the
-        // part no payload spells: wait, because an immediate retry
-        // re-runs the dead ladder, and the breaker already routes the
-        // next turns to the fallback model.
-        let notice =
-            rate_limit_escalation_notice(&loopctl::error::LoopError::RateLimitEscalation {
+        // payload's facts — four retries, no Retry-After — and advice
+        // that matches them: a generic minute-or-two, because the
+        // provider named no window. With a fallback model armed, the
+        // routing sentence rides along and says what the breaker
+        // really does — repeated failures reroute, not the next turn.
+        let notice = rate_limit_escalation_notice(
+            &loopctl::error::LoopError::RateLimitEscalation {
                 attempts: 4,
                 retry_after: None,
-            })
-            .expect("an escalation earns its notice");
+            },
+            true,
+        )
+        .expect("an escalation earns its notice");
         assert!(
             notice.contains("4 retries")
                 && notice.contains("no Retry-After")
                 && notice.contains("Wait a minute or two")
+                && notice.contains("Repeated rate-limiting")
                 && notice.contains("fallback model"),
-            "the notice names the facts and the next step: {notice}"
+            "the notice names the facts, the honest routing, and the next step: {notice}"
         );
-        // A hinted escalation says what the hint said, in seconds.
-        let hinted =
-            rate_limit_escalation_notice(&loopctl::error::LoopError::RateLimitEscalation {
-                attempts: 3,
-                retry_after: Some(std::time::Duration::from_secs(90)),
-            })
-            .expect("a hinted escalation earns its notice too");
+        // Without a fallback model the routing promise is absent — a
+        // session with nowhere to reroute is told nothing false.
+        let bare = rate_limit_escalation_notice(
+            &loopctl::error::LoopError::RateLimitEscalation {
+                attempts: 4,
+                retry_after: None,
+            },
+            false,
+        )
+        .expect("the notice itself does not depend on the fallback");
         assert!(
-            hinted.contains("3 retries") && hinted.contains("90s"),
-            "the hint's seconds ride along: {hinted}"
+            !bare.contains("fallback"),
+            "no fallback armed, no routing claimed: {bare}"
+        );
+        // A hinted escalation takes its advice from the hint: the wait
+        // is the provider's own window, in seconds, not the generic
+        // minute-or-two — an hour-long quota window used to tell the
+        // user to come back in two minutes.
+        let hinted = rate_limit_escalation_notice(
+            &loopctl::error::LoopError::RateLimitEscalation {
+                attempts: 3,
+                retry_after: Some(std::time::Duration::from_secs(3600)),
+            },
+            false,
+        )
+        .expect("a hinted escalation earns its notice too");
+        assert!(
+            hinted.contains("3 retries")
+                && hinted.contains("3600s")
+                && hinted.contains("3600-second window")
+                && !hinted.contains("minute or two"),
+            "the hint's own window is the advice: {hinted}"
         );
         // Every other failure stays wordless: only the escalation's
         // remedy lives outside the session.
         assert!(
-            rate_limit_escalation_notice(&loopctl::error::LoopError::Cancelled).is_none(),
+            rate_limit_escalation_notice(&loopctl::error::LoopError::Cancelled, true).is_none(),
             "a cancel owes no advice"
         );
     }
@@ -700,6 +751,7 @@ mod tests {
                 attempts: 4,
                 retry_after: None,
             },
+            true,
         );
         {
             let errors = state.errors.lock().unwrap();
@@ -729,6 +781,7 @@ mod tests {
             &plain_state,
             &plain_tx,
             &loopctl::error::LoopError::Cancelled,
+            false,
         );
         assert_eq!(
             plain_state.errors.lock().unwrap().len(),

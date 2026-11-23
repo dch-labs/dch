@@ -151,11 +151,16 @@ impl TuiApp {
     /// judged over everything landed since the snapshot was taken,
     /// because a run that settles between the confirming press and
     /// this stop can graduate its reply through an ordinary frame
-    /// before the settle ever runs. A run that already stopped before
-    /// this moment still owes its record — the snapshot exists
-    /// precisely for the press that cancelled it — so only an idle
-    /// exit, with neither a run to stop nor a snapshot to land,
-    /// returns without writing.
+    /// before the settle ever runs. Graduation is read by content:
+    /// reply text landing supersedes the snapshot whole, while
+    /// reasoning landing alone — the failed turn's thinking-only row —
+    /// supersedes only the snapshot's reasoning, and its words still
+    /// land, so the reasoning never appears twice and the text never
+    /// vanishes beside its own graduated thinking. A run that already
+    /// stopped before this moment still owes its record — the
+    /// snapshot exists precisely for the press that cancelled it — so
+    /// only an idle exit, with neither a run to stop nor a snapshot
+    /// to land, returns without writing.
     pub fn settle_exit_stop(
         &mut self,
         terminal: &mut ratatui::Terminal<impl ratatui::backend::Backend>,
@@ -175,29 +180,44 @@ impl TuiApp {
         drop(terminal.draw(|frame| self.render(frame)));
         self.drain_shared_state();
         let graduated_from = self.exit.partial_reply_since.min(self.conversation.len());
-        let reply_graduated = self
+        let graduated = self
             .conversation
             .get(graduated_from..)
-            .is_some_and(|landed| {
-                landed.iter().any(|message| {
-                    matches!(
-                        message,
-                        TuiMessage::Assistant { blocks, .. }
-                            if blocks.iter().any(|block| matches!(
-                                block,
-                                ContentBlock::Text { .. } | ContentBlock::Thinking { .. }
-                            ))
-                    )
-                })
+            .map_or((false, false), |landed| {
+                landed
+                    .iter()
+                    .fold((false, false), |(text, thinking), message| match message {
+                        TuiMessage::Assistant { blocks, .. } => (
+                            text || blocks
+                                .iter()
+                                .any(|block| matches!(block, ContentBlock::Text { .. })),
+                            thinking
+                                || blocks
+                                    .iter()
+                                    .any(|block| matches!(block, ContentBlock::Thinking { .. })),
+                        ),
+                        _ => (text, thinking),
+                    })
             });
-        if !reply_graduated && let Some(blocks) = self.exit.partial_reply.take() {
-            self.conversation.push(TuiMessage::Assistant {
-                blocks,
-                timestamp: chrono::Utc::now(),
-                duration_ms: None,
-            });
-        } else {
+        let (reply_text_graduated, reasoning_graduated) = graduated;
+        if reply_text_graduated {
             self.exit.partial_reply = None;
+        } else if let Some(blocks) = self.exit.partial_reply.take() {
+            let kept: Vec<ContentBlock> = if reasoning_graduated {
+                blocks
+                    .into_iter()
+                    .filter(|block| matches!(block, ContentBlock::Text { .. }))
+                    .collect()
+            } else {
+                blocks
+            };
+            if !kept.is_empty() {
+                self.conversation.push(TuiMessage::Assistant {
+                    blocks: kept,
+                    timestamp: chrono::Utc::now(),
+                    duration_ms: None,
+                });
+            }
         }
         let record_landed = self.conversation.get(before..).is_some_and(|landed| {
             landed
@@ -645,6 +665,64 @@ mod tests {
         assert!(
             cancel_record_landed(&app),
             "a live run is cancelled and recorded"
+        );
+    }
+
+    #[test]
+    fn a_reasoning_only_graduation_keeps_the_snapshots_words() {
+        // The failed turn's own graduation: its reasoning lands through
+        // an ordinary frame — a thinking-only row, the text cleared
+        // without graduating — between the confirming press and the
+        // stop. The old check read that row as the reply graduating and
+        // dropped the snapshot, so the words the user watched stream
+        // never reached the transcript. The stop now reads graduation
+        // by content: the snapshot's words land, its reasoning does not
+        // — the graduated row already carries it — so nothing appears
+        // twice and nothing vanishes.
+        let mut app = TuiApp::new(dch_config::DchConfig::default());
+        seed_partial_reply(&mut app, "half said");
+        app.state
+            .thinking
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .text = "thought first".to_string();
+        app.snapshot_exit_state_before_cancel();
+        app.conversation.push(TuiMessage::Assistant {
+            blocks: vec![ContentBlock::Thinking {
+                text: "thought first".to_string(),
+                redacted: false,
+                duration_ms: 0,
+            }],
+            timestamp: chrono::Utc::now(),
+            duration_ms: None,
+        });
+        stop_as_a_failed_turn_does(&mut app);
+        let mut terminal = test_terminal();
+        app.settle_exit_stop(&mut terminal);
+        let texts = reply_texts(&app);
+        assert_eq!(
+            texts,
+            ["half said"],
+            "the snapshot's words land beside their graduated reasoning"
+        );
+        let thinkings = app
+            .conversation
+            .iter()
+            .filter_map(|message| match message {
+                TuiMessage::Assistant { blocks, .. } => Some(blocks),
+                _ => None,
+            })
+            .flat_map(|blocks| {
+                blocks.iter().filter_map(|block| match block {
+                    ContentBlock::Thinking { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            thinkings,
+            ["thought first"],
+            "the reasoning appears once, in the row that graduated it"
         );
     }
 

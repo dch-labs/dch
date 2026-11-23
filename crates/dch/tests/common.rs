@@ -731,6 +731,10 @@ impl Sandbox {
                 ..PtySize::default()
             })
             .expect("pty opens");
+        // Raw mode speaks the Unix termios: elsewhere the pair keeps its
+        // platform's cooked defaults, and the scenarios that lean on
+        // raw semantics are Unix-only themselves.
+        #[cfg(unix)]
         raw_before_the_first_byte(pty.master.as_raw_fd());
         let mut command = CommandBuilder::new(dch_binary());
         command.args(args);
@@ -773,6 +777,11 @@ impl Sandbox {
 /// the never-asked scenarios stand on — and the stream carries only
 /// what the child writes. The binary's own raw-mode entry then saves
 /// and restores these settings as its own.
+///
+/// Unix-only: the termios calls and the master descriptor they take
+/// exist only there, so the helper and its call compile away on other
+/// hosts — every test target that declares `mod common;` still builds.
+#[cfg(unix)]
 fn raw_before_the_first_byte(fd: Option<std::os::unix::io::RawFd>) {
     let Some(fd) = fd else {
         return;

@@ -401,10 +401,10 @@ pub(crate) fn host_transports(env: ClipboardEnv) -> Vec<HostTransport> {
 
 /// The process transports one copy's chain holds, in run order.
 ///
-/// Split from [`run_process_transports`] so a caller can prepare the
-/// chain once and hand it to the ordered lane whole, and so the pins
-/// can drive the runner with a chain of their own — nothing ambient
-/// spawns beside the commands a test names.
+/// Prepared here so a caller can assemble the chain once and hand it
+/// to [`run_command_chain`] whole, and so the pins can drive the
+/// runner with a chain of their own — nothing ambient spawns beside
+/// the commands a test names.
 pub(crate) fn transport_commands(custom: Option<&str>) -> Vec<std::process::Command> {
     let mut commands = Vec::new();
     if let Some(command_line) = custom {
@@ -692,67 +692,117 @@ mod tests {
         line: &str,
         delay: &str,
     ) -> Vec<std::process::Command> {
+        // The output path rides as the script's first argument rather
+        // than inside its text, quoted by the shell itself — a
+        // temporary directory whose name carries a space stays one
+        // filename, and the redirect lands in the file the test reads.
         let mut command = std::process::Command::new("sh");
         command
             .arg("-c")
-            .arg(format!("{delay}printf '%s\\n' {line} >> {}", out.display()));
+            .arg(format!("{delay}printf '%s\\n' {line} >> \"$1\""))
+            .arg("sh")
+            .arg(out);
         vec![command]
+    }
+
+    /// Wait until `job` has been scheduled and is parked at the lane,
+    /// proving it past its first fence.
+    ///
+    /// The worker's closure raises `scheduled` as its first act, so a
+    /// raised flag proves the thread ran; a worker declined at the
+    /// before-queue check finishes on the spot, whoever holds the lane,
+    /// so a finished handle after the grace sleep proves a decline. What
+    /// remains — scheduled, not finished, past two atomic loads — is a
+    /// worker waiting for its turn behind the copy that holds the lane,
+    /// and the grace sleep bounds the scheduler's reach from the marker
+    /// to the lane. The asserts turn both vacuous cases — a worker that
+    /// never ran, a worker that declined — into the test's failure
+    /// rather than its silent pass.
+    fn wait_parked_at_the_lane(
+        job: &std::thread::JoinHandle<bool>,
+        scheduled: &std::sync::atomic::AtomicBool,
+    ) {
+        while !scheduled.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            !job.is_finished(),
+            "the worker must be waiting at the lane, not declined before it"
+        );
     }
 
     #[test]
     fn a_superseded_copy_cannot_write_over_a_newer_one() {
-        // Three copies overlap: the first holds the lane inside a slow
-        // helper, the second queues behind it, and the third starts
-        // while both wait. The lane orders the writes and the fence
-        // declines the second's turn — superseded while it queued —
-        // so the clipboard's record ends on the newest copy's text and
-        // never carries the overtaken copy's: the slow helper's text
-        // lands only before the newest write, never after it.
+        // The reviewer's interleaving, made deterministic: the first
+        // copy holds the lane inside its own slow helper — proven by
+        // the marker that helper's first command writes, a command the
+        // lane itself orders before the sleep — while the second copy
+        // parks behind it, proven scheduled by its marker and not
+        // declined by its unfinished handle. Attempt three publishes
+        // while the second is parked; when the first's turn ends, the
+        // second's decline can only come from the check the lane
+        // grants, and the complete record is exactly the first and the
+        // newest: the overtaken copy's turn arrives superseded and
+        // writes nothing, and the newest copy's text is the last write
+        // the clipboard takes.
         let dir = tempfile::tempdir().expect("pin dir");
         let out = dir.path().join("clipboard");
+        let held = dir.path().join("one-holds-the-lane");
         let attempts = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
-        let slow = {
+        let one = {
             let out = out.clone();
+            let held = held.clone();
             let attempts = Arc::clone(&attempts);
             std::thread::spawn(move || {
-                fenced_process_writes(
-                    1,
-                    &attempts,
-                    appending_chain(&out, "one", "sleep 0.4; "),
-                    "",
-                )
+                let mut marker = std::process::Command::new("sh");
+                marker
+                    .arg("-c")
+                    .arg("printf x > \"$1\"")
+                    .arg("sh")
+                    .arg(&held);
+                let mut chain = vec![marker];
+                chain.extend(appending_chain(&out, "one", "sleep 0.2; "));
+                fenced_process_writes(1, &attempts, chain, "")
             })
         };
-        std::thread::sleep(Duration::from_millis(120));
+        while !held.exists() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         attempts.store(2, std::sync::atomic::Ordering::SeqCst);
         let queued = {
             let out = out.clone();
             let attempts = Arc::clone(&attempts);
-            std::thread::spawn(move || {
+            let scheduled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let raised = Arc::clone(&scheduled);
+            let job = std::thread::spawn(move || {
+                raised.store(true, std::sync::atomic::Ordering::SeqCst);
                 fenced_process_writes(2, &attempts, appending_chain(&out, "two", ""), "")
-            })
+            });
+            wait_parked_at_the_lane(&job, &scheduled);
+            job
         };
         attempts.store(3, std::sync::atomic::Ordering::SeqCst);
         let newest = {
             let out = out.clone();
             let attempts = Arc::clone(&attempts);
-            std::thread::spawn(move || {
+            let scheduled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let raised = Arc::clone(&scheduled);
+            let job = std::thread::spawn(move || {
+                raised.store(true, std::sync::atomic::Ordering::SeqCst);
                 fenced_process_writes(3, &attempts, appending_chain(&out, "three", ""), "")
-            })
+            });
+            wait_parked_at_the_lane(&job, &scheduled);
+            job
         };
-        for job in [slow, queued, newest] {
+        for job in [one, queued, newest] {
             job.join().expect("job finishes");
         }
         let record = std::fs::read_to_string(&out).expect("the helpers appended a record");
-        let lines: Vec<&str> = record.lines().collect();
-        assert!(
-            !lines.contains(&"two"),
-            "a copy superseded while it queued writes nothing: {record:?}"
-        );
         assert_eq!(
-            lines.last().copied(),
-            Some("three"),
-            "the newest copy's text is the last write the clipboard took: {record:?}"
+            record, "one\nthree\n",
+            "the complete record: the parked-and-superseded copy writes nothing, and the \
+             newest copy's text is the last write the clipboard took"
         );
     }
 
